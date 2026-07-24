@@ -21,15 +21,63 @@ interface UpdateStatusData {
   error?: string;
   current_step?: number;
   total_steps?: number;
+  repair_required?: boolean;
+  database_migration_required?: boolean;
+  database_migration_applied?: boolean | null;
+}
+
+interface DeploymentCheck {
+  has_updates?: boolean;
+  needs_restart?: boolean;
+  restart_only_safe?: boolean;
+  repair_required?: boolean;
+  repair_reasons?: string[];
+  error?: string;
+  commits_behind?: number;
+  current_commit?: string;
+  latest_commit?: string;
+  disk_commit?: string;
+  running_commit?: string;
+  db_current_revision?: string | null;
+  db_head_revision?: string | null;
+  db_up_to_date?: boolean | null;
+  db_in_sync?: boolean | null;
+  commit_messages?: string[];
+  has_new_migrations?: boolean;
+  migration_count?: number;
+  has_frontend_changes?: boolean;
+  has_package_changes?: boolean;
+  active_task_count?: number;
+  active_tasks?: ActiveTaskSummary[];
+  update_blocked?: boolean;
+  remote?: string;
+  branch?: string;
+  [key: string]: unknown;
 }
 
 interface ActiveTaskSummary {
   id: number;
   title: string;
   status: string;
+  kind?: 'task' | 'instance' | 'monitor' | 'sub_agent';
+  instance_id?: number;
+  instance_claim_count?: number;
 }
 
 type Phase = 'idle' | 'checking' | 'confirming' | 'running' | 'restarting' | 'completed' | 'failed';
+type DeploymentAction = 'update' | 'repair' | 'restart' | 'none';
+
+const ACTIVE_UPDATE_KEY = 'ccm-update-active';
+const ACTIVE_DEPLOYMENT_STATUSES = new Set([
+  'claimed',
+  'running',
+  'backing_up',
+  'restarting',
+  'starting',
+  'stopping',
+  'migrating',
+  'rolling_back',
+]);
 
 const STEP_LABELS: Record<string, string> = {
   git_pull: '拉取代码',
@@ -55,9 +103,14 @@ const STATUS_ICON: Record<string, string> = {
 const INITIAL_UPDATE_CHECK_DELAY_MS = 1_000;
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60_000;
 
-function reminderFingerprint(result: Record<string, unknown>): string {
+function reminderFingerprint(result: DeploymentCheck): string {
+  if (result.repair_required) {
+    return `repair:${String(result.disk_commit || result.current_commit || '')}`;
+  }
   if (result.has_updates) return `update:${String(result.latest_commit || '')}`;
-  if (result.needs_restart) return `restart:${String(result.current_commit || '')}`;
+  if (result.needs_restart) {
+    return `restart:${String(result.disk_commit || result.current_commit || '')}`;
+  }
   return '';
 }
 
@@ -65,11 +118,52 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
 }
 
+function setUpdateActive(active: boolean) {
+  try {
+    if (active) {
+      sessionStorage.setItem(ACTIVE_UPDATE_KEY, '1');
+    } else {
+      sessionStorage.removeItem(ACTIVE_UPDATE_KEY);
+    }
+  } catch {
+    // Storage can be unavailable in hardened/private browser contexts.
+  }
+}
+
+function hasActiveUpdate() {
+  try {
+    return sessionStorage.getItem(ACTIVE_UPDATE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function isActiveDeploymentStatus(status: string | undefined) {
+  return Boolean(status && ACTIVE_DEPLOYMENT_STATUSES.has(status));
+}
+
+function deploymentAction(result: DeploymentCheck): DeploymentAction {
+  if (result.repair_required) return 'repair';
+  if (result.has_updates) return 'update';
+  // A stale running commit may also have stale dependencies/frontend output.
+  // Only use the lightweight endpoint when the backend explicitly proves that
+  // restart alone is safe; old/partial responses conservatively redeploy.
+  if (result.needs_restart) {
+    return result.restart_only_safe ? 'restart' : 'repair';
+  }
+  return 'none';
+}
+
+function shortRevision(value: string | null | undefined) {
+  if (!value) return '无法确认';
+  return value.length > 7 ? value.slice(0, 7) : value;
+}
+
 export function UpdateButton() {
   const [phase, setPhase] = useState<Phase>('idle');
   const [steps, setSteps] = useState<StepInfo[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
-  const [dryRunResult, setDryRunResult] = useState<Record<string, unknown> | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<DeploymentCheck | null>(null);
   const [skipFrontend, setSkipFrontend] = useState(false);
   const [branch, setBranch] = useState('');
   const [error, setError] = useState('');
@@ -80,6 +174,9 @@ export function UpdateButton() {
   const [autoPrompt, setAutoPrompt] = useState(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [showUpdateNotice, setShowUpdateNotice] = useState(false);
+  const [reconciling, setReconciling] = useState(false);
+  const [reconcileError, setReconcileError] = useState('');
+  const [reconcileNotice, setReconcileNotice] = useState('');
   const reconnectTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const autoCheckInFlightRef = useRef(false);
@@ -114,17 +211,20 @@ export function UpdateButton() {
     }
 
     if (event === 'update_complete') {
+      setUpdateActive(false);
       setUpdateAvailable(false);
       setShowUpdateNotice(false);
       setPhase('completed');
     }
 
     if (event === 'update_failed') {
+      setUpdateActive(false);
       setError(data.message as string || '更新失败');
       setPhase('failed');
     }
 
     if (event === 'restarting') {
+      setUpdateActive(true);
       setPhase('restarting');
       startReconnectPolling();
     }
@@ -145,6 +245,55 @@ export function UpdateButton() {
   }, []);
 
   useEffect(() => {
+    if (!hasActiveUpdate()) return;
+    let cancelled = false;
+
+    const recoverActiveUpdate = async () => {
+      try {
+        const status = await api.getUpdateStatus() as UpdateStatusData;
+        if (cancelled) return;
+        if (status.old_commit) setOldCommit(status.old_commit);
+        if (status.new_commit) setNewCommit(status.new_commit);
+        if (status.steps) setSteps(status.steps);
+
+        if (status.status === 'running') {
+          setPhase('running');
+          startReconnectPolling();
+        } else if (isActiveDeploymentStatus(status.status)) {
+          setPhase('restarting');
+          startReconnectPolling();
+        } else if (status.status === 'rolled_back') {
+          setOldCommit('');
+          setUpdateActive(false);
+          setError(status.error || '更新未完成，系统已经自动回滚到上一个版本');
+          setPhase('failed');
+        } else if (
+          status.status === 'failed'
+          || status.status === 'rollback_failed'
+          || status.repair_required
+        ) {
+          setUpdateActive(false);
+          setError(status.error || '上次部署未完成，请检查状态后重新修复');
+          setPhase('failed');
+        } else {
+          setUpdateActive(false);
+          if (status.status === 'completed') setPhase('completed');
+        }
+      } catch {
+        // The service can be temporarily unavailable while it restarts. Keep
+        // the marker so a later visibility change can recover the operation.
+        setPhase('restarting');
+        startReconnectPolling();
+      }
+    };
+
+    void recoverActiveUpdate();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const onVisible = async () => {
       if (document.visibilityState !== 'visible') return;
       const p = phaseRef.current;
@@ -155,8 +304,26 @@ export function UpdateButton() {
         if (status.new_commit) setNewCommit(status.new_commit);
         if (status.steps) setSteps(status.steps);
         if (status.status === 'completed') {
+          setUpdateActive(false);
           setPhase('completed');
-        } else if (status.status === 'rolled_back' || status.status === 'failed') {
+        } else if (status.status === 'rolled_back') {
+          setOldCommit('');
+          setUpdateActive(false);
+          setError(status.error || '更新未完成，系统已经自动回滚到上一个版本');
+          setPhase('failed');
+        } else if (isActiveDeploymentStatus(status.status)) {
+          // ``deployment_incomplete`` is deliberately true throughout the
+          // external handoff. It is a safety fence, not a terminal failure.
+          if (status.status !== 'running') {
+            setPhase('restarting');
+            startReconnectPolling();
+          }
+        } else if (
+          status.status === 'failed'
+          || status.status === 'rollback_failed'
+          || status.repair_required
+        ) {
+          setUpdateActive(false);
           setError(status.error || '更新失败');
           setPhase('failed');
         }
@@ -195,11 +362,11 @@ export function UpdateButton() {
 
         // Background checks are deliberately dry-run only: they fetch refs and
         // notify the user, but never pull code or restart the service.
-        const result = await api.startUpdate({ dry_run: true }) as Record<string, unknown> | undefined;
+        const result = await api.startUpdate({ dry_run: true }) as DeploymentCheck | undefined;
         if (disposed || phaseRef.current !== 'idle' || !result) return;
         // A remote fetch error is normally silent, but it must not hide a
         // locally detected manual pull that still needs a service restart.
-        if (!result.has_updates && !result.needs_restart) {
+        if (!result.has_updates && !result.needs_restart && !result.repair_required) {
           if (!result.error) {
             setUpdateAvailable(false);
             setShowUpdateNotice(false);
@@ -233,47 +400,68 @@ export function UpdateButton() {
   const startReconnectPolling = () => {
     if (reconnectTimer.current) clearInterval(reconnectTimer.current);
     let attempts = 0;
-    let sawDown = false;
     setReconnectSlow(false);
+
+    const slowDownPolling = () => {
+      if (attempts !== 60) return;
+      setReconnectSlow(true);
+      if (reconnectTimer.current) clearInterval(reconnectTimer.current);
+      reconnectTimer.current = setInterval(poll, 5000);
+    };
 
     const poll = async () => {
       attempts++;
       setReconnectCount(attempts);
       try {
         await api.health();
-        if (!sawDown) {
-          // Server hasn't gone down yet — the restart command fires with
-          // a 2s delay so early polls can hit the OLD still-alive server.
-          // Wait until it actually dies before accepting a success.
-          return;
-        }
-        if (reconnectTimer.current) clearInterval(reconnectTimer.current);
-        reconnectTimer.current = null;
-        setReconnectSlow(false);
         try {
           const status = await api.getUpdateStatus() as UpdateStatusData;
           if (status.old_commit) setOldCommit(status.old_commit);
           if (status.new_commit) setNewCommit(status.new_commit);
           if (status.steps) setSteps(status.steps);
           if (status.status === 'rolled_back') {
+            setOldCommit('');
+            setUpdateActive(false);
+            setError(status.error || '更新未完成，系统已经自动回滚到上一个版本');
+            setPhase('failed');
+          } else if (isActiveDeploymentStatus(status.status)) {
+            // The old process may still answer while the deployment worker
+            // holds an incomplete lease. Keep polling until the worker writes
+            // a terminal, token-matched result.
+            if (status.status !== 'running') setPhase('restarting');
+            slowDownPolling();
+            return;
+          } else if (
+            status.status === 'failed'
+            || status.status === 'rollback_failed'
+            || status.repair_required
+          ) {
+            setUpdateActive(false);
             setError(status.error || '迁移失败，已自动回滚');
             setPhase('failed');
-          } else {
+          } else if (status.status === 'completed') {
+            setUpdateActive(false);
             setPhase('completed');
             setTimeout(() => window.location.reload(), 1500);
+          } else {
+            // The old process can still answer health while the delayed
+            // restart command is pending. Only a terminal status proves that
+            // the new process recovered.
+            slowDownPolling();
+            return;
           }
         } catch {
-          setPhase('completed');
-          setTimeout(() => window.location.reload(), 1500);
+          // Health and status must both be available before declaring the
+          // deployment complete.
+          slowDownPolling();
+          return;
         }
+        if (reconnectTimer.current) clearInterval(reconnectTimer.current);
+        reconnectTimer.current = null;
+        setReconnectSlow(false);
       } catch {
-        sawDown = true;
         // After 120s (60 fast polls), switch to slow polling instead of giving up
-        if (attempts === 60) {
-          setReconnectSlow(true);
-          if (reconnectTimer.current) clearInterval(reconnectTimer.current);
-          reconnectTimer.current = setInterval(poll, 5000);
-        }
+        slowDownPolling();
       }
     };
 
@@ -285,13 +473,17 @@ export function UpdateButton() {
     setAutoPrompt(false);
     setShowUpdateNotice(false);
     setError('');
+    setReconcileError('');
+    setReconcileNotice('');
     try {
-      const result = await api.startUpdate({ dry_run: true, force: true, branch: branch || undefined }) as Record<string, unknown>;
-      if (result.error && !result.needs_restart) throw new Error(String(result.error));
+      const result = await api.startUpdate({ dry_run: true, force: true, branch: branch || undefined }) as DeploymentCheck;
+      if (result.error && !result.needs_restart && !result.repair_required) {
+        throw new Error(result.error);
+      }
       const fingerprint = reminderFingerprint(result);
       if (fingerprint) remindedFingerprintsRef.current.add(fingerprint);
       setDryRunResult(result);
-      setUpdateAvailable(Boolean(result.has_updates || result.needs_restart));
+      setUpdateAvailable(Boolean(result.has_updates || result.needs_restart || result.repair_required));
       setPhase('confirming');
     } catch (e: unknown) {
       setError(errorMessage(e, '检查更新失败'));
@@ -299,7 +491,66 @@ export function UpdateButton() {
     }
   };
 
-  const handleConfirm = async () => {
+  const handleReconcile = async () => {
+    setReconciling(true);
+    setReconcileError('');
+    setReconcileNotice('');
+    let reconciliationCompleted = false;
+
+    try {
+      const reconciliation = await api.reconcileUpdateState();
+      reconciliationCompleted = true;
+
+      // Keep the previous blocker visible until a fresh dry-run confirms the
+      // complete deployment state. A task can start after maintenance resumes,
+      // and a failed refresh must never make an uncertain action available.
+      const result = await api.startUpdate({
+        dry_run: true,
+        force: true,
+        branch: branch || undefined,
+      }) as DeploymentCheck;
+      if (result.error && !result.needs_restart && !result.repair_required) {
+        throw new Error(result.error);
+      }
+
+      const refreshedResult: DeploymentCheck = {
+        ...result,
+        update_blocked: result.update_blocked ?? reconciliation.update_blocked,
+        active_task_count: result.active_task_count ?? reconciliation.active_task_count,
+        active_tasks: result.active_tasks ?? reconciliation.active_tasks,
+      };
+      const fingerprint = reminderFingerprint(refreshedResult);
+      if (fingerprint) remindedFingerprintsRef.current.add(fingerprint);
+      setDryRunResult(refreshedResult);
+      setUpdateAvailable(Boolean(
+        refreshedResult.has_updates
+        || refreshedResult.needs_restart
+        || refreshedResult.repair_required
+      ));
+
+      const stillBlocked = Boolean(
+        refreshedResult.update_blocked
+        || refreshedResult.active_task_count
+        || refreshedResult.active_tasks?.length
+      );
+      setReconcileNotice(
+        stillBlocked
+          ? '核对完成：以上运行阻断项仍存在，更新和重启将继续保持禁用。'
+          : '运行状态已重新核对，可以继续更新或重启。'
+      );
+    } catch (e: unknown) {
+      const detail = errorMessage(e, '未知错误');
+      setReconcileError(
+        reconciliationCompleted
+          ? `运行状态已核对，但刷新更新信息失败：${detail}`
+          : `重新核对运行状态失败：${detail}`
+      );
+    } finally {
+      setReconciling(false);
+    }
+  };
+
+  const prepareRunning = () => {
     setPhase('running');
     setShowUpdateNotice(false);
     setLogs([]);
@@ -311,26 +562,75 @@ export function UpdateButton() {
       'stop_service', 'alembic_upgrade', 'start_service',
     ].map(name => ({ name, status: 'pending' }));
     setSteps(defaultSteps);
+    setUpdateActive(true);
+  };
 
+  const handleConfirm = async () => {
+    prepareRunning();
     try {
       const result = await api.startUpdate({ skip_frontend_build: skipFrontend, branch: branch || undefined });
       if (result.update_id) {
         setOldCommit(result.old_commit || '');
       }
     } catch (e: unknown) {
+      setUpdateActive(false);
       setError(errorMessage(e, '启动更新失败'));
       setPhase('failed');
     }
   };
 
-  const handleRollback = async () => {
-    if (!confirm('确定要回滚到上一个版本吗？')) return;
+  const handleRepair = async () => {
+    prepareRunning();
     try {
-      await api.rollbackUpdate();
+      const result = await api.repairUpdate();
+      if (result.old_commit) setOldCommit(result.old_commit);
+    } catch (e: unknown) {
+      setUpdateActive(false);
+      setError(errorMessage(e, '启动部署修复失败'));
+      setPhase('failed');
+    }
+  };
+
+  const handleRestart = async () => {
+    setError('');
+    setUpdateActive(true);
+    try {
+      await api.restartService();
+      setPhase('restarting');
+      startReconnectPolling();
+    } catch (e: unknown) {
+      setUpdateActive(false);
+      setError(errorMessage(e, '启动服务重启失败'));
+      setPhase('failed');
+    }
+  };
+
+  const handleRollback = async () => {
+    try {
+      const status = await api.getUpdateStatus() as UpdateStatusData;
+      // Legacy/interrupted records may not have migration metadata. Match the
+      // backend's conservative rule: only an explicit false proves that a
+      // database restore is unnecessary.
+      const restoreDatabase =
+        status.database_migration_applied !== false;
+      if (!confirm('确定要回滚到上一个版本吗？')) return;
+      if (
+        restoreDatabase
+        && !confirm(
+          `${status.database_migration_applied === true ? '这次更新已经执行' : '这次更新可能已经开始执行'}数据库迁移。`
+          + '继续回滚会恢复更新前的数据库备份，并丢失更新完成后产生的数据。确定仍要继续吗？'
+        )
+      ) {
+        return;
+      }
+      setUpdateActive(true);
+      await api.rollbackUpdate({ confirm_database_restore: restoreDatabase });
       startReconnectPolling();
       setPhase('restarting');
     } catch (e: unknown) {
+      setUpdateActive(false);
       setError(errorMessage(e, '回滚失败'));
+      setPhase('failed');
     }
   };
 
@@ -348,6 +648,10 @@ export function UpdateButton() {
     setReconnectSlow(false);
     setAutoPrompt(false);
     setShowUpdateNotice(false);
+    setUpdateActive(false);
+    setReconciling(false);
+    setReconcileError('');
+    setReconcileNotice('');
   };
 
   const handleOpenUpdateNotice = () => {
@@ -360,6 +664,19 @@ export function UpdateButton() {
   const activeTasks = (dryRunResult?.active_tasks || []) as ActiveTaskSummary[];
   const activeTaskCount = Number(dryRunResult?.active_task_count || activeTasks.length || 0);
   const updateBlocked = Boolean(dryRunResult?.update_blocked || activeTaskCount > 0);
+  const actionDisabled = updateBlocked || reconciling || Boolean(reconcileError);
+  const hasRuntimeBlockers = activeTasks.some(
+    task => task.kind && task.kind !== 'task'
+  );
+  const action = dryRunResult ? deploymentAction(dryRunResult) : 'none';
+  const canRollback = Boolean(
+    oldCommit && newCommit && oldCommit !== newCommit
+  );
+  const dbInSync = dryRunResult?.db_up_to_date ?? dryRunResult?.db_in_sync ?? (
+    dryRunResult?.db_current_revision && dryRunResult?.db_head_revision
+      ? dryRunResult.db_current_revision === dryRunResult.db_head_revision
+      : null
+  );
 
   return (
     <>
@@ -473,80 +790,150 @@ export function UpdateButton() {
 
                   {updateBlocked && (
                     <div className="rounded border border-amber-700/60 bg-amber-950/30 p-3 text-xs text-amber-200" role="alert">
-                      <p className="font-medium">当前有 {activeTaskCount} 个任务正在执行，暂不能更新或重启。</p>
-                      <p className="mt-1 text-amber-300/80">请等待任务完成后点击“重新检查”。系统不会中断这些任务。</p>
+                      <p className="font-medium">
+                        当前有 {activeTaskCount} 个{hasRuntimeBlockers ? '运行阻断项' : '任务正在执行'}，暂不能更新或重启。
+                      </p>
+                      <p className="mt-1 text-amber-300/80">请等待任务完成，或重新核对实际运行状态。系统不会中断仍在运行的任务。</p>
                       {activeTasks.length > 0 && (
                         <ul className="mt-2 space-y-1 text-amber-300/80">
                           {activeTasks.slice(0, 5).map(task => (
-                            <li key={task.id}>#{task.id} {task.title || '未命名任务'}（{task.status}）</li>
+                            <li key={`${task.kind || 'task'}:${task.id}`}>
+                              {task.kind && task.kind !== 'task'
+                                ? `${task.title || `实例 #${task.instance_id || task.id}`}（${task.status}）`
+                                : `#${task.id} ${task.title || '未命名任务'}（${task.status}）`}
+                            </li>
                           ))}
                         </ul>
                       )}
+                      <button
+                        type="button"
+                        onClick={handleReconcile}
+                        disabled={reconciling}
+                        aria-busy={reconciling}
+                        className="mt-3 inline-flex items-center gap-1.5 rounded border border-amber-600/60 bg-amber-900/40 px-2.5 py-1.5 text-amber-100 hover:bg-amber-900/60 disabled:cursor-wait disabled:opacity-60"
+                      >
+                        <RefreshCw size={13} className={reconciling ? 'animate-spin' : ''} />
+                        {reconciling ? '正在核对运行状态...' : '重新核对运行状态'}
+                      </button>
+                    </div>
+                  )}
+                  {reconcileError && (
+                    <p className="rounded border border-red-800/60 bg-red-950/30 px-3 py-2 text-xs text-red-300" role="alert">
+                      {reconcileError}
+                    </p>
+                  )}
+                  {reconcileNotice && (
+                    <p className="rounded border border-sky-800/60 bg-sky-950/30 px-3 py-2 text-xs text-sky-300" role="status">
+                      {reconcileNotice}
+                    </p>
+                  )}
+
+                  {(dryRunResult.running_commit || dryRunResult.disk_commit || dryRunResult.db_current_revision || dryRunResult.db_head_revision) && (
+                    <div className="grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 rounded border border-gray-800 bg-gray-950/60 p-2 text-xs">
+                      <span className="text-gray-500">运行版本</span>
+                      <span className="font-mono text-gray-300">{shortRevision(dryRunResult.running_commit)}</span>
+                      <span className={dryRunResult.needs_restart ? 'text-yellow-300' : 'text-green-400'}>
+                        {dryRunResult.needs_restart ? '待重启' : '已加载'}
+                      </span>
+                      <span className="text-gray-500">磁盘版本</span>
+                      <span className="font-mono text-gray-300">{shortRevision(dryRunResult.disk_commit || dryRunResult.current_commit)}</span>
+                      <span className="text-gray-500">已拉取</span>
+                      <span className="text-gray-500">数据库</span>
+                      <span className="font-mono text-gray-300">
+                        {shortRevision(dryRunResult.db_current_revision)} → {shortRevision(dryRunResult.db_head_revision)}
+                      </span>
+                      <span className={dbInSync === false ? 'text-red-300' : dbInSync === true ? 'text-green-400' : 'text-gray-500'}>
+                        {dbInSync === false ? '待迁移' : dbInSync === true ? '已同步' : '无法确认'}
+                      </span>
                     </div>
                   )}
 
-                  {!(dryRunResult.has_updates as boolean) && !(dryRunResult.needs_restart as boolean) ? (
+                  {action === 'none' ? (
                     <p className="text-sm text-gray-300">已是最新版本，无需更新。</p>
-                  ) : !(dryRunResult.has_updates as boolean) && (dryRunResult.needs_restart as boolean) ? (
+                  ) : action === 'restart' ? (
                     <div className="space-y-1 text-sm text-yellow-300">
-                      <p>检测到磁盘代码已更新，但服务仍在运行旧版本。</p>
-                      <p className="text-xs text-yellow-400/80">继续后会补齐依赖、迁移和前端构建，再安全重启服务。</p>
-                      {Boolean(dryRunResult.error) && (
-                        <p className="text-xs text-yellow-400/80">远端更新检查失败，但不影响完成本地代码的部署和重启。</p>
+                      <p>代码已是最新，但服务正在运行旧版本，需要重启。</p>
+                      {dryRunResult.error && (
+                        <p className="text-xs text-yellow-400/80">远端更新检查失败，但不影响重启并加载磁盘上的代码。</p>
+                      )}
+                    </div>
+                  ) : action === 'repair' ? (
+                    <div className="rounded border border-red-800/50 bg-red-900/20 p-3 text-sm text-red-200">
+                      <p>
+                        {dryRunResult.needs_restart && !dryRunResult.repair_required
+                          ? '磁盘代码尚未完整部署，需要同步依赖、重建前端并确认数据库后再重启。'
+                          : '当前部署未完整完成，需要修复后再重启服务。'}
+                      </p>
+                      {(dryRunResult.repair_reasons || []).length > 0 && (
+                        <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-red-300">
+                          {(dryRunResult.repair_reasons || []).map((reason, index) => (
+                            <li key={index}>{reason}</li>
+                          ))}
+                        </ul>
+                      )}
+                      {dryRunResult.error && (
+                        <p className="mt-2 break-words text-xs text-red-400">
+                          {dryRunResult.needs_restart && !dryRunResult.repair_required
+                            ? '远端更新检查失败：'
+                            : '检查详情：'}
+                          {dryRunResult.error}
+                        </p>
                       )}
                     </div>
                   ) : (
                     <>
                       <div className="text-sm text-gray-300 space-y-1">
-                        <p>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind as number}</span> 个新提交</p>
-                        <p className="text-xs text-gray-500">{dryRunResult.current_commit as string} → {dryRunResult.latest_commit as string}</p>
-                        {Boolean(dryRunResult.remote) && (
-                          <p className="text-xs text-gray-600">来源：{dryRunResult.remote as string}/{(dryRunResult.branch as string) || 'main'}</p>
+                        <p>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind}</span> 个新提交</p>
+                        <p className="text-xs text-gray-500">{dryRunResult.current_commit} → {dryRunResult.latest_commit}</p>
+                        {dryRunResult.remote && (
+                          <p className="text-xs text-gray-600">来源：{dryRunResult.remote}/{dryRunResult.branch || 'main'}</p>
                         )}
                       </div>
 
-                      {(dryRunResult.needs_restart as boolean) && (
+                      {dryRunResult.needs_restart && (
                         <p className="text-xs text-yellow-400">⚠️ 磁盘上还有尚未加载的手动更新，本次会一并完成部署。</p>
                       )}
 
-                      {(dryRunResult.commit_messages as string[] || []).length > 0 && (
+                      {(dryRunResult.commit_messages || []).length > 0 && (
                         <div className="bg-gray-800 rounded p-2 max-h-32 overflow-y-auto">
-                          {(dryRunResult.commit_messages as string[]).map((msg, i) => (
+                          {(dryRunResult.commit_messages || []).map((msg, i) => (
                             <p key={i} className="text-xs text-gray-400 py-0.5">{msg}</p>
                           ))}
                         </div>
                       )}
 
                       <div className="flex flex-wrap gap-2 text-xs">
-                        {(dryRunResult.has_new_migrations as boolean) && (
+                        {dryRunResult.has_new_migrations && (
                           <span className="px-2 py-0.5 rounded bg-yellow-900/50 text-yellow-300">
-                            {dryRunResult.migration_count as number} 个迁移
+                            {dryRunResult.migration_count} 个迁移
                           </span>
                         )}
-                        {(dryRunResult.has_frontend_changes as boolean) && (
+                        {dryRunResult.has_frontend_changes && (
                           <span className="px-2 py-0.5 rounded bg-blue-900/50 text-blue-300">前端变更</span>
                         )}
-                        {(dryRunResult.has_package_changes as boolean) && (
+                        {dryRunResult.has_package_changes && (
                           <span className="px-2 py-0.5 rounded bg-purple-900/50 text-purple-300">依赖变更</span>
                         )}
                       </div>
 
-                      <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={skipFrontend}
-                          onChange={e => setSkipFrontend(e.target.checked)}
-                          className="rounded border-gray-600"
-                        />
-                        跳过前端构建（仅后端更新）
-                      </label>
-
-                      {(dryRunResult.has_new_migrations as boolean) && (
+                      {dryRunResult.has_new_migrations && (
                         <p className="text-xs text-yellow-400">
                           ⚠️ 包含数据库迁移，更新时会短暂停服。数据库将自动备份。
                         </p>
                       )}
                     </>
+                  )}
+
+                  {action === 'update' && (
+                    <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={skipFrontend}
+                        onChange={e => setSkipFrontend(e.target.checked)}
+                        className="rounded border-gray-600"
+                      />
+                      跳过前端构建（仅后端更新）
+                    </label>
                   )}
                 </div>
               )}
@@ -626,30 +1013,63 @@ export function UpdateButton() {
 
             {/* Footer */}
             <div className="flex justify-end gap-2 px-4 py-3 border-t border-gray-700">
-              {phase === 'confirming' && dryRunResult && ((dryRunResult.has_updates as boolean) || (dryRunResult.needs_restart as boolean)) && (
+              {phase === 'confirming' && dryRunResult && action === 'update' && (
                 <>
                   <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">取消</button>
                   <button
                     onClick={handleConfirm}
-                    disabled={updateBlocked}
+                    disabled={actionDisabled}
                     className="px-3 py-1.5 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    {updateBlocked ? '等待任务完成' : ((dryRunResult.has_updates as boolean) ? '确认更新' : '完成部署并重启')}
+                    {updateBlocked ? '等待任务完成' : '确认更新'}
                   </button>
                 </>
               )}
-              {phase === 'confirming' && dryRunResult && !(dryRunResult.has_updates as boolean) && !(dryRunResult.needs_restart as boolean) && (
-                <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">关闭</button>
+              {phase === 'confirming' && dryRunResult && action === 'repair' && (
+                <>
+                  <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">取消</button>
+                  <button
+                    onClick={handleRepair}
+                    disabled={actionDisabled}
+                    className="px-3 py-1.5 text-xs rounded bg-red-700 text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {updateBlocked ? '等待任务完成' : '修复并重新部署'}
+                  </button>
+                </>
+              )}
+              {phase === 'confirming' && dryRunResult && action === 'restart' && (
+                <>
+                  <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">取消</button>
+                  <button
+                    onClick={handleRestart}
+                    disabled={actionDisabled}
+                    className="px-3 py-1.5 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {updateBlocked ? '等待任务完成' : '重启服务'}
+                  </button>
+                </>
+              )}
+              {phase === 'confirming' && dryRunResult && action === 'none' && (
+                <>
+                  <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">关闭</button>
+                  <button
+                    onClick={handleRestart}
+                    disabled={actionDisabled}
+                    className="px-3 py-1.5 text-xs rounded border border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {updateBlocked ? '等待任务完成' : '手动重启'}
+                  </button>
+                </>
               )}
               {phase === 'completed' && (
                 <>
-                  <button onClick={handleRollback} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">回滚</button>
+                  {canRollback && <button onClick={handleRollback} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">回滚</button>}
                   <button onClick={() => window.location.reload()} className="px-3 py-1.5 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500">刷新页面</button>
                 </>
               )}
               {phase === 'failed' && (
                 <>
-                  {oldCommit && <button onClick={handleRollback} className="px-3 py-1.5 text-xs rounded bg-red-900/50 text-red-300 hover:bg-red-900/70">回滚</button>}
+                  {canRollback && <button onClick={handleRollback} className="px-3 py-1.5 text-xs rounded bg-red-900/50 text-red-300 hover:bg-red-900/70">回滚</button>}
                   <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">关闭</button>
                 </>
               )}

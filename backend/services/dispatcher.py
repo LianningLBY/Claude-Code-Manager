@@ -25,6 +25,10 @@ from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
 from backend.services.git_config import merge_git_config, settings_to_dict
+from backend.services.context_compaction import (
+    context_tokens_used,
+    is_context_window_exceeded,
+)
 from backend.services.instance_capacity import (
     active_capacity_predicate,
     instance_capacity_lock,
@@ -37,6 +41,9 @@ from backend.services.instance_manager import (
     InstanceManager,
 )
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.deployment_start_guard import (
+    DeploymentTaskStartBlocked,
+)
 from backend.services.task_queue import (
     TaskQueue,
     task_is_pr_review_superseded,
@@ -408,6 +415,9 @@ class GlobalDispatcher:
         self._maintenance_shutdown_committed = False
         self._dispatch_resumed = asyncio.Event()
         self._dispatch_resumed.set()
+        # backend.main injects a repo-scoped, cross-process deployment fence.
+        # Tests and embedders may leave it unset.
+        self.deployment_task_start_fence = None
         # Local lifecycle tasks use integer Instance IDs.  Worker forwarding
         # tasks use string keys (``worker-<task_id>``) and must never leak into
         # SQL predicates against the integer ``instances.id`` column.
@@ -629,7 +639,15 @@ class GlobalDispatcher:
         async with self._dispatch_claim_lock:
             if self._dispatch_paused or self._shutting_down:
                 raise TaskStartPausedError("task starts are paused for maintenance")
-            yield
+            fence = self.deployment_task_start_fence
+            if fence is None:
+                yield
+                return
+            try:
+                with fence():
+                    yield
+            except DeploymentTaskStartBlocked as exc:
+                raise TaskStartPausedError(str(exc)) from exc
 
     async def wait_until_resumed(self) -> None:
         await self._dispatch_resumed.wait()
@@ -653,15 +671,40 @@ class GlobalDispatcher:
             raise RuntimeError("shutdown commit must hold paused task admission")
         self._maintenance_shutdown_committed = True
 
-    async def _cleanup_stale_state(self):
+    async def reconcile_stale_state_for_maintenance(self) -> None:
+        """Reconcile orphaned runtime claims while task admission is closed.
+
+        UpdateService uses this explicit entry point instead of interpreting
+        persisted PIDs itself.  The chat-launch lock closes the remaining
+        pre-spawn window; manager-owned process/consumer generations are still
+        preserved by ``_cleanup_stale_state``.
+        """
+
+        if not self._dispatch_paused:
+            raise RuntimeError(
+                "stale-state reconciliation requires paused task admission"
+            )
+        async with self._chat_launch_admission_lock:
+            # This is an in-process operator action, not process startup.
+            # Auxiliary/native sub-agents have separate ownership registries;
+            # the startup-only stale sweep would incorrectly fail live rows.
+            await self._cleanup_stale_state(reconcile_auxiliary=False)
+
+    async def _cleanup_stale_state(
+        self,
+        *,
+        reconcile_auxiliary: bool = True,
+    ):
         """Reconcile persisted claims with generations owned by this process.
 
         An OS PID is not attachable state and may have been reused.  After a
         real manager restart, a ``running`` row without an in-memory process or
         output consumer is quarantined as terminal ``error``.  Dead/no PID
-        claims return to pending; a PID that may still be alive makes the task
-        fail closed so CCM cannot start a duplicate writer.  Conversely,
-        Pause -> Start preserves manager-owned generations exactly as they are.
+        claims return to pending only when Task/Instance ownership is unique
+        and bidirectionally consistent; corrupt ownership or a PID that may
+        still be alive fails the task closed so CCM cannot start a duplicate
+        writer. Conversely, Pause -> Start preserves manager-owned generations
+        exactly as they are.
         """
 
         import os
@@ -717,6 +760,15 @@ class GlobalDispatcher:
         # subprocess map exists.  It is still an in-process owned generation
         # and must survive an immediate Pause -> Start.
         manager_owned_instance_ids |= self._active_local_instance_ids()
+        # The fresh-task path keeps its exact Instance reservation from the
+        # pending -> in_progress claim through project/config preparation, but
+        # does not publish `_running_tasks` until that preparation completes.
+        # Maintenance can pause immediately after the durable claim, so take a
+        # lock-consistent reservation snapshot as additional ownership proof.
+        # Otherwise reconciliation could fail a legitimate admitted Task in
+        # this narrow pre-lifecycle window.
+        async with self._instance_claim_lock:
+            manager_owned_instance_ids.update(self._launching_instances)
 
         async with self.db_factory() as db:
             result = await db.execute(
@@ -733,11 +785,16 @@ class GlobalDispatcher:
             unmanaged_live_pids: dict[int, int] = {}
             unmanaged_live_instance_pids: dict[int, int] = {}
             unmanaged_live_owners: dict[int, tuple[int, int]] = {}
+            reverse_owner_ids: dict[int, set[int]] = {}
             reconciliation_race_instance_ids: set[int] = set()
             stale_instances: list[
                 tuple[Instance, bool]
             ] = []
             for inst in persisted_instances:
+                if inst.current_task_id is not None:
+                    reverse_owner_ids.setdefault(
+                        inst.current_task_id, set()
+                    ).add(inst.id)
                 if inst.id in manager_owned_instance_ids:
                     if inst.current_task_id is not None:
                         live_task_ids.add(inst.current_task_id)
@@ -768,6 +825,7 @@ class GlobalDispatcher:
                         Task.instance_id.in_(manager_owned_instance_ids),
                         Task.status.in_(["executing", "in_progress"]),
                         Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
                     )
                 )
                 live_task_ids.update(owned_task_ids.scalars().all())
@@ -776,6 +834,10 @@ class GlobalDispatcher:
                 select(Task).where(
                     Task.status.in_(["executing", "in_progress"]),
                     Task.worker_id.is_(None),
+                    # Shared tasks are remote-authoritative mirror rows and
+                    # never execute on this dispatcher. Reconciliation must
+                    # not rewrite their synced lifecycle state.
+                    Task.shared_from_id.is_(None),
                 )
             )
             active_tasks = list(active_result.scalars().all())
@@ -881,6 +943,12 @@ class GlobalDispatcher:
                     # The instance changed after our ownership snapshot.  Do
                     # not apply a stale task decision to its newer generation.
                     continue
+                task_reverse_owners = reverse_owner_ids.get(t.id, set())
+                if task_reverse_owners & reconciliation_race_instance_ids:
+                    # A duplicate/corrupt reverse owner also participates in
+                    # the generation proof. If any one of them changed, leave
+                    # the Task untouched and retry reconciliation later.
+                    continue
                 unmanaged_pid = unmanaged_live_pids.get(t.id)
                 if unmanaged_pid is None and t.instance_id is not None:
                     unmanaged_pid = unmanaged_live_instance_pids.get(t.instance_id)
@@ -899,6 +967,39 @@ class GlobalDispatcher:
                         "Fail-closing task %s because unmanaged PID %s may be alive",
                         t.id,
                         unmanaged_pid,
+                    )
+                elif (
+                    len(task_reverse_owners) > 1
+                    or (
+                        task_reverse_owners
+                        and t.instance_id not in task_reverse_owners
+                    )
+                    or (
+                        not task_reverse_owners
+                        and t.instance_id is not None
+                    )
+                ):
+                    # Only a unique, bidirectionally consistent dead claim is
+                    # safe to retry automatically. Multiple reverse owners (or
+                    # a mismatched Task owner) mean the generation history is
+                    # corrupt; replay could duplicate non-idempotent work.
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "Recovered inconsistent Task/Instance ownership "
+                            f"(reverse owners: {sorted(task_reverse_owners)}); "
+                            "automatic replay was blocked"
+                        ),
+                    }
+                    logger.error(
+                        "Failing unowned task %s because ownership evidence is "
+                        "inconsistent: task owner %s, reverse owners %s",
+                        t.id,
+                        t.instance_id,
+                        sorted(task_reverse_owners),
                     )
                 else:
                     new_status = "pending"
@@ -938,6 +1039,7 @@ class GlobalDispatcher:
                         else Task.session_id == t.session_id
                     ),
                     Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
                 ]
                 if new_status == "pending":
                     release_predicates.append(
@@ -1000,6 +1102,7 @@ class GlobalDispatcher:
                             else Task.session_id == pending_owner.session_id
                         ),
                         Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
                     )
                     .values(
                         status="failed",
@@ -1019,17 +1122,52 @@ class GlobalDispatcher:
                     if resulting_generation is not None:
                         reset_tasks.append(resulting_generation)
 
-            from backend.models.monitor_session import MonitorSession
-            result = await db.execute(
-                select(MonitorSession).where(MonitorSession.status == "running")
-            )
-            for ms in result.scalars().all():
-                monitor_task = self._monitor_tasks.get(ms.id)
-                if monitor_task is not None and not monitor_task.done():
-                    continue
-                logger.warning(f"Cleaning up stale monitor session {ms.id}")
-                ms.status = "failed"
-                ms.completed_at = datetime.utcnow()
+            if reconcile_auxiliary:
+                from backend.models.monitor_session import MonitorSession
+                (
+                    active_monitor_ids,
+                    active_sub_agent_ids,
+                ) = self._active_auxiliary_session_ids()
+                result = await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.status == "running"
+                    )
+                )
+                for ms in result.scalars().all():
+                    # Remote mirror rows are owned by their source CCM.
+                    if ms.remote_id is not None:
+                        continue
+                    if ms.source == "native":
+                        # Historical native monitor rows may use the generic
+                        # ``monitor`` agent_type. Source is authoritative.
+                        manager_owned = ms.task_id in live_task_ids
+                    elif ms.agent_type == "monitor":
+                        manager_owned = ms.id in active_monitor_ids
+                    elif ms.agent_type == "sub_agent":
+                        manager_owned = ms.id in active_sub_agent_ids
+                    elif ms.agent_type in {
+                        "native-agent",
+                        "native-monitor",
+                    }:
+                        # Native children live inside the parent CLI
+                        # generation, represented by exact InstanceManager
+                        # evidence in ``live_task_ids``.
+                        manager_owned = ms.task_id in live_task_ids
+                    else:
+                        # Unknown future CCM auxiliary types can use either
+                        # lifecycle registry; fail closed while exact evidence
+                        # remains.
+                        manager_owned = (
+                            ms.id in active_monitor_ids
+                            or ms.id in active_sub_agent_ids
+                        )
+                    if manager_owned:
+                        continue
+                    logger.warning(
+                        "Cleaning up stale auxiliary session %s", ms.id
+                    )
+                    ms.status = "failed"
+                    ms.completed_at = datetime.utcnow()
 
             await db.commit()
 
@@ -1437,6 +1575,61 @@ class GlobalDispatcher:
             if type(instance_id) is int and not task.done()
         }
 
+    def _active_auxiliary_session_ids(self) -> tuple[set[int], set[int]]:
+        """Snapshot exact in-process CCM auxiliary lifecycle evidence.
+
+        A retained process-map entry remains blocking even if its parent task
+        has completed: the entry is removed only after exact process-group
+        reaping proves that generation terminal.
+        """
+
+        monitor_ids = {
+            session_id
+            for session_id, task in self._monitor_tasks.items()
+            if type(session_id) is int and not task.done()
+        }
+        monitor_ids.update(
+            session_id
+            for session_id in self._monitor_processes
+            if type(session_id) is int
+        )
+        sub_agent_ids = {
+            session_id
+            for session_id, task in self._sub_agent_tasks.items()
+            if type(session_id) is int and not task.done()
+        }
+        sub_agent_ids.update(
+            session_id
+            for session_id in self._sub_agent_processes
+            if type(session_id) is int
+        )
+        return monitor_ids, sub_agent_ids
+
+    def active_auxiliary_blockers(self) -> list[dict[str, object]]:
+        """Return live CCM-owned auxiliary generations that a restart kills."""
+
+        monitor_ids, sub_agent_ids = self._active_auxiliary_session_ids()
+        return [
+            *(
+                {
+                    "id": session_id,
+                    "title": f"监控子 Agent #{session_id}",
+                    "status": "running_auxiliary",
+                    "kind": "monitor",
+                }
+                for session_id in sorted(monitor_ids)
+            ),
+            *(
+                {
+                    "id": session_id,
+                    "title": f"子 Agent #{session_id}",
+                    "status": "running_auxiliary",
+                    "kind": "sub_agent",
+                }
+                for session_id in sorted(sub_agent_ids)
+            ),
+        ]
+
     def _remove_running_task_if_same(
         self,
         key: int | str,
@@ -1669,9 +1862,11 @@ class GlobalDispatcher:
                 await self._ensure_min_idle_instances()
 
                 # 路径 1：分布式 Worker task —— 不消耗本地 instance，直接转发
-                async with self._dispatch_claim_lock:
-                    if not self._dispatch_paused:
+                try:
+                    async with self.task_start_guard():
                         await self._dispatch_worker_tasks()
+                except TaskStartPausedError:
+                    pass
 
                 # Fill available local slots.  Reservation and task claim are
                 # deliberately coupled: a task is stamped with its active
@@ -3909,10 +4104,10 @@ class GlobalDispatcher:
                     )
                     return
 
-                # "Prompt is too long" — compact and retry instead of failing
-                log_contents = await self.instance_manager.get_recent_log_contents(task.id, limit=5)
-                log_text = " ".join(log_contents) if isinstance(log_contents, list) else str(log_contents)
-                if "prompt is too long" in log_text.lower():
+                # Context overflow — compact and retry instead of failing.
+                # Codex app-server uses a structured contextWindowExceeded
+                # code while exec/Claude may only expose human-readable text.
+                if is_context_window_exceeded(task.provider, combined):
                     try:
                         async with self.db_factory() as db:
                             t = await self._read_owned_lifecycle_task(
@@ -3920,7 +4115,11 @@ class GlobalDispatcher:
                                 lifecycle_generation,
                             )
                             if t and t.session_id:
-                                logger.warning("Task %d hit 'Prompt is too long', compacting session", task.id)
+                                logger.warning(
+                                    "Task %d exceeded its context window, "
+                                    "compacting session",
+                                    task.id,
+                                )
                                 summary = await self._compact_session(task.id, t.session_id, db)
                                 if summary:
                                     compacted = await db.execute(
@@ -3952,7 +4151,10 @@ class GlobalDispatcher:
                                         })
                                     return
                     except Exception:
-                        logger.exception("Prompt-too-long compact failed for task %d", task.id)
+                        logger.exception(
+                            "Context-window compaction failed for task %d",
+                            task.id,
+                        )
 
                 await self._retry_or_fail_mode_task(
                     lifecycle_generation,
@@ -6822,7 +7024,7 @@ class GlobalDispatcher:
             # 上下文超阈值时自动摘要 + 新 session（无限续聊）
             if task.session_id and task.context_window_usage:
                 usage = task.context_window_usage
-                total_input = (usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0)
+                used_tokens = context_tokens_used(task.provider, usage)
                 # context_window 可能被 CC 低报（1M 模型报 200K），用模型名兜底；
                 # codex 无该字段时查 codex 窗口表（272K/128K，非 claude 的 200K）
                 if (task.provider or "claude").lower() == "codex":
@@ -6835,7 +7037,7 @@ class GlobalDispatcher:
                     model_lower = (msg.model_override or task.model or "").lower()
                     if "[1m]" in model_lower or "fable" in model_lower:
                         window = max(window, 1_000_000)
-                utilization = total_input / window if window else 0
+                utilization = used_tokens / window if window else 0
                 # 阈值：GlobalSettings 覆盖 > env 默认（前端运行时设置可改）
                 gs = await db.get(GlobalSettings, 1)
                 compact_threshold = (
@@ -6846,7 +7048,7 @@ class GlobalDispatcher:
                 if utilization >= compact_threshold:
                     logger.info(
                         "Task %d context at %.0f%% (%d/%d), compacting session...",
-                        task_id, utilization * 100, total_input, window,
+                        task_id, utilization * 100, used_tokens, window,
                     )
                     # 收集最近对话摘要
                     summary = await self._compact_session(task_id, task.session_id, db)
@@ -6857,7 +7059,7 @@ class GlobalDispatcher:
                         # 在聊天里给用户留一条可见的压缩提示（落库 + 实时广播）
                         notice = (
                             f"⚡ 上下文已达 {utilization * 100:.0f}%"
-                            f"（{total_input:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
+                            f"（{used_tokens:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
                             f"已自动压缩摘要并开启新会话延续上下文"
                         )
                         db.add(LogEntry(

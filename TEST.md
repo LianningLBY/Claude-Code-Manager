@@ -457,6 +457,14 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_resume_config_dir.py::TestResolveResumeConfigDirCodexGate` | resume 选号对 codex 返回 None（不 select 不 migrate），claude 不受影响 |
 | `test_service_instance_manager.py::test_process_event_codex_window_backfill` | codex usage 无窗口时回填 272K（落库 + 广播都验证） |
 | `test_service_instance_manager.py::test_parse_codex_file_change_started_is_tool_use` | file_change 的 item.started → tool_use（真实事件流实证 started 存在，源码注释不实） |
+| `test_codex_app_server.py::test_notifications_stream_delta_and_finish_process` | app-server `thread/tokenUsage/updated` 保留真实 `modelContextWindow`、latest total/reasoning token，而非累计 thread total |
+| `test_codex_app_server.py::test_context_window_error_keeps_structured_codex_error_info` | `turn/completed` 失败不得丢弃 `codexErrorInfo=contextWindowExceeded` 与 additionalDetails |
+| `test_context_compaction.py` | provider 共享的上下文超限分类、Codex current-context token 计算及旧 usage fallback |
+| `test_service_instance_manager.py::test_codex_context_window_failure_compacts_and_requeues` | chat Codex 结构化超限事件触发摘要、清 session、携原消息 `compact_retry` 自动续跑 |
+| `test_service_instance_manager.py::test_recent_failure_output_keeps_structured_codex_error` | fresh/mode 失败分类读取受限长度的 raw system error envelope，不遗漏结构化错误码 |
+| `test_service_instance_manager.py::test_process_event_codex_exec_uses_rollout_last_usage` | exec fallback 从 rollout 取 `last_token_usage`，不把 1.5M 累计 turn token 误报成 553% 上下文 |
+| `test_service_dispatcher.py::test_lifecycle_codex_context_error_compacts_before_retry` | fresh/mode Codex 超限后摘要并回到 pending，不消耗普通失败重试语义 |
+| `test_service_dispatcher.py::test_codex_precompact_uses_full_context_tokens` | Codex 预压缩按 current context（含会进入下一请求的 output）和有效窗口触发 |
 | `test_api_pr_monitor.py::test_create_repo_with_codex_provider` 等 | PR Monitor API 层 provider 创建/默认/更新（含显式 null 清空模型防跨家族残留） |
 | 前端 `ProjectTodoList.test.tsx` | Todo Run 建 task 带 provider |
 | 前端 `TaskForm.test.tsx::Codex provider UI gating` | codex 下 Thinking 隐藏、显式「Skills / Monitor 仅支持 Claude」标注（非静默消失） |
@@ -534,6 +542,11 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_get_active_tasks_only_returns_running_states` | 更新阻塞器只识别 `in_progress/executing` task |
 | `test_get_blocking_tasks_includes_queued_resumes` | 已入队但尚未启动的续跑消息也属于停服 blocker |
 | `test_start_update_blocks_running_prompt_only_instance` | prompt-only 手动实例 launch 后即使没有 Task 行，更新仍识别 `running` Instance 并拒绝停服 |
+| `test_reconcile_blockers_clears_multi_dead_owner_ghost` | 空标题 Task 被 5 个已死亡 Instance 反向占用时先显示 description/claim count；显式核对后 fail-close Task 并清理全部 dead owner |
+| `test_reconcile_keeps_unknown_live_process_as_blocker` / `test_reconcile_preserves_manager_owned_active_generation` | unknown/live PID 继续阻断；当前进程真实拥有的 generation 核对后保持原样 |
+| `test_cleanup_preserves_reserved_fresh_task_claim` / shared/auxiliary cases | pending→in_progress 后仍在项目准备窗口的 reservation 不被误清；远端 shadow 与 live CCM/native auxiliary 保持 remote/current-process ownership |
+| `test_live_auxiliary_generations_block_restart_without_active_task` | parent Task 已终态时，仍有 exact monitor/sub-agent task/process map 也会阻止重启；只有 DB stale row 不冒充 live blocker |
+| `test_process_wide_test_services_use_ephemeral_*` | pytest 在首次 backend import 前隔离全局 DB、pool/login journal、Worker/backup 与 update checkout，避免测试污染开发环境 |
 | `test_enqueue_then_clear_before_dequeue_removes_resume_blocker` | enqueue 后、consumer dequeue 前执行 stop-session 清队列，会同步清除 pending 标记，后续 blocker 查询不出现幽灵 `queued_resume` |
 | `test_start_update_pauses_and_refuses_active_tasks` | 更新前暂停领取任务；活动 task 存在时即使 force 也拒绝并恢复调度 |
 | `test_start_update_fails_closed_when_task_check_errors` | 活动任务查询失败时按“有风险”处理，恢复调度且绝不启动更新 |
@@ -559,9 +572,26 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_chat_send_returns_conflict_after_shutdown_commit` | 最终停服已提交后新聊天返回 409，明确要求重连重试而不是静默入队 |
 | `test_update_dry_run_forwards_force_and_branch` | System API 将手动 dry-run 的 branch/force 原样透传给服务层 |
 | `test_update_returns_conflict_when_active_tasks_block_start` | 正式更新被活动任务门禁拒绝时 API 返回 409，`force` 不得绕过 |
+| `test_reconcile_endpoint_returns_structured_conflict` | 核对失败以结构化 409 返回，前端保留原 blocker，不能误开放更新按钮 |
 | `automatic update reminder` | 页面打开约 1 秒后仅 dry-run 检查；最新版静默；更新以顶部非阻塞通知展示，点击查看才开弹窗；同页同 commit 只提醒一次；远端失败但本地需重启仍提醒 |
 | `forces a fresh dry-run when the user checks manually` | 手动检查携带 `force=true` 绕过后端短缓存 |
 | `blocks confirmation while tasks are active` | 弹窗展示活动 task 并禁用正式更新按钮 |
+| `reconcile` / auxiliary blocker cases | 显式核对后强制 dry-run；失败或新 blocker 保留禁用态；Instance/Monitor/Sub-Agent 不伪装成可复制的用户 Task |
+| `shows running, disk, and database revisions` / repair/restart cases | 前端分开展示运行代码、磁盘代码和 DB revision；只有后端明确证明安全时才轻量重启，否则执行完整修复 |
+| rollback confirmation cases | 已迁移或迁移结果未知时必须二次确认数据库快照恢复的数据丢失；明确未迁移时只回退代码 |
+| active handoff recovery cases | 页面刷新、可见性恢复和旧进程仍可响应期间，`restarting/starting + repair_required` 继续轮询，不误报终态失败 |
+
+##### 部署事务、启动守卫与迁移故障注入
+
+| 测试文件 | 验证内容 |
+|---------|---------|
+| `test_deployment_start_guard.py` | repo lease 优先于 `/tmp` 状态；commit/port/token 精确匹配；损坏、未知 PID 身份和活动 lease fail closed；失败事务只进入 maintenance-only；task shared fence 阻止跨进程部署竞态 |
+| `test_main_deployment_start.py` | guard 在 `init_db` 前执行；maintenance-only 不访问数据库、不启动 Dispatcher/Worker；受控 handoff 跳过重复 mutation |
+| `test_deployment_maintenance_auth.py` | 维护模式只开放 health/status/repair/rollback/restart；legacy recovery token 与已签名 admin JWT 无 DB 可恢复，member JWT 和密码登录被拒绝 |
+| `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
+| `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障 |
+| `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
+| `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
 
 ##### `test_service_pr_review.py` — PR 审核服务
 
@@ -914,6 +944,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/dispatcher.py` | `backend/tests/test_service_dispatcher.py` |
 | `backend/services/worktree_manager.py` | `backend/tests/test_service_worktree_manager.py` |
 | `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py` |
+| `backend/services/context_compaction.py` | `backend/tests/test_context_compaction.py` |
 | `backend/services/ralph_loop.py` | `backend/tests/test_service_ralph_loop.py` |
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |
 | `backend/services/whisper_client.py` | `backend/tests/test_service_whisper_client.py` |

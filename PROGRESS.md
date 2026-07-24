@@ -847,3 +847,24 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：先构造并校验 thread MCP config，再启动 transport；transport、thread/start|resume、turn/start 的普通异常及缺失 thread/turn id 都统一转成 `CodexRequiredMcpError`，同时保留取消、超时未知状态和 maintenance busy 的原语义。`InstanceManager` 再按 capability + task 上下文增加最终 fail-closed 栅栏，未知 app-server 异常也不得进入 MCP-less exec。
 - **预防**：required capability 的错误类型必须覆盖依赖启动、协议 RPC、响应结构和上层 adapter 兜底，不能只识别服务端返回的某一种初始化文案；高层测试必须同时 patch app-server 失败和 exec spawn，并对启动失败、no-thread-id、未知异常逐项断言 exec 未调用。
 - **验证**：新增/相关评审用例 7 passed；MCP renderer/app-server 回归 100 passed、5 skipped、2 个既有 Windows `SIGKILL` 用例 deselected；InstanceManager capability/重试/换号回归 15 passed；compileall、前端 `tsc --noEmit`、`git diff --check` 通过。
+
+### 2026-07-24 — 自更新事务修复：代码已拉取不再等于部署完成（commit 3e08b8d）
+
+- **问题**：旧状态只比较 Git 本地/远端；代码已经拉取后若依赖、前端或 Alembic 失败，下一次检查会误报“代码一致”，但进程和数据库仍可能是旧版本。原迁移 worker 的 `/tmp` 状态、systemd handoff、SQLite 活连接恢复和 task 门禁也缺少同一个可证明的事务边界。
+- **解决**：状态拆为 running commit、disk commit、Alembic current/head，并新增完整 repair 与受约束 restart API/前端操作。仓库级 durable lease 保存 token、PID/start identity、期望 commit、备份和迁移结果；pre-start/lifespan guard 对半完成事务只启动不访问 ORM 的 maintenance-only 恢复面。协议 v2 worker 在停服后重新生成并校验 SQLite 快照，迁移/健康失败原子恢复 DB、代码、依赖和前端，任一步失败都不启动混合版本；同 commit 修复失败在后端 operation 与 shell commit 比较两层保留 incomplete fence。
+- **并发/故障边界**：所有 task claim 与部署共用 repo flock，部署 claim 后、任何 mutation 前二次查 blocker；running Instance、Worker 转发、排队续跑和跨 CCM 进程竞态均会取消部署。post-claim cancellation 会先终结 lease 再恢复 Dispatcher，rollback claim 原子保留重试元数据；systemd-run ACK 超时/非零按结果不确定处理，late worker 即使 token 相同也不能越过终态 lease。更新、修复和重启还会拒绝所有 Git 可见的 staged、unstaged、untracked 改动，避免未跟踪源码绕过 commit 身份校验；ignored 运行时产物不阻断。
+- **验证**：开发虚拟环境入口已从误指生产目录修正为 `/home/ubuntu/Claude-Code-Manager-dev/.venv`。部署专项最终 166 passed，前端全量 370 passed、TypeScript/生产构建/本次文件定向 ESLint 通过；全仓 ESLint 仍有 55 个与本次无关的既有错误。后端最终全量 2084 passed；Shell 语法、Python compile、`git diff --check` 通过。提交前追加的 dirty-worktree 专项 91 passed，前端更新定向 56 passed，生产构建再次通过。开发服务真实重启把 SQLite 从 `31fe767354b7` 升到 `c7e9b1d42f60`，状态 API 最终返回 current=head、`db_up_to_date=true`、`repair_required=false`；联调额外发现并修复了 Alembic mergepoint 双标记解析误判。仅操作开发目录与 8003，未触碰生产；本地实现提交为 `3e08b8d`，未 push。
+
+### 2026-07-24 — 更新弹窗幽灵任务核对与 pytest 外部状态隔离（commit 3e08b8d）
+
+- **现象**：开发更新弹窗显示 `#1 test monitor task (executing)`，但正常任务入口已看不到它。数据库实证 Task #1 空标题且仍为 executing，Instance #9–#13 五条同时反向占用它，五个 PID 均已死亡。
+- **根因**：这是 Task↔Instance 多 owner 的边界损坏；同时测试虽 override FastAPI `get_db`，`backend.main` 全局 InstanceManager/Dispatcher 仍绑定开发库，三个空响应测试会通过全局 dispatcher 向真实库写 lifecycle，制造了这次残留。
+- **解决**：新增管理员 `POST /api/system/update/reconcile` 与弹窗「重新核对运行状态」。Dispatcher 在关闭准入后统一核对：唯一双向一致的 dead claim 才可恢复；多 owner/mismatch fail closed；unknown/live PID 继续阻断；当前进程 process/consumer/lifecycle、fresh `_launching_instances`、Monitor/Sub-Agent exact maps 均保留。shared shadow 不被本机改写，manual reconcile 跳过 startup auxiliary sweep。Update blocker 还覆盖 quarantined PID/owner 与 live auxiliary generation。pytest 在首次 backend import 前把 DB、账号池 journal、Worker/backup、update checkout 全部定向到临时目录，并关闭外部服务；InstanceManager 的空响应重试改用显式注入 callback，不再 import 全局 dispatcher。
+- **附带修复**：SQLite 停服独占检查仍对未知不可读同 UID 进程 fail closed，但精确允许 systemd `ssh-agent.service` 的 `/usr/bin/ssh-agent -D`；否则该正常 non-dumpable helper 会让所有迁移/回滚误报数据库无法证明独占。
+- **验证**：ghost/Dispatcher/Update/API/InstanceManager/部署门禁专项 563 passed；迁移 hardening 26 passed；后端全量 2107 passed；前端全量 376 passed，TypeScript/Vite production build、定向 ESLint、Python compile、Shell syntax 与 `git diff --check` 全绿。三轮测试前后开发 DB/WAL/SHM 的 inode/mtime/size/SHA-256 完全一致。先生成 `0600` 且 integrity=ok 的 `backups/pre-ghost-reconcile-20260724T114307Z.db`，再只重启 8003：Task #1 fail-close 为 failed，Instance #9–#13 全部清成 error 且移除 PID/owner；在线 reconcile 与 dry-run 均返回 `active_task_count=0/update_blocked=false`，running=disk commit、Alembic current=head、`repair_required=false`。未触碰生产；本地实现提交为 `3e08b8d`，未 push。
+
+### 2026-07-24 — Codex 272K 上下文跑满后摘要续跑（commit ba086c0）
+
+- **问题**：CCM 虽有 80% 预压缩和 `"Prompt is too long"` 失败兜底，但 Codex app-server 的超限以 `codexErrorInfo=contextWindowExceeded` 出现在 `system_event`；chat 失败路径只扫描普通 assistant 文本，fresh/mode 路径又只认固定英文文案，因此真实跑满时可能直接退出。app-server 上报的 `modelContextWindow`、`totalTokens`、`reasoningOutputTokens` 也被丢弃；exec fallback 还会把整轮累计 1.5M token 当成当前 272K 上下文，出现 119%/553% 假利用率。
+- **解决**：完整保留 app-server 结构化错误与有效窗口，统一 provider 上下文超限分类；Codex 当前上下文按官方口径 `last.totalTokens - last.reasoningOutputTokens` 计算。exec fallback 从绑定账号 rollout 的最新 `last_token_usage` 恢复当前请求用量，不再使用累计 turn total。chat 与 fresh/mode 两条失败路径都复用既有摘要机制：清旧 session、带摘要和原消息自动续跑；预压缩也按有效窗口和完整 current-context token 提前触发。
+- **验证**：先写红测复现结构化错误丢失、输出 token 未计入阈值、exec 553% 假读数；修复后上下文专项 12 passed，Codex/上下文相关 122 passed，Dispatcher 相关 21 passed；正确隔离环境下后端全量 `1981 passed`（3m22s），`compileall` 与 `git diff --check` 通过。随后在独立 8011 环境完成真实前端集成：上下文 210,000/258,400（81%，阈值 80%）时界面显示自动压缩提示，新会话启动并返回 `E2E_CONTEXT_CONTINUED`，任务最终 completed、无错误且上下文重置到约 1.2K/272K；未触碰现有 8010。

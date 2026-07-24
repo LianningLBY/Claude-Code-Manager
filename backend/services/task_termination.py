@@ -1000,7 +1000,8 @@ async def terminate_authoritative_task_generation(
 async def task_termination_operation_locks(task_ids):
     """Hold migration/proxy mutation locks through supersede replacement."""
 
-    from backend.main import task_migrator, worker_proxy
+    from backend.main import task_migrator
+    from backend.services.worker_proxy import get_task_operation_lock
 
     async with AsyncExitStack() as stack:
         for task_id in sorted(set(task_ids)):
@@ -1010,8 +1011,11 @@ async def task_termination_operation_locks(task_ids):
                     asyncio.Lock(),
                 )
                 await stack.enter_async_context(migration_lock)
-            if worker_proxy is not None:
-                await stack.enter_async_context(
-                    worker_proxy.task_operation_lock(task_id)
-                )
+            # Retry/chat/delete paths use this module-level lock even when the
+            # optional Worker runtime is disabled. Supersede must therefore
+            # always take the same lock rather than condition ownership on a
+            # constructed WorkerProxy instance.
+            await stack.enter_async_context(
+                get_task_operation_lock(task_id)
+            )
         yield

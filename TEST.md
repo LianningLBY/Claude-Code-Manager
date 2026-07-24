@@ -303,6 +303,24 @@ cd frontend && npx tsc --noEmit
 | `test_claude_renderer_includes_env_but_not_provider_metadata` | Claude renderer 透传 env 且不泄漏 provider 专用字段 |
 | `test_mcp_server_spec_collections_are_immutable` | spec 拷贝参数、环境变量和工具列表，避免调用方后续修改 |
 | `test_claude_renderer_rejects_duplicate_server_names` | 重名 server 明确失败而不是静默覆盖 |
+| `test_codex_app_server_renderer_includes_supported_stdio_fields` | app-server `config.mcp_servers` 覆盖 command/args/cwd/env/required/enabled_tools/timeouts，并保留空格、中文、引号和反斜杠 |
+| `test_codex_exec_renderer_serializes_the_same_config_as_toml` | exec `-c` argv 使用合法 TOML 数组/inline table，反解析后与 app-server 配置完全一致 |
+| `test_codex_renderers_share_each_role_spec` | 主任务、Monitor、Sub-Agent 的同一份 spec 可同时渲染为 app-server 和 exec 配置 |
+| `test_codex_renderer_omits_unset_optional_fields` | 未设置的 cwd/env/enabled_tools/timeouts 不进入 Codex 配置，避免空 allow-list 改变工具语义 |
+| `test_codex_renderers_support_empty_specs` | 空 spec 集合得到空 app-server 配置和空 exec argv |
+| `test_codex_exec_renderer_emits_one_merged_server_table_override` | 多 server 合并为一个 `mcp_servers` inline table 覆盖，绕开 CLI dotted-path 拆名且不丢配置 |
+| `test_codex_renderers_reject_duplicate_server_names` | 两种 Codex 输出都拒绝重名 server |
+| `test_codex_renderers_reject_names_the_cli_cannot_initialize` | 提前拒绝 Codex 初始化阶段不接受的空白、点号、空格和非 ASCII server 名 |
+| `test_codex_renderers_do_not_write_codex_home` | renderer 不创建或修改 `$CODEX_HOME/config.toml` |
+| `test_codex_renderers_reject_invalid_timeouts` | app-server/exec 均拒绝 NaN、无穷、负数和布尔 timeout，避免延迟到 CLI 初始化才失败 |
+
+Codex 版本兼容基线（2026-07-24）：
+
+- `0.144.6` 与 `0.145.0` 生成的 app-server schema 均允许 `thread/start`、`thread/resume` 的 `config` object。
+- 两版 CLI 的隔离 `$CODEX_HOME` smoke test 均可通过 `mcp list -c <merged-inline-table> --json` 无损解析上述 stdio 字段；已有用户 MCP entry 与本次 override 会深合并，不会被覆盖。
+- 两版 app-server 均已用真实 `thread/start` 启动 CCM FastMCP server，`required`、`enabled_tools` 和 timeout 配置可正常完成 session 初始化。
+- 实测确认 app-server 对 server 名强制 `^[a-zA-Z0-9_-]+$`；renderer 在进 CLI 前做同样校验。
+- smoke test 前后隔离目录均未产生 `config.toml`；路径/中文/引号/反斜杠的无损序列化由不经过 shell 的单元测试覆盖。
 
 #### `test_monitor_dispatcher.py` — Monitor Dispatcher 生命周期
 

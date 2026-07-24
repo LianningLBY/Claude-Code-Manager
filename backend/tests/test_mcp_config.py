@@ -1,6 +1,7 @@
 """Tests for MCP config generation and cleanup."""
 import json
 import tempfile
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,8 @@ from backend.services.mcp_config import (
     generate_monitor_agent_mcp_config,
     generate_sub_agent_mcp_config,
     render_claude_mcp_config,
+    render_codex_exec_config_args,
+    render_codex_mcp_config,
 )
 
 
@@ -412,3 +415,249 @@ def test_claude_renderer_rejects_duplicate_server_names():
 
     with pytest.raises(ValueError, match="Duplicate MCP server name: duplicate"):
         render_claude_mcp_config((spec, spec))
+
+
+def _parse_codex_exec_config_args(args: list[str]) -> dict[str, object]:
+    assert len(args) % 2 == 0
+    servers: dict[str, object] = {}
+    for flag, override in zip(args[::2], args[1::2], strict=True):
+        assert flag == "-c"
+        parsed = tomllib.loads(override)
+        assert set(parsed) == {"mcp_servers"}
+        servers.update(parsed["mcp_servers"])
+    return {"mcp_servers": servers}
+
+
+def test_codex_app_server_renderer_includes_supported_stdio_fields():
+    spec = McpServerSpec(
+        name="ccm_server_zh",
+        command=r"C:\Program Files\CCM\python.exe",
+        args=(
+            "-m",
+            "测试.mcp",
+            "--label",
+            '他说 "你好"',
+            "--path",
+            r"C:\工具\server.py",
+        ),
+        cwd=r"C:\CCM 工作区",
+        env={
+            "API.TOKEN": 'a\\b"c',
+            "中文键": "值",
+        },
+        required=True,
+        enabled_tools=("工具一", "tool_two"),
+        startup_timeout_sec=10.0,
+        tool_timeout_sec=60.0,
+    )
+
+    assert render_codex_mcp_config((spec,)) == {
+        "mcp_servers": {
+            "ccm_server_zh": {
+                "command": r"C:\Program Files\CCM\python.exe",
+                "args": [
+                    "-m",
+                    "测试.mcp",
+                    "--label",
+                    '他说 "你好"',
+                    "--path",
+                    r"C:\工具\server.py",
+                ],
+                "cwd": r"C:\CCM 工作区",
+                "env": {
+                    "API.TOKEN": 'a\\b"c',
+                    "中文键": "值",
+                },
+                "required": True,
+                "enabled_tools": ["工具一", "tool_two"],
+                "startup_timeout_sec": 10.0,
+                "tool_timeout_sec": 60.0,
+            }
+        }
+    }
+
+
+def test_codex_exec_renderer_serializes_the_same_config_as_toml():
+    spec = McpServerSpec(
+        name="ccm_server_zh",
+        command=r"C:\Program Files\CCM\python.exe",
+        args=("-m", "测试.mcp", "--label", '他说 "你好"'),
+        cwd=r"C:\CCM 工作区",
+        env={"API.TOKEN": 'a\\b"c'},
+        required=True,
+        enabled_tools=("工具一", "tool_two"),
+        startup_timeout_sec=10.0,
+        tool_timeout_sec=60.0,
+    )
+
+    app_server_config = render_codex_mcp_config((spec,))
+    exec_args = render_codex_exec_config_args((spec,))
+
+    assert len(exec_args) == 2
+    assert exec_args[0] == "-c"
+    assert exec_args[1].startswith("mcp_servers={ ccm_server_zh = { ")
+    assert 'args = ["-m", "测试.mcp", "--label", "他说 \\"你好\\""]' in exec_args[1]
+    assert 'cwd = "C:\\\\CCM 工作区"' in exec_args[1]
+    assert _parse_codex_exec_config_args(exec_args) == app_server_config
+
+
+@pytest.mark.parametrize(
+    ("builder", "builder_args", "expected_name"),
+    [
+        (build_mcp_server_specs, (42,), "ccm_skills"),
+        (
+            build_monitor_agent_mcp_server_specs,
+            (7, 42),
+            "ccm_monitor_agent",
+        ),
+        (
+            build_sub_agent_mcp_server_specs,
+            (9, 42),
+            "ccm_sub_agent",
+        ),
+    ],
+)
+def test_codex_renderers_share_each_role_spec(
+    monkeypatch,
+    builder,
+    builder_args,
+    expected_name,
+):
+    _set_spec_snapshot_runtime(monkeypatch)
+    specs = builder(*builder_args, api_base="http://manager:8321")
+
+    app_server_config = render_codex_mcp_config(specs)
+
+    assert set(app_server_config["mcp_servers"]) == {expected_name}
+    assert _parse_codex_exec_config_args(
+        render_codex_exec_config_args(specs)
+    ) == app_server_config
+
+
+def test_codex_renderer_omits_unset_optional_fields():
+    spec = McpServerSpec(name="minimal", command="python")
+
+    assert render_codex_mcp_config((spec,)) == {
+        "mcp_servers": {
+            "minimal": {
+                "command": "python",
+                "args": [],
+                "required": False,
+            }
+        }
+    }
+    assert _parse_codex_exec_config_args(
+        render_codex_exec_config_args((spec,))
+    ) == render_codex_mcp_config((spec,))
+
+
+def test_codex_renderers_support_empty_specs():
+    assert render_codex_mcp_config(()) == {"mcp_servers": {}}
+    assert render_codex_exec_config_args(()) == []
+
+
+def test_codex_exec_renderer_emits_one_merged_server_table_override():
+    specs = (
+        McpServerSpec(name="first", command="python"),
+        McpServerSpec(name="second", command="node"),
+    )
+
+    exec_args = render_codex_exec_config_args(specs)
+
+    assert len(exec_args) == 2
+    assert exec_args[0] == "-c"
+    assert exec_args[1].startswith("mcp_servers={ first = { ")
+    assert "second = { " in exec_args[1]
+    assert _parse_codex_exec_config_args(exec_args) == render_codex_mcp_config(specs)
+
+
+@pytest.mark.parametrize(
+    "renderer",
+    [render_codex_mcp_config, render_codex_exec_config_args],
+)
+def test_codex_renderers_reject_duplicate_server_names(renderer):
+    spec = McpServerSpec(name="duplicate", command="python")
+
+    with pytest.raises(ValueError, match="Duplicate MCP server name: duplicate"):
+        renderer((spec, spec))
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    ["", "contains.dot", "contains space", "中文"],
+)
+@pytest.mark.parametrize(
+    "renderer",
+    [render_codex_mcp_config, render_codex_exec_config_args],
+)
+def test_codex_renderers_reject_names_the_cli_cannot_initialize(
+    renderer,
+    invalid_name,
+):
+    spec = McpServerSpec(name=invalid_name, command="python")
+
+    with pytest.raises(
+        ValueError,
+        match=r"must match \^\[A-Za-z0-9_-\]\+\$",
+    ):
+        renderer((spec,))
+
+
+@pytest.mark.parametrize("existing_config", [False, True])
+def test_codex_renderers_do_not_write_codex_home(
+    monkeypatch,
+    tmp_path,
+    existing_config,
+):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    original = b'model = "existing-user-choice"\n'
+    if existing_config:
+        config_path.write_bytes(original)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    spec = McpServerSpec(name="example", command="python")
+
+    render_codex_mcp_config((spec,))
+    render_codex_exec_config_args((spec,))
+
+    if existing_config:
+        assert config_path.read_bytes() == original
+        assert list(codex_home.iterdir()) == [config_path]
+    else:
+        assert not config_path.exists()
+        assert list(codex_home.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "renderer",
+    [render_codex_mcp_config, render_codex_exec_config_args],
+)
+@pytest.mark.parametrize(
+    ("field_name", "invalid_timeout"),
+    [
+        ("startup_timeout_sec", float("nan")),
+        ("startup_timeout_sec", float("inf")),
+        ("startup_timeout_sec", -0.1),
+        ("startup_timeout_sec", True),
+        ("tool_timeout_sec", float("-inf")),
+        ("tool_timeout_sec", -1),
+        ("tool_timeout_sec", False),
+    ],
+)
+def test_codex_renderers_reject_invalid_timeouts(
+    renderer,
+    field_name,
+    invalid_timeout,
+):
+    spec = McpServerSpec(
+        name="invalid",
+        command="python",
+        **{field_name: invalid_timeout},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"Invalid Codex {field_name}.*finite non-negative number",
+    ):
+        renderer((spec,))

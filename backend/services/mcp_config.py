@@ -1,23 +1,27 @@
 """CCM MCP server specs and provider-specific config generation.
 
 The server description is provider-neutral.  Existing callers still receive a
-Claude-compatible JSON file; future providers can render the same specs without
-duplicating task/session context construction.
+Claude-compatible JSON file, while pure Codex renderers expose the same specs
+without changing either provider's runtime task-launch path.
 """
 
 import json
+import math
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, cast
 
 
 _CCM_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 _VENV_PYTHON = str(Path(_CCM_ROOT) / ".venv" / "bin" / "python3")
 _MCP_STARTUP_TIMEOUT_SEC = 10.0
 _MCP_TOOL_TIMEOUT_SEC = 60.0
+_TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_CODEX_MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 CCM_SKILLS_TOOLS = (
     "ccm_command_help",
@@ -194,6 +198,114 @@ def render_claude_mcp_config(specs: Sequence[McpServerSpec]) -> dict[str, object
         servers[spec.name] = server
 
     return {"mcpServers": servers}
+
+
+def render_codex_mcp_config(specs: Sequence[McpServerSpec]) -> dict[str, object]:
+    """Render thread-level config for Codex app-server.
+
+    The returned object is suitable for the ``config`` field of both
+    ``thread/start`` and ``thread/resume``.  It is intentionally in-memory only;
+    callers do not need to create or modify a Codex ``config.toml``.
+    """
+
+    servers: dict[str, dict[str, object]] = {}
+    for spec in specs:
+        if spec.name in servers:
+            raise ValueError(f"Duplicate MCP server name: {spec.name}")
+        if not _CODEX_MCP_SERVER_NAME_RE.fullmatch(spec.name):
+            raise ValueError(
+                f"Invalid Codex MCP server name {spec.name!r}: "
+                "must match ^[A-Za-z0-9_-]+$"
+            )
+
+        for field_name, timeout in (
+            ("startup_timeout_sec", spec.startup_timeout_sec),
+            ("tool_timeout_sec", spec.tool_timeout_sec),
+        ):
+            if timeout is None:
+                continue
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout)
+                or timeout < 0
+            ):
+                raise ValueError(
+                    f"Invalid Codex {field_name} for {spec.name!r}: "
+                    "must be a finite non-negative number"
+                )
+
+        server: dict[str, object] = {
+            "command": spec.command,
+            "args": list(spec.args),
+            "required": spec.required,
+        }
+        if spec.cwd is not None:
+            server["cwd"] = spec.cwd
+        if spec.env:
+            server["env"] = dict(spec.env)
+        if spec.enabled_tools:
+            server["enabled_tools"] = list(spec.enabled_tools)
+        if spec.startup_timeout_sec is not None:
+            server["startup_timeout_sec"] = spec.startup_timeout_sec
+        if spec.tool_timeout_sec is not None:
+            server["tool_timeout_sec"] = spec.tool_timeout_sec
+        servers[spec.name] = server
+
+    return {"mcp_servers": servers}
+
+
+def _toml_key(key: str) -> str:
+    """Return one TOML key segment without introducing dotted-key semantics."""
+
+    if _TOML_BARE_KEY_RE.fullmatch(key):
+        return key
+    return json.dumps(key, ensure_ascii=False)
+
+
+def _toml_literal(value: object) -> str:
+    """Serialize the config value types used by ``McpServerSpec`` as TOML."""
+
+    if isinstance(value, str):
+        # JSON basic-string escapes are also valid TOML basic-string escapes.
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Codex config cannot contain a non-finite float")
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_literal(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        items: list[str] = []
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("Codex config mapping keys must be strings")
+            items.append(f"{_toml_key(key)} = {_toml_literal(item)}")
+        if not items:
+            return "{}"
+        return "{ " + ", ".join(items) + " }"
+    raise TypeError(f"Unsupported Codex config value: {type(value).__name__}")
+
+
+def render_codex_exec_config_args(specs: Sequence[McpServerSpec]) -> list[str]:
+    """Render ``codex exec -c`` argv tokens for the same config.
+
+    The complete server table is one TOML override.  This avoids routing server
+    names through Codex's dotted-path parser and still deep-merges with existing
+    user MCP entries.  Returning argv tokens rather than a shell command
+    preserves spaces, Unicode, quotes, and backslashes without applying shell
+    quoting.
+    """
+
+    config = render_codex_mcp_config(specs)
+    servers = cast(dict[str, dict[str, object]], config["mcp_servers"])
+    if not servers:
+        return []
+    return ["-c", f"mcp_servers={_toml_literal(servers)}"]
 
 
 def _write_claude_mcp_config(

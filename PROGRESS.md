@@ -827,6 +827,12 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **预防**：Provider 适配器只负责格式转换，任何 task/session 上下文必须在公共 spec builder 中形成；工具白名单必须与 FastMCP 注册表做回归对照，禁止在 Claude/Codex renderer 中各维护一套角色逻辑。
 - **验证**：MCP/Monitor 相关测试 47 passed，Claude 命令构建 5 passed，compileall 与 `git diff --check` 通过；用户在 Windows worktree 人工生成三类 spec/Claude JSON，确认角色、ID、required 和 13/3/3 工具数量正确。
 
+### 2026-07-24 — Codex Pool 支持邮箱-only 人工验证码登录
+
+- **需求**：新增 Codex 账号时只提供 OpenAI 邮箱，不预先保存邮箱查询 token 或 OpenAI 密码；管理员收到验证码后在 CCM 里人工输入。
+- **实现**：前端与新增/重登 API 允许空 token、空密码；登录 wrapper 仍通过同一 stdin 管道接收初始化消息和 OTP。密码页会尝试 OpenAI 的 email-code / one-time-code 入口，成功后发布 `awaiting_otp`；若页面只提供密码则明确提示补密码重试。
+- **安全与原子性**：OTP 仍只在内存/管道传递，不写文件或日志；账号仍以 journal + `auth.json` 校验为提交点。email-only 账号只保存空凭据元数据，日后重新登录时再次人工收码。
+
 ### 2026-07-24 — Codex 全量 CCM MCP PR 2：双 transport 配置渲染（commit f55506b）
 
 - **问题**：PR 1 只有 Claude JSON renderer；Codex app-server 的线程级 `config.mcp_servers` 与 `codex exec -c` 若各自拼装，复杂路径、Unicode、引号、工具白名单和 timeout 很容易漂移。初版单测又只用 `tomllib` 自我反解析，未发现 `mcp_servers."含点名称"` 会被 Codex CLI 的 dotted-path parser 错拆，形成假绿。

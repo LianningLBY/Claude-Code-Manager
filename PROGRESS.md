@@ -827,6 +827,13 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **预防**：Provider 适配器只负责格式转换，任何 task/session 上下文必须在公共 spec builder 中形成；工具白名单必须与 FastMCP 注册表做回归对照，禁止在 Claude/Codex renderer 中各维护一套角色逻辑。
 - **验证**：MCP/Monitor 相关测试 47 passed，Claude 命令构建 5 passed，compileall 与 `git diff --check` 通过；用户在 Windows worktree 人工生成三类 spec/Claude JSON，确认角色、ID、required 和 13/3/3 工具数量正确。
 
+### 2026-07-24 — Codex 全量 CCM MCP PR 2：双 transport 配置渲染（commit f55506b）
+
+- **问题**：PR 1 只有 Claude JSON renderer；Codex app-server 的线程级 `config.mcp_servers` 与 `codex exec -c` 若各自拼装，复杂路径、Unicode、引号、工具白名单和 timeout 很容易漂移。初版单测又只用 `tomllib` 自我反解析，未发现 `mcp_servers."含点名称"` 会被 Codex CLI 的 dotted-path parser 错拆，形成假绿。
+- **解决**：同一 `McpServerSpec` 先渲染为 app-server config，再把完整 `mcp_servers` table 序列化成一个 exec TOML override；不经 shell、不写全局 `config.toml`。renderer 提前执行 Codex 实际约束：server name 必须匹配 `^[A-Za-z0-9_-]+$`，两类 timeout 必须为有限非负数。
+- **预防**：Provider 配置测试不能只反解析自己的输出，至少要用目标 CLI 的只读命令和实际 session 初始化各验一次；CLI 的 `-c` key parser 与 TOML dotted-key grammar 不应假定等价。配置适配器必须返回 argv token，不返回已拼 shell command。
+- **验证**：Codex renderer 单测 56 passed；MCP config/server 65 passed；Monitor 可比项 14 passed（另 2 项因 Windows 沙箱无权写硬编码 `/tmp` 而未运行）；Claude 命令构建 5 passed；前端 `tsc --noEmit` 通过。Codex CLI `0.144.6`、`0.145.0` 均在隔离 `$CODEX_HOME` 下通过 `mcp list -c ... --json`，且两版 app-server 都用 `thread/start` 成功初始化真实 CCM FastMCP server；全程未生成 `config.toml`。
+
 ### 2026-07-24 — 自更新事务修复：代码已拉取不再等于部署完成（commit 3e08b8d）
 
 - **问题**：旧状态只比较 Git 本地/远端；代码已经拉取后若依赖、前端或 Alembic 失败，下一次检查会误报“代码一致”，但进程和数据库仍可能是旧版本。原迁移 worker 的 `/tmp` 状态、systemd handoff、SQLite 活连接恢复和 task 门禁也缺少同一个可证明的事务边界。

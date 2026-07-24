@@ -833,3 +833,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：同一 `McpServerSpec` 先渲染为 app-server config，再把完整 `mcp_servers` table 序列化成一个 exec TOML override；不经 shell、不写全局 `config.toml`。renderer 提前执行 Codex 实际约束：server name 必须匹配 `^[A-Za-z0-9_-]+$`，两类 timeout 必须为有限非负数。
 - **预防**：Provider 配置测试不能只反解析自己的输出，至少要用目标 CLI 的只读命令和实际 session 初始化各验一次；CLI 的 `-c` key parser 与 TOML dotted-key grammar 不应假定等价。配置适配器必须返回 argv token，不返回已拼 shell command。
 - **验证**：Codex renderer 单测 56 passed；MCP config/server 65 passed；Monitor 可比项 14 passed（另 2 项因 Windows 沙箱无权写硬编码 `/tmp` 而未运行）；Claude 命令构建 5 passed；前端 `tsc --noEmit` 通过。Codex CLI `0.144.6`、`0.145.0` 均在隔离 `$CODEX_HOME` 下通过 `mcp list -c ... --json`，且两版 app-server 都用 `thread/start` 成功初始化真实 CCM FastMCP server；全程未生成 `config.toml`。
+
+### 2026-07-24 — Codex 全量 CCM MCP PR 3：app-server 按线程注入主 MCP（commit 7f41159）
+
+- **问题**：PR 2 只有纯 renderer，生产 `CodexAppServer.start_turn()` 仍未接收 MCP specs，导致 Codex 主任务在新建、resume、瞬时重试或账号轮换时都看不到 `ccm_skills`；如果 required MCP 初始化失败后再落入尚未接线的 exec fallback，还会伪装成普通无工具任务。
+- **解决**：新增默认关闭的 `CODEX_MAIN_MCP_ENABLED` capability；开启后 `InstanceManager` 每次 app-server launch 都从当前 `task_id` 重建 required `ccm_skills` spec，`start_turn()` 将 renderer 结果只合并到本次 `thread/start|resume` 的 `config`，不写共享 `CODEX_HOME/config.toml`。required spec 校验或 thread 初始化失败统一转成 `CodexRequiredMcpError` 并禁止无 MCP 的 exec replay；Claude、prompt、UI、Monitor/Sub-Agent 和 exec 配置接线保持本 PR 范围外。
+- **预防**：任何 task-scoped MCP 上下文必须在每次 start/resume/retry/rotation 时重建，不能缓存到共享 app-server 或账号目录；capability 未开启时不得发送空 `config`；required 能力失败必须 fail closed，并用并发双 task 测试锁定配置对象和 `task_id` 隔离。
+- **验证**：MCP renderer/app-server 相关回归 97 passed、5 skipped；InstanceManager capability、重试、换号和 Claude 不变相关 11 passed；前端 `tsc --noEmit`、compileall、`git diff --check` 通过。真实 Codex CLI `0.145.0` + `gpt-5.6-sol` 在隔离 `CODEX_HOME` 下完成 start 与同 thread resume：两轮均实际调用 `ccm_skills/ccm_command_help`，工具状态 `completed`、结果 `success=true`、turn returncode 0；隔离后端两次收到绑定 Task 1 的 API 请求，测试进程、数据库和认证硬链接随后全部清理。

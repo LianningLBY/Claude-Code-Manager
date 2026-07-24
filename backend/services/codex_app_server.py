@@ -755,13 +755,23 @@ class CodexAppServer:
                 "input_tokens": int(last.get("inputTokens") or 0),
                 "cached_input_tokens": int(last.get("cachedInputTokens") or 0),
                 "output_tokens": int(last.get("outputTokens") or 0),
+                "reasoning_output_tokens": int(
+                    last.get("reasoningOutputTokens") or 0
+                ),
+                "total_tokens": int(last.get("totalTokens") or 0),
+                "context_window": int(
+                    token_usage.get("modelContextWindow") or 0
+                ),
             }
             return
 
         if method == "error":
             error = params.get("error") or params
-            message = error.get("message") if isinstance(error, dict) else str(error)
-            context.process.feed({"type": "turn.failed", "error": {"message": message}})
+            normalized_error = self._normalize_turn_error(error)
+            context.process.feed({
+                "type": "turn.failed",
+                "error": normalized_error,
+            })
             return
 
         if method == "turn/completed":
@@ -775,11 +785,13 @@ class CodexAppServer:
                 exit_code = 0
                 stderr = ""
             else:
-                message = (
-                    error.get("message") if isinstance(error, dict) else error
-                ) or f"Codex turn ended with status {status}"
+                normalized_error = self._normalize_turn_error(
+                    error,
+                    fallback=f"Codex turn ended with status {status}",
+                )
+                message = normalized_error["message"]
                 context.process.feed(
-                    {"type": "turn.failed", "error": {"message": str(message)}}
+                    {"type": "turn.failed", "error": normalized_error}
                 )
                 exit_code = 1
                 stderr = str(message)
@@ -794,6 +806,23 @@ class CodexAppServer:
             self._contexts_by_thread.pop(context.thread_id, None)
             if context.turn_id:
                 self._contexts_by_turn.pop(context.turn_id, None)
+
+    @staticmethod
+    def _normalize_turn_error(
+        error: Any,
+        *,
+        fallback: str = "Codex turn failed",
+    ) -> dict[str, Any]:
+        """Keep app-server error classification fields alongside its message."""
+
+        if isinstance(error, dict):
+            normalized = dict(error)
+            message = normalized.get("message") or fallback
+        else:
+            normalized = {}
+            message = error or fallback
+        normalized["message"] = str(message)
+        return normalized
 
     @staticmethod
     def _normalize_item(item: dict[str, Any]) -> dict[str, Any] | None:

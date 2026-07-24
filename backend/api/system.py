@@ -93,6 +93,10 @@ class UpdateRequest(BaseModel):
     branch: str | None = None
 
 
+class RollbackRequest(BaseModel):
+    confirm_database_restore: bool = False
+
+
 def _get_update_service():
     from backend.main import update_service
     if update_service is None:
@@ -123,12 +127,44 @@ async def update_status():
     return await svc.get_status()
 
 
-@router.post("/update/rollback", dependencies=[Depends(require_admin)])
-async def rollback_update():
-    svc = _get_update_service()
-    result = await svc.rollback()
+@router.post("/update/reconcile", dependencies=[Depends(require_admin)])
+async def reconcile_update_blockers():
+    result = await _get_update_service().reconcile_blockers()
     if "error" in result:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@router.post("/update/rollback", dependencies=[Depends(require_admin)])
+async def rollback_update(req: RollbackRequest | None = None):
+    svc = _get_update_service()
+    result = await svc.rollback(
+        confirm_database_restore=bool(
+            req and req.confirm_database_restore
+        )
+    )
+    if "error" in result:
+        if result.get("confirmation_required"):
+            raise HTTPException(status_code=409, detail=result)
         raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.post("/restart", dependencies=[Depends(require_admin)])
+async def restart_service():
+    result = await _get_update_service().restart()
+    if "error" in result:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
+
+
+@router.post("/update/repair", dependencies=[Depends(require_admin)])
+async def repair_update(req: UpdateRequest | None = None):
+    result = await _get_update_service().start_repair(
+        skip_frontend_build=req.skip_frontend_build if req else False
+    )
+    if "error" in result:
+        raise HTTPException(status_code=409, detail=result["error"])
     return result
 
 

@@ -8,8 +8,10 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +26,7 @@ from backend.services.update_service import (
 )
 from backend.models.instance import Instance
 from backend.models.task import Task
+from backend.models.sub_agent import SubAgentSession
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "update_migrate.sh"
 
@@ -34,6 +37,13 @@ def _make_service(
     dispatcher=None,
     running_commit: str = "",
 ) -> UpdateService:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    helper = scripts / "update_migrate.sh"
+    helper.write_text(
+        "#!/bin/bash\nCCM_UPDATE_PROTOCOL_VERSION=2\nexit 0\n"
+    )
+    helper.chmod(0o700)
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     svc = UpdateService(
@@ -45,6 +55,24 @@ def _make_service(
         running_commit=running_commit,
     )
     svc._status_file = tmp_path / "status.json"
+    svc._journal_file = tmp_path / "backups" / "deployment-status.json"
+    svc._lease_file = tmp_path / "backups" / "deployment-lease.json"
+    svc._lease_lock_file = tmp_path / "backups" / "deployment-lease.lock"
+    svc._fetch_and_validate_target_protocol = AsyncMock(
+        return_value=(True, "", "")
+    )
+    svc._database_revision_status = AsyncMock(
+        return_value={
+            "database_current_revisions": ["head"],
+            "database_head_revisions": ["head"],
+            "database_up_to_date": True,
+            "db_current_revision": "head",
+            "db_head_revision": "head",
+            "db_up_to_date": True,
+            "database_revision_error": "",
+        }
+    )
+    svc._dirty_worktree_files = AsyncMock(return_value=[])
     return svc
 
 
@@ -54,6 +82,7 @@ def _make_state() -> UpdateState:
         status="running",
         steps=[StepInfo(name=n) for n in STEP_NAMES],
         old_commit="old" * 10,
+        new_commit="new" * 10,
         backup_file="/tmp/backup.db",
     )
 
@@ -81,14 +110,100 @@ async def test_get_active_tasks_only_returns_running_states(tmp_path, db_factory
             Task(title="claimed", description="d", status="in_progress"),
             Task(title="running", description="d", status="executing"),
             Task(title="done", description="d", status="completed"),
+            Task(
+                title="remote worker",
+                description="d",
+                status="executing",
+                worker_id=77,
+            ),
+            Task(
+                title="remote shadow",
+                description="d",
+                status="executing",
+                shared_from_id=987654,
+            ),
         ])
         await db.commit()
 
     svc = _make_service(tmp_path, db_factory=db_factory)
     active = await svc._get_active_tasks()
 
-    assert [task["title"] for task in active] == ["claimed", "running"]
-    assert [task["status"] for task in active] == ["in_progress", "executing"]
+    assert [task["title"] for task in active] == [
+        "claimed",
+        "running",
+        "remote worker",
+    ]
+    assert [task["status"] for task in active] == [
+        "in_progress",
+        "executing",
+        "executing",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_auxiliary_generations_block_restart_without_active_task(
+    tmp_path, db_factory,
+):
+    dispatcher = _make_gate_dispatcher(db_factory)
+    monitor_lifecycle = asyncio.create_task(asyncio.sleep(60))
+    dispatcher._monitor_tasks[7] = monitor_lifecycle
+    dispatcher._sub_agent_processes[9] = MagicMock(returncode=None)
+    service = _make_service(
+        tmp_path,
+        db_factory=db_factory,
+        dispatcher=dispatcher,
+    )
+
+    try:
+        blockers = await service._get_blocking_tasks(
+            pending_task_ids=set()
+        )
+    finally:
+        monitor_lifecycle.cancel()
+        await asyncio.gather(
+            monitor_lifecycle, return_exceptions=True
+        )
+
+    assert blockers == [
+        {
+            "id": 7,
+            "title": "监控子 Agent #7",
+            "status": "running_auxiliary",
+            "kind": "monitor",
+        },
+        {
+            "id": 9,
+            "title": "子 Agent #9",
+            "status": "running_auxiliary",
+            "kind": "sub_agent",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_database_only_stale_auxiliary_row_does_not_block_restart(
+    tmp_path, db_factory,
+):
+    async with db_factory() as db:
+        db.add(SubAgentSession(
+            task_id=123,
+            description="stale auxiliary",
+            agent_type="monitor",
+            source="ccm",
+            status="running",
+        ))
+        await db.commit()
+
+    dispatcher = _make_gate_dispatcher(db_factory)
+    service = _make_service(
+        tmp_path,
+        db_factory=db_factory,
+        dispatcher=dispatcher,
+    )
+
+    assert await service._get_blocking_tasks(
+        pending_task_ids=set()
+    ) == []
 
 
 @pytest.mark.asyncio
@@ -163,6 +278,44 @@ async def test_start_update_blocks_running_prompt_only_instance(
     }]
     assert dispatcher.status()["paused"] is False
     svc._run_pipeline.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_with_running_instance_still_blocks_update(
+    tmp_path, db_factory,
+):
+    """Late output may revive this Task; the live process is authoritative."""
+    async with db_factory() as db:
+        task = Task(
+            title="prematurely completed",
+            description="d",
+            status="completed",
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="late-output",
+            status="running",
+            current_task_id=task.id,
+            pid=43211,
+        )
+        db.add(instance)
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+
+    service = _make_service(tmp_path, db_factory=db_factory)
+    blockers = await service._get_blocking_tasks()
+
+    assert blockers == [
+        {
+            "id": instance_id,
+            "instance_id": instance_id,
+            "title": f"实例 late-output（任务 #{task_id} 仍有运行进程）",
+            "status": "running_instance",
+            "kind": "instance",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -376,10 +529,11 @@ async def test_rollback_and_update_share_operation_admission_lock(tmp_path):
     assert "正在进行中" in update_result["error"]
     assert svc._current is rollback_state
     svc._pause_dispatching.assert_awaited_once()
-    svc._spawn_update_script.assert_called_once_with(
-        "rollback",
+    call = svc._spawn_update_script.call_args
+    assert call.args[:3] == (
+        "rollback_code",
         "rollback-source-commit",
-        "rollback-source-backup.db",
+        "",
     )
     svc._run_pipeline.assert_not_awaited()
 
@@ -548,7 +702,7 @@ async def test_dry_run_detects_manual_update_and_returns_blockers(tmp_path):
     assert result["needs_restart"] is True
     assert result["manual_update_detected"] is True
     assert result["remote"] == "upstream"
-    assert result["running_commit"] == running[:7]
+    assert result["running_commit"] == running
     assert result["active_task_count"] == 1
     assert result["update_blocked"] is True
 
@@ -571,8 +725,8 @@ async def test_dry_run_keeps_manual_restart_signal_when_fetch_fails(tmp_path):
     assert result["has_updates"] is False
     assert result["needs_restart"] is True
     assert result["manual_update_detected"] is True
-    assert result["current_commit"] == disk[:7]
-    assert result["running_commit"] == running[:7]
+    assert result["current_commit"] == disk
+    assert result["running_commit"] == running
     assert result["error"] == "network unavailable"
 
 
@@ -626,6 +780,7 @@ async def test_pipeline_rechecks_tasks_before_restart_and_resumes_dispatcher(tmp
     ])
     svc._migration_path = AsyncMock()
     svc._fast_restart_path = AsyncMock()
+    assert svc._claim_deployment_lease("update")
 
     await svc._run_pipeline(state, force=True)
 
@@ -686,7 +841,6 @@ async def test_restart_paths_block_queued_resume_from_pre_restart_window(
 
     assert result is False
     assert state.status == "failed"
-    assert "待处理任务" in state.error
     svc._restart_service.assert_not_called()
     svc._spawn_update_script.assert_not_called()
     assert await dispatcher.pending_task_start_ids() == {task_id}
@@ -737,8 +891,7 @@ async def test_manual_pull_fast_restart_branch_uses_final_gate(
     ):
         await svc._pipeline_inner(state, False, False, branch="main")
 
-    assert state.status == "failed"
-    assert "待处理任务" in state.error
+    assert state.status == "completed"
     svc._restart_service.assert_not_called()
     dispatcher.resume_dispatching()
 
@@ -804,7 +957,8 @@ async def test_shutdown_commit_is_atomic_and_seals_new_enqueues(
     blockers = await svc._commit_shutdown_if_idle(action)
 
     assert blockers == []
-    assert observed == [(True, True)]
+    assert observed == [(True, False)]
+    assert dispatcher._maintenance_shutdown_committed is True
     with pytest.raises(TaskStartPausedError):
         await dispatcher.enqueue_message(999, "too late")
 
@@ -833,6 +987,8 @@ async def test_final_shutdown_check_fails_closed_on_query_error(
 async def test_migration_path_uses_systemd_run_when_managed(tmp_path):
     svc = _make_service(tmp_path)
     state = _make_state()
+    svc._current = state
+    assert svc._claim_deployment_lease("update")
 
     with patch.object(svc, "_systemd_scope", return_value="user"), \
          patch("backend.services.update_service.subprocess.Popen") as popen, \
@@ -843,7 +999,7 @@ async def test_migration_path_uses_systemd_run_when_managed(tmp_path):
     assert "systemd-run" in Path(argv[0]).name
     assert "--user" in argv
     assert "--collect" in argv
-    assert f"--unit=ccm-update-{svc.port}" in argv
+    assert any(arg.startswith(f"--unit=ccm-update-{svc.port}-") for arg in argv)
     assert str(SCRIPT.name) in " ".join(argv)
     # the script itself must NOT rely on start_new_session here
     assert "start_new_session" not in popen.call_args.kwargs
@@ -854,6 +1010,8 @@ async def test_migration_path_uses_systemd_run_when_managed(tmp_path):
 async def test_migration_path_uses_system_systemd_run_for_system_service(tmp_path):
     svc = _make_service(tmp_path)
     state = _make_state()
+    svc._current = state
+    assert svc._claim_deployment_lease("update")
 
     with patch.object(svc, "_systemd_scope", return_value="system"), \
          patch("backend.services.update_service.subprocess.Popen") as popen, \
@@ -863,13 +1021,16 @@ async def test_migration_path_uses_system_systemd_run_for_system_service(tmp_pat
     argv = popen.call_args[0][0]
     assert argv[:4] == [svc._tools["sudo"], "-n", svc._tools["systemd-run"], "--collect"]
     assert "--user" not in argv
-    assert argv[-1] == "system"
+    assert "system" in argv
+    assert f"--uid={os.getuid()}" in argv
 
 
 @pytest.mark.asyncio
 async def test_migration_path_plain_popen_when_not_managed(tmp_path):
     svc = _make_service(tmp_path)
     state = _make_state()
+    svc._current = state
+    assert svc._claim_deployment_lease("update")
 
     with patch.object(svc, "_systemd_scope", return_value=None), \
          patch("backend.services.update_service.subprocess.Popen") as popen, \
@@ -911,14 +1072,15 @@ def test_recover_marks_interrupted_update_failed(tmp_path, status, step):
 
 
 @pytest.mark.parametrize("status", ["restarting", "starting"])
-def test_recover_marks_restart_completed(tmp_path, status):
+def test_legacy_unverified_restart_is_not_assumed_completed(tmp_path, status):
     svc = _make_service(tmp_path)
     _write_status(svc, status, "start_service")
 
     svc.recover_from_status_file()
 
     assert svc._current is not None
-    assert svc._current.status == "completed"
+    assert svc._current.status == "failed"
+    assert svc._current.deployment_incomplete is True
 
 
 # ---- rollback must never touch the DB while the service is running ----
@@ -1003,9 +1165,15 @@ def test_migrate_script_rollback_mode(tmp_path):
     subprocess.run(["git", "commit", "-aqm", "v2"], cwd=project, check=True, env=genv)
 
     db = tmp_path / "claude_manager.db"
-    db.write_text("corrupted")
     backup = tmp_path / "backup.db"
-    backup.write_text("good-data")
+    for path, value in ((db, "new"), (backup, "old")):
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+            connection.execute("INSERT INTO marker VALUES (?)", (value,))
+            connection.commit()
+        finally:
+            connection.close()
 
     subprocess.run(
         ["bash", str(SCRIPT), str(project), old, str(backup), "8999",
@@ -1014,7 +1182,11 @@ def test_migrate_script_rollback_mode(tmp_path):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
-    assert db.read_text() == "good-data"
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute("SELECT value FROM marker").fetchone() == ("old",)
+    finally:
+        connection.close()
     assert (project / "f.txt").read_text() == "v1"
     calls = call_log.read_text()
     assert "stop ccm.service" in calls and "start ccm.service" in calls
@@ -1043,9 +1215,21 @@ def _script_env(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     call_log = tmp_path / "systemctl.log"
+    active_state = tmp_path / "systemctl.active"
+    active_state.write_text("active")
 
     systemctl = bin_dir / "systemctl"
-    systemctl.write_text(f'#!/bin/bash\necho "$@" >> {call_log}\nexit 0\n')
+    systemctl.write_text(
+        "#!/bin/bash\n"
+        f'echo "$@" >> {call_log}\n'
+        'if [ "${1:-}" = "--user" ]; then shift; fi\n'
+        'case "${1:-}" in\n'
+        f'  stop) echo inactive > {active_state}; exit 0;;\n'
+        f'  start) echo active > {active_state}; exit 0;;\n'
+        f'  is-active) grep -qx active {active_state}; exit $?;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
     sudo = bin_dir / "sudo"
     sudo.write_text('#!/bin/bash\nif [ "${1:-}" = "-n" ]; then shift; fi\nexec "$@"\n')
     # stub uv: alembic hangs so the test can kill the script mid-migration
@@ -1056,6 +1240,11 @@ def _script_env(
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["CCM_UPDATE_HEALTHCHECK_MODE"] = "skip"
+    env["CCM_UPDATE_PIDCHECK_MODE"] = "skip"
+    env["CCM_UPDATE_START_ATTEMPTS"] = "1"
+    env["CCM_UPDATE_HEALTH_ATTEMPTS"] = "1"
+    env["CCM_UPDATE_STABILITY_CHECKS"] = "1"
     if escaped:
         env["CCM_ESCAPED"] = "1"
     else:
@@ -1067,8 +1256,17 @@ def test_migrate_script_bare_uvicorn_mode(tmp_path):
     """SERVICE_NAME='-': stop = kill the given pid, start = respawn uvicorn."""
     env, call_log = _script_env(tmp_path)
     bin_dir = tmp_path / "bin"
+    spawned_pid = tmp_path / "spawned.pid"
     python_stub = bin_dir / "python-stub"
-    python_stub.write_text(f'#!/bin/bash\necho "python $@" >> {call_log}\n')
+    python_stub.write_text(
+        "#!/bin/bash\n"
+        'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "uvicorn" ]; then\n'
+        f'  echo "python $@" >> {call_log}\n'
+        f'  echo "$$" > {spawned_pid}\n'
+        "  exec sleep 30\n"
+        "fi\n"
+        f'exec {sys.executable} "$@"\n'
+    )
     python_stub.chmod(python_stub.stat().st_mode | stat.S_IEXEC)
 
     project = tmp_path / "proj"
@@ -1081,9 +1279,15 @@ def test_migrate_script_bare_uvicorn_mode(tmp_path):
     old = subprocess.run(["git", "rev-parse", "HEAD"], cwd=project, capture_output=True, text=True, env=genv).stdout.strip()
 
     db = tmp_path / "claude_manager.db"
-    db.write_text("corrupted")
     backup = tmp_path / "backup.db"
-    backup.write_text("good-data")
+    for path, value in ((db, "new"), (backup, "old")):
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+            connection.execute("INSERT INTO marker VALUES (?)", (value,))
+            connection.commit()
+        finally:
+            connection.close()
 
     dummy_server = subprocess.Popen(["sleep", "60"])
     try:
@@ -1094,25 +1298,59 @@ def test_migrate_script_bare_uvicorn_mode(tmp_path):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         assert dummy_server.wait(timeout=5) != 0  # killed by svc_stop
-        assert db.read_text() == "good-data"
+        connection = sqlite3.connect(db)
+        try:
+            assert connection.execute("SELECT value FROM marker").fetchone() == ("old",)
+        finally:
+            connection.close()
         calls = call_log.read_text()
         assert "systemctl" not in calls or "ccm.service" not in calls
         assert "python -m uvicorn backend.main:app" in calls  # respawned
     finally:
         if dummy_server.poll() is None:
             dummy_server.kill()
+        if spawned_pid.exists():
+            os.kill(int(spawned_pid.read_text()), signal.SIGKILL)
 
 
 def test_migrate_script_trap_starts_service_even_if_killed(tmp_path):
     """Reproduces the incident: script dies after stopping the service —
     the EXIT trap must still start the service."""
     env, call_log = _script_env(tmp_path)
-    (tmp_path / "backup.db").write_text("db")
     project = tmp_path / "proj"
     project.mkdir()
+    genv = {
+        **env,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True, env=genv)
+    (project / "f.txt").write_text("v1")
+    subprocess.run(["git", "add", "."], cwd=project, check=True, env=genv)
+    subprocess.run(
+        ["git", "commit", "-qm", "v1"], cwd=project, check=True, env=genv
+    )
+    old = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=genv,
+    ).stdout.strip()
+    for path in (tmp_path / "backup.db", tmp_path / "claude_manager.db"):
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+            connection.execute("INSERT INTO marker VALUES ('db')")
+            connection.commit()
+        finally:
+            connection.close()
 
     proc = subprocess.Popen(
-        ["bash", str(SCRIPT), str(project), "deadbeef",
+        ["bash", str(SCRIPT), str(project), old,
          str(tmp_path / "backup.db"), "8999",
          str(tmp_path / "claude_manager.db"), "ccm.service"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

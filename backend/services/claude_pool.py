@@ -140,6 +140,44 @@ def quota_usage_at_or_above(
     return False
 
 
+def api_quota_at_or_above(
+    snapshot: dict | None,
+    *,
+    threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
+) -> bool:
+    """Whether a generic API quota/window reached ``threshold``.
+
+    CloudRouter exposes wallet, subscription, and quota-limited shapes through
+    one normalized snapshot.  Unknown/missing limits stay eligible; only a
+    proven unavailable state or a real used/limit ratio can trigger rotation.
+    """
+
+    if not isinstance(snapshot, dict):
+        return False
+    if bool(snapshot.get("known")) and snapshot.get("available") is False:
+        return True
+    candidates: list[dict] = []
+    quota = snapshot.get("quota")
+    if isinstance(quota, dict):
+        candidates.append(quota)
+    windows = snapshot.get("windows")
+    if isinstance(windows, list):
+        candidates.extend(
+            window for window in windows if isinstance(window, dict)
+        )
+    for window in candidates:
+        if window.get("unlimited") is True:
+            continue
+        try:
+            limit = float(window.get("limit"))
+            used = float(window.get("used"))
+        except (TypeError, ValueError):
+            continue
+        if limit > 0 and (used / limit) * 100 >= threshold:
+            return True
+    return False
+
+
 def quota_cooldown_seconds(
     rate_limit_info: dict | None,
     *,
@@ -303,7 +341,19 @@ OAUTH_USER_AGENT = "claude-cli/2.1.0 (external, cli)"
 
 
 class PoolAccount:
-    __slots__ = ("id", "config_dir", "email", "role", "enabled")
+    __slots__ = (
+        "id",
+        "config_dir",
+        "email",
+        "role",
+        "enabled",
+        "retired",
+        "auth_kind",
+        "display_name",
+        "api_account_id",
+        "supported_models",
+        "_api_account",
+    )
 
     def __init__(self, data: dict):
         account_id = data.get("id") or data.get("name")
@@ -314,12 +364,62 @@ class PoolAccount:
         self.email: str = data.get("email", "")
         self.role: str = data.get("role", "automation")
         self.enabled: bool = data.get("enabled", True)
+        self.retired: bool = bool(data.get("retired", False))
+        self.auth_kind: str = str(data.get("auth_kind") or "subscription")
+        self.display_name: str = str(
+            data.get("display_name") or self.email or self.id
+        )
+        self.api_account_id: str | None = data.get("api_account_id")
+        self.supported_models: list[str] | None = data.get("supported_models")
+        self._api_account = data.get("_api_account")
+
+    @classmethod
+    def from_cloudrouter(cls, account) -> "PoolAccount":
+        return cls({
+            "id": account.id,
+            "config_dir": str(account.claude_config_dir),
+            "email": "",
+            "role": "automation",
+            # Keep a disabled projection if a later model refresh removes the
+            # Claude family. Historical JSONL sessions in this directory must
+            # remain discoverable for safe migration.
+            "enabled": (
+                bool(account.enabled)
+                and not bool(account.retired)
+                and bool((account.models or {}).get("claude"))
+            ),
+            "retired": bool(account.retired),
+            "auth_kind": "cloudrouter_api",
+            "display_name": account.name,
+            "api_account_id": account.id,
+            "supported_models": list((account.models or {}).get("claude", [])),
+            "_api_account": account,
+        })
+
+    def supports_model(self, model: str | None) -> bool:
+        if self.auth_kind != "cloudrouter_api":
+            return True
+        try:
+            return bool(self._api_account.supports_model("claude", model))
+        except Exception:
+            logger.exception(
+                "Could not evaluate CloudRouter model support for %s", self.id
+            )
+            return False
 
 
 class ClaudePool:
     """In-process account pool with cooldown tracking."""
 
-    def __init__(self, config_path: str | Path | None = None, cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS):
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+        *,
+        cloudrouter_store=None,
+        bootstrap_default: bool = True,
+        include_native: bool = True,
+    ):
         if config_path:
             expanded = os.path.expandvars(os.path.expanduser(str(config_path)))
             self._config_path = Path(expanded)
@@ -339,6 +439,10 @@ class ClaudePool:
         self._last_selected_at: float = 0.0
         self._usage_cache: list[dict] | None = None
         self._usage_cache_at: float = 0.0
+        self._api_quota_cache: dict[str, dict] = {}
+        self._cloudrouter_store = cloudrouter_store
+        self._bootstrap_native = bool(bootstrap_default)
+        self._include_native = bool(include_native)
         # account_id -> asyncio.Lock，防并发重复 refresh（refresh token 会轮换）
         self._refresh_locks: dict[str, object] = {}
         self._load()
@@ -348,14 +452,43 @@ class ClaudePool:
         return True
 
     def _load(self):
-        if not self._config_path.exists():
-            self._bootstrap_default_account()
+        if self._include_native and not self._config_path.exists():
+            if self._bootstrap_native:
+                self._bootstrap_default_account()
             if not self._config_path.exists():
-                logger.info("Pool config not found at %s, pool empty", self._config_path)
-                return
+                logger.info(
+                    "Native pool config not found at %s; loading API accounts only",
+                    self._config_path,
+                )
         try:
-            data = json.loads(self._config_path.read_text(encoding="utf-8"))
-            self._accounts = [PoolAccount(a) for a in data.get("accounts", [])]
+            data = (
+                json.loads(self._config_path.read_text(encoding="utf-8"))
+                if self._include_native and self._config_path.exists()
+                else {"accounts": []}
+            )
+            accounts = [PoolAccount(a) for a in data.get("accounts", [])]
+            if self._cloudrouter_store is not None:
+                known_ids = {account.id for account in accounts}
+                known_dirs = {account.config_dir for account in accounts}
+                for api_account in self._cloudrouter_store.all_accounts(
+                    include_retired=True
+                ):
+                    projection = PoolAccount.from_cloudrouter(api_account)
+                    if (
+                        projection.id in known_ids
+                        or projection.config_dir in known_dirs
+                    ):
+                        logger.error(
+                            "Skipping duplicate CloudRouter Claude projection "
+                            "%s (%s)",
+                            projection.id,
+                            projection.config_dir,
+                        )
+                        continue
+                    accounts.append(projection)
+                    known_ids.add(projection.id)
+                    known_dirs.add(projection.config_dir)
+            self._accounts = accounts
             logger.info("Pool loaded %d accounts from %s", len(self._accounts), self._config_path)
         except Exception:
             logger.exception("Failed to load pool config from %s", self._config_path)
@@ -395,22 +528,71 @@ class ClaudePool:
 
     def reload(self):
         self._accounts.clear()
+        self._usage_cache = None
+        self._usage_cache_at = 0.0
+        self._api_quota_cache.clear()
         self._load()
+
+    def _api_quota_decision(self, account: PoolAccount) -> dict:
+        if (
+            account.auth_kind != "cloudrouter_api"
+            or self._cloudrouter_store is None
+            or not account.api_account_id
+        ):
+            return {"available": True, "known": False, "reason": ""}
+        try:
+            decision = self._cloudrouter_store.cached_quota_decision(
+                account.api_account_id
+            )
+            return decision if isinstance(decision, dict) else {
+                "available": True,
+                "known": False,
+                "reason": "",
+            }
+        except Exception:
+            logger.exception(
+                "Could not read cached CloudRouter quota for %s", account.id
+            )
+            return {"available": True, "known": False, "reason": ""}
+
+    def _account_available(self, account: PoolAccount, now: float) -> bool:
+        if not account.enabled or account.retired:
+            return False
+        if now < self._cooldowns.get(account.id, 0):
+            return False
+        decision = self._api_quota_decision(account)
+        if (
+            bool(decision.get("known"))
+            and decision.get("available") is False
+        ):
+            return False
+        return True
 
     def list_accounts(self) -> list[dict]:
         now = time.time()
         result = []
         for a in self._accounts:
+            if a.retired or (
+                a.auth_kind == "cloudrouter_api"
+                and not a.supported_models
+            ):
+                continue
             cd_until = self._cooldowns.get(a.id, 0)
+            available = self._account_available(a, now)
             result.append({
                 "id": a.id,
                 "config_dir": a.config_dir,
                 "email": a.email,
                 "role": a.role,
                 "enabled": a.enabled,
-                "available": a.enabled and now >= cd_until,
+                "available": available,
                 "cooldown_until": cd_until if cd_until > now else None,
                 "cooldown_remaining": max(0, cd_until - now) if cd_until > now else 0,
+                "auth_kind": a.auth_kind,
+                "display_name": a.display_name,
+                "api_account_id": a.api_account_id,
+                "supported_models": a.supported_models,
+                "api_quota": self._api_quota_cache.get(a.id),
             })
         return result
 
@@ -442,13 +624,21 @@ class ClaudePool:
             self._preferred_account_id = None
             logger.info("Pool preferred account cleared (auto rotation)")
             return True
-        if not any(a.id == account_id for a in self._accounts):
+        if not any(
+            a.id == account_id and not a.retired for a in self._accounts
+        ):
             return False
         self._preferred_account_id = account_id
         logger.info("Pool preferred account set to %s", account_id)
         return True
 
-    def select(self, *, exclude: set[str] | None = None, validate: bool = False) -> str | None:
+    def select(
+        self,
+        *,
+        exclude: set[str] | None = None,
+        validate: bool = False,
+        model: str | None = None,
+    ) -> str | None:
         """Pick the best available account config_dir, excluding specified IDs.
 
         Returns the config_dir path, or None if no account is available.
@@ -456,11 +646,11 @@ class ClaudePool:
         now = time.time()
         candidates = []
         for a in self._accounts:
-            if not a.enabled:
-                continue
             if exclude and a.id in exclude:
                 continue
-            if now < self._cooldowns.get(a.id, 0):
+            if not self._account_available(a, now):
+                continue
+            if not a.supports_model(model):
                 continue
             candidates.append(a)
 
@@ -491,16 +681,34 @@ class ClaudePool:
         logger.warning("Pool has no healthy accounts after validation (exclude=%s)", exclude)
         return None
 
-    async def select_async(self, *, exclude: set[str] | None = None, validate: bool = False) -> str | None:
+    async def select_async(
+        self,
+        *,
+        exclude: set[str] | None = None,
+        validate: bool = False,
+        model: str | None = None,
+    ) -> str | None:
         """Async wrapper for :meth:`select` — runs probe subprocesses in a thread
         so validation doesn't block the event loop (up to 30s per account)."""
         import asyncio
-        return await asyncio.to_thread(self.select, exclude=exclude, validate=validate)
+        return await asyncio.to_thread(
+            self.select,
+            exclude=exclude,
+            validate=validate,
+            model=model,
+        )
 
     def _probe_account(self, account: PoolAccount) -> bool:
         """Run a small Claude CLI probe before assigning work to an account."""
         # Same nested-session cleanup as InstanceManager.launch
         env = {k: v for k, v in os.environ.items() if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
+        if account.auth_kind == "cloudrouter_api":
+            for key in (
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ):
+                env.pop(key, None)
         env["CLAUDE_CONFIG_DIR"] = account.config_dir
         try:
             proc = subprocess.run(
@@ -592,6 +800,65 @@ class ClaudePool:
         )
         return account is not None and not account.enabled
 
+    def is_config_dir_available(self, config_dir: str) -> bool:
+        """Whether a registered account is selectable without a live probe.
+
+        Besides the native enabled/cooldown checks this also honors a cached
+        CloudRouter quota decision.  Resume routing uses this instead of
+        separately checking cooldown/disabled so a key with a proven exhausted
+        quota cannot keep receiving turns merely because its session is
+        resident in that account directory.
+        """
+
+        account = next(
+            (a for a in self._accounts if a.config_dir == config_dir), None
+        )
+        return bool(account and self._account_available(account, time.time()))
+
+    def supports_model_for_config_dir(
+        self, config_dir: str, model: str | None
+    ) -> bool:
+        """Whether a known account can execute ``model``.
+
+        Subscription accounts retain their existing unrestricted behavior.
+        CloudRouter projections are restricted to the models reported for the
+        key's bound model group.
+        """
+
+        account = next(
+            (a for a in self._accounts if a.config_dir == config_dir), None
+        )
+        return True if account is None else account.supports_model(model)
+
+    def has_compatible_enabled_account(self, model: str | None) -> bool:
+        """Whether any non-retired account is configured for ``model``.
+
+        Cooldown/quota state is intentionally ignored so callers can
+        distinguish a temporary exhausted pool from a permanent model-group
+        mismatch.
+        """
+
+        return any(
+            account.enabled
+            and not account.retired
+            and account.supports_model(model)
+            for account in self._accounts
+        )
+
+    def has_native_enabled_account(self) -> bool:
+        return any(
+            account.enabled
+            and not account.retired
+            and account.auth_kind != "cloudrouter_api"
+            for account in self._accounts
+        )
+
+    def is_cloudrouter_account(self, config_dir: str) -> bool:
+        account = next(
+            (a for a in self._accounts if a.config_dir == config_dir), None
+        )
+        return bool(account and account.auth_kind == "cloudrouter_api")
+
     def is_known_account(self, config_dir: str) -> bool:
         """Whether this config_dir is a registered pool account.
 
@@ -648,6 +915,8 @@ class ClaudePool:
         acc = self.account(account_id)
         if acc is None:
             raise KeyError(account_id)
+        if acc.auth_kind == "cloudrouter_api":
+            return False
         creds = await self._refresh_oauth(acc, Path(acc.config_dir) / ".credentials.json")
         if creds is None:
             return False
@@ -729,13 +998,46 @@ class ClaudePool:
 
         async def fetch_one(account: PoolAccount) -> dict:
             base = {"id": account.id, "email": account.email, "enabled": account.enabled,
-                    "subscription_type": None, "error": None, "usage": None}
+                    "subscription_type": None, "error": None, "usage": None,
+                    "auth_kind": account.auth_kind,
+                    "display_name": account.display_name,
+                    "api_account_id": account.api_account_id,
+                    "supported_models": account.supported_models,
+                    "api_quota": None}
             # Disabled (retired) accounts make zero outbound requests: don't read
             # their credentials, don't refresh their OAuth token, don't hit the
             # usage API. Combined with select() skipping them and resume migrating
             # off them, a disabled account is fully untouched by this process.
             if not account.enabled:
                 base["error"] = "disabled"
+                return base
+            if account.auth_kind == "cloudrouter_api":
+                if self._cloudrouter_store is None or not account.api_account_id:
+                    base["error"] = "api_store_unavailable"
+                    return base
+                try:
+                    snapshot = await self._cloudrouter_store.fetch_usage(
+                        account.api_account_id,
+                        force=force,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "CloudRouter usage read failed for %s: %s",
+                        account.id,
+                        exc,
+                    )
+                    base["error"] = f"request_failed: {exc}"[:200]
+                    return base
+                if isinstance(snapshot, dict):
+                    base["api_quota"] = snapshot
+                    self._api_quota_cache[account.id] = snapshot
+                    if (
+                        bool(snapshot.get("known"))
+                        and snapshot.get("available") is False
+                    ):
+                        base["error"] = snapshot.get("reason") or "unavailable"
+                else:
+                    base["error"] = "invalid_api_quota"
                 return base
             cred_path = Path(account.config_dir) / ".credentials.json"
             try:
@@ -778,7 +1080,18 @@ class ClaudePool:
             }
             return base
 
-        results = await asyncio.gather(*(fetch_one(a) for a in self._accounts))
+        public_accounts = [
+            account
+            for account in self._accounts
+            if not account.retired
+            and not (
+                account.auth_kind == "cloudrouter_api"
+                and not account.supported_models
+            )
+        ]
+        results = await asyncio.gather(
+            *(fetch_one(account) for account in public_accounts)
+        )
         self._usage_cache = list(results)
         self._usage_cache_at = now
         return self._usage_cache
@@ -788,6 +1101,7 @@ class ClaudePool:
         current_config_dir: str,
         *,
         threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
+        model: str | None = None,
     ) -> str | None:
         """Pick an available alternative whose known quota is below threshold.
 
@@ -804,11 +1118,34 @@ class ClaudePool:
         usage_by_id = {
             row["id"]: row for row in await self.fetch_usage(force=True)
         }
+        current_account = self.account(current_id)
+        if current_account and current_account.auth_kind == "cloudrouter_api":
+            current_row = usage_by_id.get(current_id)
+            current_snapshot = (
+                current_row.get("api_quota")
+                if isinstance(current_row, dict)
+                else None
+            )
+            if not api_quota_at_or_above(
+                current_snapshot,
+                threshold=threshold,
+            ):
+                return None
         excluded = {current_id}
         for account in self._accounts:
             if account.id == current_id:
                 continue
             row = usage_by_id.get(account.id)
+            if account.auth_kind == "cloudrouter_api":
+                snapshot = (
+                    row.get("api_quota") if isinstance(row, dict) else None
+                )
+                if api_quota_at_or_above(
+                    snapshot,
+                    threshold=threshold,
+                ):
+                    excluded.add(account.id)
+                continue
             if row and (
                 str(row.get("error") or "").lower()
                 in _DEFINITIVE_QUOTA_AUTH_ERRORS
@@ -817,7 +1154,7 @@ class ClaudePool:
                 )
             ):
                 excluded.add(account.id)
-        return self.select(exclude=excluded, validate=False)
+        return self.select(exclude=excluded, validate=False, model=model)
 
 
 # ---------------------------------------------------------------------------

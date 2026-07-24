@@ -67,6 +67,25 @@ def test_assistant_message(parser):
     assert result["content"] == "Hello world"
 
 
+def test_assistant_api_error_message_is_marked_error(parser):
+    line = json.dumps({
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "API Error: upstream unavailable"},
+            ],
+        },
+    })
+
+    result = parser.parse_line(line)[0]
+
+    assert result["event_type"] == "message"
+    assert result["content"] == "API Error: upstream unavailable"
+    assert result["is_error"] is True
+
+
 def test_tool_use(parser):
     line = json.dumps({
         "type": "tool_use",
@@ -121,6 +140,33 @@ def test_result_is_error(parser):
     })
     result = parser.parse_line(line)[0]
     assert result["is_error"] is True
+
+
+@pytest.mark.parametrize(
+    ("terminal_field", "terminal_value", "expected"),
+    [
+        ("result", "API Error: upstream_error", "API Error: upstream_error"),
+        (
+            "error",
+            {"type": "upstream_error", "message": "Gateway timed out"},
+            "Gateway timed out",
+        ),
+    ],
+)
+def test_error_result_extracts_top_level_terminal_text(
+    parser, terminal_field, terminal_value, expected
+):
+    payload = {
+        "type": "result",
+        "is_error": True,
+        terminal_field: terminal_value,
+    }
+
+    result = parser.parse_line(json.dumps(payload))[0]
+
+    assert result["event_type"] == "result"
+    assert result["is_error"] is True
+    assert result["content"] == expected
 
 
 def test_content_extraction_string(parser):

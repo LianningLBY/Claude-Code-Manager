@@ -30,6 +30,9 @@ os.environ.update({
     "POOL_CONFIG_PATH": str(
         _GLOBAL_TEST_DB_DIR / "claude-pool" / "accounts.json"
     ),
+    "CLOUDROUTER_ACCOUNTS_DIR": str(
+        _GLOBAL_TEST_DB_DIR / "cloudrouter-accounts"
+    ),
     "WORKSPACE_DIR": str(_GLOBAL_TEST_DB_DIR / "workspace"),
     "WORKER_ENABLED": "false",
     "POOL_ENABLED": "false",

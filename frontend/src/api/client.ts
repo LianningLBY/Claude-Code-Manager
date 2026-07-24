@@ -420,7 +420,81 @@ export interface PoolUsageWindow {
   resets_at: string | null;
 }
 
-export interface PoolAccountUsage {
+export interface CloudRouterQuotaWindow {
+  id?: string | null;
+  label?: string | null;
+  used?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  utilization?: number | null;
+  reset_at?: string | number | null;
+  resets_at?: string | number | null;
+  currency?: string | null;
+}
+
+export interface CloudRouterQuotaTotal {
+  used?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  currency?: string | null;
+}
+
+export interface CloudRouterApiQuota {
+  state: string;
+  status?: string | null;
+  mode?: string | null;
+  currency?: string | null;
+  unit?: string | null;
+  quota?: CloudRouterQuotaTotal | null;
+  remaining?: number | null;
+  balance?: number | null;
+  windows?: CloudRouterQuotaWindow[];
+  available?: boolean;
+  known?: boolean;
+  stale?: boolean;
+  reason?: string | null;
+  plan_name?: string | null;
+  expires_at?: string | number | null;
+  days_until_expiry?: number | null;
+  fetched_at?: string | number | null;
+  usage?: Record<string, unknown> | null;
+  account_id?: string;
+}
+
+export interface CloudRouterModelMap {
+  claude: string[];
+  codex: string[];
+}
+
+export interface CloudRouterAccount {
+  id: string;
+  name: string;
+  enabled: boolean;
+  retired: boolean;
+  key_hint: string;
+  models: CloudRouterModelMap;
+  providers: string[];
+  account_dir: string;
+  claude_config_dir: string;
+  codex_home: string;
+  supported_models: string[];
+  endpoints: Record<string, string>;
+  api_quota?: CloudRouterApiQuota | null;
+}
+
+export interface CloudRouterRetireResult extends CloudRouterAccount {
+  ok: boolean;
+}
+
+export interface CloudRouterAccountProjection {
+  auth_kind?: string | null;
+  display_name?: string | null;
+  api_account_id?: string | null;
+  supported_models?: string[];
+  api_quota?: CloudRouterApiQuota | null;
+}
+
+export interface PoolAccountUsage extends CloudRouterAccountProjection {
   id: string;
   config_dir: string;
   email: string;
@@ -465,7 +539,7 @@ export interface CodexPoolQuota {
   has_credits: boolean;
 }
 
-export interface CodexPoolAccountUsage {
+export interface CodexPoolAccountUsage extends CloudRouterAccountProjection {
   id: string;
   codex_home: string;
   email: string;
@@ -785,6 +859,24 @@ export const api = {
     request<{ ok: boolean; method: string; status: string }>(`/api/pool/accounts/${accountId}/relogin`, { method: 'POST' }),
   poolReloginStatus: (accountId: string) =>
     request<{ status: string; detail?: string }>(`/api/pool/accounts/${accountId}/relogin`),
+
+  // CloudRouter API accounts are projected into both existing pools. Their
+  // secret is accepted only when creating the dedicated account directory.
+  getCloudRouterAccounts: (force?: boolean) =>
+    request<CloudRouterAccount[]>('/api/cloudrouter/accounts' + (force ? '?force=true' : '')),
+  createCloudRouterAccount: (data: { name: string; api_key: string }) =>
+    request<CloudRouterAccount>('/api/cloudrouter/accounts', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  refreshCloudRouterAccount: (accountId: string) =>
+    request<CloudRouterAccount>(`/api/cloudrouter/accounts/${encodeURIComponent(accountId)}/refresh`, {
+      method: 'POST',
+    }),
+  deleteCloudRouterAccount: (accountId: string) =>
+    request<CloudRouterRetireResult>(`/api/cloudrouter/accounts/${encodeURIComponent(accountId)}`, {
+      method: 'DELETE',
+    }),
 
   // Global Settings
   getRuntimeSettings: () => request<RuntimeSettings>('/api/settings/runtime'),

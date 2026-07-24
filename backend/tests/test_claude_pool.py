@@ -16,6 +16,7 @@ from backend.services.claude_pool import (
     transient_retry_delay,
     migrate_session,
     collect_process_output_for_detection,
+    api_quota_at_or_above,
     quota_cooldown_seconds,
     quota_usage_at_or_above,
     rate_limit_event_is_actionable,
@@ -228,6 +229,7 @@ class TestClaudePool:
     def test_select_excludes_specified(self, pool, tmp_path):
         result = pool.select(exclude={"acc-1"})
         assert result == str(tmp_path / "claude-2")
+
 
     def test_select_returns_none_when_all_excluded(self, pool):
         result = pool.select(exclude={"acc-1", "acc-2"})
@@ -1148,3 +1150,210 @@ class TestChatTransientRetryCodex:
         ok = await im._try_chat_transient_retry(1, 42, 1, "")
         assert ok is True
         assert im.launch.await_args.kwargs["provider"] == "claude"
+
+
+class _FakeCloudRouterAccount:
+    def __init__(self, root: Path):
+        self.id = "cloudrouter-1"
+        self.name = "CloudRouter test"
+        self.enabled = True
+        self.retired = False
+        self.models = {
+            "claude": ["claude-sonnet-5"],
+            "codex": [],
+        }
+        self.root = root
+        self.claude_config_dir = str(root / "claude")
+        self.codex_home = str(root / "codex")
+
+    def supports_model(self, provider, model):
+        choices = self.models.get(provider, [])
+        return bool(choices) if not model else model in choices
+
+
+class _FakeCloudRouterStore:
+    def __init__(self, account, snapshot=None):
+        self._account = account
+        self._snapshot = snapshot or {
+            "available": True,
+            "known": True,
+            "reason": "active",
+            "state": "active",
+        }
+
+    def all_accounts(self, include_retired=False):
+        return [self._account]
+
+    def cached_quota_decision(self, _account_id):
+        return {
+            key: self._snapshot[key]
+            for key in ("available", "known", "reason")
+        }
+
+    async def fetch_usage(self, _account_id, force=False):
+        return dict(self._snapshot)
+
+
+class TestCloudRouterClaudeProjection:
+    def test_api_only_pool_loads_without_native_config_and_filters_models(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="claude-sonnet-5") == account.claude_config_dir
+        assert pool.select(model="claude-opus-4-8") is None
+        public = pool.list_accounts()[0]
+        assert public["auth_kind"] == "cloudrouter_api"
+        assert public["api_account_id"] == "cloudrouter-1"
+        assert public["supported_models"] == ["claude-sonnet-5"]
+
+    @pytest.mark.asyncio
+    async def test_api_usage_uses_store_and_known_exhaustion_blocks_selection(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": False,
+            "known": True,
+            "reason": "quota_exhausted",
+            "state": "exhausted",
+        }
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        rows = await pool.fetch_usage(force=True)
+
+        assert rows[0]["api_quota"] == snapshot
+        assert rows[0]["error"] == "quota_exhausted"
+        assert pool.select(model="claude-sonnet-5") is None
+
+    @pytest.mark.asyncio
+    async def test_projection_survives_provider_model_removal_for_session_discovery(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        account.models["claude"] = []
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account),
+            bootstrap_default=False,
+        )
+        session = (
+            Path(account.claude_config_dir)
+            / "projects"
+            / "-repo"
+            / "session-after-refresh.jsonl"
+        )
+        session.parent.mkdir(parents=True)
+        session.write_text("{}")
+
+        assert pool.is_known_account(account.claude_config_dir)
+        assert pool.is_disabled(account.claude_config_dir)
+        assert (
+            pool.locate_session_config_dir("session-after-refresh")
+            == account.claude_config_dir
+        )
+        assert pool.list_accounts() == []
+        assert pool.status()["total"] == 0
+        assert await pool.fetch_usage(force=True) == []
+
+    def test_native_config_is_excluded_when_native_pool_toggle_is_off(
+        self, tmp_path
+    ):
+        native_path = tmp_path / "native-accounts.json"
+        native_path.write_text(json.dumps({
+            "accounts": [{
+                "id": "native-old",
+                "config_dir": str(tmp_path / "native-old"),
+                "enabled": True,
+            }],
+        }))
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+
+        pool = ClaudePool(
+            config_path=native_path,
+            cloudrouter_store=_FakeCloudRouterStore(account),
+            bootstrap_default=False,
+            include_native=False,
+        )
+
+        assert [item.id for item in pool._accounts] == ["cloudrouter-1"]
+
+    @pytest.mark.asyncio
+    async def test_api_quota_threshold_selects_only_below_threshold_alternative(
+        self, tmp_path
+    ):
+        current = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        replacement = _FakeCloudRouterAccount(tmp_path / "cloudrouter-2")
+        replacement.id = "cloudrouter-2"
+        replacement.name = "CloudRouter replacement"
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            bootstrap_default=False,
+        )
+        pool._accounts = [
+            PoolAccount.from_cloudrouter(current),
+            PoolAccount.from_cloudrouter(replacement),
+        ]
+        pool._cloudrouter_store = MagicMock()
+        pool._cloudrouter_store.cached_quota_decision.return_value = {
+            "available": True,
+            "known": True,
+            "reason": "active",
+        }
+        pool.fetch_usage = AsyncMock(return_value=[
+            {
+                "id": current.id,
+                "api_quota": {
+                    "known": True,
+                    "available": True,
+                    "quota": {"used": 95, "limit": 100},
+                },
+            },
+            {
+                "id": replacement.id,
+                "api_quota": {
+                    "known": True,
+                    "available": True,
+                    "windows": [{"used": 20, "limit": 100}],
+                },
+            },
+        ])
+
+        assert api_quota_at_or_above(
+            {"known": True, "available": True, "quota": {"used": 90, "limit": 100}}
+        )
+        assert await pool.select_quota_alternative(
+            current.claude_config_dir,
+            model="claude-sonnet-5",
+        ) == replacement.claude_config_dir
+
+        pool.fetch_usage = AsyncMock(return_value=[
+            {
+                "id": current.id,
+                "api_quota": {
+                    "known": True,
+                    "available": True,
+                    "quota": {"used": 50, "limit": 100},
+                },
+            },
+            {
+                "id": replacement.id,
+                "api_quota": {
+                    "known": False,
+                    "available": True,
+                },
+            },
+        ])
+        assert await pool.select_quota_alternative(
+            current.claude_config_dir,
+            model="claude-sonnet-5",
+        ) is None

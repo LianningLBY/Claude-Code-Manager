@@ -17,12 +17,27 @@ user-role 消毒承担（<task-notification> 压成一行 system_event，其余 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
 from claude_pty.adapters.ccm import CCMBackend
 
 logger = logging.getLogger(__name__)
+
+
+def _structured_rate_limit_is_hard(raw: dict) -> bool:
+    """Return whether a raw Claude rate-limit signal aborts the turn."""
+
+    if raw.get("error") == "rate_limit":
+        return True
+    info = raw.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return True
+    if bool(info.get("hard_limit")):
+        return True
+    status = str(info.get("status") or "").lower()
+    return status not in {"allowed", "allowed_warning"}
 
 
 class FullMirrorCCMBackend(CCMBackend):
@@ -42,6 +57,42 @@ class FullMirrorCCMBackend(CCMBackend):
         record = getattr(
             consumer, "_ccm_output_consumer_record", None
         )
+        raw = event_dict.get("raw_json")
+        if raw:
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                parsed = None
+            if (
+                isinstance(parsed, dict)
+                and parsed.get("type") == "rate_limit_event"
+            ):
+                event_dict = dict(event_dict)
+                event_dict["event_type"] = "rate_limit_event"
+                event_dict["rate_limit_info"] = parsed.get(
+                    "rate_limit_info"
+                )
+                hard_limit = _structured_rate_limit_is_hard(parsed)
+                event_dict["is_error"] = hard_limit
+                if (
+                    not hard_limit
+                    or event_dict.get("orphan")
+                    or event_dict.get("autonomous")
+                ):
+                    # Pinned claude-pty marks every structured quota event as
+                    # terminal before yielding it. on_event is awaited before
+                    # Session checks that latch, so clear soft events and hard
+                    # events proven to belong to stale/autonomous turns. Only
+                    # a hard signal from this foreground turn may abort it.
+                    process = getattr(record, "process", None)
+                    session = getattr(process, "session", None)
+                    if (
+                        session is None
+                        and self._consumers.get(key) is consumer
+                    ):
+                        session = self._sessions.get(key)
+                    if session is not None:
+                        session._rate_limited_turn = False
         try:
             await self._im._process_event(
                 key,
@@ -91,12 +142,40 @@ class FullMirrorCCMBackend(CCMBackend):
             and self._im._tasks.get(key) is consumer
             and self._im.processes.get(key) is getattr(record, "process", None)
         )
+        provider_error = str(
+            getattr(record, "fatal_provider_error", "") or ""
+        ).strip()
+        rate_limit_info = self._im.pty_rate_limit_info(key) or {}
+        rate_limit_status = str(
+            rate_limit_info.get("status") or ""
+        ).lower()
+        hard_rate_limit = bool(rate_limit_info.get("hard_limit")) or (
+            bool(rate_limit_status)
+            and rate_limit_status not in {"allowed", "allowed_warning"}
+        )
+        semantic_turn_failure = bool(
+            owns_record
+            and (
+                provider_error
+                or self._im.transient_error_seen(key)
+                or hard_rate_limit
+            )
+        )
+        if ec == 0 and semantic_turn_failure:
+            # A PTY process is intentionally persistent. Its OS-level success
+            # cannot override a failed API turn recorded in JSONL.
+            ec = 1
+
         if chat_initiated and task_id and owns_record and ec not in (0, -2, 130):
             try:
-                rotated = await self._im._try_chat_pool_rotation(
-                    key, task_id, ec, ""
+                retried = await self._im._try_chat_transient_retry(
+                    key, task_id, ec, provider_error
                 )
-                if rotated:
+                if not retried:
+                    retried = await self._im._try_chat_pool_rotation(
+                        key, task_id, ec, provider_error
+                    )
+                if retried:
                     old_proxy = record.process
                     new_proxy = self._proxies.get(key)
                     if new_proxy is not None and new_proxy is not old_proxy:
@@ -106,7 +185,7 @@ class FullMirrorCCMBackend(CCMBackend):
                     return
             except Exception:
                 logger.exception(
-                    "Pool rotation check failed for instance %s", key
+                    "PTY retry/rotation check failed for instance %s", key
                 )
 
         final_status = None

@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     codex_pool_config_path: str = "~/.codex-pool/accounts.json"
     codex_pool_cooldown_seconds: int = 300
 
+    # --- CloudRouter API accounts ---
+    # Each API identity owns one private root with separate Claude/Codex native
+    # homes underneath it.  The two provider pools project the same identity
+    # instead of introducing a task-level execution mode.
+    cloudrouter_accounts_dir: str = "~/.ccm/api-accounts"
+
     # --- Transient server-side 429 / overload auto-retry ---
     # Anthropic 基础设施侧的临时限流/过载（"Server is temporarily limiting
     # requests (not your usage limit)" / overloaded）——退避后用同一账号

@@ -714,6 +714,39 @@ async def test_app_server_spawn_uses_independent_session(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_app_server_removes_account_specific_inherited_auth_env(tmp_path):
+    server = CodexAppServer(
+        "codex",
+        codex_home=tmp_path / "api-account",
+        env_remove={"OPENAI_API_KEY", "CLOUDROUTER_API_KEY"},
+    )
+    spawn = AsyncMock(side_effect=RuntimeError("synthetic spawn failure"))
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "must-not-leak",
+                "CLOUDROUTER_API_KEY": "must-not-leak",
+                "UNRELATED": "preserved",
+            },
+            clear=False,
+        ),
+        patch(
+            "backend.services.codex_app_server.asyncio.create_subprocess_exec",
+            spawn,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="synthetic spawn failure"):
+            await server._start()
+
+    child_env = spawn.await_args.kwargs["env"]
+    assert "OPENAI_API_KEY" not in child_env
+    assert "CLOUDROUTER_API_KEY" not in child_env
+    assert child_env["UNRELATED"] == "preserved"
+
+
+@pytest.mark.asyncio
 async def test_shutdown_intent_blocks_a_start_already_waiting_on_lifecycle_lock(
     tmp_path,
 ):

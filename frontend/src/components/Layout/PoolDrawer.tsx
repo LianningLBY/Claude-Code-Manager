@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Plus, RefreshCw, X, Users, Settings } from '../icons';
+import { Eye, EyeOff, Plus, RefreshCw, X, Users, Settings } from '../icons';
 import { api } from '../../api/client';
-import type { CodexLoginMethod, CodexLoginStatus, CodexPoolAccountUsage, CodexPoolUsageStatus, PoolAccountUsage, PoolUsageStatus, PoolUsageWindow } from '../../api/client';
+import type {
+  CloudRouterApiQuota,
+  CodexLoginMethod,
+  CodexLoginStatus,
+  CodexPoolAccountUsage,
+  CodexPoolUsageStatus,
+  PoolAccountUsage,
+  PoolUsageStatus,
+  PoolUsageWindow,
+} from '../../api/client';
 
 const ACTIVE_CODEX_LOGIN_STATUSES = new Set([
   'running', 'awaiting_otp', 'verifying_otp', 'finalizing',
@@ -42,6 +51,213 @@ function UsageBar({ label, window: w }: { label: string; window: PoolUsageWindow
   );
 }
 
+function formatApiAmount(value: number | null | undefined, currency?: string | null): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  // CloudRouter uses -1 for an unrestricted wallet balance. Rendering it as
+  // a negative currency amount would incorrectly look overdrawn/exhausted.
+  if (value === -1) return '无限';
+  const formatted = value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  const unit = currency?.trim();
+  if (!unit) return formatted;
+  if (['usd', '$'].includes(unit.toLowerCase())) return `$${formatted}`;
+  if (['credit', 'credits'].includes(unit.toLowerCase())) return `${formatted} credits`;
+  return `${formatted} ${unit}`;
+}
+
+function formatApiTimestamp(value: string | number | null | undefined): string {
+  if (value == null || value === '') return '无法确认';
+  let timestamp: string | number = value;
+  if (typeof value === 'number') {
+    timestamp = value < 1_000_000_000_000 ? value * 1000 : value;
+  } else if (/^\d+(?:\.\d+)?$/.test(value)) {
+    const numeric = Number(value);
+    timestamp = numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  }
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) return '无法确认';
+  return parsed.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function ApiQuotaPanel({ quota, onRefresh }: {
+  quota: CloudRouterApiQuota | null | undefined;
+  onRefresh: () => void;
+}) {
+  if (!quota) {
+    return (
+      <div className="space-y-1.5 text-xs text-gray-500">
+        <div className="flex items-center gap-2">
+          <span>额度无法确认</span>
+          <button
+            onClick={onRefresh}
+            className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-foreground"
+          >
+            刷新
+          </button>
+        </div>
+        <div>到期时间：无法确认</div>
+        <div>剩余天数：无法确认</div>
+      </div>
+    );
+  }
+
+  const state = quota.state || quota.status || 'unknown';
+  const currency = quota.currency || quota.unit;
+  const normalizedState = state.trim().toLowerCase();
+  const noExpiry = quota.known === true
+    && quota.stale !== true
+    && quota.available !== false
+    && ['ok', 'active'].includes(normalizedState)
+    && quota.mode?.trim().toLowerCase() === 'wallet'
+    && quota.expires_at == null
+    && quota.days_until_expiry == null;
+  const total = quota.quota;
+  const totalUtilization = total?.used != null && total.limit != null && total.limit > 0
+    ? Math.min(100, Math.max(0, (total.used / total.limit) * 100))
+    : null;
+  const remaining = quota.remaining ?? total?.remaining;
+  const stateColor = ['ok', 'active'].includes(state)
+    ? 'text-green-400'
+    : ['exhausted', 'quota_exhausted', 'expired', 'forbidden', 'error'].includes(state)
+      ? 'text-red-400'
+      : 'text-yellow-400';
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px]">
+        <span className="text-gray-500">
+          状态 <span className={`font-medium ${stateColor}`}>{state}</span>
+        </span>
+        {quota.mode && <span className="text-gray-500">模式 <span className="text-gray-300">{quota.mode}</span></span>}
+        {currency && <span className="text-gray-500">单位 <span className="text-gray-300">{currency}</span></span>}
+        {quota.plan_name && <span className="text-gray-500">套餐 <span className="text-gray-300">{quota.plan_name}</span></span>}
+        <button
+          onClick={onRefresh}
+          className="ml-auto text-[10px] text-gray-400 hover:text-foreground underline"
+        >
+          刷新额度
+        </button>
+      </div>
+      {total && (total.used != null || total.limit != null || total.remaining != null) ? (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-[10px]">
+            <span className="text-gray-400">总额度</span>
+            {totalUtilization != null && <span className={textColor(totalUtilization)}>已用 {totalUtilization.toFixed(0)}%</span>}
+          </div>
+          {totalUtilization != null && (
+            <div className="h-2 rounded-full bg-gray-700 overflow-hidden">
+              <div className={`h-full rounded-full ${barColor(totalUtilization)}`} style={{ width: `${totalUtilization}%` }} />
+            </div>
+          )}
+          <div className="flex flex-wrap gap-x-3 text-[10px] text-gray-500">
+            {total.used != null && <span>已用 {formatApiAmount(total.used, total.currency || currency)}</span>}
+            {total.limit != null && <span>上限 {formatApiAmount(total.limit, total.currency || currency)}</span>}
+            {total.remaining != null && <span>剩余 {formatApiAmount(total.remaining, total.currency || currency)}</span>}
+          </div>
+        </div>
+      ) : (remaining != null || quota.balance != null) ? (
+        <div className="flex gap-4 text-xs">
+          {remaining != null && (
+            <span className="text-gray-400">剩余 <span className="font-medium text-foreground">{formatApiAmount(remaining, currency)}</span></span>
+          )}
+          {quota.balance != null && (
+            <span className="text-gray-400">余额 <span className="font-medium text-foreground">{formatApiAmount(quota.balance, currency)}</span></span>
+          )}
+        </div>
+      ) : (
+        <div className="text-xs text-gray-500">总额度：无法确认</div>
+      )}
+      <div className="grid grid-cols-1 gap-1 text-[10px] text-gray-500">
+        <span>到期时间：<span className="text-gray-300">
+          {noExpiry ? '无期限' : formatApiTimestamp(quota.expires_at)}
+        </span></span>
+        <span>剩余天数：<span className="text-gray-300">
+          {noExpiry
+            ? '无期限'
+            : quota.days_until_expiry == null
+              ? '无法确认'
+              : `${quota.days_until_expiry.toLocaleString()} 天`}
+        </span></span>
+      </div>
+      {quota.windows?.map((window, index) => {
+        const utilization = window.utilization != null
+          ? window.utilization
+          : window.used != null && window.limit != null && window.limit > 0
+            ? (window.used / window.limit) * 100
+            : null;
+        const pct = utilization == null ? null : Math.min(100, Math.max(0, utilization));
+        const resetAt = window.reset_at ?? window.resets_at ?? null;
+        return (
+          <div key={window.id || `${window.label || 'window'}-${index}`} className="space-y-1">
+            <div className="flex items-center justify-between gap-2 text-[10px]">
+              <span className="text-gray-400">{window.label || window.id || `额度窗口 ${index + 1}`}</span>
+              <span className="text-gray-500">
+                {resetAt == null ? '重置时间无法确认' : formatApiTimestamp(resetAt)}
+              </span>
+            </div>
+            {pct != null && (
+              <div className="flex items-center gap-2">
+                <div className="flex-1 h-2 rounded-full bg-gray-700 overflow-hidden">
+                  <div className={`h-full rounded-full ${barColor(pct)}`} style={{ width: `${pct}%` }} />
+                </div>
+                <span className={`w-10 shrink-0 text-right text-xs font-medium ${textColor(pct)}`}>{pct.toFixed(0)}%</span>
+              </div>
+            )}
+            {(window.used != null || window.limit != null || window.remaining != null) && (
+              <div className="flex flex-wrap gap-x-3 text-[10px] text-gray-500">
+                {window.used != null && <span>已用 {formatApiAmount(window.used, window.currency || quota.currency)}</span>}
+                {window.limit != null && <span>上限 {formatApiAmount(window.limit, window.currency || quota.currency)}</span>}
+                {window.remaining != null && <span>剩余 {formatApiAmount(window.remaining, window.currency || quota.currency)}</span>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {quota.reason && state !== 'active' && <div className="text-[10px] text-red-400 break-all">{quota.reason}</div>}
+    </div>
+  );
+}
+
+function ApiQuotaDisclosure({ quota, onRefresh }: {
+  quota: CloudRouterApiQuota | null | undefined;
+  onRefresh: () => void;
+}) {
+  const [visible, setVisible] = useState(false);
+
+  return (
+    <div className="space-y-2">
+      <button
+        type="button"
+        onClick={() => setVisible((current) => !current)}
+        aria-expanded={visible}
+        className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-foreground hover:border-gray-500"
+      >
+        {visible ? <EyeOff size={11} /> : <Eye size={11} />}
+        {visible ? '收起额度与有效期' : '查看额度与有效期'}
+      </button>
+      {visible && <ApiQuotaPanel quota={quota} onRefresh={onRefresh} />}
+    </div>
+  );
+}
+
+function ApiAccountModels({ models }: { models?: string[] }) {
+  if (!models?.length) return <div className="text-[10px] text-gray-500">支持模型：尚未获取</div>;
+  return (
+    <div className="flex flex-wrap gap-1" aria-label="支持模型">
+      {models.map((model) => (
+        <span key={model} className="px-1.5 py-0.5 rounded bg-sky-600/15 text-sky-300 text-[10px]">
+          {model}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // --- Codex quota helpers ---
 function formatResetCountdown(epochSec: number | null): string {
   if (!epochSec) return '';
@@ -73,9 +289,10 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
   onRetryUsage: () => void;
-  onDelete: (id: string) => void;
+  onDelete?: (id: string) => void;
   reloginState?: { status: string; message?: string };
 }) {
+  const isApi = account.auth_kind === 'cloudrouter_api';
   const statusDot = !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
@@ -88,8 +305,15 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
     <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${isPreferred ? 'border-indigo-500' : 'border-gray-700'}`}>
       <div className="flex items-center gap-2">
         <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot.cls}`} title={statusDot.label} />
-        <span className="text-sm font-medium text-foreground truncate">{account.id}</span>
-        {account.subscription_type && (
+        <span className="text-sm font-medium text-foreground truncate" title={account.id}>
+          {isApi ? account.display_name || account.id : account.id}
+        </span>
+        {isApi && (
+          <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
+            API
+          </span>
+        )}
+        {!isApi && account.subscription_type && (
           <span className="px-1.5 py-0.5 rounded bg-indigo-600/30 text-indigo-300 text-[10px] font-semibold uppercase">
             {account.subscription_type}
           </span>
@@ -105,7 +329,7 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
-          {!account.available && account.enabled && (
+          {!isApi && !account.available && account.enabled && (
             <button
               onClick={() => onClearCooldown(account.id)}
               className="text-[10px] text-gray-400 hover:text-foreground underline"
@@ -133,17 +357,27 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
               </button>
             )
           )}
-          <button
-            onClick={() => onDelete(account.id)}
-            className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500"
-            title="从号池删除"
-          >
-            删除
-          </button>
+          {onDelete && (
+            <button
+              onClick={() => onDelete(account.id)}
+              className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500"
+              title="从号池删除"
+            >
+              删除
+            </button>
+          )}
         </div>
       </div>
-      {account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
-      {account.usage ? (
+      {!isApi && account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
+      {isApi && (
+        <div className="text-[10px] text-gray-500 font-mono truncate" title={account.config_dir}>
+          CLAUDE_CONFIG_DIR: {account.config_dir}
+        </div>
+      )}
+      {isApi && <ApiAccountModels models={account.supported_models} />}
+      {isApi ? (
+        <ApiQuotaDisclosure quota={account.api_quota} onRefresh={onRetryUsage} />
+      ) : account.usage ? (
         <div className="space-y-1.5">
           <UsageBar label="5h" window={account.usage.five_hour} />
           <UsageBar label="7d" window={account.usage.seven_day} />
@@ -157,7 +391,7 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
               {account.usage_error === 'token_expired' && 'Token 过期，将在使用时自动刷新'}
               {account.usage_error && !['no_credentials', 'token_expired'].includes(account.usage_error) && `额度获取失败: ${account.usage_error}`}
             </span>
-            {account.usage_error === 'no_credentials' && (
+            {account.usage_error === 'no_credentials' && !isApi && (
               <button
                 onClick={() => onRelogin(account.id)}
                 disabled={reloginState?.status === 'running'}
@@ -246,30 +480,38 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
   onSubmitOtp: (state: CodexLoginStatus, code: string) => Promise<void>;
-  onDelete: (id: string) => void;
+  onDelete?: (id: string) => void;
   onRetryUsage: () => void;
   reloginState?: CodexLoginStatus;
 }) {
+  const isApi = account.auth_kind === 'cloudrouter_api';
   const statusDot = !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
       ? { cls: 'bg-green-500', label: '可用' }
       : { cls: 'bg-yellow-500', label: '冷却中' };
 
-  const q = account.quota;
+  const q = isApi ? null : account.quota;
   const isPreferred = preferred === account.id;
 
   return (
     <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${isPreferred ? 'border-emerald-500' : 'border-gray-700'}`}>
       <div className="flex items-center gap-2">
         <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot.cls}`} title={statusDot.label} />
-        <span className="text-sm font-medium text-foreground truncate">{account.id}</span>
-        {account.plan_type && (
+        <span className="text-sm font-medium text-foreground truncate" title={account.id}>
+          {isApi ? account.display_name || account.id : account.id}
+        </span>
+        {isApi && (
+          <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
+            API
+          </span>
+        )}
+        {!isApi && account.plan_type && (
           <span className="px-1.5 py-0.5 rounded bg-emerald-600/30 text-emerald-300 text-[10px] font-semibold uppercase">
             {account.plan_type}
           </span>
         )}
-        {q?.has_credits && (
+        {!isApi && q?.has_credits && (
           <span className="px-1.5 py-0.5 rounded bg-amber-600/30 text-amber-300 text-[10px] font-semibold">
             Credits
           </span>
@@ -280,7 +522,7 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
-          {!account.available && account.enabled && (
+          {!isApi && !account.available && account.enabled && (
             <button onClick={() => onClearCooldown(account.id)} className="text-[10px] text-gray-400 hover:text-foreground underline">
               解除冷却
             </button>
@@ -304,26 +546,33 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
               </button>
             )
           )}
-          <button
-            onClick={() => onRelogin(account.id)}
-            disabled={Boolean(reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status))}
-            className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/20 disabled:opacity-50"
-          >
-            {reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status) ? '登录中…' : '重新登录'}
-          </button>
-          <button
-            onClick={() => onDelete(account.id)}
-            className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500"
-          >
-            删除
-          </button>
+          {!isApi && (
+            <button
+              onClick={() => onRelogin(account.id)}
+              disabled={Boolean(reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status))}
+              className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/20 disabled:opacity-50"
+            >
+              {reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status) ? '登录中…' : '重新登录'}
+            </button>
+          )}
+          {onDelete && (
+            <button
+              onClick={() => onDelete(account.id)}
+              className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500"
+            >
+              删除
+            </button>
+          )}
         </div>
       </div>
-      {account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
+      {!isApi && account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
       <div className="text-[10px] text-gray-500 font-mono truncate" title={account.codex_home}>
         CODEX_HOME: {account.codex_home}
       </div>
-      {q ? (
+      {isApi && <ApiAccountModels models={account.supported_models} />}
+      {isApi ? (
+        <ApiQuotaDisclosure quota={account.api_quota} onRefresh={onRetryUsage} />
+      ) : q ? (
         <div className="space-y-2">
           {/* Primary window */}
           {q.primary_used_percent != null && (
@@ -383,27 +632,113 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
           </div>
         </div>
       )}
-      {reloginState?.status === 'running' && (
+      {!isApi && reloginState?.status === 'running' && (
         <div className="text-xs text-blue-400">自动登录中…</div>
       )}
-      {reloginState?.status === 'awaiting_otp' && (
+      {!isApi && reloginState?.status === 'awaiting_otp' && (
         <CodexOtpPrompt state={reloginState} onSubmit={(code) => onSubmitOtp(reloginState, code)} />
       )}
-      {reloginState?.status === 'verifying_otp' && (
+      {!isApi && reloginState?.status === 'verifying_otp' && (
         <div className="text-xs text-blue-400">验证码已提交，正在继续登录…</div>
       )}
-      {reloginState?.status === 'finalizing' && (
+      {!isApi && reloginState?.status === 'finalizing' && (
         <div className="text-xs text-blue-400">登录已完成，正在安全提交登录结果…</div>
       )}
-      {reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status) && reloginState.detail && (
+      {!isApi && reloginState && ACTIVE_CODEX_LOGIN_STATUSES.has(reloginState.status) && reloginState.detail && (
         <div className="text-[10px] text-amber-400 break-all">{reloginState.detail}</div>
       )}
-      {(reloginState?.status === 'failed' || reloginState?.status === 'expired') && (
+      {!isApi && (reloginState?.status === 'failed' || reloginState?.status === 'expired') && (
         <div className="text-xs text-red-400 break-all">{reloginState.detail || '登录失败'}</div>
       )}
-      {reloginState?.status === 'success' && (
+      {!isApi && reloginState?.status === 'success' && (
         <div className="text-xs text-green-400">登录成功</div>
       )}
+    </div>
+  );
+}
+
+function AddCloudRouterAccountModal({ onClose, onAdded }: {
+  onClose: () => void;
+  onAdded: () => void | Promise<void>;
+}) {
+  const [name, setName] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const trimmedName = name.trim();
+    const secret = apiKey.trim();
+    if (!trimmedName || !secret) return;
+
+    setSubmitting(true);
+    setError(null);
+    // Do not retain a reusable API key in component state while validation and
+    // quota discovery are in flight.
+    setApiKey('');
+    try {
+      await api.createCloudRouterAccount({ name: trimmedName, api_key: secret });
+      await onAdded();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '添加 API 账号失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="absolute inset-0 bg-gray-900/80 z-10 flex items-start justify-center pt-16">
+      <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-xs">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+          <h3 className="text-sm font-semibold text-foreground">添加 CloudRouter API 账号</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-200"><X size={14} /></button>
+        </div>
+        <form onSubmit={handleSubmit} className="p-4 space-y-3">
+          <div>
+            <label htmlFor="cloudrouter-account-name" className="block text-xs text-gray-400 mb-1">账号名称</label>
+            <input
+              id="cloudrouter-account-name"
+              className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="例如：CloudRouter Claude"
+              autoComplete="off"
+              required
+            />
+          </div>
+          <div>
+            <label htmlFor="cloudrouter-api-key" className="block text-xs text-gray-400 mb-1">CloudRouter API Key</label>
+            <input
+              id="cloudrouter-api-key"
+              type="password"
+              className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+              placeholder="cr-..."
+              autoComplete="new-password"
+              required
+            />
+          </div>
+          <div className="space-y-1 text-[11px] leading-relaxed text-gray-500">
+            <p>每把 Key 建立一个独立 API 账号目录，Key 会以 0600 权限持久保存，不会显示在账号列表或日志中。</p>
+            <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>
+            <p>API 账号会直接加入现有账号池，任务、换模型、会话与自动轮换方式不变。</p>
+          </div>
+          {error && <p className="text-xs text-red-400 break-all">{error}</p>}
+          <div className="flex justify-end gap-2 pt-1">
+            <button type="button" onClick={onClose} className="px-3 py-1.5 text-xs text-gray-300 hover:text-foreground">取消</button>
+            <button
+              type="submit"
+              disabled={submitting || !name.trim() || !apiKey.trim()}
+              className="px-3 py-1.5 text-xs bg-sky-600 text-white rounded hover:bg-sky-500 disabled:opacity-50"
+            >
+              {submitting ? '验证并添加…' : '验证并添加'}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
@@ -723,6 +1058,7 @@ type PoolTab = 'claude' | 'codex';
 export function PoolDrawer() {
   const [claudeEnabled, setClaudeEnabled] = useState(false);
   const [codexEnabled, setCodexEnabled] = useState(false);
+  const [cloudRouterAvailable, setCloudRouterAvailable] = useState(false);
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<PoolTab>('claude');
 
@@ -744,6 +1080,11 @@ export function PoolDrawer() {
     api.getCodexPoolStatus()
       .then(() => { setCodexEnabled(true); })
       .catch(() => setCodexEnabled(false));
+    // The API-account manager remains available even when both native pools
+    // are disabled, so users can add the first key from the same drawer.
+    api.getCloudRouterAccounts()
+      .then(() => setCloudRouterAvailable(true))
+      .catch(() => setCloudRouterAvailable(false));
   }, []);
 
   const loadClaudeUsage = useCallback(async (force?: boolean) => {
@@ -790,10 +1131,10 @@ export function PoolDrawer() {
 
   useEffect(() => {
     if (open) {
-      if (tab === 'claude') loadClaudeUsage();
-      else loadCodexUsage(true);
+      if (tab === 'claude' && claudeEnabled) loadClaudeUsage();
+      else if (tab === 'codex' && codexEnabled) loadCodexUsage(true);
     }
-  }, [open, tab, loadClaudeUsage, loadCodexUsage]);
+  }, [open, tab, claudeEnabled, codexEnabled, loadClaudeUsage, loadCodexUsage]);
 
   // Claude handlers
   const handleClaudeClearCooldown = useCallback(async (accountId: string) => {
@@ -807,6 +1148,7 @@ export function PoolDrawer() {
   const [relogin, setRelogin] = useState<Record<string, { status: string; message?: string }>>({});
   const [showAdd, setShowAdd] = useState(false);
   const [showCodexAdd, setShowCodexAdd] = useState(false);
+  const [showCloudRouterAdd, setShowCloudRouterAdd] = useState(false);
   const [showCcSettings, setShowCcSettings] = useState(false);
 
   const handleClaudeRelogin = useCallback(async (accountId: string) => {
@@ -926,9 +1268,44 @@ export function PoolDrawer() {
     }));
   }, []);
 
-  if (!claudeEnabled && !codexEnabled) return null;
+  const refreshBothPools = useCallback(async () => {
+    // create/refresh already performs the live CloudRouter requests. Read the
+    // resulting pool snapshots without issuing duplicate force requests.
+    await Promise.all([loadClaudeUsage(false), loadCodexUsage(false)]);
+    const [claudeResult, codexResult] = await Promise.allSettled([
+      api.getPoolStatus(),
+      api.getCodexPoolStatus(),
+    ]);
+    const nextClaudeEnabled = claudeResult.status === 'fulfilled' && claudeResult.value.enabled;
+    const nextCodexEnabled = codexResult.status === 'fulfilled' && codexResult.value.enabled !== false;
+    if (claudeResult.status === 'fulfilled') {
+      setClaudeEnabled(nextClaudeEnabled);
+    }
+    if (codexResult.status === 'fulfilled') {
+      setCodexEnabled(nextCodexEnabled);
+    }
+    if (!nextClaudeEnabled && nextCodexEnabled) setTab('codex');
+    else if (nextClaudeEnabled && !nextCodexEnabled) setTab('claude');
+    setCloudRouterAvailable(true);
+  }, [loadClaudeUsage, loadCodexUsage]);
+
+  const handleCloudRouterRefresh = useCallback(async (accountId: string | null | undefined) => {
+    if (!accountId) {
+      window.alert('API 账号标识缺失，无法安全刷新');
+      return;
+    }
+    try {
+      await api.refreshCloudRouterAccount(accountId);
+      await refreshBothPools();
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'CloudRouter 额度刷新失败');
+    }
+  }, [refreshBothPools]);
+
+  if (!claudeEnabled && !codexEnabled && !cloudRouterAvailable) return null;
 
   const hasBothPools = claudeEnabled && codexEnabled;
+  const hasActivePool = claudeEnabled || codexEnabled;
   const loading = tab === 'claude' ? claudeLoading : codexLoading;
 
   return (
@@ -939,10 +1316,10 @@ export function PoolDrawer() {
           setOpen(true);
         }}
         className="flex items-center gap-1 px-2 py-1 rounded bg-gray-800 border border-gray-700 hover:border-indigo-500 transition-colors"
-        title="账号池额度"
+        title={hasActivePool ? '账号池额度' : 'API 账号与额度'}
       >
         <Users size={13} className="text-indigo-400" />
-        <span className="text-xs font-semibold text-indigo-300">Pro</span>
+        <span className="text-xs font-semibold text-indigo-300">{hasActivePool ? 'Pro' : 'API'}</span>
       </button>
       {open && createPortal(
         <div className="fixed inset-0 z-[70]">
@@ -951,20 +1328,20 @@ export function PoolDrawer() {
             <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-700">
               <Users size={16} className="text-indigo-400" />
               <h2 className="text-sm font-semibold text-foreground">
-                {tab === 'claude' ? 'Claude Pool' : 'Codex Pool'}
+                {!hasActivePool ? 'API 账号' : tab === 'claude' ? 'Claude Pool' : 'Codex Pool'}
               </h2>
-              {tab === 'claude' && claudeStatus && (
+              {hasActivePool && tab === 'claude' && claudeStatus && (
                 <span className="text-xs text-gray-500">
                   {claudeStatus.available}/{claudeStatus.total} 可用
                 </span>
               )}
-              {tab === 'codex' && codexStatus && (
+              {hasActivePool && tab === 'codex' && codexStatus && (
                 <span className="text-xs text-gray-500">
                   {codexStatus.available}/{codexStatus.total} 可用
                 </span>
               )}
               <div className="ml-auto flex items-center gap-1">
-                {tab === 'claude' && (
+                {claudeEnabled && tab === 'claude' && (
                   <button
                     onClick={() => setShowCcSettings(true)}
                     className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800"
@@ -973,21 +1350,32 @@ export function PoolDrawer() {
                     <Settings size={14} />
                   </button>
                 )}
+                {hasActivePool && (
+                  <button
+                    onClick={() => tab === 'claude' ? setShowAdd(true) : setShowCodexAdd(true)}
+                    className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800"
+                    title="添加账号"
+                  >
+                    <Plus size={14} />
+                  </button>
+                )}
                 <button
-                  onClick={() => tab === 'claude' ? setShowAdd(true) : setShowCodexAdd(true)}
-                  className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800"
-                  title="添加账号"
+                  onClick={() => setShowCloudRouterAdd(true)}
+                  className="px-1.5 py-1 rounded text-[10px] font-semibold text-sky-300 border border-sky-600/40 hover:bg-sky-600/15"
+                  title="添加 CloudRouter API 账号"
                 >
-                  <Plus size={14} />
+                  API
                 </button>
-                <button
-                  onClick={() => tab === 'claude' ? loadClaudeUsage(true) : loadCodexUsage(true)}
-                  disabled={loading}
-                  className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800 disabled:opacity-50"
-                  title="刷新"
-                >
-                  <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
-                </button>
+                {hasActivePool && (
+                  <button
+                    onClick={() => tab === 'claude' ? loadClaudeUsage(true) : loadCodexUsage(true)}
+                    disabled={loading}
+                    className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800 disabled:opacity-50"
+                    title="刷新"
+                  >
+                    <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+                  </button>
+                )}
                 <button
                   onClick={() => { if (!showCodexAdd) setOpen(false); }}
                   disabled={showCodexAdd}
@@ -1028,10 +1416,23 @@ export function PoolDrawer() {
             <div className="flex-1 overflow-y-auto p-3 space-y-2 relative">
               {showAdd && <AddAccountModal onClose={() => setShowAdd(false)} onAdded={loadClaudeUsage} />}
               {showCodexAdd && <AddCodexAccountModal onClose={() => setShowCodexAdd(false)} onAdded={loadCodexUsage} />}
+              {showCloudRouterAdd && (
+                <AddCloudRouterAccountModal
+                  onClose={() => setShowCloudRouterAdd(false)}
+                  onAdded={refreshBothPools}
+                />
+              )}
               {showCcSettings && <CcSettingsModal onClose={() => setShowCcSettings(false)} />}
 
+              {!hasActivePool && (
+                <div className="rounded-lg border border-sky-700/40 bg-sky-950/20 p-3 text-xs leading-relaxed text-gray-400">
+                  还没有可用账号。点击右上角 <span className="font-semibold text-sky-300">API</span>，
+                  添加 CloudRouter Key 后会自动识别 Claude 或 Codex 模型，并显示额度与到期时间。
+                </div>
+              )}
+
               {/* Claude tab */}
-              {tab === 'claude' && (
+              {hasActivePool && tab === 'claude' && (
                 <>
                   {claudeError && <div className="text-xs text-red-400">{claudeError}</div>}
                   {claudeLoading && !claudeStatus && <div className="text-xs text-gray-500">加载中…</div>}
@@ -1044,8 +1445,14 @@ export function PoolDrawer() {
                       onClearCooldown={handleClaudeClearCooldown}
                       onSetPreferred={handleClaudeSetPreferred}
                       onRelogin={handleClaudeRelogin}
-                      onRetryUsage={() => loadClaudeUsage(true)}
-                      onDelete={async (id) => {
+                      onRetryUsage={() => {
+                        if (a.auth_kind === 'cloudrouter_api') {
+                          void handleCloudRouterRefresh(a.api_account_id);
+                        } else {
+                          void loadClaudeUsage(true);
+                        }
+                      }}
+                      onDelete={a.auth_kind === 'cloudrouter_api' ? undefined : async (id) => {
                         if (!window.confirm(`从 Claude 号池中删除 ${id}？`)) return;
                         try { await api.poolDeleteAccount(id); await loadClaudeUsage(); } catch (e) { window.alert(String(e)); }
                       }}
@@ -1056,7 +1463,7 @@ export function PoolDrawer() {
               )}
 
               {/* Codex tab */}
-              {tab === 'codex' && (
+              {hasActivePool && tab === 'codex' && (
                 <>
                   {codexError && <div className="text-xs text-red-400">{codexError}</div>}
                   {codexLoading && !codexStatus && <div className="text-xs text-gray-500">加载中…</div>}
@@ -1069,11 +1476,17 @@ export function PoolDrawer() {
                       onSetPreferred={handleCodexSetPreferred}
                       onRelogin={handleCodexRelogin}
                       onSubmitOtp={(state, code) => handleCodexSubmitOtp(a.id, state, code)}
-                      onDelete={async (id) => {
+                      onDelete={a.auth_kind === 'cloudrouter_api' ? undefined : async (id) => {
                         if (!window.confirm(`从 Codex 号池中删除 ${id}？将清除 OAuth、邮箱 Token、OpenAI 密码以及该账号的日志、历史和配置；仅保留原生会话文件用于任务上下文迁移。`)) return;
                         try { await api.codexPoolDeleteAccount(id); await loadCodexUsage(); } catch (e) { window.alert(String(e)); }
                       }}
-                      onRetryUsage={() => loadCodexUsage(true)}
+                      onRetryUsage={() => {
+                        if (a.auth_kind === 'cloudrouter_api') {
+                          void handleCloudRouterRefresh(a.api_account_id);
+                        } else {
+                          void loadCodexUsage(true);
+                        }
+                      }}
                       reloginState={codexRelogin[a.id]}
                     />
                   ))}

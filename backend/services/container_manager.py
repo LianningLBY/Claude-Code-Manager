@@ -17,6 +17,7 @@ import shutil
 import signal
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 from backend.services.process_safety import require_safe_process_group_id
 
@@ -26,6 +27,7 @@ SANDBOX_IMAGE = "ccm-sandbox:latest"
 CONTAINER_PREFIX = "ccm-project-"
 _EXEC_TOKEN_ENV = "CCM_CONTAINER_EXEC_TOKEN"
 _EXEC_ROLE_ENV = "CCM_CONTAINER_EXEC_ROLE"
+_API_ACCOUNT_CONTAINER_ROOT = "/home/sandbox/.ccm-api-account"
 
 
 class ContainerExecSpawnCleanupError(RuntimeError):
@@ -331,6 +333,8 @@ class ContainerManager:
 
     async def ensure_container(self, project_id: int, project_path: str,
                                 config_dir: str | None = None,
+                                *,
+                                api_account_root: str | None = None,
                                 git_credential_type: str | None = None,
                                 git_ssh_key_path: str | None = None,
                                 git_https_username: str | None = None,
@@ -338,10 +342,36 @@ class ContainerManager:
         """Ensure a running container for this project with isolated git credentials."""
         async with self._lock(project_id):
             name = f"{CONTAINER_PREFIX}{project_id}"
+            desired_api_root = (
+                str(Path(api_account_root).resolve(strict=False))
+                if api_account_root
+                else ""
+            )
 
             code, out = await self._run(["docker", "inspect", "-f", "{{.State.Running}}", name])
             if code == 0 and "true" in out.lower():
-                return name
+                mount_template = (
+                    "{{range .Mounts}}{{if eq .Destination "
+                    f"\"{_API_ACCOUNT_CONTAINER_ROOT}\""
+                    "}}{{.Source}}{{end}}{{end}}"
+                )
+                mount_code, mounted_root = await self._run(
+                    ["docker", "inspect", "-f", mount_template, name]
+                )
+                current_api_root = (
+                    str(Path(mounted_root.strip()).resolve(strict=False))
+                    if mount_code == 0 and mounted_root.strip()
+                    else ""
+                )
+                if current_api_root == desired_api_root:
+                    return name
+                logger.info(
+                    "Recreating container %s because its API account mount "
+                    "changed (%s -> %s)",
+                    name,
+                    current_api_root or "none",
+                    desired_api_root or "none",
+                )
 
             await self._run(["docker", "rm", "-f", name])
             os.makedirs(project_path, exist_ok=True)
@@ -367,6 +397,11 @@ class ContainerManager:
             # Mount Claude config (read-only, for auth)
             if config_dir:
                 cmd.extend(["-v", f"{config_dir}:/home/sandbox/.claude:ro"])
+            if desired_api_root:
+                cmd.extend([
+                    "-v",
+                    f"{desired_api_root}:{_API_ACCOUNT_CONTAINER_ROOT}:ro",
+                ])
 
             # Mount project-specific git credentials
             if git_dir:

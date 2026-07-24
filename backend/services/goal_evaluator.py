@@ -16,6 +16,16 @@ from backend.services.process_safety import require_safe_process_group_id
 logger = logging.getLogger(__name__)
 
 _PROCESS_CLEANUP_TIMEOUT = 5.0
+_CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+_CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CLOUDROUTER_API_KEY",
+)
 # Exact handles remain reachable when cleanup cannot prove a process tree
 # terminal.  Evaluators are otherwise short-lived local objects, so swallowing
 # a reap failure would make the surviving child completely invisible.
@@ -307,6 +317,8 @@ class GoalEvaluator:
         provider: str = "claude",
         codex_home: str | None = None,
         task_id: int | None = None,
+        config_dir: str | None = None,
+        cloudrouter_store=None,
     ) -> GoalEvalResult:
         provider = (provider or "claude").lower()
         if provider == "codex":
@@ -321,8 +333,30 @@ class GoalEvaluator:
             for k, v in os.environ.items()
             if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
         }
-        if provider == "codex" and codex_home:
-            env["CODEX_HOME"] = os.path.expandvars(os.path.expanduser(codex_home))
+        # ``codex_home`` is retained as a compatibility name because the
+        # dispatcher historically passes the active provider's config_dir
+        # through that argument for both providers.
+        provider_home = config_dir or codex_home
+        if provider_home:
+            provider_home = os.path.expandvars(os.path.expanduser(provider_home))
+            if provider == "codex":
+                env["CODEX_HOME"] = provider_home
+            else:
+                env["CLAUDE_CONFIG_DIR"] = provider_home
+
+        if (
+            provider_home
+            and self._is_cloudrouter_projection(
+                cloudrouter_store, provider, provider_home,
+            )
+        ):
+            auth_keys = (
+                _CLOUDROUTER_CODEX_AUTH_ENV_KEYS
+                if provider == "codex"
+                else _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS
+            )
+            for key in auth_keys:
+                env.pop(key, None)
 
         cmd = self._build_eval_command(provider, prompt, eval_model)
 
@@ -429,6 +463,33 @@ class GoalEvaluator:
         if provider == "codex":
             return self._parse_codex_response(raw)
         return self._parse_response(raw)
+
+    @staticmethod
+    def _is_cloudrouter_projection(
+        cloudrouter_store,
+        provider: str,
+        provider_home: str,
+    ) -> bool:
+        """Identify an API projection by path without reading its API key."""
+
+        if cloudrouter_store is None:
+            return False
+        finder_name = (
+            "account_for_codex_home"
+            if provider == "codex"
+            else "account_for_claude_config_dir"
+        )
+        finder = getattr(cloudrouter_store, finder_name, None)
+        if not callable(finder):
+            return False
+        try:
+            return finder(provider_home) is not None
+        except Exception:
+            logger.exception(
+                "Could not resolve CloudRouter goal-evaluator home %s",
+                provider_home,
+            )
+            return False
 
     def _build_eval_command(self, provider: str, prompt: str, model: str) -> list[str]:
         if provider == "codex":

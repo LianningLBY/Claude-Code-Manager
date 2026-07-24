@@ -80,6 +80,8 @@ class StreamParser:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
+                if data.get("isApiErrorMessage"):
+                    event["is_error"] = True
                 if usage_data:
                     event["context_usage"] = usage_data
                 return [event]
@@ -107,9 +109,14 @@ class StreamParser:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
+                if data.get("isApiErrorMessage"):
+                    event["is_error"] = True
                 if usage_data:
                     event["context_usage"] = usage_data
                 return [event]
+            if data.get("isApiErrorMessage"):
+                for event in events:
+                    event["is_error"] = True
             # Attach usage data to the first event only
             if usage_data and events:
                 events[0]["context_usage"] = usage_data
@@ -223,4 +230,18 @@ class StreamParser:
         message = data.get("message")
         if isinstance(message, dict):
             return self._extract_content(message)
+        # Claude Code's terminal stream-json envelope uses a top-level result
+        # string for successful and failed turns. Some gateway failures expose
+        # a structured top-level error instead.
+        result = data.get("result")
+        if isinstance(result, str):
+            return result
+        error = data.get("error")
+        if isinstance(error, str):
+            return error
+        if isinstance(error, dict):
+            for key in ("message", "detail", "error"):
+                value = error.get(key)
+                if isinstance(value, str):
+                    return value
         return None

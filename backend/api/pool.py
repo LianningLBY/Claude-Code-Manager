@@ -54,6 +54,7 @@ async def pool_usage(force: bool = False):
         account["subscription_type"] = u.get("subscription_type")
         account["usage"] = u.get("usage")
         account["usage_error"] = u.get("error")
+        account["api_quota"] = u.get("api_quota")
     return status
 
 
@@ -100,6 +101,11 @@ async def relogin_account(request: Request, account_id: str):
     acc = pool.account(account_id)
     if acc is None:
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+        raise HTTPException(
+            status_code=400,
+            detail="CloudRouter API 账号不使用 OAuth 登录，请通过 API 账号刷新入口校验",
+        )
 
     # 1) OAuth refresh——绝大多数"过期"到这一步就解决了
     if await pool.refresh_oauth_token(account_id):
@@ -166,6 +172,11 @@ async def delete_account(request: Request, account_id: str):
     acc = pool.account(account_id)
     if acc is None:
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+        raise HTTPException(
+            status_code=400,
+            detail="CloudRouter API 账号请通过 API 账号删除入口处理",
+        )
     # 从 accounts.json 中删除
     accounts_path = Path.home() / ".claude-pool" / "accounts.json"
     data = json.loads(accounts_path.read_text())

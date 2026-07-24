@@ -32,6 +32,7 @@ from backend.api.codex_pool import (
     recover_pending_codex_login_transactions,
     router as codex_pool_router,
 )
+from backend.api.cloudrouter_accounts import router as cloudrouter_accounts_router
 from backend.api.monitor import router as monitor_router
 from backend.api.sub_agents import router as sub_agents_router
 from backend.api.sub_agent_tasks import router as sub_agent_tasks_router
@@ -56,6 +57,7 @@ from backend.services.deployment_start_guard import (
     deployment_task_start_fence,
 )
 from backend.services.sub_agent_watcher import SubAgentWatcher
+from backend.services.cloudrouter_accounts import CloudRouterAccountStore
 
 # Logging: surface INFO from our services AND claude_pty in the server log.
 # Without this, PTY delivery/turn diagnostics are invisible (learned the
@@ -70,6 +72,8 @@ logger = logging.getLogger(__name__)
 broadcaster = WebSocketBroadcaster()
 broadcaster.db_factory = async_session
 instance_manager = InstanceManager(db_factory=async_session, broadcaster=broadcaster)
+cloudrouter_store = CloudRouterAccountStore(settings.cloudrouter_accounts_dir)
+instance_manager.cloudrouter_store = cloudrouter_store
 
 shared_relay = None
 ralph_loop = RalphLoop(
@@ -82,6 +86,7 @@ dispatcher = GlobalDispatcher(
     instance_manager=instance_manager,
     broadcaster=broadcaster,
 )
+dispatcher.cloudrouter_store = cloudrouter_store
 instance_manager.task_message_enqueuer = dispatcher.enqueue_message
 
 sub_agent_watcher = SubAgentWatcher(db_factory=async_session, broadcaster=broadcaster)
@@ -109,13 +114,22 @@ if recovery["recovered"] or recovery["quarantined"]:
         recovery,
     )
 
-if settings.codex_pool_enabled:
+_has_cloudrouter_codex_accounts = any(
+    account.enabled
+    and not account.retired
+    and account.supports_model("codex", None)
+    for account in cloudrouter_store.all_accounts()
+)
+if settings.codex_pool_enabled or _has_cloudrouter_codex_accounts:
     try:
         from backend.services.codex_pool import CodexPool
         codex_pool = CodexPool(
             config_path=settings.codex_pool_config_path,
             cooldown_seconds=settings.codex_pool_cooldown_seconds,
             quota_reader=instance_manager.read_codex_rate_limits,
+            cloudrouter_store=cloudrouter_store,
+            bootstrap_default=settings.codex_pool_enabled,
+            include_native=settings.codex_pool_enabled,
         )
         dispatcher.codex_pool = codex_pool
         logger.info("Codex pool enabled with %d accounts", len(codex_pool._accounts))
@@ -248,6 +262,8 @@ async def _ensure_claude_warmup():
             pool = ClaudePool(
                 config_path=settings.pool_config_path,
                 cooldown_seconds=settings.pool_cooldown_seconds,
+                cloudrouter_store=cloudrouter_store,
+                include_native=settings.pool_enabled,
             )
             for acct in pool._accounts:
                 if acct.enabled:
@@ -644,6 +660,7 @@ app.include_router(tags_router)
 app.include_router(files_router)
 app.include_router(pool_router)
 app.include_router(codex_pool_router)
+app.include_router(cloudrouter_accounts_router)
 app.include_router(discussions_router)
 app.include_router(quick_phrases_router)
 app.include_router(monitor_router)

@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 TASK_DISTILL_MAX_CHARS = 30_000
 TASK_DISTILL_CLAUDE_MODEL = "claude-opus-4-6"
 TASK_DISTILL_TIMEOUT_SECONDS = 300
+_CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+_CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CLOUDROUTER_API_KEY",
+)
 
 
 class TaskDistillError(RuntimeError):
@@ -90,6 +100,7 @@ def _select_codex_distill_home(
     codex_pool,
     *,
     bound_account_id: str | None,
+    model: str,
 ) -> str | None:
     """Pick a healthy account for an ephemeral run without changing task binding."""
     if codex_pool is None:
@@ -100,10 +111,14 @@ def _select_codex_distill_home(
         if bound_account_id
         else None
     )
-    if bound_home and codex_pool.is_home_available(bound_home):
+    if (
+        bound_home
+        and codex_pool.is_home_available(bound_home)
+        and codex_pool.supports_model_for_home(bound_home, model)
+    ):
         return codex_pool.canonical_home(bound_home)
 
-    selected_home = codex_pool.select()
+    selected_home = codex_pool.select(model=model)
     if selected_home:
         return codex_pool.canonical_home(selected_home)
 
@@ -113,7 +128,12 @@ def _select_codex_distill_home(
     )
 
 
-def _build_task_distill_command(provider: str, model: str) -> list[str]:
+def _build_task_distill_command(
+    provider: str,
+    model: str,
+    *,
+    load_user_config: bool = False,
+) -> list[str]:
     if provider == "codex":
         cmd = [
             settings.codex_binary,
@@ -122,10 +142,11 @@ def _build_task_distill_command(provider: str, model: str) -> list[str]:
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
-            "--ignore-user-config",
             "--ignore-rules",
             "--ephemeral",
         ]
+        if not load_user_config:
+            cmd.append("--ignore-user-config")
         if model and model != "default":
             cmd.extend(["--model", model])
         # Keep the conversation out of argv/process listings.
@@ -206,15 +227,44 @@ async def _shielded_terminate_task_distill_process(process) -> None:
     await cleanup
 
 
+def _is_cloudrouter_projection(
+    cloudrouter_store,
+    provider: str,
+    provider_home: str | None,
+) -> bool:
+    """Resolve a managed API home without touching credential contents."""
+
+    if cloudrouter_store is None or not provider_home:
+        return False
+    finder_name = (
+        "account_for_codex_home"
+        if provider == "codex"
+        else "account_for_claude_config_dir"
+    )
+    finder = getattr(cloudrouter_store, finder_name, None)
+    if not callable(finder):
+        return False
+    try:
+        return finder(provider_home) is not None
+    except Exception:
+        logger.exception(
+            "Could not resolve CloudRouter distill home %s",
+            provider_home,
+        )
+        return False
+
+
 async def distill_task_conversation(
     *,
     title: str,
     conversation: str,
     provider: str,
     custom_instruction: str | None = None,
+    claude_pool=None,
     codex_pool=None,
     codex_account_id: str | None = None,
     instance_manager=None,
+    cloudrouter_store=None,
 ) -> dict:
     """Generate a reusable skill card with the task's configured provider."""
     provider = (provider or "claude").lower()
@@ -244,27 +294,55 @@ async def distill_task_conversation(
         codex_home = _select_codex_distill_home(
             codex_pool,
             bound_account_id=codex_account_id,
+            model=model,
         )
+    elif claude_pool is not None:
+        claude_config_dir = claude_pool.select(
+            validate=False,
+            model=model,
+        )
+        if not claude_config_dir:
+            raise TaskDistillError(
+                "Claude pool has no available account for distillation",
+                provider="claude",
+            )
+        env["CLAUDE_CONFIG_DIR"] = claude_config_dir
     elif "CLAUDE_CONFIG_DIR" not in env:
-        try:
-            from backend.services.claude_pool import pool
+        for candidate in (
+            "/home/ubuntu/.claude-account-2",
+            "/home/ubuntu/.claude",
+        ):
+            if os.path.isdir(candidate):
+                env["CLAUDE_CONFIG_DIR"] = candidate
+                break
 
-            if pool:
-                account = pool.select(validate=False)
-                if account:
-                    env["CLAUDE_CONFIG_DIR"] = account.config_dir
-        except Exception:
-            logger.debug("Could not select Claude account for distill", exc_info=True)
-        if "CLAUDE_CONFIG_DIR" not in env:
-            for candidate in (
-                "/home/ubuntu/.claude-account-2",
-                "/home/ubuntu/.claude",
-            ):
-                if os.path.isdir(candidate):
-                    env["CLAUDE_CONFIG_DIR"] = candidate
-                    break
+    provider_home = (
+        codex_home
+        if provider == "codex"
+        else env.get("CLAUDE_CONFIG_DIR")
+    )
+    cloudrouter_api = _is_cloudrouter_projection(
+        cloudrouter_store,
+        provider,
+        provider_home,
+    )
+    if cloudrouter_api:
+        auth_keys = (
+            _CLOUDROUTER_CODEX_AUTH_ENV_KEYS
+            if provider == "codex"
+            else _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS
+        )
+        for key in auth_keys:
+            env.pop(key, None)
 
-    cmd = _build_task_distill_command(provider, model)
+    # CloudRouter's Codex provider/auth helper lives in CODEX_HOME/config.toml,
+    # so only API projections must load that file. Native distill runs retain
+    # the existing isolated --ignore-user-config behavior.
+    cmd = _build_task_distill_command(
+        provider,
+        model,
+        load_user_config=provider == "codex" and cloudrouter_api,
+    )
 
     async def run_process() -> tuple[object, bytes, bytes]:
         process = None

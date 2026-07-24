@@ -996,3 +996,173 @@ class TestQuotaAwareSelection:
         assert await pool.select_quota_alternative(
             str(tmp_path / "codex-1")
         ) is None
+
+
+class _FakeCloudRouterCodexAccount:
+    def __init__(self, root: Path):
+        self.id = "cloudrouter-1"
+        self.name = "CloudRouter Codex"
+        self.enabled = True
+        self.retired = False
+        self.models = {
+            "claude": [],
+            "codex": ["gpt-5.5"],
+        }
+        self.root = root
+        self.claude_config_dir = str(root / "claude")
+        self.codex_home = str(root / "codex")
+
+    def supports_model(self, provider, model):
+        choices = self.models.get(provider, [])
+        return bool(choices) if not model else model in choices
+
+
+class _FakeCloudRouterCodexStore:
+    def __init__(self, account, snapshot=None):
+        self._account = account
+        self.snapshot = snapshot or {
+            "available": True,
+            "known": True,
+            "reason": "active",
+            "state": "active",
+            "windows": [],
+        }
+
+    def all_accounts(self, include_retired=False):
+        return [self._account]
+
+    def cached_quota_decision(self, _account_id):
+        return {
+            key: self.snapshot[key]
+            for key in ("available", "known", "reason")
+        }
+
+    async def fetch_usage(self, _account_id, force=False):
+        return dict(self.snapshot)
+
+
+class TestCloudRouterCodexProjection:
+    def test_api_only_pool_loads_without_oauth_config_and_filters_models(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="gpt-5.5") == str(
+            Path(account.codex_home).resolve()
+        )
+        assert pool.select(model="gpt-5.6-sol") is None
+        public = pool.list_accounts()[0]
+        assert public["auth_kind"] == "cloudrouter_api"
+        assert public["api_account_id"] == "cloudrouter-1"
+        assert public["supported_models"] == ["gpt-5.5"]
+
+    @pytest.mark.asyncio
+    async def test_api_quota_never_calls_oauth_app_server_or_rollout(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": True,
+            "reason": "active",
+            "state": "active",
+            "windows": [{"used": 1, "limit": 10}],
+        }
+
+        async def forbidden_reader(_home):
+            raise AssertionError("API quota must not use account/rateLimits/read")
+
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account, snapshot),
+            quota_reader=forbidden_reader,
+            bootstrap_default=False,
+        )
+
+        rows = await pool.fetch_quota(force=True, live=True)
+
+        assert rows[0]["quota"] is None
+        assert rows[0]["api_quota"] == snapshot
+        assert rows[0]["error"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["invalid_api_key", "forbidden"])
+    async def test_api_verify_uses_usage_and_reports_invalid_key(
+        self, tmp_path, reason
+    ):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        store = _FakeCloudRouterCodexStore(account, {
+            "available": False,
+            "known": True,
+            "reason": reason,
+            "state": "error",
+            "windows": [],
+        })
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=store,
+            bootstrap_default=False,
+        )
+
+        result = await pool.verify_account_live("cloudrouter-1")
+
+        assert result["logged_in"] is False
+        assert result["live_verified"] is True
+
+    @pytest.mark.asyncio
+    async def test_projection_survives_provider_model_removal_for_rollout_discovery(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        account.models["codex"] = []
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account),
+            bootstrap_default=False,
+        )
+        rollout = (
+            Path(account.codex_home)
+            / "sessions"
+            / "2026"
+            / "07"
+            / "24"
+            / "rollout-2026-07-24T00-00-00-session-after-refresh.jsonl"
+        )
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("{}")
+
+        assert pool.is_known_account(account.codex_home)
+        assert pool.is_disabled(account.codex_home)
+        assert pool.locate_session_homes("session-after-refresh") == [
+            str(Path(account.codex_home).resolve())
+        ]
+        assert pool.list_accounts() == []
+        assert pool.status()["total"] == 0
+        assert await pool.fetch_quota(force=True) == []
+
+    def test_native_config_is_excluded_when_native_pool_toggle_is_off(
+        self, tmp_path
+    ):
+        native_path = tmp_path / "native-codex-accounts.json"
+        native_path.write_text(json.dumps({
+            "accounts": [{
+                "id": "native-old",
+                "codex_home": str(tmp_path / "native-old"),
+                "enabled": True,
+            }],
+        }))
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+
+        pool = CodexPool(
+            config_path=native_path,
+            cloudrouter_store=_FakeCloudRouterCodexStore(account),
+            bootstrap_default=False,
+            include_native=False,
+        )
+
+        assert [item.id for item in pool._accounts] == ["cloudrouter-1"]

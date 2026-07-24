@@ -14,6 +14,10 @@ vi.mock('../../api/client', () => ({
     poolAddAccount: vi.fn(),
     poolAddStatus: vi.fn(),
     poolDeleteAccount: vi.fn(),
+    getCloudRouterAccounts: vi.fn(),
+    createCloudRouterAccount: vi.fn(),
+    refreshCloudRouterAccount: vi.fn(),
+    deleteCloudRouterAccount: vi.fn(),
     getCodexPoolStatus: vi.fn(),
     getCodexPoolUsage: vi.fn(),
     clearCodexPoolCooldown: vi.fn(),
@@ -90,12 +94,14 @@ async function openDrawer(user: ReturnType<typeof userEvent.setup>) {
 
 describe('PoolDrawer', () => {
   beforeEach(() => {
+    vi.mocked(api.getCloudRouterAccounts).mockResolvedValue([]);
     enablePool();
   });
 
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
   it('renders the Pro trigger button when pool is enabled', async () => {
@@ -105,6 +111,7 @@ describe('PoolDrawer', () => {
 
   it('does not render anything when pool is disabled', async () => {
     vi.mocked(api.getPoolStatus).mockResolvedValue({ enabled: false } as never);
+    vi.mocked(api.getCloudRouterAccounts).mockRejectedValue(new Error('API accounts unavailable'));
     const { container } = render(<PoolDrawer />);
     await waitFor(() => {
       expect(container.innerHTML).toBe('');
@@ -341,6 +348,361 @@ describe('PoolDrawer', () => {
       await user.click(screen.getByRole('button', { name: 'Codex' }));
 
       expect(await screen.findByText('实时额度查询失败，无法确认当前额度')).toBeInTheDocument();
+    });
+  });
+
+  describe('CloudRouter API accounts', () => {
+    const apiQuota = {
+      state: 'active',
+      mode: 'quota_limited',
+      currency: 'USD',
+      remaining: 42.5,
+      quota: {
+        used: 7.5,
+        limit: 50,
+        remaining: 42.5,
+      },
+      plan_name: 'CloudRouter Pro',
+      expires_at: '2026-08-07T00:00:00Z',
+      days_until_expiry: 14,
+      windows: [{
+        id: 'daily',
+        label: '每日额度',
+        used: 7.5,
+        limit: 50,
+        remaining: 42.5,
+        reset_at: '2026-07-25T00:00:00Z',
+      }],
+    };
+    const apiAccount = {
+      id: 'cloudrouter-1',
+      name: 'CloudRouter Claude',
+      enabled: true,
+      retired: false,
+      key_hint: 'cr-…1234',
+      models: {
+        claude: ['claude-sonnet-4-6'],
+        codex: [],
+      },
+      providers: ['claude'],
+      account_dir: '/tmp/cloudrouter-1',
+      claude_config_dir: '/tmp/cloudrouter-1/claude',
+      codex_home: '/tmp/cloudrouter-1/codex',
+      supported_models: ['claude-sonnet-4-6'],
+      endpoints: {
+        models: 'https://console.cloudrouter.online/v1/models',
+        usage: 'https://console.cloudrouter.online/v1/usage',
+      },
+    };
+
+    it('allows adding the first API key when both native pools are disabled', async () => {
+      vi.mocked(api.getPoolStatus).mockResolvedValue({ enabled: false } as never);
+      vi.mocked(api.getCodexPoolStatus).mockRejectedValue(new Error('Codex pool disabled'));
+      vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        api_quota: apiQuota,
+      });
+      vi.mocked(api.getPoolUsage).mockResolvedValue({
+        enabled: true,
+        total: 1,
+        available: 1,
+        preferred: null,
+        accounts: [],
+      } as never);
+      const user = userEvent.setup();
+
+      render(<PoolDrawer />);
+      await user.click(await screen.findByText('API'));
+      expect(screen.getByText('API 账号')).toBeInTheDocument();
+      expect(screen.getByText(/还没有可用账号/)).toBeInTheDocument();
+      expect(screen.queryByTitle('添加账号')).not.toBeInTheDocument();
+
+      await user.click(screen.getByTitle('添加 CloudRouter API 账号'));
+      await user.type(screen.getByLabelText('账号名称'), 'First API');
+      await user.type(screen.getByLabelText('CloudRouter API Key'), 'cr-first-secret');
+      await user.click(screen.getByRole('button', { name: '验证并添加' }));
+
+      await waitFor(() => {
+        expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
+          name: 'First API',
+          api_key: 'cr-first-secret',
+        });
+      });
+    });
+
+    it('adds one key as a dedicated API account without exposing a task-level mode', async () => {
+      vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        api_quota: apiQuota,
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByTitle('添加 CloudRouter API 账号'));
+
+      expect(screen.getByText(/每把 Key 建立一个独立 API 账号目录/)).toBeInTheDocument();
+      expect(screen.getByText(/0600 权限持久保存/)).toBeInTheDocument();
+      expect(screen.getByText(/通常需要分别添加两把 Key/)).toBeInTheDocument();
+      await user.type(screen.getByLabelText('账号名称'), 'CloudRouter Claude');
+      await user.type(screen.getByLabelText('CloudRouter API Key'), 'cr-secret-value');
+      await user.click(screen.getByRole('button', { name: '验证并添加' }));
+
+      await waitFor(() => {
+        expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
+          name: 'CloudRouter Claude',
+          api_key: 'cr-secret-value',
+        });
+        expect(screen.queryByText('添加 CloudRouter API 账号')).not.toBeInTheDocument();
+      });
+      expect(api.getPoolUsage).toHaveBeenCalledWith(false);
+      expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
+    });
+
+    it('renders a Claude API projection with models and generic quota without exposing unsafe runtime deletion', async () => {
+      vi.mocked(api.getPoolUsage).mockResolvedValue({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'cloudrouter:cloudrouter-1:claude',
+          config_dir: '/tmp/cloudrouter-1/claude',
+          email: '',
+          role: 'api',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'CloudRouter Claude',
+          api_account_id: 'cloudrouter-1',
+          supported_models: ['claude-sonnet-4-6', 'claude-opus-4-8'],
+          api_quota: apiQuota,
+        }],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+
+      const card = screen.getByText('CloudRouter Claude').closest('.rounded-lg') as HTMLElement;
+      expect(card).toBeTruthy();
+      expect(within(card).getByText('API')).toBeInTheDocument();
+      expect(within(card).getByText('claude-sonnet-4-6')).toBeInTheDocument();
+      expect(within(card).getByText('claude-opus-4-8')).toBeInTheDocument();
+      expect(card).toHaveTextContent('CLAUDE_CONFIG_DIR: /tmp/cloudrouter-1/claude');
+      const reveal = within(card).getByRole('button', { name: '查看额度与有效期' });
+      expect(reveal).toHaveAttribute('aria-expanded', 'false');
+      expect(within(card).queryByText('active')).not.toBeInTheDocument();
+      expect(card).not.toHaveTextContent('14 天');
+
+      await user.click(reveal);
+
+      expect(within(card).getByText('active')).toBeInTheDocument();
+      expect(within(card).getByText('quota_limited')).toBeInTheDocument();
+      expect(within(card).getByText('CloudRouter Pro')).toBeInTheDocument();
+      expect(within(card).getByText('总额度')).toBeInTheDocument();
+      expect(within(card).getByText('14 天')).toBeInTheDocument();
+      expect(within(card).getAllByText(/剩余 \$42\.5/).length).toBeGreaterThan(0);
+      await user.click(within(card).getByRole('button', { name: '收起额度与有效期' }));
+      expect(within(card).queryByText('active')).not.toBeInTheDocument();
+      expect(card).not.toHaveTextContent('14 天');
+      expect(within(card).queryByRole('button', { name: '重新登录' })).not.toBeInTheDocument();
+      expect(within(card).queryByRole('button', { name: '删除' })).not.toBeInTheDocument();
+      expect(api.deleteCloudRouterAccount).not.toHaveBeenCalled();
+    });
+
+    it('renders the same API account in Codex without OAuth controls and refreshes its shared quota', async () => {
+      enableCodexPool({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'cloudrouter:cloudrouter-2:codex',
+          codex_home: '/tmp/cloudrouter-2/codex',
+          email: '',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'CloudRouter Codex',
+          api_account_id: 'cloudrouter-2',
+          supported_models: ['gpt-5.5'],
+          api_quota: apiQuota,
+        }],
+      });
+      vi.mocked(api.refreshCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        id: 'cloudrouter-2',
+        name: 'CloudRouter Codex',
+        models: {
+          claude: [],
+          codex: ['gpt-5.5'],
+        },
+        providers: ['codex'],
+        supported_models: ['gpt-5.5'],
+        api_quota: apiQuota,
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+
+      const card = (await screen.findByText('CloudRouter Codex')).closest('.rounded-lg') as HTMLElement;
+      expect(within(card).getByText('API')).toBeInTheDocument();
+      expect(within(card).getByText('gpt-5.5')).toBeInTheDocument();
+      expect(within(card).queryByRole('button', { name: '重新登录' })).not.toBeInTheDocument();
+      expect(within(card).queryByLabelText('OpenAI 邮箱验证码')).not.toBeInTheDocument();
+
+      await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
+      await user.click(within(card).getByRole('button', { name: '刷新额度' }));
+      await waitFor(() => {
+        expect(api.refreshCloudRouterAccount).toHaveBeenCalledWith('cloudrouter-2');
+      });
+      expect(api.getPoolUsage).toHaveBeenCalledWith(false);
+      expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
+    });
+
+    it('marks missing quota and expiry fields as unconfirmed instead of displaying zero', async () => {
+      vi.mocked(api.getPoolUsage).mockResolvedValue({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'cloudrouter:cloudrouter-3:claude',
+          config_dir: '/tmp/cloudrouter-3/claude',
+          email: '',
+          role: 'api',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'CloudRouter Unknown',
+          api_account_id: 'cloudrouter-3',
+          supported_models: ['claude-sonnet-4-6'],
+          api_quota: {
+            state: 'unknown',
+            mode: 'wallet',
+            currency: 'USD',
+            windows: [],
+          },
+        }],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+
+      const card = screen.getByText('CloudRouter Unknown').closest('.rounded-lg') as HTMLElement;
+      expect(card).not.toHaveTextContent('总额度：无法确认');
+      await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
+      expect(card).toHaveTextContent('总额度：无法确认');
+      expect(card).toHaveTextContent('到期时间：无法确认');
+      expect(card).toHaveTextContent('剩余天数：无法确认');
+      expect(card).not.toHaveTextContent('0 天');
+      expect(card).not.toHaveTextContent('$0');
+    });
+
+    it('renders a confirmed active wallet without expiry fields as unlimited duration', async () => {
+      vi.mocked(api.getPoolUsage).mockResolvedValue({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'cloudrouter:cloudrouter-4:claude',
+          config_dir: '/tmp/cloudrouter-4/claude',
+          email: '',
+          role: 'api',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'CloudRouter Wallet',
+          api_account_id: 'cloudrouter-4',
+          supported_models: ['claude-opus-4-8'],
+          api_quota: {
+            state: 'active',
+            mode: 'wallet',
+            currency: 'USD',
+            known: true,
+            remaining: 3000,
+            balance: 3000,
+            plan_name: '钱包余额',
+            windows: [],
+          },
+        }],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+
+      const card = screen.getByText('CloudRouter Wallet').closest('.rounded-lg') as HTMLElement;
+      expect(card).not.toHaveTextContent('剩余 $3,000');
+      await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
+      expect(card).toHaveTextContent('剩余 $3,000');
+      expect(card).toHaveTextContent('余额 $3,000');
+      expect(card).toHaveTextContent('到期时间：无期限');
+      expect(card).toHaveTextContent('剩余天数：无期限');
+      expect(card).not.toHaveTextContent('到期时间：无法确认');
+    });
+
+    it('renders CloudRouter remaining=-1 as unlimited instead of a negative balance', async () => {
+      vi.mocked(api.getPoolUsage).mockResolvedValue({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'cloudrouter:cloudrouter-4:claude',
+          config_dir: '/tmp/cloudrouter-4/claude',
+          email: '',
+          role: 'api',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'CloudRouter Unlimited',
+          api_account_id: 'cloudrouter-4',
+          supported_models: ['claude-sonnet-4-6'],
+          api_quota: {
+            state: 'active',
+            mode: 'wallet',
+            currency: 'USD',
+            remaining: -1,
+            windows: [],
+          },
+        }],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+
+      const card = screen.getByText('CloudRouter Unlimited').closest('.rounded-lg') as HTMLElement;
+      expect(card).not.toHaveTextContent('剩余 无限');
+      await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
+      expect(card).toHaveTextContent('剩余 无限');
+      expect(card).not.toHaveTextContent('-$1');
     });
   });
 

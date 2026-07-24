@@ -21,6 +21,63 @@ from backend.services.process_safety import UnsafeProcessGroupError
 
 
 @pytest.mark.asyncio
+async def test_api_account_root_is_mounted_once_read_only_for_shared_project(
+    tmp_path,
+):
+    manager = ContainerManager()
+    project = tmp_path / "project"
+    config = tmp_path / "cloudrouter-1" / "claude"
+    api_root = config.parent
+    config.mkdir(parents=True)
+    manager._run = AsyncMock(side_effect=[
+        (1, ""),  # container does not exist
+        (0, ""),  # docker rm
+        (0, "container-id"),  # docker run
+    ])
+
+    await manager.ensure_container(
+        7,
+        str(project),
+        str(config),
+        api_account_root=str(api_root),
+    )
+
+    run_command = manager._run.await_args_list[-1].args[0]
+    assert (
+        f"{api_root.resolve()}:/home/sandbox/.ccm-api-account:ro"
+        in run_command
+    )
+    assert run_command.count(
+        f"{api_root.resolve()}:/home/sandbox/.ccm-api-account:ro"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_api_account_mount_recreates_running_container(tmp_path):
+    manager = ContainerManager()
+    project = tmp_path / "project"
+    config = tmp_path / "new" / "claude"
+    api_root = config.parent
+    config.mkdir(parents=True)
+    manager._run = AsyncMock(side_effect=[
+        (0, "true"),
+        (0, str(tmp_path / "old")),
+        (0, ""),
+        (0, "container-id"),
+    ])
+
+    await manager.ensure_container(
+        8,
+        str(project),
+        str(config),
+        api_account_root=str(api_root),
+    )
+
+    commands = [call.args[0] for call in manager._run.await_args_list]
+    assert ["docker", "rm", "-f", "ccm-project-8"] in commands
+
+
+@pytest.mark.asyncio
 async def test_exec_command_uses_tokenized_supervisor_and_host_session():
     manager = ContainerManager()
     manager._containers[7] = "ccm-project-7"

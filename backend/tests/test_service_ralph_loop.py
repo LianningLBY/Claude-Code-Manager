@@ -18,6 +18,17 @@ def _make_ralph_loop():
     )
 
 
+def test_effective_exit_code_uses_provider_semantic_result():
+    rl = _make_ralph_loop()
+    process = MagicMock(returncode=0)
+    rl.instance_manager.effective_exit_code = MagicMock(return_value=1)
+
+    assert rl._effective_process_exit_code(7, process) == 1
+    rl.instance_manager.effective_exit_code.assert_called_once_with(
+        7, process
+    )
+
+
 @pytest.mark.asyncio
 async def test_start_creates_task():
     rl = _make_ralph_loop()
@@ -300,6 +311,7 @@ async def test_codex_task_launch_resolves_home_and_resumes_native_thread():
     task = MagicMock(
         id=77,
         provider="codex",
+        model="gpt-5.6-sol",
         session_id="thread-ralph-1",
         thinking_budget=1234,
     )
@@ -317,11 +329,13 @@ async def test_codex_task_launch_resolves_home_and_resumes_native_thread():
         "thread-ralph-1",
         "codex",
         task_id=77,
+        model="gpt-5.6-sol",
     )
     launch_kwargs = rl.instance_manager.launch.await_args.kwargs
     assert launch_kwargs["config_dir"] == "/pool/codex-2"
     assert launch_kwargs["resume_session_id"] == "thread-ralph-1"
     assert launch_kwargs["provider"] == "codex"
+    assert launch_kwargs["model"] == "gpt-5.6-sol"
 
 
 @pytest.mark.asyncio
@@ -335,6 +349,7 @@ async def test_claude_task_launch_uses_resolved_home_without_forcing_resume():
     task = MagicMock(
         id=78,
         provider="claude",
+        model="claude-opus-4-8",
         session_id="claude-session",
         thinking_budget=None,
     )
@@ -346,10 +361,12 @@ async def test_claude_task_launch_uses_resolved_home_without_forcing_resume():
         "claude-session",
         "claude",
         task_id=78,
+        model="claude-opus-4-8",
     )
     launch_kwargs = rl.instance_manager.launch.await_args.kwargs
     assert launch_kwargs["config_dir"] == "/pool/claude-2"
     assert launch_kwargs["resume_session_id"] is None
+    assert launch_kwargs["model"] == "claude-opus-4-8"
 
 
 @pytest.mark.asyncio

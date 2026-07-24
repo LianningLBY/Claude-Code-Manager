@@ -134,6 +134,7 @@ class RalphLoop:
             task.session_id,
             task.provider,
             task_id=task.id,
+            model=task.model,
         )
         resume_session_id = (
             task.session_id
@@ -145,7 +146,7 @@ class RalphLoop:
             prompt=prompt,
             task_id=task.id,
             cwd=cwd,
-            model=None,
+            model=task.model,
             resume_session_id=resume_session_id,
             thinking_budget=task.thinking_budget,
             provider=task.provider,
@@ -201,6 +202,19 @@ class RalphLoop:
                 f"Output consumer did not finish after {label} for task "
                 f"{task.id}"
             ) from exc
+
+    def _effective_process_exit_code(self, instance_id: int, process) -> int:
+        """Return the exact turn's provider-semantic result."""
+
+        if process is None:
+            return -1
+        resolver = getattr(self.instance_manager, "effective_exit_code", None)
+        if callable(resolver):
+            value = resolver(instance_id, process)
+            if isinstance(value, int):
+                return value
+        returncode = getattr(process, "returncode", None)
+        return returncode if isinstance(returncode, int) else -1
 
     async def _broadcast_generation_event(
         self,
@@ -869,7 +883,9 @@ class RalphLoop:
                     label="Task run",
                 )
 
-                exit_code = process.returncode if process else -1
+                exit_code = self._effective_process_exit_code(
+                    instance_id, process
+                )
 
                 # Handle result
                 async with self.db_factory() as db:

@@ -48,6 +48,14 @@ def _make_dispatcher(db_factory):
     instance_manager.wait_for_output_consumer = AsyncMock()
     # Model the real InstanceManager interface used by failure classification.
     instance_manager.pty_mode_enabled = False
+    instance_manager.is_pty_managed_turn = MagicMock(return_value=False)
+    instance_manager.effective_exit_code = MagicMock(
+        side_effect=lambda _instance_id, process: (
+            process.returncode
+            if isinstance(getattr(process, "returncode", None), int)
+            else -1
+        )
+    )
     instance_manager.transient_error_seen = MagicMock(return_value=False)
     instance_manager.get_last_stderr = MagicMock(return_value="")
     instance_manager.get_recent_log_contents = AsyncMock(return_value=[])
@@ -334,6 +342,42 @@ async def test_lifecycle_success(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_does_not_complete_semantic_api_failure_with_zero_os_exit(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        inst = Instance(name="semantic-failure-worker")
+        task = Task(
+            title="semantic API failure",
+            description="call provider",
+            target_repo="/repo",
+            max_retries=0,
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_obj = task
+
+    process = MagicMock(returncode=0, wait=AsyncMock(return_value=0))
+    d.instance_manager.processes = {inst_id: process}
+    d.instance_manager.effective_exit_code = MagicMock(return_value=1)
+
+    await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_obj.id)
+
+    assert current.status == "failed"
+    d.instance_manager.effective_exit_code.assert_called_with(
+        inst_id, process
+    )
+
+
+@pytest.mark.asyncio
 async def test_stale_lifecycle_cannot_claim_same_task_and_instance_after_retry(
     db_factory,
 ):
@@ -393,13 +437,22 @@ async def test_stale_lifecycle_cannot_claim_same_task_and_instance_after_retry(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pty_enabled, expected_switches", [(False, 0), (True, 1)])
-async def test_lifecycle_proactive_switch_is_pty_only(
-    db_factory, pty_enabled, expected_switches,
+@pytest.mark.parametrize(
+    ("pty_enabled", "exact_pty_turn", "expected_switches"),
+    [
+        (False, False, 0),
+        (True, True, 1),
+        (False, True, 1),
+        (True, False, 0),
+    ],
+)
+async def test_lifecycle_proactive_switch_uses_exact_pty_turn(
+    db_factory, pty_enabled, exact_pty_turn, expected_switches,
 ):
-    """The subprocess consumer owns non-PTY switching; lifecycle owns PTY."""
+    """Runtime toggles affect new launches, not an already-owned PTY turn."""
     d = _make_dispatcher(db_factory)
     d.instance_manager.pty_mode_enabled = pty_enabled
+    d.instance_manager.is_pty_managed_turn.return_value = exact_pty_turn
     d.instance_manager.pty_rate_limit_seen.return_value = True
     d.instance_manager.pty_rate_limit_info = MagicMock(return_value={
         "status": "allowed_warning",
@@ -423,7 +476,7 @@ async def test_lifecycle_proactive_switch_is_pty_only(
 
     assert d.instance_manager._try_proactive_pool_switch.await_count == expected_switches
     assert d.instance_manager.clear_pty_rate_limit.call_count == expected_switches
-    if not pty_enabled:
+    if not exact_pty_turn:
         d.instance_manager.pty_rate_limit_seen.assert_not_called()
 
 
@@ -3949,6 +4002,65 @@ async def test_spawn_oserror_requeues_exact_queued_message(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_kind", "expected_notice"),
+    [
+        ("unsafe", "API 账号配置安全校验失败"),
+        ("unavailable", "API 账号当前不可用"),
+    ],
+)
+async def test_cloudrouter_admission_error_is_visible_and_not_requeued(
+    db_factory, monkeypatch, error_kind, expected_notice,
+):
+    from backend.services.cloudrouter_accounts import (
+        CloudRouterAccountError,
+        CloudRouterUnsafePathError,
+    )
+    from backend.models.log_entry import LogEntry
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    error = (
+        CloudRouterUnsafePathError(
+            "Unsafe managed file: /private/account/.claude.json"
+        )
+        if error_kind == "unsafe"
+        else CloudRouterAccountError(
+            "CloudRouter API account does not support model 'secret-model'"
+        )
+    )
+    d.instance_manager.launch = AsyncMock(
+        side_effect=error
+    )
+
+    with pytest.raises(type(error)):
+        await d._process_queued_message(task_id, msg)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        notice = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalar_one()
+
+    assert task.status == "executing"
+    assert expected_notice in notice.content
+    assert "/private/" not in notice.content
+    assert "secret-model" not in notice.content
+    assert any(
+        call.args[0] == f"task:{task_id}"
+        and call.args[1].get("id") == notice.id
+        for call in d.broadcaster.broadcast.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_stale_codex_lifecycle_cannot_defer_new_instance_owner(db_factory):
     d = _make_dispatcher(db_factory)
     async with db_factory() as db:
@@ -6227,6 +6339,35 @@ async def test_queued_codex_turn_never_runs_claude_pty_finalizer(
         for call in d.broadcaster.broadcast.await_args_list
         if len(call.args) > 1 and isinstance(call.args[1], dict)
     )
+
+
+@pytest.mark.asyncio
+async def test_queued_pty_turn_does_not_start_second_transient_retry_owner(
+    db_factory, monkeypatch,
+):
+    """FullMirror owns retries; the queue only waits on its chained proxy."""
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    process = MagicMock(returncode=1)
+
+    async def launch(**kwargs):
+        d.instance_manager.processes[kwargs["instance_id"]] = process
+
+    d.instance_manager.launch = AsyncMock(side_effect=launch)
+    d.instance_manager.pty_mode_enabled = False
+    d.instance_manager.is_pty_managed_turn.return_value = True
+    d.instance_manager.transient_error_seen.return_value = True
+    d.instance_manager._try_chat_transient_retry = AsyncMock(
+        return_value=True
+    )
+    d._wait_process = AsyncMock()
+
+    await d._process_queued_message(task_id, msg)
+
+    d.instance_manager._try_chat_transient_retry.assert_not_awaited()
+    d.instance_manager.is_pty_managed_turn.assert_called()
 
 
 @pytest.mark.asyncio

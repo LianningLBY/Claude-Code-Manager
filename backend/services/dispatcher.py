@@ -474,6 +474,10 @@ class GlobalDispatcher:
 
         # Pool: initialized lazily on start() if pool_enabled
         self.pool: "ClaudePool | None" = None
+        # Injected by backend.main. A configured CloudRouter store can provide
+        # Claude/Codex account projections even when the native OAuth pool file
+        # does not exist.
+        self.cloudrouter_store = None
         # CodexPool is created by backend.main and injected after construction.
         # Task ownership lives on Task.metadata_["codex_account_id"] because
         # instances are generic workers that rotate between unrelated tasks.
@@ -491,11 +495,25 @@ class GlobalDispatcher:
         self._running = True
         try:
             # Initialize pool if enabled
-            if settings.pool_enabled:
+            has_cloudrouter_claude = bool(
+                self.cloudrouter_store is not None
+                and any(
+                    account.enabled
+                    and not account.retired
+                    and account.supports_model("claude", None)
+                    for account in self.cloudrouter_store.all_accounts(
+                        include_retired=True
+                    )
+                )
+            )
+            if settings.pool_enabled or has_cloudrouter_claude:
                 from backend.services.claude_pool import ClaudePool
                 self.pool = ClaudePool(
                     config_path=settings.pool_config_path,
                     cooldown_seconds=settings.pool_cooldown_seconds,
+                    cloudrouter_store=self.cloudrouter_store,
+                    bootstrap_default=settings.pool_enabled,
+                    include_native=settings.pool_enabled,
                 )
                 logger.info(
                     "Claude pool enabled with %d accounts",
@@ -1783,6 +1801,24 @@ class GlobalDispatcher:
                 task.id,
             )
 
+    def _effective_process_exit_code(self, instance_id: int, process) -> int:
+        """Return the exact turn's provider-semantic exit code.
+
+        A direct CLI can exit zero while its structured result reports an API
+        failure.  InstanceManager records that distinction after consuming all
+        output; lifecycle callers must use it instead of the OS return code.
+        """
+
+        if process is None:
+            return -1
+        resolver = getattr(self.instance_manager, "effective_exit_code", None)
+        if callable(resolver):
+            value = resolver(instance_id, process)
+            if isinstance(value, int):
+                return value
+        returncode = getattr(process, "returncode", None)
+        return returncode if isinstance(returncode, int) else -1
+
     async def _curator_loop(self):
         """Background curator: periodic skill lifecycle management.
 
@@ -2174,13 +2210,59 @@ class GlobalDispatcher:
                             extra={"old_status": "in_progress"},
                         )
 
-    async def _pool_select(self, exclude: set[str] | None = None) -> str | None:
+    async def _pool_select(
+        self,
+        exclude: set[str] | None = None,
+        *,
+        model: str | None = None,
+    ) -> str | None:
         """Select a pool account config_dir, or None if pool is off / exhausted."""
         if not self.pool:
             return None
         # validate=True probes accounts with a blocking subprocess (up to 30s
         # each) — must run off the event loop
-        return await self.pool.select_async(exclude=exclude, validate=True)
+        selected = await self.pool.select_async(
+            exclude=exclude,
+            validate=True,
+            model=model,
+        )
+        if selected is None:
+            detail = (
+                "no enabled account supports the requested model"
+                if not self.pool.has_compatible_enabled_account(model)
+                else "all compatible pool accounts are currently unavailable"
+            )
+            raise RuntimeError(
+                f"Claude pool has {detail} {model!r}; refusing to run an "
+                "auxiliary process with inherited service credentials"
+            )
+        return selected
+
+    def _sanitize_cloudrouter_claude_env(
+        self, env: dict[str, str], config_dir: str | None
+    ) -> None:
+        """Remove inherited credentials that override API-key helper auth."""
+
+        if self.cloudrouter_store is None or not config_dir:
+            return
+        try:
+            account = self.cloudrouter_store.account_for_claude_config_dir(
+                config_dir
+            )
+        except Exception:
+            logger.exception(
+                "Could not resolve auxiliary Claude account home %s",
+                config_dir,
+            )
+            return
+        if account is None:
+            return
+        for key in (
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            env.pop(key, None)
 
     async def _resolve_resume_config_dir(
         self,
@@ -2189,6 +2271,7 @@ class GlobalDispatcher:
         *,
         task_id: int | None = None,
         expected_generation: _TaskRoutingGeneration | None = None,
+        model: str | None = None,
     ) -> str | None:
         """Resolve the provider account home for a (possibly resuming) launch.
 
@@ -2216,6 +2299,7 @@ class GlobalDispatcher:
                 session_id,
                 task_id=task_id,
                 expected_generation=expected_generation,
+                model=model,
             )
         if not (self.pool and self.pool.enabled):
             return None
@@ -2236,9 +2320,9 @@ class GlobalDispatcher:
             resident = self.pool.locate_session_config_dir(session_id)
             if (
                 resident
-                and not self.pool.is_in_cooldown(resident)
-                and not self.pool.is_disabled(resident)
                 and self.pool.is_known_account(resident)
+                and self.pool.is_config_dir_available(resident)
+                and self.pool.supports_model_for_config_dir(resident, model)
             ):
                 return resident
             # Resident account is missing, rate-limited, or disabled → pick a
@@ -2247,7 +2331,7 @@ class GlobalDispatcher:
             # ``enabled=false`` a hard guarantee: an in-flight session sitting on
             # a retired account is moved off it on its next resume instead of
             # being reused.
-            config_dir = self.pool.select(validate=False)
+            config_dir = self.pool.select(validate=False, model=model)
             if config_dir:
                 if resident and resident != config_dir:
                     await self._require_task_lifecycle_active(
@@ -2267,6 +2351,31 @@ class GlobalDispatcher:
             # --resume finds the conversation instead of hard-failing on a wrong
             # (inherited) account dir.
             if resident:
+                if (
+                    self.pool.is_known_account(resident)
+                    and not self.pool.supports_model_for_config_dir(
+                        resident, model
+                    )
+                ):
+                    raise RuntimeError(
+                        f"Claude pool has no enabled account supporting model "
+                        f"{model!r}; refusing to resume on an incompatible "
+                        "CloudRouter account"
+                    )
+                if (
+                    self.pool.is_known_account(resident)
+                    and self.pool.is_disabled(resident)
+                ):
+                    raise RuntimeError(
+                        "Claude session is resident on a disabled account and "
+                        "no enabled replacement account is available"
+                    )
+                if self.pool.is_cloudrouter_account(resident):
+                    raise RuntimeError(
+                        f"Claude CloudRouter account for model {model!r} is "
+                        "currently unavailable and no compatible replacement "
+                        "account can safely resume the session"
+                    )
                 logger.warning(
                     "Pool exhausted; resuming session %s on its resident account "
                     "dir %s (account may be rate-limited, but --resume can still "
@@ -2276,7 +2385,18 @@ class GlobalDispatcher:
             return resident
 
         # Fresh launch (no session to anchor): just pick a healthy account.
-        return self.pool.select(validate=False)
+        config_dir = self.pool.select(validate=False, model=model)
+        if config_dir is None and self.pool._accounts:
+            detail = (
+                "no enabled account supports the model"
+                if not self.pool.has_compatible_enabled_account(model)
+                else "all compatible pool accounts are currently unavailable"
+            )
+            raise RuntimeError(
+                f"Claude pool has {detail} {model!r}; refusing to fall back "
+                "to the service default account"
+            )
+        return config_dir
 
     async def _codex_task_binding(self, task_id: int | None) -> str | None:
         if task_id is None:
@@ -2497,6 +2617,7 @@ class GlobalDispatcher:
         *,
         task_id: int | None,
         expected_generation: _TaskRoutingGeneration | None = None,
+        model: str | None = None,
     ) -> str | None:
         """Select/reuse a Codex account without losing the native thread.
 
@@ -2545,7 +2666,11 @@ class GlobalDispatcher:
                 "but the task has no codex_account_id binding"
             )
 
-        if resident and pool.is_home_available(resident):
+        if (
+            resident
+            and pool.is_home_available(resident)
+            and pool.supports_model_for_home(resident, model)
+        ):
             account_id = pool.account_id_for_home(resident)
             await self._persist_codex_binding_for_route(
                 task_id=task_id,
@@ -2558,9 +2683,14 @@ class GlobalDispatcher:
         resident_id = pool.account_id_for_home(resident) if resident else None
         if resident_id:
             excluded.add(resident_id)
-        target = pool.select(exclude=excluded)
+        target = pool.select(exclude=excluded, model=model)
 
         if not target:
+            if not pool.has_compatible_enabled_account(model):
+                raise CodexAccountRoutingError(
+                    f"Codex pool has no enabled account supporting model "
+                    f"{model!r}; refusing to route or downgrade the task"
+                )
             if resident and pool.is_known_account(resident) and pool.is_home_enabled(resident):
                 retry_after = self._codex_pool_retry_after()
                 raise CodexAccountRoutingError(
@@ -2674,6 +2804,7 @@ class GlobalDispatcher:
                 else await db.get(Task, task_id)
             )
             provider = (t.provider or "claude").lower() if t else "claude"
+            task_model = t.model if t else None
 
         # Codex has an independent account pool and native rollout format. It
         # must never enter the Claude pool/migrate_session path below.
@@ -2696,7 +2827,13 @@ class GlobalDispatcher:
             combined = collect_process_output_for_detection(stderr, log_contents)
         await self._require_task_lifecycle_active(expected_generation)
 
-        if not is_pool_rotatable(combined):
+        cloudrouter_auth_failed = (
+            self.instance_manager.is_cloudrouter_auth_failure(
+                instance_id, "claude", combined
+            )
+            is True
+        )
+        if not (is_pool_rotatable(combined) or cloudrouter_auth_failed):
             return None
 
         old_config_dir = self.instance_manager.get_config_dir(instance_id)
@@ -2707,7 +2844,7 @@ class GlobalDispatcher:
             old_config_dir = _os.path.expanduser("~/.claude")
 
         # Mark the old account
-        if is_auth_failure(combined):
+        if is_auth_failure(combined) or cloudrouter_auth_failed:
             self.pool.mark_auth_failure(old_config_dir)
             logger.warning("Pool account %s auth failure, marked indefinite cooldown", old_config_dir)
         elif is_rate_limited(combined):
@@ -2718,7 +2855,10 @@ class GlobalDispatcher:
         old_account_id = self.pool.account_id_from_config_dir(old_config_dir)
         excluded = {old_account_id} if old_account_id else set()
 
-        new_config_dir = await self._pool_select(exclude=excluded)
+        new_config_dir = await self._pool_select(
+            exclude=excluded,
+            model=task_model,
+        )
         await self._require_task_lifecycle_active(expected_generation)
         if not new_config_dir:
             logger.warning("Pool exhausted — no alternative account for task %d", task_id)
@@ -2752,7 +2892,11 @@ class GlobalDispatcher:
             "event_type": "pool_rotation",
             "old_account": old_account_id,
             "new_account": self.pool.account_id_from_config_dir(new_config_dir),
-            "reason": "rate_limit" if is_rate_limited(combined) else "auth_failure",
+            "reason": (
+                "rate_limit"
+                if is_rate_limited(combined) and not cloudrouter_auth_failed
+                else "auth_failure"
+            ),
         })
         await self.broadcaster.broadcast("system", {
             "event": "pool_rotation",
@@ -2790,7 +2934,13 @@ class GlobalDispatcher:
         if combined is None:
             combined = await self._collect_failure_output(instance_id, task_id)
         await self._require_task_lifecycle_active(expected_generation)
-        if not is_pool_rotatable(combined):
+        cloudrouter_auth_failed = (
+            self.instance_manager.is_cloudrouter_auth_failure(
+                instance_id, "codex", combined
+            )
+            is True
+        )
+        if not (is_pool_rotatable(combined) or cloudrouter_auth_failed):
             return None
 
         async with self.db_factory() as db:
@@ -2806,6 +2956,7 @@ class GlobalDispatcher:
             bound_id = (
                 (task.metadata_ or {}).get("codex_account_id") if task else None
             )
+            task_model = task.model if task else None
 
         old_home = self.instance_manager.get_config_dir(instance_id)
         if not old_home and isinstance(bound_id, str):
@@ -2814,7 +2965,7 @@ class GlobalDispatcher:
             old_home or os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
         )
 
-        auth_failed = is_auth_failure(combined)
+        auth_failed = is_auth_failure(combined) or cloudrouter_auth_failed
         await self._require_task_lifecycle_active(expected_generation)
         if auth_failed:
             pool.mark_auth_failure(old_home)
@@ -2828,7 +2979,7 @@ class GlobalDispatcher:
 
         old_account_id = pool.account_id_for_home(old_home)
         excluded = {old_account_id} if old_account_id else set()
-        new_home = pool.select(exclude=excluded)
+        new_home = pool.select(exclude=excluded, model=task_model)
         if not new_home:
             logger.warning(
                 "Codex pool exhausted — no alternative account for task %d",
@@ -3059,7 +3210,7 @@ class GlobalDispatcher:
                 process, task, label, instance_id=instance_id
             )
         await self._wait_output_consumer(instance_id, task, label, process)
-        return process.returncode if process else -1
+        return self._effective_process_exit_code(instance_id, process)
 
     async def _launch_mode_turn_with_rotation(
         self,
@@ -3120,7 +3271,7 @@ class GlobalDispatcher:
                     process, task, label, instance_id=instance_id
                 )
             await self._wait_output_consumer(instance_id, task, label, process)
-            exit_code = process.returncode if process else -1
+            exit_code = self._effective_process_exit_code(instance_id, process)
             if not await self._task_claim_is_active(generation):
                 return -2, current_home
             if exit_code in (0, -2, 130):
@@ -3821,7 +3972,15 @@ class GlobalDispatcher:
         if (
             settings.transient_retry_enabled
             and attempt < settings.transient_retry_max
-            and (still_transient or is_transient_for(task.provider, combined))
+            and (
+                still_transient
+                or is_transient_for(task.provider, combined)
+                or self.instance_manager.is_cloudrouter_transient(
+                    instance_id,
+                    (task.provider or "claude").lower(),
+                    combined,
+                ) is True
+            )
         ):
             await self._run_transient_retry(
                 instance_id, task, generation, cwd, git_env,
@@ -3983,6 +4142,7 @@ class GlobalDispatcher:
                 task.provider,
                 task_id=task.id,
                 expected_generation=lifecycle_generation,
+                **({"model": task.model} if task.model else {}),
             )
 
             if not await self._task_claim_is_active(lifecycle_generation):
@@ -4011,6 +4171,9 @@ class GlobalDispatcher:
 
             # Wait for process to finish (with timeout)
             process = self.instance_manager.processes.get(instance_id)
+            pty_managed_turn = self.instance_manager.is_pty_managed_turn(
+                instance_id, process
+            )
             if process:
                 await self._wait_process(
                     process, task, "Task run", instance_id=instance_id
@@ -4024,7 +4187,7 @@ class GlobalDispatcher:
                 instance_id, task, "Task run", process
             )
 
-            exit_code = process.returncode if process else -1
+            exit_code = self._effective_process_exit_code(instance_id, process)
 
             # === Step 5: Judge result ===
             if not await self._task_claim_is_active(lifecycle_generation):
@@ -4059,7 +4222,7 @@ class GlobalDispatcher:
             # rate_limit_event was observed → migrate session to a healthy
             # account before judging success (next retry/turn uses fresh quota).
             if (
-                self.instance_manager.pty_mode_enabled
+                pty_managed_turn
                 and self.instance_manager.pty_rate_limit_seen(instance_id)
             ):
                 await self.instance_manager._try_proactive_pool_switch(
@@ -4078,7 +4241,14 @@ class GlobalDispatcher:
 
                 # Transient overload that only surfaced on stderr (subprocess
                 # mode) — the flag above may miss it, so re-check the text.
-                if settings.transient_retry_enabled and is_transient_for(task.provider, combined):
+                if settings.transient_retry_enabled and (
+                    is_transient_for(task.provider, combined)
+                    or self.instance_manager.is_cloudrouter_transient(
+                        instance_id,
+                        (task.provider or "claude").lower(),
+                        combined,
+                    ) is True
+                ):
                     await self._run_transient_retry(
                         instance_id, task, lifecycle_generation, cwd, git_env,
                         thinking_budget=thinking_budget,
@@ -4695,6 +4865,7 @@ class GlobalDispatcher:
                 task.provider,
                 task_id=task.id,
                 expected_generation=generation,
+                **({"model": task.model} if task.model else {}),
             )
 
             iteration_exit_code, config_dir = await self._launch_mode_turn_with_rotation(
@@ -4861,30 +5032,108 @@ class GlobalDispatcher:
         """
         from backend.services.goal_evaluator import GoalEvaluationError
 
-        current_home = codex_home
+        provider = (task.provider or "claude").lower()
+        evaluator_model = task.goal_evaluator_model or (
+            settings.default_codex_goal_evaluator_model
+            if provider == "codex"
+            else settings.default_goal_evaluator_model
+        )
+        turn_home = codex_home
+        evaluation_home = turn_home
+
+        if provider == "codex" and self.codex_pool:
+            pool = self.codex_pool
+            current_usable = bool(
+                turn_home
+                and (
+                    not pool.is_known_account(turn_home)
+                    or (
+                        pool.is_home_available(turn_home)
+                        and pool.supports_model_for_home(
+                            turn_home, evaluator_model
+                        )
+                    )
+                )
+            )
+            if not current_usable:
+                evaluation_home = pool.select(model=evaluator_model)
+                if evaluation_home is None:
+                    detail = (
+                        "no enabled account supports"
+                        if not pool.has_compatible_enabled_account(
+                            evaluator_model
+                        )
+                        else "no compatible pool account is currently available for"
+                    )
+                    raise GoalEvaluationError(
+                        f"Codex pool has {detail} goal evaluator model "
+                        f"{evaluator_model!r}",
+                        provider=provider,
+                    )
+        elif provider == "claude" and self.pool:
+            pool = self.pool
+            current_usable = bool(
+                turn_home
+                and (
+                    not pool.is_known_account(turn_home)
+                    or (
+                        pool.is_config_dir_available(turn_home)
+                        and pool.supports_model_for_config_dir(
+                            turn_home, evaluator_model
+                        )
+                    )
+                )
+            )
+            if not current_usable:
+                evaluation_home = pool.select(
+                    validate=False,
+                    model=evaluator_model,
+                )
+                if evaluation_home is None:
+                    detail = (
+                        "no enabled account supports"
+                        if not pool.has_compatible_enabled_account(
+                            evaluator_model
+                        )
+                        else "no compatible pool account is currently available for"
+                    )
+                    raise GoalEvaluationError(
+                        f"Claude pool has {detail} goal evaluator model "
+                        f"{evaluator_model!r}",
+                        provider=provider,
+                    )
+
         for rotation_attempt in range(2):
             if not await self._task_claim_is_active(generation):
                 raise GoalEvaluationError(
                     "Goal task generation was superseded before evaluation",
-                    provider=task.provider or "claude",
+                    provider=provider,
                 )
             try:
                 result = await evaluator.evaluate(
                     condition=task.goal_condition,
                     conversation_summary=conversation_summary,
                     model=task.goal_evaluator_model,
-                    provider=task.provider or "claude",
-                    codex_home=current_home,
+                    provider=provider,
+                    codex_home=evaluation_home,
                     task_id=task.id,
+                    config_dir=evaluation_home,
+                    cloudrouter_store=self.cloudrouter_store,
                 )
-                return result, current_home
+                return result, turn_home
             except GoalEvaluationError as exc:
                 if (
-                    (task.provider or "claude").lower() != "codex"
+                    provider != "codex"
                     or rotation_attempt > 0
                 ):
                     raise
                 if not await self._task_claim_is_active(generation):
+                    raise
+                # An evaluator may deliberately use a different API account
+                # because the task's resident account does not support the
+                # evaluator model.  Never run the main-session migration path
+                # against that ephemeral evaluator home.
+                if evaluation_home != turn_home:
                     raise
 
                 classifier_exit_code = (
@@ -4902,9 +5151,10 @@ class GlobalDispatcher:
                 if not rotation:
                     raise
 
-                current_home = rotation.get("config_dir")
-                if not current_home:
+                evaluation_home = rotation.get("config_dir")
+                if not evaluation_home:
                     raise
+                turn_home = evaluation_home
                 logger.info(
                     "Goal evaluator for task %s rotating Codex account and retrying",
                     task.id,
@@ -4971,6 +5221,7 @@ class GlobalDispatcher:
                     task.provider,
                     task_id=task.id,
                     expected_generation=generation,
+                    **({"model": task.model} if task.model else {}),
                 )
             else:
                 resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
@@ -4983,6 +5234,7 @@ class GlobalDispatcher:
                     task.provider,
                     task_id=task.id,
                     expected_generation=generation,
+                    **({"model": task.model} if task.model else {}),
                 )
 
             turn_exit_code, config_dir = await self._launch_mode_turn_with_rotation(
@@ -5357,6 +5609,7 @@ class GlobalDispatcher:
             task.provider,
             task_id=task.id,
             expected_generation=generation,
+            **({"model": task.model} if task.model else {}),
         )
 
         logger.info(f"Loop task {task.id} iter {iteration}: resuming session {resume_sid} to fix missing signal")
@@ -5402,6 +5655,7 @@ class GlobalDispatcher:
             task.provider,
             task_id=task.id,
             expected_generation=generation,
+            **({"model": task.model} if task.model else {}),
         )
         exit_code, config_dir = await self._launch_mode_turn_with_rotation(
             instance_id,
@@ -5957,9 +6211,12 @@ class GlobalDispatcher:
         # Monitor sub-agent needs a logged-in account. Pick one from the pool
         # (or fall back to default ~/.claude).
         if self.pool:
-            config_dir = await self._pool_select()
+            config_dir = await self._pool_select(
+                model=model or settings.default_model
+            )
             if config_dir:
                 env["CLAUDE_CONFIG_DIR"] = config_dir
+                self._sanitize_cloudrouter_claude_env(env, config_dir)
 
         log_path = Path(f"/tmp/ccm_monitor_{monitor_session_id}.log")
         process = await self._launch_registered_aux_process(
@@ -6190,9 +6447,12 @@ class GlobalDispatcher:
                if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
 
         if self.pool:
-            config_dir = await self._pool_select()
+            config_dir = await self._pool_select(
+                model=model or settings.default_model
+            )
             if config_dir:
                 env["CLAUDE_CONFIG_DIR"] = config_dir
+                self._sanitize_cloudrouter_claude_env(env, config_dir)
 
         log_path = Path(f"/tmp/ccm_sub_agent_{session_id}.log")
         process = await self._launch_registered_aux_process(
@@ -7002,11 +7262,13 @@ class GlobalDispatcher:
             # the session's resident dir instead of letting it fall through to an
             # inherited CLAUDE_CONFIG_DIR that lacks the JSONL (prod #734/#740).
             queued_routing_generation = self._task_status_generation(task)
+            effective_model = msg.model_override or task.model
             config_dir = await self._resolve_resume_config_dir(
                 task.session_id,
                 task.provider,
                 task_id=task.id,
                 expected_generation=queued_routing_generation,
+                **({"model": effective_model} if effective_model else {}),
             )
 
             logger.info(
@@ -7030,11 +7292,11 @@ class GlobalDispatcher:
                 if (task.provider or "claude").lower() == "codex":
                     from backend.services.codex_models import codex_context_window
                     window = usage.get("context_window") or codex_context_window(
-                        msg.model_override or task.model
+                        effective_model
                     )
                 else:
                     window = usage.get("context_window") or 200_000
-                    model_lower = (msg.model_override or task.model or "").lower()
+                    model_lower = (effective_model or "").lower()
                     if "[1m]" in model_lower or "fable" in model_lower:
                         window = max(window, 1_000_000)
                 utilization = used_tokens / window if window else 0
@@ -7089,7 +7351,7 @@ class GlobalDispatcher:
                 prompt=msg.prompt,
                 task_id=task_id,
                 cwd=task.last_cwd or task.target_repo or os.getcwd(),
-                model=msg.model_override or task.model,
+                model=effective_model,
                 resume_session_id=task.session_id,
                 git_env=git_env,
                 thinking_budget=task.thinking_budget,
@@ -7254,6 +7516,10 @@ class GlobalDispatcher:
                     CodexAppServerBusyError,
                     CodexThreadHomeMismatchError,
                 )
+                from backend.services.cloudrouter_accounts import (
+                    CloudRouterAccountError,
+                    CloudRouterUnsafePathError,
+                )
 
                 # Known routing/admission errors cannot have started this turn.
                 # For arbitrary spawn failures, the absence of this exact
@@ -7269,10 +7535,14 @@ class GlobalDispatcher:
                         InstanceAlreadyRunningError,
                     ),
                 )
+                permanent_prelaunch = isinstance(
+                    exc, CloudRouterAccountError
+                )
                 safe_to_retry = (
                     known_prelaunch
                     or self.instance_manager.processes.get(inst_id) is None
                 )
+                permanent_notice_data = None
                 rollback_values = {
                     "status": (
                         status_before_launch if safe_to_retry else "failed"
@@ -7313,14 +7583,60 @@ class GlobalDispatcher:
                     failed_generation = (
                         await self._read_task_status_generation(db, task_id)
                     )
+                if permanent_prelaunch and restored.rowcount:
+                    unsafe_cloudrouter_config = isinstance(
+                        exc, CloudRouterUnsafePathError
+                    )
+                    permanent_notice = LogEntry(
+                        instance_id=None,
+                        task_id=task_id,
+                        event_type="system_event",
+                        role="system",
+                        content=(
+                            (
+                                "API 账号配置安全校验失败，本条消息未执行。"
+                                "请检查或重新保存该 API 账号后再发送。"
+                            )
+                            if unsafe_cloudrouter_config
+                            else (
+                                "API 账号当前不可用，本条消息未执行。"
+                                "请刷新账号，并检查启用状态、模型支持或额度后"
+                                "重新发送。"
+                            )
+                        ),
+                        is_error=True,
+                    )
+                    db.add(permanent_notice)
+                    await db.flush()
+                    permanent_notice_data = {
+                        "id": permanent_notice.id,
+                        "instance_id": None,
+                        "task_id": task_id,
+                        "event_type": "system_event",
+                        "role": "system",
+                        "content": permanent_notice.content,
+                        "is_error": True,
+                        "timestamp": (
+                            permanent_notice.timestamp or datetime.utcnow()
+                        ).isoformat(),
+                    }
                 await db.commit()
+                if permanent_notice_data is not None:
+                    await self.broadcaster.broadcast(
+                        f"task:{task_id}",
+                        permanent_notice_data,
+                    )
                 if failed_generation is not None:
                     await self._broadcast_task_status_generation(
                         failed_generation,
                         instance_id=inst_id,
                         db=db,
                     )
-                if safe_to_retry and not known_prelaunch:
+                if (
+                    safe_to_retry
+                    and not known_prelaunch
+                    and not permanent_prelaunch
+                ):
                     raise QueuedMessagePrelaunchError(
                         f"Queued message launch failed before process creation: {exc}"
                     ) from exc
@@ -7346,7 +7662,13 @@ class GlobalDispatcher:
         try:
             process = self.instance_manager.processes.get(inst_id)
             consumer = self.instance_manager._tasks.get(inst_id)
-            if task_provider != "claude" or not self.instance_manager.pty_mode_enabled:
+            pty_managed_turn = bool(
+                task_provider == "claude"
+                and self.instance_manager.is_pty_managed_turn(
+                    inst_id, process
+                )
+            )
+            if not pty_managed_turn:
                 # A subprocess/app-server output consumer may react to a
                 # transient or account limit by launching a replacement turn
                 # before it exits. Follow that chain to completion so this
@@ -7379,36 +7701,11 @@ class GlobalDispatcher:
                 )
             # Status management is handled by _consume_output (chat_initiated=True)
             #
-            # PTY mode: a transient 429/overload aborts the turn but the
-            # persistent session stays alive, so on_exit reports exit_code 0 and
-            # never enters the failure path. The per-turn flag set in
-            # _process_event is the only reliable signal here. We drive the
-            # wait+retry loop from this consumer (heartbeat-covered, so the
-            # watchdog won't respawn us): each retry relaunches the same account
-            # and we re-check the flag after it finishes. Subprocess mode is
-            # handled via exit_code in _consume_output, so restrict to PTY to
-            # avoid double-firing.
-            if (
-                settings.transient_retry_enabled
-                and inst_id is not None
-                and task_provider == "claude"
-                and self.instance_manager.pty_mode_enabled
-            ):
-                while self.instance_manager.transient_error_seen(inst_id):
-                    launched = await self.instance_manager._try_chat_transient_retry(
-                        inst_id, task_id, 1, ""
-                    )
-                    if not launched:
-                        break  # budget exhausted / no longer transient
-                    process = self.instance_manager.processes.get(inst_id)
-                    if process:
-                        await self._wait_process(
-                            process,
-                            task,
-                            "Chat transient retry",
-                            instance_id=inst_id,
-                        )
-                self.instance_manager._transient_attempts.pop(inst_id, None)
+            # FullMirrorCCMBackend.on_exit is the sole owner of PTY transient
+            # retries. It chains every replacement proxy back to ``process``,
+            # so the wait above already covers the whole retry sequence.
+            # Retrying again here would reset an exhausted attempt tally and
+            # could keep a failed API turn spinning indefinitely.
 
             # PTY proactive pool switch: if this turn saw an actionable
             # rate_limit_event, migrate the session to a healthy account so the
@@ -7417,8 +7714,7 @@ class GlobalDispatcher:
             # mode needs it here because the process stays alive (exit_code 0).
             if (
                 inst_id is not None
-                and task_provider == "claude"
-                and self.instance_manager.pty_mode_enabled
+                and pty_managed_turn
                 and self.instance_manager.pty_rate_limit_seen(inst_id)
             ):
                 await self.instance_manager._try_proactive_pool_switch(

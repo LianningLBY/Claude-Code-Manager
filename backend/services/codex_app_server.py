@@ -156,10 +156,14 @@ class CodexAppServer:
         request_timeout: float = 30.0,
         *,
         codex_home: str | os.PathLike[str] | None = None,
+        env_remove: set[str] | None = None,
     ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
         self.codex_home = normalize_codex_home(codex_home)
+        self._env_remove = {
+            str(key).upper() for key in (env_remove or set())
+        }
         self._process: asyncio.subprocess.Process | None = None
         # On POSIX, app-server is launched as its own session leader.  Keep
         # the exact process identity—not just its numeric PID—so a stale
@@ -259,7 +263,10 @@ class CodexAppServer:
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
+            if (
+                key.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
+                and key.upper() not in self._env_remove
+            )
         }
         env["CODEX_HOME"] = self.codex_home
         started = time.perf_counter()
@@ -1051,9 +1058,16 @@ class CodexAppServerRegistry:
     thread -> home owner and independent process lifecycle for every account.
     """
 
-    def __init__(self, binary: str, request_timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        binary: str,
+        request_timeout: float = 30.0,
+        *,
+        env_remove_resolver: Callable[[str], set[str]] | None = None,
+    ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
+        self._env_remove_resolver = env_remove_resolver
         self._servers: dict[str, CodexAppServer] = {}
         self._thread_owners: dict[str, str] = {}
         self._draining: set[str] = set()
@@ -1118,10 +1132,14 @@ class CodexAppServerRegistry:
                 self._starting_threads[resume_session_id] = start_token
             server = self._servers.get(home)
             if server is None:
+                server_kwargs: dict[str, Any] = {}
+                if self._env_remove_resolver is not None:
+                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
                 server = CodexAppServer(
                     self.binary,
                     request_timeout=self.request_timeout,
                     codex_home=home,
+                    **server_kwargs,
                 )
                 self._servers[home] = server
             self._starting[home] = self._starting.get(home, 0) + 1
@@ -1301,10 +1319,14 @@ class CodexAppServerRegistry:
                 )
             server = self._servers.get(home)
             if server is None:
+                server_kwargs: dict[str, Any] = {}
+                if self._env_remove_resolver is not None:
+                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
                 server = CodexAppServer(
                     self.binary,
                     request_timeout=self.request_timeout,
                     codex_home=home,
+                    **server_kwargs,
                 )
                 self._servers[home] = server
             self._starting[home] = self._starting.get(home, 0) + 1

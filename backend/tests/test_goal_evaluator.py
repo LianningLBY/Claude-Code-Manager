@@ -622,6 +622,72 @@ class TestEvaluateIntegration:
         assert mock_exec.call_args.args[1] == "exec"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider", ["claude", "codex"])
+    async def test_api_evaluation_uses_provider_home_and_scrubs_auth(
+        self, provider, tmp_path, monkeypatch,
+    ):
+        evaluator = GoalEvaluator()
+        provider_home = tmp_path / f"{provider}-api-account"
+        store = MagicMock()
+        store._read_api_key = MagicMock(
+            side_effect=AssertionError("evaluator must not read API key"),
+        )
+        if provider == "codex":
+            store.account_for_codex_home.return_value = object()
+            agent_text = json.dumps({"achieved": True, "reason": "ok"})
+            stdout = json.dumps({
+                "item": {"type": "agent_message", "text": agent_text},
+            }).encode()
+            auth_keys = (
+                "OPENAI_API_KEY",
+                "CODEX_API_KEY",
+                "CLOUDROUTER_API_KEY",
+            )
+            home_key = "CODEX_HOME"
+            evaluate_home = {"codex_home": str(provider_home)}
+        else:
+            store.account_for_claude_config_dir.return_value = object()
+            stdout = json.dumps({"achieved": True, "reason": "ok"}).encode()
+            auth_keys = (
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            )
+            home_key = "CLAUDE_CONFIG_DIR"
+            evaluate_home = {"config_dir": str(provider_home)}
+
+        for key in auth_keys:
+            monkeypatch.setenv(key, f"secret-{key}")
+        mock_proc = MagicMock()
+        mock_proc.pid = 55_010 if provider == "claude" else 55_011
+        mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+        mock_proc.returncode = 0
+
+        with (
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_proc,
+            ) as mock_exec,
+            patch(
+                "backend.services.goal_evaluator.os.killpg",
+                side_effect=ProcessLookupError,
+            ),
+        ):
+            result = await evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                provider=provider,
+                cloudrouter_store=store,
+                **evaluate_home,
+            )
+
+        child_env = mock_exec.call_args.kwargs["env"]
+        assert result.achieved is True
+        assert child_env[home_key] == str(provider_home)
+        assert not set(auth_keys) & child_env.keys()
+        store._read_api_key.assert_not_called()
+
+    @pytest.mark.asyncio
     @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
     async def test_normal_completion_kills_closed_stdio_descendant(self, tmp_path):
         evaluator = GoalEvaluator()

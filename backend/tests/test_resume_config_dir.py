@@ -14,8 +14,8 @@ import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
-from backend.services.claude_pool import ClaudePool
-from backend.services.codex_pool import CodexPool
+from backend.services.claude_pool import ClaudePool, PoolAccount
+from backend.services.codex_pool import CodexPool, CodexPoolAccount
 from backend.services.dispatcher import (
     CodexAccountRoutingError,
     GlobalDispatcher,
@@ -77,13 +77,14 @@ class TestResolveResumeConfigDir:
         assert result == str(tmp_path / "claude-2")
 
     @pytest.mark.asyncio
-    async def test_pool_exhausted_no_session_returns_none(self, dispatcher, pool, tmp_path, monkeypatch):
-        """Fresh launch (no session) + exhausted pool → None (don't fabricate a dir)."""
+    async def test_pool_exhausted_fresh_launch_fails_closed(self, dispatcher, pool, tmp_path, monkeypatch):
+        """An active pool must not leak through to inherited service credentials."""
         monkeypatch.setenv("HOME", str(tmp_path))
         future = time.time() + 999
         pool._cooldowns = {"acc-1": future, "acc-2": future}
 
-        assert await dispatcher._resolve_resume_config_dir(None) is None
+        with pytest.raises(RuntimeError, match="currently unavailable"):
+            await dispatcher._resolve_resume_config_dir(None)
 
     @pytest.mark.asyncio
     async def test_pool_exhausted_unknown_session_returns_none(self, dispatcher, pool, tmp_path, monkeypatch):
@@ -161,6 +162,90 @@ class TestResolveResumeConfigDir:
         disp.pool = None
         assert await disp._resolve_resume_config_dir("sess-x") is None
 
+    @pytest.mark.asyncio
+    async def test_api_only_fresh_task_with_unsupported_model_fails_closed(
+        self, dispatcher, pool, tmp_path
+    ):
+        api = MagicMock()
+        api.supports_model.side_effect = (
+            lambda provider, model: model == "claude-sonnet-5"
+        )
+        pool._accounts = [PoolAccount({
+            "id": "cloudrouter-1",
+            "config_dir": str(tmp_path / "api" / "claude"),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "_api_account": api,
+        })]
+
+        with pytest.raises(RuntimeError, match="no enabled account supports"):
+            await dispatcher._resolve_resume_config_dir(
+                None,
+                model="claude-opus-4-8",
+            )
+
+    @pytest.mark.asyncio
+    async def test_api_only_compatible_but_cooled_fresh_task_fails_closed(
+        self, dispatcher, pool, tmp_path
+    ):
+        api = MagicMock()
+        api.supports_model.return_value = True
+        pool._accounts = [PoolAccount({
+            "id": "cloudrouter-1",
+            "config_dir": str(tmp_path / "api" / "claude"),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "_api_account": api,
+        })]
+        pool._cooldowns["cloudrouter-1"] = time.time() + 999
+
+        with pytest.raises(RuntimeError, match="currently unavailable"):
+            await dispatcher._resolve_resume_config_dir(
+                None,
+                model="claude-sonnet-5",
+            )
+
+    @pytest.mark.asyncio
+    async def test_model_switch_migrates_off_incompatible_api_resident(
+        self, dispatcher, pool, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        api_dir = tmp_path / "api" / "claude"
+        native_dir = tmp_path / "native"
+        api = MagicMock()
+        api.supports_model.side_effect = (
+            lambda provider, model: model == "claude-sonnet-5"
+        )
+        pool._accounts = [
+            PoolAccount({
+                "id": "cloudrouter-1",
+                "config_dir": str(api_dir),
+                "enabled": True,
+                "auth_kind": "cloudrouter_api",
+                "_api_account": api,
+            }),
+            PoolAccount({
+                "id": "native",
+                "config_dir": str(native_dir),
+                "enabled": True,
+            }),
+        ]
+        old = _seed_session(api_dir, "model-switch")
+
+        result = await dispatcher._resolve_resume_config_dir(
+            "model-switch",
+            model="claude-opus-4-8",
+        )
+
+        assert result == str(native_dir)
+        copied = (
+            native_dir
+            / "projects"
+            / "-home-user-repo"
+            / "model-switch.jsonl"
+        )
+        assert copied.stat().st_ino == old.stat().st_ino
+
 
 def _codex_db_factory(task):
     db = MagicMock()
@@ -223,6 +308,60 @@ class TestResolveResumeConfigDirCodex:
 
         with pytest.raises(RuntimeError, match="no available account"):
             await disp._resolve_resume_config_dir(None, "codex", task_id=42)
+
+    @pytest.mark.asyncio
+    async def test_api_only_unsupported_model_fails_without_downgrade(
+        self, tmp_path
+    ):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        api = MagicMock()
+        api.supports_model.side_effect = (
+            lambda provider, model: model == "gpt-5.5"
+        )
+        disp.codex_pool._accounts = [CodexPoolAccount({
+            "id": "cloudrouter-1",
+            "codex_home": str(tmp_path / "api" / "codex"),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "_api_account": api,
+        })]
+
+        with pytest.raises(
+            CodexAccountRoutingError,
+            match="no enabled account supporting model",
+        ):
+            await disp._resolve_resume_config_dir(
+                None,
+                "codex",
+                task_id=42,
+                model="gpt-5.6-sol",
+            )
+
+    @pytest.mark.asyncio
+    async def test_api_only_compatible_but_cooled_never_uses_default_home(
+        self, tmp_path
+    ):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        api = MagicMock()
+        api.supports_model.return_value = True
+        disp.codex_pool._accounts = [CodexPoolAccount({
+            "id": "cloudrouter-1",
+            "codex_home": str(tmp_path / "api" / "codex"),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "_api_account": api,
+        })]
+        disp.codex_pool._cooldowns["cloudrouter-1"] = time.time() + 999
+
+        with pytest.raises(CodexAccountRoutingError, match="no available account"):
+            await disp._resolve_resume_config_dir(
+                None,
+                "codex",
+                task_id=42,
+                model="gpt-5.5",
+            )
 
     @pytest.mark.asyncio
     async def test_cooldown_migrates_rollout_rebinds_and_updates_owner(self, tmp_path):

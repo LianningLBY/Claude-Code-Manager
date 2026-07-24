@@ -31,6 +31,31 @@ logger = logging.getLogger(__name__)
 _EXPECTED_GENERATION_UNSET = object()
 DEFAULT_TERMINAL_CONSUMER_TIMEOUT = 30.0
 DEFAULT_CONSUMER_CANCEL_TIMEOUT = 5.0
+_CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+_CLOUDROUTER_CLAUDE_BINARY_ENV = "CCM_CLOUDROUTER_CLAUDE_BINARY"
+_CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CLOUDROUTER_API_KEY",
+)
+_CLOUDROUTER_TRANSIENT_RE = re.compile(
+    r"(?:API\s+Error|HTTP|status(?:\s+code)?|error|upstream)"
+    r"[^\n]{0,120}(?:\b429\b|too many requests|rate[ _-]?limited)"
+    r"|(?:\b429\b|too many requests|rate[ _-]?limited)"
+    r"[^\n]{0,120}(?:API|HTTP|request|upstream|error)",
+    re.IGNORECASE,
+)
+_CLOUDROUTER_AUTH_RE = re.compile(
+    r"\b401\b[^\n]{0,120}(?:unauthori[sz]ed|invalid|API[ _-]?key)"
+    r"|\b403\b[^\n]{0,120}(?:forbidden|unauthori[sz]ed|API[ _-]?key)"
+    r"|(?:invalid[ _-]?api[ _-]?key|API[ _-]?key[^\n]{0,80}invalid"
+    r"|authentication_error|\bforbidden\b)",
+    re.IGNORECASE,
+)
 
 
 class InstanceAlreadyRunningError(RuntimeError):
@@ -67,6 +92,10 @@ class _OutputConsumerRecord:
     # PID across many turns, so neither process identity nor PID alone can
     # distinguish a late exit callback from a newer turn on the same slot.
     instance_started_at: datetime | None = None
+    # PTY is a persistent interactive process: an upstream API turn may abort
+    # while the OS process remains healthy and therefore reports exit code 0.
+    # Keep the semantic failure on this exact immutable turn generation.
+    fatal_provider_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +146,9 @@ class InstanceManager:
         # tests) from importing the process-global Dispatcher and enqueueing
         # work against an unrelated database.
         self.task_message_enqueuer = None
+        # Injected by backend.main. Runtime lookup is path-only and never reads
+        # or stores the API key in launch params, git env, or process argv.
+        self.cloudrouter_store = None
         self.parser = StreamParser()
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self._tasks: dict[int, asyncio.Task] = {}  # instance_id -> consumer task
@@ -167,6 +199,10 @@ class InstanceManager:
             int, asyncio.subprocess.Process
         ] = {}
         self._last_stderr: dict[int, str] = {}  # instance_id -> stderr from last run
+        # Direct CLI can report a structured fatal provider result while the
+        # OS process exits 0. Keep the semantic result by exact process
+        # identity until the owning lifecycle reads it (bounded: one per slot).
+        self._effective_exit_codes: dict[int, tuple[object, int]] = {}
         self._launch_params: dict[int, dict] = {}  # instance_id -> params for re-launch on rotation
         # instance_id -> consecutive transient-overload retry count. Survives
         # the in-place relaunch (launch() resets _launch_params, so this can't
@@ -232,6 +268,39 @@ class InstanceManager:
     @property
     def pty_mode_enabled(self) -> bool:
         return self._pty_enabled and self._pty_backend is not None
+
+    def is_pty_managed_turn(
+        self,
+        instance_id: int | None,
+        process=None,
+    ) -> bool:
+        """Whether the exact current turn is owned by the PTY adapter."""
+
+        if instance_id is None or self._pty_backend is None:
+            return False
+        current = process or self.processes.get(instance_id)
+        if current is None:
+            return False
+        proxies = getattr(self._pty_backend, "_proxies", None)
+        if isinstance(proxies, dict):
+            return proxies.get(instance_id) is current
+        # Compatibility for narrow test/older adapter doubles.
+        return instance_id in getattr(self._pty_backend, "_sessions", {})
+
+    def has_pty_session(self, session_id: str | None) -> bool:
+        """Whether this native Claude session belongs to the PTY backend.
+
+        Task.instance_id is a rotating worker claim and can be absent or stale
+        when the injection endpoint runs, so injection routing must resolve by
+        the native session id just like ``inject_pty_message`` itself.
+        """
+
+        if self._pty_backend is None or not session_id:
+            return False
+        return any(
+            getattr(session, "session_id", None) == session_id
+            for session in getattr(self._pty_backend, "_sessions", {}).values()
+        )
 
     async def inject_pty_message(self, session_id: str, content: str) -> bool:
         """Inject text into a live PTY session (PTY-only).
@@ -454,24 +523,27 @@ class InstanceManager:
                     )
                     self._launch_reservations[instance_id] = reservation
                     try:
-                        result = await self._launch_locked(
-                            instance_id=instance_id,
-                            prompt=prompt,
-                            task_id=task_id,
-                            cwd=cwd,
-                            model=model,
-                            resume_session_id=resume_session_id,
-                            loop_iteration=loop_iteration,
-                            git_env=git_env,
-                            thinking_budget=thinking_budget,
-                            effort_level=effort_level,
-                            chat_initiated=chat_initiated,
-                            config_dir=config_dir,
-                            provider=provider,
-                            enable_workflows=enable_workflows,
-                            enabled_skills=enabled_skills,
-                            system_prompt_mode=system_prompt_mode,
-                        )
+                        async with self._cloudrouter_runtime_admission(
+                            provider, config_dir, model,
+                        ):
+                            result = await self._launch_locked(
+                                instance_id=instance_id,
+                                prompt=prompt,
+                                task_id=task_id,
+                                cwd=cwd,
+                                model=model,
+                                resume_session_id=resume_session_id,
+                                loop_iteration=loop_iteration,
+                                git_env=git_env,
+                                thinking_budget=thinking_budget,
+                                effort_level=effort_level,
+                                chat_initiated=chat_initiated,
+                                config_dir=config_dir,
+                                provider=provider,
+                                enable_workflows=enable_workflows,
+                                enabled_skills=enabled_skills,
+                                system_prompt_mode=system_prompt_mode,
+                            )
                     except BaseException:
                         current_process = (
                             self.processes.get(instance_id)
@@ -552,6 +624,9 @@ class InstanceManager:
         that loop-task chat history can be grouped by iteration in the frontend.
         """
         provider = (provider or "claude").lower()
+        cloudrouter_account = self._cloudrouter_account_for_runtime_home(
+            provider, config_dir
+        )
         # The API and Dispatcher serialize deletion/reservation with this
         # lifecycle lock.  Verify the reusable slot before creating config
         # files, containers, or a real agent process; a post-spawn rowcount
@@ -616,6 +691,7 @@ class InstanceManager:
         self._transient_seen.discard(instance_id)
         self._pty_rate_limit_seen.discard(instance_id)
         self._pty_rate_limit_info.pop(instance_id, None)
+        self._effective_exit_codes.pop(instance_id, None)
 
         mcp_config_path = None
         if provider == "claude" and task_id:
@@ -649,6 +725,11 @@ class InstanceManager:
                             _proj = await _db.get(_Project, _t.project_id)
                             container_name = await self._container_mgr.ensure_container(
                                 _container_project_id, project_path, config_dir,
+                                api_account_root=(
+                                    str(cloudrouter_account.root)
+                                    if cloudrouter_account is not None
+                                    else None
+                                ),
                                 git_credential_type=_proj.git_credential_type if _proj else None,
                                 git_ssh_key_path=_proj.git_ssh_key_path if _proj else None,
                                 git_https_username=_proj.git_https_username if _proj else None,
@@ -747,6 +828,7 @@ class InstanceManager:
                 claude_binary_override=_container_wrapper,
                 container_exec_spec=_container_exec_spec,
                 task_retry_count=task_retry_count,
+                cloudrouter_api=cloudrouter_account is not None,
             )
 
         cmd = self._build_command(
@@ -770,6 +852,15 @@ class InstanceManager:
         # These take precedence over any global ~/.gitconfig or system credential helper.
         if git_env:
             env.update(git_env)
+
+        if cloudrouter_account is not None:
+            auth_keys = (
+                _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS
+                if provider == "claude"
+                else _CLOUDROUTER_CODEX_AUTH_ENV_KEYS
+            )
+            for key in auth_keys:
+                env.pop(key, None)
 
         # Provider account home.  The Codex assignment is especially important
         # for app-server fallback: the rollout and auth.json must stay together.
@@ -828,11 +919,26 @@ class InstanceManager:
             except Exception:
                 pass
             await self._container_mgr.ensure_container(
-                container_project_id, project_path, config_dir, **_git_creds
+                container_project_id,
+                project_path,
+                config_dir,
+                api_account_root=(
+                    str(cloudrouter_account.root)
+                    if cloudrouter_account is not None
+                    else None
+                ),
+                **_git_creds,
             )
             try:
+                container_env = env
+                if provider == "claude" and config_dir:
+                    container_env = dict(env)
+                    container_env["CLAUDE_CONFIG_DIR"] = "/home/sandbox/.claude"
                 process = await self._container_mgr.exec_command(
-                    container_project_id, cmd, env=env, cwd="/workspace"
+                    container_project_id,
+                    cmd,
+                    env=container_env,
+                    cwd="/workspace",
                 )
             except ContainerExecSpawnCleanupError as exc:
                 # exec_command was cancelled after docker(1) may have asked
@@ -952,8 +1058,82 @@ class InstanceManager:
             self._codex_app_server = CodexAppServerRegistry(
                 self._resolve_codex_binary(),
                 request_timeout=settings.codex_app_server_request_timeout,
+                env_remove_resolver=self._codex_env_remove_for_home,
             )
         return self._codex_app_server
+
+    def _cloudrouter_account_for_runtime_home(
+        self,
+        provider: str,
+        config_dir: str | None,
+    ):
+        """Resolve an API account projection by its exact runtime home."""
+
+        if self.cloudrouter_store is None or not config_dir:
+            return None
+        try:
+            if provider == "codex":
+                return self.cloudrouter_store.account_for_codex_home(config_dir)
+            return self.cloudrouter_store.account_for_claude_config_dir(config_dir)
+        except Exception:
+            logger.exception(
+                "Could not resolve CloudRouter runtime home for %s", config_dir
+            )
+            return None
+
+    @asynccontextmanager
+    async def _cloudrouter_runtime_admission(
+        self,
+        provider: str,
+        config_dir: str | None,
+        model: str | None,
+    ):
+        """Revalidate an API route atomically with process admission."""
+
+        account = self._cloudrouter_account_for_runtime_home(
+            provider, config_dir,
+        )
+        if account is None:
+            yield None
+            return
+        guard = getattr(self.cloudrouter_store, "runtime_admission", None)
+        if not callable(guard):
+            raise RuntimeError(
+                "CloudRouter account store cannot fence runtime admission"
+            )
+        async with guard(provider, config_dir, model) as current:
+            yield current
+
+    def _codex_env_remove_for_home(self, codex_home: str) -> set[str]:
+        if self._cloudrouter_account_for_runtime_home("codex", codex_home):
+            return set(_CLOUDROUTER_CODEX_AUTH_ENV_KEYS)
+        return set()
+
+    def is_cloudrouter_transient(
+        self,
+        instance_id: int,
+        provider: str,
+        text: str,
+    ) -> bool:
+        """Classify gateway 429s only for a proven API-account launch."""
+
+        config_dir = self._config_dirs.get(instance_id)
+        if self._cloudrouter_account_for_runtime_home(provider, config_dir) is None:
+            return False
+        return bool(_CLOUDROUTER_TRANSIENT_RE.search(text or ""))
+
+    def is_cloudrouter_auth_failure(
+        self,
+        instance_id: int,
+        provider: str,
+        text: str,
+    ) -> bool:
+        """Classify gateway key rejection only for a proven API account."""
+
+        config_dir = self._config_dirs.get(instance_id)
+        if self._cloudrouter_account_for_runtime_home(provider, config_dir) is None:
+            return False
+        return bool(_CLOUDROUTER_AUTH_RE.search(text or ""))
 
     async def read_codex_rate_limits(self, codex_home: str) -> dict:
         """Read live quota from the app-server bound to ``codex_home``."""
@@ -1585,6 +1765,7 @@ class InstanceManager:
         claude_binary_override: str | None = None,
         container_exec_spec=None,
         task_retry_count: int | None = None,
+        cloudrouter_api: bool = False,
     ) -> int:
         """PTY-mode launch: delegate to claude_pty, mirror -p bookkeeping.
 
@@ -1611,19 +1792,61 @@ class InstanceManager:
         process = None
         consumer = None
         session_id = None
+        pty_launch_params = None
+        # The PTY backend starts its output consumer inside launch_for_ccm().
+        # Bind the account route and exact retry parameters before that call so
+        # a fast API error cannot outrun CloudRouter classification.
+        if config_dir:
+            self._config_dirs[instance_id] = config_dir
+        if chat_initiated:
+            pty_launch_params = {
+                "prompt": prompt,
+                "task_id": task_id,
+                "cwd": cwd,
+                "model": model,
+                "git_env": git_env,
+                "thinking_budget": thinking_budget,
+                "effort_level": effort_level,
+                "enable_workflows": enable_workflows,
+                "enabled_skills": enabled_skills,
+                "provider": "claude",
+                "config_dir": config_dir,
+            }
+            self._launch_params[instance_id] = pty_launch_params
         try:
             # build_config is shared by every PTY instance. Hold one global
             # admission lock across patch -> config construction -> restore so
             # a container wrapper can never leak into another launch.
             async with self._pty_build_config_lock:
                 original_build_config = None
-                if claude_binary_override:
+                if claude_binary_override or cloudrouter_api:
                     original_build_config = self._pty_backend.build_config
                     wrapper = claude_binary_override
 
                     def _patched_build_config(**kw):
                         cfg = original_build_config(**kw)
-                        cfg.claude_binary = wrapper
+                        if cloudrouter_api:
+                            final_binary = wrapper or cfg.claude_binary
+                            cloudrouter_wrapper = Path(__file__).with_name(
+                                "cloudrouter_claude_wrapper.sh"
+                            )
+                            if not (
+                                cloudrouter_wrapper.is_file()
+                                and os.access(cloudrouter_wrapper, os.X_OK)
+                            ):
+                                raise RuntimeError(
+                                    "CloudRouter Claude wrapper is unavailable"
+                                )
+                            overrides = dict(cfg.env_overrides or {})
+                            for key in _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS:
+                                overrides.pop(key, None)
+                            overrides[_CLOUDROUTER_CLAUDE_BINARY_ENV] = str(
+                                final_binary
+                            )
+                            cfg.env_overrides = overrides
+                            cfg.claude_binary = str(cloudrouter_wrapper)
+                        elif wrapper:
+                            cfg.claude_binary = wrapper
                         return cfg
 
                     self._pty_backend.build_config = _patched_build_config
@@ -1651,6 +1874,26 @@ class InstanceManager:
 
             process = self.processes.get(instance_id)
             consumer = self._tasks.get(instance_id)
+            if process is None:
+                raise RuntimeError(
+                    "PTY backend did not register a process during startup"
+                )
+            native_session = getattr(process, "session", None)
+            if (
+                native_session is not None
+                and getattr(native_session, "is_alive", None) is False
+            ):
+                native_process = getattr(native_session, "_process", None)
+                exit_code = getattr(native_process, "exit_code", None)
+                # BasePTYBackend creates the output consumer before returning.
+                # Prevent that exact task from observing the dead process and
+                # entering Session._auto_resume while failure cleanup starts.
+                if consumer is not None and not consumer.done():
+                    consumer.cancel()
+                raise RuntimeError(
+                    "PTY process exited during startup "
+                    f"(exit_code={exit_code})"
+                )
             turn_started_at = datetime.utcnow()
             if container_exec_spec is not None and process is not None:
                 self._container_mgr.register_exec(
@@ -1824,7 +2067,18 @@ class InstanceManager:
                         record = self._consumer_records.get(instance_id)
                         if record is not None and record.task is consumer:
                             self._consumer_records.pop(instance_id, None)
+                if reap_confirmed:
+                    if (
+                        pty_launch_params is not None
+                        and self._launch_params.get(instance_id)
+                        is pty_launch_params
+                    ):
                         self._launch_params.pop(instance_id, None)
+                    if (
+                        config_dir
+                        and self._config_dirs.get(instance_id) == config_dir
+                    ):
+                        self._config_dirs.pop(instance_id, None)
                 if (
                     reap_confirmed
                     and process is None
@@ -1924,6 +2178,8 @@ class InstanceManager:
         interrupted = ec in (-2, 130)
         final_status = "completed" if ec == 0 or interrupted else "failed"
         completed_at = datetime.utcnow()
+        provider_error = (record.fatal_provider_error or "").strip()
+        failure_notice_data = None
 
         async with lifecycle_lock:
             if instance_id in self._stopping or not owns_generation():
@@ -1939,7 +2195,11 @@ class InstanceManager:
                 else:
                     task_values.update(
                         completed_at=completed_at,
-                        error_message=f"Process exited with code {ec}",
+                        error_message=(
+                            provider_error[:2000]
+                            if provider_error
+                            else f"Process exited with code {ec}"
+                        ),
                     )
                 # Lock/update the Task first.  Cancellation and retry use the
                 # same global Task -> Instance order.
@@ -1981,6 +2241,36 @@ class InstanceManager:
                 if not instance_result.rowcount or not owns_generation():
                     await db.rollback()
                     return None
+                # API-error events have already been persisted verbatim by
+                # _process_event. A process that dies before producing any
+                # event still needs a visible chat entry; process_exit alone
+                # only stops the frontend spinner.
+                if final_status == "failed" and not provider_error:
+                    failure_notice = LogEntry(
+                        instance_id=instance_id,
+                        task_id=task_id,
+                        event_type="system_event",
+                        role="system",
+                        content=(
+                            "Claude 进程在返回回复前异常退出"
+                            f"（exit code {ec}）。"
+                        ),
+                        is_error=True,
+                    )
+                    db.add(failure_notice)
+                    await db.flush()
+                    failure_notice_data = {
+                        "id": failure_notice.id,
+                        "instance_id": instance_id,
+                        "task_id": task_id,
+                        "event_type": "system_event",
+                        "role": "system",
+                        "content": failure_notice.content,
+                        "is_error": True,
+                        "timestamp": (
+                            failure_notice.timestamp or datetime.utcnow()
+                        ).isoformat(),
+                    }
                 # MySQL DATETIME without fractional precision normalizes away
                 # Python microseconds.  Re-read the locked row before commit
                 # and use that database value for the publication fence.
@@ -2007,6 +2297,11 @@ class InstanceManager:
                     .values(status=final_status)
                 )
                 if publish_guard.rowcount:
+                    if failure_notice_data is not None:
+                        await self.broadcaster.broadcast(
+                            f"task:{task_id}",
+                            failure_notice_data,
+                        )
                     await self.broadcaster.broadcast(
                         "tasks",
                         {
@@ -2599,6 +2894,7 @@ class InstanceManager:
         _saw_rate_limit = False
         _rate_limit_info: dict | None = None
         _saw_error = False
+        _fatal_provider_error: str | None = None
         try:
             while True:
                 try:
@@ -2619,6 +2915,16 @@ class InstanceManager:
 
                     for event in events:
                         try:
+                            fatal_provider_error = (
+                                self._fatal_provider_error_for_event(event)
+                            )
+                            if (
+                                fatal_provider_error
+                                and _fatal_provider_error is None
+                            ):
+                                _fatal_provider_error = (
+                                    fatal_provider_error[:2000]
+                                )
                             await self._process_event(
                                 instance_id,
                                 task_id,
@@ -2700,6 +3006,13 @@ class InstanceManager:
             # DB ownership plus generation maps if proof still fails.
             reap_error = exc
         exit_code = process.returncode
+        if exit_code == 0 and _fatal_provider_error:
+            # The CLI can report a structurally failed provider turn while
+            # exiting cleanly. Use the semantic result for retries and durable
+            # task status; process health must not turn an API error into a
+            # completed chat.
+            exit_code = 1
+        self._effective_exit_codes[instance_id] = (process, exit_code)
 
         # stderr has been drained concurrently since the turn started.
         # A tool/descendant can outlive the CLI parent while retaining the
@@ -2723,6 +3036,7 @@ class InstanceManager:
             lines = [l for l in lines if not re.sub(r'\x1b\[[0-9;]*m', '', l).strip().startswith("[auto]")]
             stderr_text = "\n".join(lines).strip()
         self._last_stderr[instance_id] = stderr_text
+        failure_text = _fatal_provider_error or stderr_text
 
         if reap_error is not None:
             raise RuntimeError(
@@ -2860,10 +3174,10 @@ class InstanceManager:
                         task_id,
                     )
             # Transient server-side 429/overload: wait + retry same account
-            elif await self._try_chat_transient_retry(instance_id, task_id, exit_code, stderr_text):
+            elif await self._try_chat_transient_retry(instance_id, task_id, exit_code, failure_text):
                 return
             # Pool rotation for chat-initiated rate limit failures
-            elif await self._try_chat_pool_rotation(instance_id, task_id, exit_code, stderr_text):
+            elif await self._try_chat_pool_rotation(instance_id, task_id, exit_code, failure_text):
                 return
         elif task_id and chat_initiated:
             # Clean turn — drop any transient-retry tally for this instance.
@@ -2886,6 +3200,7 @@ class InstanceManager:
         new_status = "idle" if (exit_code == 0 or interrupted) else "error"
         final_status = None
         task_publication_generation: dict | None = None
+        failure_notice_data = None
         async with self.db_factory() as db:
             if task_id and chat_initiated:
                 # Lock this exact Task generation even when cancellation has
@@ -2946,8 +3261,8 @@ class InstanceManager:
                         )
                     else:
                         task_values["error_message"] = (
-                            stderr_text[:500]
-                            if stderr_text
+                            failure_text[:2000]
+                            if failure_text
                             else f"Process exited with code {exit_code}"
                         )
                     task_update = await db.execute(
@@ -2961,6 +3276,32 @@ class InstanceManager:
                     if not task_update.rowcount:
                         await db.rollback()
                         return
+                    if final_status == "failed" and not _fatal_provider_error:
+                        failure_notice = LogEntry(
+                            instance_id=instance_id,
+                            task_id=task_id,
+                            event_type="system_event",
+                            role="system",
+                            content=(
+                                "Claude API 进程在返回回复前异常退出"
+                                f"（exit code {exit_code}）。"
+                            ),
+                            is_error=True,
+                        )
+                        db.add(failure_notice)
+                        await db.flush()
+                        failure_notice_data = {
+                            "id": failure_notice.id,
+                            "instance_id": instance_id,
+                            "task_id": task_id,
+                            "event_type": "system_event",
+                            "role": "system",
+                            "content": failure_notice.content,
+                            "is_error": True,
+                            "timestamp": (
+                                failure_notice.timestamp or datetime.utcnow()
+                            ).isoformat(),
+                        }
 
                 # MySQL DATETIME may discard Python microseconds. Re-read the
                 # exact values under the Task lock for the publication fence.
@@ -3094,6 +3435,11 @@ class InstanceManager:
                 publish_allowed = bool(instance_publish_guard.rowcount)
 
             if publish_allowed:
+                if failure_notice_data is not None:
+                    await self.broadcaster.broadcast(
+                        f"task:{task_id}",
+                        failure_notice_data,
+                    )
                 if final_status:
                     await self.broadcaster.broadcast(
                         "tasks",
@@ -3220,7 +3566,12 @@ class InstanceManager:
             provider = (params.get("provider") or "claude").lower()
             log_contents = await self.get_recent_log_contents(task_id, limit=10)
             combined = collect_process_output_for_detection(stderr_text, log_contents)
-            if not is_transient_for(provider, combined):
+            if not (
+                is_transient_for(provider, combined)
+                or self.is_cloudrouter_transient(
+                    instance_id, provider, combined
+                )
+            ):
                 # Non-transient failure — reset tally so the next genuine
                 # overload chain starts fresh.
                 self._transient_attempts.pop(instance_id, None)
@@ -3427,7 +3778,10 @@ class InstanceManager:
             if not dispatcher.pool or not dispatcher.pool.enabled:
                 return False
 
-            if not is_pool_rotatable(combined):
+            cloudrouter_auth_failed = self.is_cloudrouter_auth_failure(
+                instance_id, provider, combined
+            )
+            if not (is_pool_rotatable(combined) or cloudrouter_auth_failed):
                 return False
 
             old_config_dir = self._config_dirs.get(instance_id)
@@ -3435,7 +3789,7 @@ class InstanceManager:
                 # Default-account launch — still rotatable (see dispatcher)
                 old_config_dir = os.path.expanduser("~/.claude")
 
-            if is_auth_failure(combined):
+            if is_auth_failure(combined) or cloudrouter_auth_failed:
                 dispatcher.pool.mark_auth_failure(old_config_dir)
                 logger.warning("Chat pool rotation: account %s auth failure", old_config_dir)
             elif is_rate_limited(combined):
@@ -3444,7 +3798,10 @@ class InstanceManager:
 
             old_account_id = dispatcher.pool.account_id_from_config_dir(old_config_dir)
             excluded = {old_account_id} if old_account_id else set()
-            new_config_dir = dispatcher.pool.select(exclude=excluded)
+            new_config_dir = dispatcher.pool.select(
+                exclude=excluded,
+                model=params.get("model"),
+            )
 
             if not new_config_dir:
                 logger.warning("Chat pool rotation: no alternative account for task %d", task_id)
@@ -3633,6 +3990,7 @@ class InstanceManager:
                 provider = (task.provider or "claude").lower()
                 session_id = task.session_id
                 bound_codex_id = (task.metadata_ or {}).get("codex_account_id")
+                task_model = task.model
 
             if not await generation_is_current(generation):
                 return False
@@ -3649,7 +4007,10 @@ class InstanceManager:
                 if not old_home:
                     return False
                 old_home = pool.canonical_home(old_home)
-                new_home = await pool.select_quota_alternative(old_home)
+                new_home = await pool.select_quota_alternative(
+                    old_home,
+                    model=task_model,
+                )
                 if not await generation_is_current(generation):
                     return False
                 if not new_home:
@@ -3843,7 +4204,10 @@ class InstanceManager:
                 # to use _check_rate_limit_and_rotate unchanged.
                 dispatcher.pool.mark_rate_limited(old_config_dir)
                 excluded = {old_account_id} if old_account_id else set()
-                new_config_dir = dispatcher.pool.select(exclude=excluded)
+                new_config_dir = dispatcher.pool.select(
+                    exclude=excluded,
+                    model=task_model,
+                )
                 reason = "proactive_rate_limit"
             else:
                 if not session_id:
@@ -3851,7 +4215,8 @@ class InstanceManager:
                 if not rate_limit_event_is_actionable(info):
                     return False
                 new_config_dir = await dispatcher.pool.select_quota_alternative(
-                    old_config_dir
+                    old_config_dir,
+                    model=task_model,
                 )
                 if not await generation_is_current(generation):
                     return False
@@ -4217,6 +4582,43 @@ class InstanceManager:
             result["context_window"] = context_window
         return result
 
+    @staticmethod
+    def _fatal_provider_error_for_event(event: dict) -> str | None:
+        """Return a turn-fatal provider error without matching tool failures."""
+
+        if (
+            not event.get("is_error")
+            or event.get("orphan")
+            or event.get("autonomous")
+        ):
+            return None
+
+        event_type = str(event.get("event_type") or "")
+        content = str(event.get("content") or "").strip()
+        raw = event.get("raw_json")
+        parsed = None
+        if raw:
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                parsed = None
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("isApiErrorMessage")
+            and event_type in {"message", "result"}
+        ):
+            return content or "Claude API request failed"
+        if event_type in {"result", "session_crashed"}:
+            return content or "Claude turn failed"
+        if event_type == "rate_limit_event":
+            return content or "Claude API rate limit"
+        if event_type == "system_event" and (
+            content.startswith("api_error:")
+            or content.startswith("Response timed out")
+        ):
+            return content
+        return None
+
     async def _process_event(
         self,
         instance_id: int,
@@ -4327,6 +4729,16 @@ class InstanceManager:
                 task_id,
             )
             return
+        fatal_provider_error = self._fatal_provider_error_for_event(event)
+        if fatal_provider_error and event_record is not None:
+            # Keep the first (usually detailed upstream) message. A later
+            # synthetic "api_error: turn aborted" marker must not replace it.
+            if event_record.fatal_provider_error is None:
+                object.__setattr__(
+                    event_record,
+                    "fatal_provider_error",
+                    fatal_provider_error[:2000],
+                )
         # Extract session_id, cost, and context usage from event
         session_id = event.pop("session_id", None)
         cost_usd = event.pop("cost_usd", None)
@@ -4597,7 +5009,13 @@ class InstanceManager:
             and not event.get("autonomous")
         ):
             from backend.services.claude_pool import is_transient_for
-            if is_transient_for(provider, event.get("content") or ""):
+            event_content = event.get("content") or ""
+            if (
+                is_transient_for(provider, event_content)
+                or self.is_cloudrouter_transient(
+                    instance_id, provider, event_content
+                )
+            ):
                 self._transient_seen.add(instance_id)
 
         # PTY rate-limit detection: actionable rate_limit_event during this turn
@@ -6206,6 +6624,19 @@ class InstanceManager:
 
     def get_last_stderr(self, instance_id: int) -> str:
         return self._last_stderr.pop(instance_id, "")
+
+    def effective_exit_code(
+        self,
+        instance_id: int,
+        process,
+    ) -> int:
+        """Return the provider-semantic exit code for this exact process."""
+
+        effective = self._effective_exit_codes.get(instance_id)
+        if effective is not None and effective[0] is process:
+            return effective[1]
+        returncode = getattr(process, "returncode", None)
+        return returncode if isinstance(returncode, int) else -1
 
     def get_config_dir(self, instance_id: int) -> str | None:
         return self._config_dirs.get(instance_id)

@@ -76,6 +76,7 @@ async def test_codex_task_distill_uses_ephemeral_stdin_and_bound_account(tmp_pat
     pool = MagicMock()
     pool.home_for_account.return_value = str(codex_home)
     pool.is_home_available.return_value = True
+    pool.supports_model_for_home.return_value = True
     pool.canonical_home.return_value = str(codex_home)
     agent_message = {
         "type": "item.completed",
@@ -127,6 +128,7 @@ async def test_codex_task_distill_selects_ephemeral_fallback_without_rebinding(
     pool = MagicMock()
     pool.home_for_account.return_value = str(tmp_path / "codex-bound")
     pool.is_home_available.return_value = False
+    pool.supports_model_for_home.return_value = True
     pool.select.return_value = str(fallback_home)
     pool.canonical_home.return_value = str(fallback_home)
     process = _process(stdout=json.dumps({
@@ -147,10 +149,109 @@ async def test_codex_task_distill_selects_ephemeral_fallback_without_rebinding(
             instance_manager=manager,
         )
 
-    pool.select.assert_called_once_with()
+    pool.select.assert_called_once_with(model=settings.default_codex_model)
     assert create_process.await_args.kwargs["env"]["CODEX_HOME"] == str(
         fallback_home
     )
+
+
+@pytest.mark.asyncio
+async def test_claude_api_distill_selects_model_and_scrubs_inherited_auth(
+    tmp_path, monkeypatch,
+):
+    config_dir = tmp_path / "api-account" / "claude"
+    pool = MagicMock()
+    pool.select.return_value = str(config_dir)
+    store = MagicMock()
+    store.account_for_claude_config_dir.return_value = object()
+    store._read_api_key = MagicMock(side_effect=AssertionError("must not read key"))
+    process = _process(stdout=json.dumps({
+        "type": "result",
+        "result": "# Claude API result",
+    }).encode())
+    for key in (
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.setenv(key, f"secret-{key}")
+
+    with patch(
+        "backend.services.skill_distill.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as create_process:
+        result = await distill_task_conversation(
+            title="Claude API task",
+            conversation="[User]: fix it",
+            provider="claude",
+            claude_pool=pool,
+            cloudrouter_store=store,
+        )
+
+    pool.select.assert_called_once_with(
+        validate=False,
+        model="claude-opus-4-6",
+    )
+    child_env = create_process.await_args.kwargs["env"]
+    assert child_env["CLAUDE_CONFIG_DIR"] == str(config_dir)
+    assert not {
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    } & child_env.keys()
+    store._read_api_key.assert_not_called()
+    assert result["content"] == "# Claude API result"
+
+
+@pytest.mark.asyncio
+async def test_codex_api_distill_loads_provider_config_and_scrubs_auth(
+    tmp_path, monkeypatch,
+):
+    codex_home = tmp_path / "api-account" / "codex"
+    pool = MagicMock()
+    pool.home_for_account.return_value = str(codex_home)
+    pool.is_home_available.return_value = True
+    pool.supports_model_for_home.return_value = True
+    pool.canonical_home.return_value = str(codex_home)
+    store = MagicMock()
+    store.account_for_codex_home.return_value = object()
+    store._read_api_key = MagicMock(side_effect=AssertionError("must not read key"))
+    process = _process(stdout=json.dumps({
+        "item": {"type": "agent_message", "text": "# Codex API result"},
+    }).encode())
+    manager = _guard_manager()
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "CLOUDROUTER_API_KEY"):
+        monkeypatch.setenv(key, f"secret-{key}")
+
+    with patch(
+        "backend.services.skill_distill.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as create_process:
+        result = await distill_task_conversation(
+            title="Codex API task",
+            conversation="[User]: fix it",
+            provider="codex",
+            codex_pool=pool,
+            codex_account_id="cloudrouter-1",
+            instance_manager=manager,
+            cloudrouter_store=store,
+        )
+
+    pool.supports_model_for_home.assert_called_once_with(
+        str(codex_home),
+        settings.default_codex_model,
+    )
+    cmd = create_process.await_args.args
+    assert "--ignore-user-config" not in cmd
+    child_env = create_process.await_args.kwargs["env"]
+    assert child_env["CODEX_HOME"] == str(codex_home)
+    assert not {
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CLOUDROUTER_API_KEY",
+    } & child_env.keys()
+    store._read_api_key.assert_not_called()
+    assert result["content"] == "# Codex API result"
 
 
 @pytest.mark.asyncio

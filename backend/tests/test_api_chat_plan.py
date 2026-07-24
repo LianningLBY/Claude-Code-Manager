@@ -59,8 +59,12 @@ async def test_codex_task_distill_routes_to_codex_provider(
         await db.commit()
 
     sentinel_pool = object()
+    sentinel_claude_pool = object()
+    sentinel_cloudrouter_store = object()
     with (
         patch("backend.main.codex_pool", sentinel_pool),
+        patch("backend.main.dispatcher.pool", sentinel_claude_pool),
+        patch("backend.main.cloudrouter_store", sentinel_cloudrouter_store),
         patch(
             "backend.services.skill_distill.distill_task_conversation",
             new=AsyncMock(return_value={
@@ -81,8 +85,10 @@ async def test_codex_task_distill_routes_to_codex_provider(
     assert resp.json()["content"] == "# Skill"
     kwargs = distill.await_args.kwargs
     assert kwargs["provider"] == "codex"
+    assert kwargs["claude_pool"] is sentinel_claude_pool
     assert kwargs["codex_pool"] is sentinel_pool
     assert kwargs["codex_account_id"] == "codex-2"
+    assert kwargs["cloudrouter_store"] is sentinel_cloudrouter_store
     assert kwargs["custom_instruction"] == "focus on tests"
     assert "fix the bug" in kwargs["conversation"]
 
@@ -641,7 +647,10 @@ def _make_dispatcher(db_factory):
     mock_im.processes = {}
     mock_im.launch = AsyncMock()
     mock_im.pty_mode_enabled = False
+    mock_im.is_pty_managed_turn = MagicMock(return_value=False)
     mock_im.transient_error_seen = MagicMock(return_value=False)
+    mock_im.pty_rate_limit_seen = MagicMock(return_value=False)
+    mock_im._try_proactive_pool_switch = AsyncMock()
     mock_broadcaster = MagicMock()
     mock_broadcaster.broadcast = AsyncMock()
     return GlobalDispatcher(db_factory, mock_im, mock_broadcaster)
@@ -863,6 +872,7 @@ async def test_inject_requires_pty_mode(client, session_factory):
 
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = False
+    mock_im.has_pty_session = MagicMock(return_value=False)
     with patch("backend.main.instance_manager", mock_im), \
          patch("backend.main.broadcaster", MagicMock(broadcast=AsyncMock())):
         resp = await client.post(
@@ -872,8 +882,34 @@ async def test_inject_requires_pty_mode(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_inject_rejects_direct_turn_when_global_pty_is_enabled(
+    client, session_factory
+):
+    task_id = await _create_task_with_session(
+        client, session_factory, provider="claude"
+    )
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=False)
+    mock_im.inject_pty_message = AsyncMock()
+
+    with patch("backend.main.instance_manager", mock_im), \
+         patch(
+             "backend.main.broadcaster",
+             MagicMock(broadcast=AsyncMock()),
+         ):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/inject", json={"message": "hint"}
+        )
+
+    assert resp.status_code == 400
+    assert "直连进程" in resp.json()["detail"]
+    mock_im.inject_pty_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inject_delivers_to_pty_session(client, session_factory):
-    """PTY 注入成功：调用 inject_pty_message 并广播 source=inject 的 user_message。"""
+    """An in-flight PTY session remains injectable after the global toggle."""
     from backend.models.task import Task
 
     task_id = await _create_task_with_session(
@@ -881,7 +917,8 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     )
 
     mock_im = MagicMock()
-    mock_im.pty_mode_enabled = True
+    mock_im.pty_mode_enabled = False
+    mock_im.has_pty_session = MagicMock(return_value=True)
     mock_im.inject_pty_message = AsyncMock(return_value=True)
     mock_broadcaster = MagicMock()
     mock_broadcaster.broadcast = AsyncMock()
@@ -914,6 +951,7 @@ async def test_inject_no_live_session_409(client, session_factory):
 
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
     mock_im.inject_pty_message = AsyncMock(return_value=False)
     with patch("backend.main.instance_manager", mock_im), \
          patch("backend.main.broadcaster", MagicMock(broadcast=AsyncMock())):

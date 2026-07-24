@@ -80,6 +80,46 @@ def quota_at_or_above(
     return False
 
 
+def api_quota_at_or_above(
+    snapshot: dict | None,
+    *,
+    threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
+) -> bool:
+    """Whether a generic CloudRouter quota snapshot reached ``threshold``.
+
+    The adapter deliberately keeps CloudRouter's wallet/credit/quota schema in
+    ``api_quota`` rather than pretending it is Codex's native 5-hour/weekly
+    subscription shape.  Ratios are evaluated only when the upstream supplied
+    a real limit.
+    """
+
+    if not isinstance(snapshot, dict):
+        return False
+    if (
+        bool(snapshot.get("known"))
+        and snapshot.get("available") is False
+    ):
+        return True
+    candidates: list[dict] = []
+    quota = snapshot.get("quota")
+    if isinstance(quota, dict):
+        candidates.append(quota)
+    windows = snapshot.get("windows")
+    if isinstance(windows, list):
+        candidates.extend(window for window in windows if isinstance(window, dict))
+    for window in candidates:
+        if window.get("unlimited") is True:
+            continue
+        try:
+            limit = float(window.get("limit"))
+            used = float(window.get("used"))
+        except (TypeError, ValueError):
+            continue
+        if limit > 0 and (used / limit) * 100 >= threshold:
+            return True
+    return False
+
+
 def quota_cooldown_seconds(
     quota: dict | None,
     *,
@@ -155,6 +195,8 @@ class CodexPoolAccount:
     __slots__ = (
         "id", "codex_home", "email", "enabled", "retired", "cleanup_pending",
         "login_recovery_failed", "quota_valid_after", "quota_cutoff_invalid",
+        "auth_kind", "display_name", "api_account_id", "supported_models",
+        "_api_account",
     )
 
     def __init__(self, data: dict):
@@ -186,6 +228,45 @@ class CodexPoolAccount:
         self.quota_valid_after = parsed_quota_cutoff
         self.quota_cutoff_invalid: bool = has_quota_cutoff and not valid_quota_cutoff
         self.enabled: bool = bool(data.get("enabled", True)) and not self.retired
+        self.auth_kind: str = str(data.get("auth_kind") or "oauth")
+        self.display_name: str = str(
+            data.get("display_name") or self.email or self.id
+        )
+        self.api_account_id: str | None = data.get("api_account_id")
+        self.supported_models: list[str] | None = data.get("supported_models")
+        self._api_account = data.get("_api_account")
+
+    @classmethod
+    def from_cloudrouter(cls, account) -> "CodexPoolAccount":
+        return cls({
+            "id": account.id,
+            "codex_home": str(account.codex_home),
+            "email": "",
+            # Keep the home as a disabled projection when refreshed models no
+            # longer include Codex. Old rollouts remain migration evidence.
+            "enabled": (
+                bool(account.enabled)
+                and not bool(account.retired)
+                and bool((account.models or {}).get("codex"))
+            ),
+            "retired": bool(account.retired),
+            "auth_kind": "cloudrouter_api",
+            "display_name": account.name,
+            "api_account_id": account.id,
+            "supported_models": list((account.models or {}).get("codex", [])),
+            "_api_account": account,
+        })
+
+    def supports_model(self, model: str | None) -> bool:
+        if self.auth_kind != "cloudrouter_api":
+            return True
+        try:
+            return bool(self._api_account.supports_model("codex", model))
+        except Exception:
+            logger.exception(
+                "Could not evaluate CloudRouter model support for %s", self.id
+            )
+            return False
 
 
 class CodexPool:
@@ -197,6 +278,9 @@ class CodexPool:
         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
         *,
         quota_reader: Callable[[str], Awaitable[dict]] | None = None,
+        cloudrouter_store=None,
+        bootstrap_default: bool = True,
+        include_native: bool = True,
     ):
         if config_path:
             self._config_path = Path(os.path.expandvars(os.path.expanduser(str(config_path))))
@@ -213,6 +297,9 @@ class CodexPool:
         self._quota_cache_live_until: float = 0.0
         self._selection_quota_cache: dict[str, dict] | None = None
         self._quota_reader = quota_reader
+        self._cloudrouter_store = cloudrouter_store
+        self._bootstrap_native = bool(bootstrap_default)
+        self._include_native = bool(include_native)
         self._config_generation = 0
         self._load()
 
@@ -221,14 +308,42 @@ class CodexPool:
         return True
 
     def _load(self):
-        if not self._config_path.exists():
-            self._bootstrap_default()
+        if self._include_native and not self._config_path.exists():
+            if self._bootstrap_native:
+                self._bootstrap_default()
             if not self._config_path.exists():
-                logger.info("Codex pool config not found at %s", self._config_path)
-                return
+                logger.info(
+                    "Native Codex pool config not found at %s; loading API accounts only",
+                    self._config_path,
+                )
         try:
-            data = json.loads(self._config_path.read_text(encoding="utf-8"))
+            data = (
+                json.loads(self._config_path.read_text(encoding="utf-8"))
+                if self._include_native and self._config_path.exists()
+                else {"accounts": []}
+            )
             accounts = [CodexPoolAccount(a) for a in data.get("accounts", [])]
+            if self._cloudrouter_store is not None:
+                known_ids = {account.id for account in accounts}
+                known_homes = {account.codex_home for account in accounts}
+                for api_account in self._cloudrouter_store.all_accounts(
+                    include_retired=True
+                ):
+                    projection = CodexPoolAccount.from_cloudrouter(api_account)
+                    if (
+                        projection.id in known_ids
+                        or projection.codex_home in known_homes
+                    ):
+                        logger.error(
+                            "Skipping duplicate CloudRouter Codex projection "
+                            "%s (%s)",
+                            projection.id,
+                            projection.codex_home,
+                        )
+                        continue
+                    accounts.append(projection)
+                    known_ids.add(projection.id)
+                    known_homes.add(projection.codex_home)
             account_ids = [account.id for account in accounts]
             account_homes = [account.codex_home for account in accounts]
             if len(account_ids) != len(set(account_ids)):
@@ -330,6 +445,15 @@ class CodexPool:
             return None
         now = time.time()
         cooldown_until = self._cooldowns.get(account.id, 0)
+        quota_decision = self._api_quota_decision(account)
+        available = (
+            account.enabled
+            and now >= cooldown_until
+            and not (
+                bool(quota_decision.get("known"))
+                and quota_decision.get("available") is False
+            )
+        )
         return {
             "id": account.id,
             "codex_home": account.codex_home,
@@ -340,12 +464,49 @@ class CodexPool:
             "login_recovery_failed": account.login_recovery_failed,
             "quota_valid_after": account.quota_valid_after or None,
             "quota_cutoff_invalid": account.quota_cutoff_invalid,
-            "available": account.enabled and now >= cooldown_until,
+            "available": available,
             "cooldown_until": cooldown_until if cooldown_until > now else None,
             "cooldown_remaining": (
                 max(0, cooldown_until - now) if cooldown_until > now else 0
             ),
+            "auth_kind": account.auth_kind,
+            "display_name": account.display_name,
+            "api_account_id": account.api_account_id,
+            "supported_models": account.supported_models,
+            "api_quota": self._cached_api_quota(account.id),
         }
+
+    def _api_quota_decision(self, account: CodexPoolAccount) -> dict:
+        if (
+            account.auth_kind != "cloudrouter_api"
+            or self._cloudrouter_store is None
+            or not account.api_account_id
+        ):
+            return {"available": True, "known": False, "reason": ""}
+        try:
+            decision = self._cloudrouter_store.cached_quota_decision(
+                account.api_account_id
+            )
+            return decision if isinstance(decision, dict) else {
+                "available": True,
+                "known": False,
+                "reason": "",
+            }
+        except Exception:
+            logger.exception(
+                "Could not read cached CloudRouter quota for %s", account.id
+            )
+            return {"available": True, "known": False, "reason": ""}
+
+    def _cached_api_quota(self, account_id: str) -> dict | None:
+        for cache in (self._selection_quota_cache, self._quota_cache):
+            if not isinstance(cache, dict):
+                continue
+            row = cache.get(account_id)
+            snapshot = row.get("api_quota") if isinstance(row, dict) else None
+            if isinstance(snapshot, dict):
+                return snapshot
+        return None
 
     def home_status(self, codex_home: str | os.PathLike[str]) -> dict | None:
         account = self.account_for_home(codex_home)
@@ -358,6 +519,32 @@ class CodexPool:
     def is_home_available(self, codex_home: str | os.PathLike[str]) -> bool:
         state = self.home_status(codex_home)
         return bool(state and state["available"])
+
+    def supports_model_for_home(
+        self, codex_home: str | os.PathLike[str], model: str | None
+    ) -> bool:
+        account = self.account_for_home(codex_home)
+        return True if account is None else account.supports_model(model)
+
+    def has_compatible_enabled_account(self, model: str | None) -> bool:
+        """Whether model routing is possible independent of cooldown/quota."""
+
+        return any(
+            account.enabled
+            and not account.retired
+            and account.supports_model(model)
+            for account in self._accounts
+        )
+
+    def has_native_enabled_account(self) -> bool:
+        """Whether service-default fallback remains backed by a native account."""
+
+        return any(
+            account.enabled
+            and not account.retired
+            and account.auth_kind != "cloudrouter_api"
+            for account in self._accounts
+        )
 
     def is_disabled(self, codex_home: str | os.PathLike[str]) -> bool:
         """Whether a known account home is explicitly disabled."""
@@ -374,7 +561,10 @@ class CodexPool:
             # Retired tombstones remain internally addressable so historical
             # task bindings can migrate their rollout, but they are deleted
             # from the user-facing pool and are never selectable.
-            if account.retired:
+            if account.retired or (
+                account.auth_kind == "cloudrouter_api"
+                and not account.supported_models
+            ):
                 continue
             state = self.account_status(account.id)
             if state is not None:
@@ -410,14 +600,29 @@ class CodexPool:
         self._preferred_account_id = account_id
         return True
 
-    def select(self, exclude: set[str] | None = None) -> str | None:
+    def select(
+        self,
+        exclude: set[str] | None = None,
+        *,
+        model: str | None = None,
+    ) -> str | None:
         """Pick an available CODEX_HOME. Returns None if all exhausted."""
         now = time.time()
         excluded = exclude or set()
-        candidates = [
-            a for a in self._accounts
-            if a.enabled and a.id not in excluded and now >= self._cooldowns.get(a.id, 0)
-        ]
+        candidates = []
+        for account in self._accounts:
+            decision = self._api_quota_decision(account)
+            if (
+                account.enabled
+                and account.id not in excluded
+                and now >= self._cooldowns.get(account.id, 0)
+                and account.supports_model(model)
+                and not (
+                    bool(decision.get("known"))
+                    and decision.get("available") is False
+                )
+            ):
+                candidates.append(account)
         if not candidates:
             return None
 
@@ -576,19 +781,41 @@ class CodexPool:
 
         async def _read_account_quota(
             acc: CodexPoolAccount,
-        ) -> tuple[dict | None, str | None]:
+        ) -> tuple[dict | None, dict | None, str | None]:
+            if acc.auth_kind == "cloudrouter_api":
+                if self._cloudrouter_store is None or not acc.api_account_id:
+                    return None, None, "api_store_unavailable"
+                try:
+                    snapshot = await self._cloudrouter_store.fetch_usage(
+                        acc.api_account_id,
+                        force=force,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "CloudRouter usage read failed for %s: %s", acc.id, exc
+                    )
+                    return None, None, f"request_failed: {exc}"[:200]
+                if not isinstance(snapshot, dict):
+                    return None, None, "invalid_api_quota"
+                error = None
+                if (
+                    bool(snapshot.get("known"))
+                    and snapshot.get("available") is False
+                ):
+                    error = str(snapshot.get("reason") or "unavailable")
+                return None, snapshot, error
             if live:
                 if self._quota_reader is None:
                     logger.warning(
                         "Codex live quota reader is unavailable for %s",
                         acc.id,
                     )
-                    return None, "live_unavailable"
+                    return None, None, "live_unavailable"
                 try:
                     response = await self._quota_reader(acc.codex_home)
                     quota = _quota_from_app_server_response(response)
                     if quota is not None:
-                        return quota, None
+                        return quota, None, None
                     logger.warning(
                         "Codex live quota response had no rate-limit snapshot: %s",
                         acc.id,
@@ -602,16 +829,16 @@ class CodexPool:
                 # A rollout belongs to a session, not to credentials. Session
                 # migration preserves its old rate_limits events, so it cannot
                 # safely substitute for an unavailable live account response.
-                return None, "live_unavailable"
+                return None, None, "live_unavailable"
 
             if acc.quota_cutoff_invalid:
-                return None, "invalid_quota_cutoff"
+                return None, None, "invalid_quota_cutoff"
             quota = await asyncio.to_thread(
                 _read_quota_from_rollout,
                 acc.codex_home,
                 min_event_timestamp=acc.quota_valid_after or None,
             )
-            return quota, None
+            return quota, None, None
 
         while True:
             generation = self._config_generation
@@ -628,14 +855,27 @@ class CodexPool:
             )
 
         results = {}
-        for acc, (quota, quota_error) in zip(enabled_accounts, quota_results):
+        for acc, (quota, api_quota, quota_error) in zip(
+            enabled_accounts, quota_results
+        ):
             results[acc.id] = {
                 "id": acc.id,
                 "email": acc.email,
                 "codex_home": acc.codex_home,
                 "plan_type": quota.get("plan_type") if quota else None,
                 "quota": quota,
-                "error": None if quota else (quota_error or "no_rollout_data"),
+                "api_quota": api_quota,
+                "auth_kind": acc.auth_kind,
+                "display_name": acc.display_name,
+                "api_account_id": acc.api_account_id,
+                "supported_models": acc.supported_models,
+                "error": (
+                    quota_error
+                    if quota_error
+                    else None
+                    if quota or api_quota
+                    else "no_rollout_data"
+                ),
             }
 
         completed_at = time.time()
@@ -666,9 +906,50 @@ class CodexPool:
         account = self.account(account_id)
         if account is None or account.retired:
             return {"logged_in": False, "detail": "account missing"}
-        local = await asyncio.to_thread(verify_login, account.codex_home)
+        local = await asyncio.to_thread(
+            verify_login,
+            account.codex_home,
+            auth_kind=account.auth_kind,
+        )
         if local.get("logged_in") is not True:
             return local
+        if account.auth_kind == "cloudrouter_api":
+            if self._cloudrouter_store is None or not account.api_account_id:
+                return {
+                    **local,
+                    "logged_in": None,
+                    "live_verified": False,
+                    "detail": "CloudRouter account store unavailable",
+                }
+            try:
+                snapshot = await self._cloudrouter_store.fetch_usage(
+                    account.api_account_id,
+                    force=True,
+                )
+            except Exception:
+                return {
+                    **local,
+                    "logged_in": None,
+                    "live_verified": False,
+                    "detail": "live account verification temporarily unavailable",
+                }
+            reason = str(
+                snapshot.get("reason") if isinstance(snapshot, dict) else ""
+            )
+            if reason in {"invalid_api_key", "forbidden"}:
+                return {
+                    **local,
+                    "logged_in": False,
+                    "live_verified": True,
+                    "detail": "live account authentication was rejected",
+                }
+            return {
+                **local,
+                "logged_in": True,
+                "live_verified": True,
+                "detail": "ok",
+                "api_quota": snapshot,
+            }
         if self._quota_reader is None:
             return {
                 **local,
@@ -705,6 +986,7 @@ class CodexPool:
         current_home: str,
         *,
         threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
+        model: str | None = None,
     ) -> str | None:
         """Return a below-threshold alternative when the current home is high.
 
@@ -721,8 +1003,11 @@ class CodexPool:
             row["id"]: row for row in await self.fetch_quota(force=True)
         }
         current = quota_by_id.get(current_id)
-        if not current or not quota_at_or_above(
-            current.get("quota"), threshold=threshold
+        if not current or not (
+            quota_at_or_above(current.get("quota"), threshold=threshold)
+            or api_quota_at_or_above(
+                current.get("api_quota"), threshold=threshold
+            )
         ):
             return None
 
@@ -734,7 +1019,11 @@ class CodexPool:
         ]
         login_states = await asyncio.gather(
             *(
-                asyncio.to_thread(verify_login, account.codex_home)
+                asyncio.to_thread(
+                    verify_login,
+                    account.codex_home,
+                    auth_kind=account.auth_kind,
+                )
                 for account in alternatives
             ),
             return_exceptions=True,
@@ -748,9 +1037,14 @@ class CodexPool:
 
         for account in alternatives:
             row = quota_by_id.get(account.id)
-            if row and quota_at_or_above(row.get("quota"), threshold=threshold):
+            if row and (
+                quota_at_or_above(row.get("quota"), threshold=threshold)
+                or api_quota_at_or_above(
+                    row.get("api_quota"), threshold=threshold
+                )
+            ):
                 excluded.add(account.id)
-        return self.select(exclude=excluded)
+        return self.select(exclude=excluded, model=model)
 
     def cached_quota_for_home(self, codex_home: str) -> dict | None:
         """Return the latest selection snapshot for one account home."""
@@ -978,8 +1272,28 @@ def _extract_email_from_jwt(id_token: str) -> str:
         return ""
 
 
-def verify_login(codex_home: str) -> dict:
-    """Check if the account at codex_home has valid auth.json."""
+def verify_login(
+    codex_home: str,
+    *,
+    auth_kind: str = "oauth",
+) -> dict:
+    """Check whether a CODEX_HOME has the expected local auth projection.
+
+    CloudRouter uses a command-backed custom-provider credential rather than
+    OAuth ``auth.json``.  Its live key validity is checked asynchronously by
+    :meth:`CodexPool.verify_account_live`; this local branch only identifies
+    the deliberately configured API projection and never reads OAuth files.
+    """
+
+    if auth_kind == "cloudrouter_api":
+        return {
+            "logged_in": True,
+            "email": "",
+            "plan_type": None,
+            "subscription_until": None,
+            "auth_mode": "api",
+            "detail": "configured",
+        }
     auth_path = Path(codex_home) / "auth.json"
     if not auth_path.exists():
         return {"logged_in": False, "detail": "auth.json missing"}

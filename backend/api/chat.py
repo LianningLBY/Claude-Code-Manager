@@ -635,10 +635,15 @@ async def inject_message(
             "exec fallback；空闲时请关闭注入模式直接发普通消息"
         )
     elif provider == "claude":
-        if not instance_manager.pty_mode_enabled:
+        if not instance_manager.has_pty_session(task.session_id):
             raise HTTPException(
                 400,
-                "PTY 模式未开启，Claude 注入仅在 PTY 模式下可用",
+                (
+                    "当前 Claude turn 使用直连进程，不支持执行中注入；"
+                    "请关闭注入模式后发送普通消息"
+                )
+                if instance_manager.pty_mode_enabled
+                else "当前 Claude turn 不由 PTY 管理，无法执行中注入",
             )
         ok = await instance_manager.inject_pty_message(
             task.session_id, body.message
@@ -793,7 +798,12 @@ async def distill_task(
     if not conversation.strip():
         raise HTTPException(400, "No conversation history to distill")
 
-    from backend.main import codex_pool, instance_manager
+    from backend.main import (
+        cloudrouter_store,
+        codex_pool,
+        dispatcher,
+        instance_manager,
+    )
     from backend.services.skill_distill import (
         CodexDistillAccountUnavailableError,
         TaskDistillError,
@@ -811,9 +821,11 @@ async def distill_task(
             conversation=conversation,
             provider=task.provider or "claude",
             custom_instruction=body.custom_instruction,
+            claude_pool=dispatcher.pool,
             codex_pool=codex_pool,
             codex_account_id=(task.metadata_ or {}).get("codex_account_id"),
             instance_manager=instance_manager,
+            cloudrouter_store=cloudrouter_store,
         )
     except TaskDistillTimeoutError as exc:
         raise HTTPException(504, str(exc)) from exc

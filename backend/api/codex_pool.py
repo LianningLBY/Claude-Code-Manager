@@ -1383,6 +1383,7 @@ async def codex_pool_usage(force: bool = False):
         account["plan_type"] = q.get("plan_type")
         account["quota"] = q.get("quota")
         account["quota_error"] = q.get("error")
+        account["api_quota"] = q.get("api_quota")
     return status
 
 
@@ -1417,7 +1418,10 @@ async def codex_verify_account(
     if live:
         return await pool.verify_account_live(account_id)
     from backend.services.codex_pool import verify_login
-    return verify_login(acc.codex_home)
+    return verify_login(
+        acc.codex_home,
+        auth_kind=getattr(acc, "auth_kind", "oauth"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1481,6 +1485,11 @@ async def codex_relogin(request: Request, account_id: str):
     acc = pool.account(account_id)
     if not acc or getattr(acc, "retired", False):
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+        raise HTTPException(
+            status_code=400,
+            detail="CloudRouter API 账号不使用 OAuth 登录，请通过 API 账号刷新入口校验",
+        )
 
     state = _relogin_state.get(account_id)
     if state and state.get("status") in ACTIVE_LOGIN_STATUSES:
@@ -2114,6 +2123,11 @@ async def codex_delete_account(request: Request, account_id: str):
         and not getattr(acc, "cleanup_pending", False)
     ):
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+        raise HTTPException(
+            status_code=400,
+            detail="CloudRouter API 账号请通过 API 账号删除入口处理",
+        )
 
     if _login_lock.locked():
         raise HTTPException(

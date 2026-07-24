@@ -252,6 +252,150 @@ class TestFullMirrorBackend:
         )
         im.wait_for_pty_launch_metadata.assert_awaited_once_with(7)
 
+    @pytest.mark.parametrize(
+        (
+            "status",
+            "expected_exit",
+            "expects_answer",
+            "quota_before_echo",
+            "expected_event_error",
+        ),
+        [
+            ("allowed_warning", 0, True, False, False),
+            ("rejected", 1, False, False, True),
+            ("rejected", 0, True, True, True),
+        ],
+    )
+    async def test_structured_quota_status_only_ends_hard_limit(
+        self,
+        status,
+        expected_exit,
+        expects_answer,
+        quota_before_echo,
+        expected_event_error,
+    ):
+        """Exercise the pinned Session generator through FullMirror._consume."""
+
+        from claude_pty.config import PTYConfig
+        from claude_pty.jsonl_reader import JsonlReader
+        from claude_pty.session import Session
+
+        im = MagicMock()
+        im.wait_for_pty_launch_metadata = AsyncMock()
+        im._process_event = AsyncMock()
+        backend = self._bare_backend(im)
+        backend.on_exit = AsyncMock()
+
+        prompt = "hello"
+        quota = {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": status,
+                "rateLimitType": "five_hour",
+                "utilization": 0.95,
+            },
+        }
+        current_turn_start = [
+            {
+                "type": "user",
+                "message": {"content": prompt},
+            },
+        ]
+        if not quota_before_echo:
+            current_turn_start.append(quota)
+        batches = [[], [quota]] if quota_before_echo else [[]]
+        batches.append(current_turn_start)
+        if expects_answer:
+            batches.append(
+                [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "real answer"},
+                        ],
+                    },
+                },
+                {"type": "system", "subtype": "turn_duration"},
+                ]
+            )
+
+        delegate = JsonlReader("/nonexistent")
+
+        class FakeReader:
+            def read_new_messages(self):
+                return batches.pop(0) if batches else []
+
+            def normalize(self, *args, **kwargs):
+                return delegate.normalize(*args, **kwargs)
+
+            def is_prompt_echo(self, *args, **kwargs):
+                return delegate.is_prompt_echo(*args, **kwargs)
+
+            def is_response_complete(self, *args, **kwargs):
+                return delegate.is_response_complete(*args, **kwargs)
+
+        class FakeProcess:
+            is_alive = True
+            exit_code = 0
+            session_id = "quota-session"
+            rate_limited = False
+
+            def send_prompt(self, _text):
+                pass
+
+            def clear_rate_limited(self):
+                self.rate_limited = False
+
+        session = Session(
+            cwd="/repo",
+            session_id="quota-session",
+            config=PTYConfig(
+                response_timeout=1,
+                jsonl_poll_interval=0,
+                post_response_wait=0,
+                subagent_check_interval=float("inf"),
+            ),
+        )
+        session._started = True
+        session._process = FakeProcess()
+        session._reader = FakeReader()
+
+        consumer = asyncio.create_task(
+            backend._consume(
+                7,
+                session,
+                prompt,
+                task_id=27,
+                chat_initiated=True,
+            )
+        )
+        proxy = MagicMock(session=session)
+        record = MagicMock(process=proxy)
+        setattr(consumer, "_ccm_output_consumer_record", record)
+        backend._consumers[7] = consumer
+        backend._sessions[7] = session
+        await consumer
+
+        forwarded = [
+            call.args[2]
+            for call in im._process_event.await_args_list
+        ]
+        quota_event = next(
+            event
+            for event in forwarded
+            if event.get("event_type") == "rate_limit_event"
+        )
+        assert quota_event["rate_limit_info"]["status"] == status
+        assert quota_event["is_error"] is expected_event_error
+        assert bool(quota_event.get("orphan")) is quota_before_echo
+        assert any(
+            event.get("content") == "real answer"
+            for event in forwarded
+        ) is expects_answer
+        assert session.rate_limited is (expected_exit != 0)
+        assert backend.on_exit.await_args.args[1] == expected_exit
+
     def test_restore_replaces_subagent_only(self):
         backend = self._bare_backend()
         session = MagicMock()
@@ -430,6 +574,177 @@ class TestFullMirrorBackend:
             assert task.completed_at is not None
             assert "code 9" in task.error_message
             assert inst.status == "error"
+
+    async def test_pty_api_error_overrides_zero_process_exit(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        error_text = "API Error: invalid_request_error: unsupported beta"
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 3
+            task.instance_id = instance_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 778
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 778
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session._reader._tracker.has_pending = False
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        im._try_chat_transient_retry = AsyncMock(return_value=False)
+        im._try_chat_pool_rotation = AsyncMock(return_value=False)
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            record = im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=3,
+                instance_started_at=started_at,
+            )
+            await im._process_event(
+                instance_id,
+                task_id,
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": error_text,
+                    "is_error": True,
+                    "raw_json": (
+                        '{"type":"assistant","isApiErrorMessage":true}'
+                    ),
+                },
+                consumer_record=record,
+            )
+            assert record.fatal_provider_error == error_text
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        await exit_turn()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            persisted = (
+                await db.execute(
+                    select(LogEntry).where(
+                        LogEntry.task_id == task_id,
+                        LogEntry.content == error_text,
+                        LogEntry.is_error.is_(True),
+                    )
+                )
+            ).scalar_one()
+            assert persisted.event_type == "message"
+            assert task.status == "failed"
+            assert task.error_message == error_text
+            assert inst.status == "error"
+        assert proxy.returncode == 1
+        im._try_chat_transient_retry.assert_awaited_once()
+        im._try_chat_pool_rotation.assert_awaited_once()
+
+    async def test_soft_quota_warning_keeps_successful_pty_turn_completed(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        backend._maybe_retry_empty_reply = AsyncMock()
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 2
+            task.instance_id = instance_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 779
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 779
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session._reader._tracker.has_pending = False
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        im._pty_rate_limit_seen.add(instance_id)
+        im._pty_rate_limit_info[instance_id] = {
+            "status": "allowed_warning",
+            "rateLimitType": "five_hour",
+            "utilization": 0.95,
+        }
+        im._try_chat_transient_retry = AsyncMock(return_value=False)
+        im._try_chat_pool_rotation = AsyncMock(return_value=False)
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=2,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        await exit_turn()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+
+        assert task.status == "completed"
+        assert inst.status == "idle"
+        assert proxy.returncode == 0
+        im._try_chat_transient_retry.assert_not_awaited()
+        im._try_chat_pool_rotation.assert_not_awaited()
 
     @pytest.mark.parametrize("changed_field", ["retry", "started_at"])
     async def test_old_pty_exit_cannot_finalize_new_same_task_generation(

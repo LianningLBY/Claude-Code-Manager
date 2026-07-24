@@ -621,6 +621,163 @@ async def test_launch_unsets_claude_env(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_cloudrouter_claude_launch_removes_inherited_auth_env(
+    db_factory, tmp_path
+):
+    async with db_factory() as db:
+        inst = Instance(name="cloudrouter-env-inst")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    account_root = tmp_path / "cloudrouter-1"
+    config_dir = account_root / "claude"
+    config_dir.mkdir(parents=True)
+    account = MagicMock(root=account_root)
+    store = MagicMock()
+    store.account_for_claude_config_dir.return_value = account
+    @asynccontextmanager
+    async def runtime_admission(*_args):
+        yield account
+    store.runtime_admission = runtime_admission
+    mock_proc = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.cloudrouter_store = store
+
+    im._pty_enabled = False
+
+    inherited = {
+        "ANTHROPIC_AUTH_TOKEN": "must-not-leak",
+        "ANTHROPIC_API_KEY": "must-not-leak",
+        "CLAUDE_CODE_OAUTH_TOKEN": "must-not-leak",
+    }
+    with (
+        patch.dict(os.environ, inherited, clear=False),
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=mock_proc,
+        ) as mock_exec,
+    ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="hi",
+            cwd="/tmp",
+            provider="claude",
+            config_dir=str(config_dir),
+            git_env={"ANTHROPIC_API_KEY": "also-must-not-leak"},
+        )
+
+    child_env = mock_exec.call_args.kwargs["env"]
+    for key in inherited:
+        assert key not in child_env
+    assert child_env["CLAUDE_CONFIG_DIR"] == str(config_dir)
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_claude_pty_wraps_binary_and_removes_auth_overrides(
+    db_factory, tmp_path
+):
+    async with db_factory() as db:
+        inst = Instance(name="cloudrouter-pty-env-inst")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    account_root = tmp_path / "cloudrouter-1"
+    config_dir = account_root / "claude"
+    config_dir.mkdir(parents=True)
+    account = MagicMock(root=account_root)
+    store = MagicMock()
+    store.account_for_claude_config_dir.return_value = account
+
+    @asynccontextmanager
+    async def runtime_admission(*_args):
+        yield account
+
+    store.runtime_admission = runtime_admission
+    observed = {}
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.cloudrouter_store = store
+
+    class Config:
+        claude_binary = "/opt/claude-real"
+        env_overrides = {
+            "ANTHROPIC_AUTH_TOKEN": "must-not-leak",
+            "ANTHROPIC_API_KEY": "must-not-leak",
+            "CLAUDE_CODE_OAUTH_TOKEN": "must-not-leak",
+            "SAFE_VALUE": "kept",
+        }
+
+    class FakePTYBackend:
+        def build_config(self, **_kwargs):
+            return Config()
+
+        async def launch_for_ccm(self, **kwargs):
+            config = self.build_config()
+            observed["binary"] = config.claude_binary
+            observed["env"] = dict(config.env_overrides)
+            im.processes[kwargs["instance_id"]] = MagicMock(
+                pid=52_001, returncode=None
+            )
+            return "cloudrouter-pty-session"
+
+    im._pty_backend = FakePTYBackend()
+    im._pty_enabled = True
+
+    await im.launch(
+        instance_id=inst.id,
+        prompt="hi",
+        cwd="/tmp",
+        provider="claude",
+        config_dir=str(config_dir),
+        chat_initiated=True,
+    )
+
+    wrapper = Path(observed["binary"])
+    assert wrapper.name == "cloudrouter_claude_wrapper.sh"
+    assert wrapper.is_file()
+    assert os.access(wrapper, os.X_OK)
+    assert observed["env"]["CCM_CLOUDROUTER_CLAUDE_BINARY"] == (
+        "/opt/claude-real"
+    )
+    assert observed["env"]["SAFE_VALUE"] == "kept"
+    for key in (
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        assert key not in observed["env"]
+    assert im.get_config_dir(inst.id) == str(config_dir)
+    assert im._launch_params[inst.id]["prompt"] == "hi"
+    assert im._launch_params[inst.id]["provider"] == "claude"
+
+
+def test_cloudrouter_429_is_transient_only_for_exact_api_account_home(
+    db_factory,
+):
+    im = InstanceManager(db_factory, MagicMock())
+    store = MagicMock()
+    store.account_for_claude_config_dir.side_effect = (
+        lambda path: MagicMock() if path == "/api/claude" else None
+    )
+    im.cloudrouter_store = store
+    im._config_dirs[1] = "/api/claude"
+    im._config_dirs[2] = "/native/claude"
+    error = "API Error: HTTP 429 Too Many Requests"
+
+    assert im.is_cloudrouter_transient(1, "claude", error)
+    assert not im.is_cloudrouter_transient(2, "claude", error)
+    auth_error = "API Error: HTTP 401 Unauthorized INVALID_API_KEY"
+    assert im.is_cloudrouter_auth_failure(1, "claude", auth_error)
+    assert not im.is_cloudrouter_auth_failure(2, "claude", auth_error)
+    assert im.is_cloudrouter_auth_failure(
+        1, "claude", "API Error: HTTP 403 Forbidden",
+    )
+
+
+@pytest.mark.asyncio
 async def test_default_claude_launch_clears_stale_instance_account_home(db_factory):
     async with db_factory() as db:
         inst = Instance(name="default-home-inst")
@@ -4347,6 +4504,123 @@ async def test_consume_output_chat_initiated_error_marks_failed(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_consume_output_fatal_result_overrides_zero_exit(db_factory):
+    error_text = "API Error: upstream_error: provider unavailable"
+    async with db_factory() as db:
+        inst = Instance(name="chat-fatal-result-inst")
+        db.add(inst)
+        task = Task(
+            title="chat fatal result task",
+            description="d",
+            status="executing",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_id = task.id
+
+    mock_proc = _make_mock_process(returncode=0)
+    output = iter([
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "result": error_text,
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    mock_proc.stdout.readline = readline
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    im.processes[inst_id] = mock_proc
+
+    await im._consume_output(
+        inst_id,
+        task_id,
+        mock_proc,
+        chat_initiated=True,
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        persisted_error = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "result",
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalar_one()
+
+    assert task.status == "failed"
+    assert task.error_message == error_text
+    assert persisted_error.content == error_text
+
+
+@pytest.mark.asyncio
+async def test_consume_output_records_fatal_result_for_outer_lifecycle(
+    db_factory,
+):
+    """Non-chat lifecycle must see provider failure despite OS exit zero."""
+
+    error_text = "API Error: upstream_error: provider unavailable"
+    async with db_factory() as db:
+        inst = Instance(name="lifecycle-fatal-result-inst")
+        task = Task(
+            title="lifecycle fatal result task",
+            description="d",
+            status="executing",
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_id = task.id
+
+    process = _make_mock_process(returncode=0)
+    output = iter([
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "result": error_text,
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    im = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    im.processes[inst_id] = process
+
+    await im._consume_output(
+        inst_id,
+        task_id,
+        process,
+        chat_initiated=False,
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+
+    assert task.status == "executing"
+    assert process.returncode == 0
+    assert im.effective_exit_code(inst_id, process) == 1
+    assert im.effective_exit_code(inst_id, object()) == -1
+
+
+@pytest.mark.asyncio
 async def test_consume_output_chat_initiated_interrupt_marks_completed(db_factory):
     """When chat_initiated=True and process is interrupted (SIGINT), task is marked completed."""
     async with db_factory() as db:
@@ -5655,6 +5929,101 @@ async def test_launch_delegates_to_pty_backend_for_claude():
     assert calls["prompt"] == "do it"
     assert calls["model"] is None  # "default" normalized away
     assert calls["cwd"] == "/w"
+
+
+@pytest.mark.asyncio
+async def test_launch_pty_rejects_dead_startup_before_persisting_running(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="pty-dead-startup", status="idle")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="pty-dead-startup",
+            description="startup must fail closed",
+            status="executing",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    class NativeProcess:
+        exit_code = 1
+
+    class NativeSession:
+        is_alive = False
+        _process = NativeProcess()
+
+    class Process:
+        def __init__(self):
+            self.pid = 4243
+            self.returncode = None
+            self.session = NativeSession()
+
+        async def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -signal.SIGKILL
+
+    process = Process()
+    consumer = None
+    stopped = []
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class FakeBackend:
+        async def launch_for_ccm(self, **kwargs):
+            nonlocal consumer
+            consumer = asyncio.create_task(asyncio.Event().wait())
+            im.processes[kwargs["instance_id"]] = process
+            im._tasks[kwargs["instance_id"]] = consumer
+            return "session-dead-startup"
+
+        async def stop(self, instance_arg):
+            stopped.append(instance_arg)
+            assert consumer is not None and consumer.cancelling()
+            process.returncode = 1
+
+    im._pty_backend = FakeBackend()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"PTY process exited during startup \(exit_code=1\)",
+    ):
+        await im._launch_pty(
+            instance_id=instance_id,
+            prompt="run",
+            task_id=task_id,
+            cwd="/tmp",
+            model=None,
+            resume_session_id=None,
+            loop_iteration=None,
+            git_env=None,
+            thinking_budget=None,
+            effort_level=None,
+            chat_initiated=False,
+            config_dir=None,
+            enable_workflows=False,
+            enabled_skills=None,
+            mcp_config_path=None,
+        )
+
+    assert stopped == [instance_id]
+    assert consumer is not None and consumer.cancelled()
+    assert instance_id not in im.processes
+    assert instance_id not in im._tasks
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.session_id is None
+        assert instance.status == "idle"
+        assert instance.pid is None
+        assert instance.current_task_id is None
 
 
 @pytest.mark.asyncio

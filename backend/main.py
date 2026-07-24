@@ -50,6 +50,11 @@ from backend.services.instance_manager import InstanceManager
 from backend.services.ralph_loop import RalphLoop
 from backend.services.dispatcher import GlobalDispatcher
 from backend.services.update_service import UpdateService
+from backend.services.deployment_start_guard import (
+    StartDecision,
+    assess_deployment_start,
+    deployment_task_start_fence,
+)
 from backend.services.sub_agent_watcher import SubAgentWatcher
 
 # Logging: surface INFO from our services AND claude_pty in the server log.
@@ -77,6 +82,7 @@ dispatcher = GlobalDispatcher(
     instance_manager=instance_manager,
     broadcaster=broadcaster,
 )
+instance_manager.task_message_enqueuer = dispatcher.enqueue_message
 
 sub_agent_watcher = SubAgentWatcher(db_factory=async_session, broadcaster=broadcaster)
 
@@ -116,12 +122,24 @@ if settings.codex_pool_enabled:
     except Exception:
         logger.exception("Codex pool init failed — codex pool disabled")
 
+_update_project_dir = str(Path(__file__).resolve().parent.parent)
+if os.environ.get("CCM_TESTING") == "1":
+    _test_project_dir = os.environ.get("CCM_TEST_PROJECT_DIR", "").strip()
+    if not _test_project_dir:
+        raise RuntimeError(
+            "CCM_TESTING requires an isolated CCM_TEST_PROJECT_DIR"
+        )
+    _update_project_dir = _test_project_dir
+
 update_service = UpdateService(
     broadcaster=broadcaster,
     port=settings.port,
-    project_dir=str(Path(__file__).resolve().parent.parent),
+    project_dir=_update_project_dir,
     db_factory=async_session,
     dispatcher=dispatcher,
+)
+dispatcher.deployment_task_start_fence = (
+    lambda: deployment_task_start_fence(update_service.project_dir)
 )
 
 # 分布式 Worker（可选，WORKER_ENABLED=true 且装了 boto3 才启用）
@@ -460,9 +478,58 @@ async def _shutdown_runtime_services(
 
 
 
+def _prepare_deployment_start() -> StartDecision:
+    """Fail closed before startup can perform an implicit DB migration."""
+
+    running_commit = str(
+        getattr(update_service, "running_commit", "")
+        or getattr(update_service, "_running_commit", "")
+    )
+    decision = assess_deployment_start(
+        update_service.project_dir,
+        port=update_service.port,
+        running_commit=running_commit,
+        status_file=update_service._status_file,
+    )
+    if decision.blocked:
+        raise RuntimeError(
+            "Deployment startup guard blocked application startup: "
+            f"{decision.reason}"
+        )
+
+    # Recover durable deployment state before opening the database. The repair
+    # API must describe the operation that caused this process to start, even
+    # when /tmp was cleared by a reboot.
+    update_service.recover_from_status_file()
+    if decision.skip_mutations:
+        logger.warning("Startup mutations skipped: %s", decision.reason)
+    return decision
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    deployment_start = _prepare_deployment_start()
+    update_service.maintenance_only = (
+        deployment_start.maintenance_only
+    )
+    app.state.deployment_maintenance_only = (
+        deployment_start.maintenance_only
+    )
+    if deployment_start.maintenance_only:
+        # A failed/partial migration may leave the checked-out application
+        # unable to safely query the current schema. Keep the ASGI process
+        # alive so an administrator can inspect status and invoke repair,
+        # without starting any database-, worker-, or dispatcher-dependent
+        # runtime services.
+        logger.error(
+            "CCM started in deployment maintenance-only mode: %s",
+            deployment_start.reason,
+        )
+        yield
+        return
+
+    if not deployment_start.skip_mutations:
+        await init_db()
     # Create default admin on first startup
     from backend.models.user import User
     from backend.api.auth import _hash_password
@@ -492,7 +559,6 @@ async def lifespan(app: FastAPI):
         row = await db.get(GlobalSettings, 1)
         if row is not None and row.use_pty_mode is not None:
             instance_manager.set_pty_mode(row.use_pty_mode)
-    update_service.recover_from_status_file()
     await _reset_stale_discussion_agents()
     await _cleanup_stale_sub_agents()
     await _recover_stale_worker_lifecycles()

@@ -4,11 +4,15 @@ import os
 import signal
 import sys
 import pytest
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.services.dispatcher import GlobalDispatcher
+from backend.services.deployment_start_guard import (
+    DeploymentTaskStartBlocked,
+)
 from backend.models.instance import Instance
 from backend.models.task import Task
 
@@ -126,6 +130,45 @@ async def test_pause_dispatching_does_not_stop_dispatcher(db_factory):
 
     d.resume_dispatching()
     assert d.status()["paused"] is False
+
+
+@pytest.mark.asyncio
+async def test_task_start_guard_holds_repo_deployment_fence(db_factory):
+    d = _make_dispatcher(db_factory)
+    events = []
+
+    @contextmanager
+    def fence():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    d.deployment_task_start_fence = fence
+
+    async with d.task_start_guard():
+        events.append("claim")
+
+    assert events == ["enter", "claim", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_task_start_guard_maps_repo_fence_to_paused(db_factory):
+    from backend.services.dispatcher import TaskStartPausedError
+
+    d = _make_dispatcher(db_factory)
+
+    @contextmanager
+    def blocked_fence():
+        raise DeploymentTaskStartBlocked("deployment active")
+        yield
+
+    d.deployment_task_start_fence = blocked_fence
+
+    with pytest.raises(TaskStartPausedError, match="deployment active"):
+        async with d.task_start_guard():
+            pass
 
 
 @pytest.mark.asyncio

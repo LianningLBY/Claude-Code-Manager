@@ -943,6 +943,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     registry.start_turn = AsyncMock(return_value=(process, "thread-home"))
     codex_home = tmp_path / "account-home"
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
 
     with patch(
         "backend.services.codex_app_server.CodexAppServerRegistry",
@@ -972,6 +973,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     assert im.get_config_dir(inst.id) == str(codex_home.resolve())
     assert im._launch_params[inst.id]["config_dir"] == str(codex_home.resolve())
     await asyncio.sleep(0.1)
+    im.task_message_enqueuer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -5343,6 +5345,7 @@ async def test_launch_chat_initiated_stores_enable_workflows_in_params(db_factor
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
+    im.task_message_enqueuer = AsyncMock()
 
     with patch("backend.services.instance_manager.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
         await im.launch(instance_id=inst_id, prompt="hi", task_id=task_id, cwd="/tmp", chat_initiated=True, enable_workflows=True)
@@ -5350,6 +5353,7 @@ async def test_launch_chat_initiated_stores_enable_workflows_in_params(db_factor
     assert inst_id in im._launch_params
     assert im._launch_params[inst_id]["enable_workflows"] is True
     await asyncio.sleep(0.1)
+    im.task_message_enqueuer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -5376,12 +5380,14 @@ async def test_launch_chat_initiated_stores_enable_workflows_false_in_params(db_
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
+    im.task_message_enqueuer = AsyncMock()
 
     with patch("backend.services.instance_manager.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
         await im.launch(instance_id=inst_id, prompt="hi", task_id=task_id, cwd="/tmp", chat_initiated=True, enable_workflows=False)
 
     assert im._launch_params[inst_id]["enable_workflows"] is False
     await asyncio.sleep(0.1)
+    im.task_message_enqueuer.assert_awaited_once()
 
 
 @pytest.mark.asyncio

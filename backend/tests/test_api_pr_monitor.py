@@ -1052,6 +1052,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
     """Worker reviews use the locked internal full-lifecycle endpoint."""
 
     import backend.main
+    from backend.services.worker_proxy import get_task_operation_lock
 
     repo = await _create_repo(
         client,
@@ -1071,7 +1072,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
         await db.commit()
         old_task_id = old_task.id
 
-    operation_lock = asyncio.Lock()
+    operation_lock = get_task_operation_lock(old_task_id)
     migration_lock = asyncio.Lock()
     calls: list[tuple[str, str]] = []
 
@@ -1112,6 +1113,11 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
             "metadata_": {"pr_review_superseded": True},
         }
 
+    proxy = SimpleNamespace(
+        proxy_to_worker=AsyncMock(
+            side_effect=authoritative_worker_call
+        )
+    )
     with (
         patch.object(
             backend.main,
@@ -1119,15 +1125,9 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
             SimpleNamespace(_locks={old_task_id: migration_lock}),
         ),
         patch.object(
-            backend.main.worker_proxy,
-            "task_operation_lock",
-            return_value=operation_lock,
-        ),
-        patch.object(
-            backend.main.worker_proxy,
-            "proxy_to_worker",
-            new_callable=AsyncMock,
-            side_effect=authoritative_worker_call,
+            backend.main,
+            "worker_proxy",
+            proxy,
         ),
     ):
         synchronized = await _post_webhook(
@@ -1172,6 +1172,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
     """A lost response is fail-closed, then a terminal retry converges."""
 
     import backend.main
+    from backend.services.worker_proxy import get_task_operation_lock
 
     repo = await _create_repo(
         client,
@@ -1191,7 +1192,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
         await db.commit()
         old_task_id = old_task.id
 
-    operation_lock = asyncio.Lock()
+    operation_lock = get_task_operation_lock(old_task_id)
     migration_lock = asyncio.Lock()
     post_attempts = 0
 
@@ -1238,6 +1239,9 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
             "metadata_": {"pr_review_superseded": True},
         }
 
+    proxy = SimpleNamespace(
+        proxy_to_worker=AsyncMock(side_effect=lost_worker_response)
+    )
     with (
         patch.object(
             backend.main,
@@ -1245,15 +1249,9 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
             SimpleNamespace(_locks={old_task_id: migration_lock}),
         ),
         patch.object(
-            backend.main.worker_proxy,
-            "task_operation_lock",
-            return_value=operation_lock,
-        ),
-        patch.object(
-            backend.main.worker_proxy,
-            "proxy_to_worker",
-            new_callable=AsyncMock,
-            side_effect=lost_worker_response,
+            backend.main,
+            "worker_proxy",
+            proxy,
         ),
     ):
         first_attempt = await _post_webhook(

@@ -108,6 +108,11 @@ class InstanceManager:
     def __init__(self, db_factory, broadcaster: WebSocketBroadcaster):
         self.db_factory = db_factory  # async_sessionmaker
         self.broadcaster = broadcaster
+        # Wired by backend.main after Dispatcher construction. Keeping this
+        # dependency explicit prevents background consumers (especially in
+        # tests) from importing the process-global Dispatcher and enqueueing
+        # work against an unrelated database.
+        self.task_message_enqueuer = None
         self.parser = StreamParser()
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self._tasks: dict[int, asyncio.Task] = {}  # instance_id -> consumer task
@@ -2708,19 +2713,27 @@ class InstanceManager:
             combined = " ".join(_assistant_texts).strip().lower().rstrip(".")
             if not _assistant_texts or combined in _NO_RESPONSE_PATTERNS:
                 params = self._launch_params[instance_id]
-                params["_retried"] = True
-                logger.warning(
-                    "Task %d got empty/non-response (%r), re-enqueueing prompt",
-                    task_id, combined[:80],
-                )
-                from backend.main import dispatcher
-                from backend.services.dispatcher import PRIORITY_USER
-                await dispatcher.enqueue_message(
-                    task_id=task_id,
-                    prompt=params["prompt"],
-                    priority=PRIORITY_USER,
-                    source="retry",
-                )
+                enqueuer = self.task_message_enqueuer
+                if enqueuer is None:
+                    logger.warning(
+                        "Task %d got empty/non-response (%r), but no task "
+                        "message enqueuer is configured",
+                        task_id,
+                        combined[:80],
+                    )
+                else:
+                    params["_retried"] = True
+                    logger.warning(
+                        "Task %d got empty/non-response (%r), re-enqueueing prompt",
+                        task_id, combined[:80],
+                    )
+                    from backend.services.dispatcher import PRIORITY_USER
+                    await enqueuer(
+                        task_id=task_id,
+                        prompt=params["prompt"],
+                        priority=PRIORITY_USER,
+                        source="retry",
+                    )
                 # Still clean up instance below so it's available for the retry
                 # fall through to normal cleanup
 

@@ -143,7 +143,8 @@ claude-manager/
 │       ├── worker_proxy.py      # 任务转发到 Worker
 │       ├── worker_relay.py      # Manager↔Worker WebSocket 事件中继
 │       ├── task_migrator.py     # 任务在本机↔Worker 之间迁移
-│       ├── update_service.py    # 一键更新 + 智能重启
+│       ├── update_service.py    # 更新/修复/回滚事务 + 智能重启
+│       ├── deployment_start_guard.py # 部署 lease、启动守卫与跨进程 task fence
 │       ├── stream_parser.py     # NDJSON stream-json 解析
 │       ├── task_queue.py        # 优先级任务队列
 │       ├── worktree_manager.py  # Git worktree 管理 + rebase + push
@@ -309,7 +310,30 @@ curl -X POST http://localhost:8000/api/system/update \
 
 真正更新时自动执行：git pull → 刷新 PTY 依赖 → 数据库迁移 → 重建前端 → 智能重启（自动检测 systemd 服务名 `SERVICE_NAME`）。更新源优先使用目标分支配置的 tracking remote（例如本仓库的 `upstream/main`），没有 tracking remote 时回退 `origin`。
 
+状态检查会分别显示当前进程实际加载的 commit、磁盘 `HEAD`、数据库 Alembic current/head。三者含义不同：代码已经拉取成功，只说明磁盘是新版；依赖、前端产物或迁移失败时，旧服务仍可能继续运行，所以“远端与本地代码一致”不能作为部署完成的判断。此时页面会提供「修复并重新部署」，重新执行当前磁盘版本的依赖同步、PTY 刷新、前端安装/构建、数据库确认/迁移和受控重启；只有代码与数据库都已确认一致时才开放轻量重启。即使一切一致，详情页仍保留「手动重启」按钮。
+
+更新、修复和受控重启还要求 Git 工作树干净，包括 staged、unstaged 和未被 `.gitignore` 排除的 untracked 文件；否则新进程可能加载无法由 commit 证明的代码。数据库、日志、备份、构建产物等运行时文件应通过 `.gitignore` 明确排除。
+
+```bash
+# 对当前磁盘版本补齐完整部署
+curl -X POST http://localhost:8000/api/system/update/repair \
+  -H "Authorization: Bearer $AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{}'
+
+# 已证明代码/数据库一致时，仅重启服务
+curl -X POST http://localhost:8000/api/system/restart \
+  -H "Authorization: Bearer $AUTH_TOKEN"
+```
+
+更新事务使用仓库内的持久 deployment lease 记录 token、worker PID 身份、期望 commit 和迁移结果。服务启动前会先检查该 lease；若上一次迁移或回滚没有完整结束，CCM 只启动一个不访问业务数据库的维护界面，Dispatcher、Worker 和普通 API 不会启动，管理员仍可查看状态并执行修复/回滚。迁移脚本会在服务完全停止后重新生成 SQLite 快照；数据库恢复、代码回退、依赖恢复或前端恢复任一步失败，服务保持停止，避免启动代码、依赖和 schema 混合的版本。
+
+一键更新和自动修复仅支持文件型 SQLite，因为 CCM 必须能在停服后制作并验证快照，才能承诺自动回滚。PostgreSQL/MySQL 等外部数据库仍可在版本完全一致时使用「重启」，但更新和修复必须由管理员先完成数据库备份，再按数据库自己的迁移/恢复流程部署。迁移失败通常来自数据库 schema 漂移、迁移脚本本身报错、数据库文件被其他进程占用、权限/磁盘空间问题或新服务未在健康检查期限内启动；页面和 deployment status 会保留失败步骤与日志，不应通过反复点击更新绕过。
+
 为避免中断任务，更新开始前会关闭统一的任务启动门禁：普通 Dispatcher、Worker 转发、聊天/Monitor 续跑、RalphLoop 和手动 Instance 运行都不能越过维护窗口。`in_progress/executing` task、无 Task 关联但仍为 `running` 的 prompt-only 实例，或已经进入队列、尚未启动的续跑消息都会阻止停服；stop-session 清空消息时会在同一门禁内同步移除已经失效的队列 blocker，避免之后出现幽灵阻塞。若更新期间收到新的续跑消息，本次重启会取消并恢复调度，消息不会因进程重启而从内存队列丢失。更新与回滚请求还共用同一个操作准入锁：一次只能放行一个操作，回滚使用的 commit 和备份会在锁内固定，不能被并发更新替换。所有更新、迁移、手动拉取后的快速重启和回滚都在同一门禁内完成最后一次 blocker 查询，并在查询成功后不再经过异步等待，直接提交停服操作。任务完成后点击「重新检查」即可继续。手动 `git pull` 后触发更新时，系统会以服务实际加载的旧 commit 为基线补齐部署步骤，而不是只做一次盲目重启。
+
+如果任务列表里已经找不到任务、更新弹窗却仍显示运行阻断项，可点击「重新核对运行状态」。系统会暂停新领取并由 Dispatcher 对照内存中的真实 lifecycle/process 与数据库 Task↔Instance 所有权：明确死亡且关系一致的残留会安全收敛；多 owner、关系不一致或 PID 仍可能存活时不会猜测重放，而会终止损坏状态或继续保留阻断证据。正在准备 launch 的任务、当前进程拥有的任务、Monitor/子 Agent 不会被误清；远端共享任务镜像不参与本机 stale recovery。
+
+同一 checkout 被多个 CCM 进程使用时，任务领取还会持有仓库级共享文件锁，部署 claim 使用排他锁；部署拿到 lease 后会在任何 checkout、备份或依赖修改之前再次查询活动任务。这样即使另一个 CCM 恰好在第一次检查后提交了 task，也只会取消本次部署，不会一边运行任务一边改它脚下的环境。
 
 stop-session 清理 per-task 消息时还会推进该队列的 cancellation generation。已经被 consumer 从队列取走、但尚未登记为 in-flight 的旧代次消息会被明确取消，不会在清理成功后再次启动；已经登记的真实 in-flight 工作仍保留为更新 blocker，直到其生命周期结束。
 
@@ -433,6 +457,9 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | System | `GET /api/system/health` | 健康检查 |
 | | `GET /api/system/stats` | 统计信息 |
 | | `POST /api/system/update` | 一键更新重启 |
+| | `POST /api/system/update/reconcile` | 安全核对并收敛幽灵运行状态 |
+| | `POST /api/system/update/repair` | 对当前磁盘版本执行完整修复部署 |
+| | `POST /api/system/restart` | 代码与数据库一致时受控重启 |
 | WebSocket | `ws://host/ws` | 实时推送（subscribe channel） |
 | Auth | `POST /api/auth/login` | Token 登录 |
 

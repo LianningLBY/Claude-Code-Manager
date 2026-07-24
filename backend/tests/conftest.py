@@ -1,6 +1,51 @@
 """Shared fixtures for backend tests."""
+import atexit
 import asyncio
 import os
+import shutil
+import tempfile
+from pathlib import Path
+
+# This must run before the first ``backend.*`` import.  API fixtures override
+# FastAPI's ``get_db`` dependency, but process-wide services imported from
+# ``backend.main`` retain ``backend.database.async_session``.  Without this
+# bootstrap, an incompletely mocked test can write Instance/Task lifecycle
+# state into the developer's real ``claude_manager.db``.
+TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+_GLOBAL_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="ccm-pytest-global-"))
+atexit.register(shutil.rmtree, _GLOBAL_TEST_DB_DIR, ignore_errors=True)
+_GLOBAL_TEST_PROJECT_DIR = _GLOBAL_TEST_DB_DIR / "project"
+_GLOBAL_TEST_PROJECT_DIR.mkdir(mode=0o700)
+os.environ.update({
+    "DATABASE_URL": (
+        f"sqlite+aiosqlite:///{_GLOBAL_TEST_DB_DIR / 'global.db'}"
+    ),
+    # Global services created by ``backend.main`` must never inspect real
+    # account journals, credentials, cloud workers, backups, or this checkout.
+    "CCM_TESTING": "1",
+    "CCM_TEST_PROJECT_DIR": str(_GLOBAL_TEST_PROJECT_DIR),
+    "CODEX_POOL_CONFIG_PATH": str(
+        _GLOBAL_TEST_DB_DIR / "codex-pool" / "accounts.json"
+    ),
+    "POOL_CONFIG_PATH": str(
+        _GLOBAL_TEST_DB_DIR / "claude-pool" / "accounts.json"
+    ),
+    "WORKSPACE_DIR": str(_GLOBAL_TEST_DB_DIR / "workspace"),
+    "WORKER_ENABLED": "false",
+    "POOL_ENABLED": "false",
+    "CODEX_POOL_ENABLED": "false",
+    "BACKUP_ENABLED": "false",
+    "AUTO_START_DISPATCHER": "false",
+    "AUTO_PUSH_TO_ORIGIN": "false",
+    # Preserve the product default for constructor/wiring tests. Dispatcher is
+    # disabled, so no PTY process can start merely by importing backend.main.
+    "USE_PTY_MODE": "true",
+    "SERVICE_NAME": "ccm-pytest.invalid",
+    "PORT": "0",
+    # Host shell/.env settings must not make baseline tests nondeterministic.
+    "DEFAULT_PROVIDER": "codex",
+    "DEFAULT_CODEX_MODEL": "gpt-5.6-sol",
+})
 
 import pytest
 import pytest_asyncio
@@ -22,10 +67,6 @@ import backend.models.discussion  # noqa: F401
 import backend.models.monitor_session  # noqa: F401
 import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker  # noqa: F401
-
-# Use in-memory SQLite for tests
-TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-
 
 @pytest.fixture(scope="session")
 def event_loop():

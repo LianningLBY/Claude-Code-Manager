@@ -826,3 +826,18 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：新增 provider-neutral、不可变的 `McpServerSpec`，统一描述 command/args/cwd/env/required/enabled_tools/startup timeout/tool timeout；三类现有生成函数先构造各自 spec，再由独立 Claude renderer 输出原 JSON。三个角色的工具白名单分别锁定 13/3/3 个实际 FastMCP 注册工具，Claude 调用方式和输出结构保持不变。
 - **预防**：Provider 适配器只负责格式转换，任何 task/session 上下文必须在公共 spec builder 中形成；工具白名单必须与 FastMCP 注册表做回归对照，禁止在 Claude/Codex renderer 中各维护一套角色逻辑。
 - **验证**：MCP/Monitor 相关测试 47 passed，Claude 命令构建 5 passed，compileall 与 `git diff --check` 通过；用户在 Windows worktree 人工生成三类 spec/Claude JSON，确认角色、ID、required 和 13/3/3 工具数量正确。
+
+### 2026-07-24 — 自更新事务修复：代码已拉取不再等于部署完成（开发环境，未提交）
+
+- **问题**：旧状态只比较 Git 本地/远端；代码已经拉取后若依赖、前端或 Alembic 失败，下一次检查会误报“代码一致”，但进程和数据库仍可能是旧版本。原迁移 worker 的 `/tmp` 状态、systemd handoff、SQLite 活连接恢复和 task 门禁也缺少同一个可证明的事务边界。
+- **解决**：状态拆为 running commit、disk commit、Alembic current/head，并新增完整 repair 与受约束 restart API/前端操作。仓库级 durable lease 保存 token、PID/start identity、期望 commit、备份和迁移结果；pre-start/lifespan guard 对半完成事务只启动不访问 ORM 的 maintenance-only 恢复面。协议 v2 worker 在停服后重新生成并校验 SQLite 快照，迁移/健康失败原子恢复 DB、代码、依赖和前端，任一步失败都不启动混合版本；同 commit 修复失败在后端 operation 与 shell commit 比较两层保留 incomplete fence。
+- **并发/故障边界**：所有 task claim 与部署共用 repo flock，部署 claim 后、任何 mutation 前二次查 blocker；running Instance、Worker 转发、排队续跑和跨 CCM 进程竞态均会取消部署。post-claim cancellation 会先终结 lease 再恢复 Dispatcher，rollback claim 原子保留重试元数据；systemd-run ACK 超时/非零按结果不确定处理，late worker 即使 token 相同也不能越过终态 lease。
+- **验证**：开发虚拟环境入口已从误指生产目录修正为 `/home/ubuntu/Claude-Code-Manager-dev/.venv`。部署专项最终 166 passed，前端全量 370 passed、TypeScript/生产构建/本次文件定向 ESLint 通过；全仓 ESLint 仍有 55 个与本次无关的既有错误。后端最终全量 2084 passed；Shell 语法、Python compile、`git diff --check` 通过。开发服务真实重启把 SQLite 从 `31fe767354b7` 升到 `c7e9b1d42f60`，状态 API 最终返回 current=head、`db_up_to_date=true`、`repair_required=false`；联调额外发现并修复了 Alembic mergepoint 双标记解析误判。仅操作开发目录与 8003，未触碰生产、未 commit/push。
+
+### 2026-07-24 — 更新弹窗幽灵任务核对与 pytest 外部状态隔离（开发环境，未提交）
+
+- **现象**：开发更新弹窗显示 `#1 test monitor task (executing)`，但正常任务入口已看不到它。数据库实证 Task #1 空标题且仍为 executing，Instance #9–#13 五条同时反向占用它，五个 PID 均已死亡。
+- **根因**：这是 Task↔Instance 多 owner 的边界损坏；同时测试虽 override FastAPI `get_db`，`backend.main` 全局 InstanceManager/Dispatcher 仍绑定开发库，三个空响应测试会通过全局 dispatcher 向真实库写 lifecycle，制造了这次残留。
+- **解决**：新增管理员 `POST /api/system/update/reconcile` 与弹窗「重新核对运行状态」。Dispatcher 在关闭准入后统一核对：唯一双向一致的 dead claim 才可恢复；多 owner/mismatch fail closed；unknown/live PID 继续阻断；当前进程 process/consumer/lifecycle、fresh `_launching_instances`、Monitor/Sub-Agent exact maps 均保留。shared shadow 不被本机改写，manual reconcile 跳过 startup auxiliary sweep。Update blocker 还覆盖 quarantined PID/owner 与 live auxiliary generation。pytest 在首次 backend import 前把 DB、账号池 journal、Worker/backup、update checkout 全部定向到临时目录，并关闭外部服务；InstanceManager 的空响应重试改用显式注入 callback，不再 import 全局 dispatcher。
+- **附带修复**：SQLite 停服独占检查仍对未知不可读同 UID 进程 fail closed，但精确允许 systemd `ssh-agent.service` 的 `/usr/bin/ssh-agent -D`；否则该正常 non-dumpable helper 会让所有迁移/回滚误报数据库无法证明独占。
+- **验证**：ghost/Dispatcher/Update/API/InstanceManager/部署门禁专项 563 passed；迁移 hardening 26 passed；后端全量 2107 passed；前端全量 376 passed，TypeScript/Vite production build、定向 ESLint、Python compile、Shell syntax 与 `git diff --check` 全绿。三轮测试前后开发 DB/WAL/SHM 的 inode/mtime/size/SHA-256 完全一致。先生成 `0600` 且 integrity=ok 的 `backups/pre-ghost-reconcile-20260724T114307Z.db`，再只重启 8003：Task #1 fail-close 为 failed，Instance #9–#13 全部清成 error 且移除 PID/owner；在线 reconcile 与 dry-run 均返回 `active_task_count=0/update_blocked=false`，running=disk commit、Alembic current=head、`repair_required=false`。未触碰生产、未 commit/push。

@@ -225,6 +225,85 @@ async def test_invalid_required_mcp_config_is_explicit_before_thread_rpc():
 
 
 @pytest.mark.asyncio
+async def test_required_mcp_app_server_startup_failure_is_explicit():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock(
+        side_effect=CodexAppServerError("initialize failed")
+    )
+    server._request = AsyncMock()
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="could not start required MCP transport",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=53,
+            mcp_specs=(_task_mcp_spec(53),),
+        )
+
+    server._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_missing_thread_id_is_explicit():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={"thread": {}})
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="Required MCP configuration was not admitted",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=54,
+            mcp_specs=(_task_mcp_spec(54),),
+        )
+
+    assert server._request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_missing_turn_id_is_explicit_and_detaches_context():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-missing-turn"}},
+        {"turn": {}},
+    ])
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="Required MCP turn was not admitted",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=55,
+            mcp_specs=(_task_mcp_spec(55),),
+        )
+
+    assert "thread-missing-turn" not in server._contexts_by_thread
+
+
+@pytest.mark.asyncio
 async def test_steer_turn_targets_the_active_turn():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)

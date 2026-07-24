@@ -331,6 +331,10 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_concurrent_task_threads_keep_mcp_context_isolated` | 同一 app-server 并发任务保留各自 `task_id`，配置对象不串线 |
 | `test_required_mcp_thread_rejection_is_explicit` | required MCP 的 thread 创建失败转为 `CodexRequiredMcpError` |
 | `test_invalid_required_mcp_config_is_explicit_before_thread_rpc` | required spec 在本地校验失败时 fail closed，且不发送 thread RPC |
+| `test_required_mcp_app_server_startup_failure_is_explicit` | required MCP 已选中后，app-server transport 启动失败转为显式能力错误 |
+| `test_required_mcp_missing_thread_id_is_explicit` | malformed/no-thread-id 响应 fail closed，不进入 `turn/start` |
+| `test_required_mcp_missing_turn_id_is_explicit_and_detaches_context` | malformed/no-turn-id 响应 fail closed，并清理未成立的 turn context |
+| `test_required_mcp_app_server_failure_does_not_launch_exec` | transport 启动失败、no-thread-id 与未知 adapter 异常都不得启动无 MCP 的 `codex exec` |
 | `test_launch_codex_does_not_fallback_when_replay_is_unsafe[required-mcp]` | required MCP 失败不静默降级到当前尚无 MCP 的 exec fallback |
 | `test_codex_main_mcp_capability_defaults_off` | `CODEX_MAIN_MCP_ENABLED` 服务端 capability 默认关闭 |
 | `test_launch_codex_app_server_injects_task_scoped_specs_when_enabled` | capability 开启时每次 app-server launch 从当前 `task_id` 重建 required spec |
@@ -343,7 +347,7 @@ Codex 版本兼容基线（2026-07-24）：
 2. 创建本地 Codex task，要求它“必须调用 `ccm_command_help` 查询一个 CCM 命令后原样报告工具结果”。
 3. 确认日志出现 `mcp_tool_call`，server/tool 为 `ccm_skills/ccm_command_help`，且工具参数中的 task 上下文对应当前任务。
 4. 在同一 task 发送第二条消息并确认 resume 仍可调用；再并发运行另一个 task，确认两边查询结果和 `task_id` 不串线。
-5. 将测试 MCP command 临时改为不存在路径时，任务应明确失败并包含 required MCP 初始化错误，不得启动 `codex exec`。
+5. 将测试 MCP command 临时改为不存在路径，或模拟 app-server 启动失败/no-thread-id 响应；任务应明确报告 required MCP 错误，且不得启动 `codex exec`。
 6. 测试完恢复 `CODEX_MAIN_MCP_ENABLED=false`。PR 4 完成前，exec fallback 不具备此 MCP。
 
 真实验收记录（2026-07-24）：

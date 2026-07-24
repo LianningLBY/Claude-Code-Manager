@@ -326,8 +326,6 @@ class CodexAppServer:
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
     ) -> tuple[CodexTurnProcess, str]:
-        await self.ensure_started()
-        launch_started = time.perf_counter()
         required_mcp = any(spec.required for spec in mcp_specs)
         try:
             thread_config: dict[str, Any] = (
@@ -339,6 +337,20 @@ class CodexAppServer:
                     f"Invalid required Codex MCP configuration: {exc}"
                 ) from exc
             raise
+        try:
+            await self.ensure_started()
+        except CodexAppServerBusyError:
+            # Preserve maintenance/draining semantics.  InstanceManager already
+            # treats this as unsafe to replay through exec.
+            raise
+        except Exception as exc:
+            if required_mcp:
+                raise CodexRequiredMcpError(
+                    "Codex app-server could not start required MCP transport: "
+                    f"{exc}"
+                ) from exc
+            raise
+        launch_started = time.perf_counter()
         if git_env:
             # Per-project git credentials must remain thread-scoped.  A global
             # app-server environment would leak one project's identity into
@@ -366,7 +378,7 @@ class CodexAppServer:
         )
         try:
             response = await self._request(thread_method, thread_params)
-        except CodexAppServerError as exc:
+        except Exception as exc:
             if required_mcp:
                 raise CodexRequiredMcpError(
                     f"{thread_method} could not initialize required MCP "
@@ -377,7 +389,12 @@ class CodexAppServer:
         thread = response.get("thread") if isinstance(response, dict) else None
         thread_id = thread.get("id") if isinstance(thread, dict) else None
         if not thread_id:
-            raise CodexAppServerError("thread start/resume returned no thread id")
+            message = "thread start/resume returned no thread id"
+            if required_mcp:
+                raise CodexRequiredMcpError(
+                    f"Required MCP configuration was not admitted: {message}"
+                )
+            raise CodexAppServerError(message)
         self._known_threads.add(thread_id)
         existing = self._contexts_by_thread.get(thread_id)
         if existing and existing.process.returncode is None:
@@ -439,9 +456,14 @@ class CodexAppServer:
             if turn_cancelled:
                 raise _UnconfirmedTurnCancellation(turn_process, reason) from exc
             raise _UnconfirmedTurnStartFailure(turn_process, reason) from exc
-        except BaseException:
+        except BaseException as exc:
             self._contexts_by_thread.pop(thread_id, None)
             turn_process.finish(1, "Codex app-server rejected turn/start")
+            if required_mcp and isinstance(exc, Exception):
+                raise CodexRequiredMcpError(
+                    "turn/start could not preserve required MCP "
+                    f"configuration: {exc}"
+                ) from exc
             raise
 
         turn = turn_response.get("turn") if isinstance(turn_response, dict) else None
@@ -449,7 +471,12 @@ class CodexAppServer:
         if not turn_id:
             self._contexts_by_thread.pop(thread_id, None)
             turn_process.finish(1, "Codex app-server turn/start returned no turn id")
-            raise CodexAppServerError("turn/start returned no turn id")
+            message = "turn/start returned no turn id"
+            if required_mcp:
+                raise CodexRequiredMcpError(
+                    f"Required MCP turn was not admitted: {message}"
+                )
+            raise CodexAppServerError(message)
         context.turn_id = turn_id
         self._contexts_by_turn[turn_id] = context
         if turn_cancelled:

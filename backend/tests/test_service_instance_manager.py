@@ -24,6 +24,7 @@ from backend.services.claude_pool import ClaudePool
 from backend.services.codex_pool import CodexPool
 from backend.services.codex_app_server import (
     CodexAppServerBusyError,
+    CodexAppServerError,
     CodexRequiredMcpError,
     CodexThreadHomeMismatchError,
 )
@@ -821,6 +822,7 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
     db_factory, monkeypatch, tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
         inst = Instance(name="codex-fallback-inst")
         db.add(inst)
@@ -849,6 +851,88 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
         codex_home.resolve()
     )
     await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_mode", "error_match"),
+    [
+        ("startup", "could not start required MCP transport"),
+        ("missing-thread", "Required MCP configuration was not admitted"),
+        ("unknown", "required ccm_skills could be guaranteed"),
+    ],
+)
+async def test_required_mcp_app_server_failure_does_not_launch_exec(
+    db_factory, monkeypatch, tmp_path, failure_mode, error_match,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-required-mcp-fail-closed")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="required MCP task",
+            description="must fail closed",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock())
+    if failure_mode == "unknown":
+        im._launch_codex_app_server = AsyncMock(
+            side_effect=RuntimeError("unexpected adapter failure")
+        )
+    startup_error = (
+        CodexAppServerError("initialize failed")
+        if failure_mode == "startup"
+        else None
+    )
+    thread_response = {"thread": {}} if failure_mode == "missing-thread" else None
+    with (
+        patch(
+            "backend.services.codex_app_server.CodexAppServer.ensure_started",
+            new_callable=AsyncMock,
+            side_effect=startup_error,
+        ) as ensure_started,
+        patch(
+            "backend.services.codex_app_server.CodexAppServer._request",
+            new_callable=AsyncMock,
+            return_value=thread_response,
+        ) as request,
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as exec_mock,
+    ):
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match=error_match,
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must keep required MCP",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-required-mcp-home"),
+            )
+
+    if failure_mode == "startup":
+        ensure_started.assert_awaited_once()
+        request.assert_not_awaited()
+    elif failure_mode == "missing-thread":
+        ensure_started.assert_awaited_once()
+        request.assert_awaited_once()
+    else:
+        ensure_started.assert_not_awaited()
+        request.assert_not_awaited()
+    exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -697,7 +697,20 @@ class InstanceManager:
                         "Codex app-server launch cannot safely fall back to exec"
                     )
                     raise
-                except Exception:
+                except Exception as exc:
+                    if settings.codex_main_mcp_enabled and task_id is not None:
+                        # PR4 will teach exec fallback to carry the same MCP
+                        # spec.  Until then, once required ccm_skills was
+                        # selected, every unknown app-server failure must fail
+                        # closed instead of silently replaying without tools.
+                        logger.exception(
+                            "Codex app-server launch failed while required "
+                            "ccm_skills was enabled; refusing MCP-less exec fallback"
+                        )
+                        raise CodexRequiredMcpError(
+                            "Codex app-server failed before required "
+                            "ccm_skills could be guaranteed"
+                        ) from exc
                     # App-server is an experimental Codex surface.  A CLI upgrade
                     # must not take all Codex tasks down; retain the proven exec
                     # path as an automatic compatibility fallback.

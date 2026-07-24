@@ -15,10 +15,30 @@ from backend.services.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerError,
     CodexAppServerRegistry,
+    CodexRequiredMcpError,
     CodexThreadHomeMismatchError,
     CodexTurnProcess,
     normalize_codex_home,
 )
+from backend.services.mcp_config import McpServerSpec
+
+
+def _task_mcp_spec(task_id: int) -> McpServerSpec:
+    return McpServerSpec(
+        name="ccm_skills",
+        command="python",
+        args=(
+            "-m",
+            "backend.mcp.ccm_skills_server",
+            "--task-id",
+            str(task_id),
+        ),
+        cwd="/ccm",
+        required=True,
+        enabled_tools=("ccm_command_help",),
+        startup_timeout_sec=10,
+        tool_timeout_sec=60,
+    )
 
 
 @pytest.mark.asyncio
@@ -39,6 +59,7 @@ async def test_start_turn_uses_native_resume_and_turn_start():
         resume_session_id="thread-123",
         git_env={"GIT_AUTHOR_NAME": "CCM"},
         task_id=9,
+        mcp_specs=(_task_mcp_spec(9),),
     )
 
     assert thread_id == "thread-123"
@@ -50,12 +71,157 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     assert resume_call.args[1]["config"]["shell_environment_policy"]["set"] == {
         "GIT_AUTHOR_NAME": "CCM"
     }
+    assert resume_call.args[1]["config"]["mcp_servers"]["ccm_skills"] == {
+        "command": "python",
+        "args": [
+            "-m",
+            "backend.mcp.ccm_skills_server",
+            "--task-id",
+            "9",
+        ],
+        "cwd": "/ccm",
+        "required": True,
+        "enabled_tools": ["ccm_command_help"],
+        "startup_timeout_sec": 10,
+        "tool_timeout_sec": 60,
+    }
     assert turn_call.args[0] == "turn/start"
     assert turn_call.args[1]["effort"] == "max"
     assert turn_call.args[1]["model"] == "gpt-5.6-luna"
 
     first = json.loads((await process.stdout.readline()).decode())
     assert first == {"type": "thread.started", "thread_id": "thread-123"}
+
+
+@pytest.mark.asyncio
+async def test_start_turn_injects_mcp_config_into_new_thread():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-new"}},
+        {"turn": {"id": "turn-new"}},
+    ])
+
+    await server.start_turn(
+        prompt="start",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=41,
+        mcp_specs=(_task_mcp_spec(41),),
+    )
+
+    thread_call = server._request.await_args_list[0]
+    assert thread_call.args[0] == "thread/start"
+    assert thread_call.args[1]["config"]["mcp_servers"]["ccm_skills"]["args"][-2:] == [
+        "--task-id",
+        "41",
+    ]
+    assert thread_call.args[1]["config"]["mcp_servers"]["ccm_skills"]["required"] is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_threads_keep_mcp_context_isolated():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    thread_configs: dict[str, dict] = {}
+
+    async def request(method, params):
+        if method == "thread/start":
+            args = params["config"]["mcp_servers"]["ccm_skills"]["args"]
+            task_id = args[args.index("--task-id") + 1]
+            thread_configs[task_id] = params["config"]
+            await asyncio.sleep(0)
+            return {"thread": {"id": f"thread-{task_id}"}}
+        if method == "turn/start":
+            await asyncio.sleep(0)
+            return {"turn": {"id": f"turn-{params['threadId']}"}}
+        raise AssertionError(f"unexpected method: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+
+    await asyncio.gather(*(
+        server.start_turn(
+            prompt=f"task {task_id}",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=task_id,
+            mcp_specs=(_task_mcp_spec(task_id),),
+        )
+        for task_id in (101, 202)
+    ))
+
+    assert set(thread_configs) == {"101", "202"}
+    assert thread_configs["101"] is not thread_configs["202"]
+    assert (
+        thread_configs["101"]["mcp_servers"]["ccm_skills"]["args"][-1]
+        == "101"
+    )
+    assert (
+        thread_configs["202"]["mcp_servers"]["ccm_skills"]["args"][-1]
+        == "202"
+    )
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_thread_rejection_is_explicit():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(
+        side_effect=CodexAppServerError(
+            "thread/start failed: required MCP server ccm_skills failed to initialize"
+        )
+    )
+
+    with pytest.raises(CodexRequiredMcpError, match="required MCP"):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=51,
+            mcp_specs=(_task_mcp_spec(51),),
+        )
+
+
+@pytest.mark.asyncio
+async def test_invalid_required_mcp_config_is_explicit_before_thread_rpc():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock()
+    invalid_spec = McpServerSpec(
+        name="invalid.name",
+        command="python",
+        required=True,
+    )
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="Invalid required Codex MCP configuration",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=52,
+            mcp_specs=(invalid_spec,),
+        )
+
+    server._request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

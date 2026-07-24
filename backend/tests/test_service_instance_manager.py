@@ -24,9 +24,10 @@ from backend.services.claude_pool import ClaudePool
 from backend.services.codex_pool import CodexPool
 from backend.services.codex_app_server import (
     CodexAppServerBusyError,
+    CodexRequiredMcpError,
     CodexThreadHomeMismatchError,
 )
-from backend.config import settings
+from backend.config import Settings, settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
@@ -40,6 +41,10 @@ def _no_pty_no_skills(monkeypatch):
          patch("backend.services.skill_loader.build_skill_prompt_file", return_value=""), \
          patch("backend.services.skill_loader.get_skill_disallowed_tools", return_value=[]):
         yield
+
+
+def test_codex_main_mcp_capability_defaults_off():
+    assert Settings.model_fields["codex_main_mcp_enabled"].default is False
 
 
 def test_parse_codex_agent_message():
@@ -852,10 +857,11 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
     [
         asyncio.TimeoutError(),
         CodexAppServerBusyError("account busy"),
+        CodexRequiredMcpError("required MCP failed"),
         CodexThreadHomeMismatchError("wrong owner"),
         CodexLaunchCommitError("turn already started"),
     ],
-    ids=["timeout", "busy", "owner-mismatch", "commit-failed"],
+    ids=["timeout", "busy", "required-mcp", "owner-mismatch", "commit-failed"],
 )
 async def test_launch_codex_does_not_fallback_when_replay_is_unsafe(
     db_factory, monkeypatch, tmp_path, launch_error,
@@ -921,8 +927,9 @@ async def test_codex_started_turn_wraps_generic_persistence_failure(
 
 @pytest.mark.asyncio
 async def test_launch_codex_app_server_routes_turn_to_canonical_home(
-    db_factory, tmp_path,
+    db_factory, monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
         inst = Instance(name="codex-registry-inst")
         db.add(inst)
@@ -969,8 +976,84 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     assert registry.start_turn.await_args.kwargs["codex_home"] == str(
         codex_home.resolve()
     )
+    assert registry.start_turn.await_args.kwargs["mcp_specs"] == ()
     assert im.get_config_dir(inst.id) == str(codex_home.resolve())
     assert im._launch_params[inst.id]["config_dir"] == str(codex_home.resolve())
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_launch_codex_app_server_injects_task_scoped_specs_when_enabled(
+    db_factory, monkeypatch,
+):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    process = _make_mock_process(pid=7655)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(return_value=(process, "thread-mcp"))
+    im = InstanceManager(db_factory, MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im._persist_and_track_launch = AsyncMock(return_value=7655)
+
+    pid = await im._launch_codex_app_server(
+        instance_id=1,
+        prompt="use CCM",
+        task_id=73,
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        resume_session_id="thread-mcp",
+        loop_iteration=None,
+        git_env=None,
+        effort_level="high",
+        chat_initiated=False,
+        config_dir="/tmp/codex-mcp",
+        enable_workflows=False,
+        enabled_skills={"monitor": True},
+    )
+
+    assert pid == 7655
+    specs = registry.start_turn.await_args.kwargs["mcp_specs"]
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.name == "ccm_skills"
+    assert spec.required is True
+    assert spec.args[spec.args.index("--task-id") + 1] == "73"
+    assert "ccm_command_help" in spec.enabled_tools
+
+
+@pytest.mark.asyncio
+async def test_codex_main_mcp_capability_does_not_change_claude_launch(
+    db_factory, monkeypatch,
+):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="claude-capability-regression")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    process = _make_mock_process(pid=7656)
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(
+        side_effect=AssertionError("Claude launch reached Codex app-server")
+    )
+
+    with (
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as create_process,
+        patch("backend.services.ask_user_settings.ensure_ask_user_hook"),
+    ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="Claude stays Claude",
+            cwd="/tmp",
+            provider="claude",
+        )
+
+    assert create_process.await_args.args[0] == settings.claude_binary
+    im._launch_codex_app_server.assert_not_awaited()
     await asyncio.sleep(0.1)
 
 
@@ -1180,6 +1263,7 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
         "model": "gpt-5.5",
         "git_env": {},
         "effort_level": "high",
+        "enabled_skills": {"monitor": True},
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(return_value=999)
@@ -1197,9 +1281,11 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
     assert "usage limit" in combined
     launch_kwargs = im.launch.await_args.kwargs
     assert launch_kwargs["provider"] == "codex"
+    assert launch_kwargs["task_id"] == task.id
     assert launch_kwargs["config_dir"] == new_home
     assert launch_kwargs["resume_session_id"] == "thread-rotate"
     assert launch_kwargs["prompt"] == "continue the task"
+    assert launch_kwargs["enabled_skills"] == {"monitor": True}
 
 
 @pytest.mark.asyncio
@@ -1763,6 +1849,7 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         "provider": "codex",
         "prompt": "preserve transient prompt",
         "model": "gpt-5.5",
+        "enabled_skills": {"sub-agent": True},
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(
@@ -1778,6 +1865,11 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         )
 
     assert launched is False
+    assert im.launch.await_args.kwargs["task_id"] == task.id
+    assert im.launch.await_args.kwargs["resume_session_id"] == task.session_id
+    assert im.launch.await_args.kwargs["enabled_skills"] == {
+        "sub-agent": True,
+    }
     dispatcher.enqueue_message.assert_awaited_once_with(
         task_id=task.id,
         prompt="preserve transient prompt",

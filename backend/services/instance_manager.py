@@ -589,6 +589,7 @@ class InstanceManager:
         if provider == "codex":
             from backend.services.codex_app_server import (
                 CodexAppServerBusyError,
+                CodexRequiredMcpError,
                 CodexThreadHomeMismatchError,
                 normalize_codex_home,
             )
@@ -682,6 +683,7 @@ class InstanceManager:
                 except (
                     asyncio.TimeoutError,
                     CodexAppServerBusyError,
+                    CodexRequiredMcpError,
                     CodexThreadHomeMismatchError,
                     CodexLaunchCommitError,
                     InstanceNotFoundError,
@@ -1003,6 +1005,14 @@ class InstanceManager:
 
         actual_cwd = cwd or os.getcwd()
         codex_effort = clamp_codex_effort(model, effort_level)
+        mcp_specs = ()
+        if settings.codex_main_mcp_enabled and task_id is not None:
+            from backend.services.mcp_config import build_mcp_server_specs
+
+            mcp_specs = build_mcp_server_specs(
+                task_id,
+                enabled_skills or {},
+            )
         process, _thread_id = await registry.start_turn(
             codex_home=config_dir,
             prompt=prompt,
@@ -1012,6 +1022,7 @@ class InstanceManager:
             resume_session_id=resume_session_id,
             git_env=git_env,
             task_id=task_id,
+            mcp_specs=mcp_specs,
         )
         if config_dir:
             self._config_dirs[instance_id] = config_dir

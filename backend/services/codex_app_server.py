@@ -18,8 +18,9 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
+from backend.services.mcp_config import McpServerSpec, render_codex_mcp_config
 from backend.services.process_safety import require_safe_process_group_id
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,10 @@ class CodexAppServerError(RuntimeError):
 
 class CodexAppServerBusyError(CodexAppServerError):
     """The requested account home still has an active Codex turn."""
+
+
+class CodexRequiredMcpError(CodexAppServerError):
+    """A thread could not be created with its required MCP configuration."""
 
 
 class CodexThreadHomeMismatchError(CodexAppServerError):
@@ -319,10 +324,21 @@ class CodexAppServer:
         resume_session_id: str | None,
         git_env: dict[str, str] | None,
         task_id: int | None,
+        mcp_specs: Sequence[McpServerSpec] = (),
     ) -> tuple[CodexTurnProcess, str]:
         await self.ensure_started()
         launch_started = time.perf_counter()
-        thread_config: dict[str, Any] = {}
+        required_mcp = any(spec.required for spec in mcp_specs)
+        try:
+            thread_config: dict[str, Any] = (
+                render_codex_mcp_config(mcp_specs) if mcp_specs else {}
+            )
+        except (TypeError, ValueError) as exc:
+            if required_mcp:
+                raise CodexRequiredMcpError(
+                    f"Invalid required Codex MCP configuration: {exc}"
+                ) from exc
+            raise
         if git_env:
             # Per-project git credentials must remain thread-scoped.  A global
             # app-server environment would leak one project's identity into
@@ -342,13 +358,21 @@ class CodexAppServer:
         if thread_config:
             common["config"] = thread_config
 
-        if resume_session_id:
-            response = await self._request(
-                "thread/resume",
-                {"threadId": resume_session_id, **common},
-            )
-        else:
-            response = await self._request("thread/start", common)
+        thread_method = "thread/resume" if resume_session_id else "thread/start"
+        thread_params = (
+            {"threadId": resume_session_id, **common}
+            if resume_session_id
+            else common
+        )
+        try:
+            response = await self._request(thread_method, thread_params)
+        except CodexAppServerError as exc:
+            if required_mcp:
+                raise CodexRequiredMcpError(
+                    f"{thread_method} could not initialize required MCP "
+                    f"configuration: {exc}"
+                ) from exc
+            raise
 
         thread = response.get("thread") if isinstance(response, dict) else None
         thread_id = thread.get("id") if isinstance(thread, dict) else None

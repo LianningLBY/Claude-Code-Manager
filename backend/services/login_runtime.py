@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -39,7 +41,6 @@ class LoginRuntime:
     display: str
     xauthority: Path
     temp_dir: Path
-    cdp_port: int
 
     def child_environment(
         self,
@@ -54,10 +55,12 @@ class LoginRuntime:
             "TMP": str(self.temp_dir),
             "TEMP": str(self.temp_dir),
             "CCM_LOGIN_TMPDIR": str(self.temp_dir),
-            "CCM_LOGIN_CDP_PORT": str(self.cdp_port),
         }
         if extra:
             env.update(extra)
+        # Fixed CDP ports can be captured by an orphan Chrome.  Login scripts
+        # now bind through their unique profile's DevToolsActivePort instead.
+        env.pop("CCM_LOGIN_CDP_PORT", None)
         return env
 
 
@@ -85,21 +88,6 @@ def _configured_display() -> tuple[str, int]:
             f"Invalid CCM_XVFB_DISPLAY={display!r}; expected :<number>",
         )
     return display, int(match.group(1))
-
-
-def _configured_cdp_port() -> int:
-    raw = os.environ.get("CCM_LOGIN_CDP_PORT", "9222").strip()
-    try:
-        port = int(raw)
-    except ValueError as exc:
-        raise LoginRuntimeError(
-            f"Invalid CCM_LOGIN_CDP_PORT={raw!r}; expected an integer",
-        ) from exc
-    if not 1 <= port <= 65535:
-        raise LoginRuntimeError(
-            f"Invalid CCM_LOGIN_CDP_PORT={port}; expected 1..65535",
-        )
-    return port
 
 
 def _configured_nonnegative_int(name: str, default: int) -> int:
@@ -208,6 +196,253 @@ class XvfbManager:
         )
 
     @staticmethod
+    def _owner_path(lock_path: Path) -> Path:
+        return lock_path.with_name(f"{lock_path.stem}.owner.json")
+
+    @staticmethod
+    def _x_lock_path(socket_path: Path, display_number: int) -> Path:
+        if socket_path.parent == Path("/tmp/.X11-unix"):
+            return Path(f"/tmp/.X{display_number}-lock")
+        # Tests and private runtimes may redirect the socket away from /tmp.
+        return socket_path.parent / f".X{display_number}-lock"
+
+    @staticmethod
+    def _read_process_identity(pid: int) -> tuple[str, int] | None:
+        """Return Linux process state/start ticks, or None when PID is gone."""
+
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise LoginRuntimeError(
+                f"Unable to verify Xvfb owner process {pid}: {exc}",
+            ) from exc
+
+        # comm is parenthesized and may itself contain spaces or parentheses.
+        separator = raw.rfind(") ")
+        if separator < 0:
+            raise LoginRuntimeError(
+                f"Unable to parse Xvfb owner process identity for PID {pid}",
+            )
+        fields = raw[separator + 2 :].split()
+        if len(fields) <= 19:
+            raise LoginRuntimeError(
+                f"Incomplete Xvfb owner process identity for PID {pid}",
+            )
+        try:
+            return fields[0], int(fields[19])
+        except ValueError as exc:
+            raise LoginRuntimeError(
+                f"Invalid Xvfb owner process identity for PID {pid}",
+            ) from exc
+
+    @staticmethod
+    def _path_identity(path: Path) -> dict[str, int] | None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise LoginRuntimeError(
+                f"Unable to inspect Xvfb runtime artifact {path}: {exc}",
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise LoginRuntimeError(
+                f"Refusing symlink Xvfb runtime artifact: {path}",
+            )
+        return {
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "uid": int(info.st_uid),
+            "file_type": int(stat.S_IFMT(info.st_mode)),
+        }
+
+    @staticmethod
+    def _same_path_identity(
+        current: dict[str, int] | None,
+        recorded: object,
+    ) -> bool:
+        if current is None or not isinstance(recorded, dict):
+            return False
+        required = {"device", "inode", "uid", "file_type"}
+        if set(recorded) != required:
+            return False
+        return all(current[key] == recorded.get(key) for key in required)
+
+    @staticmethod
+    def _write_owner_record(path: Path, record: dict[str, object]) -> None:
+        if path.is_symlink():
+            raise LoginRuntimeError(f"Refusing symlink Xvfb owner file: {path}")
+        temp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temp_path, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                json.dump(record, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+            os.chmod(path, 0o600)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _read_owner_record(path: Path) -> dict[str, object] | None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise LoginRuntimeError(
+                f"Unable to inspect Xvfb owner file {path}: {exc}",
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise LoginRuntimeError(f"Invalid Xvfb owner file: {path}")
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise LoginRuntimeError(
+                f"Unsafe Xvfb owner file permissions: {path}",
+            )
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise LoginRuntimeError(
+                    f"Xvfb owner file changed while opening: {path}",
+                )
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = -1
+                record = json.load(handle)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise LoginRuntimeError(f"Invalid Xvfb owner file {path}: {exc}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+        if not isinstance(record, dict):
+            raise LoginRuntimeError(f"Invalid Xvfb owner record: {path}")
+        return record
+
+    def _record_owned_display(
+        self,
+        *,
+        display: str,
+        proc: subprocess.Popen,
+        owner_path: Path,
+        socket_path: Path,
+        x_lock_path: Path,
+    ) -> None:
+        process_identity = self._read_process_identity(proc.pid)
+        if process_identity is None:
+            raise LoginRuntimeError(
+                f"Xvfb {display} exited before ownership could be recorded",
+            )
+        state, start_time_ticks = process_identity
+        if state == "Z":
+            raise LoginRuntimeError(
+                f"Xvfb {display} became a zombie before ownership was recorded",
+            )
+        socket_identity = self._path_identity(socket_path)
+        if socket_identity is None or socket_identity["file_type"] != stat.S_IFSOCK:
+            raise LoginRuntimeError(
+                f"Xvfb {display} became ready without its Unix socket",
+            )
+        self._write_owner_record(
+            owner_path,
+            {
+                "version": 1,
+                "display": display,
+                "pid": int(proc.pid),
+                "start_time_ticks": start_time_ticks,
+                "socket": socket_identity,
+                "x_lock": self._path_identity(x_lock_path),
+            },
+        )
+
+    def _recover_stale_owned_display(
+        self,
+        *,
+        display: str,
+        owner_path: Path,
+        socket_path: Path,
+        x_lock_path: Path,
+    ) -> bool:
+        """Remove artifacts only when they still belong to a dead CCM Xvfb."""
+
+        record = self._read_owner_record(owner_path)
+        socket_identity = self._path_identity(socket_path)
+        x_lock_identity = self._path_identity(x_lock_path)
+        if record is None:
+            return False
+        if (
+            record.get("version") != 1
+            or record.get("display") != display
+            or not isinstance(record.get("pid"), int)
+            or not isinstance(record.get("start_time_ticks"), int)
+        ):
+            raise LoginRuntimeError(
+                f"Invalid Xvfb owner record for display {display}",
+            )
+
+        pid = int(record["pid"])
+        process_identity = self._read_process_identity(pid)
+        if process_identity is not None:
+            state, start_time_ticks = process_identity
+            if state != "Z" and start_time_ticks == record["start_time_ticks"]:
+                raise LoginRuntimeError(
+                    f"X display {display} is owned by live CCM Xvfb PID {pid} "
+                    "but cannot be authenticated",
+                )
+
+        if socket_identity is not None:
+            if (
+                socket_identity["file_type"] != stat.S_IFSOCK
+                or not self._same_path_identity(socket_identity, record.get("socket"))
+            ):
+                raise LoginRuntimeError(
+                    f"X display {display} socket no longer matches its CCM owner "
+                    "record; refusing to remove it",
+                )
+        if x_lock_identity is not None and not self._same_path_identity(
+            x_lock_identity,
+            record.get("x_lock"),
+        ):
+            raise LoginRuntimeError(
+                f"X display {display} lock no longer matches its CCM owner "
+                "record; refusing to remove it",
+            )
+
+        if socket_identity is not None:
+            socket_path.unlink()
+        if x_lock_identity is not None:
+            x_lock_path.unlink()
+        try:
+            owner_path.unlink()
+        except FileNotFoundError:
+            pass
+        logger.warning(
+            "Recovered stale CCM-owned Xvfb artifacts display=%s pid=%s",
+            display,
+            pid,
+        )
+        return True
+
+    @staticmethod
     def _display_ready(display: str, auth_path: Path) -> bool:
         if not auth_path.is_file() or auth_path.is_symlink():
             return False
@@ -275,10 +510,11 @@ class XvfbManager:
 
     def _ensure_sync(self) -> LoginRuntime:
         display, display_number = _configured_display()
-        cdp_port = _configured_cdp_port()
         temp_dir = login_temp_directory()
         ensure_login_capacity(temp_dir=temp_dir)
         lock_path, auth_path, stderr_path, socket_path = self._paths(display_number)
+        owner_path = self._owner_path(lock_path)
+        x_lock_path = self._x_lock_path(socket_path, display_number)
 
         lock_flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
@@ -296,15 +532,27 @@ class XvfbManager:
                     and self._display_ready(display, auth_path)
                 ):
                     return self._activate(
-                        display, auth_path, temp_dir, cdp_port,
+                        display, auth_path, temp_dir,
                     )
                 self._stop_owned_process()
 
             # A sibling CCM process may already own this display.  Reuse it
             # only when its shared private cookie proves the display is ready.
             if self._display_ready(display, auth_path):
-                return self._activate(display, auth_path, temp_dir, cdp_port)
-            if socket_path.exists():
+                return self._activate(display, auth_path, temp_dir)
+            socket_exists = self._path_identity(socket_path) is not None
+            x_lock_exists = self._path_identity(x_lock_path) is not None
+            owner_exists = self._path_identity(owner_path) is not None
+            if socket_exists or x_lock_exists or owner_exists:
+                if self._recover_stale_owned_display(
+                    display=display,
+                    owner_path=owner_path,
+                    socket_path=socket_path,
+                    x_lock_path=x_lock_path,
+                ):
+                    socket_exists = self._path_identity(socket_path) is not None
+                    x_lock_exists = self._path_identity(x_lock_path) is not None
+            if socket_exists or x_lock_exists:
                 raise LoginRuntimeError(
                     f"X display {display} exists but cannot be authenticated; "
                     "configure a distinct CCM_XVFB_DISPLAY instead of killing it",
@@ -350,13 +598,20 @@ class XvfbManager:
                 if self._proc.returncode is not None:
                     break
                 if self._display_ready(display, auth_path):
+                    self._record_owned_display(
+                        display=display,
+                        proc=self._proc,
+                        owner_path=owner_path,
+                        socket_path=socket_path,
+                        x_lock_path=x_lock_path,
+                    )
                     logger.info(
                         "Xvfb ready display=%s pid=%s",
                         display,
                         self._proc.pid,
                     )
                     return self._activate(
-                        display, auth_path, temp_dir, cdp_port,
+                        display, auth_path, temp_dir,
                     )
                 time.sleep(0.1)
 
@@ -380,7 +635,6 @@ class XvfbManager:
         display: str,
         auth_path: Path,
         temp_dir: Path,
-        cdp_port: int,
     ) -> LoginRuntime:
         # Preserve compatibility with scripts that inherit the API process
         # environment while every explicit child receives the same values.
@@ -390,8 +644,8 @@ class XvfbManager:
         os.environ["TMP"] = str(temp_dir)
         os.environ["TEMP"] = str(temp_dir)
         os.environ["CCM_LOGIN_TMPDIR"] = str(temp_dir)
-        os.environ["CCM_LOGIN_CDP_PORT"] = str(cdp_port)
-        return LoginRuntime(display, auth_path, temp_dir, cdp_port)
+        os.environ.pop("CCM_LOGIN_CDP_PORT", None)
+        return LoginRuntime(display, auth_path, temp_dir)
 
 
 xvfb_manager = XvfbManager()
@@ -411,6 +665,5 @@ def login_child_environment(
         display=display,
         xauthority=root / f"display-{display_number}.auth",
         temp_dir=login_temp_directory(),
-        cdp_port=_configured_cdp_port(),
     )
     return runtime.child_environment(extra=extra)

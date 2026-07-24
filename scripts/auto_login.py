@@ -46,6 +46,19 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+try:
+    from scripts.chrome_cdp import (
+        ChromeCdpError,
+        dynamic_debugging_arguments,
+        wait_for_owned_chrome_cdp,
+    )
+except ModuleNotFoundError:
+    from chrome_cdp import (  # type: ignore[no-redef]
+        ChromeCdpError,
+        dynamic_debugging_arguments,
+        wait_for_owned_chrome_cdp,
+    )
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -341,7 +354,6 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
     """
     import subprocess as _sp
 
-    CDP_PORT = int(os.environ.get("CCM_LOGIN_CDP_PORT", "9222"))
     display = configured_login_display()
     if not display:
         logger.error(
@@ -400,17 +412,37 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
             os.environ.get("CCM_LOGIN_TMPDIR", "/tmp"),
         ).expanduser()
         temp_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        profile_dir = temp_root / f"chrome-cdp-login-{os.getpid()}"
-        shutil.rmtree(profile_dir, ignore_errors=True)
+        profile_dir = temp_root / (
+            f"chrome-cdp-login-{os.getpid()}-{uuid.uuid4().hex}"
+        )
         profile_dir.mkdir(mode=0o700)
-        chrome_proc = _sp.Popen([chrome_bin, "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--disable-software-rasterizer", "--no-first-run", "--no-default-browser-check", "--disable-extensions", f"--window-size=1365,900", f"--remote-debugging-port={CDP_PORT}", f"--user-data-dir={profile_dir}", "about:blank"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, env={**os.environ, "DISPLAY": display})
-        await asyncio.sleep(4)
+        chrome_proc = _sp.Popen([
+            chrome_bin,
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-software-rasterizer",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--window-size=1365,900",
+            *dynamic_debugging_arguments(profile_dir),
+            "about:blank",
+        ], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, env={**os.environ, "DISPLAY": display})
         logger.info("Chrome launched pid=%d", chrome_proc.pid)
 
         import httpx as _httpx
-        async with _httpx.AsyncClient() as c:
-            r = await c.get(f"http://127.0.0.1:{CDP_PORT}/json")
-            tabs = r.json()
+        try:
+            owned_cdp = await wait_for_owned_chrome_cdp(
+                chrome_proc,
+                profile_dir,
+                client_factory=_httpx.AsyncClient,
+                sleep=asyncio.sleep,
+            )
+        except ChromeCdpError as exc:
+            logger.error("Chrome CDP ownership check failed: %s", exc)
+            return None
+        tabs = owned_cdp.tabs
         page_tab = next((t for t in tabs if t.get("type") == "page"), None)
         if not page_tab:
             logger.error("No Chrome page tab")

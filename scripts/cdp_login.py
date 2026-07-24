@@ -1,19 +1,26 @@
 """Chrome CDP 登录模块（从 auto_login.py 调用）。"""
-import asyncio, datetime, json, os, re, select, shutil, subprocess, sys, tempfile, time
+import asyncio, datetime, json, os, re, secrets, select, shutil, subprocess, sys, tempfile, time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 import httpx, websockets
 
+try:
+    from scripts.chrome_cdp import (
+        ChromeCdpError,
+        ChromeExitedBeforeCdp,
+        dynamic_debugging_arguments,
+        wait_for_owned_chrome_cdp,
+    )
+except ModuleNotFoundError:
+    from chrome_cdp import (  # type: ignore[no-redef]
+        ChromeCdpError,
+        ChromeExitedBeforeCdp,
+        dynamic_debugging_arguments,
+        wait_for_owned_chrome_cdp,
+    )
+
 MAILCATCHER = "https://mail.claude-code-manager.com"
-
-
-def _cdp_port() -> int:
-    raw = os.environ.get("CCM_LOGIN_CDP_PORT", "9222")
-    port = int(raw)
-    if not 1 <= port <= 65535:
-        raise ValueError(f"invalid CCM_LOGIN_CDP_PORT: {port}")
-    return port
 
 
 def _login_temp_dir() -> Path:
@@ -295,45 +302,43 @@ async def _cdp_login(email: str, token: str, config_dir: str, oauth_url: str = "
 
     # 1. Launch Chrome with a profile owned by this wrapper.  Never pkill by
     # command pattern: production/test and Claude/Codex may share one host.
-    cdp_port = _cdp_port()
     temp_root = _login_temp_dir()
-    profile_dir = temp_root / f"chrome-claude-login-{os.getpid()}"
-    shutil.rmtree(profile_dir, ignore_errors=True)
+    profile_dir = temp_root / (
+        f"chrome-claude-login-{os.getpid()}-{secrets.token_hex(8)}"
+    )
     profile_dir.mkdir(mode=0o700)
     resources.chrome_profile_dir = profile_dir
 
     # 2. Launch Chrome (fresh profile)
     # --disable-dev-shm-usage 必带：小机型（t3.medium 等）/dev/shm 太小，
-    # 不加会让渲染进程因共享内存不足直接崩溃 → CDP 9222 端口起不来，
-    # 后面连 http://127.0.0.1:9222/json 报 ConnectError（登录整段失败）。
+    # 不加会让渲染进程因共享内存不足直接崩溃，动态 CDP endpoint 无法就绪，
+    # 后续 profile 身份校验会超时（登录整段失败）。
     chrome_env = _ensure_display(dict(os.environ))
     resources.chrome_stderr = open(temp_root / "chrome-cdp-stderr.log", "w")
     chrome = subprocess.Popen(["google-chrome", "--no-sandbox", "--disable-gpu",
         "--disable-dev-shm-usage", "--disable-software-rasterizer",
         "--no-first-run", "--disable-extensions", "--window-size=1365,900",
-        f"--remote-debugging-port={cdp_port}", f"--user-data-dir={profile_dir}",
+        *dynamic_debugging_arguments(profile_dir),
         "about:blank"], stdout=subprocess.DEVNULL,
         stderr=resources.chrome_stderr, env=chrome_env)
     resources.chrome = chrome
     print(f"Chrome pid={chrome.pid}")
 
     # 3. Connect CDP (poll until ready)
-    tabs = None
-    for _attempt in range(15):
-        await asyncio.sleep(2)
-        if chrome.poll() is not None:
-            print(f"  Chrome exited early (code={chrome.returncode})")
-            return None
-        try:
-            async with httpx.AsyncClient() as c:
-                r = await c.get(f"http://127.0.0.1:{cdp_port}/json", timeout=3)
-                tabs = r.json()
-                break
-        except Exception:
-            pass
-    if not tabs:
-        print("  Chrome CDP not ready after 30s")
+    try:
+        owned_cdp = await wait_for_owned_chrome_cdp(
+            chrome,
+            profile_dir,
+            client_factory=httpx.AsyncClient,
+            sleep=asyncio.sleep,
+        )
+    except ChromeExitedBeforeCdp as exc:
+        print(f"  {exc}")
         return None
+    except ChromeCdpError as exc:
+        print(f"  Chrome CDP ownership check failed: {exc}")
+        return None
+    tabs = owned_cdp.tabs
     page_tab = next((t for t in tabs if t.get("type") == "page"), None)
     if not page_tab or not page_tab.get("webSocketDebuggerUrl"):
         print("  Chrome CDP returned no page tab")

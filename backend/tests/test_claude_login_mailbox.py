@@ -3,9 +3,24 @@ from __future__ import annotations
 import stat
 import sys
 import types
+from types import SimpleNamespace
 from pathlib import Path
 
 import scripts.auto_login as auto_login
+
+
+class FakeChromeProcess:
+    pid = 321
+    returncode = 1
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self):
+        return self.returncode
 
 
 def test_configured_login_display_uses_ccm_value_without_display(monkeypatch):
@@ -34,6 +49,40 @@ def test_onet_and_gazeta_use_mailcatcher_decode_api():
     assert auto_login.uses_mailcatcher_api("gazeta") is True
     assert auto_login.uses_mailcatcher_api("mailcom") is True
     assert auto_login.uses_mailcatcher_api("171mail") is False
+
+
+async def test_standalone_browser_login_uses_profile_owned_dynamic_cdp(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("DISPLAY", ":123")
+    monkeypatch.setenv("CCM_LOGIN_CDP_PORT", "9322")
+    monkeypatch.setenv("CCM_LOGIN_TMPDIR", str(tmp_path))
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        auto_login.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="/usr/bin/google-chrome\n",
+        ),
+    )
+
+    def fake_popen(command, **_kwargs):
+        commands.append(command)
+        return FakeChromeProcess()
+
+    monkeypatch.setattr(auto_login.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(auto_login.asyncio, "sleep", lambda _seconds: _no_sleep())
+
+    result = await auto_login._mailcatcher_browser_login(
+        "user@example.com",
+        "mail-token",
+    )
+
+    assert result is None
+    assert len(commands) == 1
+    assert "--remote-debugging-port=0" in commands[0]
+    assert "--remote-debugging-port=9322" not in commands[0]
 
 
 def _write_credential(config_dir: Path, name: str, content: bytes, mode: int) -> None:

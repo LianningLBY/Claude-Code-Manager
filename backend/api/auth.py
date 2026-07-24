@@ -80,7 +80,11 @@ class UserResponse(BaseModel):
 # --- Endpoints ---
 
 @router.post("/login")
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(
+    body: LoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     # Legacy token login (backward compatible)
     if body.token:
         if not settings.auth_token:
@@ -88,6 +92,17 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         if body.token == settings.auth_token:
             return {"ok": True, "auth_type": "token"}
         raise HTTPException(401, "Invalid token")
+
+    if getattr(
+        request.app.state,
+        "deployment_maintenance_only",
+        False,
+    ):
+        raise HTTPException(
+            503,
+            "Email/password login is unavailable during deployment "
+            "maintenance; use the configured recovery token",
+        )
 
     # JWT login with email + password
     if not body.email or not body.password:

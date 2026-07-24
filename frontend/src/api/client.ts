@@ -33,7 +33,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    const detail = err.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail && typeof detail === 'object' && typeof detail.error === 'string'
+        ? detail.error
+        : res.statusText;
+    const requestError = new Error(message) as Error & {
+      status?: number;
+      detail?: unknown;
+    };
+    requestError.status = res.status;
+    requestError.detail = detail;
+    throw requestError;
   }
   const refreshedToken = res.headers.get('X-Refreshed-Token');
   if (refreshedToken) {
@@ -621,6 +633,20 @@ export interface OrgTeam {
   members?: OrgMember[];
 }
 
+export interface UpdateReconcileResult {
+  update_blocked: boolean;
+  active_task_count: number;
+  active_tasks: Array<{
+    id: number;
+    title: string;
+    status: string;
+    kind?: 'task' | 'instance' | 'monitor' | 'sub_agent';
+    instance_id?: number;
+    instance_claim_count?: number;
+  }>;
+  reconciled?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Skills / User-Skills cache (avoid re-fetching on every TaskForm mount)
 // ---------------------------------------------------------------------------
@@ -1188,8 +1214,20 @@ export const api = {
     request<any>('/api/system/update', { method: 'POST', body: JSON.stringify(data) }),
   getUpdateStatus: () =>
     request<any>('/api/system/update/status'),
-  rollbackUpdate: () =>
-    request<any>('/api/system/update/rollback', { method: 'POST' }),
+  reconcileUpdateState: () =>
+    request<UpdateReconcileResult>('/api/system/update/reconcile', { method: 'POST' }),
+  repairUpdate: () =>
+    request<{ update_id?: string; old_commit?: string; status?: string }>(
+      '/api/system/update/repair',
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+  restartService: () =>
+    request<{ status?: string }>('/api/system/restart', { method: 'POST' }),
+  rollbackUpdate: (data: { confirm_database_restore?: boolean } = {}) =>
+    request<{ status?: string }>(
+      '/api/system/update/rollback',
+      { method: 'POST', body: JSON.stringify(data) },
+    ),
 
   // System
   health: () => request<{ status: string; commit?: string }>('/api/system/health'),

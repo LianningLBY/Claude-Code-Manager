@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
+from backend.models.sub_agent import SubAgentSession
 from backend.services.dispatcher import (
     GlobalDispatcher,
     _TaskLifecycleGeneration,
@@ -65,6 +66,168 @@ async def _lifecycle_generation(dispatcher, db_factory, task_id):
 
 
 # === _cleanup_stale_state tests ===
+
+
+@pytest.mark.asyncio
+async def test_maintenance_reconciliation_requires_paused_admission(db_factory):
+    d = _make_dispatcher(db_factory)
+    d._cleanup_stale_state = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="paused task admission"):
+        await d.reconcile_stale_state_for_maintenance()
+
+    await d.pause_dispatching()
+    await d.reconcile_stale_state_for_maintenance()
+
+    d._cleanup_stale_state.assert_awaited_once_with(
+        reconcile_auxiliary=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_maintenance_reconcile_preserves_live_auxiliary_rows(db_factory):
+    """Manual reconciliation is not a startup sweep of sub-agent sessions."""
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        rows = [
+            SubAgentSession(
+                task_id=101,
+                description="ccm monitor",
+                agent_type="monitor",
+                source="ccm",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=102,
+                description="native agent",
+                agent_type="native-agent",
+                source="native",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=103,
+                description="native monitor",
+                agent_type="native-monitor",
+                source="native",
+                status="running",
+            ),
+        ]
+        db.add_all(rows)
+        await db.commit()
+        row_ids = [row.id for row in rows]
+
+    await d.pause_dispatching()
+    try:
+        await d.reconcile_stale_state_for_maintenance()
+    finally:
+        d.resume_dispatching()
+
+    async with db_factory() as db:
+        statuses = [
+            (await db.get(SubAgentSession, row_id)).status
+            for row_id in row_ids
+        ]
+    assert statuses == ["running", "running", "running"]
+
+
+@pytest.mark.asyncio
+async def test_startup_cleanup_uses_exact_auxiliary_ownership(db_factory):
+    """Stop -> Start preserves live CCM/native rows and clears only stale ones."""
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        parent = Task(
+            title="native parent",
+            description="d",
+            status="executing",
+        )
+        db.add(parent)
+        await db.flush()
+        instance = Instance(
+            name="native owner",
+            status="running",
+            pid=43210,
+            current_task_id=parent.id,
+        )
+        db.add(instance)
+        await db.flush()
+        parent.instance_id = instance.id
+        rows = [
+            SubAgentSession(
+                task_id=parent.id,
+                description="live ccm monitor",
+                agent_type="monitor",
+                source="ccm",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=parent.id,
+                description="live ccm sub-agent",
+                agent_type="sub_agent",
+                source="ccm",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=parent.id,
+                description="live native",
+                agent_type="native-agent",
+                source="native",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=parent.id,
+                description="legacy native monitor",
+                agent_type="monitor",
+                source="native",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=999,
+                description="stale local",
+                agent_type="monitor",
+                source="ccm",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=998,
+                remote_id=88,
+                description="remote mirror",
+                agent_type="monitor",
+                source="ccm",
+                status="running",
+            ),
+        ]
+        db.add_all(rows)
+        await db.commit()
+        instance_id = instance.id
+        row_ids = [row.id for row in rows]
+
+    d.instance_manager.processes[instance_id] = MagicMock(
+        returncode=None
+    )
+    monitor_lifecycle = asyncio.create_task(asyncio.sleep(60))
+    d._monitor_tasks[row_ids[0]] = monitor_lifecycle
+    d._sub_agent_processes[row_ids[1]] = MagicMock(returncode=None)
+    try:
+        await d._cleanup_stale_state()
+    finally:
+        monitor_lifecycle.cancel()
+        await asyncio.gather(
+            monitor_lifecycle, return_exceptions=True
+        )
+
+    async with db_factory() as db:
+        statuses = [
+            (await db.get(SubAgentSession, row_id)).status
+            for row_id in row_ids
+        ]
+    assert statuses == [
+        "running",
+        "running",
+        "running",
+        "running",
+        "failed",
+        "running",
+    ]
 
 
 @pytest.mark.asyncio
@@ -157,6 +320,70 @@ async def test_cleanup_preserves_prelaunch_lifecycle_claim(db_factory):
     finally:
         lifecycle.cancel()
         await asyncio.gather(lifecycle, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_reserved_fresh_task_claim(db_factory):
+    """Maintenance cannot recover a claim still in project/config preparation."""
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="reserved-prelaunch", status="idle")
+        task = Task(
+            title="reserved-prelaunch",
+            description="d",
+            status="pending",
+        )
+        db.add_all([instance, task])
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    claim_token = None
+    try:
+        async with db_factory() as db:
+            reserved, claim_token = await d._reserve_idle_instance(
+                db, instance_id=instance_id
+            )
+            assert reserved is not None
+            claimed = await TaskQueue(db).dequeue(instance_id=instance_id)
+            assert claimed is not None
+            assert claimed.id == task_id
+
+        await d.pause_dispatching()
+        await d.reconcile_stale_state_for_maintenance()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "in_progress"
+            assert task.instance_id == instance_id
+    finally:
+        if claim_token is not None:
+            await d._release_instance_reservation(
+                instance_id, claim_token
+            )
+        d.resume_dispatching()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_does_not_rewrite_remote_shared_shadow(db_factory):
+    """Shared task lifecycle is remote-authoritative, never locally recovered."""
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        shadow = Task(
+            title="remote shadow",
+            description="d",
+            status="executing",
+            shared_from_id=987654,
+        )
+        db.add(shadow)
+        await db.commit()
+        shadow_id = shadow.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        shadow = await db.get(Task, shadow_id)
+        assert shadow.status == "executing"
+        assert shadow.instance_id is None
 
 
 @pytest.mark.asyncio
@@ -462,6 +689,188 @@ async def test_cleanup_resets_stuck_executing_task(db_factory):
         t = await db.get(Task, task_id)
         assert t.status == "pending"
         assert t.instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fails_multi_owner_corruption_without_replay(db_factory):
+    """Multiple dead reverse owners are corruption, not retry permission."""
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(
+            title="duplicate owners",
+            description="test",
+            status="executing",
+        )
+        db.add(task)
+        await db.flush()
+        owners = [
+            Instance(
+                name=f"duplicate-owner-{index}",
+                status="running",
+                pid=990000 + index,
+                current_task_id=task.id,
+            )
+            for index in range(3)
+        ]
+        db.add_all(owners)
+        await db.flush()
+        task.instance_id = owners[-1].id
+        await db.commit()
+        task_id = task.id
+        owner_ids = [owner.id for owner in owners]
+
+    with patch(
+        "backend.services.dispatcher.os.kill",
+        side_effect=ProcessLookupError,
+    ):
+        await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert task.instance_id is None
+        assert "inconsistent Task/Instance ownership" in task.error_message
+        for owner_id in owner_ids:
+            owner = await db.get(Instance, owner_id)
+            assert owner.status == "error"
+            assert owner.pid is None
+            assert owner.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_requeues_unique_consistent_dead_owner(db_factory):
+    """A unique dead generation retries despite an older terminal log."""
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(title="unique owner", status="executing")
+        db.add(task)
+        await db.flush()
+        owner = Instance(
+            name="unique-dead-owner",
+            status="running",
+            pid=991111,
+            current_task_id=task.id,
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        db.add(
+            LogEntry(
+                task_id=task.id,
+                instance_id=owner.id,
+                event_type="result",
+                is_error=True,
+            )
+        )
+        await db.commit()
+        task_id, owner_id = task.id, owner.id
+
+    with patch(
+        "backend.services.dispatcher.os.kill",
+        side_effect=ProcessLookupError,
+    ):
+        await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = await db.get(Instance, owner_id)
+        assert task.status == "pending"
+        assert task.instance_id is None
+        assert owner.status == "error"
+        assert owner.pid is None
+        assert owner.current_task_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forward_owner", ["none", "different"])
+async def test_cleanup_fails_single_mismatched_reverse_owner(
+    db_factory,
+    forward_owner,
+):
+    """A reverse owner is retryable only when the Task points back to it."""
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(title="mismatched owner", status="executing")
+        db.add(task)
+        await db.flush()
+        reverse_owner = Instance(
+            name="reverse-owner",
+            status="running",
+            pid=992222,
+            current_task_id=task.id,
+        )
+        unrelated = Instance(name="unrelated-owner", status="idle")
+        db.add_all([reverse_owner, unrelated])
+        await db.flush()
+        if forward_owner == "different":
+            task.instance_id = unrelated.id
+        await db.commit()
+        task_id = task.id
+
+    with patch(
+        "backend.services.dispatcher.os.kill",
+        side_effect=ProcessLookupError,
+    ):
+        await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert task.instance_id is None
+        assert "inconsistent Task/Instance ownership" in task.error_message
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_live_owner_while_removing_dead_duplicate(
+    db_factory,
+):
+    """A managed live generation wins over a dead duplicate reverse owner."""
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(title="live plus duplicate", status="executing")
+        db.add(task)
+        await db.flush()
+        live_owner = Instance(
+            name="managed-live-owner",
+            status="running",
+            pid=993331,
+            current_task_id=task.id,
+        )
+        dead_duplicate = Instance(
+            name="dead-duplicate-owner",
+            status="running",
+            pid=993332,
+            current_task_id=task.id,
+        )
+        db.add_all([live_owner, dead_duplicate])
+        await db.flush()
+        task.instance_id = live_owner.id
+        await db.commit()
+        task_id = task.id
+        live_id, dead_id = live_owner.id, dead_duplicate.id
+
+    d.instance_manager.processes[live_id] = MagicMock(returncode=None)
+    with patch(
+        "backend.services.dispatcher.os.kill",
+        side_effect=ProcessLookupError,
+    ):
+        await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        live_owner = await db.get(Instance, live_id)
+        dead_duplicate = await db.get(Instance, dead_id)
+        assert task.status == "executing"
+        assert task.instance_id == live_id
+        assert live_owner.status == "running"
+        assert live_owner.current_task_id == task_id
+        assert dead_duplicate.status == "error"
+        assert dead_duplicate.pid is None
+        assert dead_duplicate.current_task_id is None
 
 
 @pytest.mark.asyncio

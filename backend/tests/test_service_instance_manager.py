@@ -24,9 +24,11 @@ from backend.services.claude_pool import ClaudePool
 from backend.services.codex_pool import CodexPool
 from backend.services.codex_app_server import (
     CodexAppServerBusyError,
+    CodexAppServerError,
+    CodexRequiredMcpError,
     CodexThreadHomeMismatchError,
 )
-from backend.config import settings
+from backend.config import Settings, settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
@@ -40,6 +42,10 @@ def _no_pty_no_skills(monkeypatch):
          patch("backend.services.skill_loader.build_skill_prompt_file", return_value=""), \
          patch("backend.services.skill_loader.get_skill_disallowed_tools", return_value=[]):
         yield
+
+
+def test_codex_main_mcp_capability_defaults_off():
+    assert Settings.model_fields["codex_main_mcp_enabled"].default is False
 
 
 def test_parse_codex_agent_message():
@@ -262,7 +268,10 @@ def test_parse_codex_turn_completed_usage():
         "cache_read_input_tokens": 40,
         "cache_creation_input_tokens": 0,
         "output_tokens": 20,
+        "reasoning_output_tokens": 5,
         "total_input_tokens": 100,
+        "total_tokens": 120,
+        "context_tokens": 115,
     }
     assert event["content"] == "turn.completed"
 
@@ -816,6 +825,7 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
     db_factory, monkeypatch, tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
         inst = Instance(name="codex-fallback-inst")
         db.add(inst)
@@ -848,14 +858,97 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("failure_mode", "error_match"),
+    [
+        ("startup", "could not start required MCP transport"),
+        ("missing-thread", "Required MCP configuration was not admitted"),
+        ("unknown", "required ccm_skills could be guaranteed"),
+    ],
+)
+async def test_required_mcp_app_server_failure_does_not_launch_exec(
+    db_factory, monkeypatch, tmp_path, failure_mode, error_match,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-required-mcp-fail-closed")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="required MCP task",
+            description="must fail closed",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock())
+    if failure_mode == "unknown":
+        im._launch_codex_app_server = AsyncMock(
+            side_effect=RuntimeError("unexpected adapter failure")
+        )
+    startup_error = (
+        CodexAppServerError("initialize failed")
+        if failure_mode == "startup"
+        else None
+    )
+    thread_response = {"thread": {}} if failure_mode == "missing-thread" else None
+    with (
+        patch(
+            "backend.services.codex_app_server.CodexAppServer.ensure_started",
+            new_callable=AsyncMock,
+            side_effect=startup_error,
+        ) as ensure_started,
+        patch(
+            "backend.services.codex_app_server.CodexAppServer._request",
+            new_callable=AsyncMock,
+            return_value=thread_response,
+        ) as request,
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as exec_mock,
+    ):
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match=error_match,
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must keep required MCP",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-required-mcp-home"),
+            )
+
+    if failure_mode == "startup":
+        ensure_started.assert_awaited_once()
+        request.assert_not_awaited()
+    elif failure_mode == "missing-thread":
+        ensure_started.assert_awaited_once()
+        request.assert_awaited_once()
+    else:
+        ensure_started.assert_not_awaited()
+        request.assert_not_awaited()
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "launch_error",
     [
         asyncio.TimeoutError(),
         CodexAppServerBusyError("account busy"),
+        CodexRequiredMcpError("required MCP failed"),
         CodexThreadHomeMismatchError("wrong owner"),
         CodexLaunchCommitError("turn already started"),
     ],
-    ids=["timeout", "busy", "owner-mismatch", "commit-failed"],
+    ids=["timeout", "busy", "required-mcp", "owner-mismatch", "commit-failed"],
 )
 async def test_launch_codex_does_not_fallback_when_replay_is_unsafe(
     db_factory, monkeypatch, tmp_path, launch_error,
@@ -921,8 +1014,9 @@ async def test_codex_started_turn_wraps_generic_persistence_failure(
 
 @pytest.mark.asyncio
 async def test_launch_codex_app_server_routes_turn_to_canonical_home(
-    db_factory, tmp_path,
+    db_factory, monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
         inst = Instance(name="codex-registry-inst")
         db.add(inst)
@@ -943,6 +1037,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     registry.start_turn = AsyncMock(return_value=(process, "thread-home"))
     codex_home = tmp_path / "account-home"
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
 
     with patch(
         "backend.services.codex_app_server.CodexAppServerRegistry",
@@ -969,8 +1064,85 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     assert registry.start_turn.await_args.kwargs["codex_home"] == str(
         codex_home.resolve()
     )
+    assert registry.start_turn.await_args.kwargs["mcp_specs"] == ()
     assert im.get_config_dir(inst.id) == str(codex_home.resolve())
     assert im._launch_params[inst.id]["config_dir"] == str(codex_home.resolve())
+    await asyncio.sleep(0.1)
+    im.task_message_enqueuer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_launch_codex_app_server_injects_task_scoped_specs_when_enabled(
+    db_factory, monkeypatch,
+):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    process = _make_mock_process(pid=7655)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(return_value=(process, "thread-mcp"))
+    im = InstanceManager(db_factory, MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im._persist_and_track_launch = AsyncMock(return_value=7655)
+
+    pid = await im._launch_codex_app_server(
+        instance_id=1,
+        prompt="use CCM",
+        task_id=73,
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        resume_session_id="thread-mcp",
+        loop_iteration=None,
+        git_env=None,
+        effort_level="high",
+        chat_initiated=False,
+        config_dir="/tmp/codex-mcp",
+        enable_workflows=False,
+        enabled_skills={"monitor": True},
+    )
+
+    assert pid == 7655
+    specs = registry.start_turn.await_args.kwargs["mcp_specs"]
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.name == "ccm_skills"
+    assert spec.required is True
+    assert spec.args[spec.args.index("--task-id") + 1] == "73"
+    assert "ccm_command_help" in spec.enabled_tools
+
+
+@pytest.mark.asyncio
+async def test_codex_main_mcp_capability_does_not_change_claude_launch(
+    db_factory, monkeypatch,
+):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="claude-capability-regression")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    process = _make_mock_process(pid=7656)
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(
+        side_effect=AssertionError("Claude launch reached Codex app-server")
+    )
+
+    with (
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as create_process,
+        patch("backend.services.ask_user_settings.ensure_ask_user_hook"),
+    ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="Claude stays Claude",
+            cwd="/tmp",
+            provider="claude",
+        )
+
+    assert create_process.await_args.args[0] == settings.claude_binary
+    im._launch_codex_app_server.assert_not_awaited()
     await asyncio.sleep(0.1)
 
 
@@ -1180,6 +1352,7 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
         "model": "gpt-5.5",
         "git_env": {},
         "effort_level": "high",
+        "enabled_skills": {"monitor": True},
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(return_value=999)
@@ -1197,9 +1370,11 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
     assert "usage limit" in combined
     launch_kwargs = im.launch.await_args.kwargs
     assert launch_kwargs["provider"] == "codex"
+    assert launch_kwargs["task_id"] == task.id
     assert launch_kwargs["config_dir"] == new_home
     assert launch_kwargs["resume_session_id"] == "thread-rotate"
     assert launch_kwargs["prompt"] == "continue the task"
+    assert launch_kwargs["enabled_skills"] == {"monitor": True}
 
 
 @pytest.mark.asyncio
@@ -1763,6 +1938,7 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         "provider": "codex",
         "prompt": "preserve transient prompt",
         "model": "gpt-5.5",
+        "enabled_skills": {"sub-agent": True},
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(
@@ -1778,6 +1954,11 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         )
 
     assert launched is False
+    assert im.launch.await_args.kwargs["task_id"] == task.id
+    assert im.launch.await_args.kwargs["resume_session_id"] == task.session_id
+    assert im.launch.await_args.kwargs["enabled_skills"] == {
+        "sub-agent": True,
+    }
     dispatcher.enqueue_message.assert_awaited_once_with(
         task_id=task.id,
         prompt="preserve transient prompt",
@@ -5343,6 +5524,7 @@ async def test_launch_chat_initiated_stores_enable_workflows_in_params(db_factor
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
+    im.task_message_enqueuer = AsyncMock()
 
     with patch("backend.services.instance_manager.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
         await im.launch(instance_id=inst_id, prompt="hi", task_id=task_id, cwd="/tmp", chat_initiated=True, enable_workflows=True)
@@ -5350,6 +5532,7 @@ async def test_launch_chat_initiated_stores_enable_workflows_in_params(db_factor
     assert inst_id in im._launch_params
     assert im._launch_params[inst_id]["enable_workflows"] is True
     await asyncio.sleep(0.1)
+    im.task_message_enqueuer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -5376,12 +5559,14 @@ async def test_launch_chat_initiated_stores_enable_workflows_false_in_params(db_
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
+    im.task_message_enqueuer = AsyncMock()
 
     with patch("backend.services.instance_manager.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
         await im.launch(instance_id=inst_id, prompt="hi", task_id=task_id, cwd="/tmp", chat_initiated=True, enable_workflows=False)
 
     assert im._launch_params[inst_id]["enable_workflows"] is False
     await asyncio.sleep(0.1)
+    im.task_message_enqueuer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -6520,11 +6705,17 @@ def test_parse_codex_turn_failed_extracts_nested_message():
     im = InstanceManager(MagicMock(), MagicMock())
     event = im._parse_codex_line(json.dumps({
         "type": "turn.failed",
-        "error": {"message": "stream disconnected before completion: transport error"},
+        "error": {
+            "message": "stream disconnected before completion: transport error",
+            "codexErrorInfo": "contextWindowExceeded",
+            "additionalDetails": "effective model window exhausted",
+        },
     }))
     assert event["event_type"] == "system_event"
     assert event["is_error"] is True
     assert event["content"] == "stream disconnected before completion: transport error"
+    assert event["error_code"] == "contextWindowExceeded"
+    assert event["error_details"] == "effective model window exhausted"
 
 
 def test_parse_codex_file_change_started_is_tool_use():
@@ -6581,6 +6772,7 @@ async def test_process_event_codex_window_backfill(db_factory):
             "cache_creation_input_tokens": 0,
             "output_tokens": 100,
             "total_input_tokens": 35000,
+            "context_tokens": 35_100,
         },
     }
     await im._process_event(inst_id, task_id, event)
@@ -6597,3 +6789,199 @@ async def test_process_event_codex_window_backfill(db_factory):
         from backend.models.task import Task
         t = await db.get(Task, task_id)
         assert t.context_window_usage["context_window"] == 272_000
+
+
+@pytest.mark.asyncio
+async def test_process_event_codex_exec_uses_rollout_last_usage(
+    db_factory,
+    tmp_path,
+    monkeypatch,
+):
+    """Exec's cumulative turn usage must not become a 553% context reading."""
+
+    rollout = tmp_path / "rollout-codex-thread-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": 1_505_114,
+                    "cached_input_tokens": 1_300_000,
+                    "output_tokens": 50_000,
+                    "reasoning_output_tokens": 20_000,
+                    "total_tokens": 1_555_114,
+                },
+                "last_token_usage": {
+                    "input_tokens": 210_000,
+                    "cached_input_tokens": 180_000,
+                    "output_tokens": 8_000,
+                    "reasoning_output_tokens": 2_000,
+                    "total_tokens": 218_000,
+                },
+                "model_context_window": 258_400,
+            },
+        },
+    }) + "\n")
+    monkeypatch.setattr(
+        "backend.api.tasks._find_session_jsonl",
+        lambda _session_id, provider="claude": rollout,
+    )
+
+    async with db_factory() as db:
+        inst = Instance(name="codex-exec-context")
+        task = Task(
+            title="codex exec context",
+            provider="codex",
+            model="gpt-5.6-terra",
+            session_id="codex-thread-1",
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id, task_id = inst.id, task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    await manager._process_event(
+        inst_id,
+        task_id,
+        {
+            "event_type": "system_event",
+            "content": "turn.completed",
+            "is_error": False,
+            "context_usage": {
+                "input_tokens": 205_114,
+                "cache_read_input_tokens": 1_300_000,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 50_000,
+                "reasoning_output_tokens": 20_000,
+                "total_input_tokens": 1_505_114,
+                "total_tokens": 1_555_114,
+                "context_tokens": 1_535_114,
+            },
+        },
+    )
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        usage = current.context_window_usage
+    assert usage["total_input_tokens"] == 210_000
+    assert usage["context_tokens"] == 216_000
+    assert usage["context_window"] == 258_400
+
+
+@pytest.mark.asyncio
+async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
+    """A structured app-server failure must continue via a compacted session."""
+
+    started_at = datetime(2026, 7, 24, 9, 10, 11)
+    async with db_factory() as db:
+        instance = Instance(
+            name="codex-context-full",
+            status="running",
+            pid=73_104,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="codex context full",
+            provider="codex",
+            status="executing",
+            retry_count=0,
+            instance_id=instance.id,
+            session_id="codex-thread-1",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    process = _make_mock_process(pid=73_104, returncode=1)
+    output = iter((
+        json.dumps({
+            "type": "turn.failed",
+            "error": {
+                "message": "The request could not be completed.",
+                "codexErrorInfo": "contextWindowExceeded",
+            },
+        }).encode() + b"\n",
+        b"",
+    ))
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager.processes[instance_id] = process
+    manager._launch_params[instance_id] = {
+        "prompt": "continue the task",
+        "provider": "codex",
+    }
+
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(return_value="durable summary")
+    dispatcher.enqueue_message = AsyncMock()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        consumer = asyncio.create_task(
+            manager._consume_output(
+                instance_id,
+                task_id,
+                process,
+                chat_initiated=True,
+                provider="codex",
+            )
+        )
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            provider="codex",
+            task_id=task_id,
+            task_retry_count=0,
+            instance_started_at=started_at,
+        )
+        await consumer
+
+    dispatcher._compact_session.assert_awaited_once()
+    dispatcher.enqueue_message.assert_awaited_once()
+    retry = dispatcher.enqueue_message.await_args.kwargs
+    assert retry["source"] == "compact_retry"
+    assert "durable summary" in retry["prompt"]
+    assert "continue the task" in retry["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_recent_failure_output_keeps_structured_codex_error(db_factory):
+    async with db_factory() as db:
+        task = Task(title="structured failure", provider="codex")
+        db.add(task)
+        await db.flush()
+        db.add(LogEntry(
+            task_id=task.id,
+            event_type="system_event",
+            content="The request could not be completed.",
+            raw_json=json.dumps({
+                "type": "turn.failed",
+                "error": {
+                    "message": "The request could not be completed.",
+                    "codexErrorInfo": "contextWindowExceeded",
+                },
+            }),
+            is_error=True,
+        ))
+        await db.commit()
+        task_id = task.id
+
+    manager = InstanceManager(db_factory, MagicMock())
+    recent = await manager.get_recent_log_contents(task_id)
+
+    assert len(recent) == 1
+    assert "The request could not be completed." in recent[0]
+    assert "contextWindowExceeded" in recent[0]

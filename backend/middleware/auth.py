@@ -43,7 +43,75 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
     _admin_user_id: int | None = None
     _admin_resolved: bool = False
 
+    @staticmethod
+    def _is_deployment_maintenance_path(path: str) -> bool:
+        return (
+            path == "/api/system/health"
+            or path == "/api/system/update"
+            or path.startswith("/api/system/update/")
+            or path == "/api/system/restart"
+            or path == "/api/auth/me"
+            or path == "/api/auth/login"
+        )
+
+    @staticmethod
+    def _maintenance_identity_response(request: Request) -> JSONResponse:
+        role = getattr(request.state, "user_role", "member")
+        auth_type = getattr(request.state, "auth_type", "")
+        user_id = getattr(request.state, "user_id", None)
+        if user_id:
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "auth_type": auth_type,
+                    "user": {
+                        "id": user_id,
+                        "email": "",
+                        "name": "Maintenance Admin",
+                        "role": role,
+                        "avatar_url": "",
+                        "feishu_open_id": "",
+                        "feishu_name": "",
+                    },
+                    "deployment_maintenance_only": True,
+                }
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "auth_type": auth_type,
+                "role": role,
+                "deployment_maintenance_only": True,
+            }
+        )
+
     async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        maintenance_only = bool(
+            getattr(
+                request.app.state,
+                "deployment_maintenance_only",
+                False,
+            )
+        )
+        maintenance_path = self._is_deployment_maintenance_path(path)
+        if (
+            maintenance_only
+            and path.startswith("/api")
+            and not maintenance_path
+        ):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": (
+                        "CCM is in deployment maintenance mode; only health, "
+                        "update status, repair, rollback, and restart are "
+                        "available"
+                    ),
+                    "deployment_maintenance_only": True,
+                },
+            )
+
         if not settings.auth_token:
             # 无鉴权模式（AUTH_TOKEN 为空）：历史语义是完全开放。RBAC 守卫
             # （require_task_access / require_admin）需要请求身份，若不设置则
@@ -52,9 +120,9 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             request.state.user_id = None
             request.state.user_role = "super_admin"
             request.state.auth_type = "none"
+            if maintenance_only and path == "/api/auth/me":
+                return self._maintenance_identity_response(request)
             return await call_next(request)
-
-        path = request.url.path
 
         if path in self.PUBLIC_PATHS or not path.startswith("/api") or path.startswith("/api/uploads/"):
             return await call_next(request)
@@ -76,9 +144,14 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
 
         # Legacy token → resolve to default admin account
         if token == settings.auth_token:
-            if not self._admin_resolved or self._admin_user_id is None:
-                await self._resolve_admin_id()
-            request.state.user_id = self._admin_user_id
+            if maintenance_only and maintenance_path:
+                # Do not touch a potentially incompatible database merely to
+                # authorize the narrowly scoped deployment recovery surface.
+                request.state.user_id = None
+            else:
+                if not self._admin_resolved or self._admin_user_id is None:
+                    await self._resolve_admin_id()
+                request.state.user_id = self._admin_user_id
             request.state.user_role = "super_admin"
             request.state.auth_type = "token"
         else:
@@ -86,10 +159,6 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             from backend.api.auth import decode_jwt
             payload = decode_jwt(token)
             if payload:
-                # A JWT role is only a login-time snapshot. Resolve the current
-                # database row on every request so account deletion, disabling,
-                # and role demotion revoke HTTP access immediately instead of
-                # leaving old admin tokens valid until their 30-day expiry.
                 user_id = payload.get("user_id")
                 if (
                     not isinstance(user_id, int)
@@ -100,24 +169,50 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
                         status_code=401,
                         content={"detail": "Unauthorized"},
                     )
-                from backend.database import async_session
-                from backend.models.user import User
-                async with async_session() as db:
-                    user = await db.get(User, user_id)
-                if user is None or not user.is_active:
-                    return JSONResponse(
-                        status_code=401,
-                        content={"detail": "Unauthorized"},
-                    )
-                request.state.user_id = user.id
-                request.state.user_role = user.role
-                request.state.auth_type = "jwt"
-                # Sliding refresh: if token expires within threshold, flag for refresh
-                exp = payload.get("exp")
-                if exp:
-                    remaining = datetime.fromtimestamp(exp, tz=timezone.utc) - datetime.now(timezone.utc)
-                    if remaining.total_seconds() < JWT_REFRESH_THRESHOLD_DAYS * 86400:
-                        request.state._refresh_jwt = True
+                if maintenance_only and maintenance_path:
+                    # Normal mode revalidates every JWT against the User row.
+                    # A partial schema migration may make that query unsafe, so
+                    # maintenance mode accepts only an unexpired signed token
+                    # whose snapshot role was already administrative, and only
+                    # for the recovery endpoints above.
+                    role = payload.get("role")
+                    if role not in ("admin", "super_admin"):
+                        return JSONResponse(
+                            status_code=403,
+                            content={"detail": "Admin only"},
+                        )
+                    request.state.user_id = user_id
+                    request.state.user_role = role
+                    request.state.auth_type = "jwt-maintenance"
+                else:
+                    # A JWT role is only a login-time snapshot. Resolve the
+                    # current database row on every normal request so account
+                    # deletion, disabling, and demotion revoke HTTP access.
+                    from backend.database import async_session
+                    from backend.models.user import User
+                    async with async_session() as db:
+                        user = await db.get(User, user_id)
+                    if user is None or not user.is_active:
+                        return JSONResponse(
+                            status_code=401,
+                            content={"detail": "Unauthorized"},
+                        )
+                    request.state.user_id = user.id
+                    request.state.user_role = user.role
+                    request.state.auth_type = "jwt"
+                    # Sliding refresh: if token expires within threshold, flag
+                    # for refresh.
+                    exp = payload.get("exp")
+                    if exp:
+                        remaining = (
+                            datetime.fromtimestamp(exp, tz=timezone.utc)
+                            - datetime.now(timezone.utc)
+                        )
+                        if (
+                            remaining.total_seconds()
+                            < JWT_REFRESH_THRESHOLD_DAYS * 86400
+                        ):
+                            request.state._refresh_jwt = True
             else:
                 return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
@@ -134,6 +229,9 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
                 for prefix in self.ADMIN_ONLY_PREFIXES:
                     if path.startswith(prefix):
                         return JSONResponse(status_code=403, content={"detail": "Admin only"})
+
+        if maintenance_only and path == "/api/auth/me":
+            return self._maintenance_identity_response(request)
 
         response = await call_next(request)
 

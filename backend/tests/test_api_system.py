@@ -96,6 +96,83 @@ async def test_update_returns_conflict_when_active_tasks_block_start(client, mon
     )
 
 
+@pytest.mark.asyncio
+async def test_restart_and_repair_endpoints_delegate(client, monkeypatch):
+    service = MagicMock()
+    service.restart = AsyncMock(return_value={"status": "started"})
+    service.start_repair = AsyncMock(return_value={"status": "started"})
+    service.reconcile_blockers = AsyncMock(
+        return_value={
+            "reconciled": True,
+            "update_blocked": False,
+            "active_task_count": 0,
+            "active_tasks": [],
+        }
+    )
+    monkeypatch.setattr("backend.main.update_service", service)
+
+    restart = await client.post("/api/system/restart")
+    repair = await client.post("/api/system/update/repair", json={})
+    reconcile = await client.post("/api/system/update/reconcile")
+
+    assert restart.status_code == 200
+    assert repair.status_code == 200
+    assert reconcile.status_code == 200
+    assert reconcile.json()["reconciled"] is True
+    service.restart.assert_awaited_once()
+    service.start_repair.assert_awaited_once_with(skip_frontend_build=False)
+    service.reconcile_blockers.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_endpoint_returns_structured_conflict(
+    client, monkeypatch,
+):
+    service = MagicMock()
+    service.reconcile_blockers = AsyncMock(
+        return_value={
+            "error": "无法安全核对",
+            "reconciled": False,
+            "update_blocked": True,
+            "active_task_count": 0,
+            "active_tasks": [],
+        }
+    )
+    monkeypatch.setattr("backend.main.update_service", service)
+
+    response = await client.post("/api/system/update/reconcile")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "error": "无法安全核对",
+        "reconciled": False,
+        "update_blocked": True,
+        "active_task_count": 0,
+        "active_tasks": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_rollback_confirmation_is_structured_conflict(client, monkeypatch):
+    service = MagicMock()
+    service.rollback = AsyncMock(
+        return_value={
+            "error": "database restore confirmation required",
+            "confirmation_required": True,
+            "database_restore_required": True,
+        }
+    )
+    monkeypatch.setattr("backend.main.update_service", service)
+
+    response = await client.post("/api/system/update/rollback", json={})
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["confirmation_required"] is True
+    service.rollback.assert_awaited_once_with(
+        confirm_database_restore=False
+    )
+
+
 # === /api/system/config tests ===
 
 

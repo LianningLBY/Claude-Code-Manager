@@ -303,6 +303,59 @@ cd frontend && npx tsc --noEmit
 | `test_claude_renderer_includes_env_but_not_provider_metadata` | Claude renderer 透传 env 且不泄漏 provider 专用字段 |
 | `test_mcp_server_spec_collections_are_immutable` | spec 拷贝参数、环境变量和工具列表，避免调用方后续修改 |
 | `test_claude_renderer_rejects_duplicate_server_names` | 重名 server 明确失败而不是静默覆盖 |
+| `test_codex_app_server_renderer_includes_supported_stdio_fields` | app-server `config.mcp_servers` 覆盖 command/args/cwd/env/required/enabled_tools/timeouts，并保留空格、中文、引号和反斜杠 |
+| `test_codex_exec_renderer_serializes_the_same_config_as_toml` | exec `-c` argv 使用合法 TOML 数组/inline table，反解析后与 app-server 配置完全一致 |
+| `test_codex_renderers_share_each_role_spec` | 主任务、Monitor、Sub-Agent 的同一份 spec 可同时渲染为 app-server 和 exec 配置 |
+| `test_codex_renderer_omits_unset_optional_fields` | 未设置的 cwd/env/enabled_tools/timeouts 不进入 Codex 配置，避免空 allow-list 改变工具语义 |
+| `test_codex_renderers_support_empty_specs` | 空 spec 集合得到空 app-server 配置和空 exec argv |
+| `test_codex_exec_renderer_emits_one_merged_server_table_override` | 多 server 合并为一个 `mcp_servers` inline table 覆盖，绕开 CLI dotted-path 拆名且不丢配置 |
+| `test_codex_renderers_reject_duplicate_server_names` | 两种 Codex 输出都拒绝重名 server |
+| `test_codex_renderers_reject_names_the_cli_cannot_initialize` | 提前拒绝 Codex 初始化阶段不接受的空白、点号、空格和非 ASCII server 名 |
+| `test_codex_renderers_do_not_write_codex_home` | renderer 不创建或修改 `$CODEX_HOME/config.toml` |
+| `test_codex_renderers_reject_invalid_timeouts` | app-server/exec 均拒绝 NaN、无穷、负数和布尔 timeout，避免延迟到 CLI 初始化才失败 |
+
+Codex 版本兼容基线（2026-07-24）：
+
+- `0.144.6` 与 `0.145.0` 生成的 app-server schema 均允许 `thread/start`、`thread/resume` 的 `config` object。
+- 两版 CLI 的隔离 `$CODEX_HOME` smoke test 均可通过 `mcp list -c <merged-inline-table> --json` 无损解析上述 stdio 字段；已有用户 MCP entry 与本次 override 会深合并，不会被覆盖。
+- 两版 app-server 均已用真实 `thread/start` 启动 CCM FastMCP server，`required`、`enabled_tools` 和 timeout 配置可正常完成 session 初始化。
+- 实测确认 app-server 对 server 名强制 `^[a-zA-Z0-9_-]+$`；renderer 在进 CLI 前做同样校验。
+- smoke test 前后隔离目录均未产生 `config.toml`；路径/中文/引号/反斜杠的无损序列化由不经过 shell 的单元测试覆盖。
+
+#### `test_codex_app_server.py` / `test_service_instance_manager.py` — Codex 主任务 MCP 按 thread 注入
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_start_turn_injects_mcp_config_into_new_thread` | `thread/start` 收到 task-scoped `config.mcp_servers.ccm_skills` |
+| `test_start_turn_uses_native_resume_and_turn_start` | `thread/resume` 同时合并 MCP 配置和线程级 Git 环境，不互相覆盖 |
+| `test_concurrent_task_threads_keep_mcp_context_isolated` | 同一 app-server 并发任务保留各自 `task_id`，配置对象不串线 |
+| `test_required_mcp_thread_rejection_is_explicit` | required MCP 的 thread 创建失败转为 `CodexRequiredMcpError` |
+| `test_invalid_required_mcp_config_is_explicit_before_thread_rpc` | required spec 在本地校验失败时 fail closed，且不发送 thread RPC |
+| `test_required_mcp_app_server_startup_failure_is_explicit` | required MCP 已选中后，app-server transport 启动失败转为显式能力错误 |
+| `test_required_mcp_missing_thread_id_is_explicit` | malformed/no-thread-id 响应 fail closed，不进入 `turn/start` |
+| `test_required_mcp_missing_turn_id_is_explicit_and_detaches_context` | malformed/no-turn-id 响应 fail closed，并清理未成立的 turn context |
+| `test_required_mcp_app_server_failure_does_not_launch_exec` | transport 启动失败、no-thread-id 与未知 adapter 异常都不得启动无 MCP 的 `codex exec` |
+| `test_launch_codex_does_not_fallback_when_replay_is_unsafe[required-mcp]` | required MCP 失败不静默降级到当前尚无 MCP 的 exec fallback |
+| `test_codex_main_mcp_capability_defaults_off` | `CODEX_MAIN_MCP_ENABLED` 服务端 capability 默认关闭 |
+| `test_launch_codex_app_server_injects_task_scoped_specs_when_enabled` | capability 开启时每次 app-server launch 从当前 `task_id` 重建 required spec |
+| `test_launch_codex_app_server_routes_turn_to_canonical_home` | capability 关闭时 app-server 行为保持原样且不注入空配置 |
+| `test_codex_main_mcp_capability_does_not_change_claude_launch` | capability 开启不改变 Claude provider 的启动路径 |
+
+人工 app-server smoke（仅测试环境）：
+
+1. 设置 `CODEX_APP_SERVER_ENABLED=true`、`CODEX_MAIN_MCP_ENABLED=true` 并重启后端。
+2. 创建本地 Codex task，要求它“必须调用 `ccm_command_help` 查询一个 CCM 命令后原样报告工具结果”。
+3. 确认日志出现 `mcp_tool_call`，server/tool 为 `ccm_skills/ccm_command_help`，且工具参数中的 task 上下文对应当前任务。
+4. 在同一 task 发送第二条消息并确认 resume 仍可调用；再并发运行另一个 task，确认两边查询结果和 `task_id` 不串线。
+5. 将测试 MCP command 临时改为不存在路径，或模拟 app-server 启动失败/no-thread-id 响应；任务应明确报告 required MCP 错误，且不得启动 `codex exec`。
+6. 测试完恢复 `CODEX_MAIN_MCP_ENABLED=false`。PR 4 完成前，exec fallback 不具备此 MCP。
+
+真实验收记录（2026-07-24）：
+
+- Codex CLI `0.145.0`、`gpt-5.6-sol`、隔离 `CODEX_HOME`。
+- app-server `thread/start` 成功启动 required `ccm_skills`，模型显式调用 `ccm_command_help` 一次。
+- `mcp_tool_call` 状态为 `completed`，耗时约 864 ms，返回 JSON `success=true`；turn 正常完成且 returncode 为 0。
+- smoke 使用独立 SQLite 数据库中的 task 1，结束后已关闭测试后端并清理隔离 CODEX_HOME。
 
 #### `test_monitor_dispatcher.py` — Monitor Dispatcher 生命周期
 
@@ -404,6 +457,14 @@ cd frontend && npx tsc --noEmit
 | `test_resume_config_dir.py::TestResolveResumeConfigDirCodexGate` | resume 选号对 codex 返回 None（不 select 不 migrate），claude 不受影响 |
 | `test_service_instance_manager.py::test_process_event_codex_window_backfill` | codex usage 无窗口时回填 272K（落库 + 广播都验证） |
 | `test_service_instance_manager.py::test_parse_codex_file_change_started_is_tool_use` | file_change 的 item.started → tool_use（真实事件流实证 started 存在，源码注释不实） |
+| `test_codex_app_server.py::test_notifications_stream_delta_and_finish_process` | app-server `thread/tokenUsage/updated` 保留真实 `modelContextWindow`、latest total/reasoning token，而非累计 thread total |
+| `test_codex_app_server.py::test_context_window_error_keeps_structured_codex_error_info` | `turn/completed` 失败不得丢弃 `codexErrorInfo=contextWindowExceeded` 与 additionalDetails |
+| `test_context_compaction.py` | provider 共享的上下文超限分类、Codex current-context token 计算及旧 usage fallback |
+| `test_service_instance_manager.py::test_codex_context_window_failure_compacts_and_requeues` | chat Codex 结构化超限事件触发摘要、清 session、携原消息 `compact_retry` 自动续跑 |
+| `test_service_instance_manager.py::test_recent_failure_output_keeps_structured_codex_error` | fresh/mode 失败分类读取受限长度的 raw system error envelope，不遗漏结构化错误码 |
+| `test_service_instance_manager.py::test_process_event_codex_exec_uses_rollout_last_usage` | exec fallback 从 rollout 取 `last_token_usage`，不把 1.5M 累计 turn token 误报成 553% 上下文 |
+| `test_service_dispatcher.py::test_lifecycle_codex_context_error_compacts_before_retry` | fresh/mode Codex 超限后摘要并回到 pending，不消耗普通失败重试语义 |
+| `test_service_dispatcher.py::test_codex_precompact_uses_full_context_tokens` | Codex 预压缩按 current context（含会进入下一请求的 output）和有效窗口触发 |
 | `test_api_pr_monitor.py::test_create_repo_with_codex_provider` 等 | PR Monitor API 层 provider 创建/默认/更新（含显式 null 清空模型防跨家族残留） |
 | 前端 `ProjectTodoList.test.tsx` | Todo Run 建 task 带 provider |
 | 前端 `TaskForm.test.tsx::Codex provider UI gating` | codex 下 Thinking 隐藏、显式「Skills / Monitor 仅支持 Claude」标注（非静默消失） |
@@ -481,6 +542,11 @@ cd frontend && npx tsc --noEmit
 | `test_get_active_tasks_only_returns_running_states` | 更新阻塞器只识别 `in_progress/executing` task |
 | `test_get_blocking_tasks_includes_queued_resumes` | 已入队但尚未启动的续跑消息也属于停服 blocker |
 | `test_start_update_blocks_running_prompt_only_instance` | prompt-only 手动实例 launch 后即使没有 Task 行，更新仍识别 `running` Instance 并拒绝停服 |
+| `test_reconcile_blockers_clears_multi_dead_owner_ghost` | 空标题 Task 被 5 个已死亡 Instance 反向占用时先显示 description/claim count；显式核对后 fail-close Task 并清理全部 dead owner |
+| `test_reconcile_keeps_unknown_live_process_as_blocker` / `test_reconcile_preserves_manager_owned_active_generation` | unknown/live PID 继续阻断；当前进程真实拥有的 generation 核对后保持原样 |
+| `test_cleanup_preserves_reserved_fresh_task_claim` / shared/auxiliary cases | pending→in_progress 后仍在项目准备窗口的 reservation 不被误清；远端 shadow 与 live CCM/native auxiliary 保持 remote/current-process ownership |
+| `test_live_auxiliary_generations_block_restart_without_active_task` | parent Task 已终态时，仍有 exact monitor/sub-agent task/process map 也会阻止重启；只有 DB stale row 不冒充 live blocker |
+| `test_process_wide_test_services_use_ephemeral_*` | pytest 在首次 backend import 前隔离全局 DB、pool/login journal、Worker/backup 与 update checkout，避免测试污染开发环境 |
 | `test_enqueue_then_clear_before_dequeue_removes_resume_blocker` | enqueue 后、consumer dequeue 前执行 stop-session 清队列，会同步清除 pending 标记，后续 blocker 查询不出现幽灵 `queued_resume` |
 | `test_start_update_pauses_and_refuses_active_tasks` | 更新前暂停领取任务；活动 task 存在时即使 force 也拒绝并恢复调度 |
 | `test_start_update_fails_closed_when_task_check_errors` | 活动任务查询失败时按“有风险”处理，恢复调度且绝不启动更新 |
@@ -506,9 +572,26 @@ cd frontend && npx tsc --noEmit
 | `test_chat_send_returns_conflict_after_shutdown_commit` | 最终停服已提交后新聊天返回 409，明确要求重连重试而不是静默入队 |
 | `test_update_dry_run_forwards_force_and_branch` | System API 将手动 dry-run 的 branch/force 原样透传给服务层 |
 | `test_update_returns_conflict_when_active_tasks_block_start` | 正式更新被活动任务门禁拒绝时 API 返回 409，`force` 不得绕过 |
+| `test_reconcile_endpoint_returns_structured_conflict` | 核对失败以结构化 409 返回，前端保留原 blocker，不能误开放更新按钮 |
 | `automatic update reminder` | 页面打开约 1 秒后仅 dry-run 检查；最新版静默；更新以顶部非阻塞通知展示，点击查看才开弹窗；同页同 commit 只提醒一次；远端失败但本地需重启仍提醒 |
 | `forces a fresh dry-run when the user checks manually` | 手动检查携带 `force=true` 绕过后端短缓存 |
 | `blocks confirmation while tasks are active` | 弹窗展示活动 task 并禁用正式更新按钮 |
+| `reconcile` / auxiliary blocker cases | 显式核对后强制 dry-run；失败或新 blocker 保留禁用态；Instance/Monitor/Sub-Agent 不伪装成可复制的用户 Task |
+| `shows running, disk, and database revisions` / repair/restart cases | 前端分开展示运行代码、磁盘代码和 DB revision；只有后端明确证明安全时才轻量重启，否则执行完整修复 |
+| rollback confirmation cases | 已迁移或迁移结果未知时必须二次确认数据库快照恢复的数据丢失；明确未迁移时只回退代码 |
+| active handoff recovery cases | 页面刷新、可见性恢复和旧进程仍可响应期间，`restarting/starting + repair_required` 继续轮询，不误报终态失败 |
+
+##### 部署事务、启动守卫与迁移故障注入
+
+| 测试文件 | 验证内容 |
+|---------|---------|
+| `test_deployment_start_guard.py` | repo lease 优先于 `/tmp` 状态；commit/port/token 精确匹配；损坏、未知 PID 身份和活动 lease fail closed；失败事务只进入 maintenance-only；task shared fence 阻止跨进程部署竞态 |
+| `test_main_deployment_start.py` | guard 在 `init_db` 前执行；maintenance-only 不访问数据库、不启动 Dispatcher/Worker；受控 handoff 跳过重复 mutation |
+| `test_deployment_maintenance_auth.py` | 维护模式只开放 health/status/repair/rollback/restart；legacy recovery token 与已签名 admin JWT 无 DB 可恢复，member JWT 和密码登录被拒绝 |
+| `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
+| `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障 |
+| `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
+| `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
 
 ##### `test_service_pr_review.py` — PR 审核服务
 
@@ -861,6 +944,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/dispatcher.py` | `backend/tests/test_service_dispatcher.py` |
 | `backend/services/worktree_manager.py` | `backend/tests/test_service_worktree_manager.py` |
 | `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py` |
+| `backend/services/context_compaction.py` | `backend/tests/test_context_compaction.py` |
 | `backend/services/ralph_loop.py` | `backend/tests/test_service_ralph_loop.py` |
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |
 | `backend/services/whisper_client.py` | `backend/tests/test_service_whisper_client.py` |

@@ -15,10 +15,30 @@ from backend.services.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerError,
     CodexAppServerRegistry,
+    CodexRequiredMcpError,
     CodexThreadHomeMismatchError,
     CodexTurnProcess,
     normalize_codex_home,
 )
+from backend.services.mcp_config import McpServerSpec
+
+
+def _task_mcp_spec(task_id: int) -> McpServerSpec:
+    return McpServerSpec(
+        name="ccm_skills",
+        command="python",
+        args=(
+            "-m",
+            "backend.mcp.ccm_skills_server",
+            "--task-id",
+            str(task_id),
+        ),
+        cwd="/ccm",
+        required=True,
+        enabled_tools=("ccm_command_help",),
+        startup_timeout_sec=10,
+        tool_timeout_sec=60,
+    )
 
 
 @pytest.mark.asyncio
@@ -39,6 +59,7 @@ async def test_start_turn_uses_native_resume_and_turn_start():
         resume_session_id="thread-123",
         git_env={"GIT_AUTHOR_NAME": "CCM"},
         task_id=9,
+        mcp_specs=(_task_mcp_spec(9),),
     )
 
     assert thread_id == "thread-123"
@@ -50,12 +71,236 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     assert resume_call.args[1]["config"]["shell_environment_policy"]["set"] == {
         "GIT_AUTHOR_NAME": "CCM"
     }
+    assert resume_call.args[1]["config"]["mcp_servers"]["ccm_skills"] == {
+        "command": "python",
+        "args": [
+            "-m",
+            "backend.mcp.ccm_skills_server",
+            "--task-id",
+            "9",
+        ],
+        "cwd": "/ccm",
+        "required": True,
+        "enabled_tools": ["ccm_command_help"],
+        "startup_timeout_sec": 10,
+        "tool_timeout_sec": 60,
+    }
     assert turn_call.args[0] == "turn/start"
     assert turn_call.args[1]["effort"] == "max"
     assert turn_call.args[1]["model"] == "gpt-5.6-luna"
 
     first = json.loads((await process.stdout.readline()).decode())
     assert first == {"type": "thread.started", "thread_id": "thread-123"}
+
+
+@pytest.mark.asyncio
+async def test_start_turn_injects_mcp_config_into_new_thread():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-new"}},
+        {"turn": {"id": "turn-new"}},
+    ])
+
+    await server.start_turn(
+        prompt="start",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=41,
+        mcp_specs=(_task_mcp_spec(41),),
+    )
+
+    thread_call = server._request.await_args_list[0]
+    assert thread_call.args[0] == "thread/start"
+    assert thread_call.args[1]["config"]["mcp_servers"]["ccm_skills"]["args"][-2:] == [
+        "--task-id",
+        "41",
+    ]
+    assert thread_call.args[1]["config"]["mcp_servers"]["ccm_skills"]["required"] is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_threads_keep_mcp_context_isolated():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    thread_configs: dict[str, dict] = {}
+
+    async def request(method, params):
+        if method == "thread/start":
+            args = params["config"]["mcp_servers"]["ccm_skills"]["args"]
+            task_id = args[args.index("--task-id") + 1]
+            thread_configs[task_id] = params["config"]
+            await asyncio.sleep(0)
+            return {"thread": {"id": f"thread-{task_id}"}}
+        if method == "turn/start":
+            await asyncio.sleep(0)
+            return {"turn": {"id": f"turn-{params['threadId']}"}}
+        raise AssertionError(f"unexpected method: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+
+    await asyncio.gather(*(
+        server.start_turn(
+            prompt=f"task {task_id}",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=task_id,
+            mcp_specs=(_task_mcp_spec(task_id),),
+        )
+        for task_id in (101, 202)
+    ))
+
+    assert set(thread_configs) == {"101", "202"}
+    assert thread_configs["101"] is not thread_configs["202"]
+    assert (
+        thread_configs["101"]["mcp_servers"]["ccm_skills"]["args"][-1]
+        == "101"
+    )
+    assert (
+        thread_configs["202"]["mcp_servers"]["ccm_skills"]["args"][-1]
+        == "202"
+    )
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_thread_rejection_is_explicit():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(
+        side_effect=CodexAppServerError(
+            "thread/start failed: required MCP server ccm_skills failed to initialize"
+        )
+    )
+
+    with pytest.raises(CodexRequiredMcpError, match="required MCP"):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=51,
+            mcp_specs=(_task_mcp_spec(51),),
+        )
+
+
+@pytest.mark.asyncio
+async def test_invalid_required_mcp_config_is_explicit_before_thread_rpc():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock()
+    invalid_spec = McpServerSpec(
+        name="invalid.name",
+        command="python",
+        required=True,
+    )
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="Invalid required Codex MCP configuration",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=52,
+            mcp_specs=(invalid_spec,),
+        )
+
+    server._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_app_server_startup_failure_is_explicit():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock(
+        side_effect=CodexAppServerError("initialize failed")
+    )
+    server._request = AsyncMock()
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="could not start required MCP transport",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=53,
+            mcp_specs=(_task_mcp_spec(53),),
+        )
+
+    server._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_missing_thread_id_is_explicit():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={"thread": {}})
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="Required MCP configuration was not admitted",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=54,
+            mcp_specs=(_task_mcp_spec(54),),
+        )
+
+    assert server._request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_missing_turn_id_is_explicit_and_detaches_context():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-missing-turn"}},
+        {"turn": {}},
+    ])
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="Required MCP turn was not admitted",
+    ):
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=55,
+            mcp_specs=(_task_mcp_spec(55),),
+        )
+
+    assert "thread-missing-turn" not in server._contexts_by_thread
 
 
 @pytest.mark.asyncio
@@ -225,9 +470,23 @@ async def test_notifications_stream_delta_and_finish_process():
     })
     server._handle_notification("thread/tokenUsage/updated", {
         "threadId": "thread-1", "turnId": "turn-1",
-        "tokenUsage": {"last": {
-            "inputTokens": 100, "cachedInputTokens": 80, "outputTokens": 5,
-        }},
+        "tokenUsage": {
+            "last": {
+                "inputTokens": 100,
+                "cachedInputTokens": 80,
+                "outputTokens": 5,
+                "reasoningOutputTokens": 2,
+                "totalTokens": 105,
+            },
+            "total": {
+                "inputTokens": 300,
+                "cachedInputTokens": 240,
+                "outputTokens": 15,
+                "reasoningOutputTokens": 6,
+                "totalTokens": 315,
+            },
+            "modelContextWindow": 258_400,
+        },
     })
     server._handle_notification("turn/completed", {
         "threadId": "thread-1",
@@ -247,9 +506,55 @@ async def test_notifications_stream_delta_and_finish_process():
     assert lines[1]["item"]["type"] == "agent_message"
     assert lines[2] == {
         "type": "turn.completed",
-        "usage": {"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 5},
+        "usage": {
+            "input_tokens": 100,
+            "cached_input_tokens": 80,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 2,
+            "total_tokens": 105,
+            "context_window": 258_400,
+        },
     }
     assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_context_window_error_keeps_structured_codex_error_info():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1"}},
+        {"turn": {"id": "turn-1"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="continue",
+        cwd="/tmp",
+        model="gpt-5.6-terra",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=1,
+    )
+    await process.stdout.readline()
+
+    error = {
+        "message": "The request could not be completed.",
+        "codexErrorInfo": "contextWindowExceeded",
+        "additionalDetails": "effective window exhausted",
+    }
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-1",
+        "turn": {
+            "id": "turn-1",
+            "status": "failed",
+            "error": error,
+        },
+    })
+
+    failed = json.loads((await process.stdout.readline()).decode())
+    assert failed == {"type": "turn.failed", "error": error}
+    assert await process.wait() == 1
 
 
 @pytest.mark.asyncio

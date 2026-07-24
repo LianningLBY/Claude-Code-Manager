@@ -322,6 +322,41 @@ Codex 版本兼容基线（2026-07-24）：
 - 实测确认 app-server 对 server 名强制 `^[a-zA-Z0-9_-]+$`；renderer 在进 CLI 前做同样校验。
 - smoke test 前后隔离目录均未产生 `config.toml`；路径/中文/引号/反斜杠的无损序列化由不经过 shell 的单元测试覆盖。
 
+#### `test_codex_app_server.py` / `test_service_instance_manager.py` — Codex 主任务 MCP 按 thread 注入
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_start_turn_injects_mcp_config_into_new_thread` | `thread/start` 收到 task-scoped `config.mcp_servers.ccm_skills` |
+| `test_start_turn_uses_native_resume_and_turn_start` | `thread/resume` 同时合并 MCP 配置和线程级 Git 环境，不互相覆盖 |
+| `test_concurrent_task_threads_keep_mcp_context_isolated` | 同一 app-server 并发任务保留各自 `task_id`，配置对象不串线 |
+| `test_required_mcp_thread_rejection_is_explicit` | required MCP 的 thread 创建失败转为 `CodexRequiredMcpError` |
+| `test_invalid_required_mcp_config_is_explicit_before_thread_rpc` | required spec 在本地校验失败时 fail closed，且不发送 thread RPC |
+| `test_required_mcp_app_server_startup_failure_is_explicit` | required MCP 已选中后，app-server transport 启动失败转为显式能力错误 |
+| `test_required_mcp_missing_thread_id_is_explicit` | malformed/no-thread-id 响应 fail closed，不进入 `turn/start` |
+| `test_required_mcp_missing_turn_id_is_explicit_and_detaches_context` | malformed/no-turn-id 响应 fail closed，并清理未成立的 turn context |
+| `test_required_mcp_app_server_failure_does_not_launch_exec` | transport 启动失败、no-thread-id 与未知 adapter 异常都不得启动无 MCP 的 `codex exec` |
+| `test_launch_codex_does_not_fallback_when_replay_is_unsafe[required-mcp]` | required MCP 失败不静默降级到当前尚无 MCP 的 exec fallback |
+| `test_codex_main_mcp_capability_defaults_off` | `CODEX_MAIN_MCP_ENABLED` 服务端 capability 默认关闭 |
+| `test_launch_codex_app_server_injects_task_scoped_specs_when_enabled` | capability 开启时每次 app-server launch 从当前 `task_id` 重建 required spec |
+| `test_launch_codex_app_server_routes_turn_to_canonical_home` | capability 关闭时 app-server 行为保持原样且不注入空配置 |
+| `test_codex_main_mcp_capability_does_not_change_claude_launch` | capability 开启不改变 Claude provider 的启动路径 |
+
+人工 app-server smoke（仅测试环境）：
+
+1. 设置 `CODEX_APP_SERVER_ENABLED=true`、`CODEX_MAIN_MCP_ENABLED=true` 并重启后端。
+2. 创建本地 Codex task，要求它“必须调用 `ccm_command_help` 查询一个 CCM 命令后原样报告工具结果”。
+3. 确认日志出现 `mcp_tool_call`，server/tool 为 `ccm_skills/ccm_command_help`，且工具参数中的 task 上下文对应当前任务。
+4. 在同一 task 发送第二条消息并确认 resume 仍可调用；再并发运行另一个 task，确认两边查询结果和 `task_id` 不串线。
+5. 将测试 MCP command 临时改为不存在路径，或模拟 app-server 启动失败/no-thread-id 响应；任务应明确报告 required MCP 错误，且不得启动 `codex exec`。
+6. 测试完恢复 `CODEX_MAIN_MCP_ENABLED=false`。PR 4 完成前，exec fallback 不具备此 MCP。
+
+真实验收记录（2026-07-24）：
+
+- Codex CLI `0.145.0`、`gpt-5.6-sol`、隔离 `CODEX_HOME`。
+- app-server `thread/start` 成功启动 required `ccm_skills`，模型显式调用 `ccm_command_help` 一次。
+- `mcp_tool_call` 状态为 `completed`，耗时约 864 ms，返回 JSON `success=true`；turn 正常完成且 returncode 为 0。
+- smoke 使用独立 SQLite 数据库中的 task 1，结束后已关闭测试后端并清理隔离 CODEX_HOME。
+
 #### `test_monitor_dispatcher.py` — Monitor Dispatcher 生命周期
 
 | 测试 | 验证内容 |

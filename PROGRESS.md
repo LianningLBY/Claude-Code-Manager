@@ -834,6 +834,20 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **预防**：Provider 配置测试不能只反解析自己的输出，至少要用目标 CLI 的只读命令和实际 session 初始化各验一次；CLI 的 `-c` key parser 与 TOML dotted-key grammar 不应假定等价。配置适配器必须返回 argv token，不返回已拼 shell command。
 - **验证**：Codex renderer 单测 56 passed；MCP config/server 65 passed；Monitor 可比项 14 passed（另 2 项因 Windows 沙箱无权写硬编码 `/tmp` 而未运行）；Claude 命令构建 5 passed；前端 `tsc --noEmit` 通过。Codex CLI `0.144.6`、`0.145.0` 均在隔离 `$CODEX_HOME` 下通过 `mcp list -c ... --json`，且两版 app-server 都用 `thread/start` 成功初始化真实 CCM FastMCP server；全程未生成 `config.toml`。
 
+### 2026-07-24 — Codex 全量 CCM MCP PR 3：app-server 按线程注入主 MCP（commit 7f41159）
+
+- **问题**：PR 2 只有纯 renderer，生产 `CodexAppServer.start_turn()` 仍未接收 MCP specs，导致 Codex 主任务在新建、resume、瞬时重试或账号轮换时都看不到 `ccm_skills`；如果 required MCP 初始化失败后再落入尚未接线的 exec fallback，还会伪装成普通无工具任务。
+- **解决**：新增默认关闭的 `CODEX_MAIN_MCP_ENABLED` capability；开启后 `InstanceManager` 每次 app-server launch 都从当前 `task_id` 重建 required `ccm_skills` spec，`start_turn()` 将 renderer 结果只合并到本次 `thread/start|resume` 的 `config`，不写共享 `CODEX_HOME/config.toml`。required spec 校验或 thread 初始化失败统一转成 `CodexRequiredMcpError` 并禁止无 MCP 的 exec replay；Claude、prompt、UI、Monitor/Sub-Agent 和 exec 配置接线保持本 PR 范围外。
+- **预防**：任何 task-scoped MCP 上下文必须在每次 start/resume/retry/rotation 时重建，不能缓存到共享 app-server 或账号目录；capability 未开启时不得发送空 `config`；required 能力失败必须 fail closed，并用并发双 task 测试锁定配置对象和 `task_id` 隔离。
+- **验证**：MCP renderer/app-server 相关回归 97 passed、5 skipped；InstanceManager capability、重试、换号和 Claude 不变相关 11 passed；前端 `tsc --noEmit`、compileall、`git diff --check` 通过。真实 Codex CLI `0.145.0` + `gpt-5.6-sol` 在隔离 `CODEX_HOME` 下完成 start 与同 thread resume：两轮均实际调用 `ccm_skills/ccm_command_help`，工具状态 `completed`、结果 `success=true`、turn returncode 0；隔离后端两次收到绑定 Task 1 的 API 请求，测试进程、数据库和认证硬链接随后全部清理。
+
+### 2026-07-24 — PR 3 评审修复：required MCP 全启动链 fail closed（commit 642b996）
+
+- **问题**：`start_turn()` 在判断 required MCP 前先启动 app-server；transport 初始化异常或 malformed/no-thread-id 响应可能以普通 `CodexAppServerError` 逸出，随后被 `InstanceManager` 的兼容分支重放为尚未携带 MCP 的 `codex exec`，使要求 `ccm_skills` 的任务静默降级。
+- **解决**：先构造并校验 thread MCP config，再启动 transport；transport、thread/start|resume、turn/start 的普通异常及缺失 thread/turn id 都统一转成 `CodexRequiredMcpError`，同时保留取消、超时未知状态和 maintenance busy 的原语义。`InstanceManager` 再按 capability + task 上下文增加最终 fail-closed 栅栏，未知 app-server 异常也不得进入 MCP-less exec。
+- **预防**：required capability 的错误类型必须覆盖依赖启动、协议 RPC、响应结构和上层 adapter 兜底，不能只识别服务端返回的某一种初始化文案；高层测试必须同时 patch app-server 失败和 exec spawn，并对启动失败、no-thread-id、未知异常逐项断言 exec 未调用。
+- **验证**：新增/相关评审用例 7 passed；MCP renderer/app-server 回归 100 passed、5 skipped、2 个既有 Windows `SIGKILL` 用例 deselected；InstanceManager capability/重试/换号回归 15 passed；compileall、前端 `tsc --noEmit`、`git diff --check` 通过。
+
 ### 2026-07-24 — 自更新事务修复：代码已拉取不再等于部署完成（commit 3e08b8d）
 
 - **问题**：旧状态只比较 Git 本地/远端；代码已经拉取后若依赖、前端或 Alembic 失败，下一次检查会误报“代码一致”，但进程和数据库仍可能是旧版本。原迁移 worker 的 `/tmp` 状态、systemd handoff、SQLite 活连接恢复和 task 门禁也缺少同一个可证明的事务边界。

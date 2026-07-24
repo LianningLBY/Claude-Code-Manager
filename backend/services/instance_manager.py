@@ -598,6 +598,7 @@ class InstanceManager:
         if provider == "codex":
             from backend.services.codex_app_server import (
                 CodexAppServerBusyError,
+                CodexRequiredMcpError,
                 CodexThreadHomeMismatchError,
                 normalize_codex_home,
             )
@@ -691,6 +692,7 @@ class InstanceManager:
                 except (
                     asyncio.TimeoutError,
                     CodexAppServerBusyError,
+                    CodexRequiredMcpError,
                     CodexThreadHomeMismatchError,
                     CodexLaunchCommitError,
                     InstanceNotFoundError,
@@ -704,7 +706,20 @@ class InstanceManager:
                         "Codex app-server launch cannot safely fall back to exec"
                     )
                     raise
-                except Exception:
+                except Exception as exc:
+                    if settings.codex_main_mcp_enabled and task_id is not None:
+                        # PR4 will teach exec fallback to carry the same MCP
+                        # spec.  Until then, once required ccm_skills was
+                        # selected, every unknown app-server failure must fail
+                        # closed instead of silently replaying without tools.
+                        logger.exception(
+                            "Codex app-server launch failed while required "
+                            "ccm_skills was enabled; refusing MCP-less exec fallback"
+                        )
+                        raise CodexRequiredMcpError(
+                            "Codex app-server failed before required "
+                            "ccm_skills could be guaranteed"
+                        ) from exc
                     # App-server is an experimental Codex surface.  A CLI upgrade
                     # must not take all Codex tasks down; retain the proven exec
                     # path as an automatic compatibility fallback.
@@ -1012,6 +1027,14 @@ class InstanceManager:
 
         actual_cwd = cwd or os.getcwd()
         codex_effort = clamp_codex_effort(model, effort_level)
+        mcp_specs = ()
+        if settings.codex_main_mcp_enabled and task_id is not None:
+            from backend.services.mcp_config import build_mcp_server_specs
+
+            mcp_specs = build_mcp_server_specs(
+                task_id,
+                enabled_skills or {},
+            )
         process, _thread_id = await registry.start_turn(
             codex_home=config_dir,
             prompt=prompt,
@@ -1021,6 +1044,7 @@ class InstanceManager:
             resume_session_id=resume_session_id,
             git_env=git_env,
             task_id=task_id,
+            mcp_specs=mcp_specs,
         )
         if config_dir:
             self._config_dirs[instance_id] = config_dir

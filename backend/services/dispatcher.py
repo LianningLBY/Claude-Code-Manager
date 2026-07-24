@@ -25,6 +25,10 @@ from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
 from backend.services.git_config import merge_git_config, settings_to_dict
+from backend.services.context_compaction import (
+    context_tokens_used,
+    is_context_window_exceeded,
+)
 from backend.services.instance_capacity import (
     active_capacity_predicate,
     instance_capacity_lock,
@@ -4100,10 +4104,10 @@ class GlobalDispatcher:
                     )
                     return
 
-                # "Prompt is too long" — compact and retry instead of failing
-                log_contents = await self.instance_manager.get_recent_log_contents(task.id, limit=5)
-                log_text = " ".join(log_contents) if isinstance(log_contents, list) else str(log_contents)
-                if "prompt is too long" in log_text.lower():
+                # Context overflow — compact and retry instead of failing.
+                # Codex app-server uses a structured contextWindowExceeded
+                # code while exec/Claude may only expose human-readable text.
+                if is_context_window_exceeded(task.provider, combined):
                     try:
                         async with self.db_factory() as db:
                             t = await self._read_owned_lifecycle_task(
@@ -4111,7 +4115,11 @@ class GlobalDispatcher:
                                 lifecycle_generation,
                             )
                             if t and t.session_id:
-                                logger.warning("Task %d hit 'Prompt is too long', compacting session", task.id)
+                                logger.warning(
+                                    "Task %d exceeded its context window, "
+                                    "compacting session",
+                                    task.id,
+                                )
                                 summary = await self._compact_session(task.id, t.session_id, db)
                                 if summary:
                                     compacted = await db.execute(
@@ -4143,7 +4151,10 @@ class GlobalDispatcher:
                                         })
                                     return
                     except Exception:
-                        logger.exception("Prompt-too-long compact failed for task %d", task.id)
+                        logger.exception(
+                            "Context-window compaction failed for task %d",
+                            task.id,
+                        )
 
                 await self._retry_or_fail_mode_task(
                     lifecycle_generation,
@@ -7013,7 +7024,7 @@ class GlobalDispatcher:
             # 上下文超阈值时自动摘要 + 新 session（无限续聊）
             if task.session_id and task.context_window_usage:
                 usage = task.context_window_usage
-                total_input = (usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0)
+                used_tokens = context_tokens_used(task.provider, usage)
                 # context_window 可能被 CC 低报（1M 模型报 200K），用模型名兜底；
                 # codex 无该字段时查 codex 窗口表（272K/128K，非 claude 的 200K）
                 if (task.provider or "claude").lower() == "codex":
@@ -7026,7 +7037,7 @@ class GlobalDispatcher:
                     model_lower = (msg.model_override or task.model or "").lower()
                     if "[1m]" in model_lower or "fable" in model_lower:
                         window = max(window, 1_000_000)
-                utilization = total_input / window if window else 0
+                utilization = used_tokens / window if window else 0
                 # 阈值：GlobalSettings 覆盖 > env 默认（前端运行时设置可改）
                 gs = await db.get(GlobalSettings, 1)
                 compact_threshold = (
@@ -7037,7 +7048,7 @@ class GlobalDispatcher:
                 if utilization >= compact_threshold:
                     logger.info(
                         "Task %d context at %.0f%% (%d/%d), compacting session...",
-                        task_id, utilization * 100, total_input, window,
+                        task_id, utilization * 100, used_tokens, window,
                     )
                     # 收集最近对话摘要
                     summary = await self._compact_session(task_id, task.session_id, db)
@@ -7048,7 +7059,7 @@ class GlobalDispatcher:
                         # 在聊天里给用户留一条可见的压缩提示（落库 + 实时广播）
                         notice = (
                             f"⚡ 上下文已达 {utilization * 100:.0f}%"
-                            f"（{total_input:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
+                            f"（{used_tokens:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
                             f"已自动压缩摘要并开启新会话延续上下文"
                         )
                         db.add(LogEntry(

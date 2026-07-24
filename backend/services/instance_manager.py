@@ -17,6 +17,10 @@ from backend.models.instance import Instance
 from backend.models.task import Task
 
 from backend.models.log_entry import LogEntry
+from backend.services.context_compaction import (
+    is_context_window_exceeded,
+    read_codex_rollout_last_usage,
+)
 from backend.services.codex_models import clamp_codex_effort
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
@@ -2567,6 +2571,7 @@ class InstanceManager:
             )
 
         _assistant_texts: list[str] = []
+        _failure_details: list[object] = []
         _saw_rate_limit = False
         _rate_limit_info: dict | None = None
         _saw_error = False
@@ -2619,6 +2624,11 @@ class InstanceManager:
                                     _rate_limit_info = info
                             if event.get("is_error"):
                                 _saw_error = True
+                                _failure_details.extend((
+                                    event.get("content"),
+                                    event.get("error_code"),
+                                    event.get("error_details"),
+                                ))
                             if event.get("event_type") in ("message", "result") and event.get("role") == "assistant":
                                 c = event.get("content") or ""
                                 if c:
@@ -2753,17 +2763,26 @@ class InstanceManager:
             )
 
         if task_id and chat_initiated and exit_code not in (0, -2, 130):
-            # "Prompt is too long" — session context exceeded window.
-            # Compact the session and retry with summary.
-            _prompt_too_long = _assistant_texts and any("prompt is too long" in t.lower() for t in _assistant_texts)
-            if _prompt_too_long:
+            # Context overflow can be a plain CLI message or the app-server's
+            # structured contextWindowExceeded code. Compact and continue.
+            _context_window_exceeded = is_context_window_exceeded(
+                provider,
+                _failure_details,
+                _assistant_texts,
+                stderr_text,
+            )
+            if _context_window_exceeded:
                 try:
                     from backend.main import dispatcher
                     async with self.db_factory() as db:
                         from backend.models.task import Task as _Task
                         task = await db.get(_Task, task_id)
                         if task and task.session_id:
-                            logger.warning("Task %d hit 'Prompt is too long', compacting session", task_id)
+                            logger.warning(
+                                "Task %d exceeded its context window, "
+                                "compacting session",
+                                task_id,
+                            )
                             compacted_session_id = task.session_id
                             compacted_status = task.status
                             summary = await dispatcher._compact_session(
@@ -2812,7 +2831,10 @@ class InstanceManager:
                                         source="compact_retry",
                                     )
                 except Exception:
-                    logger.exception("Prompt-too-long compact failed for task %d", task_id)
+                    logger.exception(
+                        "Context-window compaction failed for task %d",
+                        task_id,
+                    )
             # Transient server-side 429/overload: wait + retry same account
             elif await self._try_chat_transient_retry(instance_id, task_id, exit_code, stderr_text):
                 return
@@ -4073,10 +4095,24 @@ class InstanceManager:
                 message = err or codex_type
             if isinstance(message, (dict, list)):
                 message = json.dumps(message, ensure_ascii=False)
+            error_code = None
+            error_details = None
+            if isinstance(err, dict):
+                error_code = (
+                    err.get("codexErrorInfo")
+                    or err.get("codex_error_info")
+                    or err.get("code")
+                )
+                error_details = (
+                    err.get("additionalDetails")
+                    or err.get("additional_details")
+                )
             event.update({
                 "event_type": "system_event",
                 "content": str(message),
                 "is_error": True,
+                "error_code": error_code,
+                "error_details": error_details,
             })
         else:
             content = data.get("content") or data.get("message") or data.get("text")
@@ -4138,13 +4174,24 @@ class InstanceManager:
         input_tokens = int(usage.get("input_tokens") or 0)
         cached_tokens = int(usage.get("cached_input_tokens") or 0)
         output_tokens = int(usage.get("output_tokens") or 0)
-        return {
+        reasoning_tokens = int(usage.get("reasoning_output_tokens") or 0)
+        total_tokens = int(
+            usage.get("total_tokens") or (input_tokens + output_tokens)
+        )
+        result = {
             "input_tokens": max(input_tokens - cached_tokens, 0),
             "cache_read_input_tokens": cached_tokens,
             "cache_creation_input_tokens": 0,
             "output_tokens": output_tokens,
+            "reasoning_output_tokens": reasoning_tokens,
             "total_input_tokens": input_tokens,
+            "total_tokens": total_tokens,
+            "context_tokens": max(total_tokens - reasoning_tokens, 0),
         }
+        context_window = int(usage.get("context_window") or 0)
+        if context_window:
+            result["context_window"] = context_window
+        return result
 
     async def _process_event(
         self,
@@ -4657,6 +4704,7 @@ class InstanceManager:
             # task's model choice: codex 查窗口表，claude [1m] 变体 1M 其余 200K。
             model_name = ""
             task_provider = "claude"
+            task_session_id = None
             if task_id:
                 async with self.db_factory() as db:
                     t = (
@@ -4666,9 +4714,52 @@ class InstanceManager:
                     ).scalar_one_or_none()
                     model_name = (t.model or "") if t else ""
                     task_provider = ((t.provider if t else None) or "claude").lower()
+                    task_session_id = t.session_id if t else None
             if task_provider == "codex":
-                from backend.services.codex_models import codex_context_window
-                context_usage["context_window"] = codex_context_window(model_name)
+                # ``codex exec --json`` exposes cumulative turn usage, which
+                # can exceed the model window many times during a tool-heavy
+                # turn. Its rollout contains the authoritative latest request
+                # usage used by Codex's own context meter.
+                rollout_usage = None
+                if task_session_id:
+                    rollout_path = None
+                    codex_home = self._config_dirs.get(instance_id)
+                    if codex_home:
+                        from backend.services.codex_session_migration import (
+                            CodexSessionMigrationError,
+                            find_codex_rollout_session,
+                        )
+
+                        try:
+                            rollout_path = find_codex_rollout_session(
+                                task_session_id,
+                                codex_home,
+                            )
+                        except CodexSessionMigrationError:
+                            logger.debug(
+                                "Could not resolve current-home rollout for "
+                                "Codex context usage",
+                                exc_info=True,
+                            )
+                    if rollout_path is None:
+                        from backend.api.tasks import _find_session_jsonl
+
+                        rollout_path = _find_session_jsonl(
+                            task_session_id,
+                            provider="codex",
+                        )
+                    if rollout_path:
+                        rollout_usage = await asyncio.to_thread(
+                            read_codex_rollout_last_usage,
+                            rollout_path,
+                        )
+                if rollout_usage:
+                    context_usage = self._codex_context_usage(rollout_usage)
+                else:
+                    from backend.services.codex_models import codex_context_window
+                    context_usage["context_window"] = codex_context_window(
+                        model_name
+                    )
             else:
                 context_usage["context_window"] = _model_context_window(model_name)
         if context_usage and task_id:
@@ -6117,14 +6208,32 @@ class InstanceManager:
         self._pty_rate_limit_info.pop(instance_id, None)
 
     async def get_recent_log_contents(self, task_id: int, limit: int = 10) -> list[str]:
-        """Fetch recent log entry contents for a task (for rate-limit detection)."""
+        """Fetch recent task output used by terminal failure classifiers.
+
+        Structured provider codes such as Codex ``contextWindowExceeded`` live
+        in the raw error envelope even when the human message is generic. Keep
+        that small error envelope alongside its content; non-error event JSON
+        (which can contain large prompts/tool payloads) remains excluded.
+        """
         from backend.models.log_entry import LogEntry
         from sqlalchemy import select as sa_select
         async with self.db_factory() as db:
             result = await db.execute(
-                sa_select(LogEntry.content)
+                sa_select(
+                    LogEntry.content,
+                    LogEntry.raw_json,
+                    LogEntry.is_error,
+                    LogEntry.event_type,
+                )
                 .where(LogEntry.task_id == task_id)
                 .order_by(LogEntry.id.desc())
                 .limit(limit)
             )
-            return [row[0] for row in result.all() if row[0]]
+            contents = []
+            for content, raw_json, is_error, event_type in result.all():
+                pieces = [content] if content else []
+                if is_error and event_type == "system_event" and raw_json:
+                    pieces.append(raw_json[:4000])
+                if pieces:
+                    contents.append("\n".join(pieces))
+            return contents

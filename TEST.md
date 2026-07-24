@@ -404,6 +404,14 @@ cd frontend && npx tsc --noEmit
 | `test_resume_config_dir.py::TestResolveResumeConfigDirCodexGate` | resume 选号对 codex 返回 None（不 select 不 migrate），claude 不受影响 |
 | `test_service_instance_manager.py::test_process_event_codex_window_backfill` | codex usage 无窗口时回填 272K（落库 + 广播都验证） |
 | `test_service_instance_manager.py::test_parse_codex_file_change_started_is_tool_use` | file_change 的 item.started → tool_use（真实事件流实证 started 存在，源码注释不实） |
+| `test_codex_app_server.py::test_notifications_stream_delta_and_finish_process` | app-server `thread/tokenUsage/updated` 保留真实 `modelContextWindow`、latest total/reasoning token，而非累计 thread total |
+| `test_codex_app_server.py::test_context_window_error_keeps_structured_codex_error_info` | `turn/completed` 失败不得丢弃 `codexErrorInfo=contextWindowExceeded` 与 additionalDetails |
+| `test_context_compaction.py` | provider 共享的上下文超限分类、Codex current-context token 计算及旧 usage fallback |
+| `test_service_instance_manager.py::test_codex_context_window_failure_compacts_and_requeues` | chat Codex 结构化超限事件触发摘要、清 session、携原消息 `compact_retry` 自动续跑 |
+| `test_service_instance_manager.py::test_recent_failure_output_keeps_structured_codex_error` | fresh/mode 失败分类读取受限长度的 raw system error envelope，不遗漏结构化错误码 |
+| `test_service_instance_manager.py::test_process_event_codex_exec_uses_rollout_last_usage` | exec fallback 从 rollout 取 `last_token_usage`，不把 1.5M 累计 turn token 误报成 553% 上下文 |
+| `test_service_dispatcher.py::test_lifecycle_codex_context_error_compacts_before_retry` | fresh/mode Codex 超限后摘要并回到 pending，不消耗普通失败重试语义 |
+| `test_service_dispatcher.py::test_codex_precompact_uses_full_context_tokens` | Codex 预压缩按 current context（含会进入下一请求的 output）和有效窗口触发 |
 | `test_api_pr_monitor.py::test_create_repo_with_codex_provider` 等 | PR Monitor API 层 provider 创建/默认/更新（含显式 null 清空模型防跨家族残留） |
 | 前端 `ProjectTodoList.test.tsx` | Todo Run 建 task 带 provider |
 | 前端 `TaskForm.test.tsx::Codex provider UI gating` | codex 下 Thinking 隐藏、显式「Skills / Monitor 仅支持 Claude」标注（非静默消失） |
@@ -883,6 +891,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/dispatcher.py` | `backend/tests/test_service_dispatcher.py` |
 | `backend/services/worktree_manager.py` | `backend/tests/test_service_worktree_manager.py` |
 | `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py` |
+| `backend/services/context_compaction.py` | `backend/tests/test_context_compaction.py` |
 | `backend/services/ralph_loop.py` | `backend/tests/test_service_ralph_loop.py` |
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |
 | `backend/services/whisper_client.py` | `backend/tests/test_service_whisper_client.py` |

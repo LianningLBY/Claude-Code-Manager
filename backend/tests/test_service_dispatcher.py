@@ -458,6 +458,46 @@ async def test_lifecycle_failure_retry(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_codex_context_error_compacts_before_retry(db_factory):
+    """Fresh/mode turns recognize Codex's structured overflow code."""
+
+    d = _make_dispatcher(db_factory)
+    d._collect_failure_output = AsyncMock(return_value=(
+        '{"type":"turn.failed","error":{"message":"request failed",'
+        '"codexErrorInfo":"contextWindowExceeded"}}'
+    ))
+    d._compact_session = AsyncMock(return_value="preserved task context")
+
+    async with db_factory() as db:
+        inst = Instance(name="codex-context-worker")
+        task = Task(
+            title="codex context retry",
+            description="continue implementation",
+            target_repo="/repo",
+            provider="codex",
+            session_id="codex-thread-1",
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    process = MagicMock(returncode=1, wait=AsyncMock(return_value=1))
+    d.instance_manager.processes = {inst.id: process}
+
+    await _run_claimed_lifecycle(d, db_factory, inst.id, task)
+
+    d._compact_session.assert_awaited_once()
+    async with db_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.status == "pending"
+        assert current.session_id is None
+        assert current.context_window_usage is None
+        assert "[Context compacted]" in current.description
+        assert "preserved task context" in current.description
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_failure_max_retries(db_factory):
     """Task at max retries is marked failed."""
     d = _make_dispatcher(db_factory)
@@ -5120,6 +5160,40 @@ async def test_requeued_compaction_message_can_start_without_old_session(
     assert (
         d.instance_manager.launch.await_args.kwargs["resume_session_id"] is None
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_precompact_uses_full_context_tokens(
+    db_factory, monkeypatch,
+):
+    """Codex output tokens count toward the next turn's context threshold."""
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    d._compact_session = AsyncMock(return_value="compact summary")
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.provider = "codex"
+        task.model = "gpt-5.6-terra"
+        task.context_window_usage = {
+            "input_tokens": 20_000,
+            "cache_read_input_tokens": 170_000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 20_000,
+            "total_input_tokens": 190_000,
+            "context_tokens": 210_000,
+            "context_window": 258_400,
+        }
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+
+    d._compact_session.assert_awaited_once()
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["resume_session_id"] is None
+    assert "compact summary" in launch["prompt"]
+    assert "[新消息]\nhi" in launch["prompt"]
 
 
 @pytest.mark.asyncio

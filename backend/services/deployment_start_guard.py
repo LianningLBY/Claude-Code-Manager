@@ -239,6 +239,30 @@ def _evaluate_record(
                 str(source),
                 maintenance_only=maintenance_only,
             )
+        legacy_restart_recovery = (
+            not authoritative_lease
+            and status == "restarting"
+            and not record.get("owner_token")
+            and not record.get("deployment_owner_token")
+            and bool(expected)
+            and bool(running_commit)
+            and expected == running_commit
+        )
+        if legacy_restart_recovery:
+            # Releases before the v2 handoff worker pulled the replacement
+            # checkout and then called `systemctl restart` directly while
+            # leaving a tokenless "restarting" /tmp status.  The replacement
+            # pre-start guard must not deadlock that service forever, but it
+            # also cannot prove that dependencies or migrations completed.
+            # Boot only the recovery surface and keep all startup mutations
+            # disabled until an administrator runs the transactional repair.
+            return StartDecision(
+                "skip_mutations",
+                "检测到旧版更新器重启到当前代码；以 maintenance-only "
+                "模式启动，等待管理员验证并执行修复",
+                str(source),
+                maintenance_only=True,
+            )
         if (
             authoritative_lease
             and _active_lease_is_provably_abandoned(record)

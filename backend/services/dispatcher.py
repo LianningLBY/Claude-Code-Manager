@@ -3123,8 +3123,10 @@ class GlobalDispatcher:
 
     async def _build_task_prompt(self, task: Task) -> str:
         """Reconstruct a task's initial prompt (CLAUDE.md preamble + secrets +
-        images + enabled-skill templates + description). Shared by the first
-        launch and every fresh re-launch (rotation / transient retry)."""
+        images + description). Enabled skills are advertised separately through
+        the launch-time skill directory, so merely enabling one never claims
+        that the user invoked its $command. Shared by the first launch and
+        every fresh re-launch (rotation / transient retry)."""
         metadata = task.metadata_ or {}
         image_paths = metadata.get("image_paths") or []
         secret_ids = metadata.get("secret_ids") or []
@@ -3135,16 +3137,6 @@ class GlobalDispatcher:
         if image_paths:
             image_list = "\n".join(f"- {p}" for p in image_paths)
             parts.append(f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}")
-        # Skill 模板描述的是 MCP 工具，而 MCP config 只注入 claude CLI
-        # （instance_manager.launch 里 provider == "claude" 才 generate_mcp_config），
-        # codex 任务注入这些模板只会让它调用不存在的工具。
-        if task.enabled_skills and (task.provider or "claude").lower() != "codex":
-            from backend.services.command_registry import COMMAND_REGISTRY
-            for skill_name, enabled in task.enabled_skills.items():
-                if enabled and skill_name in COMMAND_REGISTRY:
-                    cmd = COMMAND_REGISTRY[skill_name]
-                    if not cmd.always_available:
-                        parts.append(cmd.prompt_template)
         parts.append(f"任务:\n{task.description}")
         return "\n\n".join(parts)
 

@@ -6473,8 +6473,10 @@ async def test_build_task_prompt_carries_doc_sync_note(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_build_task_prompt_codex_skips_skill_templates(db_factory, monkeypatch):
-    """Skill 模板描述 MCP 工具，MCP config 只注入 claude —— codex 不应收到模板。"""
+async def test_build_task_prompt_does_not_claim_enabled_skill_was_invoked(
+    db_factory, monkeypatch,
+):
+    """Availability is launch metadata; neither provider gets a fake invocation."""
     from backend.services.command_registry import COMMAND_REGISTRY, Command
     monkeypatch.setitem(COMMAND_REGISTRY, "fakeskill", Command(
         name="fakeskill", description="test", prompt_template="FAKESKILL_TEMPLATE",
@@ -6488,7 +6490,7 @@ async def test_build_task_prompt_codex_skips_skill_templates(db_factory, monkeyp
         Task(title="t", description="do X", provider="codex",
              enabled_skills={"fakeskill": True})
     )
-    assert "FAKESKILL_TEMPLATE" in claude_prompt
+    assert "FAKESKILL_TEMPLATE" not in claude_prompt
     assert "FAKESKILL_TEMPLATE" not in codex_prompt
 
 

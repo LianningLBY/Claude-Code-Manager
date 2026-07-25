@@ -58,7 +58,7 @@ async def send_chat_message(
         raise HTTPException(400, "No previous session on this task. Run the task first.")
 
     # Parse $command syntax
-    from backend.services.command_registry import parse_command, COMMAND_REGISTRY
+    from backend.services.command_registry import parse_command
     command, command_args = parse_command(body.message)
     command_skills: dict | None = None
 
@@ -81,7 +81,9 @@ async def send_chat_message(
             sender_display_name = sender.name
             display_content = f"[{sender.name}] {model_message}"
 
-    # Build prompt — append secrets, skill instructions, and image paths
+    # Explicit commands append their invocation instructions. Permanently
+    # enabled skills are advertised by the launch-time skill directory; merely
+    # enabling one must not be represented as a fresh user invocation.
     prompt_parts = [model_message]
     if command:
         # $command detected: inject command prompt and set temporary skills
@@ -89,14 +91,6 @@ async def send_chat_message(
         if command_args:
             prompt_parts[0] = command_args
         command_skills = command.required_skills or None
-    else:
-        # Normal message: inject prompts for permanently enabled skills
-        if task.enabled_skills:
-            for skill_name, enabled in task.enabled_skills.items():
-                if enabled and skill_name in COMMAND_REGISTRY:
-                    cmd = COMMAND_REGISTRY[skill_name]
-                    if not cmd.always_available:
-                        prompt_parts.append(cmd.prompt_template)
     if body.secret_ids:
         from backend.services.dispatcher import _build_secrets_block
         from backend.database import async_session

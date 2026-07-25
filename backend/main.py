@@ -137,6 +137,8 @@ if settings.codex_pool_enabled or _has_cloudrouter_codex_accounts:
         logger.exception("Codex pool init failed — codex pool disabled")
 
 _update_project_dir = str(Path(__file__).resolve().parent.parent)
+_update_runtime_root = None
+_legacy_update_runtime_root = "/tmp"
 if os.environ.get("CCM_TESTING") == "1":
     _test_project_dir = os.environ.get("CCM_TEST_PROJECT_DIR", "").strip()
     if not _test_project_dir:
@@ -144,6 +146,12 @@ if os.environ.get("CCM_TESTING") == "1":
             "CCM_TESTING requires an isolated CCM_TEST_PROJECT_DIR"
         )
     _update_project_dir = _test_project_dir
+    # Importing backend.main in tests must never scan host /tmp or write the
+    # service user's real cache, even if a test supplies a helper script.
+    _update_runtime_root = str(
+        Path(_test_project_dir) / ".ccm-update-runtime"
+    )
+    _legacy_update_runtime_root = None
 
 update_service = UpdateService(
     broadcaster=broadcaster,
@@ -151,6 +159,8 @@ update_service = UpdateService(
     project_dir=_update_project_dir,
     db_factory=async_session,
     dispatcher=dispatcher,
+    update_runtime_root=_update_runtime_root,
+    legacy_update_runtime_root=_legacy_update_runtime_root,
 )
 dispatcher.deployment_task_start_fence = (
     lambda: deployment_task_start_fence(update_service.project_dir)
@@ -547,7 +557,7 @@ def _prepare_deployment_start() -> StartDecision:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _runtime_lifespan(app: FastAPI):
     deployment_start = _prepare_deployment_start()
     update_service.maintenance_only = (
         deployment_start.maintenance_only
@@ -560,6 +570,10 @@ async def lifespan(app: FastAPI):
     # endpoints used by the maintenance-only process.
     from backend.services.tmp_space_manager import tmp_space_manager
     await tmp_space_manager.ensure_capacity(reason="startup")
+    # The module-level UpdateService captures the matching helper before the
+    # lifespan starts. Retry materialization after the capacity gate and also
+    # support lifespan re-entry from the immutable in-memory capture.
+    update_service.ensure_runtime_snapshot()
 
     if deployment_start.maintenance_only:
         # A failed/partial migration may leave the checked-out application
@@ -655,15 +669,32 @@ async def lifespan(app: FastAPI):
     # Org registry heartbeat — periodically re-register with the registry
     heartbeat_task = None
 
-    yield
+    try:
+        yield
+    finally:
+        await _shutdown_runtime_services(
+            heartbeat_task=heartbeat_task,
+            worker_health_task=worker_health_task,
+            upload_cleanup_task=upload_cleanup_task,
+            tmp_cleanup_task=tmp_cleanup_task,
+            backup_svc=backup_svc,
+        )
 
-    await _shutdown_runtime_services(
-        heartbeat_task=heartbeat_task,
-        worker_health_task=worker_health_task,
-        upload_cleanup_task=upload_cleanup_task,
-        tmp_cleanup_task=tmp_cleanup_task,
-        backup_svc=backup_svc,
-    )
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Always release the exact process-bound update snapshot on shutdown."""
+
+    try:
+        async with _runtime_lifespan(app):
+            yield
+    finally:
+        try:
+            update_service.close_runtime_snapshot()
+        except Exception:
+            # Startup stale-owner recovery will retry after crashes or an
+            # identity-safe graceful cleanup failure.
+            logger.exception("Trusted update runtime cleanup failed")
 
 
 app = FastAPI(title="Claude Code Manager", version="0.1.0", lifespan=lifespan)

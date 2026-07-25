@@ -107,6 +107,20 @@ async def test_pressure_cleanup_is_allowlist_age_and_symlink_safe(tmp_path):
     update_state.write_bytes(b"keep")
     _make_old(update_state)
 
+    update_log = tmp_path / "ccm-update-migrate-8003.log"
+    update_log.write_bytes(b"keep")
+    _make_old(update_log)
+
+    update_runtime = tmp_path / "ccm-update-runtime-8003-123-abcdefgh"
+    update_runtime.mkdir()
+    (update_runtime / "update_migrate.sh").write_bytes(b"keep")
+    _make_old(update_runtime)
+
+    update_run = tmp_path / "ccm-update-run-8003-deadbeef-abcdefgh"
+    update_run.mkdir()
+    (update_run / "update_migrate.sh").write_bytes(b"keep")
+    _make_old(update_run)
+
     recent = tmp_path / "ccm_sub_agent_21.log"
     recent.write_bytes(b"keep")
 
@@ -126,6 +140,9 @@ async def test_pressure_cleanup_is_allowlist_age_and_symlink_safe(tmp_path):
     assert unknown.exists()
     assert fixed_mcp.exists()
     assert update_state.exists()
+    assert update_log.exists()
+    assert update_runtime.exists()
+    assert update_run.exists()
     assert recent.exists()
     assert symlink.is_symlink()
     assert outside.read_bytes() == b"outside"

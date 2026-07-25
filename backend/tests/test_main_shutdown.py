@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -126,3 +127,24 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
 
     assert all(task.done() for task in tasks)
     assert all(done.is_set() for done in finalized)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_always_closes_trusted_update_runtime(monkeypatch):
+    import backend.main as main
+
+    update_service = MagicMock()
+
+    @asynccontextmanager
+    async def failing_runtime(_app):
+        yield
+        raise RuntimeError("runtime teardown failed")
+
+    monkeypatch.setattr(main, "_runtime_lifespan", failing_runtime)
+    monkeypatch.setattr(main, "update_service", update_service)
+
+    with pytest.raises(RuntimeError, match="runtime teardown failed"):
+        async with main.lifespan(MagicMock()):
+            pass
+
+    update_service.close_runtime_snapshot.assert_called_once_with()

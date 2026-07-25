@@ -28,6 +28,10 @@ from sqlalchemy import or_, select
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.services.git_info import git_head_commit
+from backend.services.update_runtime import (
+    TrustedUpdateRuntime,
+    UpdateRuntimeError,
+)
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -208,6 +212,8 @@ class UpdateService:
         db_factory: Any | None = None,
         dispatcher: Any | None = None,
         running_commit: str | None = None,
+        update_runtime_root: str | os.PathLike[str] | None = None,
+        legacy_update_runtime_root: str | os.PathLike[str] | None = "/tmp",
     ):
         self.broadcaster = broadcaster
         self.port = port
@@ -253,9 +259,17 @@ class UpdateService:
         )
         self._lease_token: str | None = None
         self._legacy_handoff = False
+        self._trusted_update_script_lock = threading.RLock()
         self._trusted_update_script: Path | None = None
         self._trusted_update_script_error = ""
+        self._trusted_update_runtime: TrustedUpdateRuntime | None = None
         try:
+            self._trusted_update_runtime = TrustedUpdateRuntime(
+                port=self.port,
+                running_commit=self._running_commit,
+                root=update_runtime_root,
+                legacy_root=legacy_update_runtime_root,
+            )
             self._trusted_update_script = self._snapshot_running_update_script()
         except Exception as exc:
             self._trusted_update_script_error = str(exc)
@@ -279,92 +293,75 @@ class UpdateService:
         return self._running_commit
 
     def _snapshot_running_update_script(self) -> Path:
-        """Create an immutable process-lifetime copy of the matching worker.
+        """Capture and materialize the immutable matching update worker.
 
         The checkout changes before the hand-off.  Executing the helper from
         that mutable checkout can pair this Python protocol with an older shell
         protocol (notably when updating to another branch or rolling back).
         """
+        runtime = self._trusted_update_runtime
+        if runtime is None:
+            raise UpdateRuntimeError("更新脚本专用运行目录尚未初始化")
         source = Path(self.project_dir) / "scripts" / "update_migrate.sh"
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        source_fd = os.open(source, flags)
-        runtime_dir: Path | None = None
-        try:
-            metadata = os.fstat(source_fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise RuntimeError(f"更新脚本不是普通文件: {source}")
-            runtime_dir = Path(
-                tempfile.mkdtemp(
-                    prefix=f"ccm-update-runtime-{self.port}-{os.getpid()}-",
-                    dir="/tmp",
-                )
-            )
-            os.chmod(runtime_dir, 0o700)
-            snapshot = runtime_dir / "update_migrate.sh"
-            temporary = runtime_dir / ".update_migrate.sh.tmp"
-            with os.fdopen(os.dup(source_fd), "rb", closefd=True) as src, open(
-                temporary, "xb"
-            ) as dst:
-                shutil.copyfileobj(src, dst)
-                dst.flush()
-                os.fsync(dst.fileno())
-            source_after = os.fstat(source_fd)
-            identity_before = (
-                metadata.st_dev,
-                metadata.st_ino,
-                metadata.st_size,
-                metadata.st_mtime_ns,
-            )
-            identity_after = (
-                source_after.st_dev,
-                source_after.st_ino,
-                source_after.st_size,
-                source_after.st_mtime_ns,
-            )
-            if identity_before != identity_after:
-                raise RuntimeError("更新脚本在创建可信快照时发生变化")
-            os.chmod(temporary, 0o500)
-            os.replace(temporary, snapshot)
-            directory_fd = os.open(runtime_dir, os.O_DIRECTORY)
+        return runtime.capture(source)
+
+    def ensure_runtime_snapshot(self) -> Path | None:
+        """Retry or rematerialize the process-bound trusted helper."""
+
+        with self._trusted_update_script_lock:
+            runtime = self._trusted_update_runtime
             try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+                if runtime is None:
+                    raise UpdateRuntimeError(
+                        "更新脚本专用运行目录尚未初始化"
+                    )
+                if not runtime.has_captured_script:
+                    raise UpdateRuntimeError(
+                        self._trusted_update_script_error
+                        or "进程启动时未能捕获匹配版本的更新脚本"
+                    )
+                snapshot = runtime.ensure_snapshot()
+            except Exception as exc:
+                self._trusted_update_script = None
+                self._trusted_update_script_error = str(exc)
+                logger.exception("Unable to ensure the trusted update helper")
+                return None
+            self._trusted_update_script = snapshot
+            self._trusted_update_script_error = ""
             return snapshot
-        except Exception:
-            if runtime_dir is not None:
-                shutil.rmtree(runtime_dir, ignore_errors=True)
-            raise
-        finally:
-            os.close(source_fd)
+
+    def close_runtime_snapshot(self) -> None:
+        """Remove only this process's exact trusted helper snapshot."""
+
+        with self._trusted_update_script_lock:
+            runtime = self._trusted_update_runtime
+            if runtime is None:
+                return
+            runtime.close()
+            self._trusted_update_script = None
 
     def _update_script_block_reason(self) -> str:
-        snapshot = self._trusted_update_script
-        if snapshot is None:
-            return (
-                "无法冻结与当前后端匹配的更新脚本，已拒绝停服操作: "
-                f"{self._trusted_update_script_error or '未知错误'}"
-            )
-        try:
-            metadata = snapshot.lstat()
-        except OSError as exc:
-            return f"更新脚本快照不可用，已拒绝停服操作: {exc}"
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
-            return "更新脚本快照身份异常，已拒绝停服操作"
-        try:
-            protocol = self._parse_update_script_protocol(
-                snapshot.read_text(encoding="utf-8")
-            )
-        except OSError as exc:
-            return f"无法读取更新脚本快照: {exc}"
-        if protocol != UPDATE_SCRIPT_PROTOCOL_VERSION:
-            return (
-                "当前运行版本的更新脚本协议不支持安全修复/重启"
-                f"（检测到 {protocol or 'legacy'}，需要 "
-                f"{UPDATE_SCRIPT_PROTOCOL_VERSION}）"
-            )
-        return ""
+        with self._trusted_update_script_lock:
+            snapshot = self.ensure_runtime_snapshot()
+            runtime = self._trusted_update_runtime
+            if snapshot is None or runtime is None:
+                return (
+                    "无法冻结与当前后端匹配的更新脚本，已拒绝停服操作: "
+                    f"{self._trusted_update_script_error or '未知错误'}"
+                )
+            try:
+                payload = runtime.read_verified_snapshot()
+                script = payload.decode("utf-8")
+            except (OSError, UnicodeDecodeError, UpdateRuntimeError) as exc:
+                return f"更新脚本快照不可用，已拒绝停服操作: {exc}"
+            protocol = self._parse_update_script_protocol(script)
+            if protocol != UPDATE_SCRIPT_PROTOCOL_VERSION:
+                return (
+                    "当前运行版本的更新脚本协议不支持安全修复/重启"
+                    f"（检测到 {protocol or 'legacy'}，需要 "
+                    f"{UPDATE_SCRIPT_PROTOCOL_VERSION}）"
+                )
+            return ""
 
     @staticmethod
     def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -2926,10 +2923,6 @@ class UpdateService:
         restart_failure_policy: str = "rollback",
     ):
         """Launch update_migrate.sh so it survives this service being stopped."""
-        block_reason = self._update_script_block_reason()
-        if block_reason:
-            raise RuntimeError(block_reason)
-        assert self._trusted_update_script is not None
         token_prefix = (self._lease_token or uuid.uuid4().hex)[:8]
         run_dir = Path(
             tempfile.mkdtemp(
@@ -2941,22 +2934,27 @@ class UpdateService:
         script = run_dir / "update_migrate.sh"
         temporary_script = run_dir / ".update_migrate.sh.tmp"
         try:
-            shutil.copyfile(self._trusted_update_script, temporary_script)
-            os.chmod(temporary_script, 0o700)
-            with temporary_script.open("rb") as handle:
-                os.fsync(handle.fileno())
-            os.replace(temporary_script, script)
-            directory_fd = os.open(run_dir, os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            with self._trusted_update_script_lock:
+                block_reason = self._update_script_block_reason()
+                if block_reason:
+                    raise RuntimeError(block_reason)
+                runtime = self._trusted_update_runtime
+                if runtime is None:
+                    raise RuntimeError("更新脚本专用运行目录尚未初始化")
+                runtime.copy_snapshot_to(temporary_script, mode=0o700)
+                os.replace(temporary_script, script)
+                directory_fd = os.open(run_dir, os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                if not self._update_deployment_lease(
+                    run_copy_dir=str(run_dir)
+                ):
+                    raise RuntimeError("无法把部署脚本副本绑定到当前租约")
         except Exception:
             shutil.rmtree(run_dir, ignore_errors=True)
             raise
-        if not self._update_deployment_lease(run_copy_dir=str(run_dir)):
-            shutil.rmtree(run_dir, ignore_errors=True)
-            raise RuntimeError("无法把部署脚本副本绑定到当前租约")
         log_file = f"/tmp/ccm-update-migrate-{self.port}.log"
 
         env = os.environ.copy()

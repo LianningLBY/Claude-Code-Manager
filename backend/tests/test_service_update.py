@@ -53,6 +53,8 @@ def _make_service(
         db_factory=db_factory,
         dispatcher=dispatcher,
         running_commit=running_commit,
+        update_runtime_root=tmp_path / ".update-runtime",
+        legacy_update_runtime_root=tmp_path / ".legacy-update-runtime",
     )
     svc._status_file = tmp_path / "status.json"
     svc._journal_file = tmp_path / "backups" / "deployment-status.json"
@@ -100,6 +102,83 @@ def _make_gate_dispatcher(db_factory):
 
 
 # ---- update safety and version detection ----
+
+
+def test_helper_missing_at_process_start_cannot_be_captured_late(tmp_path):
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    svc = UpdateService(
+        broadcaster,
+        port=8999,
+        project_dir=str(tmp_path),
+        running_commit="a" * 40,
+        update_runtime_root=tmp_path / ".update-runtime",
+        legacy_update_runtime_root=tmp_path / ".legacy-update-runtime",
+    )
+    assert svc._trusted_update_script is None
+
+    helper = tmp_path / "scripts" / "update_migrate.sh"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        "#!/bin/bash\nCCM_UPDATE_PROTOCOL_VERSION=2\nexit 0\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+
+    assert svc.ensure_runtime_snapshot() is None
+    assert "已拒绝停服操作" in svc._update_script_block_reason()
+
+
+def test_captured_helper_can_retry_materialization_after_startup_gate(tmp_path):
+    helper = tmp_path / "scripts" / "update_migrate.sh"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        "#!/bin/bash\nCCM_UPDATE_PROTOCOL_VERSION=2\nexit 0\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    runtime_root = tmp_path / ".update-runtime"
+    runtime_root.symlink_to(outside, target_is_directory=True)
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    svc = UpdateService(
+        broadcaster,
+        port=8999,
+        project_dir=str(tmp_path),
+        running_commit="a" * 40,
+        update_runtime_root=runtime_root,
+        legacy_update_runtime_root=tmp_path / ".legacy-update-runtime",
+    )
+    assert svc._trusted_update_script is None
+    assert svc._trusted_update_runtime is not None
+    assert svc._trusted_update_runtime.has_captured_script is True
+
+    runtime_root.unlink()
+    snapshot = svc.ensure_runtime_snapshot()
+
+    assert snapshot is not None
+    assert svc._update_script_block_reason() == ""
+    svc.close_runtime_snapshot()
+
+
+def test_deleted_runtime_directory_is_rematerialized_from_captured_bytes(
+    tmp_path,
+):
+    svc = _make_service(tmp_path)
+    first = svc._trusted_update_script
+    assert first is not None
+    first_dir = first.parent
+    first.unlink()
+    (first_dir / "owner.json").unlink()
+    first_dir.rmdir()
+
+    assert svc._update_script_block_reason() == ""
+    assert svc._trusted_update_script is not None
+    assert svc._trusted_update_script != first
+    assert svc._trusted_update_script.is_file()
+    svc.close_runtime_snapshot()
 
 
 @pytest.mark.asyncio

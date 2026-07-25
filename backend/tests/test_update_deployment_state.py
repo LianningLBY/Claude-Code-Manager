@@ -53,6 +53,8 @@ def _service(
         db_factory=db_factory,
         dispatcher=dispatcher,
         running_commit=running_commit,
+        update_runtime_root=tmp_path / ".update-runtime",
+        legacy_update_runtime_root=tmp_path / ".legacy-update-runtime",
     )
     service._status_file = tmp_path / "status.json"
     service._journal_file = tmp_path / "backups" / "status.json"
@@ -1295,6 +1297,8 @@ async def test_maintenance_repair_never_queries_incompatible_orm(tmp_path):
         project_dir=str(tmp_path),
         db_factory=broken_factory,
         running_commit="a" * 40,
+        update_runtime_root=tmp_path / ".update-runtime",
+        legacy_update_runtime_root=tmp_path / ".legacy-update-runtime",
     )
     service._status_file = tmp_path / "status.json"
     service._journal_file = tmp_path / "backups" / "status.json"
@@ -1467,6 +1471,8 @@ def test_spawn_passes_protocol_v2_run_copy_directory(tmp_path):
     run_dir = Path(argv[-1])
     assert run_dir.name.startswith("ccm-update-run-")
     assert Path(argv[1]).parent == run_dir
+    service.close_runtime_snapshot()
+    assert Path(argv[1]).is_file()
 
 
 def test_ambiguous_systemd_launch_keeps_lease_and_run_copy(tmp_path):

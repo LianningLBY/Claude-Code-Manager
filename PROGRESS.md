@@ -908,3 +908,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **实现**：新增 `TmpSpaceManager`，触发后按大小遍历并处理全部超过 6 小时的 CCM 唯一命名普通文件；低于 80% 不扫描。SSH 下载响应结束即删除 staging。共享 Project 容器的独立 2GB tmpfs 在每次 Agent 启动前执行同阈值门禁，只有取得独占 lease 且证明容器空闲时才整棵清空；新建容器带 Docker `--init`，但不会仅为补 init 强拆现有容器。
 - **安全边界**：宿主只做顶层 regular-file `rename + unlink`，不递归目录；session/workspace 迁移 staging、固定名 MCP、Monitor 日志、更新/回滚证据、登录资料、未知文件和 symlink 均排除。单进程检查合并、跨进程 flock 串行，扫描后再次核对 UID/device/inode/type/mtime；取消与关机等待在途文件操作落稳。容器 Agent 全生命周期持共享 lease，压力门禁 busy/未知时 fail closed，PTY 不得回退宿主裸进程。
 - **验证**：定向回归 80 passed；后端全量 2362 passed。全量测试前后开发 DB/WAL/SHM 的 inode、mtime、size、SHA-256 完全一致；真实 `/tmp` 检查为容量约 4.6%、inode 约 1.4%，未触发删除。代码仅提交在开发环境本地 `main`，未 push，生产未触碰。
+
+### 2026-07-25 — 更新脚本可信快照生命周期管理
+
+- **问题**：运行中后端为了抵抗 checkout 变更，会把匹配版本的 `update_migrate.sh` 冻结到 `/tmp/ccm-update-runtime-*`；它没有正常关停清理，测试与重启会持续累积，而人工清空 `/tmp` 又会删除活跃快照，导致更新器在停服前 fail-closed。
+- **解决**：新增 `TrustedUpdateRuntime`，把进程级可信快照迁到 owner-only 的 `~/.cache/ccm/update-runtime`（可由 `CCM_UPDATE_RUNTIME_DIR` 覆盖）。脚本内容在进程内只捕获一次并以 SHA-256、inode、权限复核；0700 目录内的 0600 owner 标记绑定 boot ID、PID start tick、uid、port 和目录身份。正常 lifespan 精确删除自身平面目录，异常退出由下次启动只回收可证明死亡的 owner；旧版 `/tmp` 快照也只在 PID 不存在且无未知内容时清理。执行单次更新前仍复制到租约绑定的 `/tmp/ccm-update-run-*`，外部 worker 的既有自清理协议不变。
+- **安全边界**：读取和复制可信脚本均用 O_NOFOLLOW，并在复制时持生命周期锁；PID 复用、跨 boot、owner 损坏、`/proc` 不可确认、symlink、inode 替换或额外文件均按 fail-closed 处理。通用 `/tmp` 压力清理继续完全排除所有 `ccm-update-*`。
+- **验证**：专项 124 passed，后端全量 2377 passed，`compileall` 与 `git diff --check` 通过；全量测试前后开发 DB/WAL/SHM 的 inode、大小、mtime、SHA-256 完全一致。8003 连续重启两次后健康，旧 `/tmp` runtime 目录从 350 个收敛为 0；第一次新进程快照在第二次 shutdown 被精确删除，专用根始终只留当前 PID 的 1 份快照。真实 update dry-run 返回 `update_supported=true`、`update_block_reason=""`、0 blockers；8002 PID/监听未变化

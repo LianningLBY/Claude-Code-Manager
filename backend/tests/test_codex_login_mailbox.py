@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -971,6 +972,60 @@ async def test_add_spawn_failure_rolls_back_journal_without_creating_home(
     assert not codex_pool_api._login_lock.locked()
 
 
+async def test_add_cleans_failed_login_runtime_residue_before_spawn(
+    monkeypatch, tmp_path,
+):
+    failed_home = tmp_path / ".codex-codex-2"
+    (failed_home / "log" / "nested").mkdir(parents=True)
+    (failed_home / "log" / "nested" / "codex.log").write_text("no credentials\n")
+    (failed_home / "tmp").mkdir()
+    (failed_home / "tmp" / "browser.tmp").write_text("transient\n")
+    (failed_home / "models_cache.json").write_text("{}\n")
+    pool = SimpleNamespace(
+        _accounts=[SimpleNamespace(id="codex-1")],
+        reload=Mock(),
+        _quota_cache=None,
+    )
+    manager = _maintenance_manager()
+
+    async def fail_after_asserting_clean_home(*_cmd, **_kwargs):
+        assert failed_home.is_dir()
+        assert list(failed_home.iterdir()) == []
+        assert failed_home.stat().st_mode & 0o777 == 0o700
+        raise OSError("stop after cleanup")
+
+    monkeypatch.setattr(codex_pool_api.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
+    monkeypatch.setattr(codex_pool_api, "_get_instance_manager", lambda: manager)
+    monkeypatch.setattr(codex_pool_api, "_ensure_xvfb", AsyncMock())
+    monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        codex_pool_api.asyncio,
+        "create_subprocess_exec",
+        fail_after_asserting_clean_home,
+    )
+    codex_pool_api._add_state.clear()
+
+    with pytest.raises(OSError, match="stop after cleanup"):
+        await codex_pool_api.codex_add_account(
+            _admin_request(),
+            codex_pool_api.AddCodexAccountRequest(
+                email="reuse-failed-slot@mail.com",
+                password="openai-password",
+                login_method="mailcom",
+            ),
+        )
+
+    manager.begin_codex_app_server_home_maintenance.assert_awaited_once_with(
+        str(failed_home), require_idle=True,
+    )
+    manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
+        str(failed_home)
+    )
+    assert list(failed_home.iterdir()) == []
+    assert not codex_pool_api._login_lock.locked()
+
+
 def test_add_account_home_allocator_never_reuses_retained_rollout_directory(
     monkeypatch, tmp_path,
 ):
@@ -1001,6 +1056,77 @@ def test_add_account_home_allocator_reuses_failed_empty_slot(monkeypatch, tmp_pa
 
     assert account_id == "codex-2"
     assert codex_home == str(failed_home)
+
+
+def test_add_account_home_allocator_reuses_failed_runtime_only_slot(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(codex_pool_api.Path, "home", lambda: tmp_path)
+    failed_home = tmp_path / ".codex-codex-2"
+    (failed_home / "log" / "nested").mkdir(parents=True)
+    (failed_home / "log" / "nested" / "codex.log").write_text("runtime only\n")
+    (failed_home / "tmp").mkdir()
+    (failed_home / "tmp" / "browser.tmp").write_text("runtime only\n")
+    (failed_home / "models_cache.json").write_text("{}\n")
+    pool = SimpleNamespace(_accounts=[SimpleNamespace(id="codex-1")])
+
+    account_id, codex_home = codex_pool_api._allocate_codex_account_home(pool)
+
+    assert account_id == "codex-2"
+    assert codex_home == str(failed_home)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "entry_type"),
+    [
+        ("auth.json", "file"),
+        ("sessions", "directory"),
+        ("config.toml", "file"),
+        ("state_5.sqlite", "file"),
+    ],
+)
+def test_add_account_home_allocator_rejects_identity_or_durable_state(
+    monkeypatch, tmp_path, relative_path, entry_type,
+):
+    monkeypatch.setattr(codex_pool_api.Path, "home", lambda: tmp_path)
+    failed_home = tmp_path / ".codex-codex-2"
+    failed_home.mkdir()
+    entry = failed_home / relative_path
+    if entry_type == "directory":
+        entry.mkdir()
+    else:
+        entry.write_text("identity-bearing state\n")
+    pool = SimpleNamespace(_accounts=[SimpleNamespace(id="codex-1")])
+
+    account_id, codex_home = codex_pool_api._allocate_codex_account_home(pool)
+
+    assert account_id == "codex-3"
+    assert codex_home == str(tmp_path / ".codex-codex-3")
+
+
+def test_failed_login_home_reuse_rejects_symlinks_and_special_files(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(codex_pool_api.Path, "home", lambda: tmp_path)
+    failed_home = tmp_path / ".codex-codex-2"
+    log_dir = failed_home / "log"
+    log_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.log"
+    outside.write_text("must remain untouched\n")
+    (log_dir / "linked.log").symlink_to(outside)
+
+    assert codex_pool_api._failed_login_home_is_reusable(failed_home) is False
+    with pytest.raises(RuntimeError, match="unsafe failed-login CODEX_HOME"):
+        codex_pool_api._purge_failed_login_codex_home(failed_home)
+    assert outside.read_text() == "must remain untouched\n"
+    assert (log_dir / "linked.log").is_symlink()
+
+    (log_dir / "linked.log").unlink()
+    os.mkfifo(log_dir / "runtime.fifo")
+    assert codex_pool_api._failed_login_home_is_reusable(failed_home) is False
+    with pytest.raises(RuntimeError, match="unsafe failed-login CODEX_HOME"):
+        codex_pool_api._purge_failed_login_codex_home(failed_home)
+    assert stat.S_ISFIFO((log_dir / "runtime.fifo").lstat().st_mode)
 
 
 def test_add_account_home_allocator_rejects_unknown_failed_home_data(

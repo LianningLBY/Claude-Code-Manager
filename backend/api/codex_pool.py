@@ -1080,19 +1080,100 @@ async def _rollback_unspawned_login_transaction(
             login_lock.release()
 
 
-def _failed_login_home_is_reusable(codex_home: Path) -> bool:
-    """Only an empty home (optionally models cache) is safe for a new identity."""
+_FAILED_LOGIN_REUSABLE_FILES = frozenset({"models_cache.json"})
+_FAILED_LOGIN_REUSABLE_DIRS = frozenset({"log", "tmp"})
 
-    if not codex_home.is_dir() or codex_home.is_symlink():
+
+def _plain_failed_login_runtime_tree(path: Path) -> bool:
+    """Accept only ordinary files/directories below a disposable runtime dir."""
+
+    pending = [path]
+    try:
+        while pending:
+            directory = pending.pop()
+            for child in directory.iterdir():
+                mode = child.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    return False
+                if stat.S_ISDIR(mode):
+                    # Never recursively remove a mounted tree as login residue.
+                    if os.path.ismount(child):
+                        return False
+                    pending.append(child)
+                elif not stat.S_ISREG(mode):
+                    return False
+    except OSError:
         return False
-    for child in codex_home.iterdir():
-        if (
-            child.name != "models_cache.json"
-            or child.is_symlink()
-            or not child.is_file()
-        ):
-            return False
     return True
+
+
+def _failed_login_home_is_reusable(codex_home: Path) -> bool:
+    """Prove an orphan home contains only disposable failed-login residue.
+
+    Codex may create ``log/`` and ``tmp/`` before authentication completes,
+    and may also refresh ``models_cache.json``.  Identity-bearing or durable
+    state (for example auth, config, state, history, or sessions) is not on
+    this allowlist and keeps the slot quarantined.
+    """
+
+    try:
+        if not codex_home.is_dir() or codex_home.is_symlink():
+            return False
+        for child in codex_home.iterdir():
+            mode = child.lstat().st_mode
+            if child.name in _FAILED_LOGIN_REUSABLE_FILES:
+                if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                    return False
+            elif child.name in _FAILED_LOGIN_REUSABLE_DIRS:
+                if (
+                    stat.S_ISLNK(mode)
+                    or not stat.S_ISDIR(mode)
+                    or os.path.ismount(child)
+                    or not _plain_failed_login_runtime_tree(child)
+                ):
+                    return False
+            else:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _purge_failed_login_codex_home(codex_home: Path) -> None:
+    """Clear a proven credential-free orphan home before assigning it."""
+
+    codex_home = _managed_codex_home_path(codex_home)
+    if not _failed_login_home_is_reusable(codex_home):
+        raise RuntimeError(
+            f"Refusing to purge unsafe failed-login CODEX_HOME: {codex_home}"
+        )
+
+    os.chmod(codex_home, 0o700)
+    for child in list(codex_home.iterdir()):
+        # Re-check the entry type immediately before removing it.  rmtree does
+        # not follow directory symlinks, but rejecting a changed entry keeps
+        # the operation fail-closed instead of silently normalizing a race.
+        mode = child.lstat().st_mode
+        if child.name in _FAILED_LOGIN_REUSABLE_FILES and stat.S_ISREG(mode):
+            child.unlink()
+        elif (
+            child.name in _FAILED_LOGIN_REUSABLE_DIRS
+            and stat.S_ISDIR(mode)
+            and not stat.S_ISLNK(mode)
+            and not os.path.ismount(child)
+            and _plain_failed_login_runtime_tree(child)
+        ):
+            shutil.rmtree(child)
+        else:
+            raise RuntimeError(
+                f"Failed-login CODEX_HOME changed during cleanup: {child}"
+            )
+
+    if any(codex_home.iterdir()):
+        raise RuntimeError(
+            f"Failed-login CODEX_HOME was not fully cleaned: {codex_home}"
+        )
+    _fsync_directory(codex_home)
 
 
 def _retired_account_slot_index(account) -> int | None:
@@ -1865,6 +1946,17 @@ async def codex_add_account(request: Request, body: AddCodexAccountRequest):
                     detail=f"Codex 账号槽位 {account_id} 已变化，请重试",
                 )
             _purge_retired_codex_home(Path(codex_home), account_id)
+        elif Path(codex_home).exists():
+            # A failed first login has no pool record or rollback marker.
+            # Re-prove and remove only its credential-free runtime residue
+            # while the destination home is fenced from app-server traffic.
+            try:
+                _purge_failed_login_codex_home(Path(codex_home))
+            except (OSError, RuntimeError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Codex 账号槽位 {account_id} 已变化，请重试",
+                ) from exc
         journal_path = _begin_login_transaction(
             attempt_id=attempt_id,
             kind="add",
@@ -2278,6 +2370,13 @@ async def codex_delete_account(request: Request, account_id: str):
 
 @router.post("/preferred")
 async def codex_set_preferred(request: Request, body: dict):
+    """Pin a Codex route, or clear it to restore automatic selection.
+
+    A compatible available pin takes effect on the next turn. Existing native
+    rollout context is copied and the app-server thread is rebound before the
+    Task binding changes; a failed migration keeps the intact resident route.
+    Without a pin, resident threads stay sticky and fresh routes prefer API.
+    """
     require_admin(request)
     pool = _get_pool()
     account_id = body.get("account_id")

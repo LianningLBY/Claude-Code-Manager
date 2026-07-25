@@ -901,3 +901,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：统一路由优先级为 preferred → 已有 session resident/bound → 新 session 兼容可用 API → 原生号池 fallback，禁止模型降级。Claude/Codex 都把账号 ID 持久绑定到 Task；Codex 在复制前先锚定 registered source，再把 copy、app-server rebind 和 target binding 作为 cancellation-settled 单元。`select()` 只提案，Codex 另用 selection cursor 保持轮询；`last_selected` 只在 binding 提交或临时进程实际 spawn 后更新。临时冷却保留原 queued message，已知额度耗尽/认证终态直接显示失败。进程退出标签按 Claude/Codex 与 API/native 实际路由生成；Codex exec/app-server 的 `turn.failed` 保留原始 provider 错误，不再追加 generic exit。
 - **预防**：账号选择、物理 session 副本、live transport owner、Task binding 和 UI marker 必须有明确 commit 顺序；任何 `asyncio.to_thread` 文件迁移都不能让 cancellation 在副本落盘后、durable owner 提交前逸出。失败补偿不能靠再次写全局 marker，而应让候选和已提交路由从结构上分离。
 - **验证**：路由/号池/Dispatcher/InstanceManager/Distill/Goal 专项 711 passed；provider 退出归因专项 6 passed；新增 rollout/Claude session copy 取消、generation change、proactive cancel 与 binding-commit cancel 等确定性并发回归。后端最终全量 2337 passed，前端全量 388 passed，TypeScript/Vite production build 与 `git diff --check` 通过；全量测试前后开发 DB/WAL/SHM 的 inode、mtime、size、SHA-256 完全一致。改动通过事务化 repair 加载到开发 8003，未触碰生产。
+
+### 2026-07-25 — `/tmp` 达到 80% 后清理全部安全候选（commit 86a2122）
+
+- **需求**：Agent 的 Bash 依赖可用 `/tmp`；服务启动时检查一次，之后每 3 小时检查容量与 inode，任一达到 80% 即清理，不设置“清到多少停止”的目标线。
+- **实现**：新增 `TmpSpaceManager`，触发后按大小遍历并处理全部超过 6 小时的 CCM 唯一命名普通文件；低于 80% 不扫描。SSH 下载响应结束即删除 staging。共享 Project 容器的独立 2GB tmpfs 在每次 Agent 启动前执行同阈值门禁，只有取得独占 lease 且证明容器空闲时才整棵清空；新建容器带 Docker `--init`，但不会仅为补 init 强拆现有容器。
+- **安全边界**：宿主只做顶层 regular-file `rename + unlink`，不递归目录；session/workspace 迁移 staging、固定名 MCP、Monitor 日志、更新/回滚证据、登录资料、未知文件和 symlink 均排除。单进程检查合并、跨进程 flock 串行，扫描后再次核对 UID/device/inode/type/mtime；取消与关机等待在途文件操作落稳。容器 Agent 全生命周期持共享 lease，压力门禁 busy/未知时 fail closed，PTY 不得回退宿主裸进程。
+- **验证**：定向回归 80 passed；后端全量 2362 passed。全量测试前后开发 DB/WAL/SHM 的 inode、mtime、size、SHA-256 完全一致；真实 `/tmp` 检查为容量约 4.6%、inode 约 1.4%，未触发删除。代码仅提交在开发环境本地 `main`，未 push，生产未触碰。

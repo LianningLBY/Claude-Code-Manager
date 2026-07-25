@@ -743,7 +743,17 @@ class InstanceManager:
                                 instance_id,
                             )
                             self._container_tasks[instance_id] = _container_project_id
-            except Exception:
+            except Exception as exc:
+                # Shared Projects must never escape their isolation boundary
+                # because the container's private /tmp is pressured, busy, or
+                # unverifiable.  The container supervisor independently
+                # repeats this gate immediately before child creation.
+                from backend.services.container_manager import (
+                    ContainerTmpPressureError,
+                )
+
+                if isinstance(exc, ContainerTmpPressureError):
+                    raise
                 logger.debug("Container setup failed, falling back to bare process")
 
         if provider == "codex" and settings.codex_app_server_enabled:

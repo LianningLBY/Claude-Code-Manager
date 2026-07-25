@@ -19,6 +19,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.config import settings
 from backend.services.process_safety import require_safe_process_group_id
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,314 @@ CONTAINER_PREFIX = "ccm-project-"
 _EXEC_TOKEN_ENV = "CCM_CONTAINER_EXEC_TOKEN"
 _EXEC_ROLE_ENV = "CCM_CONTAINER_EXEC_ROLE"
 _API_ACCOUNT_CONTAINER_ROOT = "/home/sandbox/.ccm-api-account"
+_TMP_RUNTIME_DIR = "/home/sandbox/.ccm-runtime"
+_TMP_LEASE_PATH = f"{_TMP_RUNTIME_DIR}/tmp-pressure.lock"
+_TMP_ROOT = "/tmp"
+
+
+class ContainerTmpPressureError(RuntimeError):
+    """A shared-container Agent cannot safely use its isolated temporary FS."""
+
+
+# The lease inode is created by root under a root-owned directory and exposed
+# read-only to the sandbox uid.  Agent code can contend on the inode (causing a
+# safe denial of service) but cannot unlink/replace it and split the lock.
+_TMP_LEASE_INIT = r"""
+import os
+import stat
+import sys
+
+runtime_dir, lease_path = sys.argv[1:3]
+runtime_parent = os.path.dirname(runtime_dir)
+parent_stat = os.lstat(runtime_parent)
+parent_is_protected = (
+    stat.S_ISDIR(parent_stat.st_mode)
+    and not stat.S_ISLNK(parent_stat.st_mode)
+    and parent_stat.st_uid == 0
+    and (
+        (parent_stat.st_mode & 0o022) == 0
+        or (parent_stat.st_mode & stat.S_ISVTX) != 0
+    )
+)
+if not parent_is_protected:
+    raise SystemExit("unsafe CCM runtime parent directory")
+os.makedirs(runtime_dir, mode=0o755, exist_ok=True)
+runtime_stat = os.lstat(runtime_dir)
+if (
+    not stat.S_ISDIR(runtime_stat.st_mode)
+    or stat.S_ISLNK(runtime_stat.st_mode)
+    or runtime_stat.st_uid != 0
+    or runtime_stat.st_mode & 0o022
+):
+    raise SystemExit("unsafe CCM runtime directory")
+
+flags = os.O_RDONLY | os.O_CREAT
+flags |= getattr(os, "O_CLOEXEC", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(lease_path, flags, 0o444)
+try:
+    lease_stat = os.fstat(fd)
+    if (
+        not stat.S_ISREG(lease_stat.st_mode)
+        or lease_stat.st_uid != 0
+        or lease_stat.st_nlink != 1
+        or lease_stat.st_mode & 0o222
+    ):
+        raise SystemExit("unsafe CCM tmp-pressure lease")
+    os.fchmod(fd, 0o444)
+finally:
+    os.close(fd)
+"""
+
+
+# This library is sent to the sandbox rather than imported there: the image
+# intentionally does not mount CCM's backend source.  Its safety boundary is
+# the root-owned flock plus an idle /proc proof.  /tmp is a private tmpfs for
+# this one Project container, so after that proof the whole filesystem is a
+# disposable sandbox (unlike the host /tmp, which uses a narrow allow-list).
+_TMP_PRESSURE_LIB = r"""
+import fcntl
+import os
+import shutil
+import stat
+
+TMP_BUSY_EXIT = 75
+TMP_UNSAFE_EXIT = 76
+
+class TmpPressureGateError(RuntimeError):
+    def __init__(self, message, exit_code=TMP_UNSAFE_EXIT):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+def _usage_ratios(tmp_root):
+    values = os.statvfs(tmp_root)
+    if values.f_blocks <= 0:
+        bytes_ratio = 1.0
+    else:
+        bytes_ratio = 1.0 - (values.f_bavail / values.f_blocks)
+    if values.f_files <= 0:
+        inode_ratio = None
+    else:
+        inode_ratio = 1.0 - (values.f_favail / values.f_files)
+    return bytes_ratio, inode_ratio
+
+def _under_ratio(ratios, ratio):
+    return all(value is None or value < ratio for value in ratios)
+
+def _open_lease(lease_path, expected_owner):
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lease_path, flags)
+    lease_stat = os.fstat(fd)
+    if (
+        not stat.S_ISREG(lease_stat.st_mode)
+        or lease_stat.st_uid != expected_owner
+        or lease_stat.st_nlink != 1
+        or lease_stat.st_mode & 0o222
+    ):
+        os.close(fd)
+        raise TmpPressureGateError("unsafe CCM tmp-pressure lease inode")
+    return fd
+
+def _read_process_command(pid):
+    with open("/proc/%d/cmdline" % pid, "rb") as stream:
+        return [value for value in stream.read().split(b"\0") if value]
+
+def _read_process_parent(pid):
+    with open("/proc/%d/stat" % pid, "rb") as stream:
+        raw = stream.read()
+    close = raw.rfind(b")")
+    fields = raw[close + 2:].split() if close >= 0 else []
+    if len(fields) < 2:
+        raise ProcessLookupError(pid)
+    return int(fields[1])
+
+def _is_idle_tail(command):
+    return (
+        len(command) == 3
+        and os.path.basename(command[0]) == b"tail"
+        and command[1:] == [b"-f", b"/dev/null"]
+    )
+
+def _unexpected_processes():
+    current_pid = os.getpid()
+    unexpected = []
+    try:
+        process_entries = [
+            int(entry) for entry in os.listdir("/proc") if entry.isdigit()
+        ]
+        pid_one_command = _read_process_command(1)
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return [1]
+
+    allowed = set()
+    if _is_idle_tail(pid_one_command):
+        # Compatibility for containers created before CCM added --init.
+        pass
+    elif (
+        len(pid_one_command) == 5
+        and os.path.basename(pid_one_command[0]) in (b"docker-init", b"tini")
+        and pid_one_command[1] == b"--"
+        and _is_idle_tail(pid_one_command[2:])
+    ):
+        idle_children = []
+        for pid in process_entries:
+            if pid in (1, current_pid):
+                continue
+            try:
+                command = _read_process_command(pid)
+                parent = _read_process_parent(pid)
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if parent == 1 and _is_idle_tail(command):
+                idle_children.append(pid)
+        if len(idle_children) == 1:
+            allowed.add(idle_children[0])
+        else:
+            unexpected.append(1)
+    else:
+        unexpected.append(1)
+
+    for pid in process_entries:
+        if pid in (1, current_pid) or pid in allowed:
+            continue
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as stream:
+                stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            # It exited between /proc enumeration and inspection.
+            continue
+        except PermissionError:
+            # A live but unverifiable process is not an idle proof.
+            unexpected.append(pid)
+            continue
+        # Do not trust a role environment variable to exempt a process here:
+        # Agent-controlled Bash can forge its environment. Concurrent probes
+        # may therefore cause a conservative busy result, but can never make
+        # an active process invisible to cleanup.
+        unexpected.append(pid)
+    return unexpected
+
+def _validate_tree(path, root_device):
+    metadata = os.lstat(path)
+    if metadata.st_dev != root_device:
+        raise TmpPressureGateError("refusing nested filesystem under /tmp")
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return
+    for current_root, directories, files in os.walk(
+        path, topdown=True, followlinks=False
+    ):
+        current_stat = os.lstat(current_root)
+        if current_stat.st_dev != root_device:
+            raise TmpPressureGateError("refusing nested filesystem under /tmp")
+        for name in directories + files:
+            child_stat = os.lstat(os.path.join(current_root, name))
+            if child_stat.st_dev != root_device:
+                raise TmpPressureGateError(
+                    "refusing nested filesystem under /tmp"
+                )
+
+def _clear_private_tmp(tmp_root):
+    root_stat = os.lstat(tmp_root)
+    if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+        raise TmpPressureGateError("container /tmp is not a real directory")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise TmpPressureGateError("safe recursive deletion is unavailable")
+    for entry in os.scandir(tmp_root):
+        path = entry.path
+        _validate_tree(path, root_stat.st_dev)
+        metadata = os.lstat(path)
+        if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+
+def acquire_agent_tmp_lease(
+    tmp_root,
+    lease_path,
+    expected_owner,
+    trigger_ratio,
+):
+    if not 0 < trigger_ratio <= 1:
+        raise TmpPressureGateError("invalid tmp pressure threshold")
+
+    lease_fd = _open_lease(lease_path, expected_owner)
+    try:
+        # Every Agent holds SH from before it creates a pid file/child until
+        # the supervisor has killed and reaped the complete inner group.
+        fcntl.flock(lease_fd, fcntl.LOCK_SH)
+        before = _usage_ratios(tmp_root)
+        if _under_ratio(before, trigger_ratio):
+            return lease_fd
+
+        fcntl.flock(lease_fd, fcntl.LOCK_UN)
+        try:
+            fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # If another cleaner owns EX, this blocks until its result is
+            # visible. If Agents own SH, SH succeeds immediately and pressure
+            # remains, so this launch fails without interrupting them.
+            fcntl.flock(lease_fd, fcntl.LOCK_SH)
+            after_wait = _usage_ratios(tmp_root)
+            if _under_ratio(after_wait, trigger_ratio):
+                return lease_fd
+            raise TmpPressureGateError(
+                "container /tmp is pressured while an Agent is active",
+                TMP_BUSY_EXIT,
+            )
+
+        # Re-read under EX in case a sibling cleaner won the race first.
+        under_exclusive = _usage_ratios(tmp_root)
+        if not _under_ratio(under_exclusive, trigger_ratio):
+            unexpected = _unexpected_processes()
+            if unexpected:
+                raise TmpPressureGateError(
+                    "container is not idle; unexpected pids: "
+                    + ",".join(str(pid) for pid in unexpected),
+                    TMP_BUSY_EXIT,
+                )
+            _clear_private_tmp(tmp_root)
+            after_cleanup = _usage_ratios(tmp_root)
+            if not _under_ratio(after_cleanup, trigger_ratio):
+                raise TmpPressureGateError(
+                    "container /tmp remains at the pressure threshold"
+                )
+
+        # Conversion may briefly queue behind another waiter, but no Agent
+        # child exists yet; the returned SH is held before child creation.
+        fcntl.flock(lease_fd, fcntl.LOCK_SH)
+        final_usage = _usage_ratios(tmp_root)
+        if not _under_ratio(final_usage, trigger_ratio):
+            raise TmpPressureGateError(
+                "container /tmp returned to pressure before Agent launch"
+            )
+        return lease_fd
+    except BaseException:
+        os.close(lease_fd)
+        raise
+"""
+
+
+_TMP_PRESSURE_PREFLIGHT = _TMP_PRESSURE_LIB + r"""
+import sys
+
+tmp_root = sys.argv[1]
+lease_path = sys.argv[2]
+expected_owner = int(sys.argv[3])
+trigger_ratio = float(sys.argv[4])
+try:
+    lease_fd = acquire_agent_tmp_lease(
+        tmp_root,
+        lease_path,
+        expected_owner,
+        trigger_ratio,
+    )
+except TmpPressureGateError as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(exc.exit_code)
+os.close(lease_fd)
+"""
 
 
 class ContainerExecSpawnCleanupError(RuntimeError):
@@ -68,16 +377,34 @@ class _ContainerExec:
 # gives the inner command its own session, publishes its group identity, and
 # reaps/kills any group members which outlive the command leader.  Arguments
 # are passed positionally, never interpolated into shell source.
-_EXEC_SUPERVISOR = r"""
+_EXEC_SUPERVISOR = _TMP_PRESSURE_LIB + r"""
 import os
 import signal
 import sys
 import time
 
-pid_file = sys.argv[1]
-command = sys.argv[2:]
+tmp_enabled = sys.argv[1] == "1"
+tmp_root = sys.argv[2]
+tmp_lease_path = sys.argv[3]
+tmp_lease_owner = int(sys.argv[4])
+tmp_trigger_ratio = float(sys.argv[5])
+pid_file = sys.argv[6]
+command = sys.argv[7:]
 if not command:
     raise SystemExit(127)
+
+tmp_lease_fd = None
+if tmp_enabled:
+    try:
+        tmp_lease_fd = acquire_agent_tmp_lease(
+            tmp_root,
+            tmp_lease_path,
+            tmp_lease_owner,
+            tmp_trigger_ratio,
+        )
+    except TmpPressureGateError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(exc.exit_code)
 
 child = os.fork()
 if child == 0:
@@ -140,6 +467,12 @@ try:
     os.unlink(pid_file)
 except FileNotFoundError:
     pass
+
+# Release the shared lease only after the complete inner process group is
+# proven gone and its pid evidence is removed.
+if tmp_lease_fd is not None:
+    os.close(tmp_lease_fd)
+    tmp_lease_fd = None
 
 if os.WIFEXITED(status):
     raise SystemExit(os.WEXITSTATUS(status))
@@ -268,23 +601,152 @@ class ContainerManager:
         return self._locks[project_id]
 
     @staticmethod
+    def _tmp_pressure_args() -> list[str]:
+        return [
+            _TMP_ROOT,
+            _TMP_LEASE_PATH,
+            "0",
+            str(settings.tmp_cleanup_usage_threshold),
+        ]
+
+    @staticmethod
     async def _run(cmd: list[str], timeout: int = 60) -> tuple[int, str]:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        cancellation: asyncio.CancelledError | None = None
+
+        spawn = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
         )
+        while not spawn.done():
+            try:
+                await asyncio.shield(spawn)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except BaseException:
+                break
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            proc = spawn.result()
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation
+            raise
+
+        communication = asyncio.create_task(proc.communicate())
+        timed_out = False
+        while not communication.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(communication),
+                    timeout=remaining,
+                )
+            except asyncio.CancelledError as exc:
+                # A docker exec preflight owns the container lease while it
+                # runs. Delay cancellation until it exits naturally (or the
+                # original timeout kills the client), so normal cancellation
+                # cannot release the Manager-side launch gate prematurely.
+                cancellation = cancellation or exc
+            except asyncio.TimeoutError:
+                timed_out = True
+                break
+            except BaseException:
+                break
+
+        if timed_out and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+        while not communication.done():
+            try:
+                await asyncio.shield(communication)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except BaseException:
+                break
+
+        try:
+            out, _ = communication.result()
+        except BaseException:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            if cancellation is not None:
+                raise cancellation
+            raise
+
+        if cancellation is not None:
+            raise cancellation
+        if timed_out:
             return 1, "timeout"
         return proc.returncode or 0, (out or b"").decode("utf-8", errors="replace")
 
     @staticmethod
     def is_docker_available() -> bool:
         return shutil.which("docker") is not None
+
+    async def _initialize_tmp_pressure_lease(self, name: str) -> None:
+        """Create the immutable container-internal lease as root."""
+
+        code, output = await self._run(
+            [
+                "docker",
+                "exec",
+                "-u",
+                "0",
+                name,
+                "python3",
+                "-c",
+                _TMP_LEASE_INIT,
+                _TMP_RUNTIME_DIR,
+                _TMP_LEASE_PATH,
+            ]
+        )
+        if code != 0:
+            raise ContainerTmpPressureError(
+                "Could not establish the shared-container /tmp safety lease: "
+                f"{output[:500]}"
+            )
+
+    async def ensure_tmp_capacity(self, project_id: int) -> None:
+        """Require the private container /tmp to be ready for a new Agent."""
+
+        if not settings.tmp_cleanup_enabled:
+            return
+        name = self._containers.get(
+            project_id, f"{CONTAINER_PREFIX}{project_id}"
+        )
+        code, output = await self._run(
+            [
+                "docker",
+                "exec",
+                "-e",
+                f"{_EXEC_ROLE_ENV}=tmp-gate",
+                name,
+                "python3",
+                "-c",
+                _TMP_PRESSURE_PREFLIGHT,
+                *self._tmp_pressure_args(),
+            ]
+        )
+        if code != 0:
+            detail = output.strip() or f"container preflight exited {code}"
+            raise ContainerTmpPressureError(
+                "Shared-container /tmp is not safe for a new Agent: "
+                f"{detail[:500]}"
+            )
 
     def _prepare_git_credentials(self, project_id: int, git_credential_type: str | None,
                                   git_ssh_key_path: str | None,
@@ -364,6 +826,10 @@ class ContainerManager:
                     else ""
                 )
                 if current_api_root == desired_api_root:
+                    self._containers[project_id] = name
+                    if settings.tmp_cleanup_enabled:
+                        await self._initialize_tmp_pressure_lease(name)
+                        await self.ensure_tmp_capacity(project_id)
                     return name
                 logger.info(
                     "Recreating container %s because its API account mount "
@@ -385,6 +851,7 @@ class ContainerManager:
             cmd = [
                 "docker", "run", "-d",
                 "--name", name,
+                "--init",
                 "--security-opt", "no-new-privileges",
                 "--cap-drop", "ALL",
                 "--read-only",
@@ -423,6 +890,9 @@ class ContainerManager:
                 raise RuntimeError(f"Docker container start failed: {out[:500]}")
 
             self._containers[project_id] = name
+            if settings.tmp_cleanup_enabled:
+                await self._initialize_tmp_pressure_lease(name)
+                await self.ensure_tmp_capacity(project_id)
             logger.info("Container %s started for project %d (git: %s)",
                         name, project_id, git_credential_type or "none")
             return name
@@ -447,6 +917,8 @@ class ContainerManager:
             "python3",
             "-c",
             _EXEC_SUPERVISOR,
+            "1" if settings.tmp_cleanup_enabled else "0",
+            *self._tmp_pressure_args(),
             pid_file,
             *cmd,
         ])
@@ -597,6 +1069,8 @@ class ContainerManager:
             "python3",
             "-c",
             _EXEC_SUPERVISOR,
+            "1" if settings.tmp_cleanup_enabled else "0",
+            *self._tmp_pressure_args(),
             pid_file,
             "claude",
         ]

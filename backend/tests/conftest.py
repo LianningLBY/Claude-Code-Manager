@@ -38,6 +38,9 @@ os.environ.update({
     "POOL_ENABLED": "false",
     "CODEX_POOL_ENABLED": "false",
     "BACKUP_ENABLED": "false",
+    # Unit tests exercise the cleaner with isolated roots explicitly. Importing
+    # backend.main must never start a watchdog against the host's real /tmp.
+    "TMP_CLEANUP_ENABLED": "false",
     "AUTO_START_DISPATCHER": "false",
     "AUTO_PUSH_TO_ORIGIN": "false",
     # Preserve the product default for constructor/wiring tests. Dispatcher is

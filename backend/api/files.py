@@ -7,12 +7,20 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
 MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB (for reading)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB (for uploading)
 MAX_UPLOAD_FILES = 10
+
+
+def _unlink_temporary_download(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -387,13 +395,22 @@ async def ssh_download_file(req: SSHReadRequest):
             )
 
         filename = req.path.rstrip("/").rsplit("/", 1)[-1] or "download"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}")
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False,
+            prefix="ccm-ssh-download-",
+            suffix=f"_{filename}",
+        )
         try:
             sftp.getfo(req.path, tmp)
             tmp.close()
         except PermissionError:
-            os.unlink(tmp.name)
+            tmp.close()
+            _unlink_temporary_download(tmp.name)
             raise HTTPException(status_code=403, detail="Permission denied")
+        except BaseException:
+            tmp.close()
+            _unlink_temporary_download(tmp.name)
+            raise
         finally:
             sftp.close()
     finally:
@@ -403,5 +420,5 @@ async def ssh_download_file(req: SSHReadRequest):
         path=tmp.name,
         filename=filename,
         media_type="application/octet-stream",
-        background=None,
+        background=BackgroundTask(_unlink_temporary_download, tmp.name),
     )

@@ -41,6 +41,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter API Key 共用账号池、模型兼容性检查和 session 迁移。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
 - **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级
 - **瞬时 429/过载自动重试** — 基础设施侧的临时限流/过载（非账号额度用尽），指数退避+jitter 用同一账号自动 `--resume` 重试，最多 5 次；检测按 provider 分流（Claude / Codex 各自的 CLI 错误文案）
+- **`/tmp` 空间保护** — 服务启动时及后台每 3 小时检查容量和 inode；任一达到 80% 时，清理全部超过 6 小时的 CCM 白名单临时产物
 - **进程超时保护** — 单任务最长执行时间可配置，超时后自动 kill
 
 ### 分布式
@@ -139,6 +140,7 @@ claude-manager/
 │       ├── claude_pool.py       # 多账号池 (限速检测/自动切换/session 迁移/额度查询)
 │       ├── goal_evaluator.py    # Goal 条件评估器 (claude -p 子进程)
 │       ├── mcp_config.py        # MCP config 动态生成
+│       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
 │       ├── cloud_provider.py    # AWS EC2 Provider (Worker 实例创建/启停/销毁)
 │       ├── worker_provisioner.py # Worker 全生命周期 (创建→bootstrap→ready)
 │       ├── worker_proxy.py      # 任务转发到 Worker
@@ -504,6 +506,34 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 |----------|--------|------|
 | `ASK_USER_ENABLED` | `true` | 启用 AskUserQuestion 拦截（false 时自动移除已注入的 hook） |
 | `ASK_USER_TIMEOUT` | `1800` | 等待用户回答的超时时间（秒） |
+
+### `/tmp` 临时空间保护
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `TMP_CLEANUP_ENABLED` | `true` | 启用宿主及共享 Docker `/tmp` 压力检查与安全清理 |
+| `TMP_CLEANUP_USAGE_THRESHOLD` | `0.80` | 容量或 inode 使用率达到此值即触发 |
+| `TMP_CLEANUP_INTERVAL_SECONDS` | `10800` | 后台检查间隔（秒，默认 3 小时） |
+| `TMP_CLEANUP_MIN_AGE_SECONDS` | `21600` | 临时产物至少闲置多久才可清理（默认 6 小时） |
+
+服务启动时先检查一次，随后由后台看门狗按间隔检查。容量字节或 inode 任一达到
+阈值即触发；低于阈值时不会扫描候选，也不会影响 Agent。一旦触发，本轮会处理
+全部符合条件的候选，不设置清理目标线。
+
+清理器不会执行通配式 `rm /tmp/*`。它只处理固定命名白名单中的 Sub-Agent
+过期日志、唯一命名的 skill/下载/讨论临时文件，并要求同一服务用户、同一文件
+系统、超过最小年龄的普通文件；宿主目录一律不递归删除。无法从清理进程独立
+证明空闲的 session/workspace 迁移 staging、未知文件、X11/Xvfb、登录浏览器
+资料以及 `/tmp/ccm-update-*` 更新/回滚证据始终保留。安全候选不足时只记录
+告警并在下个周期重试，不会扩大删除范围，也不会创建额外的模型任务。
+
+共享 Docker 执行模式中的 `/tmp` 是容器内独立的 2GB tmpfs，也使用相同阈值。
+每个容器 Agent 从创建子进程前到完整回收后代都持有共享 lease；达到阈值时，
+只有取得独占 lease 且能证明容器除固定 PID 1 与清理进程外完全空闲，才会清空
+这个可丢弃的私有 tmpfs。新建或因原有配置变化而重建的容器使用 Docker `--init`
+回收 Agent 遗留的孤儿进程；现有容器不会仅为补 `--init` 而被强制重建。活跃
+Agent、未知 PID、权限不足或清后仍达到触发线都会阻止新容器 Agent，绝不会退回
+宿主裸进程。远程 Worker 升级到同一版本后会运行自己的宿主看门狗和相同容器门禁。
 
 ### 号池配置
 

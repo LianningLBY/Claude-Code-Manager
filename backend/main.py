@@ -380,6 +380,7 @@ async def _shutdown_runtime_services(
     heartbeat_task,
     worker_health_task,
     upload_cleanup_task,
+    tmp_cleanup_task,
     backup_svc,
 ) -> None:
     """Run every shutdown stage and re-raise the first teardown failure."""
@@ -396,13 +397,36 @@ async def _shutdown_runtime_services(
             heartbeat_task,
             worker_health_task,
             upload_cleanup_task,
+            tmp_cleanup_task,
         )
         if task is not None
     ]
     for task in background_tasks:
         task.cancel()
+
+    # TmpSpaceManager runs filesystem deletion in a worker thread. Cancelling
+    # its asyncio wrapper deliberately waits for that in-flight rename/unlink
+    # to settle, so teardown must not apply the generic 10-second producer
+    # timeout and then continue while deletion is still running.
+    tmp_cleanup_future = (
+        tmp_cleanup_task
+        if isinstance(tmp_cleanup_task, asyncio.Future)
+        else None
+    )
+    if tmp_cleanup_future is not None:
+        try:
+            await asyncio.gather(
+                tmp_cleanup_future,
+                return_exceptions=True,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+            logger.exception("Temporary-space watchdog shutdown failed")
+
     async_tasks = {
-        task for task in background_tasks if isinstance(task, asyncio.Future)
+        task
+        for task in background_tasks
+        if isinstance(task, asyncio.Future) and task is not tmp_cleanup_future
     }
     if async_tasks:
         try:
@@ -531,6 +555,12 @@ async def lifespan(app: FastAPI):
     app.state.deployment_maintenance_only = (
         deployment_start.maintenance_only
     )
+
+    # This check is database-independent and also protects the repair/update
+    # endpoints used by the maintenance-only process.
+    from backend.services.tmp_space_manager import tmp_space_manager
+    await tmp_space_manager.ensure_capacity(reason="startup")
+
     if deployment_start.maintenance_only:
         # A failed/partial migration may leave the checked-out application
         # unable to safely query the current schema. Keep the ASGI process
@@ -618,6 +648,10 @@ async def lifespan(app: FastAPI):
     from backend.api.uploads import start_upload_cleanup_loop
     upload_cleanup_task = await start_upload_cleanup_loop()
 
+    # /tmp capacity/inode watchdog. It only removes old, inactive,
+    # allow-listed CCM artifacts and is independent from Dispatcher state.
+    tmp_cleanup_task = tmp_space_manager.start_periodic()
+
     # Org registry heartbeat — periodically re-register with the registry
     heartbeat_task = None
 
@@ -627,6 +661,7 @@ async def lifespan(app: FastAPI):
         heartbeat_task=heartbeat_task,
         worker_health_task=worker_health_task,
         upload_cleanup_task=upload_cleanup_task,
+        tmp_cleanup_task=tmp_cleanup_task,
         backup_svc=backup_svc,
     )
 

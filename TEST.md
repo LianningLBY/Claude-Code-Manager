@@ -29,6 +29,37 @@ cd frontend && npx tsc --noEmit
 
 测试使用内存 SQLite，不依赖真实数据库或外部服务。
 
+#### `test_tmp_space_manager.py` — `/tmp` 压力保护
+
+测试在 pytest 隔离目录中注入容量/inode 读数；全局测试环境关闭真实宿主
+`/tmp` 看门狗，不会扫描或删除开发机文件。
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_below_eighty_percent_does_not_scan_or_delete` | 容量低于 80% 时不触发、不删除 |
+| `test_exactly_eighty_percent_removes_all_stale_allowlisted_artifacts` | 容量恰好 80% 时触发；即使中途已低于触发线，仍清完全部合格候选 |
+| `test_pressure_cleanup_is_allowlist_age_and_symlink_safe` | 只删过期白名单文件；保留未知文件、近期文件、symlink 和 `ccm-update-*` |
+| `test_host_cleanup_never_recursively_deletes_directories` | 即使名称匹配隔离格式，宿主目录也不会被递归删除 |
+| `test_candidate_refreshed_after_scan_is_revalidated` | 扫描后重新活跃的候选会在原子删除前复核并保留 |
+| `test_stale_session_migration_directory_is_excluded` | session 迁移 staging 即使过期也不自动删除 |
+| `test_inode_pressure_also_triggers_cleanup` | inode 使用率达到 80% 也会触发 |
+| `test_default_disk_usage_uses_space_available_to_service_uid` | 字节压力按服务用户实际可用的 `f_bavail` 计算 |
+| `test_concurrent_checks_share_one_cleanup_pass` | 真正并发的检查共享同一次在途操作，结束后的调用重新读取用量 |
+| `test_completed_below_threshold_result_is_not_cached` | 79% 检查结果不会形成缓存盲区，下一次 100% 可立即触发 |
+| `test_cross_process_lock_busy_skips_this_periodic_pass` | 跨进程清理锁被占用时跳过本轮并等待下个周期 |
+| `test_cancellation_waits_for_inflight_cleanup_thread` | 取消会等待 rename/unlink 工作线程真正结束 |
+| `test_periodic_loop_is_cancellation_safe` | 后台看门狗可在服务关闭时正常取消 |
+| `test_disabled_manager_does_not_start_periodic_task` | 关闭配置时不创建后台任务 |
+
+#### 共享 Docker 独立 `/tmp`
+
+`test_container_manager.py` 另覆盖容器私有 2GB tmpfs：root-owned lease 的父目录与
+inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，清后低于 80% 可放行；
+活跃 Agent 的共享锁、未知 PID、检查失败均保留文件并拒绝新启动；新容器先建 lease
+再检查，Docker init 回收孤儿进程；PTY 压力错误不得降级为宿主裸进程。
+
+此外，`test_api_files.py` 验证 SSH 下载响应结束后删除 staging 文件。
+
 #### `test_task_queue.py` — 任务队列核心逻辑
 
 | 测试 | 验证内容 |
@@ -980,6 +1011,9 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |
 | `backend/services/whisper_client.py` | `backend/tests/test_service_whisper_client.py` |
 | `backend/services/backup_service.py` | `backend/tests/test_service_backup.py` |
+| `backend/services/tmp_space_manager.py` | `backend/tests/test_tmp_space_manager.py` |
+| `backend/services/container_manager.py`（容器 `/tmp`） | `backend/tests/test_container_manager.py` |
+| `backend/api/files.py`（SSH 下载临时文件） | `backend/tests/test_api_files.py` |
 | `backend/services/token_manager_service.py` | `backend/tests/test_service_token_manager.py` |
 | `backend/schemas/task.py` (datetime serialization) | `backend/tests/test_task_schema.py` |
 | `backend/api/chat.py` (timestamp Z suffix) | `backend/tests/test_chat_timestamp.py` |

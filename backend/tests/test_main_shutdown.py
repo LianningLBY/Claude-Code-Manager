@@ -24,6 +24,7 @@ async def test_dispatcher_shutdown_error_propagates_after_other_cleanup(
     heartbeat = MagicMock()
     worker_health = MagicMock()
     upload_cleanup = MagicMock()
+    tmp_cleanup = MagicMock()
     backup = MagicMock()
 
     monkeypatch.setattr(main, "dispatcher", dispatcher)
@@ -35,12 +36,14 @@ async def test_dispatcher_shutdown_error_propagates_after_other_cleanup(
             heartbeat_task=heartbeat,
             worker_health_task=worker_health,
             upload_cleanup_task=upload_cleanup,
+            tmp_cleanup_task=tmp_cleanup,
             backup_svc=backup,
         )
 
     heartbeat.cancel.assert_called_once_with()
     worker_health.cancel.assert_called_once_with()
     upload_cleanup.cancel.assert_called_once_with()
+    tmp_cleanup.cancel.assert_called_once_with()
     pty_backend.shutdown.assert_awaited_once_with()
     instance_manager.shutdown_codex_app_server.assert_awaited_once_with()
     watcher.stop.assert_called_once_with()
@@ -69,10 +72,12 @@ async def test_dispatcher_shutdown_retry_can_recover_after_transport_cleanup(
     monkeypatch.setattr(main, "sub_agent_watcher", watcher)
 
     upload_cleanup = MagicMock()
+    tmp_cleanup = MagicMock()
     await main._shutdown_runtime_services(
         heartbeat_task=None,
         worker_health_task=None,
         upload_cleanup_task=upload_cleanup,
+        tmp_cleanup_task=tmp_cleanup,
         backup_svc=None,
     )
 
@@ -80,6 +85,7 @@ async def test_dispatcher_shutdown_retry_can_recover_after_transport_cleanup(
     pty_backend.shutdown.assert_awaited_once_with()
     instance_manager.shutdown_codex_app_server.assert_awaited_once_with()
     upload_cleanup.cancel.assert_called_once_with()
+    tmp_cleanup.cancel.assert_called_once_with()
     watcher.stop.assert_called_once_with()
 
 
@@ -96,7 +102,7 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
     monkeypatch.setattr(main, "instance_manager", instance_manager)
     monkeypatch.setattr(main, "sub_agent_watcher", watcher)
 
-    finalized = [asyncio.Event() for _ in range(3)]
+    finalized = [asyncio.Event() for _ in range(4)]
 
     async def background(done):
         try:
@@ -114,6 +120,7 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
         heartbeat_task=tasks[0],
         worker_health_task=tasks[1],
         upload_cleanup_task=tasks[2],
+        tmp_cleanup_task=tasks[3],
         backup_svc=None,
     )
 

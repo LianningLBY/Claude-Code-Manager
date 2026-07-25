@@ -199,13 +199,14 @@ async def delete_account(request: Request, account_id: str):
 @router.post("/preferred")
 async def set_preferred(request: Request, body: dict):
     require_admin(request)
-    """Pin an account for subsequent launches (manual switch).
+    """Pin an account for subsequent routes (manual switch).
 
     Body: {"account_id": "account-1"} or {"account_id": null} to clear.
-    Session continuity is handled by the existing launch path: every launch
-    re-selects an account and hardlink-migrates the session JSONL, so the
-    next turn resumes seamlessly on the pinned account. If the pinned
-    account is rate-limited, auto rotation falls back to the others.
+    The next turn on an existing session safely hardlink-migrates its JSONL to
+    the pinned account; a migration failure keeps an intact healthy resident
+    instead of launching without context. With no pin, existing sessions stay
+    resident while fresh launches prefer a compatible available API account.
+    If the pinned account is unavailable, automatic routing falls back.
     """
     pool = _get_pool()
     account_id = body.get("account_id")

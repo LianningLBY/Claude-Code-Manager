@@ -109,6 +109,37 @@ describe('PoolDrawer', () => {
     expect(screen.getByText('Pro')).toBeInTheDocument();
   });
 
+  it('distinguishes the Claude preferred account from its most recent route', async () => {
+    vi.mocked(api.getPoolUsage).mockResolvedValue({
+      ...mockPoolUsage,
+      preferred: 'acc-1',
+      last_selected: 'acc-1',
+    } as never);
+    vi.mocked(api.setPoolPreferred).mockResolvedValue({
+      ok: true,
+      preferred: null,
+    } as never);
+    const user = userEvent.setup();
+
+    await renderAndWaitForPro();
+    await openDrawer(user);
+
+    const accountCard = screen
+      .getByText('user1@example.com')
+      .closest('.rounded-lg') as HTMLElement;
+    expect(within(accountCard).getByText('优先账号')).toBeInTheDocument();
+    expect(within(accountCard).getByText('最近使用')).toHaveAttribute(
+      'title',
+      '最近一次由路由器分配的账号',
+    );
+    expect(
+      within(accountCard).getByRole('button', { name: '恢复自动' }),
+    ).toHaveAttribute(
+      'title',
+      '取消全局优先；新会话优先兼容且可用的 API，已有对话继续使用绑定账号',
+    );
+  });
+
   it('does not render anything when pool is disabled', async () => {
     vi.mocked(api.getPoolStatus).mockResolvedValue({ enabled: false } as never);
     vi.mocked(api.getCloudRouterAccounts).mockRejectedValue(new Error('API accounts unavailable'));
@@ -1131,7 +1162,7 @@ describe('PoolDrawer', () => {
       });
     });
 
-    it('marks the preferred account and can restore automatic rotation', async () => {
+    it('marks the preferred account and can restore automatic selection', async () => {
       enableCodexPool({
         enabled: true,
         total: 1,
@@ -1146,11 +1177,43 @@ describe('PoolDrawer', () => {
 
       await openCodexTab(user);
 
-      expect(screen.getByText('当前指定')).toBeInTheDocument();
-      await user.click(screen.getByRole('button', { name: '恢复自动' }));
+      expect(screen.getByText('优先账号')).toBeInTheDocument();
+      const restoreButton = screen.getByRole('button', { name: '恢复自动' });
+      expect(restoreButton).toHaveAttribute(
+        'title',
+        '取消全局优先；新会话优先兼容且可用的 API，已有对话继续使用绑定账号',
+      );
+      await user.click(restoreButton);
       await waitFor(() => {
         expect(api.setCodexPoolPreferred).toHaveBeenCalledWith(null);
       });
+    });
+
+    it('marks only the most recently used Codex account', async () => {
+      enableCodexPool({
+        enabled: true,
+        total: 2,
+        available: 2,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        last_selected: 'codex-2',
+        accounts: [
+          { ...codexAccount, id: 'codex-1', codex_home: '/home/ubuntu/.codex' },
+          codexAccount,
+        ],
+      });
+      const user = userEvent.setup();
+
+      await openCodexTab(user);
+
+      const firstAccount = screen.getByText('codex-1').closest('.rounded-lg') as HTMLElement;
+      const lastAccount = screen.getByText('codex-2').closest('.rounded-lg') as HTMLElement;
+      expect(within(firstAccount).queryByText('最近使用')).not.toBeInTheDocument();
+      expect(within(lastAccount).getByText('最近使用')).toHaveAttribute(
+        'title',
+        '最近一次由路由器分配的账号',
+      );
     });
 
     it('retries a transient relogin status failure and still accepts the OTP', async () => {

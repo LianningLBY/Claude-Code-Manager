@@ -14,11 +14,13 @@ import logging
 import os
 import random
 import re
+import stat
 import subprocess
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # ---------------------------------------------------------------------------
 # Rate-limit / auth-failure detection (narrow patterns to avoid false positives)
@@ -429,12 +431,15 @@ class ClaudePool:
         self._accounts: list[PoolAccount] = []
         # account_id -> timestamp when cooldown expires
         self._cooldowns: dict[str, float] = {}
+        # Auth failures require explicit credential repair/manual clear; unlike
+        # rate-limit cooldowns they must not drive an infinite routing retry.
+        self._terminal_failures: set[str] = set()
         # Manual switch: preferred account is tried first by select(); if it's
         # cooled down / excluded / fails the probe, selection falls back to
         # the normal rotation order (auto rotation stays the safety net).
         self._preferred_account_id: str | None = None
-        # Most recently selected account (display only — selection happens
-        # per-launch, there is no persistent "current" account)
+        # Most recently committed route (display only — selection proposals do
+        # not update it because migration/binding may still fail).
         self._last_selected_id: str | None = None
         self._last_selected_at: float = 0.0
         self._usage_cache: list[dict] | None = None
@@ -532,6 +537,15 @@ class ClaudePool:
         self._usage_cache_at = 0.0
         self._api_quota_cache.clear()
         self._load()
+        valid_ids = {
+            account.id for account in self._accounts if not account.retired
+        }
+        self._terminal_failures.intersection_update(valid_ids)
+        if self._preferred_account_id not in valid_ids:
+            self._preferred_account_id = None
+        if self._last_selected_id not in valid_ids:
+            self._last_selected_id = None
+            self._last_selected_at = 0.0
 
     def _api_quota_decision(self, account: PoolAccount) -> dict:
         if (
@@ -658,9 +672,14 @@ class ClaudePool:
             logger.warning("Pool has no available accounts (exclude=%s)", exclude)
             return None
 
-        # Simple round-robin: pick the one whose cooldown expired earliest
-        # (or never had one), which naturally distributes load
-        candidates.sort(key=lambda a: self._cooldowns.get(a.id, 0))
+        # Fresh launches prefer a compatible CloudRouter API account.  Keep
+        # the existing cooldown-expiry order within each account kind so the
+        # native pool remains the unchanged fallback when no API projection is
+        # usable for this model.
+        candidates.sort(key=lambda a: (
+            0 if a.auth_kind == "cloudrouter_api" else 1,
+            self._cooldowns.get(a.id, 0),
+        ))
         # Manual switch: preferred account jumps the queue; if it fails the
         # probe below the normal order takes over (auto-rotation fallback)
         if self._preferred_account_id:
@@ -674,12 +693,32 @@ class ClaudePool:
             if validate and not self._probe_account(chosen):
                 continue
             logger.info("Pool selected account %s (%s)", chosen.id, chosen.config_dir)
-            self._last_selected_id = chosen.id
-            self._last_selected_at = time.time()
             return chosen.config_dir
 
         logger.warning("Pool has no healthy accounts after validation (exclude=%s)", exclude)
         return None
+
+    def record_routed_account(self, config_dir: str) -> bool:
+        """Record the account chosen as the final route for a Claude launch.
+
+        Selection is only a routing proposal and deliberately does not update
+        this marker: resume discovery or a safe migration fallback can
+        ultimately launch from another account. Callers record only after the
+        final route is committed or an auxiliary process has spawned. Unknown
+        directories are left untouched and reported to the caller.
+        """
+
+        account_id = self.account_id_from_config_dir(config_dir)
+        if account_id is None:
+            logger.warning(
+                "Cannot record routed Claude account for unknown config_dir: %s",
+                config_dir,
+            )
+            return False
+        self._last_selected_id = account_id
+        self._last_selected_at = time.time()
+        logger.info("Pool recorded routed account %s (%s)", account_id, config_dir)
+        return True
 
     async def select_async(
         self,
@@ -752,6 +791,7 @@ class ClaudePool:
             logger.warning("Cannot mark unknown config_dir as rate-limited: %s", config_dir)
             return
         cd = duration or self._cooldown_seconds
+        self._terminal_failures.discard(account_id)
         self._cooldowns[account_id] = time.time() + cd
         logger.info("Pool account %s rate-limited for %ds", account_id, cd)
 
@@ -761,11 +801,13 @@ class ClaudePool:
         if not account_id:
             return
         # Far future = effectively permanent until cleared
+        self._terminal_failures.add(account_id)
         self._cooldowns[account_id] = time.time() + 86400 * 365
         logger.warning("Pool account %s marked auth-failure (indefinite cooldown)", account_id)
 
     def clear_cooldown(self, account_id: str):
         self._cooldowns.pop(account_id, None)
+        self._terminal_failures.discard(account_id)
         logger.info("Pool cooldown cleared for account %s", account_id)
 
     def is_in_cooldown(self, config_dir: str) -> bool:
@@ -845,6 +887,34 @@ class ClaudePool:
             for account in self._accounts
         )
 
+    def has_retryable_compatible_account(self, model: str | None) -> bool:
+        """Whether pool exhaustion can recover without account intervention.
+
+        Native cooldowns and API accounts with unknown/otherwise-available
+        quota are retryable. A compatible API key with a known unavailable
+        quota/auth state is not: repeatedly requeueing cannot refresh that
+        cached fact, so callers surface a visible permanent routing refusal.
+        """
+
+        for account in self._accounts:
+            if (
+                not account.enabled
+                or account.retired
+                or not account.supports_model(model)
+            ):
+                continue
+            if account.id in self._terminal_failures:
+                continue
+            if account.auth_kind != "cloudrouter_api":
+                return True
+            decision = self._api_quota_decision(account)
+            if not (
+                bool(decision.get("known"))
+                and decision.get("available") is False
+            ):
+                return True
+        return False
+
     def has_native_enabled_account(self) -> bool:
         return any(
             account.enabled
@@ -868,13 +938,23 @@ class ClaudePool:
         """
         return any(a.config_dir == config_dir for a in self._accounts)
 
-    def locate_session_config_dir(self, session_id: str, extra_dirs: list[str] | None = None) -> str | None:
-        """Find which config dir actually holds the session JSONL.
+    def locate_session_config_dirs(
+        self,
+        session_id: str,
+        extra_dirs: list[str] | None = None,
+    ) -> list[str]:
+        """Find every config dir that currently holds the session JSONL.
 
         Searches all pool account dirs plus the env CLAUDE_CONFIG_DIR and the
         default ``~/.claude``, so session migration doesn't depend on callers
-        knowing which account a session was created under.
+        knowing which account a session was created under. Results preserve
+        the historical search order and are de-duplicated by path spelling.
         """
+        if (
+            not isinstance(session_id, str)
+            or not _SAFE_SESSION_ID_RE.fullmatch(session_id)
+        ):
+            return []
         candidates = [a.config_dir for a in self._accounts]
         env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
         if env_dir:
@@ -892,17 +972,68 @@ class ClaudePool:
         except OSError:
             pass
         seen: set[str] = set()
+        matches: list[str] = []
         for d in candidates:
             d = os.path.expanduser(d)
             if d in seen:
                 continue
             seen.add(d)
             try:
-                if next(Path(d).glob(f"projects/*/{session_id}.jsonl"), None):
-                    return d
-            except OSError:
+                projects = Path(d) / "projects"
+                projects_stat = projects.lstat()
+                if not stat.S_ISDIR(projects_stat.st_mode):
+                    continue
+                safe_jsonl = any(
+                    stat.S_ISREG(candidate.lstat().st_mode)
+                    and stat.S_ISDIR(candidate.parent.lstat().st_mode)
+                    for candidate in projects.glob(
+                        f"*/{session_id}.jsonl"
+                    )
+                )
+                if safe_jsonl:
+                    matches.append(d)
+            except (FileNotFoundError, OSError):
                 continue
-        return None
+        return matches
+
+    def locate_session_config_dir(
+        self,
+        session_id: str,
+        extra_dirs: list[str] | None = None,
+        *,
+        resident_config_dir: str | None = None,
+    ) -> str | None:
+        """Return the resident copy when known, otherwise the first match.
+
+        A migrated session can remain hardlinked in several accounts. The
+        account that just executed the turn may contain newer sidecar files
+        even though an older source copy appears first in pool order, so
+        rotation callers pass ``resident_config_dir`` as the authoritative
+        migration source.
+        """
+
+        matches = self.locate_session_config_dirs(session_id, extra_dirs)
+        if resident_config_dir:
+            resident = os.path.expanduser(resident_config_dir)
+            if resident in matches:
+                return resident
+        return matches[0] if matches else None
+
+    def authoritative_session_config_dir(
+        self,
+        session_id: str,
+        config_dirs: list[str],
+    ) -> str | None:
+        """Find the unique/equivalent copy that covers every session sidecar.
+
+        Legacy migrations hardlinked only the main JSONL, so same-inode JSONLs
+        do not prove that their sibling tool-result/sub-agent trees are equally
+        complete. This returns a copy only when its regular-file tree is a
+        provable superset of every other copy; callers otherwise fail closed or
+        require an explicit user-selected owner.
+        """
+
+        return _authoritative_session_config_dir(session_id, config_dirs)
 
     def account(self, account_id: str) -> "PoolAccount | None":
         return next((a for a in self._accounts if a.id == account_id), None)
@@ -1161,55 +1292,497 @@ class ClaudePool:
 # Session migration (hardlink JSONL for --resume across accounts)
 # ---------------------------------------------------------------------------
 
+class _UnsafeSessionTreeError(RuntimeError):
+    """A Claude session tree cannot be copied without following unsafe nodes."""
+
+
+def _scan_regular_tree(
+    root: Path,
+) -> tuple[dict[Path, os.stat_result], dict[Path, os.stat_result]] | None:
+    """Snapshot a directory tree containing only directories/regular files.
+
+    Relative paths are returned separately for directories and files.  The
+    root directory itself is represented by ``Path()`` in ``directories``.
+    Symlinks (including links to otherwise-regular files), sockets, devices,
+    and FIFOs are rejected rather than followed.
+    """
+
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _UnsafeSessionTreeError(
+            f"could not inspect session sidecar {root}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise _UnsafeSessionTreeError(
+            f"session sidecar is not a real directory: {root}"
+        )
+
+    directories: dict[Path, os.stat_result] = {Path(): root_stat}
+    files: dict[Path, os.stat_result] = {}
+    pending: list[tuple[Path, Path]] = [(root, Path())]
+    while pending:
+        directory, relative_directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError as exc:
+            raise _UnsafeSessionTreeError(
+                f"could not read session sidecar directory {directory}: {exc}"
+            ) from exc
+        for entry in entries:
+            relative = relative_directory / entry.name
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise _UnsafeSessionTreeError(
+                    f"could not inspect session sidecar entry {entry.path}: {exc}"
+                ) from exc
+            if stat.S_ISDIR(metadata.st_mode):
+                directories[relative] = metadata
+                pending.append((Path(entry.path), relative))
+            elif stat.S_ISREG(metadata.st_mode):
+                files[relative] = metadata
+            else:
+                raise _UnsafeSessionTreeError(
+                    f"unsafe session sidecar entry: {entry.path}"
+                )
+    return directories, files
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _same_tree_identity(
+    before: tuple[dict[Path, os.stat_result], dict[Path, os.stat_result]] | None,
+    after: tuple[dict[Path, os.stat_result], dict[Path, os.stat_result]] | None,
+) -> bool:
+    """Compare tree membership and inode identity while allowing file growth."""
+
+    if before is None or after is None:
+        return before is after
+    before_directories, before_files = before
+    after_directories, after_files = after
+    if (
+        before_directories.keys() != after_directories.keys()
+        or before_files.keys() != after_files.keys()
+    ):
+        return False
+    return all(
+        _same_file_identity(metadata, after_directories[relative])
+        for relative, metadata in before_directories.items()
+    ) and all(
+        _same_file_identity(metadata, after_files[relative])
+        for relative, metadata in before_files.items()
+    )
+
+
+def _authoritative_session_config_dir(
+    session_id: str,
+    config_dirs: list[str],
+) -> str | None:
+    """Return a provable sidecar superset among same-inode session copies."""
+
+    if (
+        not isinstance(session_id, str)
+        or not _SAFE_SESSION_ID_RE.fullmatch(session_id)
+        or not config_dirs
+    ):
+        return None
+
+    snapshots: list[
+        tuple[
+            str,
+            set[Path],
+            dict[Path, os.stat_result],
+        ]
+    ] = []
+    main_identity: tuple[int, int] | None = None
+    try:
+        for raw_config_dir in config_dirs:
+            config_dir = os.path.expanduser(raw_config_dir)
+            root = Path(config_dir)
+            projects = root / "projects"
+            projects_stat = projects.lstat()
+            if not stat.S_ISDIR(projects_stat.st_mode):
+                raise _UnsafeSessionTreeError(
+                    f"session projects path is not a real directory: {projects}"
+                )
+            candidates = list(
+                projects.glob(f"*/{session_id}.jsonl")
+            )
+            if len(candidates) != 1:
+                return None
+            jsonl = candidates[0]
+            project_stat = jsonl.parent.lstat()
+            jsonl_stat = jsonl.lstat()
+            if (
+                not stat.S_ISDIR(project_stat.st_mode)
+                or not stat.S_ISREG(jsonl_stat.st_mode)
+            ):
+                raise _UnsafeSessionTreeError(
+                    f"unsafe session JSONL path: {jsonl}"
+                )
+            current_identity = (jsonl_stat.st_dev, jsonl_stat.st_ino)
+            if main_identity is None:
+                main_identity = current_identity
+            elif current_identity != main_identity:
+                return None
+
+            tree = _scan_regular_tree(jsonl.parent / session_id)
+            if tree is None:
+                directories: set[Path] = set()
+                files: dict[Path, os.stat_result] = {}
+            else:
+                tree_directories, files = tree
+                directories = set(tree_directories)
+            snapshots.append((config_dir, directories, files))
+    except (OSError, _UnsafeSessionTreeError) as exc:
+        logger.warning(
+            "Could not prove authoritative Claude session copy for %s: %s",
+            session_id,
+            exc,
+        )
+        return None
+
+    def covers(
+        candidate: tuple[str, set[Path], dict[Path, os.stat_result]],
+        other: tuple[str, set[Path], dict[Path, os.stat_result]],
+    ) -> bool:
+        _, candidate_directories, candidate_files = candidate
+        _, other_directories, other_files = other
+        if not other_directories.issubset(candidate_directories):
+            return False
+        for relative, other_stat in other_files.items():
+            candidate_stat = candidate_files.get(relative)
+            if (
+                candidate_stat is None
+                or not _same_file_identity(candidate_stat, other_stat)
+            ):
+                return False
+        return True
+
+    authoritative = [
+        candidate
+        for candidate in snapshots
+        if all(covers(candidate, other) for other in snapshots)
+    ]
+    return authoritative[0][0] if authoritative else None
+
+
+def _rollback_session_migration(
+    created_files: list[tuple[Path, os.stat_result]],
+    created_directories: list[tuple[Path, os.stat_result]],
+) -> None:
+    """Remove only filesystem entries created by the current migration."""
+
+    for path, created_stat in reversed(created_files):
+        try:
+            current = path.lstat()
+            if not _same_file_identity(current, created_stat):
+                logger.warning(
+                    "Refusing to roll back replaced session file %s", path
+                )
+                continue
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Could not roll back migrated session file %s", path)
+    for path, created_stat in sorted(
+        created_directories,
+        key=lambda item: len(item[0].parts),
+        reverse=True,
+    ):
+        try:
+            current = path.lstat()
+            if not _same_file_identity(current, created_stat):
+                logger.warning(
+                    "Refusing to roll back replaced session directory %s", path
+                )
+                continue
+            path.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Never recurse here: a concurrent writer may now own the
+            # directory, and rollback must not delete anything it did not
+            # create.
+            logger.warning(
+                "Could not remove migrated session directory during rollback: %s",
+                path,
+            )
+
+
 def migrate_session(
     *,
     old_config_dir: str,
     new_config_dir: str,
     session_id: str,
 ) -> bool:
-    """Hardlink a Claude session JSONL from old_config_dir to new_config_dir.
+    """Hardlink a complete Claude session tree into another config directory.
 
     Claude stores session history at
     ``<CLAUDE_CONFIG_DIR>/projects/<encoded_cwd>/<session_id>.jsonl``.
-    ``--resume`` only looks under the *current* CLAUDE_CONFIG_DIR, so we
-    hardlink the file so it's visible from both directories.
+    It may also persist large tool results and native sub-agent state below the
+    sibling ``<session_id>/`` directory. ``--resume`` only searches the current
+    ``CLAUDE_CONFIG_DIR``, so regular files from both locations are hardlinked
+    and the sidecar directory structure is recreated.
 
-    Returns True if the file is in place after the call, False on failure.
+    Existing targets are accepted only when every overlapping file is already
+    the same inode. Symlinks, special files, and type conflicts are rejected.
+    Any entry created by a failed call is rolled back; pre-existing entries are
+    never removed.
     """
     old_root = Path(old_config_dir)
     new_root = Path(new_config_dir)
+    created_files: list[tuple[Path, os.stat_result]] = []
+    created_directories: list[tuple[Path, os.stat_result]] = []
+
+    def ensure_directory(directory: Path) -> None:
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            parent = directory.parent
+            if parent == directory:
+                raise _UnsafeSessionTreeError(
+                    f"could not create session directory {directory}"
+                )
+            ensure_directory(parent)
+            try:
+                os.mkdir(directory, mode=0o700)
+            except FileExistsError:
+                metadata = directory.lstat()
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise _UnsafeSessionTreeError(
+                        f"session target path is not a directory: {directory}"
+                    )
+            else:
+                metadata = directory.lstat()
+                created_directories.append((directory, metadata))
+            return
+        except OSError as exc:
+            raise _UnsafeSessionTreeError(
+                f"could not inspect session target directory {directory}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise _UnsafeSessionTreeError(
+                f"session target path is not a real directory: {directory}"
+            )
+
+    def link_regular_file(
+        source: Path,
+        target: Path,
+        expected_source: os.stat_result,
+    ) -> None:
+        try:
+            source_now = source.lstat()
+        except OSError as exc:
+            raise _UnsafeSessionTreeError(
+                f"could not revalidate session source {source}: {exc}"
+            ) from exc
+        if (
+            not stat.S_ISREG(source_now.st_mode)
+            or not _same_file_identity(source_now, expected_source)
+        ):
+            raise _UnsafeSessionTreeError(
+                f"session source changed during migration: {source}"
+            )
+
+        try:
+            target_stat = target.lstat()
+        except FileNotFoundError:
+            ensure_directory(target.parent)
+            try:
+                os.link(source, target, follow_symlinks=False)
+            except FileExistsError:
+                target_stat = target.lstat()
+            else:
+                # Record the inode identity immediately. If the following
+                # inspection fails, rollback still knows about the link.
+                created_files.append((target, expected_source))
+                target_stat = target.lstat()
+        except OSError as exc:
+            raise _UnsafeSessionTreeError(
+                f"could not inspect session target {target}: {exc}"
+            ) from exc
+
+        if (
+            not stat.S_ISREG(target_stat.st_mode)
+            or not _same_file_identity(target_stat, expected_source)
+        ):
+            raise _UnsafeSessionTreeError(
+                f"conflicting session target file: {target}"
+            )
+
     try:
+        if (
+            not isinstance(session_id, str)
+            or not _SAFE_SESSION_ID_RE.fullmatch(session_id)
+        ):
+            logger.warning("migrate_session: invalid session id %r", session_id)
+            return False
+
         candidates = list(old_root.glob(f"projects/*/{session_id}.jsonl"))
-        if not candidates:
+        if len(candidates) != 1:
             logger.warning(
-                "migrate_session: no jsonl for sid=%s under %s — context will be lost",
-                session_id, old_root,
+                "migrate_session: expected one jsonl for sid=%s under %s, found %d",
+                session_id,
+                old_root,
+                len(candidates),
             )
             return False
 
         old_jsonl = candidates[0]
+        old_jsonl_stat = old_jsonl.lstat()
+        if not stat.S_ISREG(old_jsonl_stat.st_mode):
+            raise _UnsafeSessionTreeError(
+                f"session JSONL is not a regular file: {old_jsonl}"
+            )
+        old_project_dir_stat = old_jsonl.parent.lstat()
+        if not stat.S_ISDIR(old_project_dir_stat.st_mode):
+            raise _UnsafeSessionTreeError(
+                f"session project path is not a real directory: {old_jsonl.parent}"
+            )
+
         encoded_cwd = old_jsonl.parent.name
         new_jsonl = new_root / "projects" / encoded_cwd / f"{session_id}.jsonl"
+        old_sidecar = old_jsonl.parent / session_id
+        new_sidecar = new_jsonl.parent / session_id
+        source_tree = _scan_regular_tree(old_sidecar)
+        target_tree = _scan_regular_tree(new_sidecar)
 
-        if new_jsonl.exists():
-            try:
-                if new_jsonl.stat().st_ino == old_jsonl.stat().st_ino:
-                    return True  # already hardlinked
-            except OSError:
-                return False
-            logger.warning(
-                "migrate_session: %s already exists under %s with different inode",
-                session_id, new_root,
+        try:
+            existing_jsonl_stat = new_jsonl.lstat()
+        except FileNotFoundError:
+            existing_jsonl_stat = None
+        if existing_jsonl_stat is not None and (
+            not stat.S_ISREG(existing_jsonl_stat.st_mode)
+            or not _same_file_identity(existing_jsonl_stat, old_jsonl_stat)
+        ):
+            raise _UnsafeSessionTreeError(
+                f"conflicting session JSONL target: {new_jsonl}"
             )
-            return False
 
-        new_jsonl.parent.mkdir(parents=True, exist_ok=True)
-        os.link(old_jsonl, new_jsonl)
-        logger.info("migrate_session: hardlinked %s → %s", old_jsonl, new_jsonl)
+        # A sidecar without the matching JSONL cannot be proven to belong to
+        # this migration. Once the JSONL is already the same inode, additional
+        # regular target-only sidecar files are allowed: they may have been
+        # created by a later turn executed in the target account.
+        if existing_jsonl_stat is None and target_tree is not None:
+            raise _UnsafeSessionTreeError(
+                f"orphan session sidecar conflicts with migration: {new_sidecar}"
+            )
+
+        if source_tree is not None:
+            source_directories, source_files = source_tree
+            target_directories, target_files = target_tree or ({}, {})
+            for relative in source_directories:
+                if relative in target_files:
+                    raise _UnsafeSessionTreeError(
+                        f"session sidecar directory conflicts with file: "
+                        f"{new_sidecar / relative}"
+                    )
+            for relative, source_stat in source_files.items():
+                if relative in target_directories:
+                    raise _UnsafeSessionTreeError(
+                        f"session sidecar file conflicts with directory: "
+                        f"{new_sidecar / relative}"
+                    )
+                target_stat = target_files.get(relative)
+                if target_stat is not None and not _same_file_identity(
+                    source_stat, target_stat
+                ):
+                    raise _UnsafeSessionTreeError(
+                        f"conflicting session sidecar file: "
+                        f"{new_sidecar / relative}"
+                    )
+
+            for relative in sorted(
+                source_directories,
+                key=lambda item: (len(item.parts), str(item)),
+            ):
+                ensure_directory(new_sidecar / relative)
+            for relative in sorted(source_files, key=str):
+                link_regular_file(
+                    old_sidecar / relative,
+                    new_sidecar / relative,
+                    source_files[relative],
+                )
+
+        # Link the JSONL last: it is the resume-discovery commit point.
+        link_regular_file(old_jsonl, new_jsonl, old_jsonl_stat)
+
+        # Refuse a partial snapshot if the source tree changed while files were
+        # linked. File growth is safe because hardlinks share the same inode;
+        # entry additions/removals/replacements are not.
+        source_tree_after = _scan_regular_tree(old_sidecar)
+        if not _same_tree_identity(source_tree, source_tree_after):
+            raise _UnsafeSessionTreeError(
+                f"session sidecar changed during migration: {old_sidecar}"
+            )
+        old_jsonl_after = old_jsonl.lstat()
+        if not _same_file_identity(old_jsonl_after, old_jsonl_stat):
+            raise _UnsafeSessionTreeError(
+                f"session JSONL changed during migration: {old_jsonl}"
+            )
+
+        logger.info(
+            "migrate_session: hardlinked complete session %s → %s",
+            old_jsonl,
+            new_jsonl,
+        )
         return True
-    except OSError as exc:
-        logger.warning("migrate_session(%s → %s, sid=%s): %s", old_config_dir, new_config_dir, session_id, exc)
+    except (OSError, _UnsafeSessionTreeError) as exc:
+        _rollback_session_migration(created_files, created_directories)
+        logger.warning(
+            "migrate_session(%s → %s, sid=%s): %s",
+            old_config_dir,
+            new_config_dir,
+            session_id,
+            exc,
+        )
         return False
+
+
+async def migrate_session_async(
+    *,
+    old_config_dir: str,
+    new_config_dir: str,
+    session_id: str,
+) -> bool:
+    """Run complete session migration off-loop and settle cancellation."""
+
+    import asyncio
+
+    operation = asyncio.create_task(
+        asyncio.to_thread(
+            migrate_session,
+            old_config_dir=old_config_dir,
+            new_config_dir=new_config_dir,
+            session_id=session_id,
+        )
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException:
+            break
+    try:
+        migrated = operation.result()
+    except BaseException as exc:
+        if cancellation is not None:
+            raise cancellation from exc
+        raise
+    if cancellation is not None:
+        raise cancellation
+    return migrated
 
 
 # ---------------------------------------------------------------------------

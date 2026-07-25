@@ -1081,6 +1081,26 @@ class InstanceManager:
             )
             return None
 
+    def _provider_process_label(
+        self,
+        instance_id: int,
+        provider: str | None,
+    ) -> str:
+        """Describe the exact CLI/API process used by one instance turn."""
+
+        normalized = (provider or "claude").lower()
+        label = "Codex" if normalized == "codex" else "Claude"
+        config_dir = self._config_dirs.get(instance_id)
+        if (
+            config_dir
+            and self._cloudrouter_account_for_runtime_home(
+                normalized, config_dir
+            )
+            is not None
+        ):
+            label += " API"
+        return label
+
     @asynccontextmanager
     async def _cloudrouter_runtime_admission(
         self,
@@ -3277,13 +3297,16 @@ class InstanceManager:
                         await db.rollback()
                         return
                     if final_status == "failed" and not _fatal_provider_error:
+                        process_label = self._provider_process_label(
+                            instance_id, provider
+                        )
                         failure_notice = LogEntry(
                             instance_id=instance_id,
                             task_id=task_id,
                             event_type="system_event",
                             role="system",
                             content=(
-                                "Claude API 进程在返回回复前异常退出"
+                                f"{process_label} 进程在返回回复前异常退出"
                                 f"（exit code {exit_code}）。"
                             ),
                             is_error=True,
@@ -3668,6 +3691,25 @@ class InstanceManager:
     ) -> bool:
         """Preserve a Codex chat prompt when replacement routing is busy."""
 
+        return await self._requeue_chat_prompt(
+            task_id,
+            params,
+            exc,
+            phase=phase,
+            provider="Codex",
+        )
+
+    async def _requeue_chat_prompt(
+        self,
+        task_id: int,
+        params: dict,
+        exc: Exception,
+        *,
+        phase: str,
+        provider: str,
+    ) -> bool:
+        """Preserve an exact chat prompt after a retryable routing failure."""
+
         prompt = params.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             return False
@@ -3682,10 +3724,21 @@ class InstanceManager:
                 prompt=prompt,
                 priority=PRIORITY_USER,
                 source="routing_retry",
+                command_skills=(
+                    dict(params["enabled_skills"])
+                    if isinstance(params.get("enabled_skills"), dict)
+                    else None
+                ),
+                model_override=(
+                    params["model"]
+                    if isinstance(params.get("model"), str)
+                    else None
+                ),
             )
             logger.warning(
-                "Codex chat task %d %s routing failed; requeued original "
+                "%s chat task %d %s routing failed; requeued original "
                 "prompt for safe retry: %s",
+                provider,
                 task_id,
                 phase,
                 exc,
@@ -3693,7 +3746,8 @@ class InstanceManager:
             return True
         except Exception:
             logger.exception(
-                "Failed to requeue Codex chat prompt for task %d after %s",
+                "Failed to requeue %s chat prompt for task %d after %s",
+                provider,
                 task_id,
                 phase,
             )
@@ -3704,7 +3758,9 @@ class InstanceManager:
     ) -> bool:
         """Attempt pool rotation for a chat-initiated process that hit rate limit.
 
-        Returns True if rotation succeeded and a new process was launched.
+        Returns True only if rotation succeeded and a replacement process was
+        launched. A safely requeued prompt still returns False so the caller
+        completes cleanup of the failed process generation first.
         """
         params: dict = {}
         provider = "claude"
@@ -3718,7 +3774,7 @@ class InstanceManager:
 
             from backend.services.claude_pool import (
                 is_pool_rotatable, is_rate_limited, is_auth_failure,
-                collect_process_output_for_detection, migrate_session,
+                collect_process_output_for_detection, migrate_session_async,
             )
 
             log_contents = await self.get_recent_log_contents(task_id, limit=10)
@@ -3816,14 +3872,60 @@ class InstanceManager:
 
             # The session may have been created under a different account dir
             # than the one this instance launched with — locate it
-            source_dir = dispatcher.pool.locate_session_config_dir(session_id) or old_config_dir
-            migrate_session(
+            source_dir = (
+                dispatcher.pool.locate_session_config_dir(
+                    session_id,
+                    resident_config_dir=old_config_dir,
+                )
+                or old_config_dir
+            )
+            migrated = await migrate_session_async(
                 old_config_dir=source_dir,
                 new_config_dir=new_config_dir,
                 session_id=session_id,
             )
+            if not migrated:
+                # ``False`` means the target cannot safely resume this native
+                # session (missing source JSONL, conflicting target, hardlink
+                # failure, ...).  Do not announce or launch a switch that did
+                # not happen.  Returning False lets the terminal consumer
+                # release the failed generation; the queued exact prompt then
+                # follows the normal failed-session recovery path.
+                await self._requeue_chat_prompt(
+                    task_id,
+                    params,
+                    RuntimeError(
+                        f"session {session_id} could not be migrated "
+                        f"from {source_dir} to {new_config_dir}"
+                    ),
+                    phase="session migration",
+                    provider="Claude",
+                )
+                return False
 
             new_account_id = dispatcher.pool.account_id_from_config_dir(new_config_dir)
+            try:
+                binding_persisted = (
+                    await dispatcher._persist_claude_binding_for_route(
+                        task_id=task_id,
+                        config_dir=new_config_dir,
+                        expected_generation=None,
+                    )
+                )
+                if not binding_persisted:
+                    raise RuntimeError(
+                        f"Claude account binding for task {task_id} "
+                        "was not persisted"
+                    )
+            except Exception as exc:
+                await self._requeue_chat_prompt(
+                    task_id,
+                    params,
+                    exc,
+                    phase="account binding",
+                    provider="Claude",
+                )
+                return False
             logger.info("Chat pool rotation: task %d switching %s -> %s",
                         task_id, old_account_id, new_account_id)
 
@@ -3876,6 +3978,20 @@ class InstanceManager:
                 ):
                     await self._requeue_codex_chat_prompt(
                         task_id, params, exc, phase="replacement launch",
+                    )
+                    return False
+            elif provider == "claude":
+                from backend.services.dispatcher import (
+                    ClaudeAccountRoutingError,
+                )
+
+                if isinstance(exc, ClaudeAccountRoutingError):
+                    await self._requeue_chat_prompt(
+                        task_id,
+                        params,
+                        exc,
+                        phase="replacement launch",
+                        provider="Claude",
                     )
                     return False
             logger.exception("Chat pool rotation failed for task %d", task_id)
@@ -4028,30 +4144,30 @@ class InstanceManager:
                 )
                 from backend.services.codex_pool import quota_cooldown_seconds
 
-                try:
-                    await asyncio.to_thread(
-                        migrate_codex_rollout_session,
-                        session_id,
-                        old_home,
-                        new_home,
-                    )
-                    if not await generation_is_current(generation):
-                        return False
-                except Exception as exc:
-                    # A copied rollout is non-destructive.  Before the owner is
-                    # rebound, failures leave the authoritative DB/in-memory
-                    # route on the old home.
-                    logger.warning(
-                        "Codex quota switch failed for task %d (%s -> %s): %s",
-                        task_id,
-                        old_home,
-                        new_home,
-                        exc,
-                    )
-                    return False
-
                 old_account_id = pool.account_id_for_home(old_home)
                 new_account_id = pool.account_id_for_home(new_home)
+                if old_account_id is None:
+                    logger.warning(
+                        "Codex quota switch refused for task %d: source home "
+                        "%s is not a registered account",
+                        task_id,
+                        old_home,
+                    )
+                    return False
+                try:
+                    await dispatcher._persist_codex_binding_for_route(
+                        task_id=task_id,
+                        account_id=old_account_id,
+                        expected_generation=generation,
+                        record_route=False,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Codex quota switch could not anchor source account "
+                        "binding for task %d",
+                        task_id,
+                    )
+                    return False
 
                 async def rollback_codex_owner() -> bool:
                     try:
@@ -4088,7 +4204,24 @@ class InstanceManager:
                     """Settle owner + durable affinity as one cancellation unit."""
 
                     owner_rebound = False
+                    binding_committed = False
+
+                    def commit_in_memory_route() -> None:
+                        nonlocal binding_committed
+                        self._config_dirs[instance_id] = new_home
+                        binding_committed = True
+
                     try:
+                        await asyncio.to_thread(
+                            migrate_codex_rollout_session,
+                            session_id,
+                            old_home,
+                            new_home,
+                        )
+                        if not await generation_is_current(generation):
+                            raise RuntimeError(
+                                "task generation changed after rollout copy"
+                            )
                         await self.rebind_codex_thread(
                             session_id,
                             source_codex_home=old_home,
@@ -4099,11 +4232,12 @@ class InstanceManager:
                             raise RuntimeError(
                                 "task generation changed after owner rebind"
                             )
-                        binding_changed = (
-                            await dispatcher._set_codex_task_binding(
-                                task_id,
-                                new_account_id,
+                        binding_changed = await (
+                            dispatcher._persist_codex_binding_for_route(
+                                task_id=task_id,
+                                account_id=new_account_id,
                                 expected_generation=generation,
+                                on_route_committed=commit_in_memory_route,
                             )
                         )
                         if not binding_changed:
@@ -4115,14 +4249,13 @@ class InstanceManager:
                         # owner=new.  The enclosing task is shielded from its
                         # caller; this branch also compensates direct internal
                         # cancellation before propagating it.
-                        rollback_succeeded = (
-                            await rollback_codex_owner()
-                            if owner_rebound else True
-                        )
+                        rollback_succeeded = True
+                        if owner_rebound and not binding_committed:
+                            rollback_succeeded = await rollback_codex_owner()
                         if isinstance(exc, asyncio.CancelledError):
                             raise
                         logger.warning(
-                            "Codex quota switch binding persist failed for task "
+                            "Codex quota switch failed for task "
                             "%d; old binding %s retained (owner rollback "
                             "succeeded=%s): %s",
                             task_id,
@@ -4132,7 +4265,6 @@ class InstanceManager:
                         )
                         return False
 
-                    self._config_dirs[instance_id] = new_home
                     pool.mark_rate_limited(
                         old_home,
                         duration=quota_cooldown_seconds(
@@ -4182,7 +4314,7 @@ class InstanceManager:
                 return False
 
             from backend.services.claude_pool import (
-                migrate_session,
+                migrate_session_async,
                 quota_cooldown_seconds,
                 rate_limit_event_is_actionable,
             )
@@ -4235,10 +4367,40 @@ class InstanceManager:
                 # is already cooled even when a fresh turn has no resumable ID.
                 return False
 
-            source_dir = dispatcher.pool.locate_session_config_dir(session_id) or old_config_dir
+            source_dir = (
+                dispatcher.pool.locate_session_config_dir(
+                    session_id,
+                    resident_config_dir=old_config_dir,
+                )
+                or old_config_dir
+            )
             if not await generation_is_current(generation):
                 return False
-            migrated = migrate_session(
+            try:
+                source_anchored = (
+                    await dispatcher._persist_claude_binding_for_route(
+                        task_id=task_id,
+                        config_dir=source_dir,
+                        expected_generation=generation,
+                        record_route=False,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Proactive Claude pool switch could not anchor source "
+                    "account binding for task %d",
+                    task_id,
+                )
+                return False
+            if not source_anchored:
+                logger.warning(
+                    "Proactive Claude pool switch refused unregistered source "
+                    "%s for task %d",
+                    source_dir,
+                    task_id,
+                )
+                return False
+            migrated = await migrate_session_async(
                 old_config_dir=source_dir,
                 new_config_dir=new_config_dir,
                 session_id=session_id,
@@ -4252,10 +4414,41 @@ class InstanceManager:
 
             if not await generation_is_current(generation):
                 return False
+
+            new_account_id = dispatcher.pool.account_id_from_config_dir(new_config_dir)
+            if not await generation_is_current(generation):
+                return False
+
+            def commit_in_memory_route() -> None:
+                self._config_dirs[instance_id] = new_config_dir
+
+            try:
+                binding_changed = (
+                    await dispatcher._persist_claude_binding_for_route(
+                        task_id=task_id,
+                        config_dir=new_config_dir,
+                        expected_generation=generation,
+                        on_route_committed=commit_in_memory_route,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Proactive Claude pool switch could not persist account "
+                    "binding for task %d",
+                    task_id,
+                )
+                return False
+            if not binding_changed:
+                logger.info(
+                    "Proactive Claude pool switch for task %d lost its exact "
+                    "Task generation before account binding",
+                    task_id,
+                )
+                return False
             if not hard_limit:
-                # Soft >=90% isolation begins only after context is safely
-                # available on the replacement account. Use the event's reset
-                # boundary (capped; expired/malformed falls back to pool default).
+                # Soft >=90% isolation begins only after context and the
+                # durable target binding have both committed. Use the event's
+                # reset boundary (capped; malformed values use pool default).
                 dispatcher.pool.mark_rate_limited(
                     old_config_dir,
                     duration=quota_cooldown_seconds(
@@ -4263,11 +4456,6 @@ class InstanceManager:
                         fallback=dispatcher.pool._cooldown_seconds,
                     ),
                 )
-
-            new_account_id = dispatcher.pool.account_id_from_config_dir(new_config_dir)
-            if not await generation_is_current(generation):
-                return False
-            self._config_dirs[instance_id] = new_config_dir
             logger.info(
                 "Proactive pool switch: task %d migrated %s -> %s (%s)",
                 task_id,
@@ -4608,6 +4796,16 @@ class InstanceManager:
             and event_type in {"message", "result"}
         ):
             return content or "Claude API request failed"
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("type") == "turn.failed"
+            and event_type == "system_event"
+        ):
+            # Both ``codex exec --json`` and the app-server adapter emit this
+            # exact terminal shape. Preserve its real provider message and
+            # prevent consumer cleanup from appending a misleading generic
+            # process-exit notice.
+            return content or "Codex turn failed"
         if event_type in {"result", "session_crashed"}:
             return content or "Claude turn failed"
         if event_type == "rate_limit_event":

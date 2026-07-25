@@ -1,6 +1,8 @@
 """Tests for Claude account pool — rotation, detection, session migration."""
+import asyncio
 import json
 import os
+import threading
 import time
 import pytest
 from pathlib import Path
@@ -15,6 +17,7 @@ from backend.services.claude_pool import (
     is_transient_overload,
     transient_retry_delay,
     migrate_session,
+    migrate_session_async,
     collect_process_output_for_detection,
     api_quota_at_or_above,
     quota_cooldown_seconds,
@@ -256,6 +259,20 @@ class TestClaudePool:
         # Should have a very long cooldown
         assert acc1["cooldown_remaining"] > 86000
 
+    def test_auth_failure_is_not_an_infinite_routing_retry(
+        self, pool, tmp_path
+    ):
+        for account in pool._accounts:
+            account.enabled = account.id == "acc-1"
+        config_dir = str(tmp_path / "claude-1")
+        pool.mark_auth_failure(config_dir)
+
+        assert pool.has_compatible_enabled_account(None)
+        assert not pool.has_retryable_compatible_account(None)
+
+        pool.clear_cooldown("acc-1")
+        assert pool.has_retryable_compatible_account(None)
+
     def test_clear_cooldown(self, pool, tmp_path):
         config_dir = str(tmp_path / "claude-1")
         pool.mark_rate_limited(config_dir)
@@ -336,6 +353,54 @@ class TestSessionMigration:
         # Verify it's a hardlink (same inode)
         assert session_file.stat().st_ino == new_file.stat().st_ino
 
+    def test_hardlinks_nested_sidecar_files(self, tmp_path):
+        old_dir = tmp_path / "old-account"
+        new_dir = tmp_path / "new-account"
+        session_id = "sidecar-session-123"
+        project_dir = old_dir / "projects" / "encoded-cwd"
+        project_dir.mkdir(parents=True)
+        session_file = project_dir / f"{session_id}.jsonl"
+        session_file.write_text('{"event": "init"}\n')
+        tool_result = (
+            project_dir / session_id / "tool-results" / "large-output.txt"
+        )
+        tool_result.parent.mkdir(parents=True)
+        tool_result.write_text("complete tool output")
+        subagent = (
+            project_dir
+            / session_id
+            / "subagents"
+            / "nested"
+            / "agent-1.jsonl"
+        )
+        subagent.parent.mkdir(parents=True)
+        subagent.write_text('{"status":"done"}\n')
+        empty_dir = project_dir / session_id / "empty"
+        empty_dir.mkdir()
+
+        assert migrate_session(
+            old_config_dir=str(old_dir),
+            new_config_dir=str(new_dir),
+            session_id=session_id,
+        )
+
+        target_project = new_dir / "projects" / "encoded-cwd"
+        target_tool_result = (
+            target_project / session_id / "tool-results" / "large-output.txt"
+        )
+        target_subagent = (
+            target_project
+            / session_id
+            / "subagents"
+            / "nested"
+            / "agent-1.jsonl"
+        )
+        assert target_tool_result.read_text() == "complete tool output"
+        assert target_subagent.read_text() == '{"status":"done"}\n'
+        assert target_tool_result.stat().st_ino == tool_result.stat().st_ino
+        assert target_subagent.stat().st_ino == subagent.stat().st_ino
+        assert (target_project / session_id / "empty").is_dir()
+
     def test_already_hardlinked(self, tmp_path):
         old_dir = tmp_path / "old"
         new_dir = tmp_path / "new"
@@ -351,6 +416,163 @@ class TestSessionMigration:
         # Second migration should return True (idempotent)
         result = migrate_session(old_config_dir=str(old_dir), new_config_dir=str(new_dir), session_id=session_id)
         assert result is True
+
+    def test_existing_jsonl_hardlink_still_repairs_missing_sidecar(self, tmp_path):
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        session_id = "sid-repair"
+        source_project = old_dir / "projects" / "cwd"
+        target_project = new_dir / "projects" / "cwd"
+        source_project.mkdir(parents=True)
+        target_project.mkdir(parents=True)
+        source_jsonl = source_project / f"{session_id}.jsonl"
+        source_jsonl.write_text("data\n")
+        target_jsonl = target_project / f"{session_id}.jsonl"
+        os.link(source_jsonl, target_jsonl)
+        source_tool_result = (
+            source_project / session_id / "tool-results" / "result.txt"
+        )
+        source_tool_result.parent.mkdir(parents=True)
+        source_tool_result.write_text("result")
+
+        assert migrate_session(
+            old_config_dir=str(old_dir),
+            new_config_dir=str(new_dir),
+            session_id=session_id,
+        )
+
+        target_tool_result = (
+            target_project / session_id / "tool-results" / "result.txt"
+        )
+        assert target_tool_result.stat().st_ino == source_tool_result.stat().st_ino
+
+    def test_existing_jsonl_hardlink_rejects_sidecar_file_conflict(
+        self, tmp_path
+    ):
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        session_id = "sid-sidecar-conflict"
+        source_project = old_dir / "projects" / "cwd"
+        target_project = new_dir / "projects" / "cwd"
+        source_project.mkdir(parents=True)
+        target_project.mkdir(parents=True)
+        source_jsonl = source_project / f"{session_id}.jsonl"
+        source_jsonl.write_text("data\n")
+        target_jsonl = target_project / f"{session_id}.jsonl"
+        os.link(source_jsonl, target_jsonl)
+        source_file = source_project / session_id / "tool-results" / "result.txt"
+        target_file = target_project / session_id / "tool-results" / "result.txt"
+        source_file.parent.mkdir(parents=True)
+        target_file.parent.mkdir(parents=True)
+        source_file.write_text("source")
+        target_file.write_text("different")
+
+        assert migrate_session(
+            old_config_dir=str(old_dir),
+            new_config_dir=str(new_dir),
+            session_id=session_id,
+        ) is False
+        assert target_jsonl.exists()
+        assert target_file.read_text() == "different"
+
+    def test_source_sidecar_symlink_is_rejected_without_partial_target(
+        self, tmp_path
+    ):
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        session_id = "sid-symlink"
+        source_project = old_dir / "projects" / "cwd"
+        source_project.mkdir(parents=True)
+        (source_project / f"{session_id}.jsonl").write_text("data\n")
+        sidecar = source_project / session_id
+        sidecar.mkdir()
+        (sidecar / "real.txt").write_text("secret")
+        (sidecar / "unsafe-link").symlink_to("real.txt")
+
+        assert migrate_session(
+            old_config_dir=str(old_dir),
+            new_config_dir=str(new_dir),
+            session_id=session_id,
+        ) is False
+        assert not (new_dir / "projects").exists()
+
+    def test_source_sidecar_special_file_is_rejected(self, tmp_path):
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        session_id = "sid-special"
+        source_project = old_dir / "projects" / "cwd"
+        source_project.mkdir(parents=True)
+        (source_project / f"{session_id}.jsonl").write_text("data\n")
+        sidecar = source_project / session_id
+        sidecar.mkdir()
+        os.mkfifo(sidecar / "pipe")
+
+        assert migrate_session(
+            old_config_dir=str(old_dir),
+            new_config_dir=str(new_dir),
+            session_id=session_id,
+        ) is False
+        assert not (new_dir / "projects").exists()
+
+    def test_link_failure_rolls_back_every_entry_created_by_call(
+        self, tmp_path, monkeypatch
+    ):
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        session_id = "sid-rollback"
+        source_project = old_dir / "projects" / "cwd"
+        source_project.mkdir(parents=True)
+        (source_project / f"{session_id}.jsonl").write_text("data\n")
+        sidecar = source_project / session_id / "tool-results"
+        sidecar.mkdir(parents=True)
+        (sidecar / "a-ok.txt").write_text("ok")
+        (sidecar / "z-fail.txt").write_text("fail")
+        real_link = os.link
+
+        def flaky_link(source, target, *, follow_symlinks=True):
+            if Path(source).name == "z-fail.txt":
+                raise OSError("simulated hardlink failure")
+            return real_link(
+                source,
+                target,
+                follow_symlinks=follow_symlinks,
+            )
+
+        monkeypatch.setattr(os, "link", flaky_link)
+
+        assert migrate_session(
+            old_config_dir=str(old_dir),
+            new_config_dir=str(new_dir),
+            session_id=session_id,
+        ) is False
+        assert not (
+            new_dir / "projects" / "cwd" / f"{session_id}.jsonl"
+        ).exists()
+        assert not (new_dir / "projects").exists()
+
+    def test_ambiguous_source_jsonls_are_rejected(self, tmp_path):
+        old_dir = tmp_path / "old"
+        for encoded_cwd in ("cwd-one", "cwd-two"):
+            project = old_dir / "projects" / encoded_cwd
+            project.mkdir(parents=True)
+            (project / "sid-ambiguous.jsonl").write_text(encoded_cwd)
+
+        assert migrate_session(
+            old_config_dir=str(old_dir),
+            new_config_dir=str(tmp_path / "new"),
+            session_id="sid-ambiguous",
+        ) is False
+
+    @pytest.mark.parametrize(
+        "unsafe_session_id",
+        ["../escape", "with/slash", "wild*card", "[class]", ""],
+    )
+    def test_unsafe_session_id_is_rejected(self, tmp_path, unsafe_session_id):
+        assert migrate_session(
+            old_config_dir=str(tmp_path / "old"),
+            new_config_dir=str(tmp_path / "new"),
+            session_id=unsafe_session_id,
+        ) is False
 
     def test_missing_session_file(self, tmp_path):
         result = migrate_session(
@@ -379,6 +601,39 @@ class TestSessionMigration:
             session_id=session_id,
         )
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_async_migration_does_not_block_and_settles_cancellation(
+        self, monkeypatch
+    ):
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_migration(**_kwargs):
+            started.set()
+            assert release.wait(timeout=2)
+            return True
+
+        monkeypatch.setattr(
+            "backend.services.claude_pool.migrate_session",
+            blocking_migration,
+        )
+        operation = asyncio.create_task(
+            migrate_session_async(
+                old_config_dir="/old",
+                new_config_dir="/new",
+                session_id="sid-async",
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +742,9 @@ class TestChatPoolRotationRegression:
         import backend.main
         fake_dispatcher = MagicMock()
         fake_dispatcher.pool = pool
+        fake_dispatcher._persist_claude_binding_for_route = AsyncMock(
+            return_value=True
+        )
         monkeypatch.setattr(backend.main, "dispatcher", fake_dispatcher)
 
         task = MagicMock()
@@ -518,6 +776,11 @@ class TestChatPoolRotationRegression:
         new_jsonl = tmp_path / "claude-2" / "projects" / "-home-user-repo" / "sess-123.jsonl"
         assert new_jsonl.exists()
         assert im.launch.await_args.kwargs["config_dir"] == str(tmp_path / "claude-2")
+        fake_dispatcher._persist_claude_binding_for_route.assert_awaited_once_with(
+            task_id=42,
+            config_dir=str(tmp_path / "claude-2"),
+            expected_generation=None,
+        )
 
 
 class TestLocateSessionConfigDir:
@@ -529,6 +792,86 @@ class TestLocateSessionConfigDir:
 
     def test_returns_none_when_not_found(self, pool):
         assert pool.locate_session_config_dir("nope") is None
+
+    def test_returns_all_session_copies_in_search_order(self, pool, tmp_path):
+        for account_dir in ("claude-1", "claude-2"):
+            project = tmp_path / account_dir / "projects" / "-x"
+            project.mkdir(parents=True)
+            (project / "sid-copied.jsonl").write_text("{}")
+
+        assert pool.locate_session_config_dirs("sid-copied") == [
+            str(tmp_path / "claude-1"),
+            str(tmp_path / "claude-2"),
+        ]
+        assert (
+            pool.locate_session_config_dir("sid-copied")
+            == str(tmp_path / "claude-1")
+        )
+
+    def test_resident_copy_overrides_legacy_search_order(self, pool, tmp_path):
+        for account_dir in ("claude-1", "claude-2"):
+            project = tmp_path / account_dir / "projects" / "-x"
+            project.mkdir(parents=True)
+            (project / "sid-resident.jsonl").write_text("{}")
+
+        assert pool.locate_session_config_dir(
+            "sid-resident",
+            resident_config_dir=str(tmp_path / "claude-2"),
+        ) == str(tmp_path / "claude-2")
+
+    def test_authoritative_copy_is_the_unique_sidecar_superset(
+        self, pool, tmp_path
+    ):
+        first_project = tmp_path / "claude-1" / "projects" / "-x"
+        second_project = tmp_path / "claude-2" / "projects" / "-x"
+        first_project.mkdir(parents=True)
+        second_project.mkdir(parents=True)
+        first_jsonl = first_project / "sid-sidecar.jsonl"
+        first_jsonl.write_text("{}")
+        os.link(first_jsonl, second_project / "sid-sidecar.jsonl")
+        tool_result = (
+            second_project
+            / "sid-sidecar"
+            / "tool-results"
+            / "latest.txt"
+        )
+        tool_result.parent.mkdir(parents=True)
+        tool_result.write_text("newer resident state")
+
+        assert pool.authoritative_session_config_dir(
+            "sid-sidecar",
+            [str(tmp_path / "claude-1"), str(tmp_path / "claude-2")],
+        ) == str(tmp_path / "claude-2")
+
+    def test_disjoint_sidecars_have_no_provable_owner(self, pool, tmp_path):
+        first_project = tmp_path / "claude-1" / "projects" / "-x"
+        second_project = tmp_path / "claude-2" / "projects" / "-x"
+        first_project.mkdir(parents=True)
+        second_project.mkdir(parents=True)
+        first_jsonl = first_project / "sid-split.jsonl"
+        first_jsonl.write_text("{}")
+        os.link(first_jsonl, second_project / "sid-split.jsonl")
+        for project, filename in (
+            (first_project, "left.txt"),
+            (second_project, "right.txt"),
+        ):
+            sidecar = project / "sid-split" / filename
+            sidecar.parent.mkdir(parents=True)
+            sidecar.write_text(filename)
+
+        assert pool.authoritative_session_config_dir(
+            "sid-split",
+            [str(tmp_path / "claude-1"), str(tmp_path / "claude-2")],
+        ) is None
+
+    def test_symlink_jsonl_is_not_session_evidence(self, pool, tmp_path):
+        target = tmp_path / "real.jsonl"
+        target.write_text("{}")
+        project = tmp_path / "claude-1" / "projects" / "-x"
+        project.mkdir(parents=True)
+        (project / "sid-link.jsonl").symlink_to(target)
+
+        assert pool.locate_session_config_dirs("sid-link") == []
 
 
 class TestSelectAsync:
@@ -729,9 +1072,22 @@ class TestPtyModeRateLimitDetection:
 
 
 class TestLastSelected:
-    def test_select_records_last_selected(self, pool):
+    def test_select_is_only_a_proposal(self, pool):
         pool.select()
-        assert pool.status()["last_selected"] == "acc-1"
+        assert pool.status()["last_selected"] is None
+
+    def test_real_route_can_override_provisional_selection(self, pool):
+        pool.select()
+
+        assert pool.record_routed_account(pool._accounts[1].config_dir) is True
+        assert pool.status()["last_selected"] == "acc-2"
+
+    def test_unknown_real_route_does_not_replace_marker(self, pool, tmp_path):
+        pool.record_routed_account(pool._accounts[1].config_dir)
+        pool.select()
+
+        assert pool.record_routed_account(str(tmp_path / "unknown")) is False
+        assert pool.status()["last_selected"] == "acc-2"
 
     def test_no_selection_yet(self, pool):
         assert pool.status()["last_selected"] is None
@@ -1069,6 +1425,7 @@ class TestDispatcherRotationCodexGate:
         )
         # validate=True 会起 claude -p 探测子进程，测试里直接 stub 选号结果
         disp._pool_select = AsyncMock(return_value=str(tmp_path / "claude-2"))
+        disp._persist_claude_binding_for_route = AsyncMock(return_value=True)
 
         result = await disp._check_rate_limit_and_rotate(
             1, 42, 1, combined="You've hit your limit, resets 3pm (UTC)"
@@ -1195,6 +1552,56 @@ class _FakeCloudRouterStore:
 
 
 class TestCloudRouterClaudeProjection:
+    @staticmethod
+    def _mixed_pool(tmp_path, account, snapshot=None):
+        native_dir = tmp_path / "native-claude"
+        native_path = tmp_path / "native-accounts.json"
+        native_path.write_text(json.dumps({
+            "accounts": [{
+                "id": "native-1",
+                "config_dir": str(native_dir),
+                "enabled": True,
+            }],
+        }))
+        pool = ClaudePool(
+            config_path=native_path,
+            cloudrouter_store=_FakeCloudRouterStore(account, snapshot),
+            bootstrap_default=False,
+        )
+        return pool, native_dir
+
+    def test_fresh_selection_prefers_compatible_api_over_native(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        pool, _native_dir = self._mixed_pool(tmp_path, account)
+
+        assert pool.select(model="claude-sonnet-5") == account.claude_config_dir
+        assert pool.status()["last_selected"] is None
+
+    def test_unsupported_api_model_preserves_native_fallback(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        pool, native_dir = self._mixed_pool(tmp_path, account)
+
+        assert pool.select(model="claude-opus-4-8") == str(native_dir)
+
+    def test_exhausted_api_preserves_native_fallback(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": False,
+            "known": True,
+            "reason": "quota_exhausted",
+            "state": "exhausted",
+        }
+        pool, native_dir = self._mixed_pool(tmp_path, account, snapshot)
+
+        assert pool.select(model="claude-sonnet-5") == str(native_dir)
+
+    def test_preferred_native_account_outranks_available_api(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        pool, native_dir = self._mixed_pool(tmp_path, account)
+
+        assert pool.set_preferred("native-1") is True
+        assert pool.select(model="claude-sonnet-5") == str(native_dir)
+
     def test_api_only_pool_loads_without_native_config_and_filters_models(
         self, tmp_path
     ):

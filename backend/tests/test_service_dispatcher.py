@@ -653,8 +653,8 @@ async def test_fresh_codex_all_accounts_cooling_defers_without_retry_budget(
         assert deferred.started_at is None
         assert deferred.completed_at is None
         assert "no available account" in deferred.error_message
-    assert task_id in d._codex_routing_not_before
-    assert d._codex_routing_not_before[task_id] > time.monotonic()
+    assert task_id in d._account_routing_not_before
+    assert d._account_routing_not_before[task_id] > time.monotonic()
     d.instance_manager.launch.assert_not_awaited()
 
 
@@ -696,7 +696,7 @@ async def test_fresh_codex_maintenance_busy_defers_without_retry_budget(
         assert deferred.retry_count == 0
         assert deferred.started_at is None
         assert "under maintenance" in deferred.error_message
-    assert task_id in d._codex_routing_not_before
+    assert task_id in d._account_routing_not_before
 
 
 @pytest.mark.asyncio
@@ -706,7 +706,10 @@ async def test_permanent_codex_routing_error_still_fails_fresh_task(db_factory):
 
     d = _make_dispatcher(db_factory)
     d._resolve_resume_config_dir = AsyncMock(
-        side_effect=CodexAccountRoutingError("ambiguous rollout ownership")
+        side_effect=CodexAccountRoutingError(
+            "ambiguous rollout ownership",
+            permanent=True,
+        )
     )
 
     async with db_factory() as db:
@@ -731,7 +734,7 @@ async def test_permanent_codex_routing_error_still_fails_fresh_task(db_factory):
         failed = await db.get(Task, task_id)
         assert failed.status == "failed"
         assert "ambiguous rollout ownership" in failed.error_message
-    assert task_id not in d._codex_routing_not_before
+    assert task_id not in d._account_routing_not_before
 
 
 @pytest.mark.asyncio
@@ -3942,6 +3945,38 @@ async def test_codex_routing_failure_requeues_exact_message(db_factory, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_claude_routing_failure_requeues_exact_message(
+    db_factory,
+    monkeypatch,
+):
+    """A failed safe session migration must preserve the exact chat message."""
+    import backend.services.dispatcher as disp_mod
+
+    monkeypatch.setattr(disp_mod, "CODEX_ROUTING_RETRY_DELAY", 0.01)
+    d = _make_dispatcher(db_factory)
+    processed = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        if len(seen) == 1:
+            raise disp_mod.ClaudeAccountRoutingError(
+                "session hardlink failed",
+                retry_after=0.01,
+            )
+        processed.set()
+
+    d._process_queued_message = fake_process
+    await d.enqueue_message(1, "must keep Claude context")
+    await asyncio.wait_for(processed.wait(), 1)
+
+    assert len(seen) == 2
+    assert seen[0] is seen[1]
+    assert seen[1].prompt == "must keep Claude context"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
 async def test_instance_contention_requeues_exact_message(db_factory, monkeypatch):
     """A last-line launch collision must never acknowledge and lose chat."""
     import backend.services.dispatcher as disp_mod
@@ -4086,7 +4121,7 @@ async def test_stale_codex_lifecycle_cannot_defer_new_instance_owner(db_factory)
         task_id = task.id
         new_instance_id = new_instance.id
 
-    await d._defer_codex_routing_task(
+    await d._defer_account_routing_task(
         stale_generation,
         "stale account cooldown",
     )
@@ -4095,7 +4130,7 @@ async def test_stale_codex_lifecycle_cannot_defer_new_instance_owner(db_factory)
         task = await db.get(Task, task_id)
         assert task.status == "executing"
     assert task.instance_id == new_instance_id
-    assert task_id not in d._codex_routing_not_before
+    assert task_id not in d._account_routing_not_before
 
 
 @pytest.mark.asyncio

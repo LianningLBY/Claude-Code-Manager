@@ -17,7 +17,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **Git Worktree** — 每个实例在独立的 worktree 中工作，互不干扰
 
 ### 执行模式
-- **多 Provider（Claude / Codex）** — Task 级选择执行引擎：OpenAI Codex CLI（默认，`gpt-5.6-sol`）或 Claude Code。Codex 任务支持完整生命周期、多轮对话（`codex exec resume`）、Goal 模式评估、Plan 审批、上下文自动压缩（app-server 优先采用其上报的有效窗口和当前上下文 token；达到阈值预压缩，`contextWindowExceeded` 后摘要换新 session 并自动续跑）、瞬时错误退避重试、跨 Worker 迁移（rollout session 搬运）、PR 自动审核与 Todo Run；指令文件读 `AGENTS.md`（自动注入）。PTY 热会话、多账号池、Skills/MCP、ask_user 为 Claude 专属（Codex 下显式隐藏/拒绝，不静默降级）
+- **多 Provider（Claude / Codex）** — Task 级选择执行引擎：OpenAI Codex CLI（默认，`gpt-5.6-sol`）或 Claude Code。Codex 任务支持完整生命周期、多轮对话、Goal 模式评估、Plan 审批、上下文自动压缩、瞬时错误退避重试、账号池与跨 Worker rollout 迁移；指令文件读 `AGENTS.md`（自动注入）。PTY 热会话、ask_user 和 Claude 原生子 Agent 仍为 Claude 专属（Codex 下显式隐藏/拒绝，不静默降级）
 - **PTY 持久会话模式** — 默认模式，Claude Code 以常驻交互会话运行，多轮免冷启动（热 session 复用），首次启动有 Cold Start 指示器
 - **Goal 模式** — `mode="goal"` 使用自然语言完成条件（`goal_condition`），每 turn 后由轻量评估器（默认 Haiku）自动判断是否达成目标
 - **Plan Mode** — 敏感任务先生成只读计划，人工审批后再执行
@@ -38,7 +38,8 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **语音输入** — 通过 OpenAI Whisper API 语音转文字创建任务
 
 ### 可靠性
-- **Claude Pool** — 多账号池自动切换：撞限/认证失败时自动换号并硬链接 session 实现无缝 `--resume`；PTY 模式下支持主动限速轮换（仅在 5h 窗口利用率 >=90% 时触发）
+- **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter API Key 共用账号池、模型兼容性检查和 session 迁移。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
+- **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级
 - **瞬时 429/过载自动重试** — 基础设施侧的临时限流/过载（非账号额度用尽），指数退避+jitter 用同一账号自动 `--resume` 重试，最多 5 次；检测按 provider 分流（Claude / Codex 各自的 CLI 错误文案）
 - **进程超时保护** — 单任务最长执行时间可配置，超时后自动 kill
 

@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -1585,6 +1586,108 @@ async def test_codex_chat_pool_rotation_replays_fresh_prompt_without_session(
 
 
 @pytest.mark.asyncio
+async def test_claude_chat_pool_rotation_migration_failure_requeues_without_switch(
+    db_factory, tmp_path,
+):
+    source = tmp_path / "claude-a"
+    target = tmp_path / "claude-b"
+    config = tmp_path / "claude-pool.json"
+    config.write_text(json.dumps({"accounts": [
+        {"id": "claude-a", "config_dir": str(source), "enabled": True},
+        {"id": "claude-b", "config_dir": str(target), "enabled": True},
+    ]}))
+    pool = ClaudePool(config_path=config, cooldown_seconds=60)
+    pool.record_routed_account(str(source))
+
+    async with db_factory() as db:
+        task = Task(
+            title="claude migration failure",
+            status="executing",
+            provider="claude",
+            session_id="session-stays-on-source",
+            last_cwd="/tmp",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    dispatcher = MagicMock(pool=pool, codex_pool=None)
+    dispatcher.enqueue_message = AsyncMock()
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    im._config_dirs[7] = str(source)
+    im._launch_params[7] = {
+        "provider": "claude",
+        "prompt": "preserve this exact Claude message",
+        "model": "claude-opus-4-8",
+    }
+    im.get_recent_log_contents = AsyncMock(return_value=[])
+    im.launch = AsyncMock(return_value=999)
+
+    with (
+        patch("backend.main.dispatcher", dispatcher),
+        patch(
+            "backend.services.claude_pool.migrate_session",
+            return_value=False,
+        ) as migrate,
+    ):
+        rotated = await im._try_chat_pool_rotation(
+            7, task.id, 1, "You've hit your limit",
+        )
+
+    assert rotated is False
+    migrate.assert_called_once_with(
+        old_config_dir=str(source),
+        new_config_dir=str(target),
+        session_id=task.session_id,
+    )
+    im.launch.assert_not_awaited()
+    broadcaster.broadcast.assert_not_awaited()
+    dispatcher.enqueue_message.assert_awaited_once_with(
+        task_id=task.id,
+        prompt="preserve this exact Claude message",
+        priority=0,
+        source="routing_retry",
+        command_skills=None,
+        model_override="claude-opus-4-8",
+    )
+    assert pool.status()["last_selected"] == "claude-a"
+
+
+def _mock_codex_persist_route(dispatcher, pool):
+    """Model Dispatcher binding commit semantics for proactive switch tests."""
+
+    async def persist_route(
+        *,
+        task_id,
+        account_id,
+        expected_generation,
+        record_route=True,
+        on_route_committed=None,
+        **_kwargs,
+    ):
+        if not record_route:
+            return True
+        changed = await dispatcher._set_codex_task_binding(
+            task_id,
+            account_id,
+            expected_generation=expected_generation,
+        )
+        if not changed:
+            return False
+        if on_route_committed is not None:
+            on_route_committed()
+        home = pool.home_for_account(account_id)
+        if home:
+            pool.record_routed_account(home)
+        return True
+
+    dispatcher._persist_codex_binding_for_route = AsyncMock(
+        side_effect=persist_route
+    )
+
+
+@pytest.mark.asyncio
 async def test_claude_soft_quota_switch_migrates_before_reset_cooldown(
     db_factory, tmp_path,
 ):
@@ -1618,6 +1721,31 @@ async def test_claude_soft_quota_switch_migrates_before_reset_cooldown(
     im = InstanceManager(db_factory, broadcaster)
     im._config_dirs[7] = str(source)
     dispatcher = MagicMock(pool=pool, codex_pool=None)
+    dispatcher._set_claude_task_binding = AsyncMock(return_value=True)
+
+    async def persist_claude_route(
+        *,
+        task_id,
+        config_dir,
+        expected_generation,
+        record_route=True,
+        on_route_committed=None,
+    ):
+        changed = await dispatcher._set_claude_task_binding(
+            task_id,
+            pool.account_id_from_config_dir(config_dir),
+            expected_generation=expected_generation,
+        )
+        if changed:
+            if on_route_committed is not None:
+                on_route_committed()
+            if record_route:
+                pool.record_routed_account(config_dir)
+        return changed
+
+    dispatcher._persist_claude_binding_for_route = AsyncMock(
+        side_effect=persist_claude_route
+    )
     reset_at = time.time() + 3600
 
     with patch("backend.main.dispatcher", dispatcher):
@@ -1639,6 +1767,8 @@ async def test_claude_soft_quota_switch_migrates_before_reset_cooldown(
     assert pool.is_in_cooldown(str(source))
     assert pool._cooldowns["claude-a"] >= reset_at - 2
     assert im.get_config_dir(7) == str(target)
+    assert pool.status()["last_selected"] == "claude-b"
+    assert dispatcher._set_claude_task_binding.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -1659,6 +1789,7 @@ async def test_claude_soft_quota_no_usable_target_or_migration_failure_does_not_
         {"id": "claude-b", "config_dir": str(target), "enabled": True},
     ]}))
     pool = ClaudePool(config_path=config, cooldown_seconds=60)
+    pool.record_routed_account(str(source))
     if migration_exists:
         # Both accounts are known-high, so selection must stop before migration.
         pool.fetch_usage = AsyncMock(return_value=[
@@ -1684,6 +1815,9 @@ async def test_claude_soft_quota_no_usable_target_or_migration_failure_does_not_
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     im._config_dirs[7] = str(source)
     dispatcher = MagicMock(pool=pool, codex_pool=None)
+    dispatcher._persist_claude_binding_for_route = AsyncMock(
+        return_value=True
+    )
     with patch("backend.main.dispatcher", dispatcher):
         switched = await im._try_proactive_pool_switch(
             7,
@@ -1699,6 +1833,123 @@ async def test_claude_soft_quota_no_usable_target_or_migration_failure_does_not_
     assert switched is False
     assert not pool.is_in_cooldown(str(source))
     assert im.get_config_dir(7) == str(source)
+    assert pool.status()["last_selected"] == "claude-a"
+
+
+@pytest.mark.asyncio
+async def test_claude_soft_quota_cancel_during_copy_keeps_source_binding(
+    db_factory, tmp_path,
+):
+    from backend.services.claude_pool import migrate_session as real_migrate
+
+    source = tmp_path / "claude-copy-cancel-old"
+    target = tmp_path / "claude-copy-cancel-new"
+    session_id = "claude-copy-cancel"
+    rollout = source / "projects" / "encoded-cwd" / f"{session_id}.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"user"}\n')
+    config = tmp_path / "claude-copy-cancel-pool.json"
+    config.write_text(json.dumps({"accounts": [
+        {"id": "claude-old", "config_dir": str(source), "enabled": True},
+        {"id": "claude-new", "config_dir": str(target), "enabled": True},
+    ]}))
+    pool = ClaudePool(config_path=config, cooldown_seconds=60)
+    pool.record_routed_account(str(source))
+    pool.fetch_usage = AsyncMock(return_value=[
+        {"id": "claude-old", "usage": {"five_hour": {"utilization": 95}}},
+        {"id": "claude-new", "usage": {"seven_day": {"utilization": 10}}},
+    ])
+
+    async with db_factory() as db:
+        task = Task(
+            title="claude copy cancellation",
+            provider="claude",
+            status="executing",
+            session_id=session_id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    copy_started = asyncio.Event()
+    release_copy = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_migrate(*args, **kwargs):
+        loop.call_soon_threadsafe(copy_started.set)
+        assert release_copy.wait(timeout=2)
+        return real_migrate(*args, **kwargs)
+
+    persisted_routes: list[tuple[str | None, bool]] = []
+
+    async def persist_route(
+        *,
+        task_id,
+        config_dir,
+        record_route=True,
+        on_route_committed=None,
+        **_kwargs,
+    ):
+        account_id = pool.account_id_from_config_dir(config_dir)
+        persisted_routes.append((account_id, record_route))
+        async with db_factory() as db:
+            persisted = await db.get(Task, task_id)
+            metadata = dict(persisted.metadata_ or {})
+            metadata["claude_account_id"] = account_id
+            persisted.metadata_ = metadata
+            await db.commit()
+        if on_route_committed is not None:
+            on_route_committed()
+        if record_route:
+            pool.record_routed_account(config_dir)
+        return True
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._config_dirs[7] = str(source)
+    dispatcher = MagicMock(pool=pool, codex_pool=None)
+    dispatcher._persist_claude_binding_for_route = AsyncMock(
+        side_effect=persist_route
+    )
+
+    with (
+        patch("backend.main.dispatcher", dispatcher),
+        patch(
+            "backend.services.claude_pool.migrate_session",
+            side_effect=blocked_migrate,
+        ),
+    ):
+        switching = asyncio.create_task(
+            im._try_proactive_pool_switch(
+                7,
+                task.id,
+                rate_limit_info={
+                    "status": "allowed_warning",
+                    "rateLimitType": "five_hour",
+                    "utilization": 0.95,
+                    "resetsAt": time.time() + 3600,
+                },
+            )
+        )
+        await asyncio.wait_for(copy_started.wait(), timeout=1)
+        switching.cancel()
+        await asyncio.sleep(0)
+        switching.cancel()
+        await asyncio.sleep(0)
+        assert not switching.done()
+        release_copy.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(switching, timeout=2)
+
+    migrated = target / "projects" / "encoded-cwd" / f"{session_id}.jsonl"
+    assert migrated.exists()
+    assert migrated.stat().st_ino == rollout.stat().st_ino
+    assert persisted_routes == [("claude-old", False)]
+    async with db_factory() as db:
+        persisted = await db.get(Task, task.id)
+        assert persisted.metadata_["claude_account_id"] == "claude-old"
+    assert im.get_config_dir(7) == str(source)
+    assert pool.status()["last_selected"] == "claude-old"
+    assert not pool.is_in_cooldown(str(source))
 
 
 @pytest.mark.asyncio
@@ -1748,6 +1999,7 @@ async def test_codex_soft_quota_switch_migrates_rebinds_and_updates_binding(
     im.rebind_codex_thread = AsyncMock()
     dispatcher = MagicMock(pool=None, codex_pool=pool)
     dispatcher._set_codex_task_binding = AsyncMock()
+    _mock_codex_persist_route(dispatcher, pool)
 
     with patch("backend.main.dispatcher", dispatcher):
         switched = await im._try_proactive_pool_switch(7, task.id)
@@ -1773,6 +2025,7 @@ async def test_codex_soft_quota_switch_migrates_rebinds_and_updates_binding(
     assert pool.is_in_cooldown(str(source))
     assert pool._cooldowns["codex-a"] >= reset_at - 2
     assert im.get_config_dir(7) == str(target.resolve())
+    assert pool.status()["last_selected"] == "codex-b"
 
 
 @pytest.mark.asyncio
@@ -1795,6 +2048,7 @@ async def test_codex_soft_quota_binding_failure_rolls_back_owner_without_cooldow
         {"id": "codex-new", "codex_home": str(target), "enabled": True},
     ]}))
     pool = CodexPool(config_path=config)
+    pool.record_routed_account(str(source))
     pool.select_quota_alternative = AsyncMock(return_value=str(target.resolve()))
     pool._quota_cache = {
         "codex-old": {
@@ -1826,6 +2080,7 @@ async def test_codex_soft_quota_binding_failure_rolls_back_owner_without_cooldow
     dispatcher._set_codex_task_binding = AsyncMock(
         side_effect=RuntimeError("database unavailable")
     )
+    _mock_codex_persist_route(dispatcher, pool)
 
     with patch("backend.main.dispatcher", dispatcher):
         switched = await im._try_proactive_pool_switch(7, task.id)
@@ -1845,6 +2100,7 @@ async def test_codex_soft_quota_binding_failure_rolls_back_owner_without_cooldow
     ]
     assert not pool.is_in_cooldown(str(source))
     assert im.get_config_dir(7) == str(source.resolve())
+    assert pool.status()["last_selected"] == "codex-old"
     if rollback_fails:
         im.clear_codex_thread_owner_for_recovery.assert_awaited_once_with(
             session_id,
@@ -1876,6 +2132,7 @@ async def test_codex_soft_quota_cancellation_waits_for_binding_rollback(
         {"id": "codex-new", "codex_home": str(target), "enabled": True},
     ]}))
     pool = CodexPool(config_path=config)
+    pool.record_routed_account(str(source))
     pool.select_quota_alternative = AsyncMock(return_value=str(target.resolve()))
     pool._quota_cache = {
         "codex-old": {
@@ -1914,6 +2171,7 @@ async def test_codex_soft_quota_cancellation_waits_for_binding_rollback(
     dispatcher._set_codex_task_binding = AsyncMock(
         side_effect=binding_generation_changed
     )
+    _mock_codex_persist_route(dispatcher, pool)
 
     with patch("backend.main.dispatcher", dispatcher):
         switching = asyncio.create_task(
@@ -1943,9 +2201,214 @@ async def test_codex_soft_quota_cancellation_waits_for_binding_rollback(
     ]
     assert not pool.is_in_cooldown(str(source))
     assert im.get_config_dir(7) == str(source.resolve())
+    assert pool.status()["last_selected"] == "codex-old"
     async with db_factory() as db:
         persisted = await db.get(Task, task.id)
         assert persisted.metadata_["codex_account_id"] == "codex-old"
+
+
+@pytest.mark.asyncio
+async def test_codex_soft_quota_cancel_during_copy_finishes_switch(
+    db_factory, tmp_path,
+):
+    from backend.services.codex_session_migration import (
+        migrate_codex_rollout_session as real_migrate,
+    )
+
+    source = tmp_path / "codex-copy-cancel-old"
+    target = tmp_path / "codex-copy-cancel-new"
+    session_id = "thread-copy-cancel"
+    rollout = (
+        source / "sessions" / "2026" / "07" / "21"
+        / f"rollout-2026-07-21T00-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("{}\n")
+    config = tmp_path / "codex-copy-cancel-pool.json"
+    config.write_text(json.dumps({"accounts": [
+        {"id": "codex-old", "codex_home": str(source), "enabled": True},
+        {"id": "codex-new", "codex_home": str(target), "enabled": True},
+    ]}))
+    pool = CodexPool(config_path=config)
+    pool.record_routed_account(str(source))
+    pool.select_quota_alternative = AsyncMock(
+        return_value=str(target.resolve())
+    )
+    pool._quota_cache = {
+        "codex-old": {
+            "id": "codex-old",
+            "quota": {
+                "primary_used_percent": 95,
+                "primary_resets_at": time.time() + 3600,
+            },
+        }
+    }
+
+    async with db_factory() as db:
+        task = Task(
+            title="codex copy cancellation",
+            provider="codex",
+            status="executing",
+            session_id=session_id,
+            metadata_={"codex_account_id": "codex-old"},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    copy_started = asyncio.Event()
+    release_copy = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_migrate(*args, **kwargs):
+        loop.call_soon_threadsafe(copy_started.set)
+        assert release_copy.wait(timeout=2)
+        return real_migrate(*args, **kwargs)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._config_dirs[7] = str(source.resolve())
+    im.rebind_codex_thread = AsyncMock()
+    dispatcher = MagicMock(pool=None, codex_pool=pool)
+    dispatcher._set_codex_task_binding = AsyncMock(return_value=True)
+    _mock_codex_persist_route(dispatcher, pool)
+
+    with (
+        patch("backend.main.dispatcher", dispatcher),
+        patch(
+            "backend.services.codex_session_migration."
+            "migrate_codex_rollout_session",
+            side_effect=blocked_migrate,
+        ),
+    ):
+        switching = asyncio.create_task(
+            im._try_proactive_pool_switch(7, task.id)
+        )
+        await asyncio.wait_for(copy_started.wait(), timeout=1)
+        switching.cancel()
+        await asyncio.sleep(0)
+        switching.cancel()
+        await asyncio.sleep(0)
+        assert not switching.done()
+        release_copy.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(switching, timeout=2)
+
+    assert dispatcher._persist_codex_binding_for_route.await_count == 2
+    dispatcher._persist_codex_binding_for_route.assert_any_await(
+        task_id=task.id,
+        account_id="codex-old",
+        expected_generation=dispatcher._set_codex_task_binding.await_args.kwargs[
+            "expected_generation"
+        ],
+        record_route=False,
+    )
+    dispatcher._set_codex_task_binding.assert_awaited_once()
+    im.rebind_codex_thread.assert_awaited_once_with(
+        session_id,
+        source_codex_home=str(source.resolve()),
+        target_codex_home=str(target.resolve()),
+    )
+    assert im.get_config_dir(7) == str(target.resolve())
+    assert pool.status()["last_selected"] == "codex-new"
+    assert pool.is_in_cooldown(str(source))
+
+
+@pytest.mark.asyncio
+async def test_codex_soft_quota_direct_binding_cancel_keeps_committed_owner(
+    db_factory, tmp_path,
+):
+    source = tmp_path / "codex-direct-cancel-old"
+    target = tmp_path / "codex-direct-cancel-new"
+    session_id = "thread-direct-binding-cancel"
+    rollout = (
+        source / "sessions" / "2026" / "07" / "21"
+        / f"rollout-2026-07-21T00-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("{}\n")
+    config = tmp_path / "codex-direct-cancel-pool.json"
+    config.write_text(json.dumps({"accounts": [
+        {"id": "codex-old", "codex_home": str(source), "enabled": True},
+        {"id": "codex-new", "codex_home": str(target), "enabled": True},
+    ]}))
+    pool = CodexPool(config_path=config)
+    pool.record_routed_account(str(source))
+    pool.select_quota_alternative = AsyncMock(
+        return_value=str(target.resolve())
+    )
+    pool._quota_cache = {
+        "codex-old": {
+            "id": "codex-old",
+            "quota": {
+                "primary_used_percent": 95,
+                "primary_resets_at": time.time() + 3600,
+            },
+        }
+    }
+
+    async with db_factory() as db:
+        task = Task(
+            title="codex direct binding cancellation",
+            provider="codex",
+            status="executing",
+            session_id=session_id,
+            metadata_={"codex_account_id": "codex-old"},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._config_dirs[7] = str(source.resolve())
+    im.rebind_codex_thread = AsyncMock()
+    dispatcher = MagicMock(pool=None, codex_pool=pool)
+
+    async def persist_then_cancel(
+        *,
+        task_id,
+        account_id,
+        record_route=True,
+        on_route_committed=None,
+        **_kwargs,
+    ):
+        if not record_route:
+            return True
+        async with db_factory() as db:
+            persisted = await db.get(Task, task_id)
+            metadata = dict(persisted.metadata_ or {})
+            metadata["codex_account_id"] = account_id
+            persisted.metadata_ = metadata
+            await db.commit()
+        if on_route_committed is not None:
+            on_route_committed()
+        home = pool.home_for_account(account_id)
+        assert home is not None
+        pool.record_routed_account(home)
+        raise asyncio.CancelledError()
+
+    dispatcher._persist_codex_binding_for_route = AsyncMock(
+        side_effect=persist_then_cancel
+    )
+
+    with patch("backend.main.dispatcher", dispatcher):
+        with pytest.raises(asyncio.CancelledError):
+            await im._try_proactive_pool_switch(7, task.id)
+
+    assert im.rebind_codex_thread.await_args_list == [
+        call(
+            session_id,
+            source_codex_home=str(source.resolve()),
+            target_codex_home=str(target.resolve()),
+        )
+    ]
+    assert im.get_config_dir(7) == str(target.resolve())
+    assert pool.status()["last_selected"] == "codex-new"
+    async with db_factory() as db:
+        persisted = await db.get(Task, task.id)
+        assert persisted.metadata_["codex_account_id"] == "codex-new"
+    # Cancellation arrived immediately after the binding commit, so quota
+    # bookkeeping/broadcast may be skipped, but owner + durable route agree.
+    assert not pool.is_in_cooldown(str(source))
 
 
 @pytest.mark.asyncio
@@ -1967,6 +2430,7 @@ async def test_codex_soft_quota_rebind_failure_keeps_old_home_available(
         {"id": "codex-new", "codex_home": str(target), "enabled": True},
     ]}))
     pool = CodexPool(config_path=config)
+    pool.record_routed_account(str(source))
     pool.select_quota_alternative = AsyncMock(return_value=str(target.resolve()))
     pool._quota_cache = {
         "codex-old": {
@@ -1992,6 +2456,7 @@ async def test_codex_soft_quota_rebind_failure_keeps_old_home_available(
     im.rebind_codex_thread = AsyncMock(side_effect=RuntimeError("target busy"))
     dispatcher = MagicMock(pool=None, codex_pool=pool)
     dispatcher._set_codex_task_binding = AsyncMock()
+    _mock_codex_persist_route(dispatcher, pool)
 
     with patch("backend.main.dispatcher", dispatcher):
         switched = await im._try_proactive_pool_switch(7, task.id)
@@ -2000,6 +2465,7 @@ async def test_codex_soft_quota_rebind_failure_keeps_old_home_available(
     dispatcher._set_codex_task_binding.assert_not_awaited()
     assert not pool.is_in_cooldown(str(source))
     assert im.get_config_dir(7) == str(source.resolve())
+    assert pool.status()["last_selected"] == "codex-old"
 
 
 @pytest.mark.asyncio
@@ -2059,6 +2525,8 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         prompt="preserve this exact user prompt",
         priority=PRIORITY_USER,
         source="routing_retry",
+        command_skills=None,
+        model_override="gpt-5.5",
     )
     async with db_factory() as db:
         refreshed_task = await db.get(Task, task.id)
@@ -2121,6 +2589,8 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         prompt="preserve transient prompt",
         priority=0,
         source="routing_retry",
+        command_skills={"sub-agent": True},
+        model_override="gpt-5.5",
     )
 
 
@@ -2167,6 +2637,8 @@ async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
         prompt="preserve rotation prompt",
         priority=0,
         source="routing_retry",
+        command_skills=None,
+        model_override="gpt-5.5",
     )
 
 
@@ -4476,12 +4948,31 @@ async def test_consume_output_default_does_not_restore_task_status(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_consume_output_chat_initiated_error_marks_failed(db_factory):
-    """When chat_initiated=True and process exits with error, task is marked failed."""
+@pytest.mark.parametrize(
+    ("provider", "api_account", "expected_label"),
+    [
+        ("claude", False, "Claude"),
+        ("claude", True, "Claude API"),
+        ("codex", False, "Codex"),
+        ("codex", True, "Codex API"),
+    ],
+)
+async def test_consume_output_chat_initiated_error_marks_failed(
+    db_factory,
+    provider,
+    api_account,
+    expected_label,
+):
+    """A silent process exit reports its real provider and account kind."""
     async with db_factory() as db:
         inst = Instance(name="chat-err-inst")
         db.add(inst)
-        task = Task(title="chat error task", description="d", status="executing")
+        task = Task(
+            title="chat error task",
+            description="d",
+            status="executing",
+            provider=provider,
+        )
         db.add(task)
         await db.commit()
         await db.refresh(inst)
@@ -4494,13 +4985,40 @@ async def test_consume_output_chat_initiated_error_marks_failed(db_factory):
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
     im.processes[inst_id] = mock_proc
+    im._config_dirs[inst_id] = "/runtime/provider-home"
+    store = MagicMock()
+    store.account_for_claude_config_dir.return_value = (
+        MagicMock() if api_account and provider == "claude" else None
+    )
+    store.account_for_codex_home.return_value = (
+        MagicMock() if api_account and provider == "codex" else None
+    )
+    im.cloudrouter_store = store
 
-    await im._consume_output(inst_id, task_id, mock_proc, chat_initiated=True)
+    await im._consume_output(
+        inst_id,
+        task_id,
+        mock_proc,
+        chat_initiated=True,
+        provider=provider,
+    )
 
     async with db_factory() as db:
         task = await db.get(Task, task_id)
+        notices = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalars().all()
     assert task.status == "failed"
     assert task.error_message is not None
+    assert [notice.content for notice in notices] == [
+        f"{expected_label} 进程在返回回复前异常退出（exit code 1）。"
+    ]
 
 
 @pytest.mark.asyncio
@@ -4561,6 +5079,69 @@ async def test_consume_output_fatal_result_overrides_zero_exit(db_factory):
     assert task.status == "failed"
     assert task.error_message == error_text
     assert persisted_error.content == error_text
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_failed_does_not_append_generic_process_exit(
+    db_factory,
+):
+    error_text = "Your Codex access token could not be refreshed."
+    async with db_factory() as db:
+        inst = Instance(name="codex-turn-failed-inst")
+        task = Task(
+            title="codex turn failed task",
+            description="d",
+            status="executing",
+            provider="codex",
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_id = task.id
+
+    process = _make_mock_process(returncode=1)
+    output = iter([
+        json.dumps({
+            "type": "turn.failed",
+            "error": {"message": error_text},
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[inst_id] = process
+
+    await manager._consume_output(
+        inst_id,
+        task_id,
+        process,
+        chat_initiated=True,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        error_entries = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalars().all()
+
+    assert task.status == "failed"
+    assert task.error_message == error_text
+    assert [entry.content for entry in error_entries] == [error_text]
 
 
 @pytest.mark.asyncio
@@ -7085,6 +7666,10 @@ def test_parse_codex_turn_failed_extracts_nested_message():
     assert event["content"] == "stream disconnected before completion: transport error"
     assert event["error_code"] == "contextWindowExceeded"
     assert event["error_details"] == "effective model window exhausted"
+    assert (
+        im._fatal_provider_error_for_event(event)
+        == "stream disconnected before completion: transport error"
+    )
 
 
 def test_parse_codex_file_change_started_is_tool_use():

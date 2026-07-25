@@ -197,6 +197,44 @@ class TestSelection:
         pool.mark_rate_limited(str(tmp_path / "codex-2"))
         assert pool.select() is None
 
+    def test_auth_failure_requires_intervention_instead_of_infinite_retry(
+        self, pool: CodexPool, tmp_path: Path
+    ):
+        for account in pool._accounts:
+            account.enabled = account.id == "codex-1"
+        pool.mark_auth_failure(str(tmp_path / "codex-1"))
+
+        assert pool.has_compatible_enabled_account(None)
+        assert not pool.has_retryable_compatible_account(None)
+
+        pool.clear_cooldown("codex-1")
+        assert pool.has_retryable_compatible_account(None)
+
+    def test_real_route_can_override_provisional_selection(
+        self, pool: CodexPool, tmp_path: Path
+    ):
+        pool.select()
+
+        assert pool.record_routed_account(str(tmp_path / "codex-2")) is True
+        assert pool.status()["last_selected"] == "codex-2"
+
+    def test_unknown_real_route_does_not_replace_marker(
+        self, pool: CodexPool, tmp_path: Path
+    ):
+        pool.record_routed_account(str(tmp_path / "codex-2"))
+        pool.select()
+
+        assert pool.record_routed_account(str(tmp_path / "unknown")) is False
+        assert pool.status()["last_selected"] == "codex-2"
+
+    def test_selection_cursor_does_not_publish_uncommitted_route(
+        self, pool: CodexPool, tmp_path: Path
+    ):
+        assert pool.select() == str((tmp_path / "codex-1").resolve())
+        assert pool.status()["last_selected"] is None
+        assert pool.select() == str((tmp_path / "codex-2").resolve())
+        assert pool.status()["last_selected"] is None
+
 
 class TestAccountHomeHelpers:
     def test_canonical_home_resolves_alias_and_drives_lookup(
@@ -1042,6 +1080,59 @@ class _FakeCloudRouterCodexStore:
 
 
 class TestCloudRouterCodexProjection:
+    @staticmethod
+    def _mixed_pool(tmp_path, account, snapshot=None):
+        native_home = tmp_path / "native-codex"
+        native_path = tmp_path / "native-codex-accounts.json"
+        native_path.write_text(json.dumps({
+            "accounts": [{
+                "id": "native-1",
+                "codex_home": str(native_home),
+                "enabled": True,
+            }],
+        }))
+        pool = CodexPool(
+            config_path=native_path,
+            cloudrouter_store=_FakeCloudRouterCodexStore(account, snapshot),
+            bootstrap_default=False,
+        )
+        return pool, native_home
+
+    def test_fresh_selection_prefers_compatible_api_over_native(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        pool, _native_home = self._mixed_pool(tmp_path, account)
+
+        assert pool.select(model="gpt-5.5") == str(
+            Path(account.codex_home).resolve()
+        )
+        assert pool.status()["last_selected"] is None
+
+    def test_unsupported_api_model_preserves_native_fallback(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        pool, native_home = self._mixed_pool(tmp_path, account)
+
+        assert pool.select(model="gpt-5.6-sol") == str(native_home.resolve())
+
+    def test_exhausted_api_preserves_native_fallback(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": False,
+            "known": True,
+            "reason": "quota_exhausted",
+            "state": "exhausted",
+            "windows": [],
+        }
+        pool, native_home = self._mixed_pool(tmp_path, account, snapshot)
+
+        assert pool.select(model="gpt-5.5") == str(native_home.resolve())
+
+    def test_preferred_native_account_outranks_available_api(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        pool, native_home = self._mixed_pool(tmp_path, account)
+
+        assert pool.set_preferred("native-1") is True
+        assert pool.select(model="gpt-5.5") == str(native_home.resolve())
+
     def test_api_only_pool_loads_without_oauth_config_and_filters_models(
         self, tmp_path
     ):

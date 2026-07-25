@@ -894,3 +894,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **问题**：旧进程拉取带 v2 启动守卫的新代码后，仍可能写入无 lease/token 的 `restarting` 状态并直接执行 `systemctl restart`。新 `pre-start` 只承认 v2 worker 的 `starting` handoff，因而永久拒绝启动；systemd `Restart=always` 会形成重启风暴，前端则停留在断连前最后一个“迁移中”状态。
 - **解决**：启动守卫仅对非权威临时状态、无任何 owner token、目标 commit 与当前运行 commit 精确一致的 legacy `restarting` 开放启动，并强制进入 maintenance-only。依赖、数据库和业务服务仍禁止自动启动或变更，管理员必须通过事务化 repair 完成部署；tokened、commit 不匹配及其他 active 状态继续 fail closed。
 - **验证**：新增 legacy 精确 commit 恢复、错误 commit 拒绝和伪 token 不得降级走 legacy 三条回归。
+
+### 2026-07-25 — Claude/Codex API-first 路由、最近账号一致性与错误归因（基线 commit 919d642）
+
+- **问题**：Codex 缺少与 Claude 对等的「最近使用」展示；两池的 `select()` 又会在 session 迁移和 Task binding 之前提前改 marker。旧对话切换账号时若迁移、绑定或取消落在边界窗口，UI 可能显示未真正使用的候选；Codex rollout 复制若被取消或并发 Task generation 替换，还可能留下多份副本但没有 durable owner。通用 direct consumer 还把 silent exit 硬编码成「Claude API 进程退出」，且没把 Codex `turn.failed` 识别为 provider 终态，导致原始 Codex 错误后再追加一条误导性退出提示。
+- **解决**：统一路由优先级为 preferred → 已有 session resident/bound → 新 session 兼容可用 API → 原生号池 fallback，禁止模型降级。Claude/Codex 都把账号 ID 持久绑定到 Task；Codex 在复制前先锚定 registered source，再把 copy、app-server rebind 和 target binding 作为 cancellation-settled 单元。`select()` 只提案，Codex 另用 selection cursor 保持轮询；`last_selected` 只在 binding 提交或临时进程实际 spawn 后更新。临时冷却保留原 queued message，已知额度耗尽/认证终态直接显示失败。进程退出标签按 Claude/Codex 与 API/native 实际路由生成；Codex exec/app-server 的 `turn.failed` 保留原始 provider 错误，不再追加 generic exit。
+- **预防**：账号选择、物理 session 副本、live transport owner、Task binding 和 UI marker 必须有明确 commit 顺序；任何 `asyncio.to_thread` 文件迁移都不能让 cancellation 在副本落盘后、durable owner 提交前逸出。失败补偿不能靠再次写全局 marker，而应让候选和已提交路由从结构上分离。
+- **验证**：路由/号池/Dispatcher/InstanceManager/Distill/Goal 专项 711 passed；provider 退出归因专项 6 passed；新增 rollout/Claude session copy 取消、generation change、proactive cancel 与 binding-commit cancel 等确定性并发回归。后端最终全量 2337 passed，前端全量 388 passed，TypeScript/Vite production build 与 `git diff --check` 通过；全量测试前后开发 DB/WAL/SHM 的 inode、mtime、size、SHA-256 完全一致。改动通过事务化 repair 加载到开发 8003，未触碰生产。

@@ -357,6 +357,17 @@ async def distill_task_conversation(
                 # only needs the transcript supplied on stdin.
                 cwd=tempfile.gettempdir(),
             )
+            # ``select()`` only proposes an account. Publish "recently used"
+            # once the provider process really exists, including runs that
+            # later return a model/auth error.
+            if provider == "codex" and codex_pool is not None and codex_home:
+                codex_pool.record_routed_account(codex_home)
+            elif (
+                provider == "claude"
+                and claude_pool is not None
+                and env.get("CLAUDE_CONFIG_DIR")
+            ):
+                claude_pool.record_routed_account(env["CLAUDE_CONFIG_DIR"])
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(input=prompt.encode("utf-8")),
                 timeout=TASK_DISTILL_TIMEOUT_SECONDS,

@@ -289,9 +289,13 @@ class CodexPool:
         self._cooldown_seconds = cooldown_seconds
         self._accounts: list[CodexPoolAccount] = []
         self._cooldowns: dict[str, float] = {}
+        self._terminal_failures: set[str] = set()
         self._preferred_account_id: str | None = None
         self._last_selected_id: str | None = None
         self._last_selected_at: float = 0.0
+        # Round-robin proposals advance independently from the UI's
+        # last-successfully-routed marker.
+        self._selection_cursor_id: str | None = None
         self._quota_cache: dict[str, dict] | None = None
         self._quota_cache_at: float = 0.0
         self._quota_cache_live_until: float = 0.0
@@ -396,11 +400,14 @@ class CodexPool:
             for account_id, until in self._cooldowns.items()
             if account_id in valid_ids
         }
+        self._terminal_failures.intersection_update(valid_ids)
         if self._preferred_account_id not in valid_ids:
             self._preferred_account_id = None
         if self._last_selected_id not in valid_ids:
             self._last_selected_id = None
             self._last_selected_at = 0.0
+        if self._selection_cursor_id not in valid_ids:
+            self._selection_cursor_id = None
         # Account membership/home changes invalidate every quota entry, even
         # when the same account id remains in the reloaded file.
         self._quota_cache = None
@@ -536,6 +543,28 @@ class CodexPool:
             for account in self._accounts
         )
 
+    def has_retryable_compatible_account(self, model: str | None) -> bool:
+        """Whether unavailable compatible accounts can recover automatically."""
+
+        for account in self._accounts:
+            if (
+                not account.enabled
+                or account.retired
+                or not account.supports_model(model)
+            ):
+                continue
+            if account.id in self._terminal_failures:
+                continue
+            if account.auth_kind != "cloudrouter_api":
+                return True
+            decision = self._api_quota_decision(account)
+            if not (
+                bool(decision.get("known"))
+                and decision.get("available") is False
+            ):
+                return True
+        return False
+
     def has_native_enabled_account(self) -> bool:
         """Whether service-default fallback remains backed by a native account."""
 
@@ -632,16 +661,41 @@ class CodexPool:
             if preferred:
                 return self._record_selection(preferred, now)
 
-        # True round-robin follows config order and resumes immediately after
-        # the previously selected id, skipping excluded/disabled/cooled homes.
+        # Fresh launches prefer a compatible CloudRouter API account.  True
+        # round-robin is preserved within the API and native groups; if every
+        # API projection is unavailable/unsupported, the native group follows
+        # exactly the former config-order rotation.
+        api_candidates = [
+            account
+            for account in candidates
+            if account.auth_kind == "cloudrouter_api"
+        ]
+        native_candidates = [
+            account
+            for account in candidates
+            if account.auth_kind != "cloudrouter_api"
+        ]
+        for group in (api_candidates, native_candidates):
+            chosen = self._round_robin_candidate(group)
+            if chosen is not None:
+                return self._record_selection(chosen, now)
+        return None
+
+    def _round_robin_candidate(
+        self, candidates: list[CodexPoolAccount]
+    ) -> CodexPoolAccount | None:
+        """Return the next config-order candidate without recording usage."""
+
+        if not candidates:
+            return None
         candidate_ids = {account.id for account in candidates}
         start = 0
-        if self._last_selected_id:
+        if self._selection_cursor_id:
             previous = next(
                 (
                     index
                     for index, account in enumerate(self._accounts)
-                    if account.id == self._last_selected_id
+                    if account.id == self._selection_cursor_id
                 ),
                 None,
             )
@@ -650,25 +704,57 @@ class CodexPool:
         for offset in range(len(self._accounts)):
             chosen = self._accounts[(start + offset) % len(self._accounts)]
             if chosen.id in candidate_ids:
-                return self._record_selection(chosen, now)
+                return chosen
         return None
 
     def _record_selection(self, account: CodexPoolAccount, now: float) -> str:
-        self._last_selected_id = account.id
-        self._last_selected_at = now
+        self._selection_cursor_id = account.id
         logger.info("Codex pool selected account %s (%s)", account.id, account.codex_home)
         return account.codex_home
+
+    def _record_routed_account(
+        self, account: CodexPoolAccount, now: float
+    ) -> None:
+        self._last_selected_id = account.id
+        self._last_selected_at = now
+
+    def record_routed_account(self, codex_home: str) -> bool:
+        """Record the account chosen as the final route for a Codex launch.
+
+        A selected home can differ from the final route after resident-thread
+        discovery or a migration fallback. Selection therefore advances only
+        an internal round-robin cursor; callers record here after the final
+        route is committed or an auxiliary process has spawned. Unknown homes
+        do not alter the current marker.
+        """
+
+        account = self.account_for_home(codex_home)
+        if account is None:
+            logger.warning(
+                "Cannot record routed Codex account for unknown CODEX_HOME: %s",
+                codex_home,
+            )
+            return False
+        self._record_routed_account(account, time.time())
+        logger.info(
+            "Codex pool recorded routed account %s (%s)",
+            account.id,
+            account.codex_home,
+        )
+        return True
 
     def mark_rate_limited(self, codex_home: str, duration: int | None = None):
         acc = self._find_by_home(codex_home)
         if acc:
             d = duration if duration is not None else self._cooldown_seconds
+            self._terminal_failures.discard(acc.id)
             self._cooldowns[acc.id] = time.time() + d
             logger.info("Codex pool: marked %s rate-limited for %ds", acc.id, d)
 
     def mark_auth_failure(self, codex_home: str):
         acc = self._find_by_home(codex_home)
         if acc:
+            self._terminal_failures.add(acc.id)
             self._cooldowns[acc.id] = time.time() + 365 * 86400
             logger.info("Codex pool: marked %s auth-failed (indefinite)", acc.id)
 
@@ -680,6 +766,7 @@ class CodexPool:
 
     def clear_cooldown(self, account_id: str):
         self._cooldowns.pop(account_id, None)
+        self._terminal_failures.discard(account_id)
 
     def _find_by_home(self, codex_home: str) -> CodexPoolAccount | None:
         return self.account_for_home(codex_home)

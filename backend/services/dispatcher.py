@@ -8,6 +8,7 @@ import signal
 import shutil
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -199,9 +200,31 @@ _TaskRoutingGeneration = (
 class CodexAccountRoutingError(RuntimeError):
     """A Codex turn cannot be safely assigned to an account right now."""
 
-    def __init__(self, message: str, *, retry_after: float | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        permanent: bool = False,
+    ):
         super().__init__(message)
         self.retry_after = retry_after
+        self.permanent = permanent
+
+
+class ClaudeAccountRoutingError(QueuedMessagePrelaunchError):
+    """A Claude turn cannot be safely assigned without risking its context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        permanent: bool = False,
+    ):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.permanent = permanent
 
 
 class TaskStartPausedError(RuntimeError):
@@ -467,10 +490,10 @@ class GlobalDispatcher:
         # Entries intentionally outlive empty queues: deleting one could make a
         # stale dequeued message's old generation look current again.
         self._task_queue_generations: dict[int, int] = {}
-        # Fresh lifecycle tasks waiting for a Codex account cooldown or
+        # Fresh lifecycle tasks waiting for a provider-account cooldown or
         # maintenance window. TaskQueue excludes them without consuming retry
         # budget, while unrelated pending tasks can still use idle instances.
-        self._codex_routing_not_before: dict[int, float] = {}
+        self._account_routing_not_before: dict[int, float] = {}
 
         # Pool: initialized lazily on start() if pool_enabled
         self.pool: "ClaudePool | None" = None
@@ -479,8 +502,9 @@ class GlobalDispatcher:
         # does not exist.
         self.cloudrouter_store = None
         # CodexPool is created by backend.main and injected after construction.
-        # Task ownership lives on Task.metadata_["codex_account_id"] because
-        # instances are generic workers that rotate between unrelated tasks.
+        # Provider account ownership lives on Task.metadata_
+        # ("claude_account_id"/"codex_account_id") because instances are
+        # generic workers that rotate between unrelated tasks.
         self.codex_pool: "CodexPool | None" = None
 
     @property
@@ -1924,15 +1948,15 @@ class GlobalDispatcher:
                                     break
                                 queue = TaskQueue(db)
                                 now = time.monotonic()
-                                self._codex_routing_not_before = {
+                                self._account_routing_not_before = {
                                     task_id: deadline
                                     for task_id, deadline
-                                    in self._codex_routing_not_before.items()
+                                    in self._account_routing_not_before.items()
                                     if deadline > now
                                 }
                                 task = await queue.dequeue(
                                     exclude_ids=set(
-                                        self._codex_routing_not_before
+                                        self._account_routing_not_before
                                     ),
                                     instance_id=instance.id,
                                 )
@@ -2275,20 +2299,26 @@ class GlobalDispatcher:
     ) -> str | None:
         """Resolve the provider account home for a (possibly resuming) launch.
 
-        Claude returns ``CLAUDE_CONFIG_DIR``. Codex returns ``CODEX_HOME`` and
-        persists the selected account on the Task so copied rollout files do
-        not make future resumes ambiguous.
+        Claude returns ``CLAUDE_CONFIG_DIR`` and Codex returns ``CODEX_HOME``.
+        Both persist the selected account on the Task so retained hardlink/
+        rollout copies do not make future resumes ambiguous.
 
-        Prefers a fresh, validated pool account and migrates the session JSONL
-        into it. The critical case is when the pool can hand out **no** healthy
-        account (every account rate-limited): we must NOT let the launch fall
-        through to an arbitrary inherited ``CLAUDE_CONFIG_DIR`` — that account
-        won't hold the session JSONL and ``claude --resume`` dies with
-        "No conversation found with session ID", which hard-fails the task and
-        loses the session (prod tasks #734/#740). Instead anchor the resume to
-        whichever account dir actually holds the session; if that account is
-        rate-limited it surfaces as a recoverable rate-limit/transient event the
-        existing retry paths handle, rather than a fatal lookup miss.
+        Explicit preferred selection has the highest priority and safely
+        migrates an existing session on its next turn. Without an explicit
+        choice, a healthy resident session remains sticky so its native context
+        and hot transport are preserved; fresh launches prefer a compatible,
+        available CloudRouter API projection and then fall back to the native
+        pool policy.
+
+        The critical case is when the pool can hand out **no** healthy account
+        (every account rate-limited): we must NOT let the launch fall through to
+        an arbitrary inherited ``CLAUDE_CONFIG_DIR`` — that account won't hold
+        the session JSONL and ``claude --resume`` dies with "No conversation
+        found with session ID", which hard-fails the task and loses the session
+        (prod tasks #734/#740). Instead anchor the resume to whichever account
+        dir actually holds the session; if that account is rate-limited it
+        surfaces as a recoverable rate-limit/transient event the existing retry
+        paths handle, rather than a fatal lookup miss.
 
         Returns a config_dir, or None when there is no pool (default account)
         or no session to anchor a fallback to.
@@ -2304,6 +2334,33 @@ class GlobalDispatcher:
         if not (self.pool and self.pool.enabled):
             return None
 
+        bound_id = await self._claude_task_binding(task_id)
+        bound_account = self.pool.account(bound_id) if bound_id else None
+        bound_config_dir = (
+            os.path.expanduser(bound_account.config_dir)
+            if bound_account is not None
+            else None
+        )
+        preferred_owner_config_dir: str | None = None
+        preferred_config_dir: str | None = None
+        preferred_id = self.pool.preferred_account_id
+        if preferred_id:
+            preferred_account = self.pool.account(preferred_id)
+            if preferred_account is not None:
+                preferred_owner_config_dir = os.path.expanduser(
+                    preferred_account.config_dir
+                )
+            if (
+                preferred_owner_config_dir is not None
+                and self.pool.is_config_dir_available(
+                    preferred_owner_config_dir
+                )
+                and self.pool.supports_model_for_config_dir(
+                    preferred_owner_config_dir, model
+                )
+            ):
+                preferred_config_dir = preferred_owner_config_dir
+
         # --- Resume happy path: anchor to the session's resident account ---
         # The expensive part used to be ``select_async(validate=True)``, which
         # spawned a ``claude -p`` probe (a full API round-trip, up to 30s) on
@@ -2317,28 +2374,98 @@ class GlobalDispatcher:
         # healthy (not cooled-down) account, reuse it directly — no probe, no
         # migration, no config_dir drift, PTY hot-session preserved.
         if session_id:
-            resident = self.pool.locate_session_config_dir(session_id)
-            if (
+            matches = self.pool.locate_session_config_dirs(session_id)
+            resident: str | None = None
+            if bound_config_dir and (
+                not matches or bound_config_dir in matches
+            ):
+                # A just-started/hot PTY session may not have flushed its JSONL
+                # yet. The durable Task owner is still safer than drifting to a
+                # newly selected account where --resume cannot possibly find
+                # the native context.
+                resident = bound_config_dir
+            elif len(matches) == 1:
+                resident = matches[0]
+                if bound_config_dir and resident != bound_config_dir:
+                    logger.warning(
+                        "Repairing stale Claude account binding for task %s "
+                        "session %s: %s -> %s",
+                        task_id,
+                        session_id,
+                        bound_config_dir,
+                        resident,
+                    )
+            elif len(matches) > 1:
+                if preferred_owner_config_dir in matches:
+                    # An explicit user choice is authoritative enough to
+                    # disambiguate legacy divergent copies. Persist it before
+                    # launch so clearing the global preference later cannot
+                    # jump this chat back to a different history.
+                    resident = preferred_owner_config_dir
+                    logger.warning(
+                        "Using explicitly preferred Claude account %s to "
+                        "disambiguate session %s for task %s",
+                        resident,
+                        session_id,
+                        task_id,
+                    )
+                else:
+                    resident = self.pool.authoritative_session_config_dir(
+                        session_id,
+                        matches,
+                    )
+                if resident is None:
+                    raise ClaudeAccountRoutingError(
+                        f"Claude session {session_id} has multiple copies "
+                        "without one provable complete owner and no "
+                        "authoritative Task binding; refusing to guess which "
+                        "context is current",
+                        permanent=True,
+                    )
+                if preferred_owner_config_dir not in matches:
+                    logger.warning(
+                        "Bootstrapping Claude account binding for task %s "
+                        "session %s from its provable complete copy: %s",
+                        task_id,
+                        session_id,
+                        resident,
+                    )
+            resident_available = bool(
                 resident
                 and self.pool.is_known_account(resident)
                 and self.pool.is_config_dir_available(resident)
                 and self.pool.supports_model_for_config_dir(resident, model)
+            )
+            if resident_available and (
+                preferred_config_dir is None
+                or preferred_config_dir == resident
             ):
+                await self._persist_claude_binding_for_route(
+                    task_id=task_id,
+                    config_dir=resident,
+                    expected_generation=expected_generation,
+                )
                 return resident
             # Resident account is missing, rate-limited, or disabled → pick a
             # healthy enabled account cheaply (cooldown/enabled-aware, no
             # subprocess) and migrate the session in. The disabled case makes
             # ``enabled=false`` a hard guarantee: an in-flight session sitting on
             # a retired account is moved off it on its next resume instead of
-            # being reused.
-            config_dir = self.pool.select(validate=False, model=model)
+            # being reused. An explicit preferred account reaches the same
+            # migration path even when the resident is healthy, so the next
+            # turn really honors "切换到此账号".
+            config_dir = preferred_config_dir or self.pool.select(
+                validate=False, model=model
+            )
             if config_dir:
                 if resident and resident != config_dir:
                     await self._require_task_lifecycle_active(
                         expected_generation
                     )
-                    from backend.services.claude_pool import migrate_session
-                    migrate_session(
+                    from backend.services.claude_pool import (
+                        migrate_session_async,
+                    )
+                    migrated = await migrate_session_async(
                         old_config_dir=resident,
                         new_config_dir=config_dir,
                         session_id=session_id,
@@ -2346,35 +2473,81 @@ class GlobalDispatcher:
                     await self._require_task_lifecycle_active(
                         expected_generation
                     )
+                    if not migrated:
+                        if resident_available:
+                            logger.error(
+                                "Preferred Claude account switch for task %s "
+                                "session %s could not migrate %s -> %s; "
+                                "continuing on the intact resident account",
+                                task_id,
+                                session_id,
+                                resident,
+                                config_dir,
+                            )
+                            await self._persist_claude_binding_for_route(
+                                task_id=task_id,
+                                config_dir=resident,
+                                expected_generation=expected_generation,
+                            )
+                            return resident
+                        raise ClaudeAccountRoutingError(
+                            f"Claude session {session_id} could not be migrated "
+                            "to an available account; preserving the turn "
+                            "instead of launching without its native context",
+                            retry_after=CODEX_ROUTING_RETRY_DELAY,
+                        )
+                await self._persist_claude_binding_for_route(
+                    task_id=task_id,
+                    config_dir=config_dir,
+                    expected_generation=expected_generation,
+                )
                 return config_dir
             # Pool exhausted: anchor to where the session actually lives so
             # --resume finds the conversation instead of hard-failing on a wrong
             # (inherited) account dir.
             if resident:
+                compatible_account_exists = (
+                    self.pool.has_compatible_enabled_account(model)
+                )
+                retryable_account_exists = (
+                    compatible_account_exists
+                    and self.pool.has_retryable_compatible_account(model)
+                )
+                routing_error_kwargs = {
+                    "retry_after": (
+                        CODEX_ROUTING_RETRY_DELAY
+                        if retryable_account_exists
+                        else None
+                    ),
+                    "permanent": not retryable_account_exists,
+                }
                 if (
                     self.pool.is_known_account(resident)
                     and not self.pool.supports_model_for_config_dir(
                         resident, model
                     )
                 ):
-                    raise RuntimeError(
-                        f"Claude pool has no enabled account supporting model "
-                        f"{model!r}; refusing to resume on an incompatible "
-                        "CloudRouter account"
+                    raise ClaudeAccountRoutingError(
+                        f"Claude session is resident on a CloudRouter account "
+                        f"that does not support model {model!r}, and no "
+                        "compatible replacement is currently available",
+                        **routing_error_kwargs,
                     )
                 if (
                     self.pool.is_known_account(resident)
                     and self.pool.is_disabled(resident)
                 ):
-                    raise RuntimeError(
+                    raise ClaudeAccountRoutingError(
                         "Claude session is resident on a disabled account and "
-                        "no enabled replacement account is available"
+                        "no enabled replacement account is currently available",
+                        **routing_error_kwargs,
                     )
                 if self.pool.is_cloudrouter_account(resident):
-                    raise RuntimeError(
+                    raise ClaudeAccountRoutingError(
                         f"Claude CloudRouter account for model {model!r} is "
                         "currently unavailable and no compatible replacement "
-                        "account can safely resume the session"
+                        "account can safely resume the session",
+                        **routing_error_kwargs,
                     )
                 logger.warning(
                     "Pool exhausted; resuming session %s on its resident account "
@@ -2382,36 +2555,69 @@ class GlobalDispatcher:
                     "find the conversation)",
                     session_id, resident,
                 )
+                await self._persist_claude_binding_for_route(
+                    task_id=task_id,
+                    config_dir=resident,
+                    expected_generation=expected_generation,
+                )
             return resident
 
         # Fresh launch (no session to anchor): just pick a healthy account.
         config_dir = self.pool.select(validate=False, model=model)
         if config_dir is None and self.pool._accounts:
+            compatible_account_exists = (
+                self.pool.has_compatible_enabled_account(model)
+            )
+            retryable_account_exists = (
+                compatible_account_exists
+                and self.pool.has_retryable_compatible_account(model)
+            )
             detail = (
                 "no enabled account supports the model"
-                if not self.pool.has_compatible_enabled_account(model)
-                else "all compatible pool accounts are currently unavailable"
+                if not compatible_account_exists
+                else (
+                    "all compatible accounts require quota or credential intervention"
+                    if not retryable_account_exists
+                    else "all compatible pool accounts are currently unavailable"
+                )
             )
-            raise RuntimeError(
+            raise ClaudeAccountRoutingError(
                 f"Claude pool has {detail} {model!r}; refusing to fall back "
-                "to the service default account"
+                "to the service default account",
+                retry_after=(
+                    CODEX_ROUTING_RETRY_DELAY
+                    if retryable_account_exists
+                    else None
+                ),
+                permanent=not retryable_account_exists,
+            )
+        if config_dir:
+            await self._persist_claude_binding_for_route(
+                task_id=task_id,
+                config_dir=config_dir,
+                expected_generation=expected_generation,
             )
         return config_dir
 
-    async def _codex_task_binding(self, task_id: int | None) -> str | None:
+    async def _task_account_binding(
+        self,
+        task_id: int | None,
+        metadata_key: str,
+    ) -> str | None:
         if task_id is None:
             return None
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
             if not task:
                 return None
-            value = (task.metadata_ or {}).get("codex_account_id")
+            value = (task.metadata_ or {}).get(metadata_key)
             return value if isinstance(value, str) and value else None
 
-    async def _set_codex_task_binding(
+    async def _set_task_account_binding(
         self,
         task_id: int | None,
         account_id: str | None,
+        metadata_key: str,
         *,
         expected_generation: _TaskRoutingGeneration | None = None,
     ) -> bool:
@@ -2446,13 +2652,121 @@ class GlobalDispatcher:
             if not task:
                 return False
             metadata = dict(task.metadata_ or {})
-            if metadata.get("codex_account_id") == account_id:
+            if metadata.get(metadata_key) == account_id:
                 return True
-            metadata["codex_account_id"] = account_id
+            metadata[metadata_key] = account_id
             # SQLAlchemy JSON columns do not reliably detect in-place changes.
             task.metadata_ = metadata
             await db.commit()
             return True
+
+    async def _claude_task_binding(self, task_id: int | None) -> str | None:
+        return await self._task_account_binding(
+            task_id,
+            "claude_account_id",
+        )
+
+    async def _set_claude_task_binding(
+        self,
+        task_id: int | None,
+        account_id: str | None,
+        *,
+        expected_generation: _TaskRoutingGeneration | None = None,
+    ) -> bool:
+        return await self._set_task_account_binding(
+            task_id,
+            account_id,
+            "claude_account_id",
+            expected_generation=expected_generation,
+        )
+
+    async def _codex_task_binding(self, task_id: int | None) -> str | None:
+        return await self._task_account_binding(
+            task_id,
+            "codex_account_id",
+        )
+
+    async def _set_codex_task_binding(
+        self,
+        task_id: int | None,
+        account_id: str | None,
+        *,
+        expected_generation: _TaskRoutingGeneration | None = None,
+    ) -> bool:
+        return await self._set_task_account_binding(
+            task_id,
+            account_id,
+            "codex_account_id",
+            expected_generation=expected_generation,
+        )
+
+    async def _persist_claude_binding_for_route(
+        self,
+        *,
+        task_id: int | None,
+        config_dir: str | None,
+        expected_generation: _TaskRoutingGeneration | None,
+        record_route: bool = True,
+        on_route_committed: Callable[[], None] | None = None,
+    ) -> bool:
+        """Durably bind a Task to the resolved Claude session owner.
+
+        Claude session migration intentionally leaves a hardlinked source copy.
+        Without a durable owner, a later process restart would rediscover the
+        first copy in pool order and silently move the chat back to an older
+        account. Binding is therefore settled before launch; cancellation or a
+        transient database failure must never allow an unbound launch.
+        """
+
+        if not config_dir or self.pool is None:
+            return False
+        account_id = self.pool.account_id_from_config_dir(config_dir)
+        if account_id is None:
+            return False
+        if task_id is None:
+            if on_route_committed is not None:
+                on_route_committed()
+            if record_route:
+                self.pool.record_routed_account(config_dir)
+            return False
+
+        binding, cancellation = await _settle_despite_cancellation(
+            self._set_claude_task_binding(
+                task_id,
+                account_id,
+                expected_generation=expected_generation,
+            )
+        )
+        try:
+            bound = binding.result()
+        except BaseException as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise ClaudeAccountRoutingError(
+                f"Claude account binding for task {task_id} could not be "
+                "persisted; preserving the turn for retry",
+                retry_after=CODEX_ROUTING_RETRY_DELAY,
+            ) from exc
+        if not bound:
+            if expected_generation is not None:
+                raise TaskLifecycleSupersededError(
+                    f"Task {task_id} lost its lifecycle before Claude binding"
+                )
+            raise ClaudeAccountRoutingError(
+                f"Claude account binding for task {task_id} was not "
+                "persisted; preserving the turn for retry",
+                retry_after=CODEX_ROUTING_RETRY_DELAY,
+            )
+        # The binding is now the durable route. Publish the marker before
+        # delivering a delayed caller cancellation, otherwise DB=target could
+        # coexist with a stale "recently used" account indefinitely.
+        if on_route_committed is not None:
+            on_route_committed()
+        if record_route:
+            self.pool.record_routed_account(config_dir)
+        if cancellation is not None:
+            raise cancellation
+        return bound
 
     async def _rollback_codex_rebind_for_recovery(
         self,
@@ -2515,6 +2829,8 @@ class GlobalDispatcher:
         session_id: str | None = None,
         source_home: str | None = None,
         target_home: str | None = None,
+        record_route: bool = True,
+        on_route_committed: Callable[[], None] | None = None,
     ) -> bool:
         """Settle the binding commit, compensating a prior thread rebind."""
 
@@ -2532,9 +2848,13 @@ class GlobalDispatcher:
             bound = False
             binding_error = exc
 
-        lost_generation = expected_generation is not None and not bound
+        lost_binding = (
+            task_id is not None
+            and account_id is not None
+            and not bound
+        )
         if (
-            (binding_error is not None or lost_generation)
+            (binding_error is not None or lost_binding)
             and session_id
             and source_home
             and target_home
@@ -2550,14 +2870,39 @@ class GlobalDispatcher:
             if cancellation is None:
                 cancellation = rollback_cancellation
 
+        if binding_error is not None:
+            if cancellation is not None:
+                raise cancellation from binding_error
+            raise CodexAccountRoutingError(
+                f"Codex account binding for task {task_id} could not be "
+                "persisted; preserving the turn for retry",
+                retry_after=CODEX_ROUTING_RETRY_DELAY,
+            ) from binding_error
+        if lost_binding:
+            if cancellation is not None:
+                raise cancellation
+            if expected_generation is not None:
+                raise TaskLifecycleSupersededError(
+                    f"Task {task_id} lost its lifecycle before Codex binding"
+                )
+            raise CodexAccountRoutingError(
+                f"Codex account binding for task {task_id} was not persisted; "
+                "preserving the turn for retry",
+                retry_after=CODEX_ROUTING_RETRY_DELAY,
+            )
+        if bound and on_route_committed is not None:
+            on_route_committed()
+        if (
+            record_route
+            and account_id
+            and self.codex_pool
+            and (bound or task_id is None)
+        ):
+            routed_home = self.codex_pool.home_for_account(account_id)
+            if routed_home:
+                self.codex_pool.record_routed_account(routed_home)
         if cancellation is not None:
             raise cancellation
-        if binding_error is not None:
-            raise binding_error
-        if lost_generation:
-            raise TaskLifecycleSupersededError(
-                f"Task {task_id} lost its lifecycle before Codex binding"
-            )
         return bound
 
     async def _rebind_and_persist_codex_route(
@@ -2585,6 +2930,84 @@ class GlobalDispatcher:
                 session_id=session_id,
                 source_home=source_home,
                 target_home=target_home,
+            )
+
+        operation, cancellation = await _settle_despite_cancellation(
+            transition()
+        )
+        try:
+            result = operation.result()
+        except BaseException as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _migrate_rebind_and_persist_codex_route(
+        self,
+        *,
+        task_id: int | None,
+        session_id: str,
+        source_home: str,
+        target_home: str,
+        account_id: str | None,
+        expected_generation: _TaskRoutingGeneration | None,
+    ) -> bool:
+        """Settle rollout copy, live owner move and binding as one unit.
+
+        ``asyncio.to_thread`` cannot stop an in-progress filesystem copy when
+        its caller is cancelled.  Letting cancellation escape at that point
+        could leave a second rollout copy without a durable owner.  Delay the
+        cancellation until the copy is followed by either a committed binding
+        or the existing rebind compensation path.
+        """
+
+        from backend.services.codex_session_migration import (
+            migrate_codex_rollout_session,
+        )
+
+        source_account_id = (
+            self.codex_pool.account_id_for_home(source_home)
+            if self.codex_pool is not None
+            else None
+        )
+        if task_id is None or source_account_id is None:
+            raise CodexAccountRoutingError(
+                f"Codex session {session_id} cannot be migrated from "
+                f"unregistered account home {source_home} without a durable "
+                "source binding",
+                permanent=True,
+            )
+
+        # Anchor the source before creating another physical rollout copy.  A
+        # concurrent retry can supersede the Task generation while the file
+        # copy is running; the pre-existing source binding then remains
+        # authoritative instead of leaving two unbound legacy copies.
+        await self._persist_codex_binding_for_route(
+            task_id=task_id,
+            account_id=source_account_id,
+            expected_generation=expected_generation,
+            record_route=False,
+        )
+
+        async def transition() -> bool:
+            await self._require_task_lifecycle_active(expected_generation)
+            await asyncio.to_thread(
+                migrate_codex_rollout_session,
+                session_id,
+                source_home,
+                target_home,
+            )
+            await self._require_task_lifecycle_active(expected_generation)
+            return await self._rebind_and_persist_codex_route(
+                task_id=task_id,
+                session_id=session_id,
+                source_home=source_home,
+                target_home=target_home,
+                account_id=account_id,
+                expected_generation=expected_generation,
             )
 
         operation, cancellation = await _settle_despite_cancellation(
@@ -2637,6 +3060,23 @@ class GlobalDispatcher:
         if session_id:
             matches = pool.locate_session_homes(session_id)
 
+        preferred_owner_home: str | None = None
+        preferred_home: str | None = None
+        preferred_id = pool.preferred_account_id
+        if preferred_id:
+            candidate_home = pool.home_for_account(preferred_id)
+            if candidate_home:
+                preferred_owner_home = pool.canonical_home(candidate_home)
+            if (
+                preferred_owner_home
+                and pool.is_home_available(preferred_owner_home)
+                and pool.supports_model_for_home(
+                    preferred_owner_home,
+                    model,
+                )
+            ):
+                preferred_home = preferred_owner_home
+
         resident: str | None = None
         if bound_home:
             canonical_bound = pool.canonical_home(bound_home)
@@ -2653,23 +3093,49 @@ class GlobalDispatcher:
                     "%s -> %s",
                     task_id, session_id, canonical_bound, resident,
                 )
+            elif preferred_owner_home in matches:
+                resident = preferred_owner_home
+                logger.warning(
+                    "Explicit Codex preference overrides stale binding for "
+                    "task %s session %s: %s -> %s",
+                    task_id,
+                    session_id,
+                    canonical_bound,
+                    resident,
+                )
             else:
                 raise CodexAccountRoutingError(
                     f"Codex session {session_id} has multiple rollout copies, "
-                    f"none in its bound account home {canonical_bound}"
+                    f"none in its bound account home {canonical_bound}",
+                    permanent=True,
                 )
         elif len(matches) == 1:
             resident = matches[0]
         elif len(matches) > 1:
-            raise CodexAccountRoutingError(
-                f"Codex session {session_id} exists in multiple account homes "
-                "but the task has no codex_account_id binding"
-            )
+            if preferred_owner_home in matches:
+                resident = preferred_owner_home
+                logger.warning(
+                    "Using explicitly preferred Codex account %s to "
+                    "disambiguate session %s for task %s",
+                    resident,
+                    session_id,
+                    task_id,
+                )
+            else:
+                raise CodexAccountRoutingError(
+                    f"Codex session {session_id} exists in multiple account "
+                    "homes but the task has no codex_account_id binding",
+                    permanent=True,
+                )
 
-        if (
+        resident_available = bool(
             resident
             and pool.is_home_available(resident)
             and pool.supports_model_for_home(resident, model)
+        )
+
+        if resident_available and (
+            preferred_home is None or preferred_home == resident
         ):
             account_id = pool.account_id_for_home(resident)
             await self._persist_codex_binding_for_route(
@@ -2683,13 +3149,20 @@ class GlobalDispatcher:
         resident_id = pool.account_id_for_home(resident) if resident else None
         if resident_id:
             excluded.add(resident_id)
-        target = pool.select(exclude=excluded, model=model)
+        target = preferred_home or pool.select(exclude=excluded, model=model)
 
         if not target:
             if not pool.has_compatible_enabled_account(model):
                 raise CodexAccountRoutingError(
                     f"Codex pool has no enabled account supporting model "
-                    f"{model!r}; refusing to route or downgrade the task"
+                    f"{model!r}; refusing to route or downgrade the task",
+                    permanent=True,
+                )
+            if not pool.has_retryable_compatible_account(model):
+                raise CodexAccountRoutingError(
+                    f"All compatible Codex accounts for model {model!r} "
+                    "require quota or credential intervention before retrying",
+                    permanent=True,
                 )
             if resident and pool.is_known_account(resident) and pool.is_home_enabled(resident):
                 retry_after = self._codex_pool_retry_after()
@@ -2701,7 +3174,8 @@ class GlobalDispatcher:
             if resident:
                 raise CodexAccountRoutingError(
                     f"Codex task {task_id} is bound to disabled/removed account "
-                    f"home {resident} and no enabled account is available for migration"
+                    f"home {resident} and no enabled account is available for migration",
+                    permanent=True,
                 )
             retry_after = self._codex_pool_retry_after()
             raise CodexAccountRoutingError(
@@ -2716,23 +3190,10 @@ class GlobalDispatcher:
         if session_id and resident and resident != target:
             from backend.services.codex_session_migration import (
                 CodexSessionMigrationError,
-                migrate_codex_rollout_session,
             )
 
             try:
-                await self._require_task_lifecycle_active(
-                    expected_generation
-                )
-                await asyncio.to_thread(
-                    migrate_codex_rollout_session,
-                    session_id,
-                    resident,
-                    target,
-                )
-                await self._require_task_lifecycle_active(
-                    expected_generation
-                )
-                await self._rebind_and_persist_codex_route(
+                await self._migrate_rebind_and_persist_codex_route(
                     task_id=task_id,
                     session_id=session_id,
                     source_home=resident,
@@ -2748,6 +3209,11 @@ class GlobalDispatcher:
                     task_id, session_id, resident, target,
                 )
                 if pool.is_home_available(resident):
+                    await self._persist_codex_binding_for_route(
+                        task_id=task_id,
+                        account_id=pool.account_id_for_home(resident),
+                        expected_generation=expected_generation,
+                    )
                     return resident
                 raise CodexAccountRoutingError(
                     f"Codex session {session_id} could not be migrated from "
@@ -2819,7 +3285,10 @@ class GlobalDispatcher:
             return None
 
         from backend.services.claude_pool import is_pool_rotatable, is_auth_failure, is_rate_limited
-        from backend.services.claude_pool import migrate_session, collect_process_output_for_detection
+        from backend.services.claude_pool import (
+            collect_process_output_for_detection,
+            migrate_session_async,
+        )
 
         if combined is None:
             stderr = self.instance_manager.get_last_stderr(instance_id)
@@ -2877,14 +3346,41 @@ class GlobalDispatcher:
             session_id = t.session_id if t else None
 
         if session_id:
-            source_dir = self.pool.locate_session_config_dir(session_id) or old_config_dir
+            source_dir = (
+                self.pool.locate_session_config_dir(
+                    session_id,
+                    resident_config_dir=old_config_dir,
+                )
+                or old_config_dir
+            )
             await self._require_task_lifecycle_active(expected_generation)
-            migrate_session(
+            migrated = await migrate_session_async(
                 old_config_dir=source_dir,
                 new_config_dir=new_config_dir,
                 session_id=session_id,
             )
             await self._require_task_lifecycle_active(expected_generation)
+            if not migrated:
+                await self._persist_claude_binding_for_route(
+                    task_id=task_id,
+                    config_dir=source_dir,
+                    expected_generation=expected_generation,
+                )
+                logger.error(
+                    "Pool rotation for task %s could not migrate Claude "
+                    "session %s from %s to %s; refusing context-less resume",
+                    task_id,
+                    session_id,
+                    source_dir,
+                    new_config_dir,
+                )
+                return None
+
+        await self._persist_claude_binding_for_route(
+            task_id=task_id,
+            config_dir=new_config_dir,
+            expected_generation=expected_generation,
+        )
 
         # Broadcast pool rotation event
         await self._require_task_lifecycle_active(expected_generation)
@@ -3002,61 +3498,36 @@ class GlobalDispatcher:
             )
             from backend.services.codex_session_migration import (
                 CodexSessionMigrationError,
-                CodexSessionNotFoundError,
-                migrate_codex_rollout_session,
             )
 
-            try:
-                await self._require_task_lifecycle_active(
-                    expected_generation
-                )
-                await asyncio.to_thread(
-                    migrate_codex_rollout_session,
-                    session_id,
-                    source_home,
-                    new_home,
-                )
-                await self._require_task_lifecycle_active(
-                    expected_generation
-                )
-            except CodexSessionNotFoundError:
+            matches = pool.locate_session_homes(session_id)
+            if source_home not in matches:
                 # Older tasks may not have an account binding. Accept one
                 # unambiguous pool copy, but never guess among migrated copies.
-                matches = pool.locate_session_homes(session_id)
                 if len(matches) != 1:
-                    logger.exception(
-                        "Cannot identify a unique Codex rollout for task %s session %s",
-                        task_id, session_id,
+                    logger.error(
+                        "Cannot identify a unique Codex rollout for task %s "
+                        "session %s",
+                        task_id,
+                        session_id,
                     )
                     raise CodexAccountRoutingError(
-                        f"Cannot identify a unique Codex rollout for task {task_id} "
-                        f"session {session_id}",
+                        f"Cannot identify a unique Codex rollout for task "
+                        f"{task_id} session {session_id}",
                         retry_after=CODEX_ROUTING_RETRY_DELAY,
                     )
                 source_home = matches[0]
-                try:
-                    await self._require_task_lifecycle_active(
-                        expected_generation
-                    )
-                    await asyncio.to_thread(
-                        migrate_codex_rollout_session,
-                        session_id,
-                        source_home,
-                        new_home,
-                    )
-                    await self._require_task_lifecycle_active(
-                        expected_generation
-                    )
-                except CodexSessionMigrationError:
-                    logger.exception(
-                        "Codex rollout migration failed for task %s session %s",
-                        task_id, session_id,
-                    )
-                    raise CodexAccountRoutingError(
-                        f"Codex rollout migration failed for task {task_id} "
-                        f"session {session_id}",
-                        retry_after=CODEX_ROUTING_RETRY_DELAY,
-                    )
+
+            try:
+                await self._migrate_rebind_and_persist_codex_route(
+                    task_id=task_id,
+                    session_id=session_id,
+                    source_home=source_home,
+                    target_home=new_home,
+                    account_id=new_account_id,
+                    expected_generation=expected_generation,
+                )
+                binding_persisted = True
             except CodexSessionMigrationError:
                 logger.exception(
                     "Codex rollout migration failed for task %s session %s",
@@ -3067,20 +3538,6 @@ class GlobalDispatcher:
                     f"session {session_id}",
                     retry_after=CODEX_ROUTING_RETRY_DELAY,
                 )
-
-            try:
-                await self._require_task_lifecycle_active(
-                    expected_generation
-                )
-                await self._rebind_and_persist_codex_route(
-                    task_id=task_id,
-                    session_id=session_id,
-                    source_home=source_home,
-                    target_home=new_home,
-                    account_id=new_account_id,
-                    expected_generation=expected_generation,
-                )
-                binding_persisted = True
             except (CodexAppServerBusyError, CodexThreadHomeMismatchError):
                 logger.exception(
                     "Codex app-server refused account rebind for task %s session %s",
@@ -3091,6 +3548,8 @@ class GlobalDispatcher:
                     f"{session_id}",
                     retry_after=CODEX_ROUTING_RETRY_DELAY,
                 )
+            except CodexAccountRoutingError:
+                raise
 
         if not binding_persisted:
             await self._persist_codex_binding_for_route(
@@ -3833,7 +4292,7 @@ class GlobalDispatcher:
         )
         return True
 
-    async def _defer_codex_routing_task(
+    async def _defer_account_routing_task(
         self,
         generation: _TaskLifecycleGeneration,
         reason: str,
@@ -3847,7 +4306,7 @@ class GlobalDispatcher:
         # dispatch loop can observe the pending row during the context-manager
         # exit yield and immediately claim it again before this coroutine stores
         # the deadline.
-        self._codex_routing_not_before[task_id] = time.monotonic() + delay
+        self._account_routing_not_before[task_id] = time.monotonic() + delay
         try:
             async with self.db_factory() as db:
                 queue = TaskQueue(db)
@@ -3860,14 +4319,14 @@ class GlobalDispatcher:
                     ),
                 )
         except BaseException:
-            self._codex_routing_not_before.pop(task_id, None)
+            self._account_routing_not_before.pop(task_id, None)
             raise
         if not deferred:
             # Cancellation/deletion may race the launch failure.  Never revive a
             # terminal task merely because account routing also failed.
-            self._codex_routing_not_before.pop(task_id, None)
+            self._account_routing_not_before.pop(task_id, None)
             logger.info(
-                "Skipped Codex routing deferral for inactive task %s", task_id,
+                "Skipped account routing deferral for inactive task %s", task_id,
             )
             return
 
@@ -3880,7 +4339,7 @@ class GlobalDispatcher:
             "retry_after": round(delay, 1),
         })
         logger.warning(
-            "Deferred Codex task %s for %.1fs while account routing recovers: %s",
+            "Deferred task %s for %.1fs while account routing recovers: %s",
             task_id, delay, reason,
         )
 
@@ -4373,8 +4832,26 @@ class GlobalDispatcher:
                 instance_id,
             )
             return
+        except ClaudeAccountRoutingError as e:
+            if e.permanent:
+                logger.error(
+                    "Permanent Claude account routing error for task %s: %s",
+                    task.id,
+                    e,
+                )
+                if lifecycle_generation is not None:
+                    await self._fail_owned_task(
+                        lifecycle_generation,
+                        str(e)[:500],
+                    )
+            elif lifecycle_generation is not None:
+                await self._defer_account_routing_task(
+                    lifecycle_generation,
+                    str(e),
+                    retry_after=e.retry_after,
+                )
         except CodexAccountRoutingError as e:
-            if e.retry_after is None:
+            if e.permanent:
                 logger.error(
                     "Permanent Codex account routing error for task %s: %s",
                     task.id, e,
@@ -4386,7 +4863,7 @@ class GlobalDispatcher:
                     )
             else:
                 if lifecycle_generation is not None:
-                    await self._defer_codex_routing_task(
+                    await self._defer_account_routing_task(
                         lifecycle_generation,
                         str(e),
                         retry_after=e.retry_after,
@@ -4399,7 +4876,7 @@ class GlobalDispatcher:
 
             if isinstance(e, (CodexAppServerBusyError, CodexThreadHomeMismatchError)):
                 if lifecycle_generation is not None:
-                    await self._defer_codex_routing_task(
+                    await self._defer_account_routing_task(
                         lifecycle_generation,
                         str(e),
                     )
@@ -5103,6 +5580,14 @@ class GlobalDispatcher:
                         provider=provider,
                     )
 
+        def record_evaluator_route() -> None:
+            if not evaluation_home:
+                return
+            if provider == "codex" and self.codex_pool:
+                self.codex_pool.record_routed_account(evaluation_home)
+            elif provider == "claude" and self.pool:
+                self.pool.record_routed_account(evaluation_home)
+
         for rotation_attempt in range(2):
             if not await self._task_claim_is_active(generation):
                 raise GoalEvaluationError(
@@ -5120,8 +5605,13 @@ class GlobalDispatcher:
                     config_dir=evaluation_home,
                     cloudrouter_store=self.cloudrouter_store,
                 )
+                record_evaluator_route()
                 return result, turn_home
             except GoalEvaluationError as exc:
+                # A concrete return code proves the evaluator process spawned;
+                # failed provider turns still count as real recent usage.
+                if exc.returncode is not None:
+                    record_evaluator_route()
                 if (
                     provider != "codex"
                     or rotation_attempt > 0
@@ -6195,6 +6685,7 @@ class GlobalDispatcher:
 
         env = {k: v for k, v in os.environ.items()
                if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
+        config_dir: str | None = None
 
         # Bash 单调用超时上限默认 600s：interval 更长时，子 agent 的一次
         # time.sleep(interval) 会被 CLI 转后台（不阻塞）→ 它转投 ScheduleWakeup
@@ -6228,6 +6719,8 @@ class GlobalDispatcher:
             process_map=self._monitor_processes,
             log_map=self._monitor_log_fhs,
         )
+        if config_dir and self.pool:
+            self.pool.record_routed_account(config_dir)
         logger.info(
             f"Monitor agent launched: session={monitor_session_id} pid={process.pid} "
             f"log={log_path}"
@@ -6445,6 +6938,7 @@ class GlobalDispatcher:
 
         env = {k: v for k, v in os.environ.items()
                if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
+        config_dir: str | None = None
 
         if self.pool:
             config_dir = await self._pool_select(
@@ -6464,6 +6958,8 @@ class GlobalDispatcher:
             process_map=self._sub_agent_processes,
             log_map=self._sub_agent_log_fhs,
         )
+        if config_dir and self.pool:
+            self.pool.record_routed_account(config_dir)
         logger.info(
             f"Sub-agent launched: session={session_id} pid={process.pid} log={log_path}"
         )
@@ -6741,6 +7237,44 @@ class GlobalDispatcher:
         except asyncio.CancelledError:
             pass
 
+    async def _publish_permanent_account_routing_failure(
+        self,
+        task_id: int,
+        exc: Exception,
+    ) -> None:
+        """Make a non-retryable queued-message routing refusal visible."""
+
+        provider = (
+            "Claude"
+            if isinstance(exc, ClaudeAccountRoutingError)
+            else "Codex"
+        )
+        notice = (
+            f"{provider} 账号路由无法安全确定，本条消息未执行。"
+            "请检查账号启用状态与模型支持；若是旧会话多副本，"
+            "请先手动指定正确账号后重新发送。"
+        )
+        async with self.db_factory() as db:
+            entry = LogEntry(
+                instance_id=None,
+                task_id=task_id,
+                event_type="system_event",
+                role="system",
+                content=notice,
+                is_error=True,
+            )
+            db.add(entry)
+            await db.commit()
+        await self.broadcaster.broadcast(
+            f"task:{task_id}",
+            {
+                "event_type": "system_event",
+                "role": "system",
+                "content": notice,
+                "is_error": True,
+            },
+        )
+
     async def _task_queue_consumer(self, task_id: int):
         """Serial consumer: process queued messages one at a time for a task."""
         q = self._get_task_queue(task_id)
@@ -6804,16 +7338,66 @@ class GlobalDispatcher:
                             InstanceAlreadyRunningError,
                         ),
                     ):
-                        # Routing/rebind/instance-contention conflicts are
-                        # temporary. Preserve the exact user message instead
-                        # of acknowledging q.task_done() and dropping it.
-                        logger.warning(
-                            "Deferring queued message for task %s until a "
-                            "launch slot is available: %s",
-                            task_id, exc,
+                        permanent_routing_error = (
+                            isinstance(
+                                exc,
+                                (
+                                    ClaudeAccountRoutingError,
+                                    CodexAccountRoutingError,
+                                ),
+                            )
+                            and exc.permanent
                         )
-                        await q.put(msg)
-                        await asyncio.sleep(CODEX_ROUTING_RETRY_DELAY)
+                        if permanent_routing_error:
+                            logger.error(
+                                "Queued message for task %s cannot be routed: %s",
+                                task_id,
+                                exc,
+                            )
+                            try:
+                                await (
+                                    self
+                                    ._publish_permanent_account_routing_failure(
+                                        task_id,
+                                        exc,
+                                    )
+                                )
+                            except Exception:
+                                # If the durable/user-visible refusal itself
+                                # cannot be committed, preserve the exact
+                                # message rather than acknowledging it unseen.
+                                logger.exception(
+                                    "Could not publish permanent routing "
+                                    "failure for task %s; requeueing message",
+                                    task_id,
+                                )
+                                await q.put(msg)
+                                await asyncio.sleep(
+                                    CODEX_ROUTING_RETRY_DELAY
+                                )
+                        else:
+                            # Routing/rebind/instance-contention conflicts are
+                            # temporary. Preserve the exact user message instead
+                            # of acknowledging q.task_done() and dropping it.
+                            logger.warning(
+                                "Deferring queued message for task %s until a "
+                                "launch slot is available: %s",
+                                task_id, exc,
+                            )
+                            await q.put(msg)
+                            retry_after = getattr(exc, "retry_after", None)
+                            await asyncio.sleep(
+                                max(
+                                    0.0,
+                                    min(
+                                        float(
+                                            retry_after
+                                            or CODEX_ROUTING_RETRY_DELAY
+                                        ),
+                                        300.0,
+                                    ),
+                                )
+                            )
                     else:
                         logger.exception(
                             f"Error processing queued message for task {task_id}"

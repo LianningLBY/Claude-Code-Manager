@@ -320,11 +320,11 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
         )}
         {isPreferred && (
           <span className="px-1.5 py-0.5 rounded bg-green-600/30 text-green-300 text-[10px] font-semibold">
-            当前指定
+            优先账号
           </span>
         )}
         {isLastSelected && (
-          <span className="px-1.5 py-0.5 rounded bg-cyan-600/30 text-cyan-300 text-[10px] font-semibold" title="最近一次 launch 选中的账号">
+          <span className="px-1.5 py-0.5 rounded bg-cyan-600/30 text-cyan-300 text-[10px] font-semibold" title="最近一次由路由器分配的账号">
             最近使用
           </span>
         )}
@@ -343,7 +343,7 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
               <button
                 onClick={() => onSetPreferred(null)}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-foreground hover:border-gray-400"
-                title="取消指定，恢复自动轮换"
+                title="取消全局优先；新会话优先兼容且可用的 API，已有对话继续使用绑定账号"
               >
                 恢复自动
               </button>
@@ -351,7 +351,7 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
               <button
                 onClick={() => onSetPreferred(account.id)}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/50 text-indigo-300 hover:bg-indigo-600/20"
-                title="切换到此账号"
+                title="后续任务及当前对话下一轮优先切换；不可用或迁移失败时安全回退"
               >
                 切换到此账号
               </button>
@@ -473,9 +473,10 @@ function CodexOtpPrompt({ state, onSubmit }: {
   );
 }
 
-function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, onRetryUsage, reloginState }: {
+function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, onRetryUsage, reloginState }: {
   account: CodexPoolAccountUsage;
   preferred: string | null;
+  lastSelected: string | null;
   onClearCooldown: (id: string) => void;
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
@@ -493,6 +494,7 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
 
   const q = isApi ? null : account.quota;
   const isPreferred = preferred === account.id;
+  const isLastSelected = lastSelected === account.id;
 
   return (
     <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${isPreferred ? 'border-emerald-500' : 'border-gray-700'}`}>
@@ -518,7 +520,12 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
         )}
         {isPreferred && (
           <span className="px-1.5 py-0.5 rounded bg-green-600/30 text-green-300 text-[10px] font-semibold">
-            当前指定
+            优先账号
+          </span>
+        )}
+        {isLastSelected && (
+          <span className="px-1.5 py-0.5 rounded bg-cyan-600/30 text-cyan-300 text-[10px] font-semibold" title="最近一次由路由器分配的账号">
+            最近使用
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
@@ -532,7 +539,7 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
               <button
                 onClick={() => onSetPreferred(null)}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-foreground hover:border-gray-400"
-                title="取消指定，恢复 Codex 自动轮换"
+                title="取消全局优先；新会话优先兼容且可用的 API，已有对话继续使用绑定账号"
               >
                 恢复自动
               </button>
@@ -540,7 +547,7 @@ function CodexAccountCard({ account, preferred, onClearCooldown, onSetPreferred,
               <button
                 onClick={() => onSetPreferred(account.id)}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/20"
-                title="切换到此 Codex 账号"
+                title="后续任务及当前对话下一轮优先切换；不可用或迁移失败时安全回退"
               >
                 切换到此账号
               </button>
@@ -1472,6 +1479,7 @@ export function PoolDrawer() {
                       key={`${a.id}:${a.codex_home}`}
                       account={a}
                       preferred={codexStatus.preferred ?? null}
+                      lastSelected={codexStatus.last_selected ?? null}
                       onClearCooldown={handleCodexClearCooldown}
                       onSetPreferred={handleCodexSetPreferred}
                       onRelogin={handleCodexRelogin}

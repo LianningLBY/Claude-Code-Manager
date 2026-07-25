@@ -9,6 +9,7 @@ the session.
 """
 import asyncio
 import json
+import threading
 import time
 import pytest
 from pathlib import Path
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 from backend.services.claude_pool import ClaudePool, PoolAccount
 from backend.services.codex_pool import CodexPool, CodexPoolAccount
 from backend.services.dispatcher import (
+    ClaudeAccountRoutingError,
     CodexAccountRoutingError,
     GlobalDispatcher,
     TaskLifecycleSupersededError,
@@ -132,6 +134,72 @@ class TestResolveResumeConfigDir:
         assert result == str(tmp_path / "claude-1")
         # Session NOT copied into the other account (no drift).
         assert not (tmp_path / "claude-2" / "projects").exists()
+        assert pool.status()["last_selected"] == "acc-1"
+
+    @pytest.mark.asyncio
+    async def test_preferred_account_migrates_healthy_resident(
+        self, dispatcher, pool, tmp_path, monkeypatch,
+    ):
+        """An explicit switch overrides sticky resume affinity on the next turn."""
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        old_jsonl = _seed_session(tmp_path / "claude-1", "sess-preferred")
+        assert pool.set_preferred("acc-2")
+        dispatcher._claude_task_binding = AsyncMock(return_value=None)
+        async def persist_route(*, config_dir, **_kwargs):
+            pool.record_routed_account(config_dir)
+            return True
+
+        dispatcher._persist_claude_binding_for_route = AsyncMock(
+            side_effect=persist_route
+        )
+
+        result = await dispatcher._resolve_resume_config_dir(
+            "sess-preferred",
+            task_id=42,
+        )
+
+        assert result == str(tmp_path / "claude-2")
+        new_jsonl = (
+            tmp_path
+            / "claude-2"
+            / "projects"
+            / "-home-user-repo"
+            / "sess-preferred.jsonl"
+        )
+        assert new_jsonl.stat().st_ino == old_jsonl.stat().st_ino
+        assert pool.status()["last_selected"] == "acc-2"
+
+    @pytest.mark.asyncio
+    async def test_preferred_migration_failure_keeps_intact_resident(
+        self, dispatcher, pool, tmp_path, monkeypatch,
+    ):
+        """A failed manual switch must not launch without native context."""
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        _seed_session(tmp_path / "claude-1", "sess-preferred-fail")
+        assert pool.set_preferred("acc-2")
+        dispatcher._claude_task_binding = AsyncMock(return_value=None)
+        async def persist_route(*, config_dir, **_kwargs):
+            pool.record_routed_account(config_dir)
+            return True
+
+        dispatcher._persist_claude_binding_for_route = AsyncMock(
+            side_effect=persist_route
+        )
+        monkeypatch.setattr(
+            "backend.services.claude_pool.migrate_session",
+            lambda **_kwargs: False,
+        )
+
+        result = await dispatcher._resolve_resume_config_dir(
+            "sess-preferred-fail",
+            task_id=42,
+        )
+
+        assert result == str(tmp_path / "claude-1")
+        assert pool.status()["last_selected"] == "acc-1"
+        assert not (tmp_path / "claude-2" / "projects").exists()
 
     @pytest.mark.asyncio
     async def test_disabled_resident_migrates_off(self, dispatcher, pool, tmp_path, monkeypatch):
@@ -206,6 +274,36 @@ class TestResolveResumeConfigDir:
             )
 
     @pytest.mark.asyncio
+    async def test_api_only_known_exhaustion_is_visible_permanent_failure(
+        self, dispatcher, pool, tmp_path
+    ):
+        api = MagicMock()
+        api.supports_model.return_value = True
+        pool._accounts = [PoolAccount({
+            "id": "cloudrouter-1",
+            "config_dir": str(tmp_path / "api" / "claude"),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "api_account_id": "cloudrouter-1",
+            "_api_account": api,
+        })]
+        pool._cloudrouter_store = MagicMock()
+        pool._cloudrouter_store.cached_quota_decision.return_value = {
+            "available": False,
+            "known": True,
+            "reason": "quota_exhausted",
+        }
+
+        with pytest.raises(ClaudeAccountRoutingError) as caught:
+            await dispatcher._resolve_resume_config_dir(
+                None,
+                model="claude-sonnet-5",
+            )
+
+        assert caught.value.permanent is True
+        assert caught.value.retry_after is None
+
+    @pytest.mark.asyncio
     async def test_model_switch_migrates_off_incompatible_api_resident(
         self, dispatcher, pool, tmp_path, monkeypatch
     ):
@@ -246,6 +344,61 @@ class TestResolveResumeConfigDir:
         )
         assert copied.stat().st_ino == old.stat().st_ino
 
+    @pytest.mark.asyncio
+    async def test_incompatible_api_resident_without_model_fallback_is_permanent(
+        self, dispatcher, pool, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        api_dir = tmp_path / "api" / "claude"
+        api = MagicMock()
+        api.supports_model.side_effect = (
+            lambda provider, model: model == "claude-sonnet-5"
+        )
+        pool._accounts = [PoolAccount({
+            "id": "cloudrouter-1",
+            "config_dir": str(api_dir),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "_api_account": api,
+        })]
+        _seed_session(api_dir, "unsupported-resume")
+
+        with pytest.raises(ClaudeAccountRoutingError) as caught:
+            await dispatcher._resolve_resume_config_dir(
+                "unsupported-resume",
+                model="claude-opus-4-8",
+            )
+
+        assert caught.value.permanent is True
+        assert caught.value.retry_after is None
+
+    @pytest.mark.asyncio
+    async def test_cooled_api_resident_is_retryable_without_losing_message(
+        self, dispatcher, pool, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        api_dir = tmp_path / "api" / "claude"
+        api = MagicMock()
+        api.supports_model.return_value = True
+        pool._accounts = [PoolAccount({
+            "id": "cloudrouter-1",
+            "config_dir": str(api_dir),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "_api_account": api,
+        })]
+        pool._cooldowns["cloudrouter-1"] = time.time() + 999
+        _seed_session(api_dir, "cooled-resume")
+
+        with pytest.raises(ClaudeAccountRoutingError) as caught:
+            await dispatcher._resolve_resume_config_dir(
+                "cooled-resume",
+                model="claude-sonnet-5",
+            )
+
+        assert caught.value.permanent is False
+        assert caught.value.retry_after is not None
+
 
 def _codex_db_factory(task):
     db = MagicMock()
@@ -265,6 +418,185 @@ def _codex_rollout(home: Path, session_id: str, text: str = '{"type":"session_me
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return path
+
+
+class TestResolveResumeConfigDirClaudeBinding:
+    @staticmethod
+    def _dispatcher(pool: ClaudePool, task):
+        disp = GlobalDispatcher(
+            db_factory=_codex_db_factory(task),
+            instance_manager=MagicMock(),
+            broadcaster=MagicMock(),
+        )
+        disp.pool = pool
+        return disp
+
+    @pytest.mark.asyncio
+    async def test_manual_switch_persists_owner_across_auto_restore_and_restart(
+        self,
+        pool_config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        task = MagicMock(id=42, metadata_={})
+        first_pool = ClaudePool(config_path=pool_config, cooldown_seconds=60)
+        first = self._dispatcher(first_pool, task)
+        _seed_session(tmp_path / "claude-1", "claude-bound")
+        assert first_pool.set_preferred("acc-2")
+
+        switched = await first._resolve_resume_config_dir(
+            "claude-bound",
+            task_id=42,
+        )
+
+        assert switched == str(tmp_path / "claude-2")
+        assert task.metadata_["claude_account_id"] == "acc-2"
+
+        # Simulate both "恢复自动" and a service restart. The two JSONLs are
+        # hardlinks, so filesystem order alone would otherwise jump back to
+        # acc-1; the durable Task owner must keep the chat on acc-2.
+        assert first_pool.set_preferred(None)
+        restarted_pool = ClaudePool(
+            config_path=pool_config,
+            cooldown_seconds=60,
+        )
+        restarted = self._dispatcher(restarted_pool, task)
+
+        resumed = await restarted._resolve_resume_config_dir(
+            "claude-bound",
+            task_id=42,
+        )
+
+        assert resumed == str(tmp_path / "claude-2")
+        assert restarted_pool.status()["last_selected"] == "acc-2"
+
+    @pytest.mark.asyncio
+    async def test_bound_hot_session_without_flushed_jsonl_stays_on_owner(
+        self,
+        pool_config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        task = MagicMock(
+            id=42,
+            metadata_={"claude_account_id": "acc-2"},
+        )
+        pool = ClaudePool(config_path=pool_config, cooldown_seconds=60)
+        disp = self._dispatcher(pool, task)
+
+        result = await disp._resolve_resume_config_dir(
+            "claude-not-flushed",
+            task_id=42,
+        )
+
+        assert result == str(tmp_path / "claude-2")
+        assert task.metadata_["claude_account_id"] == "acc-2"
+        assert pool.status()["last_selected"] == "acc-2"
+
+    @pytest.mark.asyncio
+    async def test_unbound_divergent_session_copies_fail_closed(
+        self,
+        pool,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(pool, task)
+        _seed_session(tmp_path / "claude-1", "claude-diverged").write_text(
+            "old"
+        )
+        _seed_session(tmp_path / "claude-2", "claude-diverged").write_text(
+            "new"
+        )
+
+        with pytest.raises(
+            ClaudeAccountRoutingError,
+            match="multiple copies",
+        ):
+            await disp._resolve_resume_config_dir(
+                "claude-diverged",
+                task_id=42,
+            )
+        assert task.metadata_ == {}
+
+    @pytest.mark.asyncio
+    async def test_unbound_hardlinks_bind_to_complete_sidecar_superset(
+        self,
+        pool,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(pool, task)
+        first = _seed_session(tmp_path / "claude-1", "claude-sidecar-owner")
+        second_project = tmp_path / "claude-2" / "projects" / first.parent.name
+        second_project.mkdir(parents=True)
+        (second_project / first.name).hardlink_to(first)
+        sidecar = (
+            second_project
+            / "claude-sidecar-owner"
+            / "tool-results"
+            / "latest.txt"
+        )
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("complete")
+
+        result = await disp._resolve_resume_config_dir(
+            "claude-sidecar-owner",
+            task_id=42,
+        )
+
+        assert result == str(tmp_path / "claude-2")
+        assert task.metadata_["claude_account_id"] == "acc-2"
+
+    @pytest.mark.asyncio
+    async def test_explicit_preference_disambiguates_divergent_claude_copies(
+        self,
+        pool,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(pool, task)
+        _seed_session(tmp_path / "claude-1", "claude-pick-copy").write_text(
+            "old"
+        )
+        preferred = _seed_session(
+            tmp_path / "claude-2",
+            "claude-pick-copy",
+        )
+        preferred.write_text("chosen")
+        assert pool.set_preferred("acc-2")
+
+        result = await disp._resolve_resume_config_dir(
+            "claude-pick-copy",
+            task_id=42,
+        )
+
+        assert result == str(tmp_path / "claude-2")
+        assert preferred.read_text() == "chosen"
+        assert task.metadata_["claude_account_id"] == "acc-2"
+
+    @pytest.mark.asyncio
+    async def test_binding_database_failure_is_retryable_before_launch(
+        self,
+        pool,
+    ):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(pool, task)
+        disp._set_claude_task_binding = AsyncMock(
+            side_effect=OSError("database unavailable")
+        )
+
+        with pytest.raises(ClaudeAccountRoutingError) as caught:
+            await disp._resolve_resume_config_dir(None, task_id=42)
+
+        assert caught.value.retry_after is not None
 
 
 class TestResolveResumeConfigDirCodex:
@@ -364,6 +696,42 @@ class TestResolveResumeConfigDirCodex:
             )
 
     @pytest.mark.asyncio
+    async def test_api_only_known_exhaustion_is_permanent_for_codex(
+        self, tmp_path
+    ):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        api = MagicMock()
+        api.supports_model.return_value = True
+        disp.codex_pool._accounts = [CodexPoolAccount({
+            "id": "cloudrouter-1",
+            "codex_home": str(tmp_path / "api" / "codex"),
+            "enabled": True,
+            "auth_kind": "cloudrouter_api",
+            "api_account_id": "cloudrouter-1",
+            "_api_account": api,
+        })]
+        disp.codex_pool._cloudrouter_store = MagicMock()
+        (
+            disp.codex_pool._cloudrouter_store.cached_quota_decision.return_value
+        ) = {
+            "available": False,
+            "known": True,
+            "reason": "quota_exhausted",
+        }
+
+        with pytest.raises(CodexAccountRoutingError) as caught:
+            await disp._resolve_resume_config_dir(
+                None,
+                "codex",
+                task_id=42,
+                model="gpt-5.5",
+            )
+
+        assert caught.value.permanent is True
+        assert caught.value.retry_after is None
+
+    @pytest.mark.asyncio
     async def test_cooldown_migrates_rollout_rebinds_and_updates_owner(self, tmp_path):
         task = MagicMock(id=42, metadata_={"codex_account_id": "codex-1"})
         disp = self._dispatcher(tmp_path, task)
@@ -388,6 +756,77 @@ class TestResolveResumeConfigDirCodex:
         )
 
     @pytest.mark.asyncio
+    async def test_preferred_account_migrates_healthy_bound_thread(
+        self, tmp_path,
+    ):
+        task = MagicMock(id=42, metadata_={"codex_account_id": "codex-1"})
+        disp = self._dispatcher(tmp_path, task)
+        source = tmp_path / "codex-1"
+        target = tmp_path / "codex-2"
+        old = _codex_rollout(source, "thread-preferred", "one\ntwo\n")
+        assert disp.codex_pool.set_preferred("codex-2")
+
+        result = await disp._resolve_resume_config_dir(
+            "thread-preferred", "codex", task_id=42
+        )
+
+        assert result == str(target.resolve())
+        copied = target / old.relative_to(source)
+        assert copied.read_text() == old.read_text()
+        assert task.metadata_["codex_account_id"] == "codex-2"
+        assert disp.codex_pool.status()["last_selected"] == "codex-2"
+        disp.instance_manager.rebind_codex_thread.assert_awaited_once_with(
+            "thread-preferred",
+            source_codex_home=str(source.resolve()),
+            target_codex_home=str(target.resolve()),
+        )
+
+    @pytest.mark.asyncio
+    async def test_bound_resident_updates_true_last_used_account(self, tmp_path):
+        task = MagicMock(id=42, metadata_={"codex_account_id": "codex-2"})
+        disp = self._dispatcher(tmp_path, task)
+        _codex_rollout(tmp_path / "codex-2", "thread-last-used")
+
+        result = await disp._resolve_resume_config_dir(
+            "thread-last-used", "codex", task_id=42
+        )
+
+        assert result == str((tmp_path / "codex-2").resolve())
+        assert disp.codex_pool.status()["last_selected"] == "codex-2"
+        disp.instance_manager.rebind_codex_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_preferred_migration_failure_keeps_and_binds_resident(
+        self, tmp_path, monkeypatch,
+    ):
+        from backend.services.codex_session_migration import (
+            CodexSessionMigrationError,
+        )
+
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        source = tmp_path / "codex-1"
+        _codex_rollout(source, "thread-preferred-fail")
+        assert disp.codex_pool.set_preferred("codex-2")
+
+        def fail_migration(*_args, **_kwargs):
+            raise CodexSessionMigrationError("disk full")
+
+        monkeypatch.setattr(
+            "backend.services.codex_session_migration.migrate_codex_rollout_session",
+            fail_migration,
+        )
+
+        result = await disp._resolve_resume_config_dir(
+            "thread-preferred-fail", "codex", task_id=42
+        )
+
+        assert result == str(source.resolve())
+        assert task.metadata_["codex_account_id"] == "codex-1"
+        assert disp.codex_pool.status()["last_selected"] == "codex-1"
+        disp.instance_manager.rebind_codex_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_rebind_rolls_back_when_generation_loses_binding_cas(
         self, tmp_path,
     ):
@@ -407,7 +846,9 @@ class TestResolveResumeConfigDirCodex:
             started_at=None,
             completed_at=None,
         )
-        disp._set_codex_task_binding = AsyncMock(return_value=False)
+        disp._set_codex_task_binding = AsyncMock(
+            side_effect=[True, False]
+        )
 
         with pytest.raises(TaskLifecycleSupersededError):
             await disp._resolve_resume_config_dir(
@@ -451,7 +892,9 @@ class TestResolveResumeConfigDirCodex:
             started_at=None,
             completed_at=None,
         )
-        disp._set_codex_task_binding = AsyncMock(return_value=False)
+        disp._set_codex_task_binding = AsyncMock(
+            side_effect=[True, False]
+        )
         calls = []
         resolver_task = None
 
@@ -486,6 +929,122 @@ class TestResolveResumeConfigDirCodex:
                 target_codex_home=source,
             ),
         ]
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_rollout_copy_finishes_target_binding(
+        self, tmp_path, monkeypatch,
+    ):
+        from backend.services.codex_session_migration import (
+            migrate_codex_rollout_session as real_migrate,
+        )
+
+        task = MagicMock(id=42, metadata_={"codex_account_id": "codex-1"})
+        disp = self._dispatcher(tmp_path, task)
+        source = str((tmp_path / "codex-1").resolve())
+        target = str((tmp_path / "codex-2").resolve())
+        _codex_rollout(Path(source), "thread-cancel-copy")
+        disp.codex_pool.mark_rate_limited(source, duration=999)
+
+        copy_started = asyncio.Event()
+        release_copy = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def blocked_migrate(*args, **kwargs):
+            loop.call_soon_threadsafe(copy_started.set)
+            assert release_copy.wait(timeout=2)
+            return real_migrate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "backend.services.codex_session_migration."
+            "migrate_codex_rollout_session",
+            blocked_migrate,
+        )
+
+        resolver = asyncio.create_task(
+            disp._resolve_resume_config_dir(
+                "thread-cancel-copy",
+                "codex",
+                task_id=42,
+            )
+        )
+        await asyncio.wait_for(copy_started.wait(), timeout=1)
+        resolver.cancel()
+        await asyncio.sleep(0)
+        assert not resolver.done()
+        release_copy.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(resolver, timeout=2)
+
+        assert task.metadata_["codex_account_id"] == "codex-2"
+        assert disp.codex_pool.status()["last_selected"] == "codex-2"
+        disp.instance_manager.rebind_codex_thread.assert_awaited_once_with(
+            "thread-cancel-copy",
+            source_codex_home=source,
+            target_codex_home=target,
+        )
+
+    @pytest.mark.asyncio
+    async def test_generation_change_during_copy_keeps_source_binding(
+        self, tmp_path, monkeypatch,
+    ):
+        from backend.services.codex_session_migration import (
+            migrate_codex_rollout_session as real_migrate,
+        )
+
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        source = str((tmp_path / "codex-1").resolve())
+        target = str((tmp_path / "codex-2").resolve())
+        _codex_rollout(Path(source), "thread-generation-copy")
+        disp.codex_pool.mark_rate_limited(source, duration=999)
+
+        copy_started = asyncio.Event()
+        release_copy = threading.Event()
+        loop = asyncio.get_running_loop()
+        superseded = False
+
+        def blocked_migrate(*args, **kwargs):
+            loop.call_soon_threadsafe(copy_started.set)
+            assert release_copy.wait(timeout=2)
+            return real_migrate(*args, **kwargs)
+
+        async def require_current(_generation):
+            if superseded:
+                raise TaskLifecycleSupersededError("replacement generation")
+
+        monkeypatch.setattr(
+            "backend.services.codex_session_migration."
+            "migrate_codex_rollout_session",
+            blocked_migrate,
+        )
+        disp._require_task_lifecycle_active = AsyncMock(
+            side_effect=require_current
+        )
+
+        resolver = asyncio.create_task(
+            disp._resolve_resume_config_dir(
+                "thread-generation-copy",
+                "codex",
+                task_id=42,
+            )
+        )
+        await asyncio.wait_for(copy_started.wait(), timeout=1)
+        superseded = True
+        release_copy.set()
+
+        with pytest.raises(
+            TaskLifecycleSupersededError,
+            match="replacement generation",
+        ):
+            await asyncio.wait_for(resolver, timeout=2)
+
+        assert task.metadata_["codex_account_id"] == "codex-1"
+        assert disp.codex_pool.status()["last_selected"] is None
+        disp.instance_manager.rebind_codex_thread.assert_not_awaited()
+        assert disp.codex_pool.locate_session_homes(
+            "thread-generation-copy"
+        ) == [source, target]
 
     @pytest.mark.asyncio
     async def test_real_usage_limit_rotation_preserves_rollout_and_binding(self, tmp_path):
@@ -622,6 +1181,28 @@ class TestResolveResumeConfigDirCodex:
             await disp._resolve_resume_config_dir(
                 "thread-ambiguous", "codex", task_id=42
             )
+
+    @pytest.mark.asyncio
+    async def test_explicit_preference_disambiguates_codex_copies(self, tmp_path):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        _codex_rollout(tmp_path / "codex-1", "thread-explicit-copy", "old\n")
+        _codex_rollout(
+            tmp_path / "codex-2",
+            "thread-explicit-copy",
+            "chosen\n",
+        )
+        assert disp.codex_pool.set_preferred("codex-2")
+
+        result = await disp._resolve_resume_config_dir(
+            "thread-explicit-copy",
+            "codex",
+            task_id=42,
+        )
+
+        assert result == str((tmp_path / "codex-2").resolve())
+        assert task.metadata_["codex_account_id"] == "codex-2"
+        disp.instance_manager.rebind_codex_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_claude_provider_unaffected(self, dispatcher, pool, tmp_path):

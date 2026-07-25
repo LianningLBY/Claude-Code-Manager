@@ -522,6 +522,22 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 
 多账号时，撞限或认证失败会自动换号，通过硬链接 session 目录实现无缝 `--resume`。
 
+### 账号自动登录浏览器
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `CCM_XVFB_DISPLAY` | `:99` | 自动登录专用 X display；同机多套 CCM 必须不同 |
+| `CCM_LOGIN_TMPDIR` | `~/.cache/ccm/login-tmp` | Chrome profile/诊断文件的磁盘目录，避免使用 RAM-backed `/tmp` |
+| `CCM_LOGIN_MIN_AVAILABLE_MB` | `512` | 可用内存低于此值时拒绝启动新登录浏览器 |
+| `CCM_LOGIN_MIN_TEMP_FREE_MB` | `512` | 登录临时目录可用空间下限 |
+
+Claude/Codex 自动登录共享一个 Xvfb manager 和登录锁。manager 使用私有
+Xauthority、跨进程 display 锁和实际 display 就绪探测，并持久记录 Xvfb 的
+PID/start time 与 socket inode。只有能证明属于已死亡 manager owner 的残留
+socket 才会被清理；未知或已被替换的 socket 继续 fail-closed。Chrome 每次使用
+独立 profile 和动态 DevTools 端口，并用该 profile 的 `DevToolsActivePort`
+校验 browser websocket identity，不会再连接固定端口上的孤儿 Chrome。
+
 ### Worker（分布式执行节点）
 
 | 环境变量 | 默认值 | 说明 |

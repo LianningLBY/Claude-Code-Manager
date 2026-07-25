@@ -874,3 +874,17 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **问题**：CCM 虽有 80% 预压缩和 `"Prompt is too long"` 失败兜底，但 Codex app-server 的超限以 `codexErrorInfo=contextWindowExceeded` 出现在 `system_event`；chat 失败路径只扫描普通 assistant 文本，fresh/mode 路径又只认固定英文文案，因此真实跑满时可能直接退出。app-server 上报的 `modelContextWindow`、`totalTokens`、`reasoningOutputTokens` 也被丢弃；exec fallback 还会把整轮累计 1.5M token 当成当前 272K 上下文，出现 119%/553% 假利用率。
 - **解决**：完整保留 app-server 结构化错误与有效窗口，统一 provider 上下文超限分类；Codex 当前上下文按官方口径 `last.totalTokens - last.reasoningOutputTokens` 计算。exec fallback 从绑定账号 rollout 的最新 `last_token_usage` 恢复当前请求用量，不再使用累计 turn total。chat 与 fresh/mode 两条失败路径都复用既有摘要机制：清旧 session、带摘要和原消息自动续跑；预压缩也按有效窗口和完整 current-context token 提前触发。
 - **验证**：先写红测复现结构化错误丢失、输出 token 未计入阈值、exec 553% 假读数；修复后上下文专项 12 passed，Codex/上下文相关 122 passed，Dispatcher 相关 21 passed；正确隔离环境下后端全量 `1981 passed`（3m22s），`compileall` 与 `git diff --check` 通过。随后在独立 8011 环境完成真实前端集成：上下文 210,000/258,400（81%，阈值 80%）时界面显示自动压缩提示，新会话启动并返回 `E2E_CONTEXT_CONTINUED`，任务最终 completed、无错误且上下文重置到约 1.2K/272K；未触碰现有 8010。
+
+### 2026-07-24 — Claude/Codex 自动登录运行时隔离与资源保护（commit 6734a93 / 80f74fe）
+
+- **问题**：Claude/Codex Pool 各自缓存 Xvfb 进程、共用 `:99`/9222 且会全局 `pkill`，死进程对象没有 `poll()` 刷新；小内存机器上 Chrome profile/诊断又落到 tmpfs `/tmp`，资源枯竭时会表现为 X server 丢失、`Page.goto` 超时并最终触发 OOM。
+- **解决**：新增两类 Pool 共用的登录锁和 `XvfbManager`：私有 Xauthority、跨进程 display 文件锁、`xdpyinfo` 就绪探测、stderr 诊断、只回收自己启动的进程；display/CDP/runtime/tmp 均可按部署配置。登录前检查 MemAvailable 和磁盘余量，资源不足返回 503；浏览器临时目录默认迁到磁盘缓存，Chrome profile 按 PID 隔离且只清理自身目录；Codex authorize 导航超时增加一次有界重试和资源诊断。
+- **预防**：同一宿主上的生产/测试部署必须使用不同 display、CDP 端口和运行目录；禁止通过全局 `pkill` 解决共享资源冲突；需要 headed browser 的流程必须在启动前完成容量检查，并把 tmpfs 当内存预算而不是普通磁盘。
+- **深测补漏**：真实多进程并发验证 6 个 CCM 进程只产生 1 个 Xvfb owner、5 个安全复用；死进程恢复、外部 display 不误杀、内存/磁盘门禁和测试残留清理均通过。静态回归发现 standalone Claude 登录只设置 `CCM_XVFB_DISPLAY` 时，Chrome 与 `xdotool` 仍可能使用不同 display；统一 display 解析并补两条回归（commit `80f74fe`）。
+- **验证**：登录运行时/Claude/Codex/CDP/号池专项 301 passed，补漏后相关专项 115 passed；后端全量 1983 passed；前端 production build 通过；真实 Xvfb 私有认证 `xdpyinfo=0` 且退出后 socket 清理；8010 测试服务加载 `:100`/9223 隔离配置，浏览器实际打开 CCM 登录页且无页面控制台错误；150 个并发鉴权 API 全部 200，静态资源与 WebSocket 握手通过，服务无 error 日志或自动重启。
+
+### 2026-07-25 — PR #64 评审修复：OOM 残留恢复与 Chrome CDP 身份绑定
+
+- **阻塞问题**：自有 Xvfb 被 SIGKILL/OOM-kill 后可能遗留 Unix socket，旧实现会把它当成未知外部 display 永久返回 503；Claude 两条 Chrome 路径固定连接配置 CDP 端口，孤儿 Chrome 占住端口时可能把新登录施加到旧 profile。
+- **解决**：Xvfb owner record 原子持久化 PID、`/proc/<pid>/stat` start time、socket/X lock 的 device/inode/uid/type；跨进程锁内仅在 owner 身份已死亡且现存 artifact 与记录完全一致时清理，活 owner、未知 socket 或 inode 已替换一律 fail-closed。Chrome 改用唯一 profile + `--remote-debugging-port=0`，只读取该 profile 的 `DevToolsActivePort`，并以其中随机 browser websocket path 反查 `/json/version` 后才接受 `/json` tabs；固定 `CCM_LOGIN_CDP_PORT` 配置已移除。
+- **验证**：新增 owner socket 恢复/替换保护、动态 CDP/orphan 拒绝和两条实际 launcher 参数回归；登录/号池相关 `314 passed`。真实隔离 smoke 在 `:198` 启动 Xvfb 和 Chrome，配置遗留端口 9222 时实际绑定动态端口 35863；SIGKILL Xvfb PID 1029638 后保留的 socket/lock 被 owner record 安全识别并重启为 PID 1029783，测试结束后 display、lock、进程和临时目录全部清理。全量测试剩余的 20 个失败全部来自部署租约安全与 WebSocket 鉴权用例；在未包含本 PR 修改的最新 `main`（`e89a08d`）独立 worktree 上复跑同一组 115 个测试，结果同为 `20 failed, 95 passed`，确认不是本 PR 回归。

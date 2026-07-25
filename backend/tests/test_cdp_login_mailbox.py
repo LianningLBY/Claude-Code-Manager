@@ -45,12 +45,38 @@ class FakeHttpClient:
     async def __aexit__(self, *_args):
         return None
 
-    async def get(self, *_args, **_kwargs):
+    async def get(self, url, **_kwargs):
+        if url.endswith("/json/version"):
+            port = url.split(":")[2].split("/")[0]
+            return FakeResponse(
+                {
+                    "webSocketDebuggerUrl": (
+                        f"ws://127.0.0.1:{port}/devtools/browser/owned"
+                    ),
+                },
+            )
         return FakeResponse(self.payload)
 
 
 async def _no_sleep(_seconds):
     return None
+
+
+def _install_active_port_from_command(
+    command,
+    *,
+    port: int = 45678,
+) -> None:
+    profile_arg = next(
+        arg for arg in command if arg.startswith("--user-data-dir=")
+    )
+    profile_dir = Path(profile_arg.split("=", 1)[1])
+    active_port_path = profile_dir / "DevToolsActivePort"
+    active_port_path.write_text(
+        f"{port}\n/devtools/browser/owned\n",
+        encoding="utf-8",
+    )
+    active_port_path.chmod(0o600)
 
 
 def _temporary_auth_dir(monkeypatch, tmp_path: Path) -> Path:
@@ -156,13 +182,47 @@ async def test_chrome_early_exit_is_reaped_and_stderr_is_closed(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_chrome_uses_dynamic_port_and_disk_profile(monkeypatch, tmp_path):
+    chrome = FakeProcess(running=False)
+    chrome_stderr = io.StringIO()
+    popen_calls = []
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return chrome
+
+    login_tmp = tmp_path / "disk-login-tmp"
+    monkeypatch.setenv("CCM_LOGIN_TMPDIR", str(login_tmp))
+    monkeypatch.setenv("CCM_LOGIN_CDP_PORT", "9322")
+    monkeypatch.setattr(login_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(login_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(login_module, "open", lambda *_a, **_k: chrome_stderr, raising=False)
+
+    result = await login_module.cdp_login(
+        "user@example.com", "query-token", str(tmp_path / "account")
+    )
+
+    assert result is None
+    command = popen_calls[0][0]
+    assert "--remote-debugging-port=0" in command
+    assert "--remote-debugging-port=9322" not in command
+    profile_arg = next(arg for arg in command if arg.startswith("--user-data-dir="))
+    assert profile_arg.startswith(f"--user-data-dir={login_tmp}/")
+    assert not any(part == "pkill" for part in command)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tabs", [[], [{"type": "service_worker"}]])
 async def test_missing_page_tab_reaps_chrome_and_closes_stderr(
     monkeypatch, tmp_path, tabs
 ):
     chrome = FakeProcess()
     chrome_stderr = io.StringIO()
-    monkeypatch.setattr(login_module.subprocess, "Popen", lambda *_a, **_k: chrome)
+    def fake_popen(command, **_kwargs):
+        _install_active_port_from_command(command)
+        return chrome
+
+    monkeypatch.setattr(login_module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(login_module.subprocess, "run", lambda *_a, **_k: None)
     monkeypatch.setattr(login_module.asyncio, "sleep", _no_sleep)
     monkeypatch.setattr(login_module, "open", lambda *_a, **_k: chrome_stderr, raising=False)
@@ -186,7 +246,11 @@ async def test_missing_page_tab_reaps_chrome_and_closes_stderr(
 async def test_websocket_exception_still_reaps_chrome(monkeypatch, tmp_path):
     chrome = FakeProcess()
     chrome_stderr = io.StringIO()
-    monkeypatch.setattr(login_module.subprocess, "Popen", lambda *_a, **_k: chrome)
+    def fake_popen(command, **_kwargs):
+        _install_active_port_from_command(command)
+        return chrome
+
+    monkeypatch.setattr(login_module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(login_module.subprocess, "run", lambda *_a, **_k: None)
     monkeypatch.setattr(login_module.asyncio, "sleep", _no_sleep)
     monkeypatch.setattr(login_module, "open", lambda *_a, **_k: chrome_stderr, raising=False)

@@ -184,6 +184,79 @@ def test_legacy_starting_status_can_boot_new_guarded_release(tmp_path):
     assert result.action == "skip_mutations"
 
 
+def test_legacy_restarting_status_enters_maintenance_only(tmp_path):
+    """An old updater may pull the new guard before its direct restart."""
+
+    commit = "b" * 40
+    status = tmp_path / "legacy-status.json"
+    _write(
+        status,
+        {
+            "status": "restarting",
+            "port": 8000,
+            "old_commit": "a" * 40,
+            "new_commit": commit,
+            "deployment_incomplete": True,
+        },
+    )
+
+    result = assess_deployment_start(
+        tmp_path,
+        port=8000,
+        running_commit=commit,
+        status_file=status,
+    )
+
+    assert result.action == "skip_mutations"
+    assert result.maintenance_only is True
+    assert "旧版更新器" in result.reason
+
+
+def test_legacy_restarting_status_rejects_wrong_commit(tmp_path):
+    status = tmp_path / "legacy-status.json"
+    _write(
+        status,
+        {
+            "status": "restarting",
+            "port": 8000,
+            "old_commit": "a" * 40,
+            "new_commit": "b" * 40,
+        },
+    )
+
+    result = assess_deployment_start(
+        tmp_path,
+        port=8000,
+        running_commit="c" * 40,
+        status_file=status,
+    )
+
+    assert result.action == "block"
+
+
+def test_tokened_restarting_status_cannot_use_legacy_recovery(tmp_path):
+    commit = "b" * 40
+    status = tmp_path / "status.json"
+    _write(
+        status,
+        {
+            "status": "restarting",
+            "port": 8000,
+            "new_commit": commit,
+            "owner_token": "unverified-worker",
+        },
+    )
+
+    result = assess_deployment_start(
+        tmp_path,
+        port=8000,
+        running_commit=commit,
+        status_file=status,
+    )
+
+    assert result.action == "block"
+
+
 def test_complete_terminal_lease_ignores_stale_active_tmp_status(tmp_path):
     commit = "b" * 40
     _write(

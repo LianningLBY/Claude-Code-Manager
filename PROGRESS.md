@@ -888,3 +888,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **阻塞问题**：自有 Xvfb 被 SIGKILL/OOM-kill 后可能遗留 Unix socket，旧实现会把它当成未知外部 display 永久返回 503；Claude 两条 Chrome 路径固定连接配置 CDP 端口，孤儿 Chrome 占住端口时可能把新登录施加到旧 profile。
 - **解决**：Xvfb owner record 原子持久化 PID、`/proc/<pid>/stat` start time、socket/X lock 的 device/inode/uid/type；跨进程锁内仅在 owner 身份已死亡且现存 artifact 与记录完全一致时清理，活 owner、未知 socket 或 inode 已替换一律 fail-closed。Chrome 改用唯一 profile + `--remote-debugging-port=0`，只读取该 profile 的 `DevToolsActivePort`，并以其中随机 browser websocket path 反查 `/json/version` 后才接受 `/json` tabs；固定 `CCM_LOGIN_CDP_PORT` 配置已移除。
 - **验证**：新增 owner socket 恢复/替换保护、动态 CDP/orphan 拒绝和两条实际 launcher 参数回归；登录/号池相关 `314 passed`。真实隔离 smoke 在 `:198` 启动 Xvfb 和 Chrome，配置遗留端口 9222 时实际绑定动态端口 35863；SIGKILL Xvfb PID 1029638 后保留的 socket/lock 被 owner record 安全识别并重启为 PID 1029783，测试结束后 display、lock、进程和临时目录全部清理。全量测试剩余的 20 个失败全部来自部署租约安全与 WebSocket 鉴权用例；在未包含本 PR 修改的最新 `main`（`e89a08d`）独立 worktree 上复跑同一组 115 个测试，结果同为 `20 failed, 95 passed`，确认不是本 PR 回归。
+
+### 2026-07-25 — 旧版更新器跨版本重启兼容
+
+- **问题**：旧进程拉取带 v2 启动守卫的新代码后，仍可能写入无 lease/token 的 `restarting` 状态并直接执行 `systemctl restart`。新 `pre-start` 只承认 v2 worker 的 `starting` handoff，因而永久拒绝启动；systemd `Restart=always` 会形成重启风暴，前端则停留在断连前最后一个“迁移中”状态。
+- **解决**：启动守卫仅对非权威临时状态、无任何 owner token、目标 commit 与当前运行 commit 精确一致的 legacy `restarting` 开放启动，并强制进入 maintenance-only。依赖、数据库和业务服务仍禁止自动启动或变更，管理员必须通过事务化 repair 完成部署；tokened、commit 不匹配及其他 active 状态继续 fail closed。
+- **验证**：新增 legacy 精确 commit 恢复、错误 commit 拒绝和伪 token 不得降级走 legacy 三条回归。

@@ -3644,16 +3644,6 @@ class GlobalDispatcher:
             if command_args:
                 task_description = command_args
             parts.append(command.prompt_template)
-        # Skill 模板描述的是 MCP 工具，而 MCP config 只注入 claude CLI
-        # （instance_manager.launch 里 provider == "claude" 才 generate_mcp_config），
-        # codex 任务注入这些模板只会让它调用不存在的工具。
-        if task.enabled_skills and (task.provider or "claude").lower() != "codex":
-            from backend.services.command_registry import COMMAND_REGISTRY
-            for skill_name, enabled in task.enabled_skills.items():
-                if enabled and skill_name in COMMAND_REGISTRY:
-                    cmd = COMMAND_REGISTRY[skill_name]
-                    if not cmd.always_available:
-                        parts.append(cmd.prompt_template)
         parts.append(f"任务:\n{task_description}")
         return "\n\n".join(parts)
 

@@ -158,7 +158,7 @@ export function MonitorPanel({ taskId, sessions, onSessionsChange, onClose, prov
       </div>
       {provider === 'codex' && (
         <div className="mx-2 mt-2 rounded border border-amber-700/50 bg-amber-900/20 px-2 py-1.5 text-xs text-amber-300">
-          Monitor / Sub-Agent 暂不支持 Codex 任务（仅 Claude 可用）
+          Sub-Agent 已支持 Codex；后台 Monitor 仍仅支持 Claude
         </div>
       )}
       <div className="p-2 space-y-2 max-h-64 overflow-y-auto">

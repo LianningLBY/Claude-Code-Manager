@@ -124,6 +124,60 @@ async def test_start_turn_injects_mcp_config_into_new_thread():
 
 
 @pytest.mark.asyncio
+async def test_delete_thread_rejects_active_turn_then_releases_known_thread():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._request = AsyncMock(return_value={})
+    process = MagicMock(returncode=None)
+    server._contexts_by_thread["thread-child"] = SimpleNamespace(
+        process=process,
+        thread_id="thread-child",
+    )
+    server._known_threads.add("thread-child")
+
+    with pytest.raises(CodexAppServerBusyError, match="active turn"):
+        await server.delete_thread("thread-child")
+
+    process.returncode = 0
+    await server.delete_thread("thread-child")
+
+    server._request.assert_awaited_once_with(
+        "thread/delete",
+        {"threadId": "thread-child"},
+    )
+    assert "thread-child" not in server._known_threads
+    assert "thread-child" not in server._contexts_by_thread
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_thread_rejects_active_turn_and_validates_status():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._request = AsyncMock(return_value={"status": "unsubscribed"})
+    process = MagicMock(returncode=None)
+    server._contexts_by_thread["thread-parent"] = SimpleNamespace(
+        process=process,
+        thread_id="thread-parent",
+    )
+    server._known_threads.add("thread-parent")
+
+    with pytest.raises(CodexAppServerBusyError, match="active turn"):
+        await server.unsubscribe_thread("thread-parent")
+
+    process.returncode = 0
+    assert await server.unsubscribe_thread("thread-parent") == "unsubscribed"
+    server._request.assert_awaited_once_with(
+        "thread/unsubscribe",
+        {"threadId": "thread-parent"},
+    )
+    assert "thread-parent" in server._known_threads
+
+    server._request = AsyncMock(return_value={"status": "unexpected"})
+    with pytest.raises(CodexAppServerError, match="invalid status"):
+        await server.unsubscribe_thread("thread-parent")
+
+
+@pytest.mark.asyncio
 async def test_concurrent_task_threads_keep_mcp_context_isolated():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -1072,6 +1126,16 @@ class _RegistryFakeServer:
         self.steered.append((thread_id, content))
         return thread_id in self.active_threads
 
+    async def delete_thread(self, thread_id):
+        if thread_id in self.active_threads:
+            raise CodexAppServerBusyError(f"{thread_id} is active")
+        self.known_threads.discard(thread_id)
+
+    async def unsubscribe_thread(self, thread_id):
+        if thread_id in self.active_threads:
+            raise CodexAppServerBusyError(f"{thread_id} is active")
+        return "unsubscribed"
+
     async def read_rate_limits(self):
         return {
             "rateLimits": {
@@ -1341,6 +1405,62 @@ async def test_registry_routes_each_canonical_home_to_one_server(
     )
     assert server_a.steered == [(thread_a, "a-only")]
     assert server_b.steered == []
+
+
+@pytest.mark.asyncio
+async def test_registry_delete_thread_releases_exact_owner_without_shutdown(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "ephemeral")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        _, thread_id = await registry.start_turn(
+            codex_home=home,
+            resume_session_id=None,
+            task_id=51,
+        )
+        server = registry._servers[home]
+        server.active_threads.discard(thread_id)
+
+        await registry.delete_thread(home, thread_id)
+
+    assert thread_id not in registry._thread_owners
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
+    assert server.shutdown_count == 0
+    assert registry._servers[home] is server
+
+
+@pytest.mark.asyncio
+async def test_registry_unsubscribe_preserves_resumable_owner_without_shutdown(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "resumable")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        _, thread_id = await registry.start_turn(
+            codex_home=home,
+            resume_session_id=None,
+            task_id=52,
+        )
+        server = registry._servers[home]
+        server.active_threads.discard(thread_id)
+
+        assert await registry.unsubscribe_thread(thread_id) == "unsubscribed"
+
+    assert registry._thread_owners[thread_id] == home
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
+    assert server.shutdown_count == 0
+    assert registry._servers[home] is server
 
 
 @pytest.mark.asyncio

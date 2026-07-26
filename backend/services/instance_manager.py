@@ -799,6 +799,20 @@ class InstanceManager:
                     raise
                 logger.debug("Container setup failed, falling back to bare process")
 
+        codex_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and (
+                settings.codex_main_mcp_enabled
+                or (enabled_skills and enabled_skills.get("sub-agent"))
+            )
+        )
+        if provider == "codex" and codex_mcp_required and not settings.codex_app_server_enabled:
+            raise CodexRequiredMcpError(
+                "Codex Sub-Agent/main MCP requires the app-server transport; "
+                "MCP-less exec fallback is disabled"
+            )
+
         if provider == "codex" and settings.codex_app_server_enabled:
             home_lock = self._codex_home_lock(config_dir)
             async with home_lock:
@@ -841,11 +855,10 @@ class InstanceManager:
                     )
                     raise
                 except Exception as exc:
-                    if settings.codex_main_mcp_enabled and task_id is not None:
-                        # PR4 will teach exec fallback to carry the same MCP
-                        # spec.  Until then, once required ccm_skills was
-                        # selected, every unknown app-server failure must fail
-                        # closed instead of silently replaying without tools.
+                    if codex_mcp_required:
+                        # Once required ccm_skills was selected, every unknown
+                        # app-server failure must fail closed instead of
+                        # silently replaying without tools.
                         logger.exception(
                             "Codex app-server launch failed while required "
                             "ccm_skills was enabled; refusing MCP-less exec fallback"
@@ -1281,13 +1294,22 @@ class InstanceManager:
         actual_cwd = cwd or os.getcwd()
         codex_effort = clamp_codex_effort(model, effort_level)
         mcp_specs = ()
-        if settings.codex_main_mcp_enabled and task_id is not None:
-            from backend.services.mcp_config import build_mcp_server_specs
+        if task_id is not None:
+            if settings.codex_main_mcp_enabled:
+                from backend.services.mcp_config import build_mcp_server_specs
 
-            mcp_specs = build_mcp_server_specs(
-                task_id,
-                enabled_skills or {},
-            )
+                mcp_specs = build_mcp_server_specs(
+                    task_id,
+                    enabled_skills or {},
+                )
+            elif enabled_skills and enabled_skills.get("sub-agent"):
+                from backend.services.mcp_config import (
+                    build_sub_agent_controller_mcp_server_specs,
+                )
+
+                # Sub-Agent is independently supported on Codex even while
+                # the broader main-task MCP rollout remains feature-gated.
+                mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
         process, _thread_id = await registry.start_turn(
             codex_home=config_dir,
             prompt=prompt,
@@ -1299,6 +1321,11 @@ class InstanceManager:
             task_id=task_id,
             mcp_specs=mcp_specs,
         )
+        # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
+        # dispatcher launches do not populate ``_launch_params`` (that cache is
+        # reserved for chat retry), so consulting it at terminal time would
+        # leak the initial thread's MCP helper/subscription.
+        process.unsubscribe_on_terminal = bool(mcp_specs)
         if config_dir:
             self._config_dirs[instance_id] = config_dir
         self.processes[instance_id] = process
@@ -3609,6 +3636,31 @@ class InstanceManager:
                 except Exception:
                     logger.exception(
                         "Failed to enqueue monitor auto-resume for task %s", task_id,
+                    )
+
+        # A Codex thread with the CCM Sub-Agent controller owns a dedicated
+        # stdio MCP helper. Preserve the resumable native thread, but release
+        # this app-server connection's idle subscription so Codex can unload
+        # the thread-scoped MCP stack after its idle grace period.
+        if (
+            provider == "codex"
+            and getattr(process, "unsubscribe_on_terminal", False)
+            and self._codex_app_server is not None
+        ):
+            thread_id = getattr(process, "thread_id", None)
+            if thread_id:
+                try:
+                    await self._codex_app_server.unsubscribe_thread(thread_id)
+                except Exception:
+                    # A queued follow-up may already be resuming this thread.
+                    # In that case its later terminal consumer will retry the
+                    # unsubscribe; never fail completed task bookkeeping.
+                    logger.info(
+                        "Codex controller thread unsubscribe deferred: "
+                        "task=%s thread=%s",
+                        task_id,
+                        thread_id,
+                        exc_info=True,
                     )
 
         # Never let an old consumer erase a replacement process/consumer.

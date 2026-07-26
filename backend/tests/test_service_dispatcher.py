@@ -6564,6 +6564,42 @@ async def test_build_task_prompt_does_not_claim_enabled_skill_was_invoked(
     assert "FAKESKILL_TEMPLATE" not in codex_prompt
 
 
+@pytest.mark.asyncio
+async def test_build_task_prompt_invokes_explicit_initial_command(
+    db_factory,
+    monkeypatch,
+):
+    from backend.services.command_registry import COMMAND_REGISTRY, Command
+    from backend.services.dispatcher import _initial_task_launch_skills
+
+    monkeypatch.setitem(
+        COMMAND_REGISTRY,
+        "delegate",
+        Command(
+            name="delegate",
+            description="delegate work",
+            prompt_template="LOAD_DELEGATE_SKILL",
+            required_skills={"sub-agent": True},
+        ),
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    task = Task(
+        title="t",
+        description="$delegate research this topic",
+        provider="codex",
+        enabled_skills={},
+    )
+
+    prompt = await dispatcher._build_task_prompt(task)
+    launch_skills, temporary = _initial_task_launch_skills(task)
+
+    assert "LOAD_DELEGATE_SKILL" in prompt
+    assert "任务:\nresearch this topic" in prompt
+    assert "$delegate" not in prompt
+    assert launch_skills == {"sub-agent": True}
+    assert temporary is True
+
+
 def test_loop_prompt_codex_references_agents_md(db_factory):
     """Loop prompts reference AGENTS.md for codex tasks."""
     d = _make_dispatcher(db_factory)

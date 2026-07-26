@@ -416,8 +416,9 @@ async def create_sub_agent(
     readonly: bool = False,
     model: str | None = None,
 ) -> str:
-    """创建一个 Sub-Agent 执行一次性任务。Sub-Agent 是独立的 Claude 子进程，
-    会自主完成任务并将结果返回给你。你可以继续工作，稍后用 check_sub_agents 查看进度。
+    """创建一个 Sub-Agent 执行一次性任务。Sub-Agent 使用主任务对应的
+    Claude Code 或 Codex provider 独立运行，会自主完成任务并将结果返回给你。
+    你可以继续工作，稍后用 check_sub_agents 查看进度。
 
     Args:
         task_description: 任务描述（如"审查 src/ 下所有文件的 SQL 注入风险"）

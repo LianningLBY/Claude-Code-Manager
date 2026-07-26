@@ -22,17 +22,17 @@ describe('MonitorPanel codex annotation', () => {
     vi.clearAllMocks();
   });
 
-  it('shows a claude-only notice for codex tasks', () => {
+  it('shows the split capability notice for codex tasks', () => {
     render(<MonitorPanel {...baseProps} provider="codex" />);
     expect(
-      screen.getByText('Monitor / Sub-Agent 暂不支持 Codex 任务（仅 Claude 可用）'),
+      screen.getByText('Sub-Agent 已支持 Codex；后台 Monitor 仍仅支持 Claude'),
     ).toBeInTheDocument();
   });
 
   it('shows no notice for claude tasks', () => {
     render(<MonitorPanel {...baseProps} provider="claude" />);
     expect(
-      screen.queryByText('Monitor / Sub-Agent 暂不支持 Codex 任务（仅 Claude 可用）'),
+      screen.queryByText('Sub-Agent 已支持 Codex；后台 Monitor 仍仅支持 Claude'),
     ).not.toBeInTheDocument();
   });
 

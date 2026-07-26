@@ -32,6 +32,7 @@ vi.mock('../../api/client', () => ({
     listWorkers: vi.fn().mockResolvedValue([]),
     listSkillsCached: vi.fn().mockResolvedValue([
       { key: 'monitor', label: 'Monitor', description: 'Background monitoring sub-agents' },
+      { key: 'sub-agent', label: 'Sub-Agent', description: 'Parallel one-shot sub-agents' },
     ]),
     listUserSkillsCached: vi.fn().mockResolvedValue([]),
     getDefaultSkills: vi.fn().mockResolvedValue({
@@ -401,12 +402,15 @@ describe('Codex provider UI gating', () => {
     expect(screen.getByText('Thinking')).toBeInTheDocument();
   });
 
-  it('shows an explicit claude-only note instead of silently hiding Skills/Monitor', async () => {
+  it('shows that Codex supports Sub-Agent but not user Skills or Monitor', async () => {
     const cliSelect = await renderAndOpenConfig();
-    expect(screen.queryByText('Skills / Monitor 仅支持 Claude')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Skills \/ Monitor 仅支持 Claude/)).not.toBeInTheDocument();
 
     await userEvent.selectOptions(cliSelect, 'codex');
-    expect(screen.getByText('Skills / Monitor 仅支持 Claude')).toBeInTheDocument();
+    expect(
+      screen.getByText('Skills / Monitor 仅支持 Claude · Sub-Agent 可用'),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/Plugins/)).toBeInTheDocument());
   });
 });
 

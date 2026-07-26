@@ -39,6 +39,13 @@ def dispatcher(db_factory, mock_broadcaster):
     d._monitor_tasks = {}
     d._monitor_processes = {}
     d._monitor_log_fhs = {}
+    d._sub_agent_tasks = {}
+    d._sub_agent_processes = {}
+    d._sub_agent_log_fhs = {}
+    d._sub_agent_codex_processes = {}
+    d._sub_agent_codex_homes = {}
+    d._sub_agent_codex_threads = {}
+    d.codex_pool = None
     return d
 
 
@@ -126,6 +133,139 @@ def test_build_monitor_agent_prompt_no_context(dispatcher):
     prompt = dispatcher._build_monitor_agent_prompt("test", None)
     assert "test" in prompt
     assert "上下文" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
+    process = _fake_proc(returncode=None)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(return_value=(process, "thread-child"))
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = registry
+
+    from backend.services.mcp_config import build_sub_agent_mcp_server_specs
+
+    specs = build_sub_agent_mcp_server_specs(41, 7)
+    launched = await dispatcher._launch_codex_sub_agent(
+        prompt="review",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort_level="high",
+        session_id=41,
+        task_id=7,
+        task_metadata={},
+        mcp_specs=specs,
+    )
+
+    assert launched is process
+    kwargs = registry.start_turn.await_args.kwargs
+    assert kwargs["resume_session_id"] is None
+    assert "ephemeral" not in kwargs
+    assert kwargs["mcp_specs"] == specs
+    assert kwargs["mcp_specs"][0].required is True
+    assert set(kwargs["mcp_specs"][0].enabled_tools) == {
+        "get_context",
+        "report_progress",
+        "submit_result",
+    }
+    assert dispatcher._sub_agent_codex_processes[41] is process
+    assert dispatcher._sub_agent_codex_threads[41] == "thread-child"
+
+
+@pytest.mark.asyncio
+async def test_finalize_codex_sub_agent_interrupts_turn_not_process_group(
+    dispatcher,
+):
+    process = _fake_proc(returncode=None)
+    registry = MagicMock()
+
+    async def abort(_home, candidate, *, reason):
+        assert reason == "stop"
+        candidate.returncode = 130
+
+    registry.abort_unclaimed_turn = AsyncMock(side_effect=abort)
+    registry.delete_thread = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = registry
+    dispatcher._sub_agent_codex_processes[42] = process
+    dispatcher._sub_agent_codex_homes[42] = "/tmp/codex-home"
+    dispatcher._sub_agent_codex_threads[42] = "thread-child"
+
+    with patch.object(
+        dispatcher,
+        "_terminate_aux_process",
+        new_callable=AsyncMock,
+    ) as terminate_group:
+        await dispatcher._finalize_codex_sub_agent_turn(
+            42,
+            process,
+            reason="stop",
+        )
+
+    registry.abort_unclaimed_turn.assert_awaited_once_with(
+        "/tmp/codex-home",
+        process,
+        reason="stop",
+    )
+    registry.delete_thread.assert_awaited_once_with(
+        "/tmp/codex-home",
+        "thread-child",
+    )
+    terminate_group.assert_not_awaited()
+    assert 42 not in dispatcher._sub_agent_codex_processes
+    assert 42 not in dispatcher._sub_agent_codex_homes
+    assert 42 not in dispatcher._sub_agent_codex_threads
+
+
+@pytest.mark.asyncio
+async def test_finalize_completed_codex_sub_agent_deletes_thread_without_interrupt(
+    dispatcher,
+):
+    process = _fake_proc(returncode=0)
+    registry = MagicMock()
+    registry.abort_unclaimed_turn = AsyncMock()
+    registry.delete_thread = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = registry
+    dispatcher._sub_agent_codex_processes[43] = process
+    dispatcher._sub_agent_codex_homes[43] = "/tmp/codex-home"
+    dispatcher._sub_agent_codex_threads[43] = "thread-completed"
+
+    await dispatcher._finalize_codex_sub_agent_turn(
+        43,
+        process,
+        reason="completed",
+    )
+
+    registry.abort_unclaimed_turn.assert_not_awaited()
+    registry.delete_thread.assert_awaited_once_with(
+        "/tmp/codex-home",
+        "thread-completed",
+    )
+    assert 43 not in dispatcher._sub_agent_codex_processes
+    assert 43 not in dispatcher._sub_agent_codex_homes
+    assert 43 not in dispatcher._sub_agent_codex_threads
+
+
+@pytest.mark.asyncio
+async def test_failed_codex_sub_agent_thread_delete_retains_cleanup_evidence(
+    dispatcher,
+):
+    process = _fake_proc(returncode=0)
+    registry = MagicMock()
+    registry.delete_thread = AsyncMock(side_effect=RuntimeError("delete failed"))
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = registry
+    dispatcher._sub_agent_codex_processes[44] = process
+    dispatcher._sub_agent_codex_homes[44] = "/tmp/codex-home"
+    dispatcher._sub_agent_codex_threads[44] = "thread-retained"
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        await dispatcher._finalize_codex_sub_agent_turn(
+            44,
+            process,
+            reason="completed",
+        )
+
+    assert dispatcher._sub_agent_codex_processes[44] is process
+    assert dispatcher._sub_agent_codex_homes[44] == "/tmp/codex-home"
+    assert dispatcher._sub_agent_codex_threads[44] == "thread-retained"
 
 
 def test_build_monitor_agent_prompt_interval_guidance(dispatcher):

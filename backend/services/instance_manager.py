@@ -5364,11 +5364,6 @@ class InstanceManager:
             await self.broadcaster.broadcast(f"task:{task_id}", broadcast_data)
 
         # Persist and broadcast context usage
-        def _model_context_window(model_name: str) -> int:
-            # fable 系与 [1m] 变体为 1M 窗口，其余 200K
-            m = (model_name or "").lower()
-            return 1_000_000 if ("[1m]" in m or "fable" in m) else 200_000
-
         if (
             event_record is not None
             and not owns_event_generation()
@@ -5394,16 +5389,17 @@ class InstanceManager:
                     ).scalar_one_or_none()
                     stored = dict(t.context_window_usage) if (t and t.context_window_usage) else None
                     model_name = (t.model or "") if t else ""
-                # modelUsage 上报的窗口对大上下文模型（fable）会低报 200K，
-                # 取上报值与模型启发式的较大者
-                window = max(window, _model_context_window(model_name))
+                # modelUsage may underreport large-context models as 200K.
+                from backend.services.claude_models import claude_context_window
+
+                window = max(window, claude_context_window(model_name))
                 if stored and stored.get("context_window") != window:
                     stored["context_window"] = window
                     context_usage = stored
         elif context_usage and not context_usage.get("context_window"):
             # Per-request usage without a window (PTY interactive mode and -p
             # assistant events; codex turn.completed usage). Fill from the
-            # task's model choice: codex 查窗口表，claude [1m] 变体 1M 其余 200K。
+            # Fill from the provider-specific model capability table.
             model_name = ""
             task_provider = "claude"
             task_session_id = None
@@ -5463,7 +5459,9 @@ class InstanceManager:
                         model_name
                     )
             else:
-                context_usage["context_window"] = _model_context_window(model_name)
+                from backend.services.claude_models import claude_context_window
+
+                context_usage["context_window"] = claude_context_window(model_name)
         if context_usage and task_id:
             async with self.db_factory() as db:
                 context_updated = await db.execute(

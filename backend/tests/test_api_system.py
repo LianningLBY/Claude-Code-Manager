@@ -224,6 +224,23 @@ async def test_config_default_model_options_include_1m_variants(client):
 
 
 @pytest.mark.asyncio
+async def test_config_includes_opus5_capabilities(client):
+    resp = await client.get("/api/system/config")
+    data = resp.json()
+
+    assert "claude-opus-5" in data["model_options"]
+    assert "claude-opus-5[1m]" not in data["model_options"]
+    assert data["claude_model_context_windows"]["claude-opus-5"] == 1_000_000
+    assert data["claude_model_efforts"]["claude-opus-5"] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_config_reflects_settings(client):
     from unittest.mock import patch
     from backend.config import settings

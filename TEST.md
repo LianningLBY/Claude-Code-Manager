@@ -476,6 +476,15 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_process_event_orphan_overload_does_not_set_transient_flag` | resume 回放的旧 api_error（`orphan`）与后台子 agent 报错（`autonomous`）**不**置标记——否则成功 resume 被误判 failed（task #729 recover-then-failed） |
 | `test_build_command_codex_gpt56_passes_max_effort` / `..._ultra_effort` | GPT-5.6 sol/terra 的 `max`/`ultra` 档位真实传给 codex CLI（旧代码把 max 一律丢弃） |
 | `test_build_command_codex_old_model_clamps_max_to_xhigh` / `..._luna_clamps_ultra_to_max` | 不支持的高档位向下夹到该模型最高档，而非静默丢弃 |
+| `test_build_command_claude_opus5_with_max_effort` | Opus 5 的模型 ID 与 `max` effort 原样传给 Claude CLI |
+
+##### `test_claude_models.py` — Claude 模型能力
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_opus5_has_fixed_1m_context_window` / `test_default_model_is_resolved_before_context_lookup` | Opus 5（含作为默认模型时）固定使用 1M context |
+| `test_existing_1m_suffix_remains_supported` / `test_unknown_claude_model_uses_default_context_window` | 兼容既有 `[1m]` 变体，未知模型安全回退 200K |
+| `test_opus5_supports_full_effort_scale` | Opus 5 支持 `low/medium/high/xhigh/max` 完整 effort 档位 |
 
 ##### `test_codex_models.py` — Codex 模型目录（GPT-5.6 三模型）
 

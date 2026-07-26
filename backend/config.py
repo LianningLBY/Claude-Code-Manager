@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     default_provider: str = "codex"
     provider_options: str = "claude,codex"
     default_model: str = "claude-opus-4-6"
-    model_options: str = "default,claude-sonnet-5,claude-sonnet-5[1m],claude-fable-5,claude-fable-5[1m],claude-opus-4-6,claude-opus-4-6[1m],claude-opus-4-7,claude-opus-4-7[1m],claude-opus-4-8,claude-opus-4-8[1m],claude-sonnet-4-6,claude-sonnet-4-6[1m],claude-haiku-4-5"  # comma-separated
+    model_options: str = "default,claude-opus-5,claude-sonnet-5,claude-sonnet-5[1m],claude-fable-5,claude-fable-5[1m],claude-opus-4-6,claude-opus-4-6[1m],claude-opus-4-7,claude-opus-4-7[1m],claude-opus-4-8,claude-opus-4-8[1m],claude-sonnet-4-6,claude-sonnet-4-6[1m],claude-haiku-4-5"  # comma-separated
     default_codex_model: str = "gpt-5.6-sol"
     # GPT-5.6 是三个模型（sol/terra/luna），无裸 "gpt-5.6" ID（Codex 服务端模型列表实证）
     codex_model_options: str = "default,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex-spark"  # comma-separated

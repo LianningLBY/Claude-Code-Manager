@@ -653,6 +653,32 @@ async def test_read_and_fork_thread_use_native_app_server_protocol():
 
 
 @pytest.mark.asyncio
+async def test_create_empty_thread_uses_native_start_without_turn():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "thread": {"id": "thread-empty", "turns": []},
+    })
+
+    created = await server.create_thread(
+        cwd="/tmp/project",
+        model="gpt-5.6-sol",
+    )
+
+    assert created["id"] == "thread-empty"
+    assert "thread-empty" in server._known_threads
+    server._request.assert_awaited_once_with(
+        "thread/start",
+        {
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.6-sol",
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_fork_thread_settles_mutating_rpc_after_cancellation():
     server = CodexAppServer("codex")
     server.ensure_started = AsyncMock()
@@ -1240,6 +1266,11 @@ class _RegistryFakeServer:
             "turns": [{"id": "turn-1", "status": "completed", "items": []}],
         }
 
+    async def create_thread(self, *, cwd, model=None):
+        thread_id = f"thread-empty-{len(self.known_threads) + 1}"
+        self.known_threads.add(thread_id)
+        return {"id": thread_id, "cwd": cwd, "model": model, "turns": []}
+
     async def fork_thread(self, thread_id, *, last_turn_id):
         fork_id = f"{thread_id}-fork"
         self.known_threads.add(fork_id)
@@ -1587,6 +1618,27 @@ async def test_registry_fork_keeps_source_and_new_thread_in_same_home(
 
     assert forked["id"] not in registry._thread_owners
     assert forked["id"] not in registry._starting_threads
+    assert home not in registry._starting
+
+
+@pytest.mark.asyncio
+async def test_registry_registers_new_empty_thread_owner(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "empty-home")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        created = await registry.create_thread(
+            home,
+            cwd="/tmp/project",
+            model="gpt-5.6-sol",
+        )
+
+    assert registry._thread_owners[created["id"]] == home
     assert home not in registry._starting
 
 

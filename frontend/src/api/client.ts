@@ -165,6 +165,8 @@ export interface Task {
     forked_from_task_id?: number;
     forked_from_log_id?: number | null;
     forked_from_turn_id?: string;
+    fork_seed_message?: string;
+    fork_seed_log_id?: number | null;
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -233,6 +235,14 @@ export interface ChatMessage {
   // ask_user 卡片（event_type === 'ask_user_question' 时存在）
   ask_questions?: AskUserQuestion[] | null;
   ask_status?: 'pending' | 'answered' | 'timed_out' | 'expired' | null;
+}
+
+export interface CodexForkAnchor {
+  type: 'initial' | 'user_message';
+  id: number | null;
+  content: string;
+  timestamp: string | null;
+  attachments: FileAttachment[];
 }
 
 export interface AskUserOption {
@@ -975,7 +985,13 @@ export const api = {
     request<Task>(`/api/tasks/${id}/unread`, { method: 'POST' }),
   stopTaskSession: (id: number) =>
     request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
-  forkTask: (id: number, anchor: { type: 'initial' } | { type: 'log'; id: number }, title?: string) =>
+  listForkAnchors: (id: number) =>
+    request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
+  forkTask: (
+    id: number,
+    anchor: { type: 'initial'; id?: never } | { type: 'user_message'; id: number },
+    title?: string,
+  ) =>
     request<Task>(`/api/tasks/${id}/fork`, {
       method: 'POST',
       body: JSON.stringify({ anchor, ...(title?.trim() ? { title: title.trim() } : {}) }),

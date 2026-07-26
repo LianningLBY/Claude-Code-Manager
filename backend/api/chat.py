@@ -39,13 +39,13 @@ class ChatMessage(BaseModel):
 
 
 class ForkAnchor(BaseModel):
-    type: Literal["initial", "log"]
+    type: Literal["initial", "user_message"]
     id: int | None = None
 
     @model_validator(mode="after")
     def validate_anchor(self):
-        if self.type == "log" and (self.id is None or self.id <= 0):
-            raise ValueError("log fork anchors require a positive id")
+        if self.type == "user_message" and (self.id is None or self.id <= 0):
+            raise ValueError("user message fork anchors require a positive id")
         if self.type == "initial" and self.id is not None:
             raise ValueError("initial fork anchors cannot include an id")
         return self
@@ -102,13 +102,33 @@ def _turn_item_ids(item: object) -> set[str]:
     return found
 
 
+def _raw_log_metadata(row: LogEntry) -> dict:
+    if not row.raw_json:
+        return {}
+    try:
+        value = json.loads(row.raw_json)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _is_forkable_user_message(row: LogEntry) -> bool:
+    """Only ordinary human follow-up messages are precise fork boundaries."""
+
+    if row.event_type != "user_message" or row.role != "user":
+        return False
+    # Injected text belongs to the middle of an active native turn. Monitor,
+    # sub-agent, and other sourced messages are likewise not human turn starts.
+    return not _raw_log_metadata(row).get("source")
+
+
 def _resolve_fork_turn(
     *,
     anchor: ForkAnchor,
     rows: list[LogEntry],
     turns: list[dict],
 ) -> tuple[str, int]:
-    """Resolve a local chat anchor to a completed native turn and log cutoff."""
+    """Resolve the completed native turn immediately before a user message."""
 
     if not turns:
         raise HTTPException(409, "Codex session has no persisted turns to fork")
@@ -128,68 +148,58 @@ def _resolve_fork_turn(
         if resolved in turn_index:
             row_turns[row.id] = resolved
 
-    if anchor.type == "initial":
-        target_turn_id = turn_ids[0]
-        anchor_row_id = 0
-    else:
-        selected_index = next(
-            (index for index, row in enumerate(rows) if row.id == anchor.id),
-            None,
-        )
-        if selected_index is None:
-            raise HTTPException(404, "Fork anchor message not found")
-        selected = rows[selected_index]
-        target_turn_id = row_turns.get(selected.id)
-        if target_turn_id is None and selected.event_type == "user_message":
-            # A CCM user row is committed before turn/start returns. Associate
-            # it with the first native event before the next real user message.
-            for candidate in rows[selected_index + 1:]:
-                if candidate.event_type == "user_message":
-                    break
-                target_turn_id = row_turns.get(candidate.id)
-                if target_turn_id:
-                    break
-        if target_turn_id is None and selected.event_type == "user_message":
-            # Legacy logs predate persisted turn ids. Initial description is
-            # turn zero, so the Nth follow-up user row normally owns turn N.
-            ordinal = sum(
-                1
-                for row in rows[:selected_index + 1]
-                if row.event_type == "user_message"
-            )
-            if ordinal < len(turn_ids):
-                target_turn_id = turn_ids[ordinal]
-        if target_turn_id is None:
-            raise HTTPException(
-                409,
-                "This legacy message cannot be mapped safely to a Codex turn",
-            )
-        anchor_row_id = selected.id
-
-    target_index = turn_index[target_turn_id]
-    status = str(turns[target_index].get("status") or "")
-    if status in {"inProgress", "in_progress", "running"}:
-        raise HTTPException(409, "The selected Codex turn is still running")
-
-    target_row_ids = [
-        row_id
-        for row_id, row_turn_id in row_turns.items()
-        if row_turn_id == target_turn_id
-    ]
-    last_target_row = max(target_row_ids, default=anchor_row_id)
-    next_user_row = next(
-        (
-            row.id
-            for row in rows
-            if row.id > last_target_row and row.event_type == "user_message"
-        ),
+    selected_index = next(
+        (index for index, row in enumerate(rows) if row.id == anchor.id),
         None,
     )
-    cutoff = (next_user_row - 1) if next_user_row else (
-        max((row.id for row in rows), default=anchor_row_id)
-    )
-    cutoff = max(cutoff, anchor_row_id)
-    return target_turn_id, cutoff
+    if selected_index is None:
+        raise HTTPException(404, "Fork anchor message not found")
+    selected = rows[selected_index]
+    if not _is_forkable_user_message(selected):
+        raise HTTPException(
+            400,
+            "Fork anchors must be ordinary user messages, not injected or generated events",
+        )
+
+    selected_turn_id = row_turns.get(selected.id)
+    if selected_turn_id is None:
+        # A CCM user row is committed before turn/start returns. Associate it
+        # with the first native event before the next real user message.
+        for candidate in rows[selected_index + 1:]:
+            if _is_forkable_user_message(candidate):
+                break
+            selected_turn_id = row_turns.get(candidate.id)
+            if selected_turn_id:
+                break
+    if selected_turn_id is None:
+        # Legacy logs predate persisted turn ids. The initial Task description
+        # owns turn zero, so the Nth ordinary follow-up user row owns turn N.
+        ordinal = sum(
+            1
+            for row in rows[:selected_index + 1]
+            if _is_forkable_user_message(row)
+        )
+        if ordinal < len(turn_ids):
+            selected_turn_id = turn_ids[ordinal]
+    if selected_turn_id is None:
+        raise HTTPException(
+            409,
+            "This user message cannot be mapped safely to a Codex turn",
+        )
+
+    selected_turn_index = turn_index[selected_turn_id]
+    if selected_turn_index == 0:
+        raise HTTPException(
+            409,
+            "There is no completed Codex turn before this user message",
+        )
+    target_index = selected_turn_index - 1
+    target_turn_id = turn_ids[target_index]
+    status = str(turns[target_index].get("status") or "")
+    if status in {"inProgress", "in_progress", "running"}:
+        raise HTTPException(409, "The preceding Codex turn is still running")
+
+    return target_turn_id, selected.id - 1
 
 
 def _codex_fork_home(task: Task) -> tuple[str, str | None]:
@@ -379,6 +389,56 @@ async def send_chat_message(
     return {"ok": True, "queued": True, "session_id": task.session_id}
 
 
+@router.get("/{task_id}/fork-anchors")
+async def list_codex_fork_anchors(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """List ordinary user follow-ups that can serve as fork boundaries."""
+
+    source = await db.get(Task, task_id)
+    if not source:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, source, db)
+    if (source.provider or "claude").lower() != "codex":
+        raise HTTPException(400, "Only Codex sessions support native forks")
+    if not source.session_id:
+        raise HTTPException(400, "This task has no Codex session to fork")
+
+    rows = list((await db.execute(
+        select(LogEntry)
+        .where(LogEntry.task_id == task_id)
+        .order_by(LogEntry.id.asc())
+    )).scalars().all())
+    anchors = []
+    if source.description:
+        anchors.append({
+            "type": "initial",
+            "id": None,
+            "content": source.description,
+            "timestamp": (
+                source.created_at.isoformat() + "Z"
+                if source.created_at else None
+            ),
+            "attachments": (source.metadata_ or {}).get("attachments") or [],
+        })
+    for row in rows:
+        if not _is_forkable_user_message(row):
+            continue
+        metadata = _raw_log_metadata(row)
+        anchors.append({
+            "type": "user_message",
+            "id": row.id,
+            "content": metadata.get("raw_content") or row.content or "",
+            "timestamp": (
+                row.timestamp.isoformat() + "Z" if row.timestamp else None
+            ),
+            "attachments": metadata.get("attachments") or [],
+        })
+    return anchors
+
+
 @router.post("/{task_id}/fork", response_model=TaskResponse, status_code=201)
 async def fork_codex_task(
     task_id: int,
@@ -408,10 +468,28 @@ async def fork_codex_task(
         .where(LogEntry.task_id == task_id)
         .order_by(LogEntry.id.asc())
     )).scalars().all())
-    if body.anchor.type == "log" and not any(
-        row.id == body.anchor.id for row in rows
-    ):
-        raise HTTPException(404, "Fork anchor message not found")
+    selected: LogEntry | None = None
+    if body.anchor.type == "initial":
+        if not source.description:
+            raise HTTPException(404, "Initial prompt not found")
+        seed_message = source.description
+        selected_metadata: dict = {}
+    else:
+        selected = next(
+            (row for row in rows if row.id == body.anchor.id),
+            None,
+        )
+        if selected is None:
+            raise HTTPException(404, "Fork anchor message not found")
+        if not _is_forkable_user_message(selected):
+            raise HTTPException(
+                400,
+                "Fork anchors must be ordinary user messages, not injected or generated events",
+            )
+        selected_metadata = _raw_log_metadata(selected)
+        seed_message = (
+            selected_metadata.get("raw_content") or selected.content or ""
+        )
 
     codex_home, account_id = _codex_fork_home(source)
     from backend.main import instance_manager
@@ -421,24 +499,33 @@ async def fork_codex_task(
     )
 
     try:
-        native_thread = await instance_manager.read_codex_thread(
-            codex_home,
-            source.session_id,
-        )
-        turns = [
-            turn for turn in (native_thread.get("turns") or [])
-            if isinstance(turn, dict)
-        ]
-        last_turn_id, cutoff = _resolve_fork_turn(
-            anchor=body.anchor,
-            rows=rows,
-            turns=turns,
-        )
-        forked_thread = await instance_manager.fork_codex_thread(
-            codex_home,
-            source.session_id,
-            last_turn_id=last_turn_id,
-        )
+        if body.anchor.type == "initial":
+            last_turn_id = None
+            cutoff = -1
+            forked_thread = await instance_manager.create_codex_thread(
+                codex_home,
+                cwd=source.last_cwd or source.target_repo or os.getcwd(),
+                model=source.model,
+            )
+        else:
+            native_thread = await instance_manager.read_codex_thread(
+                codex_home,
+                source.session_id,
+            )
+            turns = [
+                turn for turn in (native_thread.get("turns") or [])
+                if isinstance(turn, dict)
+            ]
+            last_turn_id, cutoff = _resolve_fork_turn(
+                anchor=body.anchor,
+                rows=rows,
+                turns=turns,
+            )
+            forked_thread = await instance_manager.fork_codex_thread(
+                codex_home,
+                source.session_id,
+                last_turn_id=last_turn_id,
+            )
     except CodexAppServerBusyError as exc:
         raise HTTPException(409, str(exc)) from exc
     except CodexAppServerError as exc:
@@ -452,9 +539,13 @@ async def fork_codex_task(
             metadata["codex_account_id"] = account_id
         metadata["forked_from_task_id"] = source.id
         metadata["forked_from_log_id"] = (
-            body.anchor.id if body.anchor.type == "log" else None
+            body.anchor.id if body.anchor.type == "user_message" else None
         )
         metadata["forked_from_turn_id"] = last_turn_id
+        metadata["fork_seed_message"] = seed_message
+        metadata["fork_seed_log_id"] = (
+            body.anchor.id if body.anchor.type == "user_message" else None
+        )
 
         default_title = (
             f"Fork of #{source.id}: {source.title}"
@@ -464,7 +555,11 @@ async def fork_codex_task(
         now = datetime.utcnow()
         forked_task = Task(
             title=(body.title.strip() if body.title and body.title.strip() else default_title)[:200],
-            description=source.description,
+            description=(
+                source.description
+                if body.anchor.type == "user_message"
+                else None
+            ),
             status="completed",
             priority=source.priority,
             project_id=source.project_id,
@@ -519,6 +614,7 @@ async def fork_codex_task(
             content=f"Forked from Task #{source.id}",
             raw_json=json.dumps({
                 "forked_from_task_id": source.id,
+                "forked_from_log_id": metadata["forked_from_log_id"],
                 "forked_from_turn_id": last_turn_id,
             }),
             is_error=False,

@@ -1324,6 +1324,22 @@ class InstanceManager:
         registry = self._ensure_codex_app_server_registry()
         return await registry.read_thread(codex_home, thread_id)
 
+    async def create_codex_thread(
+        self,
+        codex_home: str,
+        *,
+        cwd: str,
+        model: str | None = None,
+    ) -> dict:
+        """Create and register an empty native Codex thread."""
+
+        registry = self._ensure_codex_app_server_registry()
+        return await registry.create_thread(
+            codex_home,
+            cwd=cwd,
+            model=model,
+        )
+
     async def fork_codex_thread(
         self,
         codex_home: str,

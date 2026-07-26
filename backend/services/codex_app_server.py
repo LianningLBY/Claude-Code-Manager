@@ -546,6 +546,38 @@ class CodexAppServer:
             )
         return thread
 
+    async def create_thread(
+        self,
+        *,
+        cwd: str,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an empty persisted thread without starting a turn."""
+
+        if not cwd:
+            raise ValueError("cwd is required")
+        await self.ensure_started()
+        params: dict[str, Any] = {
+            "cwd": os.path.abspath(cwd),
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }
+        if model and model != "default":
+            params["model"] = model
+        request = asyncio.create_task(self._request("thread/start", params))
+        while not request.done():
+            try:
+                await asyncio.shield(request)
+            except asyncio.CancelledError:
+                continue
+        response = request.result()
+        thread = response.get("thread") if isinstance(response, dict) else None
+        thread_id = thread.get("id") if isinstance(thread, dict) else None
+        if not thread_id:
+            raise CodexAppServerError("thread/start returned no thread id")
+        self._known_threads.add(str(thread_id))
+        return thread
+
     async def fork_thread(
         self,
         thread_id: str,
@@ -1421,6 +1453,51 @@ class CodexAppServerRegistry:
                     and self._thread_owners.get(thread_id) == home
                 ):
                     self._thread_owners.pop(thread_id, None)
+
+    async def create_thread(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        *,
+        cwd: str,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an empty thread in one exact account home."""
+
+        home = normalize_codex_home(codex_home)
+        async with self._lock:
+            if self._shutdown_requested or home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is unavailable: {home}"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                server_kwargs: dict[str, Any] = {}
+                if self._env_remove_resolver is not None:
+                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
+                server = CodexAppServer(
+                    self.binary,
+                    request_timeout=self.request_timeout,
+                    codex_home=home,
+                    **server_kwargs,
+                )
+                self._servers[home] = server
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        thread_id: str | None = None
+        try:
+            result = await server.create_thread(cwd=cwd, model=model)
+            thread_id = str(result["id"])
+            async with self._lock:
+                existing = self._thread_owners.get(thread_id)
+                if existing is not None and existing != home:
+                    raise CodexThreadHomeMismatchError(
+                        f"New Codex thread {thread_id} is already bound to {existing}"
+                    )
+                self._thread_owners[thread_id] = home
+            return result
+        finally:
+            async with self._lock:
+                self._decrement_starting_locked(home)
 
     async def fork_thread(
         self,

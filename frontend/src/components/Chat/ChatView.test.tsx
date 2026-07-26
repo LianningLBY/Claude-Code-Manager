@@ -11,6 +11,7 @@ vi.mock('../../api/client', () => ({
     sendTaskChat: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
     stopTaskSession: vi.fn().mockResolvedValue({}),
+    listForkAnchors: vi.fn().mockResolvedValue([]),
     forkTask: vi.fn().mockResolvedValue({}),
     uploadImages: vi.fn().mockResolvedValue([]),
     listMonitorSessions: vi.fn().mockResolvedValue([]),
@@ -99,6 +100,7 @@ describe('ChatView', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -182,15 +184,27 @@ describe('ChatView', () => {
       expect(screen.queryByText('— Initial Prompt —')).not.toBeInTheDocument();
     });
 
-    it('forks a Codex session from the initial prompt and opens the new task', async () => {
+    it('opens one toolbar picker and forks before a selected user message', async () => {
       const task = makeTask({ id: 12, provider: 'codex', status: 'completed' });
+      const anchor = {
+        type: 'user_message' as const,
+        id: 456,
+        content: 'Try a different implementation',
+        timestamp: '2024-01-01T00:01:00Z',
+        attachments: [],
+      };
       const forked = makeTask({
         id: 99,
         provider: 'codex',
         status: 'completed',
         session_id: 'fork-thread',
+        metadata_: {
+          fork_seed_message: anchor.content,
+          fork_seed_log_id: anchor.id,
+        },
       });
       const onTaskForked = vi.fn();
+      (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([anchor]);
       (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(forked);
       render(
         <ChatView
@@ -202,14 +216,19 @@ describe('ChatView', () => {
       );
 
       const forkButton = screen.getByLabelText('Fork Codex session');
-      expect(forkButton).not.toHaveClass('opacity-0');
       expect(forkButton).toHaveClass('h-8', 'w-8');
       await userEvent.click(forkButton);
-      expect(screen.getByText('Fork Codex session', { selector: 'div' })).toBeInTheDocument();
+      expect(await screen.findByText(anchor.content)).toBeInTheDocument();
+      expect(api.listForkAnchors).toHaveBeenCalledWith(task.id);
+      await userEvent.click(screen.getByText(anchor.content));
       await userEvent.click(screen.getByRole('button', { name: 'Create fork' }));
 
       await waitFor(() => {
-        expect(api.forkTask).toHaveBeenCalledWith(12, { type: 'initial' }, '');
+        expect(api.forkTask).toHaveBeenCalledWith(
+          12,
+          { type: 'user_message', id: anchor.id },
+          '',
+        );
         expect(onTaskForked).toHaveBeenCalledWith(forked);
       });
     });
@@ -221,7 +240,7 @@ describe('ChatView', () => {
       expect(screen.queryByLabelText('Fork Codex session')).not.toBeInTheDocument();
     });
 
-    it('forks a Codex session from a persisted conversation message', async () => {
+    it('does not add fork actions to assistant messages', async () => {
       const task = makeTask({
         id: 13,
         description: null,
@@ -238,22 +257,28 @@ describe('ChatView', () => {
         timestamp: '2024-01-01T00:01:00Z',
       };
       (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([message]);
-      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeTask({ id: 100, provider: 'codex', session_id: 'fork-message' }),
-      );
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
 
       expect(await screen.findByText('Forkable answer')).toBeInTheDocument();
-      await userEvent.click(screen.getByLabelText('Fork Codex session'));
-      await userEvent.click(screen.getByRole('button', { name: 'Create fork' }));
+      expect(screen.getAllByLabelText('Fork Codex session')).toHaveLength(1);
+    });
 
-      await waitFor(() => {
-        expect(api.forkTask).toHaveBeenCalledWith(
-          task.id,
-          { type: 'log', id: message.id },
-          '',
-        );
+    it('prefills a fork seed only once when the child task opens', () => {
+      const task = makeTask({
+        id: 101,
+        provider: 'codex',
+        metadata_: {
+          fork_seed_message: 'editable fork prompt',
+          fork_seed_log_id: 456,
+        },
       });
+      const first = render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      expect(screen.getByRole('textbox')).toHaveValue('editable fork prompt');
+      first.unmount();
+      localStorage.removeItem(`ccm-chat-draft-${task.id}`);
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      expect(screen.getByRole('textbox')).toHaveValue('');
     });
   });
 

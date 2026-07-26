@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api } from '../../api/client';
-import type { ChatMessage, FileAttachment, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
 import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
@@ -141,10 +141,25 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   // Draft buffer: unsent input survives refresh / re-entering the chat
   const [input, setInput] = useState(() => {
-    try { return localStorage.getItem(`ccm-chat-draft-${task.id}`) || ''; } catch { return ''; }
+    try {
+      const draft = localStorage.getItem(`ccm-chat-draft-${task.id}`);
+      if (draft) return draft;
+      const seed = task.metadata_?.fork_seed_message;
+      const seedKey = `ccm-fork-seed-consumed-${task.id}`;
+      if (seed && !localStorage.getItem(seedKey)) {
+        localStorage.setItem(seedKey, '1');
+        return seed;
+      }
+      return '';
+    } catch {
+      return task.metadata_?.fork_seed_message || '';
+    }
   });
   const [sending, setSending] = useState(false);
-  const [forkAnchor, setForkAnchor] = useState<{ type: 'initial' } | { type: 'log'; id: number } | null>(null);
+  const [forkOpen, setForkOpen] = useState(false);
+  const [forkAnchors, setForkAnchors] = useState<CodexForkAnchor[]>([]);
+  const [selectedForkAnchor, setSelectedForkAnchor] = useState<CodexForkAnchor | null>(null);
+  const [forkAnchorsLoading, setForkAnchorsLoading] = useState(false);
   const [forkTitle, setForkTitle] = useState('');
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState<string | null>(null);
@@ -940,21 +955,36 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     } catch { /* ignore */ }
   };
 
-  const openFork = (message?: ChatMessage) => {
+  const openFork = async () => {
     if (task.provider !== 'codex' || !task.session_id) return;
-    if (message && !message.persisted) return;
-    setForkAnchor(message ? { type: 'log', id: message.id } : { type: 'initial' });
+    setForkOpen(true);
+    setSelectedForkAnchor(null);
+    setForkAnchors([]);
     setForkTitle('');
     setForkError(null);
+    setForkAnchorsLoading(true);
+    try {
+      setForkAnchors(await api.listForkAnchors(task.id));
+    } catch (e) {
+      setForkError(e instanceof Error ? e.message : 'Could not load user messages');
+    } finally {
+      setForkAnchorsLoading(false);
+    }
   };
 
   const confirmFork = async () => {
-    if (!forkAnchor || forking) return;
+    if (!selectedForkAnchor || forking) return;
     setForking(true);
     setForkError(null);
     try {
-      const forked = await api.forkTask(task.id, forkAnchor, forkTitle);
-      setForkAnchor(null);
+      const forked = await api.forkTask(
+        task.id,
+        selectedForkAnchor.type === 'initial'
+          ? { type: 'initial' }
+          : { type: 'user_message', id: selectedForkAnchor.id! },
+        forkTitle,
+      );
+      setForkOpen(false);
       onTaskForked?.(forked);
       onTaskUpdated?.();
     } catch (e) {
@@ -1173,29 +1203,68 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       )}
 
-      {forkAnchor && (
+      {forkOpen && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-md rounded-xl border border-gray-700 bg-gray-800 shadow-2xl">
+          <div className="flex max-h-[80vh] w-full max-w-lg flex-col rounded-xl border border-gray-700 bg-gray-800 shadow-2xl">
             <div className="flex items-center justify-between border-b border-gray-700 px-4 py-3">
               <div className="flex items-center gap-2 text-sm font-medium text-gray-100">
                 <GitBranch size={16} className="text-indigo-400" />
-                Fork Codex session
+                选择用户消息作为分叉点
               </div>
               <button
-                onClick={() => !forking && setForkAnchor(null)}
+                onClick={() => !forking && setForkOpen(false)}
                 className="text-gray-500 hover:text-gray-300 disabled:opacity-40"
                 disabled={forking}
               >
                 <X size={16} />
               </button>
             </div>
-            <div className="space-y-3 px-4 py-4">
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
               <p className="text-sm text-gray-300">
-                A new Task will keep the conversation through the selected Codex turn and continue in an independent thread.
+                新任务会保留所选消息之前的上下文，并把这条消息预填到输入框中，不会自动发送。
               </p>
               <p className="text-xs text-amber-400/90">
-                Conversation context is forked; files are not snapshotted. Both Tasks keep using the same working directory.
+                注入消息属于运行中 turn，无法作为精确边界，因此不会出现在列表中。两个 Task 仍使用同一工作目录。
               </p>
+              <div className="space-y-1.5">
+                {forkAnchorsLoading && (
+                  <div className="flex items-center justify-center gap-2 py-8 text-sm text-gray-500">
+                    <Loader2 size={15} className="animate-spin" />
+                    加载用户消息…
+                  </div>
+                )}
+                {!forkAnchorsLoading && forkAnchors.length === 0 && !forkError && (
+                  <div className="rounded border border-gray-700 bg-gray-900/40 px-3 py-6 text-center text-sm text-gray-500">
+                    当前会话没有可精确分叉的后续用户消息
+                  </div>
+                )}
+                {forkAnchors.map((anchor) => (
+                  <button
+                    key={`${anchor.type}-${anchor.id ?? 'initial'}`}
+                    type="button"
+                    onClick={() => setSelectedForkAnchor(anchor)}
+                    className={`w-full rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                      selectedForkAnchor?.type === anchor.type
+                        && selectedForkAnchor?.id === anchor.id
+                        ? 'border-indigo-400 bg-indigo-500/10'
+                        : 'border-gray-700 bg-gray-900/40 hover:border-gray-600 hover:bg-gray-700/40'
+                    }`}
+                  >
+                    <div className="line-clamp-3 whitespace-pre-wrap text-sm text-gray-200">
+                      {anchor.content}
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-2 text-[11px] text-gray-500">
+                      {anchor.timestamp && <span>{formatMessageTime(anchor.timestamp)}</span>}
+                      {anchor.attachments.length > 0 && (
+                        <span className="inline-flex items-center gap-1">
+                          <Paperclip size={10} />
+                          {anchor.attachments.length}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                ))}
+              </div>
               <div>
                 <label className="mb-1 block text-xs text-gray-400">New Task title (optional)</label>
                 <input
@@ -1214,7 +1283,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             </div>
             <div className="flex justify-end gap-2 border-t border-gray-700 px-4 py-3">
               <button
-                onClick={() => setForkAnchor(null)}
+                onClick={() => setForkOpen(false)}
                 disabled={forking}
                 className="rounded px-3 py-1.5 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 disabled:opacity-40"
               >
@@ -1222,7 +1291,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               </button>
               <button
                 onClick={confirmFork}
-                disabled={forking}
+                disabled={forking || !selectedForkAnchor}
                 className="flex items-center gap-1.5 rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-500 disabled:opacity-50"
               >
                 {forking ? <Loader2 size={13} className="animate-spin" /> : <GitBranch size={13} />}
@@ -1458,9 +1527,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <div className="flex items-center justify-end gap-1 mt-0.5 pr-1">
                   {task.created_at && <MessageTimestamp timestamp={task.created_at} />}
                   <MessageCopyButton text={task.description} />
-                  {task.provider === 'codex' && task.session_id && (
-                    <ForkButton onClick={() => openFork()} />
-                  )}
                 </div>
               </div>
             </div>
@@ -1472,14 +1538,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               key={i}
               messages={group.messages}
               taskId={task.id}
-              onFork={task.provider === 'codex' ? openFork : undefined}
             />
           ) : (
             <MessageBubble
               key={group.message.id}
               message={group.message}
               taskId={task.id}
-              onFork={task.provider === 'codex' ? openFork : undefined}
             />
           )
         )}
@@ -1699,6 +1763,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <Syringe size={18} />
               </button>
             )}
+            {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && (
+              <ForkButton onClick={openFork} disabled={isProcessing} />
+            )}
             {/* Message navigation — always visible, right-aligned */}
             <div className="ml-auto flex items-center gap-0.5">
               <button
@@ -1838,16 +1905,13 @@ function toolUseSummary(msg: ChatMessage): string {
 function ToolGroup({
   messages,
   taskId,
-  onFork,
 }: {
   messages: ChatMessage[];
   taskId: number;
-  onFork?: (message: ChatMessage) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const hasError = messages.some((m) => m.is_error);
   const toolUseCount = messages.filter((m) => m.event_type === 'tool_use').length;
-  const forkAnchor = [...messages].reverse().find((message) => message.persisted);
 
   return (
     <div className="group mx-4">
@@ -1861,7 +1925,6 @@ function ToolGroup({
             {hasError ? '⚠' : '🔧'} {toolUseCount} tool call{toolUseCount !== 1 ? 's' : ''}
           </span>
         </button>
-        {onFork && forkAnchor && <ForkButton onClick={() => onFork(forkAnchor)} />}
       </div>
       {expanded && (
         <div className="ml-3 border-l border-gray-800 pl-3 space-y-1 mt-1">
@@ -2028,13 +2091,14 @@ function MessageCopyButton({ text }: { text: string }) {
   );
 }
 
-function ForkButton({ onClick }: { onClick: () => void }) {
+function ForkButton({ onClick, disabled = false }: { onClick: () => void; disabled?: boolean }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="inline-flex h-8 w-8 items-center justify-center rounded-md text-indigo-400 transition-colors hover:bg-indigo-500/10 hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
-      title="Fork Codex session from this turn"
+      disabled={disabled}
+      className="inline-flex h-8 w-8 items-center justify-center rounded-md text-indigo-400 transition-colors hover:bg-indigo-500/10 hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
+      title={disabled ? '当前 Codex turn 结束后才能分叉' : '从一条用户消息之前的上下文创建 Fork'}
       aria-label="Fork Codex session"
     >
       <GitBranch size={16} />
@@ -2334,16 +2398,11 @@ function AskUserCard({ message, taskId }: { message: ChatMessage; taskId?: numbe
 const MessageBubble = memo(function MessageBubble({
   message,
   taskId,
-  onFork,
 }: {
   message: ChatMessage;
   taskId?: number;
-  onFork?: (message: ChatMessage) => void;
 }) {
   const isUser = message.role === 'user';
-  const forkButton = onFork && message.persisted
-    ? <ForkButton onClick={() => onFork(message)} />
-    : null;
 
   if (message.event_type === 'permission_request') {
     return <PermissionCard message={message} taskId={taskId} />;
@@ -2364,7 +2423,6 @@ const MessageBubble = memo(function MessageBubble({
           {message.timestamp && (
             <MessageTimestamp timestamp={message.timestamp} className="ml-auto" />
           )}
-          {forkButton}
         </div>
         <div className="mt-1.5">
           {text && !isEncrypted ? (
@@ -2520,7 +2578,6 @@ const MessageBubble = memo(function MessageBubble({
         <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end pr-1' : 'pl-1'}`}>
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} />}
           {message.content && <MessageCopyButton text={isUser ? (message.raw_content ?? stripSenderPrefix(message.content)) : message.content} />}
-          {forkButton}
         </div>
       </div>
     </div>

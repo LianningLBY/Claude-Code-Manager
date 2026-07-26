@@ -1196,3 +1196,34 @@ async def test_create_sub_agent_accepts_codex_task(client, session_factory):
     assert resp.status_code == 201
     assert resp.json()["description"] == "review"
     mock_dispatcher.start_sub_agent_session.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_context_uses_task_description_as_prompt(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_sub_agent(client, session_factory)
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.description = "canonical task description"
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="context-reader",
+            last_summary="inspect README",
+            status="running",
+        )
+        db.add(session)
+        await db.commit()
+        await db.refresh(session)
+        session_id = session.id
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/sub-agent-sessions/{session_id}/context"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task_description"] == "canonical task description"
+    assert response.json()["task_prompt"] == "canonical task description"

@@ -540,7 +540,9 @@ async def get_sub_agent_context(
     task = await db.get(Task, task_id)
     context: dict = {
         "task_description": task.description if task else "",
-        "task_prompt": task.prompt if task else "",
+        # Task has no separate prompt column. Keep the legacy response key for
+        # MCP clients, backed by the canonical task description.
+        "task_prompt": task.description if task else "",
         "sub_agent_prompt": sa.last_summary or "",
         "sub_agent_context": sa.monitor_context or "",
     }

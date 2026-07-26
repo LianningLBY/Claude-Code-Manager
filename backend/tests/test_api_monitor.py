@@ -1172,7 +1172,7 @@ async def test_create_monitor_rejects_codex_task(client, session_factory):
 
 
 @pytest.mark.asyncio
-async def test_create_sub_agent_rejects_codex_task(client, session_factory):
+async def test_create_sub_agent_accepts_codex_task(client, session_factory):
     resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
         "provider": "codex",
@@ -1183,8 +1183,16 @@ async def test_create_sub_agent_rejects_codex_task(client, session_factory):
         await db.execute(update(Task).where(Task.id == task_id).values(status="in_progress"))
         await db.commit()
 
-    resp = await client.post(f"/api/tasks/{task_id}/sub-agent-sessions", json={
-        "name": "review", "prompt": "review the code",
-    })
-    assert resp.status_code == 400
-    assert "claude-only" in resp.json()["detail"]
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.start_sub_agent_session = MagicMock()
+    mock_dispatcher.broadcaster = MagicMock()
+    mock_dispatcher.broadcaster.broadcast = AsyncMock()
+    with patch("backend.main.dispatcher", mock_dispatcher):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/sub-agent-sessions",
+            json={"name": "review", "prompt": "review the code"},
+        )
+
+    assert resp.status_code == 201
+    assert resp.json()["description"] == "review"
+    mock_dispatcher.start_sub_agent_session.assert_called_once()

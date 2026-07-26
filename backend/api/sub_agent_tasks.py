@@ -215,12 +215,12 @@ async def create_sub_agent_session(
             task = await db.get(Task, task_id)
             if task is None:
                 raise HTTPException(404, "Task not found")
-            # Sub-agents are currently hard-wired to Claude CLI.
-            if (task.provider or "claude").lower() != "claude":
+            provider = (task.provider or "claude").lower()
+            if provider not in {"claude", "codex"}:
                 raise HTTPException(
                     400,
-                    "Sub-agents are claude-only; this task runs on "
-                    f"provider '{task.provider}'",
+                    "Sub-agents require a supported coding provider; this task "
+                    f"runs on provider '{task.provider}'",
                 )
             skills = task.enabled_skills or {}
             if not skills.get("sub-agent"):

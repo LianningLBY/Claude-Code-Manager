@@ -16,10 +16,12 @@ from backend.services import mcp_config
 from backend.services.mcp_config import (
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
+    CCM_SUB_AGENT_CONTROLLER_TOOLS,
     CCM_SUB_AGENT_TOOLS,
     McpServerSpec,
     build_mcp_server_specs,
     build_monitor_agent_mcp_server_specs,
+    build_sub_agent_controller_mcp_server_specs,
     build_sub_agent_mcp_server_specs,
     cleanup_mcp_config,
     cleanup_monitor_agent_mcp_config,
@@ -230,6 +232,26 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
         ),
     )
     assert CCM_SUB_AGENT_TOOLS == EXPECTED_SUB_AGENT_TOOLS
+
+
+def test_sub_agent_controller_spec_is_narrow_and_required(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+
+    (spec,) = build_sub_agent_controller_mcp_server_specs(
+        42,
+        api_base="http://manager:8321",
+    )
+
+    assert spec.name == "ccm_skills"
+    assert spec.required is True
+    assert spec.enabled_tools == CCM_SUB_AGENT_CONTROLLER_TOOLS
+    assert spec.enabled_tools == (
+        "ccm_read_skill",
+        "create_sub_agent",
+        "check_sub_agents",
+        "stop_sub_agent",
+    )
+    assert "create_monitor" not in spec.enabled_tools
 
 
 @pytest.mark.parametrize(

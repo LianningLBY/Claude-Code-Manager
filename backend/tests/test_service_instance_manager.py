@@ -1111,6 +1111,51 @@ async def test_required_mcp_app_server_failure_does_not_launch_exec(
 
 
 @pytest.mark.asyncio
+async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-sub-agent-mcp-fail-closed")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="sub-agent task",
+            description="delegate",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            enabled_skills={"sub-agent": True},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock())
+    im._launch_codex_app_server = AsyncMock(
+        side_effect=RuntimeError("unexpected adapter failure")
+    )
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(CodexRequiredMcpError):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must keep sub-agent tools",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-sub-agent-mcp-home"),
+                enabled_skills={"sub-agent": True},
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "launch_error",
     [
@@ -1279,6 +1324,47 @@ async def test_launch_codex_app_server_injects_task_scoped_specs_when_enabled(
     assert spec.required is True
     assert spec.args[spec.args.index("--task-id") + 1] == "73"
     assert "ccm_command_help" in spec.enabled_tools
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_controller_bypasses_full_main_mcp_flag(
+    db_factory, monkeypatch,
+):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    process = _make_mock_process(pid=7656)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(return_value=(process, "thread-sub-agent"))
+    im = InstanceManager(db_factory, MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im._persist_and_track_launch = AsyncMock(return_value=7656)
+
+    await im._launch_codex_app_server(
+        instance_id=1,
+        prompt="delegate",
+        task_id=74,
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        resume_session_id=None,
+        loop_iteration=None,
+        git_env=None,
+        effort_level="high",
+        chat_initiated=False,
+        config_dir="/tmp/codex-sub-agent",
+        enable_workflows=False,
+        enabled_skills={"sub-agent": True},
+    )
+
+    specs = registry.start_turn.await_args.kwargs["mcp_specs"]
+    assert len(specs) == 1
+    assert specs[0].name == "ccm_skills"
+    assert specs[0].required is True
+    assert set(specs[0].enabled_tools) == {
+        "ccm_read_skill",
+        "create_sub_agent",
+        "check_sub_agents",
+        "stop_sub_agent",
+    }
+    assert "create_monitor" not in specs[0].enabled_tools
 
 
 @pytest.mark.asyncio

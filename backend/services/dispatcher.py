@@ -473,6 +473,11 @@ class GlobalDispatcher:
         self._sub_agent_tasks: dict[int, asyncio.Task] = {}      # session_id -> asyncio task
         self._sub_agent_processes: dict[int, asyncio.subprocess.Process] = {}
         self._sub_agent_log_fhs: dict[int, object] = {}
+        # Codex turns share an account-level app-server process. Keep them
+        # separate from OS subprocesses so auxiliary cleanup never sends a
+        # process-group signal to the shared transport.
+        self._sub_agent_codex_processes: dict[int, object] = {}
+        self._sub_agent_codex_homes: dict[int, str | None] = {}
 
         # Per-task message queue for serialized chat/monitor messages
         self._task_queues: dict[int, asyncio.PriorityQueue] = {}
@@ -1307,7 +1312,11 @@ class GlobalDispatcher:
             *(self.stop_monitor_session_process(session_id)
               for session_id in set(self._monitor_tasks) | set(self._monitor_processes)),
             *(self.stop_sub_agent_session_process(session_id)
-              for session_id in set(self._sub_agent_tasks) | set(self._sub_agent_processes)),
+              for session_id in (
+                  set(self._sub_agent_tasks)
+                  | set(self._sub_agent_processes)
+                  | set(self._sub_agent_codex_processes)
+              )),
         ]
         if aux_stops:
             results = await asyncio.gather(*aux_stops, return_exceptions=True)
@@ -1643,6 +1652,11 @@ class GlobalDispatcher:
         sub_agent_ids.update(
             session_id
             for session_id in self._sub_agent_processes
+            if type(session_id) is int
+        )
+        sub_agent_ids.update(
+            session_id
+            for session_id in self._sub_agent_codex_processes
             if type(session_id) is int
         )
         return monitor_ids, sub_agent_ids
@@ -6503,9 +6517,51 @@ class GlobalDispatcher:
         )
 
     async def stop_sub_agent_session_process(self, session_id: int) -> None:
+        if (
+            session_id in self._sub_agent_codex_processes
+            or session_id in self._sub_agent_codex_homes
+        ):
+            task = self._sub_agent_tasks.get(session_id)
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await self._finalize_codex_sub_agent_turn(
+                session_id,
+                self._sub_agent_codex_processes.get(session_id),
+                reason="CCM sub-agent session stopped",
+            )
+            return
         await self._stop_aux_session(
             session_id, self._sub_agent_tasks, self._sub_agent_processes
         )
+
+    async def _finalize_codex_sub_agent_turn(
+        self,
+        session_id: int,
+        process: object | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Interrupt one Codex child turn without killing its shared transport."""
+
+        candidate = process or self._sub_agent_codex_processes.get(session_id)
+        home = self._sub_agent_codex_homes.get(session_id)
+        if candidate is None:
+            self._sub_agent_codex_homes.pop(session_id, None)
+            return
+
+        if getattr(candidate, "returncode", None) is None:
+            registry = self.instance_manager._ensure_codex_app_server_registry()
+            await registry.abort_unclaimed_turn(
+                home,
+                candidate,
+                reason=reason,
+            )
+
+        if getattr(candidate, "returncode", None) is not None:
+            if self._sub_agent_codex_processes.get(session_id) is candidate:
+                self._sub_agent_codex_processes.pop(session_id, None)
+            self._sub_agent_codex_homes.pop(session_id, None)
 
     def start_monitor_session(self, monitor_session):
         if getattr(self, "_shutting_down", False):
@@ -6790,12 +6846,15 @@ class GlobalDispatcher:
         """
         from backend.models.sub_agent import SubAgentSession
         from backend.services.mcp_config import (
+            build_sub_agent_mcp_server_specs,
             generate_sub_agent_mcp_config,
             cleanup_sub_agent_mcp_config,
         )
 
         task_id: int | None = None
-        proc: asyncio.subprocess.Process | None = None
+        provider = "claude"
+        proc: object | None = None
+        mcp_config_path: Path | None = None
         SUB_AGENT_TIMEOUT = 7200  # 2 hours
 
         try:
@@ -6812,24 +6871,42 @@ class GlobalDispatcher:
                 sa_prompt_text = sa.last_summary  # stored prompt
                 model = sa.model
                 task_cwd = task.last_cwd or task.target_repo or os.getcwd()
+                provider = (task.provider or "claude").lower()
+                task_model = task.model
+                task_effort = task.effort_level
+                task_metadata = dict(task.metadata_ or {})
 
             prompt = self._build_sub_agent_prompt(
                 description=sa_prompt_text or sa_description,
                 context=sa_context,
             )
 
-            mcp_config_path = generate_sub_agent_mcp_config(
-                session_id=session_id,
-                task_id=task_id,
-            )
-
-            proc = await self._launch_sub_agent(
-                prompt=prompt,
-                cwd=task_cwd,
-                model=model,
-                session_id=session_id,
-                mcp_config_path=mcp_config_path,
-            )
+            if provider == "codex":
+                proc = await self._launch_codex_sub_agent(
+                    prompt=prompt,
+                    cwd=task_cwd,
+                    model=model or task_model or settings.default_codex_model,
+                    effort_level=task_effort or settings.default_effort,
+                    session_id=session_id,
+                    task_id=task_id,
+                    task_metadata=task_metadata,
+                    mcp_specs=build_sub_agent_mcp_server_specs(
+                        session_id,
+                        task_id,
+                    ),
+                )
+            else:
+                mcp_config_path = generate_sub_agent_mcp_config(
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+                proc = await self._launch_sub_agent(
+                    prompt=prompt,
+                    cwd=task_cwd,
+                    model=model,
+                    session_id=session_id,
+                    mcp_config_path=mcp_config_path,
+                )
 
             try:
                 await asyncio.wait_for(proc.wait(), timeout=SUB_AGENT_TIMEOUT)
@@ -6837,8 +6914,16 @@ class GlobalDispatcher:
                 logger.warning(
                     f"Sub-agent session {session_id} timed out after {SUB_AGENT_TIMEOUT}s, killing"
                 )
+                if provider == "codex":
+                    await self._finalize_codex_sub_agent_turn(
+                        session_id,
+                        proc,
+                        reason="CCM sub-agent session timed out",
+                    )
+                else:
+                    await self._terminate_aux_process(proc)
+            if provider == "claude":
                 await self._terminate_aux_process(proc)
-            await self._terminate_aux_process(proc)
 
             # If session still running after exit, sub-agent didn't call submit_result
             async with self.db_factory() as db:
@@ -6888,12 +6973,21 @@ class GlobalDispatcher:
             except Exception:
                 pass
         finally:
-            delayed_cancellation = await self._finalize_aux_lifecycle_process(
-                session_id=session_id,
-                process=proc,
-                process_map=self._sub_agent_processes,
-            )
-            cleanup_sub_agent_mcp_config(session_id)
+            delayed_cancellation = None
+            if provider == "codex":
+                await self._finalize_codex_sub_agent_turn(
+                    session_id,
+                    proc,
+                    reason="CCM sub-agent lifecycle ended",
+                )
+            else:
+                delayed_cancellation = await self._finalize_aux_lifecycle_process(
+                    session_id=session_id,
+                    process=proc,
+                    process_map=self._sub_agent_processes,
+                )
+            if mcp_config_path is not None:
+                cleanup_sub_agent_mcp_config(session_id)
             log_fh = self._sub_agent_log_fhs.pop(session_id, None)
             if log_fh:
                 try:
@@ -6954,6 +7048,64 @@ class GlobalDispatcher:
             self.pool.record_routed_account(config_dir)
         logger.info(
             f"Sub-agent launched: session={session_id} pid={process.pid} log={log_path}"
+        )
+        return process
+
+    async def _launch_codex_sub_agent(
+        self,
+        *,
+        prompt: str,
+        cwd: str,
+        model: str,
+        effort_level: str | None,
+        session_id: int,
+        task_id: int,
+        task_metadata: dict,
+        mcp_specs: tuple,
+    ):
+        """Launch an independent Codex thread with required callback tools."""
+
+        from backend.services.codex_models import clamp_codex_effort
+
+        codex_home: str | None = None
+        pool = self.codex_pool
+        if pool and pool.enabled:
+            bound_id = task_metadata.get("codex_account_id")
+            bound_home = pool.home_for_account(bound_id) if bound_id else None
+            if (
+                bound_home
+                and pool.is_home_available(bound_home)
+                and pool.supports_model_for_home(bound_home, model)
+            ):
+                codex_home = pool.canonical_home(bound_home)
+            else:
+                codex_home = pool.select(model=model)
+            if not codex_home:
+                raise RuntimeError(
+                    f"No available Codex account supports sub-agent model {model!r}"
+                )
+
+        registry = self.instance_manager._ensure_codex_app_server_registry()
+        process, thread_id = await registry.start_turn(
+            codex_home=codex_home,
+            prompt=prompt,
+            cwd=cwd,
+            model=model,
+            effort=clamp_codex_effort(model, effort_level),
+            resume_session_id=None,
+            git_env=None,
+            task_id=task_id,
+            mcp_specs=mcp_specs,
+        )
+        self._sub_agent_codex_homes[session_id] = codex_home
+        self._sub_agent_codex_processes[session_id] = process
+        if codex_home and pool:
+            pool.record_routed_account(codex_home)
+        logger.info(
+            "Codex sub-agent launched: session=%s thread=%s home=%s",
+            session_id,
+            thread_id,
+            codex_home or "<default>",
         )
         return process
 

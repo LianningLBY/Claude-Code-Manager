@@ -48,6 +48,12 @@ CCM_SUB_AGENT_TOOLS = (
     "submit_result",
     "get_context",
 )
+CCM_SUB_AGENT_CONTROLLER_TOOLS = (
+    "ccm_read_skill",
+    "create_sub_agent",
+    "check_sub_agents",
+    "stop_sub_agent",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +157,23 @@ def build_monitor_agent_mcp_server_specs(
                 str(task_id),
             ),
             enabled_tools=CCM_MONITOR_AGENT_TOOLS,
+            api_base=api_base,
+        ),
+    )
+
+
+def build_sub_agent_controller_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+) -> tuple[McpServerSpec, ...]:
+    """Expose only the tools a Codex parent needs for the Sub-Agent skill."""
+
+    return (
+        _ccm_server_spec(
+            name="ccm_skills",
+            module="backend.mcp.ccm_skills_server",
+            context_args=("--task-id", str(task_id)),
+            enabled_tools=CCM_SUB_AGENT_CONTROLLER_TOOLS,
             api_base=api_base,
         ),
     )

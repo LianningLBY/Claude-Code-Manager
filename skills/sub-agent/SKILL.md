@@ -32,6 +32,8 @@ ccm:
 2. **禁止**使用内置的 Agent 工具或 Task 工具——这些内置工具不在 CCM 系统的管理范围内，无法被追踪和记录
 3. 所有子任务必须通过 `create_sub_agent` 工具发起，由 CCM 子 agent 系统统一管理
 4. 每个 task 最多同时运行 3 个 Sub-Agent
+5. 子 Agent 自动使用主任务的 provider：Claude Code 主任务启动 Claude 子进程，
+   Codex 主任务启动独立 Codex thread；工具名称与工作流保持一致
 
 ### 可用工具
 

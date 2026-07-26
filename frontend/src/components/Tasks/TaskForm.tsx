@@ -151,10 +151,17 @@ export function TaskForm({ onCreated }: TaskFormProps) {
 
   const [availableSkills, setAvailableSkills] = useState<{ key: string; label: string; description: string }[]>([]);
   useEffect(() => {
-    if (provider !== 'claude') { setAvailableSkills([]); return; }
     api.listSkillsCached()
-      .then((skills) => setAvailableSkills(skills.map((s) => ({ key: s.key, label: s.label, description: s.description }))))
-      .catch(() => setAvailableSkills([{ key: 'monitor', label: 'Monitor', description: 'Background monitoring sub-agents' }]));
+      .then((skills) => setAvailableSkills(
+        skills
+          .filter((skill) => provider === 'claude' || skill.key === 'sub-agent')
+          .map((s) => ({ key: s.key, label: s.label, description: s.description })),
+      ))
+      .catch(() => setAvailableSkills(
+        provider === 'codex'
+          ? [{ key: 'sub-agent', label: 'Sub-Agent', description: 'Parallel one-shot sub-agents' }]
+          : [{ key: 'monitor', label: 'Monitor', description: 'Background monitoring sub-agents' }],
+      ));
   }, [provider]);
   const AVAILABLE_PLUGINS = availableSkills;
   const enabledPluginCount = Object.values(enabledPlugins).filter(Boolean).length;
@@ -794,13 +801,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             )}
           </div>
         )}
-        {/* codex 下 Skills / Plugins（含 Monitor）整体不可用——显式标注而非静默消失 */}
+        {/* Codex user-skill templates and Monitor remain unavailable; the
+            provider-neutral Sub-Agent plugin is exposed below. */}
         {provider === 'codex' && (
           <span
             className="text-xs text-gray-500 px-1 py-1.5 whitespace-nowrap"
-            title="Skills / Monitor / Sub-Agent 基于 MCP 注入，仅 Claude CLI 支持，Codex 任务暂不可用"
+            title="用户 Skills 与 Monitor 仍仅支持 Claude；Sub-Agent 已支持 Codex"
           >
-            Skills / Monitor 仅支持 Claude
+            Skills / Monitor 仅支持 Claude · Sub-Agent 可用
           </span>
         )}
         {/* Plugins dropdown */}

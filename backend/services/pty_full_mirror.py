@@ -117,6 +117,24 @@ class FullMirrorCCMBackend(CCMBackend):
         record = getattr(
             consumer, "_ccm_output_consumer_record", None
         )
+        # Claim terminal ownership before the first await that can overlap an
+        # external stop.  If stop already owns this exact record, on_exit must
+        # only finish identity-guarded proxy/map cleanup; taking the lifecycle
+        # lock for retries or DB finalization would deadlock because PTY
+        # backend.stop is awaiting this consumer while holding that lock.
+        owns_record_before_cleanup = bool(
+            record is not None
+            and getattr(record, "task", None) is consumer
+            and self._im._consumer_records.get(key) is record
+            and self._im._tasks.get(key) is consumer
+            and self._im.processes.get(key)
+            is getattr(record, "process", None)
+        )
+        terminal_owner = (
+            self._im._claim_pty_terminal_owner(record, "consumer")
+            if owns_record_before_cleanup
+            else None
+        )
         # A docker-exec client can report exit while a detached command still
         # runs in the project container.  Prove the exact tokenized generation
         # gone before the adapter publishes an idle/reusable Instance.
@@ -142,6 +160,11 @@ class FullMirrorCCMBackend(CCMBackend):
             and self._im._tasks.get(key) is consumer
             and self._im.processes.get(key) is getattr(record, "process", None)
         )
+        if owns_record and terminal_owner is None:
+            terminal_owner = self._im._claim_pty_terminal_owner(
+                record, "consumer"
+            )
+        stop_owns_terminal = terminal_owner == "stop"
         provider_error = str(
             getattr(record, "fatal_provider_error", "") or ""
         ).strip()
@@ -166,7 +189,13 @@ class FullMirrorCCMBackend(CCMBackend):
             # cannot override a failed API turn recorded in JSONL.
             ec = 1
 
-        if chat_initiated and task_id and owns_record and ec not in (0, -2, 130):
+        if (
+            chat_initiated
+            and task_id
+            and owns_record
+            and not stop_owns_terminal
+            and ec not in (0, -2, 130)
+        ):
             try:
                 retried = await self._im._try_chat_transient_retry(
                     key, task_id, ec, provider_error
@@ -189,7 +218,12 @@ class FullMirrorCCMBackend(CCMBackend):
                 )
 
         final_status = None
-        if chat_initiated and task_id and owns_record:
+        if (
+            chat_initiated
+            and task_id
+            and owns_record
+            and not stop_owns_terminal
+        ):
             final_status = await self._im.finalize_pty_chat_generation(
                 key,
                 task_id,

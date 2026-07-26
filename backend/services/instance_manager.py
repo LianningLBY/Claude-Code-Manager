@@ -96,6 +96,12 @@ class _OutputConsumerRecord:
     # while the OS process remains healthy and therefore reports exit code 0.
     # Keep the semantic failure on this exact immutable turn generation.
     fatal_provider_error: str | None = None
+    # PTY stop and consumer exit can meet while both need to settle the same
+    # hot-session turn.  The first side to claim terminal ownership decides
+    # the lock order: ``stop`` keeps the lifecycle lock and the consumer skips
+    # DB finalization; ``consumer`` finalizes first and stop waits outside the
+    # lock.  Compare/set is deliberately synchronous on the event-loop thread.
+    pty_terminal_owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -456,6 +462,43 @@ class InstanceManager:
             self._stopping[instance_id] = remaining
         else:
             self._stopping.pop(instance_id, None)
+
+    @staticmethod
+    def _claim_pty_terminal_owner(
+        record: _OutputConsumerRecord,
+        owner: str,
+        *,
+        take_over_completed_consumer: bool = False,
+    ) -> str:
+        """Atomically claim one PTY turn's terminal bookkeeping owner.
+
+        This helper must stay synchronous: stop and ``FullMirror.on_exit`` run
+        on the same asyncio event-loop thread, so the no-await compare/set is
+        the handoff that prevents either side from waiting on the other while
+        holding the per-instance lifecycle lock.  A consumer that has already
+        terminated can no longer touch bookkeeping, so an exact stop may
+        safely take over its abandoned claim.
+        """
+
+        if owner not in {"stop", "consumer"}:
+            raise ValueError(f"Unsupported PTY terminal owner: {owner}")
+        current = record.pty_terminal_owner
+        if current is None:
+            object.__setattr__(record, "pty_terminal_owner", owner)
+            return owner
+        if (
+            current == "consumer"
+            and owner == "stop"
+            and take_over_completed_consumer
+            and record.task.done()
+        ):
+            object.__setattr__(record, "pty_terminal_owner", owner)
+            return owner
+        if current not in {"stop", "consumer"}:
+            raise RuntimeError(
+                f"Invalid PTY terminal owner recorded: {current}"
+            )
+        return current
 
     async def launch(
         self,
@@ -2010,14 +2053,23 @@ class InstanceManager:
                 self._pty_launch_barriers.pop(instance_id, None)
             return pid
         except BaseException:
-            # Unblock an on_exit that may already be waiting. It will commit
-            # its terminal state before/alongside the explicit rollback below,
-            # so `running` can never become the final write.
+            process = self.processes.get(instance_id)
+            consumer = self._tasks.get(instance_id)
+            consumer_record = self._consumer_records.get(instance_id)
+            if (
+                consumer_record is not None
+                and consumer_record.process is process
+                and consumer_record.task is consumer
+            ):
+                # launch() still owns the lifecycle lock here.  Win terminal
+                # ownership before opening the metadata barrier; otherwise
+                # backend.stop would await a consumer that re-enters this lock.
+                self._claim_pty_terminal_owner(consumer_record, "stop")
+            # Unblock an on_exit that may already be waiting.  The owner claim
+            # above makes the explicit rollback the sole terminal DB writer.
             metadata_barrier.set()
             if self._pty_launch_barriers.get(instance_id) is metadata_barrier:
                 self._pty_launch_barriers.pop(instance_id, None)
-            process = self.processes.get(instance_id)
-            consumer = self._tasks.get(instance_id)
             if (
                 container_exec_spec is not None
                 and process is not None
@@ -6114,11 +6166,15 @@ class InstanceManager:
         try:
             while True:
                 async with lifecycle_lock:
-                    if (
+                    has_expected_owner = (
                         expected_task_id is not None
                         or expected_pid is not _EXPECTED_GENERATION_UNSET
                         or expected_started_at is not _EXPECTED_GENERATION_UNSET
-                    ):
+                    )
+                    owner: Instance | None | object = (
+                        _EXPECTED_GENERATION_UNSET
+                    )
+                    if has_expected_owner:
                         async with self.db_factory() as db:
                             owner = await db.get(Instance, instance_id)
                         if (
@@ -6177,6 +6233,16 @@ class InstanceManager:
                         if record_process is not None
                         else None
                     )
+                    if (
+                        recovery_pending is not None
+                        and recovery_pending.tracked_generation
+                        and owner is _EXPECTED_GENERATION_UNSET
+                    ):
+                        # Recovery evidence derives exact pid/started_at
+                        # fences inside _stop_locked. Resolve their durable
+                        # owner before terminal ownership can be claimed.
+                        async with self.db_factory() as db:
+                            owner = await db.get(Instance, instance_id)
                     process_live = (
                         process is not None
                         and not self._generation_reap_confirmed(
@@ -6184,12 +6250,44 @@ class InstanceManager:
                         )
                     )
                     consumer_live = task is not None and not task.done()
+                    pty_managed = bool(
+                        process_live
+                        and self._pty_backend is not None
+                        and instance_id
+                        in getattr(self._pty_backend, "_sessions", {})
+                    )
+                    pty_consumer_owns_terminal = False
+                    if (
+                        pty_managed
+                        and consumer_live
+                        and record is not None
+                        and record.process is process
+                        and record.task is task
+                    ):
+                        terminal_owner = record.pty_terminal_owner
+                        if terminal_owner not in {
+                            None,
+                            "stop",
+                            "consumer",
+                        }:
+                            raise RuntimeError(
+                                "Invalid PTY terminal owner recorded: "
+                                f"{terminal_owner}"
+                            )
+                        pty_consumer_owns_terminal = (
+                            terminal_owner == "consumer"
+                        )
                     terminal_consumer = (
                         consumer_live
-                        and not process_live
                         and (
-                            record_process is None
-                            or record_process.returncode is not None
+                            pty_consumer_owns_terminal
+                            or (
+                                not process_live
+                                and (
+                                    record_process is None
+                                    or record_process.returncode is not None
+                                )
+                            )
                         )
                     )
                     if terminal_consumer and not force_cancel_consumer:
@@ -6211,6 +6309,7 @@ class InstanceManager:
                                 settled_terminal_consumer
                                 or recovery_pending is not None
                             ),
+                            verified_owner=owner,
                         )
                         return stopped or (
                             settled_terminal_consumer
@@ -6240,6 +6339,30 @@ class InstanceManager:
                         )
                 except asyncio.TimeoutError:
                     force_cancel_consumer = True
+                    # The consumer owns terminal bookkeeping, so it cannot be
+                    # pre-empted while live: it may already be inside the DB
+                    # finalizer.  Cancel and reap that exact task outside the
+                    # lifecycle lock first; the next locked iteration can
+                    # then safely take over its abandoned owner claim.
+                    if task is not None and not task.done():
+                        task.cancel()
+                        if consumer_cancel_timeout is None:
+                            await asyncio.gather(
+                                task, return_exceptions=True
+                            )
+                        else:
+                            done, pending = await asyncio.wait(
+                                {task},
+                                timeout=consumer_cancel_timeout,
+                            )
+                            if pending:
+                                raise RuntimeError(
+                                    "Terminal output consumer for instance "
+                                    f"{instance_id} ignored cancellation"
+                                )
+                            await asyncio.gather(
+                                *done, return_exceptions=True
+                            )
                 except Exception:
                     logger.exception(
                         "Terminal output consumer failed while stopping instance %s",
@@ -6260,6 +6383,9 @@ class InstanceManager:
         expected_started_at: datetime | None | object = _EXPECTED_GENERATION_UNSET,
         consumer_cancel_timeout: float | None = None,
         allow_settled_cleanup: bool = False,
+        verified_owner: Instance | None | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
     ) -> bool:
         """Stop a running Claude Code instance via SIGINT (interrupt).
 
@@ -6311,27 +6437,30 @@ class InstanceManager:
             or effective_expected_pid is not _EXPECTED_GENERATION_UNSET
             or effective_expected_started_at is not _EXPECTED_GENERATION_UNSET
         ):
-            async with self.db_factory() as db:
-                owner = await db.get(Instance, instance_id)
-                if (
-                    owner is None
-                    or (
-                        expected_task_id is not None
-                        and owner.current_task_id != expected_task_id
-                    )
-                    or (
-                        effective_expected_pid
-                        is not _EXPECTED_GENERATION_UNSET
-                        and owner.pid != effective_expected_pid
-                    )
-                    or (
-                        effective_expected_started_at
-                        is not _EXPECTED_GENERATION_UNSET
-                        and owner.started_at
-                        != effective_expected_started_at
-                    )
-                ):
-                    return False
+            if verified_owner is _EXPECTED_GENERATION_UNSET:
+                async with self.db_factory() as db:
+                    owner = await db.get(Instance, instance_id)
+            else:
+                owner = verified_owner
+            if (
+                owner is None
+                or (
+                    expected_task_id is not None
+                    and owner.current_task_id != expected_task_id
+                )
+                or (
+                    effective_expected_pid
+                    is not _EXPECTED_GENERATION_UNSET
+                    and owner.pid != effective_expected_pid
+                )
+                or (
+                    effective_expected_started_at
+                    is not _EXPECTED_GENERATION_UNSET
+                    and owner.started_at
+                    != effective_expected_started_at
+                )
+            ):
+                return False
 
         process_live = (
             process is not None
@@ -6348,7 +6477,23 @@ class InstanceManager:
         )
         if pty_managed:
             # Esc-interrupt the turn, then tear the session down; the proxy's
-            # wait() is unblocked by the backend's on_exit.
+            # wait() is unblocked by the backend's on_exit.  Claim terminal
+            # ownership before awaiting the consumer: FullMirror.on_exit then
+            # skips its lifecycle-locking DB finalizer and leaves the exact
+            # Task/Instance transaction to this stop call.  If the consumer
+            # already claimed first, _stop_serialized must have routed through
+            # its lock-free terminal-consumer wait instead.
+            if record is not None and record.process is process:
+                terminal_owner = self._claim_pty_terminal_owner(
+                    record,
+                    "stop",
+                    take_over_completed_consumer=True,
+                )
+                if terminal_owner != "stop":
+                    raise RuntimeError(
+                        "PTY consumer already owns terminal finalization; "
+                        "stop must wait outside the lifecycle lock"
+                    )
             container_signal_error: Exception | None = None
             if self._is_managed_container_exec(instance_id, process):
                 try:

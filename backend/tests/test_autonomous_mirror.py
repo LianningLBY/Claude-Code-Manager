@@ -17,7 +17,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import select
 
-from backend.services.instance_manager import InstanceManager
+from backend.services.instance_manager import (
+    InstanceManager,
+    LaunchSupersededError,
+)
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
@@ -523,6 +526,555 @@ class TestFullMirrorBackend:
             event.get("new_status") == "completed"
             for event in status_events
         )
+
+    async def test_stop_owned_pty_exit_does_not_reenter_lifecycle_lock(
+        self, db_factory
+    ):
+        """Task 257: stop awaiting on_exit must not deadlock on its own lock."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            # stop-session terminalizes the Task before stopping its process.
+            task.status = "completed"
+            task.retry_count = 3
+            task.instance_id = instance_id
+            task.completed_at = started_at
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 25_701
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 25_701
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session._reader._tracker.has_pending = False
+        begin = asyncio.Event()
+
+        async def consume_until_stopped():
+            await begin.wait()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await backend.on_exit(
+                    instance_id,
+                    130,
+                    session=session,
+                    task_id=task_id,
+                    chat_initiated=True,
+                )
+
+        consumer = asyncio.create_task(consume_until_stopped())
+        backend._sessions[instance_id] = session
+        backend._consumers[instance_id] = consumer
+        backend._proxies[instance_id] = proxy
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=3,
+            instance_started_at=started_at,
+        )
+
+        async def stop_backend(key):
+            assert key == instance_id
+            assert record.pty_terminal_owner == "stop"
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+
+        backend.stop = stop_backend
+        im._wait_process_tree = AsyncMock()
+        begin.set()
+        await asyncio.sleep(0)
+
+        stopping = asyncio.create_task(
+            im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_pid=proxy.pid,
+                expected_started_at=started_at,
+                task_status="completed",
+                consumer_cancel_timeout=0.2,
+            )
+        )
+        done, _ = await asyncio.wait({stopping}, timeout=1)
+        if not done:
+            # Keep a future regression from wedging the whole test process:
+            # a second cancellation interrupts an on_exit blocked on the lock.
+            consumer.cancel()
+            await asyncio.wait({stopping}, timeout=1)
+            pytest.fail("PTY stop deadlocked while awaiting consumer on_exit")
+        assert await stopping is True
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert inst.status == "idle"
+            assert inst.pid is None
+            assert inst.current_task_id is None
+        assert record.pty_terminal_owner == "stop"
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        assert instance_id not in im._stopping
+
+    async def test_consumer_owned_pty_exit_makes_stop_wait_outside_lock(
+        self, db_factory
+    ):
+        """A naturally exiting consumer can win without racing stop cleanup."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 5
+            task.instance_id = instance_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 25_702
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 25_702
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session._reader._tracker.has_pending = False
+        begin_exit = asyncio.Event()
+        container_finalize_entered = asyncio.Event()
+        release_container_finalize = asyncio.Event()
+
+        async def gated_container_finalize(*args, **kwargs):
+            container_finalize_entered.set()
+            await release_container_finalize.wait()
+
+        im.finalize_pty_container_exec = gated_container_finalize
+
+        async def exit_naturally():
+            await begin_exit.wait()
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        consumer = asyncio.create_task(exit_naturally())
+        backend._sessions[instance_id] = session
+        backend._consumers[instance_id] = consumer
+        backend._proxies[instance_id] = proxy
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=5,
+            instance_started_at=started_at,
+        )
+        backend.stop = AsyncMock(
+            side_effect=AssertionError(
+                "consumer-owned terminal path must not call backend.stop"
+            )
+        )
+
+        begin_exit.set()
+        await container_finalize_entered.wait()
+        assert record.pty_terminal_owner == "consumer"
+
+        stopping = asyncio.create_task(
+            im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_pid=proxy.pid,
+                expected_started_at=started_at,
+                task_status="completed",
+                terminal_consumer_timeout=1,
+                consumer_cancel_timeout=0.2,
+            )
+        )
+        for _ in range(100):
+            if instance_id in im._stopping:
+                break
+            await asyncio.sleep(0.01)
+        assert instance_id in im._stopping
+        assert not im._instance_lifecycle_lock(instance_id).locked()
+        with pytest.raises(
+            RuntimeError, match="being stopped"
+        ):
+            await im.launch(instance_id, "must not race stop")
+
+        release_container_finalize.set()
+        assert await asyncio.wait_for(stopping, timeout=1) is True
+        backend.stop.assert_not_awaited()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert inst.status == "idle"
+            assert inst.pid is None
+            assert inst.current_task_id is None
+        assert record.pty_terminal_owner == "consumer"
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        assert instance_id not in im._stopping
+
+    async def test_stop_takes_over_failed_completed_consumer(
+        self, db_factory
+    ):
+        """A failed consumer cannot strand its terminal-owner claim."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 6
+            task.instance_id = instance_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 25_703
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 25_703
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session._reader._tracker.has_pending = False
+        begin_exit = asyncio.Event()
+
+        async def fail_during_exit():
+            await begin_exit.wait()
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        consumer = asyncio.create_task(fail_during_exit())
+        backend._sessions[instance_id] = session
+        backend._consumers[instance_id] = consumer
+        backend._proxies[instance_id] = proxy
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=6,
+            instance_started_at=started_at,
+        )
+        im.finalize_pty_container_exec = AsyncMock(
+            side_effect=RuntimeError("container finalization failed")
+        )
+
+        begin_exit.set()
+        result = await asyncio.gather(consumer, return_exceptions=True)
+        assert isinstance(result[0], RuntimeError)
+        assert record.pty_terminal_owner == "consumer"
+
+        async def stop_backend(key):
+            assert key == instance_id
+            assert record.pty_terminal_owner == "stop"
+            proxy.complete(130)
+
+        backend.stop = stop_backend
+        im._wait_process_tree = AsyncMock()
+
+        assert await asyncio.wait_for(
+            im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_pid=proxy.pid,
+                expected_started_at=started_at,
+                task_status="completed",
+                consumer_cancel_timeout=0.2,
+            ),
+            timeout=1,
+        ) is True
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert inst.status == "idle"
+            assert inst.pid is None
+            assert inst.current_task_id is None
+        assert record.pty_terminal_owner == "stop"
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        assert instance_id not in im._stopping
+
+    async def test_stop_cancels_stalled_consumer_before_owner_takeover(
+        self, db_factory
+    ):
+        """A timed-out live consumer is reaped before stop takes ownership."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 7
+            task.instance_id = instance_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 25_705
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 25_705
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session._reader._tracker.has_pending = False
+        begin_exit = asyncio.Event()
+        finalizer_entered = asyncio.Event()
+
+        async def never_finish_container_finalizer(*args, **kwargs):
+            finalizer_entered.set()
+            await asyncio.Event().wait()
+
+        im.finalize_pty_container_exec = never_finish_container_finalizer
+
+        async def stall_during_exit():
+            await begin_exit.wait()
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        consumer = asyncio.create_task(stall_during_exit())
+        backend._sessions[instance_id] = session
+        backend._consumers[instance_id] = consumer
+        backend._proxies[instance_id] = proxy
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=7,
+            instance_started_at=started_at,
+        )
+
+        begin_exit.set()
+        await finalizer_entered.wait()
+        assert record.pty_terminal_owner == "consumer"
+
+        async def stop_backend(key):
+            assert key == instance_id
+            assert consumer.done()
+            assert record.pty_terminal_owner == "stop"
+            proxy.complete(130)
+
+        backend.stop = stop_backend
+        im._wait_process_tree = AsyncMock()
+
+        assert await asyncio.wait_for(
+            im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_pid=proxy.pid,
+                expected_started_at=started_at,
+                task_status="completed",
+                terminal_consumer_timeout=0.02,
+                consumer_cancel_timeout=0.2,
+            ),
+            timeout=1,
+        ) is True
+
+        assert consumer.cancelled()
+        assert record.pty_terminal_owner == "stop"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert inst.status == "idle"
+            assert inst.pid is None
+            assert inst.current_task_id is None
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        assert instance_id not in im._stopping
+
+    async def test_aborted_pty_launch_claims_stop_before_consumer_exit(
+        self, db_factory
+    ):
+        """Launch rollback must not await on_exit while holding its lock."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        backend._pool = MagicMock()
+        backend._pool._sessions = {}
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+
+        class Session:
+            is_alive = True
+
+            def __init__(self):
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = False
+
+        class Proxy:
+            pid = 25_704
+            returncode = None
+
+            def __init__(self, session):
+                self.session = session
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        session = Session()
+        proxy = Proxy(session)
+        consumer = None
+        stop_owner_seen = []
+
+        async def consume_until_stopped():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await backend.on_exit(
+                    instance_id,
+                    130,
+                    session=session,
+                    task_id=task_id,
+                    chat_initiated=True,
+                )
+
+        async def launch_for_ccm(**kwargs):
+            nonlocal consumer
+            consumer = asyncio.create_task(consume_until_stopped())
+            backend._sessions[instance_id] = session
+            backend._consumers[instance_id] = consumer
+            backend._proxies[instance_id] = proxy
+            im.processes[instance_id] = proxy
+            im._tasks[instance_id] = consumer
+            return "aborted-session"
+
+        async def stop_backend(key):
+            assert key == instance_id
+            record = im._consumer_records[instance_id]
+            stop_owner_seen.append(record.pty_terminal_owner)
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+
+        backend.launch_for_ccm = launch_for_ccm
+        backend.stop = stop_backend
+
+        async def launch_while_holding_lifecycle():
+            async with im._instance_lifecycle_lock(instance_id):
+                return await im._launch_pty(
+                    instance_id=instance_id,
+                    prompt="must roll back",
+                    task_id=task_id,
+                    cwd="/tmp",
+                    model=None,
+                    resume_session_id=None,
+                    loop_iteration=None,
+                    git_env=None,
+                    thinking_budget=None,
+                    effort_level=None,
+                    chat_initiated=True,
+                    config_dir=None,
+                    enable_workflows=False,
+                    enabled_skills=None,
+                    mcp_config_path=None,
+                    task_retry_count=0,
+                )
+
+        launching = asyncio.create_task(launch_while_holding_lifecycle())
+        done, _ = await asyncio.wait({launching}, timeout=1)
+        if not done:
+            # A second cancellation releases an on_exit that regressed into
+            # waiting for the lifecycle lock held by this launch rollback.
+            consumer.cancel()
+            await asyncio.wait({launching}, timeout=1)
+            pytest.fail(
+                "PTY launch rollback deadlocked while awaiting consumer on_exit"
+            )
+        with pytest.raises(LaunchSupersededError):
+            await launching
+
+        assert consumer is not None and consumer.done()
+        assert stop_owner_seen == ["stop"]
+        assert proxy.returncode == 130
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        assert not im._instance_lifecycle_lock(instance_id).locked()
+        async with db_factory() as db:
+            inst = await db.get(Instance, instance_id)
+            assert inst.status == "idle"
+            assert inst.pid is None
+            assert inst.current_task_id is None
 
     async def test_failed_pty_generation_records_terminal_timestamp(
         self, db_factory

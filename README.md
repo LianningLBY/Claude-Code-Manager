@@ -22,7 +22,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **Goal 模式** — `mode="goal"` 使用自然语言完成条件（`goal_condition`），每 turn 后由轻量评估器（默认 Haiku）自动判断是否达成目标
 - **Plan Mode** — 敏感任务先生成只读计划，人工审批后再执行
 - **Effort Level** — 支持 `low` / `medium` / `high` / `xhigh` / `max` 五档，优先级链：Task → Instance → 全局默认
-- **Model 配置** — 支持全称模型 ID（`claude-opus-4-6`、`claude-sonnet-4-6`、`claude-haiku-4-5` 等），`[1m]` 后缀开启 1M context
+- **Model 配置** — 支持全称模型 ID（包括 `claude-opus-5`）；Opus 5 固定为 1M context 并支持 `low/medium/high/xhigh/max` effort，其他兼容模型可用 `[1m]` 后缀开启 1M context
 - **Thinking Budget** — Instance 级别设置 `thinking_budget`，通过 `MAX_THINKING_TOKENS` 传递给 CLI
 - **Workflows 开关** — Task 级别控制是否启用 Workflow 工具，关闭时节省 token
 

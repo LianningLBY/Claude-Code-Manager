@@ -926,6 +926,53 @@ async def test_context_usage_window_only_merges_into_stored(client, session_fact
 
 
 @pytest.mark.asyncio
+async def test_opus5_corrects_underreported_context_window(client, session_factory):
+    """Opus 5 is always 1M even when Claude reports the legacy 200K window."""
+    from unittest.mock import AsyncMock, MagicMock
+    from backend.models.task import Task
+    from backend.services.instance_manager import InstanceManager
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Opus 5",
+        "description": "d",
+        "target_repo": "/tmp",
+        "model": "claude-opus-5",
+    })
+    task_id = create_resp.json()["id"]
+
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.context_window_usage = {
+            "input_tokens": 10,
+            "cache_read_input_tokens": 20,
+            "cache_creation_input_tokens": 30,
+            "output_tokens": 5,
+            "total_input_tokens": 60,
+            "context_window": 200_000,
+        }
+        await db.commit()
+
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    manager = InstanceManager(
+        db_factory=session_factory,
+        broadcaster=broadcaster,
+    )
+    await manager._process_event(
+        instance_id=1,
+        task_id=task_id,
+        event={
+            "event_type": "result",
+            "context_usage": {"context_window": 200_000},
+        },
+    )
+
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.context_window_usage["context_window"] == 1_000_000
+
+
+@pytest.mark.asyncio
 async def test_context_usage_window_only_without_stored_is_dropped(client, session_factory):
     """没有已存 usage 时，window-only 事件不应写入半截数据。"""
     from unittest.mock import AsyncMock, MagicMock

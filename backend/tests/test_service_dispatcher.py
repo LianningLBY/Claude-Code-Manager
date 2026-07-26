@@ -4427,6 +4427,41 @@ async def _setup_queued_msg_two_idle(db_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_opus5_precompact_uses_fixed_1m_context(
+    db_factory,
+    monkeypatch,
+):
+    """A legacy 200K usage report must not prematurely compact Opus 5."""
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    d._compact_session = AsyncMock(return_value="unexpected summary")
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.provider = "claude"
+        task.model = "claude-opus-5"
+        task.context_window_usage = {
+            "input_tokens": 50_000,
+            "cache_read_input_tokens": 250_000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "total_input_tokens": 300_000,
+            "context_window": 200_000,
+        }
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+
+    d._compact_session.assert_not_awaited()
+    assert (
+        d.instance_manager.launch.await_args.kwargs["resume_session_id"]
+        == "sess-1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_queued_resume_waits_at_maintenance_gate_and_stays_blocking(
     db_factory, monkeypatch,
 ):

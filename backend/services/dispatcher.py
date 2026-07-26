@@ -7879,10 +7879,12 @@ class GlobalDispatcher:
                         effective_model
                     )
                 else:
-                    window = usage.get("context_window") or 200_000
-                    model_lower = (effective_model or "").lower()
-                    if "[1m]" in model_lower or "fable" in model_lower:
-                        window = max(window, 1_000_000)
+                    from backend.services.claude_models import claude_context_window
+
+                    window = max(
+                        usage.get("context_window") or 0,
+                        claude_context_window(effective_model),
+                    )
                 utilization = used_tokens / window if window else 0
                 # 阈值：GlobalSettings 覆盖 > env 默认（前端运行时设置可改）
                 gs = await db.get(GlobalSettings, 1)

@@ -328,6 +328,20 @@ def test_build_command_claude_with_resume_and_model():
     assert "high" in cmd
 
 
+def test_build_command_claude_opus5_with_max_effort():
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="claude",
+        prompt="hard task",
+        model="claude-opus-5",
+        resume_session_id=None,
+        effort_level="max",
+    )
+
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-5"
+    assert cmd[cmd.index("--effort") + 1] == "max"
+
+
 def test_build_command_codex_basic():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(provider="codex", prompt="do stuff", model=None, resume_session_id=None, effort_level=None)

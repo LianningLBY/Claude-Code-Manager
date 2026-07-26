@@ -172,6 +172,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
   const [modelOverride, setModelOverride] = useState<string | null>(null);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [modelContextWindows, setModelContextWindows] = useState<Record<string, number>>({});
   const [ptyMode, setPtyMode] = useState(false);
   const [codexAppServerEnabled, setCodexAppServerEnabled] = useState(false);
   const [injecting, setInjecting] = useState(false);
@@ -199,6 +200,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       api.config().then((c) => {
         const opts = (task.provider === 'codex' ? c.codex_model_options : c.model_options).filter((m) => m !== 'default');
         setModelOptions(opts);
+        setModelContextWindows(
+          task.provider === 'codex' ? {} : (c.claude_model_context_windows || {}),
+        );
       }).catch(() => {});
     }
     const handle = (e: MouseEvent) => {
@@ -1543,8 +1547,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
                     默认（{task.model || 'default'}）
                   </button>
                   {modelOptions.map((m) => {
-                    // 上下文超过目标模型窗口时给出警告（[1m] 变体 1M，其余按 200K 估算）
-                    const win = (m.includes('[1m]') || m.includes('fable')) ? 1_000_000 : 200_000;
+                    // Known fixed windows come from the backend capability table.
+                    const win = modelContextWindows[m]
+                      ?? ((m.includes('[1m]') || m.includes('fable')) ? 1_000_000 : 200_000);
                     const over = !!contextUsage && contextUsage.total_input_tokens > win;
                     return (
                     <button

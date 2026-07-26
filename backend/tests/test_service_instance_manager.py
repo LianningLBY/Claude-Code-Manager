@@ -1365,6 +1365,7 @@ async def test_codex_sub_agent_controller_bypasses_full_main_mcp_flag(
         "stop_sub_agent",
     }
     assert "create_monitor" not in specs[0].enabled_tools
+    assert process.unsubscribe_on_terminal is True
 
 
 @pytest.mark.asyncio
@@ -3710,10 +3711,7 @@ async def test_codex_sub_agent_controller_unsubscribes_after_terminal_turn(
     registry.unsubscribe_thread = AsyncMock(return_value="unsubscribed")
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     im._codex_app_server = registry
-    im._launch_params[instance_id] = {
-        "provider": "codex",
-        "enabled_skills": {"sub-agent": True},
-    }
+    process.unsubscribe_on_terminal = True
 
     await im._consume_output_impl(
         instance_id,
@@ -3724,6 +3722,35 @@ async def test_codex_sub_agent_controller_unsubscribes_after_terminal_turn(
 
     registry.unsubscribe_thread.assert_awaited_once_with("thread-parent")
     assert instance_id not in im._launch_params
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_without_thread_mcp_does_not_unsubscribe(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="codex-no-mcp-unsubscribe")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+
+    process = _make_mock_process(pid=54_329, returncode=0)
+    process.thread_id = "thread-without-mcp"
+    process.unsubscribe_on_terminal = False
+    registry = MagicMock()
+    registry.unsubscribe_thread = AsyncMock(return_value="unsubscribed")
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._codex_app_server = registry
+
+    await im._consume_output_impl(
+        instance_id,
+        None,
+        process,
+        provider="codex",
+    )
+
+    registry.unsubscribe_thread.assert_not_awaited()
 
 
 @pytest.mark.asyncio

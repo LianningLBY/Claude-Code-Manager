@@ -1321,6 +1321,11 @@ class InstanceManager:
             task_id=task_id,
             mcp_specs=mcp_specs,
         )
+        # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
+        # dispatcher launches do not populate ``_launch_params`` (that cache is
+        # reserved for chat retry), so consulting it at terminal time would
+        # leak the initial thread's MCP helper/subscription.
+        process.unsubscribe_on_terminal = bool(mcp_specs)
         if config_dir:
             self._config_dirs[instance_id] = config_dir
         self.processes[instance_id] = process
@@ -3637,11 +3642,9 @@ class InstanceManager:
         # stdio MCP helper. Preserve the resumable native thread, but release
         # this app-server connection's idle subscription so Codex can unload
         # the thread-scoped MCP stack after its idle grace period.
-        launch_params = self._launch_params.get(instance_id) or {}
-        enabled_skills = launch_params.get("enabled_skills") or {}
         if (
             provider == "codex"
-            and enabled_skills.get("sub-agent")
+            and getattr(process, "unsubscribe_on_terminal", False)
             and self._codex_app_server is not None
         ):
             thread_id = getattr(process, "thread_id", None)

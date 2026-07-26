@@ -89,6 +89,7 @@ class CodexTurnProcess:
     ) -> None:
         self.pid = pid
         self.thread_id = thread_id
+        self.unsubscribe_on_terminal = False
         self.returncode: int | None = None
         self.stdout = asyncio.StreamReader(limit=10 * 1024 * 1024)
         self.stderr = asyncio.StreamReader(limit=1024 * 1024)

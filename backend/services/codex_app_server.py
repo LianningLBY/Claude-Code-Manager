@@ -529,6 +529,63 @@ class CodexAppServer:
         )
         return turn_process, thread_id
 
+    async def read_thread(self, thread_id: str) -> dict[str, Any]:
+        """Load one thread and its persisted turns from this account home."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        await self.ensure_started()
+        response = await self._request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": True},
+        )
+        thread = response.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise CodexAppServerError(
+                f"thread/read returned an invalid thread for {thread_id}"
+            )
+        return thread
+
+    async def fork_thread(
+        self,
+        thread_id: str,
+        *,
+        last_turn_id: str,
+    ) -> dict[str, Any]:
+        """Fork a persisted thread through one completed turn, inclusive."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        if not last_turn_id:
+            raise ValueError("last_turn_id is required")
+        await self.ensure_started()
+        # Once the mutating RPC is on the wire, cancellation cannot tell us
+        # whether Codex created the fork. Settle the request so the caller
+        # always receives the new id and can either commit or compensate it.
+        request = asyncio.create_task(self._request(
+            "thread/fork",
+            {
+                "threadId": thread_id,
+                "lastTurnId": last_turn_id,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            },
+        ))
+        while not request.done():
+            try:
+                await asyncio.shield(request)
+            except asyncio.CancelledError:
+                continue
+        response = request.result()
+        thread = response.get("thread")
+        fork_id = thread.get("id") if isinstance(thread, dict) else None
+        if not fork_id or fork_id == thread_id:
+            raise CodexAppServerError(
+                f"thread/fork returned an invalid thread for {thread_id}"
+            )
+        self._known_threads.add(str(fork_id))
+        return thread
+
     async def delete_thread(self, thread_id: str) -> None:
         """Delete one terminal thread and release its thread-scoped resources."""
 
@@ -821,14 +878,22 @@ class CodexAppServer:
             if normalized and normalized.get("type") in {
                 "command_execution", "file_change", "mcp_tool_call", "web_search"
             }:
-                context.process.feed({"type": "item.started", "item": normalized})
+                context.process.feed({
+                    "type": "item.started",
+                    "item": normalized,
+                    "turn_id": context.turn_id,
+                })
             return
 
         if method == "item/completed":
             item = params.get("item") or {}
             normalized = self._normalize_item(item)
             if normalized and normalized.get("type") != "user_message":
-                context.process.feed({"type": "item.completed", "item": normalized})
+                context.process.feed({
+                    "type": "item.completed",
+                    "item": normalized,
+                    "turn_id": context.turn_id,
+                })
             return
 
         if method == "item/agentMessage/delta":
@@ -845,6 +910,7 @@ class CodexAppServer:
                     "type": "item.agent_message.delta",
                     "delta": params.get("delta") or "",
                     "item_id": params.get("itemId"),
+                    "turn_id": context.turn_id,
                 }
             )
             return
@@ -858,6 +924,7 @@ class CodexAppServer:
                     "type": "item.reasoning.delta",
                     "delta": params.get("delta") or "",
                     "item_id": params.get("itemId"),
+                    "turn_id": context.turn_id,
                 }
             )
             return
@@ -885,6 +952,7 @@ class CodexAppServer:
             context.process.feed({
                 "type": "turn.failed",
                 "error": normalized_error,
+                "turn_id": context.turn_id,
             })
             return
 
@@ -894,7 +962,11 @@ class CodexAppServer:
             error = turn.get("error")
             if status == "completed":
                 context.process.feed(
-                    {"type": "turn.completed", "usage": context.usage or {}}
+                    {
+                        "type": "turn.completed",
+                        "usage": context.usage or {},
+                        "turn_id": context.turn_id,
+                    }
                 )
                 exit_code = 0
                 stderr = ""
@@ -1286,6 +1358,144 @@ class CodexAppServerRegistry:
             self._starting[home] = starting - 1
         else:
             self._starting.pop(home, None)
+
+    async def read_thread(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        """Read one idle native thread from its exact account home."""
+
+        home = normalize_codex_home(codex_home)
+        token = object()
+        reserved_owner = False
+        async with self._lock:
+            if self._shutdown_requested or home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is unavailable: {home}"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if owner is not None and owner != home:
+                raise CodexThreadHomeMismatchError(
+                    f"Codex thread {thread_id} is bound to {owner}, not {home}"
+                )
+            if thread_id in self._starting_threads or thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has an operation in flight"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                server_kwargs: dict[str, Any] = {}
+                if self._env_remove_resolver is not None:
+                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
+                server = CodexAppServer(
+                    self.binary,
+                    request_timeout=self.request_timeout,
+                    codex_home=home,
+                    **server_kwargs,
+                )
+                self._servers[home] = server
+            if server.has_active_thread(thread_id):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} still has an active turn"
+                )
+            if owner is None:
+                self._thread_owners[thread_id] = home
+                reserved_owner = True
+            self._starting_threads[thread_id] = token
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        succeeded = False
+        try:
+            result = await server.read_thread(thread_id)
+            succeeded = True
+            return result
+        finally:
+            async with self._lock:
+                self._decrement_starting_locked(home)
+                if self._starting_threads.get(thread_id) is token:
+                    self._starting_threads.pop(thread_id, None)
+                if (
+                    reserved_owner
+                    and not succeeded
+                    and self._thread_owners.get(thread_id) == home
+                ):
+                    self._thread_owners.pop(thread_id, None)
+
+    async def fork_thread(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+        *,
+        last_turn_id: str,
+    ) -> dict[str, Any]:
+        """Fork an idle native thread and register the new thread owner."""
+
+        home = normalize_codex_home(codex_home)
+        token = object()
+        reserved_owner = False
+        async with self._lock:
+            if self._shutdown_requested or home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is unavailable: {home}"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if owner is not None and owner != home:
+                raise CodexThreadHomeMismatchError(
+                    f"Codex thread {thread_id} is bound to {owner}, not {home}"
+                )
+            if thread_id in self._starting_threads or thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has an operation in flight"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                server_kwargs: dict[str, Any] = {}
+                if self._env_remove_resolver is not None:
+                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
+                server = CodexAppServer(
+                    self.binary,
+                    request_timeout=self.request_timeout,
+                    codex_home=home,
+                    **server_kwargs,
+                )
+                self._servers[home] = server
+            if server.has_active_thread(thread_id):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} still has an active turn"
+                )
+            if owner is None:
+                self._thread_owners[thread_id] = home
+                reserved_owner = True
+            self._starting_threads[thread_id] = token
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        fork_id: str | None = None
+        try:
+            result = await server.fork_thread(
+                thread_id,
+                last_turn_id=last_turn_id,
+            )
+            fork_id = str(result["id"])
+            async with self._lock:
+                existing = self._thread_owners.get(fork_id)
+                if existing is not None and existing != home:
+                    raise CodexThreadHomeMismatchError(
+                        f"Forked Codex thread {fork_id} is already bound to {existing}"
+                    )
+                self._thread_owners[fork_id] = home
+            return result
+        finally:
+            async with self._lock:
+                self._decrement_starting_locked(home)
+                if self._starting_threads.get(thread_id) is token:
+                    self._starting_threads.pop(thread_id, None)
+                if (
+                    reserved_owner
+                    and fork_id is None
+                    and self._thread_owners.get(thread_id) == home
+                ):
+                    self._thread_owners.pop(thread_id, None)
 
     async def delete_thread(
         self,

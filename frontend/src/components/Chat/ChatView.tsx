@@ -5,7 +5,7 @@ import { api } from '../../api/client';
 import type { ChatMessage, FileAttachment, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -22,6 +22,7 @@ interface ChatViewProps {
   projects: Project[];
   onBack: () => void;
   onTaskUpdated?: () => void;
+  onTaskForked?: (task: Task) => void;
   inline?: boolean;
 }
 
@@ -130,7 +131,7 @@ function ContextUsageIndicator({ usage }: { usage: ContextUsage }) {
   );
 }
 
-export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: ChatViewProps) {
+export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, inline }: ChatViewProps) {
   const projectName = useMemo(() => {
     if (!task.project_id) return null;
     const p = projects.find((p) => p.id === task.project_id);
@@ -143,6 +144,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
     try { return localStorage.getItem(`ccm-chat-draft-${task.id}`) || ''; } catch { return ''; }
   });
   const [sending, setSending] = useState(false);
+  const [forkAnchor, setForkAnchor] = useState<{ type: 'initial' } | { type: 'log'; id: number } | null>(null);
+  const [forkTitle, setForkTitle] = useState('');
+  const [forking, setForking] = useState(false);
+  const [forkError, setForkError] = useState<string | null>(null);
+  const refreshHistoryRef = useRef<() => void>(() => {});
   // WS 驱动的实时状态覆盖。task.status prop（5s 轮询）才是最终一致的事实源：
   // prop 变化时清掉覆盖（见下方 effect），否则错过一次 WS 事件就永久陈旧。
   const [localStatus, setLocalStatus] = useState<string | null>(null);
@@ -589,6 +595,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
         setSending(false);
         setLocalStatus(null);  // Reset — status_change WS may have been missed
         setAutoDequeueFlag(f => f + 1);
+        // Replace live-only bubbles with their persisted LogEntry ids so every
+        // completed Codex turn immediately becomes a valid fork anchor.
+        refreshHistoryRef.current();
       }, 500);
       return;
     }
@@ -709,9 +718,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, 0, true),
       api.getAskUserPending(task.id).catch(() => ({ pending: [] as { request_id: string; questions: AskUserQuestion[] }[] })),
     ]).then(([msgs, askPending]) => {
-      const filtered = msgs.filter((m) =>
-        !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
-      );
+      const filtered = msgs
+        .filter((m) =>
+          !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
+        )
+        .map((m) => ({ ...m, persisted: true }));
       setHasMoreHistory(msgs.length >= HISTORY_PAGE_SIZE);
       const existingIds = new Set(
         filtered.filter((m) => m.event_type === 'ask_user_question').map((m) => m.request_id)
@@ -738,6 +749,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       setMessages(cards.length ? [...filtered, ...cards] : filtered);
     }).catch(() => {}).finally(() => setHistoryLoading(false));
   }, [task.id]);
+  useEffect(() => {
+    refreshHistoryRef.current = fetchHistory;
+  }, [fetchHistory]);
 
   const scrollRestorationRef = useRef<number | null>(null);
 
@@ -924,6 +938,30 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       setStarred(updated.starred);
       onTaskUpdated?.();
     } catch { /* ignore */ }
+  };
+
+  const openFork = (message?: ChatMessage) => {
+    if (task.provider !== 'codex' || !task.session_id) return;
+    if (message && !message.persisted) return;
+    setForkAnchor(message ? { type: 'log', id: message.id } : { type: 'initial' });
+    setForkTitle('');
+    setForkError(null);
+  };
+
+  const confirmFork = async () => {
+    if (!forkAnchor || forking) return;
+    setForking(true);
+    setForkError(null);
+    try {
+      const forked = await api.forkTask(task.id, forkAnchor, forkTitle);
+      setForkAnchor(null);
+      onTaskForked?.(forked);
+      onTaskUpdated?.();
+    } catch (e) {
+      setForkError(e instanceof Error ? e.message : 'Fork failed');
+    } finally {
+      setForking(false);
+    }
   };
 
   const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
@@ -1127,6 +1165,73 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
           )}
         </div>
       </div>
+
+      {task.metadata_?.forked_from_task_id && (
+        <div className="px-4 py-1.5 border-b border-indigo-500/20 bg-indigo-500/5 text-xs text-indigo-300 flex items-center gap-1.5">
+          <GitBranch size={12} />
+          <span>Forked from Task #{task.metadata_.forked_from_task_id}</span>
+        </div>
+      )}
+
+      {forkAnchor && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-md rounded-xl border border-gray-700 bg-gray-800 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-gray-700 px-4 py-3">
+              <div className="flex items-center gap-2 text-sm font-medium text-gray-100">
+                <GitBranch size={16} className="text-indigo-400" />
+                Fork Codex session
+              </div>
+              <button
+                onClick={() => !forking && setForkAnchor(null)}
+                className="text-gray-500 hover:text-gray-300 disabled:opacity-40"
+                disabled={forking}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="space-y-3 px-4 py-4">
+              <p className="text-sm text-gray-300">
+                A new Task will keep the conversation through the selected Codex turn and continue in an independent thread.
+              </p>
+              <p className="text-xs text-amber-400/90">
+                Conversation context is forked; files are not snapshotted. Both Tasks keep using the same working directory.
+              </p>
+              <div>
+                <label className="mb-1 block text-xs text-gray-400">New Task title (optional)</label>
+                <input
+                  value={forkTitle}
+                  onChange={(e) => setForkTitle(e.target.value)}
+                  placeholder={`Fork of #${task.id}`}
+                  maxLength={200}
+                  className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+                />
+              </div>
+              {forkError && (
+                <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                  {forkError}
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-gray-700 px-4 py-3">
+              <button
+                onClick={() => setForkAnchor(null)}
+                disabled={forking}
+                className="rounded px-3 py-1.5 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmFork}
+                disabled={forking}
+                className="flex items-center gap-1.5 rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-500 disabled:opacity-50"
+              >
+                {forking ? <Loader2 size={13} className="animate-spin" /> : <GitBranch size={13} />}
+                {forking ? 'Forking…' : 'Create fork'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Monitor Panel */}
       {showMonitorPanel && (
@@ -1353,6 +1458,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
                 <div className="flex items-center justify-end gap-1 mt-0.5 pr-1">
                   {task.created_at && <MessageTimestamp timestamp={task.created_at} />}
                   <MessageCopyButton text={task.description} />
+                  {task.provider === 'codex' && task.session_id && (
+                    <ForkButton onClick={() => openFork()} />
+                  )}
                 </div>
               </div>
             </div>
@@ -1360,9 +1468,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
         )}
         {grouped.map((group, i) =>
           group.type === 'tool-group' ? (
-            <ToolGroup key={i} messages={group.messages} taskId={task.id} />
+            <ToolGroup
+              key={i}
+              messages={group.messages}
+              taskId={task.id}
+              onFork={task.provider === 'codex' ? openFork : undefined}
+            />
           ) : (
-            <MessageBubble key={group.message.id} message={group.message} taskId={task.id} />
+            <MessageBubble
+              key={group.message.id}
+              message={group.message}
+              taskId={task.id}
+              onFork={task.provider === 'codex' ? openFork : undefined}
+            />
           )
         )}
         {sending && (
@@ -1717,22 +1835,34 @@ function toolUseSummary(msg: ChatMessage): string {
   return '';
 }
 
-function ToolGroup({ messages, taskId }: { messages: ChatMessage[]; taskId: number }) {
+function ToolGroup({
+  messages,
+  taskId,
+  onFork,
+}: {
+  messages: ChatMessage[];
+  taskId: number;
+  onFork?: (message: ChatMessage) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
   const hasError = messages.some((m) => m.is_error);
   const toolUseCount = messages.filter((m) => m.event_type === 'tool_use').length;
+  const forkAnchor = [...messages].reverse().find((message) => message.persisted);
 
   return (
-    <div className="mx-4">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className={`flex items-center gap-1.5 text-xs py-1 hover:text-gray-400 transition-colors ${hasError ? 'text-red-400/70' : 'text-gray-600'}`}
-      >
-        {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        <span>
-          {hasError ? '⚠' : '🔧'} {toolUseCount} tool call{toolUseCount !== 1 ? 's' : ''}
-        </span>
-      </button>
+    <div className="group mx-4">
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className={`flex items-center gap-1.5 text-xs py-1 hover:text-gray-400 transition-colors ${hasError ? 'text-red-400/70' : 'text-gray-600'}`}
+        >
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <span>
+            {hasError ? '⚠' : '🔧'} {toolUseCount} tool call{toolUseCount !== 1 ? 's' : ''}
+          </span>
+        </button>
+        {onFork && forkAnchor && <ForkButton onClick={() => onFork(forkAnchor)} />}
+      </div>
       {expanded && (
         <div className="ml-3 border-l border-gray-800 pl-3 space-y-1 mt-1">
           {messages.map((msg) => (
@@ -1894,6 +2024,20 @@ function MessageCopyButton({ text }: { text: string }) {
       title="Copy message"
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+  );
+}
+
+function ForkButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="p-0.5 text-gray-600 opacity-0 transition-colors hover:text-indigo-400 group-hover:opacity-100 focus:opacity-100"
+      title="Fork Codex session from this turn"
+      aria-label="Fork Codex session"
+    >
+      <GitBranch size={12} />
     </button>
   );
 }
@@ -2187,8 +2331,19 @@ function AskUserCard({ message, taskId }: { message: ChatMessage; taskId?: numbe
   );
 }
 
-const MessageBubble = memo(function MessageBubble({ message, taskId }: { message: ChatMessage; taskId?: number }) {
+const MessageBubble = memo(function MessageBubble({
+  message,
+  taskId,
+  onFork,
+}: {
+  message: ChatMessage;
+  taskId?: number;
+  onFork?: (message: ChatMessage) => void;
+}) {
   const isUser = message.role === 'user';
+  const forkButton = onFork && message.persisted
+    ? <ForkButton onClick={() => onFork(message)} />
+    : null;
 
   if (message.event_type === 'permission_request') {
     return <PermissionCard message={message} taskId={taskId} />;
@@ -2202,13 +2357,14 @@ const MessageBubble = memo(function MessageBubble({ message, taskId }: { message
     const text = message.content || '';
     const isEncrypted = text.startsWith('[encrypted thinking');
     return (
-      <div className="mx-4 px-3 py-2 bg-gray-800/30 rounded text-xs border border-gray-700/30">
+      <div className="group mx-4 px-3 py-2 bg-gray-800/30 rounded text-xs border border-gray-700/30">
         <div className="flex items-center gap-1.5 text-gray-500">
           <span>💭</span>
           <span className="font-medium">Thinking</span>
           {message.timestamp && (
             <MessageTimestamp timestamp={message.timestamp} className="ml-auto" />
           )}
+          {forkButton}
         </div>
         <div className="mt-1.5">
           {text && !isEncrypted ? (
@@ -2364,6 +2520,7 @@ const MessageBubble = memo(function MessageBubble({ message, taskId }: { message
         <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end pr-1' : 'pl-1'}`}>
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} />}
           {message.content && <MessageCopyButton text={isUser ? (message.raw_content ?? stripSenderPrefix(message.content)) : message.content} />}
+          {forkButton}
         </div>
       </div>
     </div>

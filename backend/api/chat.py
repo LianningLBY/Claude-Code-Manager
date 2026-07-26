@@ -1,10 +1,14 @@
+import asyncio
+from copy import deepcopy
+from datetime import datetime
 import logging
 import os
 import json
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from backend.api.deps import require_task_access
-from pydantic import BaseModel
+from backend.api.deps import get_current_user_id, require_task_access
+from pydantic import BaseModel, model_validator
 from sqlalchemy import and_, not_, select, func, update as sa_update  # still used by chat history
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +16,7 @@ from backend.database import get_db
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
 from backend.models.user_skill import UserSkill
+from backend.schemas.task import TaskResponse
 from backend.services.task_queue import task_is_pr_review_superseded
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import (
@@ -31,6 +36,209 @@ class ChatMessage(BaseModel):
     secret_ids: list[int] | None = None
     # One-shot model override for this message (does not change task.model)
     model: str | None = None
+
+
+class ForkAnchor(BaseModel):
+    type: Literal["initial", "log"]
+    id: int | None = None
+
+    @model_validator(mode="after")
+    def validate_anchor(self):
+        if self.type == "log" and (self.id is None or self.id <= 0):
+            raise ValueError("log fork anchors require a positive id")
+        if self.type == "initial" and self.id is not None:
+            raise ValueError("initial fork anchors cannot include an id")
+        return self
+
+
+class CodexForkRequest(BaseModel):
+    anchor: ForkAnchor
+    title: str | None = None
+
+
+def _native_ids(raw_json: str | None) -> tuple[str | None, str | None]:
+    """Return (item_id, turn_id) from one persisted normalized event."""
+
+    if not raw_json:
+        return None, None
+    try:
+        raw = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(raw, dict):
+        return None, None
+    item = raw.get("item")
+    turn = raw.get("turn")
+    item_id = (
+        raw.get("item_id")
+        or raw.get("itemId")
+        or (item.get("id") if isinstance(item, dict) else None)
+    )
+    turn_id = (
+        raw.get("turn_id")
+        or raw.get("turnId")
+        or (turn.get("id") if isinstance(turn, dict) else None)
+    )
+    return (
+        str(item_id) if item_id not in (None, "") else None,
+        str(turn_id) if turn_id not in (None, "") else None,
+    )
+
+
+def _turn_item_ids(item: object) -> set[str]:
+    """Collect native item ids from the lossy thread/read response."""
+
+    found: set[str] = set()
+    if isinstance(item, dict):
+        value = item.get("id")
+        if value not in (None, ""):
+            found.add(str(value))
+        for child in item.values():
+            if isinstance(child, (dict, list)):
+                found.update(_turn_item_ids(child))
+    elif isinstance(item, list):
+        for child in item:
+            found.update(_turn_item_ids(child))
+    return found
+
+
+def _resolve_fork_turn(
+    *,
+    anchor: ForkAnchor,
+    rows: list[LogEntry],
+    turns: list[dict],
+) -> tuple[str, int]:
+    """Resolve a local chat anchor to a completed native turn and log cutoff."""
+
+    if not turns:
+        raise HTTPException(409, "Codex session has no persisted turns to fork")
+    turn_ids = [str(turn.get("id") or "") for turn in turns]
+    if any(not turn_id for turn_id in turn_ids):
+        raise HTTPException(409, "Codex returned an invalid turn history")
+    turn_index = {turn_id: index for index, turn_id in enumerate(turn_ids)}
+    item_to_turn: dict[str, str] = {}
+    for turn_id, turn in zip(turn_ids, turns):
+        for item_id in _turn_item_ids(turn.get("items") or []):
+            item_to_turn[item_id] = turn_id
+
+    row_turns: dict[int, str] = {}
+    for row in rows:
+        item_id, direct_turn_id = _native_ids(row.raw_json)
+        resolved = direct_turn_id or (item_to_turn.get(item_id) if item_id else None)
+        if resolved in turn_index:
+            row_turns[row.id] = resolved
+
+    if anchor.type == "initial":
+        target_turn_id = turn_ids[0]
+        anchor_row_id = 0
+    else:
+        selected_index = next(
+            (index for index, row in enumerate(rows) if row.id == anchor.id),
+            None,
+        )
+        if selected_index is None:
+            raise HTTPException(404, "Fork anchor message not found")
+        selected = rows[selected_index]
+        target_turn_id = row_turns.get(selected.id)
+        if target_turn_id is None and selected.event_type == "user_message":
+            # A CCM user row is committed before turn/start returns. Associate
+            # it with the first native event before the next real user message.
+            for candidate in rows[selected_index + 1:]:
+                if candidate.event_type == "user_message":
+                    break
+                target_turn_id = row_turns.get(candidate.id)
+                if target_turn_id:
+                    break
+        if target_turn_id is None and selected.event_type == "user_message":
+            # Legacy logs predate persisted turn ids. Initial description is
+            # turn zero, so the Nth follow-up user row normally owns turn N.
+            ordinal = sum(
+                1
+                for row in rows[:selected_index + 1]
+                if row.event_type == "user_message"
+            )
+            if ordinal < len(turn_ids):
+                target_turn_id = turn_ids[ordinal]
+        if target_turn_id is None:
+            raise HTTPException(
+                409,
+                "This legacy message cannot be mapped safely to a Codex turn",
+            )
+        anchor_row_id = selected.id
+
+    target_index = turn_index[target_turn_id]
+    status = str(turns[target_index].get("status") or "")
+    if status in {"inProgress", "in_progress", "running"}:
+        raise HTTPException(409, "The selected Codex turn is still running")
+
+    target_row_ids = [
+        row_id
+        for row_id, row_turn_id in row_turns.items()
+        if row_turn_id == target_turn_id
+    ]
+    last_target_row = max(target_row_ids, default=anchor_row_id)
+    next_user_row = next(
+        (
+            row.id
+            for row in rows
+            if row.id > last_target_row and row.event_type == "user_message"
+        ),
+        None,
+    )
+    cutoff = (next_user_row - 1) if next_user_row else (
+        max((row.id for row in rows), default=anchor_row_id)
+    )
+    cutoff = max(cutoff, anchor_row_id)
+    return target_turn_id, cutoff
+
+
+def _codex_fork_home(task: Task) -> tuple[str, str | None]:
+    """Resolve the one proven account home containing the source rollout."""
+
+    from backend.main import codex_pool
+    from backend.services.codex_app_server import normalize_codex_home
+
+    account_id = (task.metadata_ or {}).get("codex_account_id")
+    if codex_pool:
+        if account_id:
+            home = codex_pool.home_for_account(str(account_id))
+            if not home:
+                raise HTTPException(
+                    409,
+                    "The Codex account bound to this task no longer exists",
+                )
+            matches = codex_pool.locate_session_homes(task.session_id)
+            canonical = codex_pool.canonical_home(home)
+            if matches and canonical not in matches:
+                raise HTTPException(
+                    409,
+                    "The bound Codex account does not contain this session",
+                )
+            return canonical, str(account_id)
+        matches = codex_pool.locate_session_homes(task.session_id)
+        if len(matches) > 1:
+            raise HTTPException(
+                409,
+                "Codex session has multiple rollout copies without an account binding",
+            )
+        if len(matches) == 1:
+            home = matches[0]
+            return home, codex_pool.account_id_for_home(home)
+
+    from backend.api.tasks import _find_session_jsonl
+
+    rollout = _find_session_jsonl(task.session_id, provider="codex")
+    if rollout is None:
+        raise HTTPException(409, "Codex rollout file was not found")
+    sessions_dir = next(
+        (parent for parent in rollout.parents if parent.name == "sessions"),
+        None,
+    )
+    if sessions_dir is None:
+        raise HTTPException(409, "Codex rollout is outside a valid CODEX_HOME")
+    return normalize_codex_home(sessions_dir.parent), (
+        str(account_id) if account_id else None
+    )
 
 
 @router.post("/{task_id}/chat")
@@ -169,6 +377,198 @@ async def send_chat_message(
         ) from exc
 
     return {"ok": True, "queued": True, "session_id": task.session_id}
+
+
+@router.post("/{task_id}/fork", response_model=TaskResponse, status_code=201)
+async def fork_codex_task(
+    task_id: int,
+    body: CodexForkRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an independent Codex task by forking through one chat turn."""
+
+    source = await db.get(Task, task_id)
+    if not source:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, source, db)
+    if (source.provider or "claude").lower() != "codex":
+        raise HTTPException(400, "Only Codex sessions support native forks")
+    if source.shared_from_id is not None:
+        raise HTTPException(409, "Shared shadow tasks cannot fork native sessions")
+    if source.worker_id is not None:
+        raise HTTPException(409, "Remote Worker task forks are not supported yet")
+    if not source.session_id:
+        raise HTTPException(400, "This task has no Codex session to fork")
+    if source.status in {"in_progress", "executing", "migrating"}:
+        raise HTTPException(409, "Wait for the current Codex turn to finish")
+
+    rows = list((await db.execute(
+        select(LogEntry)
+        .where(LogEntry.task_id == task_id)
+        .order_by(LogEntry.id.asc())
+    )).scalars().all())
+    if body.anchor.type == "log" and not any(
+        row.id == body.anchor.id for row in rows
+    ):
+        raise HTTPException(404, "Fork anchor message not found")
+
+    codex_home, account_id = _codex_fork_home(source)
+    from backend.main import instance_manager
+    from backend.services.codex_app_server import (
+        CodexAppServerBusyError,
+        CodexAppServerError,
+    )
+
+    try:
+        native_thread = await instance_manager.read_codex_thread(
+            codex_home,
+            source.session_id,
+        )
+        turns = [
+            turn for turn in (native_thread.get("turns") or [])
+            if isinstance(turn, dict)
+        ]
+        last_turn_id, cutoff = _resolve_fork_turn(
+            anchor=body.anchor,
+            rows=rows,
+            turns=turns,
+        )
+        forked_thread = await instance_manager.fork_codex_thread(
+            codex_home,
+            source.session_id,
+            last_turn_id=last_turn_id,
+        )
+    except CodexAppServerBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except CodexAppServerError as exc:
+        raise HTTPException(502, f"Codex thread fork failed: {exc}") from exc
+
+    forked_thread_id = str(forked_thread["id"])
+    committed = False
+    try:
+        metadata = deepcopy(source.metadata_ or {})
+        if account_id:
+            metadata["codex_account_id"] = account_id
+        metadata["forked_from_task_id"] = source.id
+        metadata["forked_from_log_id"] = (
+            body.anchor.id if body.anchor.type == "log" else None
+        )
+        metadata["forked_from_turn_id"] = last_turn_id
+
+        default_title = (
+            f"Fork of #{source.id}: {source.title}"
+            if source.title
+            else f"Fork of #{source.id}"
+        )
+        now = datetime.utcnow()
+        forked_task = Task(
+            title=(body.title.strip() if body.title and body.title.strip() else default_title)[:200],
+            description=source.description,
+            status="completed",
+            priority=source.priority,
+            project_id=source.project_id,
+            target_repo=source.target_repo,
+            target_branch=source.target_branch,
+            merge_status="pending",
+            worker_id=None,
+            created_by=get_current_user_id(request),
+            max_retries=source.max_retries,
+            mode="auto",
+            session_id=forked_thread_id,
+            last_cwd=source.last_cwd,
+            provider="codex",
+            model=source.model,
+            effort_level=source.effort_level,
+            thinking_budget=source.thinking_budget,
+            system_prompt_mode=source.system_prompt_mode,
+            timeout_hours=source.timeout_hours,
+            enable_workflows=source.enable_workflows,
+            enabled_skills=deepcopy(source.enabled_skills),
+            selected_user_skills=deepcopy(source.selected_user_skills),
+            tags=deepcopy(source.tags),
+            metadata_=metadata,
+            started_at=now,
+            completed_at=now,
+        )
+        db.add(forked_task)
+        await db.flush()
+
+        for row in rows:
+            if row.id > cutoff:
+                break
+            db.add(LogEntry(
+                instance_id=None,
+                task_id=forked_task.id,
+                event_type=row.event_type,
+                role=row.role,
+                content=row.content,
+                tool_name=row.tool_name,
+                tool_input=row.tool_input,
+                tool_output=row.tool_output,
+                raw_json=row.raw_json,
+                is_error=row.is_error,
+                loop_iteration=row.loop_iteration,
+                timestamp=row.timestamp,
+            ))
+        db.add(LogEntry(
+            instance_id=None,
+            task_id=forked_task.id,
+            event_type="system_event",
+            role="system",
+            content=f"Forked from Task #{source.id}",
+            raw_json=json.dumps({
+                "forked_from_task_id": source.id,
+                "forked_from_turn_id": last_turn_id,
+            }),
+            is_error=False,
+        ))
+        # A committed Task and its native fork must never split under request
+        # cancellation. Settle the commit before deciding whether compensation
+        # is still allowed.
+        commit_task = asyncio.create_task(db.commit())
+        cancellation: asyncio.CancelledError | None = None
+        while not commit_task.done():
+            try:
+                await asyncio.shield(commit_task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        commit_task.result()
+        committed = True
+        if cancellation is not None:
+            raise cancellation
+        await db.refresh(forked_task)
+    except BaseException:
+        await db.rollback()
+        if not committed:
+            cleanup = asyncio.create_task(
+                instance_manager.delete_codex_thread(
+                    codex_home,
+                    forked_thread_id,
+                )
+            )
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+        raise
+
+    if forked_task.project_id:
+        try:
+            from backend.services.task_sharing import auto_share_new_task
+            await auto_share_new_task(
+                db,
+                forked_task.id,
+                forked_task.project_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not auto-share forked task %s",
+                forked_task.id,
+            )
+    return forked_task
 
 
 async def _send_shared_chat(task: Task, body: ChatMessage, db: AsyncSession):
@@ -499,10 +899,26 @@ async def get_chat_history(
         image_urls = None
         source = None
         raw_content = None
+        item_id = None
+        turn_id = None
         if row.raw_json:
             try:
                 raw = json.loads(row.raw_json)
                 if isinstance(raw, dict):
+                    item = raw.get("item")
+                    turn = raw.get("turn")
+                    native_item = (
+                        raw.get("item_id")
+                        or raw.get("itemId")
+                        or (item.get("id") if isinstance(item, dict) else None)
+                    )
+                    native_turn = (
+                        raw.get("turn_id")
+                        or raw.get("turnId")
+                        or (turn.get("id") if isinstance(turn, dict) else None)
+                    )
+                    item_id = str(native_item) if native_item else None
+                    turn_id = str(native_turn) if native_turn else None
                     if raw.get("attachments"):
                         attachments = raw["attachments"]
                         image_urls = [a["url"] for a in attachments if a.get("is_image")]
@@ -543,6 +959,8 @@ async def get_chat_history(
             "attachments": attachments,
             "source": msg_source,
             "raw_content": raw_content,
+            "item_id": item_id,
+            "turn_id": turn_id,
         })
 
     # Trim back to requested limit (we over-fetched to compensate for

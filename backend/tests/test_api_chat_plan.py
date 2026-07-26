@@ -4,7 +4,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.task import Task
@@ -30,6 +30,148 @@ async def test_chat_history_empty(client):
     resp = await client.get(f"/api/tasks/{task_id}/chat/history")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_creates_independent_completed_task_at_selected_turn(
+    client, session_factory,
+):
+    from backend.models.log_entry import LogEntry
+
+    created = await client.post("/api/tasks", json={
+        "title": "Source",
+        "description": "initial prompt",
+        "target_repo": "/tmp/project",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        task.session_id = "thread-source"
+        task.last_cwd = "/tmp/project"
+        task.metadata_ = {"codex_account_id": "codex-a"}
+        first = LogEntry(
+            instance_id=1, task_id=task_id, event_type="message",
+            role="assistant", content="first answer", is_error=False,
+            raw_json='{"item_id":"item-1","turn_id":"turn-1"}',
+        )
+        anchor = LogEntry(
+            instance_id=1, task_id=task_id, event_type="user_message",
+            role="user", content="fork here", is_error=False,
+            raw_json='{"raw_content":"fork here"}',
+        )
+        second = LogEntry(
+            instance_id=1, task_id=task_id, event_type="message",
+            role="assistant", content="second answer", is_error=False,
+            raw_json='{"item_id":"item-2","turn_id":"turn-2"}',
+        )
+        later_user = LogEntry(
+            instance_id=1, task_id=task_id, event_type="user_message",
+            role="user", content="do not copy", is_error=False,
+        )
+        later_answer = LogEntry(
+            instance_id=1, task_id=task_id, event_type="message",
+            role="assistant", content="third answer", is_error=False,
+            raw_json='{"item_id":"item-3","turn_id":"turn-3"}',
+        )
+        db.add_all([first, anchor, second, later_user, later_answer])
+        await db.commit()
+        await db.refresh(anchor)
+        anchor_id = anchor.id
+
+    history = await client.get(f"/api/tasks/{task_id}/chat/history")
+    first_message = history.json()[0]
+    assert first_message["item_id"] == "item-1"
+    assert first_message["turn_id"] == "turn-1"
+
+    turns = [
+        {"id": "turn-1", "status": "completed", "items": [{"id": "item-1"}]},
+        {"id": "turn-2", "status": "completed", "items": [{"id": "item-2"}]},
+        {"id": "turn-3", "status": "completed", "items": [{"id": "item-3"}]},
+    ]
+    with (
+        patch(
+            "backend.api.chat._codex_fork_home",
+            return_value=("/tmp/codex-home", "codex-a"),
+        ),
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(return_value={"id": "thread-source", "turns": turns}),
+        ) as read_thread,
+        patch(
+            "backend.main.instance_manager.fork_codex_thread",
+            new=AsyncMock(return_value={
+                "id": "thread-fork",
+                "forkedFromId": "thread-source",
+                "turns": turns[:2],
+            }),
+        ) as fork_thread,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/fork",
+            json={"anchor": {"type": "log", "id": anchor_id}},
+        )
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["mode"] == "auto"
+    assert payload["session_id"] == "thread-fork"
+    assert payload["metadata_"]["codex_account_id"] == "codex-a"
+    assert payload["metadata_"]["forked_from_task_id"] == task_id
+    assert payload["metadata_"]["forked_from_log_id"] == anchor_id
+    assert payload["metadata_"]["forked_from_turn_id"] == "turn-2"
+    read_thread.assert_awaited_once_with("/tmp/codex-home", "thread-source")
+    fork_thread.assert_awaited_once_with(
+        "/tmp/codex-home",
+        "thread-source",
+        last_turn_id="turn-2",
+    )
+
+    async with session_factory() as db:
+        copied = list((await db.execute(
+            select(LogEntry)
+            .where(LogEntry.task_id == payload["id"])
+            .order_by(LogEntry.id.asc())
+        )).scalars().all())
+    assert [entry.content for entry in copied] == [
+        "first answer",
+        "fork here",
+        "second answer",
+        f"Forked from Task #{task_id}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_rejects_active_source_without_native_rpc(
+    client, session_factory,
+):
+    created = await client.post("/api/tasks", json={
+        "title": "Active",
+        "description": "working",
+        "target_repo": "/tmp/project",
+        "provider": "codex",
+    })
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "executing"
+        task.session_id = "thread-active"
+        await db.commit()
+
+    with patch(
+        "backend.main.instance_manager.read_codex_thread",
+        new=AsyncMock(),
+    ) as read_thread:
+        response = await client.post(
+            f"/api/tasks/{task_id}/fork",
+            json={"anchor": {"type": "initial"}},
+        )
+
+    assert response.status_code == 409
+    read_thread.assert_not_awaited()
 
 
 @pytest.mark.asyncio

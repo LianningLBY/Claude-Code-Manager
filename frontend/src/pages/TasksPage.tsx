@@ -513,7 +513,18 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const chatPanel = chatTask && (
     chatTask.mode === 'loop'
       ? <LoopChatView key={chatTask.id} task={chatTask} onBack={() => setChatTaskWrapped(null)} inline={isWide} />
-      : <ChatView key={chatTask.id} task={chatTask} projects={projects} onBack={() => setChatTaskWrapped(null)} onTaskUpdated={refresh} inline={isWide} />
+      : <ChatView
+          key={chatTask.id}
+          task={chatTask}
+          projects={projects}
+          onBack={() => setChatTaskWrapped(null)}
+          onTaskUpdated={refresh}
+          onTaskForked={(forked) => {
+            setChatTaskWrapped(forked);
+            refresh();
+          }}
+          inline={isWide}
+        />
   );
 
   const [sidebarOpen, setSidebarOpen] = useState(true);

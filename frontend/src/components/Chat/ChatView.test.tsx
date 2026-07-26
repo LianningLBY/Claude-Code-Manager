@@ -11,6 +11,7 @@ vi.mock('../../api/client', () => ({
     sendTaskChat: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
     stopTaskSession: vi.fn().mockResolvedValue({}),
+    forkTask: vi.fn().mockResolvedValue({}),
     uploadImages: vi.fn().mockResolvedValue([]),
     listMonitorSessions: vi.fn().mockResolvedValue([]),
     getAskUserPending: vi.fn().mockResolvedValue({ pending: [] }),
@@ -179,6 +180,77 @@ describe('ChatView', () => {
       render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
 
       expect(screen.queryByText('— Initial Prompt —')).not.toBeInTheDocument();
+    });
+
+    it('forks a Codex session from the initial prompt and opens the new task', async () => {
+      const task = makeTask({ id: 12, provider: 'codex', status: 'completed' });
+      const forked = makeTask({
+        id: 99,
+        provider: 'codex',
+        status: 'completed',
+        session_id: 'fork-thread',
+      });
+      const onTaskForked = vi.fn();
+      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(forked);
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskForked={onTaskForked}
+        />,
+      );
+
+      await userEvent.click(screen.getByLabelText('Fork Codex session'));
+      expect(screen.getByText('Fork Codex session', { selector: 'div' })).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Create fork' }));
+
+      await waitFor(() => {
+        expect(api.forkTask).toHaveBeenCalledWith(12, { type: 'initial' }, '');
+        expect(onTaskForked).toHaveBeenCalledWith(forked);
+      });
+    });
+
+    it('does not offer native fork actions for Claude sessions', () => {
+      const task = makeTask({ provider: 'claude', status: 'completed' });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      expect(screen.queryByLabelText('Fork Codex session')).not.toBeInTheDocument();
+    });
+
+    it('forks a Codex session from a persisted conversation message', async () => {
+      const task = makeTask({
+        id: 13,
+        description: null,
+        provider: 'codex',
+        status: 'completed',
+      });
+      const message: ChatMessage = {
+        id: 456,
+        task_id: task.id,
+        event_type: 'message',
+        role: 'assistant',
+        content: 'Forkable answer',
+        is_error: false,
+        timestamp: '2024-01-01T00:01:00Z',
+      };
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([message]);
+      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeTask({ id: 100, provider: 'codex', session_id: 'fork-message' }),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      expect(await screen.findByText('Forkable answer')).toBeInTheDocument();
+      await userEvent.click(screen.getByLabelText('Fork Codex session'));
+      await userEvent.click(screen.getByRole('button', { name: 'Create fork' }));
+
+      await waitFor(() => {
+        expect(api.forkTask).toHaveBeenCalledWith(
+          task.id,
+          { type: 'log', id: message.id },
+          '',
+        );
+      });
     });
   });
 

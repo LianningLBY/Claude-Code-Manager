@@ -308,6 +308,27 @@ def _default_worker_model(provider: str) -> str:
     return settings.default_codex_model if provider == "codex" else settings.default_model
 
 
+def _initial_task_command(task: Task):
+    """Parse an explicit leading $command from a newly-created Task."""
+
+    from backend.services.command_registry import parse_command
+
+    return parse_command(task.description or "")
+
+
+def _initial_task_launch_skills(task: Task) -> tuple[dict, bool]:
+    """Return launch-visible skills and whether they are temporary."""
+
+    original = dict(task.enabled_skills or {})
+    command, _args = _initial_task_command(task)
+    required = dict(command.required_skills or {}) if command else {}
+    if not required:
+        return original, False
+    effective = dict(original)
+    effective.update(required)
+    return effective, effective != original
+
+
 def _build_git_env(merged_config: dict) -> dict:
     """Build git-related environment variables from a merged git config dict.
 
@@ -3610,7 +3631,23 @@ class GlobalDispatcher:
         if image_paths:
             image_list = "\n".join(f"- {p}" for p in image_paths)
             parts.append(f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}")
-        parts.append(f"任务:\n{task.description}")
+        command, command_args = _initial_task_command(task)
+        task_description = task.description
+        if command:
+            if command_args:
+                task_description = command_args
+            parts.append(command.prompt_template)
+        # Skill 模板描述的是 MCP 工具，而 MCP config 只注入 claude CLI
+        # （instance_manager.launch 里 provider == "claude" 才 generate_mcp_config），
+        # codex 任务注入这些模板只会让它调用不存在的工具。
+        if task.enabled_skills and (task.provider or "claude").lower() != "codex":
+            from backend.services.command_registry import COMMAND_REGISTRY
+            for skill_name, enabled in task.enabled_skills.items():
+                if enabled and skill_name in COMMAND_REGISTRY:
+                    cmd = COMMAND_REGISTRY[skill_name]
+                    if not cmd.always_available:
+                        parts.append(cmd.prompt_template)
+        parts.append(f"任务:\n{task_description}")
         return "\n\n".join(parts)
 
     async def _relaunch_and_wait(
@@ -4495,6 +4532,10 @@ class GlobalDispatcher:
         lifecycle_generation: _TaskLifecycleGeneration | None = (
             self._task_lifecycle_generation(task)
         )
+        original_task_skills = dict(task.enabled_skills or {})
+        launch_skills, has_temporary_initial_skills = (
+            _initial_task_launch_skills(task)
+        )
         try:
             # === Step 1: Mark in_progress ===
             await self._broadcast_task_status_generation(
@@ -4515,6 +4556,15 @@ class GlobalDispatcher:
             thinking_budget = task.thinking_budget
             effort_level = task.effort_level or settings.default_effort
             async with self.db_factory() as db:
+                claim_values: dict = {
+                    "status": "executing",
+                    "instance_id": instance_id,
+                }
+                if has_temporary_initial_skills:
+                    # The API checks Task.enabled_skills when the model calls
+                    # create_sub_agent. Publish the temporary command skill in
+                    # the same transaction as execution ownership.
+                    claim_values["enabled_skills"] = launch_skills
                 claimed = await db.execute(
                     update(Task)
                     .where(
@@ -4536,7 +4586,7 @@ class GlobalDispatcher:
                         Task.shared_from_id.is_(None),
                         task_retry_not_superseded_predicate(),
                     )
-                    .values(status="executing", instance_id=instance_id)
+                    .values(**claim_values)
                 )
                 executing_generation = None
                 if claimed.rowcount:
@@ -4553,6 +4603,8 @@ class GlobalDispatcher:
             lifecycle_generation = self._task_lifecycle_generation(
                 executing_generation
             )
+            if has_temporary_initial_skills:
+                task.enabled_skills = launch_skills
             claim_validated = True
             await self._broadcast_task_status_generation(
                 executing_generation,
@@ -4917,6 +4969,21 @@ class GlobalDispatcher:
             from backend.services.mcp_config import cleanup_mcp_config
             cleanup_mcp_config(task.id)
             _cleanup_skill_prompt_files(task.id)
+            if has_temporary_initial_skills:
+                try:
+                    async with self.db_factory() as db:
+                        current = await db.get(Task, task.id)
+                        if (
+                            current is not None
+                            and dict(current.enabled_skills or {}) == launch_skills
+                        ):
+                            current.enabled_skills = original_task_skills
+                            await db.commit()
+                except Exception:
+                    logger.exception(
+                        "Failed to restore initial command skills for task %s",
+                        task.id,
+                    )
             try:
                 # Keep the lifecycle registered through exact stale cleanup.
                 # The queued-chat admission path treats this registration as a

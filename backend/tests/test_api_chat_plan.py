@@ -607,6 +607,100 @@ async def test_chat_send_without_image_paths_plain_prompt(client, session_factor
 
 
 @pytest.mark.asyncio
+async def test_enabled_skills_do_not_impersonate_command_invocations(
+    client, session_factory,
+):
+    """Enabled means discoverable, not invoked: ordinary chat stays untouched."""
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        enabled_skills={"monitor": True, "sub-agent": True},
+    )
+    mock_d = _mock_dispatcher()
+    mock_broadcaster = MagicMock()
+    mock_broadcaster.broadcast = AsyncMock()
+
+    with patch("backend.main.dispatcher", mock_d), \
+         patch("backend.main.broadcaster", mock_broadcaster):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "你好"},
+        )
+
+    assert resp.status_code == 200
+    kwargs = mock_d.enqueue_message.call_args.kwargs
+    assert kwargs["prompt"] == "你好"
+    assert kwargs["command_skills"] is None
+    assert "用户通过 $monitor 命令触发" not in kwargs["prompt"]
+    assert "用户通过 $sub-agent 命令触发" not in kwargs["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "skill_name"),
+    [
+        ("$monitor watch the build", "monitor"),
+        ("$sub-agent review the change", "sub-agent"),
+    ],
+)
+async def test_explicit_skill_command_injects_only_selected_invocation(
+    client, session_factory, message, skill_name,
+):
+    """A real leading $command activates exactly that command for the turn."""
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        enabled_skills={"monitor": True, "sub-agent": True},
+    )
+    mock_d = _mock_dispatcher()
+    mock_broadcaster = MagicMock()
+    mock_broadcaster.broadcast = AsyncMock()
+
+    with patch("backend.main.dispatcher", mock_d), \
+         patch("backend.main.broadcaster", mock_broadcaster):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": message},
+        )
+
+    assert resp.status_code == 200
+    kwargs = mock_d.enqueue_message.call_args.kwargs
+    assert kwargs["prompt"].startswith(message.split(None, 1)[1])
+    assert f"用户通过 ${skill_name} 命令触发了技能 '{skill_name}'" in kwargs["prompt"]
+    assert kwargs["command_skills"] == {skill_name: True}
+    other = "sub-agent" if skill_name == "monitor" else "monitor"
+    assert f"用户通过 ${other} 命令触发" not in kwargs["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_mentioning_skill_command_mid_message_does_not_invoke_it(
+    client, session_factory,
+):
+    """Quoting or discussing $monitor is ordinary text unless it leads."""
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        enabled_skills={"monitor": True},
+    )
+    mock_d = _mock_dispatcher()
+    mock_broadcaster = MagicMock()
+    mock_broadcaster.broadcast = AsyncMock()
+    message = "你怎么知道 $monitor？"
+
+    with patch("backend.main.dispatcher", mock_d), \
+         patch("backend.main.broadcaster", mock_broadcaster):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": message},
+        )
+
+    assert resp.status_code == 200
+    kwargs = mock_d.enqueue_message.call_args.kwargs
+    assert kwargs["prompt"] == message
+    assert kwargs["command_skills"] is None
+
+
+@pytest.mark.asyncio
 async def test_chat_send_with_image_paths_stores_original_message(client, session_factory):
     """LogEntry content stores the original user message (without image instruction)."""
     from backend.models.log_entry import LogEntry

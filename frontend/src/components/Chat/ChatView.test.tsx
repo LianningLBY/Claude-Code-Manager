@@ -201,7 +201,10 @@ describe('ChatView', () => {
         />,
       );
 
-      await userEvent.click(screen.getByLabelText('Fork Codex session'));
+      const forkButton = screen.getByLabelText('Fork Codex session');
+      expect(forkButton).not.toHaveClass('opacity-0');
+      expect(forkButton).toHaveClass('h-8', 'w-8');
+      await userEvent.click(forkButton);
       expect(screen.getByText('Fork Codex session', { selector: 'div' })).toBeInTheDocument();
       await userEvent.click(screen.getByRole('button', { name: 'Create fork' }));
 

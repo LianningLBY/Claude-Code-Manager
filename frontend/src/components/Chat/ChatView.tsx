@@ -2033,11 +2033,11 @@ function ForkButton({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="p-0.5 text-gray-600 opacity-0 transition-colors hover:text-indigo-400 group-hover:opacity-100 focus:opacity-100"
+      className="inline-flex h-8 w-8 items-center justify-center rounded-md text-indigo-400 transition-colors hover:bg-indigo-500/10 hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
       title="Fork Codex session from this turn"
       aria-label="Fork Codex session"
     >
-      <GitBranch size={12} />
+      <GitBranch size={16} />
     </button>
   );
 }

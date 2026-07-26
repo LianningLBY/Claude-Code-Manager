@@ -124,59 +124,6 @@ async def test_start_turn_injects_mcp_config_into_new_thread():
 
 
 @pytest.mark.asyncio
-async def test_start_turn_marks_one_shot_thread_ephemeral():
-    server = CodexAppServer("codex")
-    server._process = SimpleNamespace(pid=4321, returncode=None)
-    server.ensure_started = AsyncMock()
-    server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-ephemeral"}},
-        {"turn": {"id": "turn-ephemeral"}},
-    ])
-
-    await server.start_turn(
-        prompt="one shot",
-        cwd="/tmp",
-        model="gpt-5.6-sol",
-        effort="high",
-        resume_session_id=None,
-        git_env=None,
-        task_id=42,
-        mcp_specs=(_task_mcp_spec(42),),
-        ephemeral=True,
-    )
-
-    thread_call = server._request.await_args_list[0]
-    assert thread_call.args == (
-        "thread/start",
-        {
-            "cwd": "/tmp",
-            "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
-            "model": "gpt-5.6-sol",
-            "config": {
-                "mcp_servers": {
-                    "ccm_skills": {
-                        "command": "python",
-                        "args": [
-                            "-m",
-                            "backend.mcp.ccm_skills_server",
-                            "--task-id",
-                            "42",
-                        ],
-                        "cwd": "/ccm",
-                        "required": True,
-                        "enabled_tools": ["ccm_command_help"],
-                        "startup_timeout_sec": 10,
-                        "tool_timeout_sec": 60,
-                    }
-                }
-            },
-            "ephemeral": True,
-        },
-    )
-
-
-@pytest.mark.asyncio
 async def test_delete_thread_rejects_active_turn_then_releases_known_thread():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)

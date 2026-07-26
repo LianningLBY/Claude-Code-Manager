@@ -7176,7 +7176,6 @@ class GlobalDispatcher:
             git_env=None,
             task_id=task_id,
             mcp_specs=mcp_specs,
-            ephemeral=True,
         )
         self._sub_agent_codex_homes[session_id] = codex_home
         self._sub_agent_codex_processes[session_id] = process

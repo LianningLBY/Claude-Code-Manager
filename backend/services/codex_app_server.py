@@ -335,7 +335,6 @@ class CodexAppServer:
         git_env: dict[str, str] | None,
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
-        ephemeral: bool = False,
     ) -> tuple[CodexTurnProcess, str]:
         required_mcp = any(spec.required for spec in mcp_specs)
         try:
@@ -385,10 +384,7 @@ class CodexAppServer:
         thread_params = (
             {"threadId": resume_session_id, **common}
             if resume_session_id
-            else {
-                **common,
-                **({"ephemeral": True} if ephemeral else {}),
-            }
+            else common
         )
         try:
             response = await self._request(thread_method, thread_params)

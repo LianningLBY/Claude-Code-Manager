@@ -159,7 +159,7 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     assert launched is process
     kwargs = registry.start_turn.await_args.kwargs
     assert kwargs["resume_session_id"] is None
-    assert kwargs["ephemeral"] is True
+    assert "ephemeral" not in kwargs
     assert kwargs["mcp_specs"] == specs
     assert kwargs["mcp_specs"][0].required is True
     assert set(kwargs["mcp_specs"][0].enabled_tools) == {

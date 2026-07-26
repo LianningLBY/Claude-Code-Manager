@@ -499,6 +499,7 @@ class GlobalDispatcher:
         # process-group signal to the shared transport.
         self._sub_agent_codex_processes: dict[int, object] = {}
         self._sub_agent_codex_homes: dict[int, str | None] = {}
+        self._sub_agent_codex_threads: dict[int, str] = {}
 
         # Per-task message queue for serialized chat/monitor messages
         self._task_queues: dict[int, asyncio.PriorityQueue] = {}
@@ -1337,6 +1338,7 @@ class GlobalDispatcher:
                   set(self._sub_agent_tasks)
                   | set(self._sub_agent_processes)
                   | set(self._sub_agent_codex_processes)
+                  | set(self._sub_agent_codex_threads)
               )),
         ]
         if aux_stops:
@@ -1678,6 +1680,11 @@ class GlobalDispatcher:
         sub_agent_ids.update(
             session_id
             for session_id in self._sub_agent_codex_processes
+            if type(session_id) is int
+        )
+        sub_agent_ids.update(
+            session_id
+            for session_id in self._sub_agent_codex_threads
             if type(session_id) is int
         )
         return monitor_ids, sub_agent_ids
@@ -6587,6 +6594,7 @@ class GlobalDispatcher:
         if (
             session_id in self._sub_agent_codex_processes
             or session_id in self._sub_agent_codex_homes
+            or session_id in self._sub_agent_codex_threads
         ):
             task = self._sub_agent_tasks.get(session_id)
             if task and not task.done():
@@ -6613,22 +6621,27 @@ class GlobalDispatcher:
 
         candidate = process or self._sub_agent_codex_processes.get(session_id)
         home = self._sub_agent_codex_homes.get(session_id)
-        if candidate is None:
+        thread_id = self._sub_agent_codex_threads.get(session_id)
+        if candidate is None and thread_id is None:
             self._sub_agent_codex_homes.pop(session_id, None)
             return
 
-        if getattr(candidate, "returncode", None) is None:
-            registry = self.instance_manager._ensure_codex_app_server_registry()
+        registry = self.instance_manager._ensure_codex_app_server_registry()
+        if candidate is not None and getattr(candidate, "returncode", None) is None:
             await registry.abort_unclaimed_turn(
                 home,
                 candidate,
                 reason=reason,
             )
 
-        if getattr(candidate, "returncode", None) is not None:
+        if thread_id is not None:
+            await registry.delete_thread(home, thread_id)
+
+        if candidate is None or getattr(candidate, "returncode", None) is not None:
             if self._sub_agent_codex_processes.get(session_id) is candidate:
                 self._sub_agent_codex_processes.pop(session_id, None)
             self._sub_agent_codex_homes.pop(session_id, None)
+            self._sub_agent_codex_threads.pop(session_id, None)
 
     def start_monitor_session(self, monitor_session):
         if getattr(self, "_shutting_down", False):
@@ -7163,9 +7176,11 @@ class GlobalDispatcher:
             git_env=None,
             task_id=task_id,
             mcp_specs=mcp_specs,
+            ephemeral=True,
         )
         self._sub_agent_codex_homes[session_id] = codex_home
         self._sub_agent_codex_processes[session_id] = process
+        self._sub_agent_codex_threads[session_id] = thread_id
         if codex_home and pool:
             pool.record_routed_account(codex_home)
         logger.info(

@@ -84,8 +84,11 @@ class CodexTurnProcess:
         self,
         pid: int,
         interrupt: Callable[[], Awaitable[None]],
+        *,
+        thread_id: str | None = None,
     ) -> None:
         self.pid = pid
+        self.thread_id = thread_id
         self.returncode: int | None = None
         self.stdout = asyncio.StreamReader(limit=10 * 1024 * 1024)
         self.stderr = asyncio.StreamReader(limit=1024 * 1024)
@@ -332,6 +335,7 @@ class CodexAppServer:
         git_env: dict[str, str] | None,
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
+        ephemeral: bool = False,
     ) -> tuple[CodexTurnProcess, str]:
         required_mcp = any(spec.required for spec in mcp_specs)
         try:
@@ -381,7 +385,10 @@ class CodexAppServer:
         thread_params = (
             {"threadId": resume_session_id, **common}
             if resume_session_id
-            else common
+            else {
+                **common,
+                **({"ephemeral": True} if ephemeral else {}),
+            }
         )
         try:
             response = await self._request(thread_method, thread_params)
@@ -417,7 +424,11 @@ class CodexAppServer:
                     {"threadId": thread_id, "turnId": context.turn_id},
                 )
 
-        turn_process = CodexTurnProcess(self.pid, _interrupt)
+        turn_process = CodexTurnProcess(
+            self.pid,
+            _interrupt,
+            thread_id=thread_id,
+        )
         context = _TurnContext(
             thread_id=thread_id,
             process=turn_process,
@@ -511,6 +522,45 @@ class CodexAppServer:
             (time.perf_counter() - launch_started) * 1000,
         )
         return turn_process, thread_id
+
+    async def delete_thread(self, thread_id: str) -> None:
+        """Delete one terminal thread and release its thread-scoped resources."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        if self.has_active_thread(thread_id):
+            raise CodexAppServerBusyError(
+                f"Codex thread {thread_id} still has an active turn"
+            )
+        await self._request("thread/delete", {"threadId": thread_id})
+        self._known_threads.discard(thread_id)
+        self._contexts_by_thread.pop(thread_id, None)
+        for turn_id, context in list(self._contexts_by_turn.items()):
+            if context.thread_id == thread_id:
+                self._contexts_by_turn.pop(turn_id, None)
+
+    async def unsubscribe_thread(self, thread_id: str) -> str:
+        """Release this client's idle subscription while preserving history."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        if self.has_active_thread(thread_id):
+            raise CodexAppServerBusyError(
+                f"Codex thread {thread_id} still has an active turn"
+            )
+        response = await self._request(
+            "thread/unsubscribe",
+            {"threadId": thread_id},
+        )
+        status = response.get("status")
+        if status not in {"unsubscribed", "notSubscribed", "notLoaded"}:
+            raise CodexAppServerError(
+                f"thread/unsubscribe returned invalid status for {thread_id}: "
+                f"{status!r}"
+            )
+        if status == "notLoaded":
+            self._known_threads.discard(thread_id)
+        return status
 
     async def abandon_turn(
         self,
@@ -1230,6 +1280,105 @@ class CodexAppServerRegistry:
             self._starting[home] = starting - 1
         else:
             self._starting.pop(home, None)
+
+    async def delete_thread(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ) -> None:
+        """Delete one terminal thread without disturbing its shared transport."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        home = normalize_codex_home(codex_home)
+        token = object()
+
+        async with self._lock:
+            if self._shutdown_requested:
+                raise CodexAppServerBusyError(
+                    "Codex app-server registry is shutting down"
+                )
+            if home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is draining: {home}"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if owner is not None and owner != home:
+                raise CodexThreadHomeMismatchError(
+                    f"Codex thread {thread_id} is bound to {owner}, not {home}"
+                )
+            if thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} is being rebound"
+                )
+            if thread_id in self._starting_threads:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has a request in flight"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                raise CodexAppServerError(
+                    f"Codex app-server is unavailable for thread {thread_id}"
+                )
+            self._starting_threads[thread_id] = token
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        deleted = False
+        try:
+            await server.delete_thread(thread_id)
+            deleted = True
+        finally:
+            async with self._lock:
+                self._decrement_starting_locked(home)
+                if self._starting_threads.get(thread_id) is token:
+                    self._starting_threads.pop(thread_id, None)
+                if deleted and self._thread_owners.get(thread_id) == home:
+                    self._thread_owners.pop(thread_id, None)
+
+    async def unsubscribe_thread(self, thread_id: str) -> str:
+        """Release one idle subscription without dropping its resumable owner."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        token = object()
+
+        async with self._lock:
+            owner = self._thread_owners.get(thread_id)
+            if owner is None:
+                raise CodexAppServerError(
+                    f"Codex thread {thread_id} has no registered owner"
+                )
+            if self._shutdown_requested:
+                raise CodexAppServerBusyError(
+                    "Codex app-server registry is shutting down"
+                )
+            if owner in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is draining: {owner}"
+                )
+            if thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} is being rebound"
+                )
+            if thread_id in self._starting_threads:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has a request in flight"
+                )
+            server = self._servers.get(owner)
+            if server is None:
+                raise CodexAppServerError(
+                    f"Codex app-server is unavailable for thread {thread_id}"
+                )
+            self._starting_threads[thread_id] = token
+            self._starting[owner] = self._starting.get(owner, 0) + 1
+
+        try:
+            return await server.unsubscribe_thread(thread_id)
+        finally:
+            async with self._lock:
+                self._decrement_starting_locked(owner)
+                if self._starting_threads.get(thread_id) is token:
+                    self._starting_threads.pop(thread_id, None)
 
     async def abort_unclaimed_turn(
         self,

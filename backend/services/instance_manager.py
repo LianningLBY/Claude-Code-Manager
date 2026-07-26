@@ -3633,6 +3633,33 @@ class InstanceManager:
                         "Failed to enqueue monitor auto-resume for task %s", task_id,
                     )
 
+        # A Codex thread with the CCM Sub-Agent controller owns a dedicated
+        # stdio MCP helper. Preserve the resumable native thread, but release
+        # this app-server connection's idle subscription so Codex can unload
+        # the thread-scoped MCP stack after its idle grace period.
+        launch_params = self._launch_params.get(instance_id) or {}
+        enabled_skills = launch_params.get("enabled_skills") or {}
+        if (
+            provider == "codex"
+            and enabled_skills.get("sub-agent")
+            and self._codex_app_server is not None
+        ):
+            thread_id = getattr(process, "thread_id", None)
+            if thread_id:
+                try:
+                    await self._codex_app_server.unsubscribe_thread(thread_id)
+                except Exception:
+                    # A queued follow-up may already be resuming this thread.
+                    # In that case its later terminal consumer will retry the
+                    # unsubscribe; never fail completed task bookkeeping.
+                    logger.info(
+                        "Codex controller thread unsubscribe deferred: "
+                        "task=%s thread=%s",
+                        task_id,
+                        thread_id,
+                        exc_info=True,
+                    )
+
         # Never let an old consumer erase a replacement process/consumer.
         # Conditional identity checks also make cleanup safe if a caller
         # bypasses ``launch`` and installs a turn directly in the maps.

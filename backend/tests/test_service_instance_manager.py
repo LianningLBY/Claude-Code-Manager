@@ -3694,6 +3694,39 @@ async def test_stderr_is_drained_while_stdout_is_consumed(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_codex_sub_agent_controller_unsubscribes_after_terminal_turn(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="codex-controller-unsubscribe")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+
+    process = _make_mock_process(pid=54_328, returncode=0)
+    process.thread_id = "thread-parent"
+    registry = MagicMock()
+    registry.unsubscribe_thread = AsyncMock(return_value="unsubscribed")
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._codex_app_server = registry
+    im._launch_params[instance_id] = {
+        "provider": "codex",
+        "enabled_skills": {"sub-agent": True},
+    }
+
+    await im._consume_output_impl(
+        instance_id,
+        None,
+        process,
+        provider="codex",
+    )
+
+    registry.unsubscribe_thread.assert_awaited_once_with("thread-parent")
+    assert instance_id not in im._launch_params
+
+
+@pytest.mark.asyncio
 async def test_cancelled_consumer_still_finishes_terminal_cleanup(db_factory):
     """Stop cancellation must not skip exact process/DB finalization."""
 

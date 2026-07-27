@@ -217,6 +217,8 @@ describe('ChatView', () => {
 
       const forkButton = screen.getByLabelText('Fork Codex session');
       expect(forkButton).toHaveClass('h-8', 'w-8');
+      expect(forkButton).toHaveClass('text-gray-500', 'hover:text-indigo-400');
+      expect(forkButton).not.toHaveClass('text-indigo-400');
       await userEvent.click(forkButton);
       expect(await screen.findByText(anchor.content)).toBeInTheDocument();
       expect(api.listForkAnchors).toHaveBeenCalledWith(task.id);

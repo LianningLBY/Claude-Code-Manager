@@ -2097,7 +2097,7 @@ function ForkButton({ onClick, disabled = false }: { onClick: () => void; disabl
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="inline-flex h-8 w-8 items-center justify-center rounded-md text-indigo-400 transition-colors hover:bg-indigo-500/10 hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
+      className="inline-flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-indigo-500/10 hover:text-indigo-400 focus-visible:text-indigo-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
       title={disabled ? '当前 Codex turn 结束后才能分叉' : '从一条用户消息之前的上下文创建 Fork'}
       aria-label="Fork Codex session"
     >

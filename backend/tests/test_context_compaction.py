@@ -3,10 +3,46 @@
 import json
 
 from backend.services.context_compaction import (
+    build_compacted_resume_prompt,
+    build_compacted_task_retry_prompt,
     context_tokens_used,
     is_context_window_exceeded,
     read_codex_rollout_last_usage,
 )
+
+
+def test_compacted_prompt_makes_recent_information_authoritative():
+    prompt = build_compacted_resume_prompt(
+        (
+            "## 近期对话（按真实发生顺序，越靠后越新）\n"
+            "现在使用 20 台节点\n\n"
+            "## 原始任务背景（最低优先级，可能已被近期信息取代）\n"
+            "最初计划使用 24 台节点"
+        ),
+        "现在训练情况怎么样？",
+    )
+
+    assert prompt.startswith("[压缩后会话恢复优先级]")
+    assert "当前消息”默认优先级最高" in prompt
+    assert "当前消息执行期间的后续补充/纠正" in prompt
+    assert "冲突时以该补充/纠正为准" in prompt
+    assert "以近期信息为准" in prompt
+    assert prompt.index("现在使用 20 台节点") < prompt.index("最初计划使用 24 台节点")
+    assert prompt.endswith(
+        "[基础当前消息 — 默认最高优先级]\n现在训练情况怎么样？"
+    )
+    assert prompt.count("现在训练情况怎么样？") == 1
+
+
+def test_compacted_lifecycle_retry_continues_recent_work():
+    prompt = build_compacted_task_retry_prompt(
+        "近期结论：改为 20 台\n\n原始背景：最初计划 24 台"
+    )
+
+    assert prompt.startswith("[Context compacted")
+    assert "近期状态和结论优先" in prompt
+    assert "不要从头重做旧任务" in prompt
+    assert prompt.endswith("原始背景：最初计划 24 台")
 
 
 def test_codex_context_limit_classifier_accepts_protocol_code_and_cli_text():

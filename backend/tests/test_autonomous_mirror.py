@@ -213,6 +213,38 @@ class TestFullMirrorBackend:
         backend._proxies = {}
         return backend
 
+    async def test_empty_reply_retry_uses_unwrapped_current_message(self):
+        im = MagicMock()
+        im._launch_params = {
+            7: {
+                "prompt": "[old compacted summary]\nCURRENT",
+                "current_message": "CURRENT",
+                "source_log_id": 4321,
+                "enabled_skills": {"monitor": True},
+                "model": "claude-opus-4-8",
+                "queue_timestamp": 12.5,
+            },
+        }
+        backend = self._bare_backend(im)
+        backend._get_recent_assistant_texts = AsyncMock(return_value=[])
+        dispatcher = MagicMock()
+        dispatcher.enqueue_message = AsyncMock()
+
+        with patch("backend.main.dispatcher", dispatcher):
+            await backend._maybe_retry_empty_reply(7, 27)
+
+        dispatcher.enqueue_message.assert_awaited_once_with(
+            task_id=27,
+            prompt="CURRENT",
+            priority=0,
+            source="retry",
+            current_message="CURRENT",
+            source_log_id=4321,
+            command_skills={"monitor": True},
+            model_override="claude-opus-4-8",
+            queue_timestamp=12.5,
+        )
+
     async def test_foreground_event_forwards_immutable_consumer_record(self):
         im = MagicMock()
         im._process_event = AsyncMock()

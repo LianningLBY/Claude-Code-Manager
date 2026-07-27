@@ -305,12 +305,30 @@ class FullMirrorCCMBackend(CCMBackend):
             from backend.main import dispatcher
             from backend.services.dispatcher import PRIORITY_USER
 
-            await dispatcher.enqueue_message(
+            current_message = (
+                params.get("current_message")
+                or params["prompt"]
+            )
+            retry_kwargs = dict(
                 task_id=task_id,
-                prompt=params["prompt"],
+                prompt=current_message,
                 priority=PRIORITY_USER,
                 source="retry",
+                current_message=current_message,
             )
+            if isinstance(params.get("enabled_skills"), dict):
+                retry_kwargs["command_skills"] = dict(
+                    params["enabled_skills"]
+                )
+            if isinstance(params.get("model"), str):
+                retry_kwargs["model_override"] = params["model"]
+            if params.get("source_log_id") is not None:
+                retry_kwargs["source_log_id"] = params["source_log_id"]
+            if params.get("queue_timestamp") is not None:
+                retry_kwargs["queue_timestamp"] = params[
+                    "queue_timestamp"
+                ]
+            await dispatcher.enqueue_message(**retry_kwargs)
         except Exception:
             logger.exception(
                 "Empty-reply retry check failed for task %s", task_id

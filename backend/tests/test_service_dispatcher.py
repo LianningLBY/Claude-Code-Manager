@@ -548,6 +548,8 @@ async def test_lifecycle_codex_context_error_compacts_before_retry(db_factory):
         assert current.context_window_usage is None
         assert "[Context compacted]" in current.description
         assert "preserved task context" in current.description
+        assert "近期状态和结论优先" in current.description
+        assert "continue implementation" not in current.description
 
 
 @pytest.mark.asyncio
@@ -4387,6 +4389,24 @@ async def test_watchdog_never_starts_replacement_before_old_cleanup(
 # === Instance contention: queued-message must not steal a claimed instance (task #676) ===
 
 
+@pytest.mark.asyncio
+async def test_retry_queue_timestamp_preserves_original_message_order(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    d._ensure_queue_worker = MagicMock()
+
+    await d.enqueue_message(1, "later message", queue_timestamp=20.0)
+    await d.enqueue_message(1, "older retry", queue_timestamp=10.0)
+
+    queue = d._get_task_queue(1)
+    first = await queue.get()
+    queue.task_done()
+    assert first.prompt == "older retry"
+    assert first.timestamp == 10.0
+    await d.clear_task_queue(1)
+
+
 async def _setup_queued_msg_two_idle(db_factory, monkeypatch):
     """Two idle instances + a resumable task; returns (d, id1, id2, task_id, msg)."""
     import time
@@ -5293,6 +5313,48 @@ async def test_queued_recovery_cas_cannot_revive_concurrent_cancel(
 
 
 @pytest.mark.asyncio
+async def test_missing_session_recovery_uses_recency_wrapper(
+    db_factory,
+    monkeypatch,
+):
+    import backend.api.tasks as tasks_mod
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    msg.source_log_id = 654
+    monkeypatch.setattr(
+        tasks_mod,
+        "_find_session_jsonl",
+        lambda _sid, provider="claude": None,
+    )
+    monkeypatch.setattr(
+        tasks_mod,
+        "_clone_session",
+        AsyncMock(return_value=None),
+    )
+    d._compact_session = AsyncMock(return_value="RECENT_RECOVERY_CONTEXT")
+
+    await d._process_queued_message(task_id, msg)
+
+    d._compact_session.assert_awaited_once()
+    assert (
+        d._compact_session.await_args.kwargs["exclude_log_entry_id"]
+        == 654
+    )
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["resume_session_id"] is None
+    assert "RECENT_RECOVERY_CONTEXT" in launch["prompt"]
+    assert "会话异常中断前的历史摘要" in launch["prompt"]
+    assert launch["prompt"].endswith(
+        "[基础当前消息 — 默认最高优先级]\nhi"
+    )
+    assert launch["current_message"] == "hi"
+    assert launch["source_log_id"] == 654
+
+
+@pytest.mark.asyncio
 async def test_queued_message_never_launches_locally_after_worker_migration(
     db_factory, monkeypatch,
 ):
@@ -5353,6 +5415,7 @@ async def test_codex_precompact_uses_full_context_tokens(
     d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
         db_factory, monkeypatch
     )
+    msg.source_log_id = 321
     d._compact_session = AsyncMock(return_value="compact summary")
     async with db_factory() as db:
         task = await db.get(Task, task_id)
@@ -5372,10 +5435,16 @@ async def test_codex_precompact_uses_full_context_tokens(
     await d._process_queued_message(task_id, msg)
 
     d._compact_session.assert_awaited_once()
+    assert (
+        d._compact_session.await_args.kwargs["exclude_log_entry_id"]
+        == 321
+    )
     launch = d.instance_manager.launch.await_args.kwargs
     assert launch["resume_session_id"] is None
     assert "compact summary" in launch["prompt"]
-    assert "[新消息]\nhi" in launch["prompt"]
+    assert "[基础当前消息 — 默认最高优先级]\nhi" in launch["prompt"]
+    assert launch["current_message"] == "hi"
+    assert launch["source_log_id"] == 321
 
 
 @pytest.mark.asyncio

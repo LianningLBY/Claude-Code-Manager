@@ -431,6 +431,7 @@ async def send_chat_message(
             source="user",
             command_skills=command_skills,
             model_override=body.model,
+            source_log_id=user_log.id,
         )
     except TaskStartPausedError as exc:
         raise HTTPException(

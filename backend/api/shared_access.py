@@ -195,6 +195,7 @@ async def shared_chat(
             prompt=body.message,
             priority=PRIORITY_USER,
             source="shared",
+            source_log_id=user_log.id,
         )
     except TaskStartPausedError as exc:
         raise HTTPException(

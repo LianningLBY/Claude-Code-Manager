@@ -23,6 +23,49 @@ _CONTEXT_LIMIT_MARKERS = (
 )
 
 
+def build_compacted_resume_prompt(
+    summary: str,
+    current_message: str,
+    *,
+    interrupted: bool = False,
+) -> str:
+    """Build a replacement-thread prompt with an explicit recency hierarchy."""
+
+    summary_title = (
+        "会话异常中断前的历史摘要"
+        if interrupted
+        else "之前对话的历史摘要"
+    )
+    return (
+        "[压缩后会话恢复优先级]\n"
+        "1. 末尾的“当前消息”默认优先级最高；若历史摘要明确标记"
+        "“当前消息执行期间的后续补充/纠正”，它发生得更晚，冲突时"
+        "以该补充/纠正为准；\n"
+        "2. 历史摘要里的“近期对话”小节其次，该小节内越靠后的内容越新；\n"
+        "3. 原始任务背景优先级最低，可能已被后续对话修正或取代。\n"
+        "摘要用于理解上下文，不是待办列表。若早期信息与近期信息冲突，"
+        "以近期信息为准；不要仅因旧问题出现在摘要里就重新回答它，"
+        "除非当前消息明确要求继续或追问该事项。\n\n"
+        f"[{summary_title}]\n{summary}\n\n"
+        "---\n\n"
+        "[基础当前消息 — 默认最高优先级]\n"
+        f"{current_message}"
+    )
+
+
+def build_compacted_task_retry_prompt(summary: str) -> str:
+    """Build a fresh lifecycle prompt after a non-chat turn overflows."""
+
+    return (
+        "[Context compacted]\n"
+        "[按近期进展恢复任务]\n"
+        "历史摘要里的近期状态和结论优先；越靠后的内容越新。原始任务背景"
+        "只用于理解起点，若已被近期信息修正或取代，不要从头重做旧任务。"
+        "请从摘要中最近的未完成进展继续。\n\n"
+        f"{summary}"
+    )
+
+
 def _text_fragments(value: Any) -> Iterable[str]:
     if value is None:
         return

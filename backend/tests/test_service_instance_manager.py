@@ -1807,6 +1807,9 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
             config_dir=str(codex_home.resolve()),
             enable_workflows=False,
             enabled_skills=None,
+            source_log_id=4321,
+            current_message="raw work",
+            queue_timestamp=12.5,
         )
 
     assert pid == 7654
@@ -1817,8 +1820,27 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     assert registry.start_turn.await_args.kwargs["mcp_specs"] == ()
     assert im.get_config_dir(inst.id) == str(codex_home.resolve())
     assert im._launch_params[inst.id]["config_dir"] == str(codex_home.resolve())
+    assert im._launch_params[inst.id]["source_log_id"] == 4321
+    assert im._launch_params[inst.id]["current_message"] == "raw work"
+    assert im._launch_params[inst.id]["queue_timestamp"] == 12.5
     await asyncio.sleep(0.1)
     im.task_message_enqueuer.assert_awaited_once()
+    assert (
+        im.task_message_enqueuer.await_args.kwargs["source_log_id"]
+        == 4321
+    )
+    assert (
+        im.task_message_enqueuer.await_args.kwargs["current_message"]
+        == "raw work"
+    )
+    assert (
+        im.task_message_enqueuer.await_args.kwargs["model_override"]
+        == "gpt-5.5"
+    )
+    assert (
+        im.task_message_enqueuer.await_args.kwargs["queue_timestamp"]
+        == 12.5
+    )
 
 
 @pytest.mark.asyncio
@@ -3144,6 +3166,7 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         "provider": "codex",
         "prompt": "preserve this exact user prompt",
         "model": "gpt-5.5",
+        "queue_timestamp": 42.5,
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
 
@@ -3163,6 +3186,7 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         source="routing_retry",
         command_skills=None,
         model_override="gpt-5.5",
+        queue_timestamp=42.5,
     )
     async with db_factory() as db:
         refreshed_task = await db.get(Task, task.id)
@@ -8568,8 +8592,12 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
     manager = InstanceManager(db_factory, broadcaster)
     manager.processes[instance_id] = process
     manager._launch_params[instance_id] = {
-        "prompt": "continue the task",
+        "prompt": "[already wrapped history]\ncontinue the task",
+        "current_message": "continue the task",
         "provider": "codex",
+        "source_log_id": 321,
+        "enabled_skills": {"sub-agent": True},
+        "model": "gpt-5.6-terra",
     }
 
     dispatcher = MagicMock()
@@ -8599,11 +8627,28 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
         await consumer
 
     dispatcher._compact_session.assert_awaited_once()
+    assert (
+        dispatcher._compact_session.await_args.kwargs[
+            "exclude_log_entry_id"
+        ]
+        == 321
+    )
+    assert (
+        dispatcher._compact_session.await_args.kwargs[
+            "post_source_injects_are_current"
+        ]
+        is True
+    )
     dispatcher.enqueue_message.assert_awaited_once()
     retry = dispatcher.enqueue_message.await_args.kwargs
     assert retry["source"] == "compact_retry"
+    assert retry["source_log_id"] == 321
+    assert retry["current_message"] == "continue the task"
+    assert retry["command_skills"] == {"sub-agent": True}
+    assert retry["model_override"] == "gpt-5.6-terra"
     assert "durable summary" in retry["prompt"]
     assert "continue the task" in retry["prompt"]
+    assert "already wrapped history" not in retry["prompt"]
 
 
 @pytest.mark.asyncio

@@ -663,6 +663,7 @@ async def test_chat_send_enqueues_message(client, session_factory):
     assert kwargs["prompt"] == "hi"
     assert kwargs["priority"] == PRIORITY_USER
     assert kwargs["source"] == "user"
+    assert isinstance(kwargs["source_log_id"], int)
 
     # User message broadcast to task channel before enqueue
     task_broadcasts = [
@@ -780,6 +781,10 @@ async def test_shared_chat_sender_prefix_is_display_only(client, session_factory
 
     assert response["queued"] is True
     assert mock_d.enqueue_message.call_args.kwargs["prompt"] == "[TODO] keep the tag"
+    assert isinstance(
+        mock_d.enqueue_message.call_args.kwargs["source_log_id"],
+        int,
+    )
     async with session_factory() as db:
         stored = (await db.execute(
             select(LogEntry).where(
@@ -1096,6 +1101,245 @@ async def test_model_history_rebuild_uses_raw_user_content(db_factory):
         assert "[Alice]" not in model_input
         assert "[BUG] preserve this tag" in model_input
         assert "[Monitor #7] keep this operational label" in model_input
+
+
+@pytest.mark.asyncio
+async def test_compaction_prefers_final_recent_facts_and_excludes_current_row(
+    db_factory,
+):
+    """Old task text and process chatter must not outrank the latest facts."""
+    import json
+
+    from backend.models.log_entry import LogEntry
+    from backend.services.context_compaction import (
+        build_compacted_resume_prompt,
+    )
+
+    async with db_factory() as db:
+        task = Task(
+            title="Compaction recency",
+            description="OLD_BACKGROUND: inspect Task 90 with 24 nodes",
+            status="completed",
+            target_repo="/tmp",
+            session_id="history-session",
+        )
+        db.add(task)
+        await db.flush()
+        prior = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="[Alice] check the active training",
+            raw_json=json.dumps({
+                "sender_name": "Alice",
+                "raw_content": "check the active training",
+            }),
+            is_error=False,
+        )
+        db.add(prior)
+        await db.flush()
+        db.add_all([
+            LogEntry(
+                instance_id=None,
+                task_id=task.id,
+                event_type="message",
+                role="assistant",
+                content="PROCESS_CHATTER: I will check it now",
+                is_error=False,
+            ),
+            LogEntry(
+                instance_id=None,
+                task_id=task.id,
+                event_type="message",
+                role="assistant",
+                content="RECENT_FINAL: job 0738z is running on 20 nodes",
+                is_error=False,
+            ),
+        ])
+        current = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="CURRENT_REQUEST: what is the latest loss?",
+            raw_json=json.dumps({
+                "raw_content": "CURRENT_REQUEST: what is the latest loss?",
+            }),
+            is_error=False,
+        )
+        db.add(current)
+        await db.flush()
+        # A different ordinary message can already be queued behind the
+        # current turn. It has not run yet and must neither enter this retry
+        # nor hide a later live injection into the current turn.
+        db.add(
+            LogEntry(
+                instance_id=None,
+                task_id=task.id,
+                event_type="user_message",
+                role="user",
+                content="FUTURE_REQUEST: stop it",
+                raw_json=json.dumps({
+                    "raw_content": "FUTURE_REQUEST: stop it",
+                }),
+                is_error=False,
+            )
+        )
+        await db.flush()
+        db.add_all([
+            LogEntry(
+                instance_id=None,
+                task_id=task.id,
+                event_type="user_message",
+                role="user",
+                content="INJECTED_CORRECTION: use the live job, not Task 90",
+                raw_json=json.dumps({
+                    "source": "inject",
+                    "raw_content": (
+                        "INJECTED_CORRECTION: use the live job, not Task 90"
+                    ),
+                }),
+                is_error=False,
+            ),
+            LogEntry(
+                instance_id=None,
+                task_id=task.id,
+                event_type="message",
+                role="assistant",
+                content="INJECTED_FINAL: live job is healthy",
+                is_error=False,
+            ),
+        ])
+        await db.commit()
+
+        dispatcher = _make_dispatcher(db_factory)
+        compacted = await dispatcher._compact_session(
+            task.id,
+            task.session_id,
+            db,
+            exclude_log_entry_id=current.id,
+            post_source_injects_are_current=True,
+        )
+
+    assert compacted is not None
+    assert "check the active training" in compacted
+    assert "[Alice]" not in compacted
+    assert "RECENT_FINAL: job 0738z is running on 20 nodes" in compacted
+    assert "PROCESS_CHATTER" not in compacted
+    assert "CURRENT_REQUEST" not in compacted
+    assert "INJECTED_CORRECTION: use the live job, not Task 90" in compacted
+    assert "INJECTED_FINAL: live job is healthy" in compacted
+    assert "FUTURE_REQUEST" not in compacted
+    assert "当前消息执行期间的后续补充/纠正" in compacted
+    assert "冲突时以此为准" in compacted
+    assert compacted.index("## 近期对话") < compacted.index(
+        "## 原始任务背景"
+    )
+
+    resumed = build_compacted_resume_prompt(
+        compacted,
+        "CURRENT_REQUEST: what is the latest loss?",
+    )
+    assert resumed.count("CURRENT_REQUEST: what is the latest loss?") == 1
+    assert "冲突时以该补充/纠正为准" in resumed
+    assert resumed.endswith(
+        "[基础当前消息 — 默认最高优先级]\n"
+        "CURRENT_REQUEST: what is the latest loss?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_lifecycle_compaction_does_not_nest_old_wrapper(
+    db_factory,
+):
+    from backend.models.log_entry import LogEntry
+
+    async with db_factory() as db:
+        task = Task(
+            title="Repeated compaction",
+            description=(
+                "[Context compacted]\n"
+                "NESTED_OLD_SUMMARY that must not be wrapped again\n\n"
+                "## 原始任务背景（最低优先级，可能已被近期信息取代）\n"
+                "ORIGINAL_ACCEPTANCE: preserve this invariant"
+            ),
+            status="executing",
+            target_repo="/tmp",
+            session_id="second-session",
+        )
+        db.add(task)
+        await db.flush()
+        db.add_all([
+            LogEntry(
+                task_id=task.id,
+                event_type="user_message",
+                role="user",
+                content="RECENT_STAGE",
+                is_error=False,
+            ),
+            LogEntry(
+                task_id=task.id,
+                event_type="message",
+                role="assistant",
+                content="RECENT_RESULT",
+                is_error=False,
+            ),
+        ])
+        await db.commit()
+
+        dispatcher = _make_dispatcher(db_factory)
+        compacted = await dispatcher._compact_session(
+            task.id,
+            task.session_id,
+            db,
+        )
+
+    assert compacted is not None
+    assert "RECENT_STAGE" in compacted
+    assert "RECENT_RESULT" in compacted
+    assert "NESTED_OLD_SUMMARY" not in compacted
+    assert "[Context compacted]" not in compacted
+    assert "ORIGINAL_ACCEPTANCE: preserve this invariant" in compacted
+
+
+@pytest.mark.asyncio
+async def test_legacy_lifecycle_wrapper_preserves_background_head_and_tail(
+    db_factory,
+):
+    original = (
+        "ORIGINAL_HEAD: keep the task identity\n"
+        + ("middle context " * 220)
+        + "\nORIGINAL_TAIL_ACCEPTANCE: preserve this final invariant"
+    )
+    async with db_factory() as db:
+        task = Task(
+            title="Legacy repeated compaction",
+            description=(
+                "[Context compacted]\n"
+                "LEGACY_OLD_SUMMARY that must not be retained"
+                "\n\n---\n\n"
+                f"{original}"
+            ),
+            status="executing",
+            target_repo="/tmp",
+            session_id="legacy-second-session",
+        )
+        db.add(task)
+        await db.commit()
+
+        dispatcher = _make_dispatcher(db_factory)
+        compacted = await dispatcher._compact_session(
+            task.id,
+            task.session_id,
+            db,
+        )
+
+    assert compacted is not None
+    assert "LEGACY_OLD_SUMMARY" not in compacted
+    assert "ORIGINAL_HEAD: keep the task identity" in compacted
+    assert "ORIGINAL_TAIL_ACCEPTANCE: preserve this final invariant" in compacted
+    assert "...[中间省略]..." in compacted
 
 
 @pytest.fixture

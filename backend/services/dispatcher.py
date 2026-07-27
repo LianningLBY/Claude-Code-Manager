@@ -27,6 +27,8 @@ from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
 from backend.services.git_config import merge_git_config, settings_to_dict
 from backend.services.context_compaction import (
+    build_compacted_resume_prompt,
+    build_compacted_task_retry_prompt,
     context_tokens_used,
     is_context_window_exceeded,
 )
@@ -248,6 +250,12 @@ class QueuedMessage:
     # Source monitor/sub-agent session ID for dedup (frontend uses this to
     # render [Monitor] / [Sub-Agent] badges on injected user_message bubbles)
     monitor_session_id: int | None = field(compare=False, default=None)
+    # The API persists a visible user row before queue admission.  Keep its
+    # exact id so compaction can exclude the current request from history.
+    source_log_id: int | None = field(compare=False, default=None)
+    # Immutable model-facing request. ``prompt`` may later be wrapped with a
+    # compacted history; retries must not treat that wrapper as a new request.
+    current_message: str | None = field(compare=False, default=None)
     # A routing retry reuses this same object. Monitor/sub-agent source bubbles
     # are persisted/broadcast once, not once per account-maintenance retry.
     source_logged: bool = field(compare=False, default=False)
@@ -4819,9 +4827,8 @@ class GlobalDispatcher:
                                             context_window_usage=None,
                                             status="pending",
                                             instance_id=None,
-                                            description=(
-                                                f"[Context compacted]\n{summary}"
-                                                f"\n\n---\n\n{t.description or ''}"
+                                            description=build_compacted_task_retry_prompt(
+                                                summary
                                             ),
                                         )
                                     )
@@ -7306,6 +7313,9 @@ class GlobalDispatcher:
         command_skills: dict | None = None,
         model_override: str | None = None,
         monitor_session_id: int | None = None,
+        source_log_id: int | None = None,
+        current_message: str | None = None,
+        queue_timestamp: float | None = None,
     ):
         """Enqueue a message for the main agent of a task.
 
@@ -7320,13 +7330,19 @@ class GlobalDispatcher:
             )
         msg = QueuedMessage(
             priority=priority,
-            timestamp=time.monotonic(),
+            timestamp=(
+                time.monotonic()
+                if queue_timestamp is None
+                else queue_timestamp
+            ),
             prompt=prompt,
             source=source,
             user_message_text=user_message_text,
             command_skills=command_skills,
             model_override=model_override,
             monitor_session_id=monitor_session_id,
+            source_log_id=source_log_id,
+            current_message=prompt if current_message is None else current_message,
         )
         async with self._dispatch_claim_lock:
             if self._maintenance_shutdown_committed:
@@ -7769,6 +7785,10 @@ class GlobalDispatcher:
         cleanup_state: dict,
     ):
         """Resume main agent session with a queued message."""
+        if msg.current_message is None:
+            # Tests and a few internal callers construct QueuedMessage
+            # directly instead of going through enqueue_message().
+            msg.current_message = msg.prompt
         # Phase 1: read task state, find idle instance, launch process
         inst_id: int | None = None
         original_skills: dict = {}
@@ -7879,14 +7899,18 @@ class GlobalDispatcher:
                     # JSONL file missing, fall back to compact summary
                     logger.warning("Task %d JSONL not found, falling back to compact summary", task_id)
                     summary = await self._compact_session(
-                        task_id, recovery_session_id, db
+                        task_id,
+                        recovery_session_id,
+                        db,
+                        exclude_log_entry_id=msg.source_log_id,
                     )
                     recovered_session_id = None
                     recovered_context_usage = None
                     if summary:
-                        recovered_prompt = (
-                            f"[上下文摘要 — 之前的对话记录（会话异常中断后恢复）]\n{summary}\n\n"
-                            f"---\n\n[新消息]\n{msg.prompt}"
+                        recovered_prompt = build_compacted_resume_prompt(
+                            summary,
+                            msg.current_message,
+                            interrupted=True,
                         )
                 else:
                     logger.info(
@@ -8117,7 +8141,12 @@ class GlobalDispatcher:
                         task_id, utilization * 100, used_tokens, window,
                     )
                     # 收集最近对话摘要
-                    summary = await self._compact_session(task_id, task.session_id, db)
+                    summary = await self._compact_session(
+                        task_id,
+                        task.session_id,
+                        db,
+                        exclude_log_entry_id=msg.source_log_id,
+                    )
                     if summary:
                         # 清空 session_id → 下次 launch 开新 session，prompt 带摘要
                         task.session_id = None
@@ -8142,9 +8171,9 @@ class GlobalDispatcher:
                             "role": "system",
                             "content": notice,
                         })
-                        msg.prompt = (
-                            f"[上下文摘要 — 之前的对话记录]\n{summary}\n\n"
-                            f"---\n\n[新消息]\n{msg.prompt}"
+                        msg.prompt = build_compacted_resume_prompt(
+                            summary,
+                            msg.current_message,
                         )
                         msg.allow_new_session = True
                         logger.info("Task %d compacted, new session will start with summary", task_id)
@@ -8166,6 +8195,9 @@ class GlobalDispatcher:
                 enable_workflows=task.enable_workflows,
                 enabled_skills=effective_skills,
                 system_prompt_mode=task.system_prompt_mode,
+                source_log_id=msg.source_log_id,
+                current_message=msg.current_message,
+                queue_timestamp=msg.timestamp,
             )
             inst_id = inst.id
             task_provider = (task.provider or "claude").lower()
@@ -8295,6 +8327,9 @@ class GlobalDispatcher:
                 if monitor_log is not None:
                     db.add(monitor_log)
                 await db.commit()
+                if monitor_log is not None:
+                    msg.source_log_id = monitor_log.id
+                    launch_kwargs["source_log_id"] = monitor_log.id
             if broadcast_data is not None:
                 await self.broadcaster.broadcast(
                     f"task:{task_id}", broadcast_data
@@ -8535,63 +8570,259 @@ class GlobalDispatcher:
             # must never manufacture a successful ``completed`` generation.
             pass
 
-    async def _compact_session(self, task_id: int, session_id: str, db) -> str | None:
-        """收集当前 session 的对话摘要，用于上下文压缩后带入新 session。
+    async def _compact_session(
+        self,
+        task_id: int,
+        session_id: str,
+        db,
+        *,
+        exclude_log_entry_id: int | None = None,
+        post_source_injects_are_current: bool = False,
+    ) -> str | None:
+        """Collect recent logged history for a replacement native session.
 
-        取最近的 user_message + assistant message 对，拼成摘要文本。
-        保留最后 10 轮对话的要点，更早的只保留 task description。
+        Log rows do not currently carry a native session id, so ``session_id``
+        identifies the caller's generation rather than filtering the query.
+        The current user row is bounded by its exact id, so the same request
+        cannot appear in both the historical summary and the new-message
+        section. Later ordinary queued requests are excluded, while live
+        injections made into the still-active turn are retained.
         """
+
+        del session_id
         try:
             from backend.models.log_entry import LogEntry
             from backend.models.task import Task
 
             task = await db.get(Task, task_id)
-            parts = []
 
-            # 任务原始描述
-            if task and task.description:
-                parts.append(f"## 任务描述\n{task.description[:2000]}")
-
-            # 最近的对话轮次
-            result = await db.execute(
+            user_conditions = [
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            ]
+            if exclude_log_entry_id is not None:
+                user_conditions.append(LogEntry.id < exclude_log_entry_id)
+            user_result = await db.execute(
                 select(LogEntry)
-                .where(
-                    LogEntry.task_id == task_id,
-                    LogEntry.event_type.in_(["user_message", "message", "result"]),
-                )
+                .where(*user_conditions)
                 .order_by(LogEntry.id.desc())
-                .limit(30)
+                .limit(8)
             )
-            entries = list(reversed(result.scalars().all()))
+            users = list(reversed(user_result.scalars().all()))
 
-            # 提取最近 10 轮 user→assistant 对
-            rounds = []
-            current_user = None
-            for e in entries:
-                if e.event_type == "user_message":
-                    user_content = e.content or ""
-                    if e.raw_json:
-                        try:
-                            raw = json.loads(e.raw_json)
-                            if isinstance(raw, dict) and isinstance(raw.get("raw_content"), str):
-                                user_content = raw["raw_content"]
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                    current_user = user_content[:500]
-                elif e.event_type in ("message", "result") and e.role == "assistant":
-                    content = (e.content or "")[:1000]
-                    if current_user:
-                        rounds.append(f"用户: {current_user}\n助手: {content}")
-                        current_user = None
+            def _user_text(entry: LogEntry) -> tuple[str, str]:
+                content = entry.content or ""
+                source = ""
+                if entry.raw_json:
+                    try:
+                        raw = json.loads(entry.raw_json)
+                        if isinstance(raw, dict):
+                            if isinstance(raw.get("raw_content"), str):
+                                content = raw["raw_content"]
+                            if isinstance(raw.get("source"), str):
+                                source = raw["source"]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                return content[:600], source
 
-            if rounds:
-                # 保留最近 10 轮
-                recent = rounds[-10:]
-                parts.append("## 最近对话（摘要）\n" + "\n\n".join(recent))
+            async def _last_assistant_between(
+                lower_id: int,
+                upper_id: int | None,
+            ) -> LogEntry | None:
+                conditions = [
+                    LogEntry.task_id == task_id,
+                    LogEntry.id > lower_id,
+                    or_(
+                        LogEntry.event_type == "result",
+                        (
+                            (LogEntry.event_type == "message")
+                            & (LogEntry.role == "assistant")
+                        ),
+                    ),
+                    LogEntry.content.is_not(None),
+                    LogEntry.content != "",
+                    LogEntry.is_error.is_(False),
+                ]
+                if upper_id is not None:
+                    conditions.append(LogEntry.id < upper_id)
+                result = await db.execute(
+                    select(LogEntry)
+                    .where(*conditions)
+                    .order_by(LogEntry.id.desc())
+                    .limit(1)
+                )
+                return result.scalar_one_or_none()
+
+            history_blocks: list[str] = []
+            for index, user_entry in enumerate(users):
+                next_user_id = (
+                    users[index + 1].id
+                    if index + 1 < len(users)
+                    else exclude_log_entry_id
+                )
+                user_content, source = _user_text(user_entry)
+                label = (
+                    "用户当时的执行中补充/纠正"
+                    if source == "inject"
+                    else "用户当时的消息"
+                )
+                block = f"[{label}]\n{user_content}"
+                assistant_entry = await _last_assistant_between(
+                    user_entry.id,
+                    next_user_id,
+                )
+                if assistant_entry is not None:
+                    block += (
+                        "\n\n[该阶段助手的最后输出]\n"
+                        f"{(assistant_entry.content or '')[:1200]}"
+                    )
+                history_blocks.append(block)
+
+            # A later ordinary user row is only queued while this task's single
+            # consumer is still processing the current turn.  It therefore
+            # must not hide a still-later live injection into the active turn.
+            # Keep all explicit injections but never import ordinary queued
+            # requests. queue_timestamp preserves their execution order when
+            # this turn is retried after compaction.
+            if exclude_log_entry_id is not None:
+                later_users_result = await db.execute(
+                    select(LogEntry)
+                    .where(
+                        LogEntry.task_id == task_id,
+                        LogEntry.event_type == "user_message",
+                        LogEntry.id > exclude_log_entry_id,
+                    )
+                    .order_by(LogEntry.id.asc())
+                )
+                queued_during_previous_turn: list[LogEntry] = []
+                for later_user in later_users_result.scalars().all():
+                    _, source = _user_text(later_user)
+                    if source == "inject":
+                        queued_during_previous_turn.append(later_user)
+                post_current_blocks: list[tuple[int, str]] = []
+                for injected_user in queued_during_previous_turn:
+                    injected_content, _ = _user_text(injected_user)
+                    if post_source_injects_are_current:
+                        inject_label = (
+                            "当前消息执行期间的后续补充/纠正"
+                            "（比基础当前消息更新，冲突时以此为准）"
+                        )
+                    else:
+                        inject_label = (
+                            "当前消息排队期间对上一阶段的补充/纠正"
+                        )
+                    post_current_blocks.append(
+                        (
+                            injected_user.id,
+                            f"[{inject_label}]\n"
+                            f"{injected_content}",
+                        )
+                    )
+                trailing_assistant = await _last_assistant_between(
+                    exclude_log_entry_id,
+                    None,
+                )
+                if trailing_assistant is not None:
+                    trailing_label = (
+                        "当前消息执行期间的最后输出（最新状态）"
+                        if post_source_injects_are_current
+                        else "当前消息排队期间完成的上一阶段最后输出"
+                    )
+                    post_current_blocks.append(
+                        (
+                            trailing_assistant.id,
+                            f"[{trailing_label}]\n"
+                            f"{(trailing_assistant.content or '')[:1200]}",
+                        )
+                    )
+                history_blocks.extend(
+                    block
+                    for _, block in sorted(post_current_blocks)
+                )
+
+            # Prefer complete recent stages over a wide but shallow history.
+            # Walk backwards under a fixed budget, then restore chronological
+            # order.  Old stages are the first thing discarded.
+            recent_blocks: list[str] = []
+            remaining = 6500
+            for block in reversed(history_blocks):
+                if len(block) > remaining:
+                    if recent_blocks:
+                        continue
+                    block = block[:remaining]
+                recent_blocks.append(block)
+                remaining -= len(block) + 2
+                if remaining <= 0:
+                    break
+            recent_blocks.reverse()
+
+            parts: list[str] = []
+            if recent_blocks:
+                parts.append(
+                    "## 近期对话（按真实发生顺序，越靠后越新）\n"
+                    + "\n\n".join(recent_blocks)
+                )
+
+            # Put the original description last and label it explicitly.  It
+            # is provenance, not an instruction that should outrank months of
+            # follow-up conversation.
+            def _truncate_background(
+                text: str,
+                limit: int = 2000,
+            ) -> str:
+                if len(text) <= limit:
+                    return text
+                omission = "\n...[中间省略]...\n"
+                head_length = (limit - len(omission)) // 2
+                tail_length = limit - len(omission) - head_length
+                return (
+                    text[:head_length]
+                    + omission
+                    + text[-tail_length:]
+                )
+
+            original_background = task.description if task else None
+            if (
+                original_background
+                and original_background.lstrip().startswith(
+                    "[Context compacted]"
+                )
+            ):
+                # Lifecycle retries replace Task.description with a compacted
+                # wrapper. On a later overflow, retain only the stable original
+                # background section instead of recursively nesting the whole
+                # previous summary and its recovery instructions.
+                marker_index = original_background.rfind(
+                    "## 原始任务背景（"
+                )
+                if marker_index >= 0:
+                    marker_end = original_background.find(
+                        "\n",
+                        marker_index,
+                    )
+                    original_background = (
+                        original_background[marker_end + 1 :].strip()
+                        if marker_end >= 0
+                        else None
+                    )
+                else:
+                    # Compatibility with the legacy lifecycle wrapper:
+                    # [Context compacted]\n{summary}\n\n---\n\n{original}
+                    legacy_separator = "\n\n---\n\n"
+                    if legacy_separator in original_background:
+                        original_background = original_background.rsplit(
+                            legacy_separator,
+                            1,
+                        )[1].strip()
+                    else:
+                        original_background = None
+            if original_background:
+                parts.append(
+                    "## 原始任务背景（最低优先级，可能已被近期信息取代）\n"
+                    f"{_truncate_background(original_background)}"
+                )
 
             summary = "\n\n".join(parts)
-            if len(summary) > 8000:
-                summary = summary[-8000:]
             return summary if summary.strip() else None
         except Exception as e:
             logger.exception("compact session failed for task %d: %s", task_id, e)

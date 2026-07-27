@@ -19,6 +19,7 @@ from backend.models.task import Task
 
 from backend.models.log_entry import LogEntry
 from backend.services.context_compaction import (
+    build_compacted_resume_prompt,
     is_context_window_exceeded,
     read_codex_rollout_last_usage,
 )
@@ -522,6 +523,9 @@ class InstanceManager:
         enable_workflows: bool = False,
         enabled_skills: dict | None = None,
         system_prompt_mode: str | None = None,
+        source_log_id: int | None = None,
+        current_message: str | None = None,
+        queue_timestamp: float | None = None,
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
@@ -590,6 +594,9 @@ class InstanceManager:
                                 enable_workflows=enable_workflows,
                                 enabled_skills=enabled_skills,
                                 system_prompt_mode=system_prompt_mode,
+                                source_log_id=source_log_id,
+                                current_message=current_message,
+                                queue_timestamp=queue_timestamp,
                             )
                     except BaseException:
                         current_process = (
@@ -663,6 +670,9 @@ class InstanceManager:
         enable_workflows: bool = False,
         enabled_skills: dict | None = None,
         system_prompt_mode: str | None = None,
+        source_log_id: int | None = None,
+        current_message: str | None = None,
+        queue_timestamp: float | None = None,
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -862,6 +872,9 @@ class InstanceManager:
                         enabled_skills=enabled_skills,
                         task_retry_count=task_retry_count,
                         mcp_specs=codex_mcp_specs,
+                        source_log_id=source_log_id,
+                        current_message=current_message,
+                        queue_timestamp=queue_timestamp,
                     )
                 except CodexRequiredMcpPreTurnError:
                     if (
@@ -932,6 +945,9 @@ class InstanceManager:
                 container_exec_spec=_container_exec_spec,
                 task_retry_count=task_retry_count,
                 cloudrouter_api=cloudrouter_account is not None,
+                source_log_id=source_log_id,
+                current_message=current_message,
+                queue_timestamp=queue_timestamp,
             )
 
         cmd = self._build_command(
@@ -1154,6 +1170,9 @@ class InstanceManager:
                 "enabled_skills": enabled_skills,
                 "provider": provider,
                 "config_dir": config_dir,
+                "source_log_id": source_log_id,
+                "current_message": current_message or prompt,
+                "queue_timestamp": queue_timestamp,
             }
 
         return await self._persist_and_track_launch(
@@ -1434,6 +1453,9 @@ class InstanceManager:
         enabled_skills: dict | None,
         task_retry_count: int | None = None,
         mcp_specs: Sequence["McpServerSpec"] = (),
+        source_log_id: int | None = None,
+        current_message: str | None = None,
+        queue_timestamp: float | None = None,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -1476,6 +1498,9 @@ class InstanceManager:
                 "enabled_skills": enabled_skills,
                 "provider": "codex",
                 "config_dir": config_dir,
+                "source_log_id": source_log_id,
+                "current_message": current_message or prompt,
+                "queue_timestamp": queue_timestamp,
             }
 
         try:
@@ -1996,6 +2021,9 @@ class InstanceManager:
         container_exec_spec=None,
         task_retry_count: int | None = None,
         cloudrouter_api: bool = False,
+        source_log_id: int | None = None,
+        current_message: str | None = None,
+        queue_timestamp: float | None = None,
     ) -> int:
         """PTY-mode launch: delegate to claude_pty, mirror -p bookkeeping.
 
@@ -2041,6 +2069,9 @@ class InstanceManager:
                 "enabled_skills": enabled_skills,
                 "provider": "claude",
                 "config_dir": config_dir,
+                "source_log_id": source_log_id,
+                "current_message": current_message or prompt,
+                "queue_timestamp": queue_timestamp,
             }
             self._launch_params[instance_id] = pty_launch_params
         try:
@@ -3331,12 +3362,28 @@ class InstanceManager:
                         task_id, combined[:80],
                     )
                     from backend.services.dispatcher import PRIORITY_USER
-                    await enqueuer(
+                    retry_kwargs = dict(
                         task_id=task_id,
-                        prompt=params["prompt"],
+                        prompt=params.get("current_message") or params["prompt"],
                         priority=PRIORITY_USER,
                         source="retry",
+                        current_message=(
+                            params.get("current_message") or params["prompt"]
+                        ),
                     )
+                    if isinstance(params.get("enabled_skills"), dict):
+                        retry_kwargs["command_skills"] = dict(
+                            params["enabled_skills"]
+                        )
+                    if isinstance(params.get("model"), str):
+                        retry_kwargs["model_override"] = params["model"]
+                    if params.get("source_log_id") is not None:
+                        retry_kwargs["source_log_id"] = params["source_log_id"]
+                    if params.get("queue_timestamp") is not None:
+                        retry_kwargs["queue_timestamp"] = params[
+                            "queue_timestamp"
+                        ]
+                    await enqueuer(**retry_kwargs)
                 # Still clean up instance below so it's available for the retry
                 # fall through to normal cleanup
 
@@ -3378,10 +3425,20 @@ class InstanceManager:
                             )
                             compacted_session_id = task.session_id
                             compacted_status = task.status
+                            params = self._launch_params.get(instance_id, {})
+                            compact_kwargs = {}
+                            if params.get("source_log_id") is not None:
+                                compact_kwargs["exclude_log_entry_id"] = (
+                                    params["source_log_id"]
+                                )
+                                compact_kwargs[
+                                    "post_source_injects_are_current"
+                                ] = True
                             summary = await dispatcher._compact_session(
                                 task_id,
                                 compacted_session_id,
                                 db,
+                                **compact_kwargs,
                             )
                             if summary:
                                 compact_generation_predicates = [
@@ -3416,12 +3473,43 @@ class InstanceManager:
                                 else:
                                     await db.commit()
                                     from backend.services.dispatcher import PRIORITY_USER
-                                    params = self._launch_params.get(instance_id, {})
-                                    await dispatcher.enqueue_message(
+                                    current_message = (
+                                        params.get("current_message")
+                                        or params.get("prompt")
+                                        or "continue"
+                                    )
+                                    retry_kwargs = dict(
                                         task_id=task_id,
-                                        prompt=f"[Context compacted — previous conversation summary]\n{summary}\n\n---\n\n[Message]\n{params.get('prompt', 'continue')}",
+                                        prompt=build_compacted_resume_prompt(
+                                            summary,
+                                            current_message,
+                                            interrupted=True,
+                                        ),
                                         priority=PRIORITY_USER,
                                         source="compact_retry",
+                                        current_message=current_message,
+                                    )
+                                    if isinstance(
+                                        params.get("enabled_skills"),
+                                        dict,
+                                    ):
+                                        retry_kwargs["command_skills"] = dict(
+                                            params["enabled_skills"]
+                                        )
+                                    if isinstance(params.get("model"), str):
+                                        retry_kwargs["model_override"] = params[
+                                            "model"
+                                        ]
+                                    if params.get("source_log_id") is not None:
+                                        retry_kwargs["source_log_id"] = (
+                                            params["source_log_id"]
+                                        )
+                                    if params.get("queue_timestamp") is not None:
+                                        retry_kwargs["queue_timestamp"] = (
+                                            params["queue_timestamp"]
+                                        )
+                                    await dispatcher.enqueue_message(
+                                        **retry_kwargs
                                     )
                 except Exception:
                     logger.exception(
@@ -3915,6 +4003,9 @@ class InstanceManager:
                 provider=provider,
                 enable_workflows=params.get("enable_workflows", False),
                 enabled_skills=params.get("enabled_skills"),
+                source_log_id=params.get("source_log_id"),
+                current_message=params.get("current_message"),
+                queue_timestamp=params.get("queue_timestamp"),
             )
             return True
 
@@ -3979,22 +4070,31 @@ class InstanceManager:
 
             if not dispatcher:
                 return False
-            await dispatcher.enqueue_message(
-                task_id=task_id,
-                prompt=prompt,
-                priority=PRIORITY_USER,
-                source="routing_retry",
-                command_skills=(
+            requeue_kwargs = {
+                "task_id": task_id,
+                "prompt": prompt,
+                "priority": PRIORITY_USER,
+                "source": "routing_retry",
+                "command_skills": (
                     dict(params["enabled_skills"])
                     if isinstance(params.get("enabled_skills"), dict)
                     else None
                 ),
-                model_override=(
+                "model_override": (
                     params["model"]
                     if isinstance(params.get("model"), str)
                     else None
                 ),
-            )
+            }
+            if params.get("source_log_id") is not None:
+                requeue_kwargs["source_log_id"] = params["source_log_id"]
+            if params.get("current_message") is not None:
+                requeue_kwargs["current_message"] = params["current_message"]
+            if params.get("queue_timestamp") is not None:
+                requeue_kwargs["queue_timestamp"] = params[
+                    "queue_timestamp"
+                ]
+            await dispatcher.enqueue_message(**requeue_kwargs)
             logger.warning(
                 "%s chat task %d %s routing failed; requeued original "
                 "prompt for safe retry: %s",
@@ -4086,6 +4186,9 @@ class InstanceManager:
                     provider="codex",
                     enable_workflows=params.get("enable_workflows", False),
                     enabled_skills=params.get("enabled_skills"),
+                    source_log_id=params.get("source_log_id"),
+                    current_message=params.get("current_message"),
+                    queue_timestamp=params.get("queue_timestamp"),
                 )
                 return True
 
@@ -4217,6 +4320,9 @@ class InstanceManager:
                 config_dir=new_config_dir,
                 enable_workflows=params.get("enable_workflows", False),
                 enabled_skills=params.get("enabled_skills"),
+                source_log_id=params.get("source_log_id"),
+                current_message=params.get("current_message"),
+                queue_timestamp=params.get("queue_timestamp"),
             )
             return True
 

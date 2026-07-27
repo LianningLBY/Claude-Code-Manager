@@ -377,7 +377,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             .map(([k]) => Number(k)),
         } : {}),
         ...(starOnCreate ? { starred: true } : {}),
-        ...(cloneFromTaskId ? { clone_from_task_id: cloneFromTaskId as number } : {}),
+        ...(provider === 'claude' && cloneFromTaskId
+          ? { clone_from_task_id: cloneFromTaskId as number }
+          : {}),
       });
       setDescription('');
       fileUpload.clear();

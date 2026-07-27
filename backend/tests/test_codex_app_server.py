@@ -585,12 +585,17 @@ async def test_notifications_stream_delta_and_finish_process():
             break
         lines.append(json.loads(line))
     assert lines[0] == {
-        "type": "item.agent_message.delta", "delta": "Hel", "item_id": "msg-1"
+        "type": "item.agent_message.delta",
+        "delta": "Hel",
+        "item_id": "msg-1",
+        "turn_id": "turn-1",
     }
     assert lines[1]["type"] == "item.completed"
     assert lines[1]["item"]["type"] == "agent_message"
+    assert lines[1]["turn_id"] == "turn-1"
     assert lines[2] == {
         "type": "turn.completed",
+        "turn_id": "turn-1",
         "usage": {
             "input_tokens": 100,
             "cached_input_tokens": 80,
@@ -601,6 +606,103 @@ async def test_notifications_stream_delta_and_finish_process():
         },
     }
     assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_read_and_fork_thread_use_native_app_server_protocol():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-source",
+                "turns": [{"id": "turn-1", "status": "completed", "items": []}],
+            },
+        },
+        {
+            "thread": {
+                "id": "thread-fork",
+                "forkedFromId": "thread-source",
+                "turns": [{"id": "turn-1", "status": "completed", "items": []}],
+            },
+        },
+    ])
+
+    source = await server.read_thread("thread-source")
+    forked = await server.fork_thread(
+        "thread-source",
+        last_turn_id="turn-1",
+    )
+
+    assert source["turns"][0]["id"] == "turn-1"
+    assert forked["id"] == "thread-fork"
+    assert "thread-fork" in server._known_threads
+    assert server._request.await_args_list[0].args == (
+        "thread/read",
+        {"threadId": "thread-source", "includeTurns": True},
+    )
+    assert server._request.await_args_list[1].args == (
+        "thread/fork",
+        {
+            "threadId": "thread-source",
+            "lastTurnId": "turn-1",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_empty_thread_uses_native_start_without_turn():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "thread": {"id": "thread-empty", "turns": []},
+    })
+
+    created = await server.create_thread(
+        cwd="/tmp/project",
+        model="gpt-5.6-sol",
+    )
+
+    assert created["id"] == "thread-empty"
+    assert "thread-empty" in server._known_threads
+    server._request.assert_awaited_once_with(
+        "thread/start",
+        {
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.6-sol",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_thread_settles_mutating_rpc_after_cancellation():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def request(_method, _params):
+        entered.set()
+        await release.wait()
+        return {"thread": {"id": "thread-fork"}}
+
+    server._request = AsyncMock(side_effect=request)
+    operation = asyncio.create_task(server.fork_thread(
+        "thread-source",
+        last_turn_id="turn-1",
+    ))
+    await entered.wait()
+    operation.cancel()
+    await asyncio.sleep(0)
+    assert not operation.done()
+
+    release.set()
+    result = await operation
+    assert result["id"] == "thread-fork"
 
 
 @pytest.mark.asyncio
@@ -1157,6 +1259,27 @@ class _RegistryFakeServer:
         self.steered.append((thread_id, content))
         return thread_id in self.active_threads
 
+    async def read_thread(self, thread_id):
+        self.known_threads.add(thread_id)
+        return {
+            "id": thread_id,
+            "turns": [{"id": "turn-1", "status": "completed", "items": []}],
+        }
+
+    async def create_thread(self, *, cwd, model=None):
+        thread_id = f"thread-empty-{len(self.known_threads) + 1}"
+        self.known_threads.add(thread_id)
+        return {"id": thread_id, "cwd": cwd, "model": model, "turns": []}
+
+    async def fork_thread(self, thread_id, *, last_turn_id):
+        fork_id = f"{thread_id}-fork"
+        self.known_threads.add(fork_id)
+        return {
+            "id": fork_id,
+            "forkedFromId": thread_id,
+            "turns": [{"id": last_turn_id, "status": "completed", "items": []}],
+        }
+
     async def delete_thread(self, thread_id):
         if thread_id in self.active_threads:
             raise CodexAppServerBusyError(f"{thread_id} is active")
@@ -1464,6 +1587,59 @@ async def test_registry_delete_thread_releases_exact_owner_without_shutdown(
     assert home not in registry._starting
     assert server.shutdown_count == 0
     assert registry._servers[home] is server
+
+
+@pytest.mark.asyncio
+async def test_registry_fork_keeps_source_and_new_thread_in_same_home(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "fork-home")
+    source_id = "thread-source"
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        source = await registry.read_thread(home, source_id)
+        forked = await registry.fork_thread(
+            home,
+            source_id,
+            last_turn_id="turn-1",
+        )
+        assert source["id"] == source_id
+        assert forked["id"] == "thread-source-fork"
+        assert registry._thread_owners[source_id] == home
+        assert registry._thread_owners[forked["id"]] == home
+        assert source_id not in registry._starting_threads
+        assert home not in registry._starting
+
+        await registry.delete_thread(home, forked["id"])
+
+    assert forked["id"] not in registry._thread_owners
+    assert forked["id"] not in registry._starting_threads
+    assert home not in registry._starting
+
+
+@pytest.mark.asyncio
+async def test_registry_registers_new_empty_thread_owner(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "empty-home")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        created = await registry.create_thread(
+            home,
+            cwd="/tmp/project",
+            model="gpt-5.6-sol",
+        )
+
+    assert registry._thread_owners[created["id"]] == home
+    assert home not in registry._starting
 
 
 @pytest.mark.asyncio

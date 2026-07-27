@@ -161,6 +161,13 @@ export interface Task {
     image_paths?: string[];
     attachments?: FileAttachment[];
     secret_ids?: number[];
+    codex_account_id?: string;
+    forked_from_task_id?: number;
+    forked_from_log_id?: number | null;
+    forked_from_turn_id?: string;
+    fork_seed_message?: string;
+    fork_seed_log_id?: number | null;
+    fork_seed_uploads?: UploadResult[];
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -218,12 +225,25 @@ export interface ChatMessage {
   raw_content?: string | null;
   /** Live-only app-server item id used to merge streamed deltas into the final message. */
   stream_item_id?: string | null;
+  /** Native Codex ids used to resolve a safe thread/fork boundary. */
+  item_id?: string | null;
+  turn_id?: string | null;
+  /** True when this row came from persisted chat history, not live optimism. */
+  persisted?: boolean;
   // 权限透传卡片（event_type === 'permission_request' 时存在）
   request_id?: string | null;
   permission_status?: 'pending' | 'allow' | 'deny' | 'expired' | null;
   // ask_user 卡片（event_type === 'ask_user_question' 时存在）
   ask_questions?: AskUserQuestion[] | null;
   ask_status?: 'pending' | 'answered' | 'timed_out' | 'expired' | null;
+}
+
+export interface CodexForkAnchor {
+  type: 'initial' | 'user_message';
+  id: number | null;
+  content: string;
+  timestamp: string | null;
+  attachments: FileAttachment[];
 }
 
 export interface AskUserOption {
@@ -966,6 +986,17 @@ export const api = {
     request<Task>(`/api/tasks/${id}/unread`, { method: 'POST' }),
   stopTaskSession: (id: number) =>
     request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
+  listForkAnchors: (id: number) =>
+    request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
+  forkTask: (
+    id: number,
+    anchor: { type: 'initial'; id?: never } | { type: 'user_message'; id: number },
+    title?: string,
+  ) =>
+    request<Task>(`/api/tasks/${id}/fork`, {
+      method: 'POST',
+      body: JSON.stringify({ anchor, ...(title?.trim() ? { title: title.trim() } : {}) }),
+    }),
   distillTask: (id: number, customInstruction?: string) =>
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>

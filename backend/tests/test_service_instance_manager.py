@@ -1227,6 +1227,50 @@ async def test_live_codex_quota_rejects_active_ephemeral_exec(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "registry_method"),
+    [
+        ("read", "read_thread"),
+        ("create", "create_thread"),
+        ("fork", "fork_thread"),
+        ("delete", "delete_thread"),
+    ],
+)
+async def test_codex_thread_operations_reject_exec_owned_home(
+    tmp_path, operation, registry_method,
+):
+    codex_home = str((tmp_path / f"codex-thread-{operation}-vs-exec").resolve())
+    registry = MagicMock()
+    setattr(registry, registry_method, AsyncMock())
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_app_server = registry
+    im._codex_exec_homes[7] = codex_home
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="still has an exec generation",
+    ):
+        if operation == "read":
+            await im.read_codex_thread(codex_home, "thread-source")
+        elif operation == "create":
+            await im.create_codex_thread(
+                codex_home,
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+            )
+        elif operation == "fork":
+            await im.fork_codex_thread(
+                codex_home,
+                "thread-source",
+                last_turn_id="turn-1",
+            )
+        else:
+            await im.delete_codex_thread(codex_home, "thread-fork")
+
+    getattr(registry, registry_method).assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_live_codex_quota_holds_home_gate_until_rpc_finishes(tmp_path):
     codex_home = str((tmp_path / "codex-live-quota-gate").resolve())
     read_started = asyncio.Event()

@@ -2,10 +2,10 @@ import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api } from '../../api/client';
-import type { ChatMessage, FileAttachment, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -22,6 +22,7 @@ interface ChatViewProps {
   projects: Project[];
   onBack: () => void;
   onTaskUpdated?: () => void;
+  onTaskForked?: (task: Task) => void;
   inline?: boolean;
 }
 
@@ -130,7 +131,7 @@ function ContextUsageIndicator({ usage }: { usage: ContextUsage }) {
   );
 }
 
-export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: ChatViewProps) {
+export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, inline }: ChatViewProps) {
   const projectName = useMemo(() => {
     if (!task.project_id) return null;
     const p = projects.find((p) => p.id === task.project_id);
@@ -138,11 +139,41 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
   }, [task.project_id, projects]);
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
+  const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
+  const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
+  const [forkSeedUploads, setForkSeedUploads] = useState<UploadResult[]>(() => {
+    try {
+      if (localStorage.getItem(forkSeedUploadsConsumedKey)) return [];
+      const saved = localStorage.getItem(forkSeedUploadsKey);
+      if (saved) return JSON.parse(saved) as UploadResult[];
+    } catch { /* storage may be unavailable */ }
+    return task.metadata_?.fork_seed_uploads || [];
+  });
   // Draft buffer: unsent input survives refresh / re-entering the chat
   const [input, setInput] = useState(() => {
-    try { return localStorage.getItem(`ccm-chat-draft-${task.id}`) || ''; } catch { return ''; }
+    try {
+      const draft = localStorage.getItem(`ccm-chat-draft-${task.id}`);
+      if (draft) return draft;
+      const seed = task.metadata_?.fork_seed_message;
+      if (seed && !localStorage.getItem(forkSeedKey)) {
+        localStorage.setItem(forkSeedKey, '1');
+        return seed;
+      }
+      return '';
+    } catch {
+      return task.metadata_?.fork_seed_message || '';
+    }
   });
   const [sending, setSending] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
+  const [forkAnchors, setForkAnchors] = useState<CodexForkAnchor[]>([]);
+  const [selectedForkAnchor, setSelectedForkAnchor] = useState<CodexForkAnchor | null>(null);
+  const [forkAnchorsLoading, setForkAnchorsLoading] = useState(false);
+  const [forkTitle, setForkTitle] = useState('');
+  const [forking, setForking] = useState(false);
+  const [forkError, setForkError] = useState<string | null>(null);
+  const refreshHistoryRef = useRef<() => void>(() => {});
   // WS 驱动的实时状态覆盖。task.status prop（5s 轮询）才是最终一致的事实源：
   // prop 变化时清掉覆盖（见下方 effect），否则错过一次 WS 事件就永久陈旧。
   const [localStatus, setLocalStatus] = useState<string | null>(null);
@@ -234,6 +265,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       else localStorage.removeItem(`ccm-chat-draft-${task.id}`);
     } catch { /* storage may be unavailable */ }
   }, [input, task.id]);
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(forkSeedUploadsConsumedKey)) {
+        localStorage.removeItem(forkSeedUploadsKey);
+      } else {
+        localStorage.setItem(forkSeedUploadsKey, JSON.stringify(forkSeedUploads));
+      }
+    } catch { /* storage may be unavailable */ }
+  }, [forkSeedUploads, forkSeedUploadsConsumedKey, forkSeedUploadsKey]);
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
 
@@ -589,6 +629,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
         setSending(false);
         setLocalStatus(null);  // Reset — status_change WS may have been missed
         setAutoDequeueFlag(f => f + 1);
+        // Replace live-only bubbles with their persisted LogEntry ids so every
+        // completed Codex turn immediately becomes a valid fork anchor.
+        refreshHistoryRef.current();
       }, 500);
       return;
     }
@@ -709,9 +752,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, 0, true),
       api.getAskUserPending(task.id).catch(() => ({ pending: [] as { request_id: string; questions: AskUserQuestion[] }[] })),
     ]).then(([msgs, askPending]) => {
-      const filtered = msgs.filter((m) =>
-        !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
-      );
+      const filtered = msgs
+        .filter((m) =>
+          !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
+        )
+        .map((m) => ({ ...m, persisted: true }));
       setHasMoreHistory(msgs.length >= HISTORY_PAGE_SIZE);
       const existingIds = new Set(
         filtered.filter((m) => m.event_type === 'ask_user_question').map((m) => m.request_id)
@@ -738,6 +783,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       setMessages(cards.length ? [...filtered, ...cards] : filtered);
     }).catch(() => {}).finally(() => setHistoryLoading(false));
   }, [task.id]);
+  useEffect(() => {
+    refreshHistoryRef.current = fetchHistory;
+  }, [fetchHistory]);
 
   const scrollRestorationRef = useRef<number | null>(null);
 
@@ -926,6 +974,45 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
     } catch { /* ignore */ }
   };
 
+  const openFork = async () => {
+    if (task.provider !== 'codex' || !task.session_id) return;
+    setForkOpen(true);
+    setSelectedForkAnchor(null);
+    setForkAnchors([]);
+    setForkTitle('');
+    setForkError(null);
+    setForkAnchorsLoading(true);
+    try {
+      setForkAnchors(await api.listForkAnchors(task.id));
+    } catch (e) {
+      setForkError(e instanceof Error ? e.message : 'Could not load user messages');
+    } finally {
+      setForkAnchorsLoading(false);
+    }
+  };
+
+  const confirmFork = async () => {
+    if (!selectedForkAnchor || forking) return;
+    setForking(true);
+    setForkError(null);
+    try {
+      const forked = await api.forkTask(
+        task.id,
+        selectedForkAnchor.type === 'initial'
+          ? { type: 'initial' }
+          : { type: 'user_message', id: selectedForkAnchor.id! },
+        forkTitle,
+      );
+      setForkOpen(false);
+      onTaskForked?.(forked);
+      onTaskUpdated?.();
+    } catch (e) {
+      setForkError(e instanceof Error ? e.message : 'Fork failed');
+    } finally {
+      setForking(false);
+    }
+  };
+
   const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
     const text = (overrideText ?? input).trim();
     if (!text && fileUpload.uploads.length === 0 && !preUploadedResults?.length) return;
@@ -961,6 +1048,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       } else if (fileUpload.uploadedResults.length > 0) {
         uploadedResults = fileUpload.uploadedResults;
       }
+      if (!fromQueue && forkSeedUploads.length > 0) {
+        uploadedResults = [...forkSeedUploads, ...uploadedResults];
+      }
       if (uploadedResults.length > 0) uploadedPaths = uploadedResults.map((r) => r.path);
       if (!fromQueue) fileUpload.clear();
 
@@ -984,6 +1074,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       }
 
       await api.sendTaskChat(task.id, text || '(files attached)', uploadedPaths, selectedSecretIds.length > 0 ? selectedSecretIds : undefined, modelOverride);
+      if (!fromQueue) {
+        try {
+          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
+          localStorage.removeItem(forkSeedUploadsKey);
+        } catch { /* storage may be unavailable */ }
+        setForkSeedUploads([]);
+      }
       setModelOverride(null);
     } catch (e) {
       setSending(false);
@@ -1127,6 +1224,112 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
           )}
         </div>
       </div>
+
+      {task.metadata_?.forked_from_task_id && (
+        <div className="px-4 py-1.5 border-b border-indigo-500/20 bg-indigo-500/5 text-xs text-indigo-300 flex items-center gap-1.5">
+          <GitBranch size={12} />
+          <span>Forked from Task #{task.metadata_.forked_from_task_id}</span>
+        </div>
+      )}
+
+      {forkOpen && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4">
+          <div className="flex max-h-[80vh] w-full max-w-lg flex-col rounded-xl border border-gray-700 bg-gray-800 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-gray-700 px-4 py-3">
+              <div className="flex items-center gap-2 text-sm font-medium text-gray-100">
+                <GitBranch size={16} className="text-indigo-400" />
+                选择用户消息作为分叉点
+              </div>
+              <button
+                onClick={() => !forking && setForkOpen(false)}
+                className="text-gray-500 hover:text-gray-300 disabled:opacity-40"
+                disabled={forking}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+              <p className="text-sm text-gray-300">
+                新任务会保留所选消息之前的上下文，并把这条消息预填到输入框中，不会自动发送。
+              </p>
+              <p className="text-xs text-amber-400/90">
+                注入消息属于运行中 turn，无法作为精确边界，因此不会出现在列表中。两个 Task 仍使用同一工作目录。
+              </p>
+              <div className="space-y-1.5">
+                {forkAnchorsLoading && (
+                  <div className="flex items-center justify-center gap-2 py-8 text-sm text-gray-500">
+                    <Loader2 size={15} className="animate-spin" />
+                    加载用户消息…
+                  </div>
+                )}
+                {!forkAnchorsLoading && forkAnchors.length === 0 && !forkError && (
+                  <div className="rounded border border-gray-700 bg-gray-900/40 px-3 py-6 text-center text-sm text-gray-500">
+                    当前会话没有可精确分叉的后续用户消息
+                  </div>
+                )}
+                {forkAnchors.map((anchor) => (
+                  <button
+                    key={`${anchor.type}-${anchor.id ?? 'initial'}`}
+                    type="button"
+                    onClick={() => setSelectedForkAnchor(anchor)}
+                    className={`w-full rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                      selectedForkAnchor?.type === anchor.type
+                        && selectedForkAnchor?.id === anchor.id
+                        ? 'border-indigo-400 bg-indigo-500/10'
+                        : 'border-gray-700 bg-gray-900/40 hover:border-gray-600 hover:bg-gray-700/40'
+                    }`}
+                  >
+                    <div className="line-clamp-3 whitespace-pre-wrap text-sm text-gray-200">
+                      {anchor.content}
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-2 text-[11px] text-gray-500">
+                      {anchor.timestamp && <span>{formatMessageTime(anchor.timestamp)}</span>}
+                      {anchor.attachments.length > 0 && (
+                        <span className="inline-flex items-center gap-1">
+                          <Paperclip size={10} />
+                          {anchor.attachments.length}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                ))}
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-gray-400">New Task title (optional)</label>
+                <input
+                  value={forkTitle}
+                  onChange={(e) => setForkTitle(e.target.value)}
+                  placeholder={`Fork of #${task.id}`}
+                  maxLength={200}
+                  className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+                />
+              </div>
+              {forkError && (
+                <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                  {forkError}
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-gray-700 px-4 py-3">
+              <button
+                onClick={() => setForkOpen(false)}
+                disabled={forking}
+                className="rounded px-3 py-1.5 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmFork}
+                disabled={forking || !selectedForkAnchor}
+                className="flex items-center gap-1.5 rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-500 disabled:opacity-50"
+              >
+                {forking ? <Loader2 size={13} className="animate-spin" /> : <GitBranch size={13} />}
+                {forking ? 'Forking…' : 'Create fork'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Monitor Panel */}
       {showMonitorPanel && (
@@ -1360,9 +1563,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
         )}
         {grouped.map((group, i) =>
           group.type === 'tool-group' ? (
-            <ToolGroup key={i} messages={group.messages} taskId={task.id} />
+            <ToolGroup
+              key={i}
+              messages={group.messages}
+              taskId={task.id}
+            />
           ) : (
-            <MessageBubble key={group.message.id} message={group.message} taskId={task.id} />
+            <MessageBubble
+              key={group.message.id}
+              message={group.message}
+              taskId={task.id}
+            />
           )
         )}
         {sending && (
@@ -1468,8 +1679,30 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
       <div className="border-t border-gray-800 bg-gray-900 p-3">
         <div className="flex flex-col gap-2 max-w-3xl mx-auto">
           {/* File preview strip */}
-          {fileUpload.uploads.length > 0 && (
+          {(forkSeedUploads.length > 0 || fileUpload.uploads.length > 0) && (
             <div className="flex gap-2 flex-wrap">
+              {forkSeedUploads.map((upload) => (
+                <div key={upload.id} className="relative rounded overflow-hidden border border-indigo-500/60">
+                  {upload.is_image ? (
+                    <div className="w-14 h-14">
+                      <img src={resolveAssetUrl(upload.url)} alt="" className="w-full h-full object-cover" />
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-800 text-xs text-gray-300 max-w-[150px]">
+                      <Paperclip size={12} className="shrink-0" />
+                      <span className="truncate">{upload.filename || upload.url.split('/').pop()}</span>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${upload.filename || 'fork attachment'}`}
+                    onClick={() => setForkSeedUploads((prev) => prev.filter((item) => item.id !== upload.id))}
+                    className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              ))}
               {fileUpload.uploads.map((upload) => (
                 <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
                   {upload.preview ? (
@@ -1580,6 +1813,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, inline }: Chat
               >
                 <Syringe size={18} />
               </button>
+            )}
+            {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && (
+              <ForkButton onClick={openFork} disabled={isProcessing} />
             )}
             {/* Message navigation — always visible, right-aligned */}
             <div className="ml-auto flex items-center gap-0.5">
@@ -1717,22 +1953,30 @@ function toolUseSummary(msg: ChatMessage): string {
   return '';
 }
 
-function ToolGroup({ messages, taskId }: { messages: ChatMessage[]; taskId: number }) {
+function ToolGroup({
+  messages,
+  taskId,
+}: {
+  messages: ChatMessage[];
+  taskId: number;
+}) {
   const [expanded, setExpanded] = useState(false);
   const hasError = messages.some((m) => m.is_error);
   const toolUseCount = messages.filter((m) => m.event_type === 'tool_use').length;
 
   return (
-    <div className="mx-4">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className={`flex items-center gap-1.5 text-xs py-1 hover:text-gray-400 transition-colors ${hasError ? 'text-red-400/70' : 'text-gray-600'}`}
-      >
-        {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        <span>
-          {hasError ? '⚠' : '🔧'} {toolUseCount} tool call{toolUseCount !== 1 ? 's' : ''}
-        </span>
-      </button>
+    <div className="group mx-4">
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className={`flex items-center gap-1.5 text-xs py-1 hover:text-gray-400 transition-colors ${hasError ? 'text-red-400/70' : 'text-gray-600'}`}
+        >
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <span>
+            {hasError ? '⚠' : '🔧'} {toolUseCount} tool call{toolUseCount !== 1 ? 's' : ''}
+          </span>
+        </button>
+      </div>
       {expanded && (
         <div className="ml-3 border-l border-gray-800 pl-3 space-y-1 mt-1">
           {messages.map((msg) => (
@@ -1894,6 +2138,21 @@ function MessageCopyButton({ text }: { text: string }) {
       title="Copy message"
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+  );
+}
+
+function ForkButton({ onClick, disabled = false }: { onClick: () => void; disabled?: boolean }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="inline-flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-indigo-500/10 hover:text-indigo-400 focus-visible:text-indigo-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
+      title={disabled ? '当前 Codex turn 结束后才能分叉' : '从一条用户消息之前的上下文创建 Fork'}
+      aria-label="Fork Codex session"
+    >
+      <GitBranch size={16} />
     </button>
   );
 }
@@ -2187,7 +2446,13 @@ function AskUserCard({ message, taskId }: { message: ChatMessage; taskId?: numbe
   );
 }
 
-const MessageBubble = memo(function MessageBubble({ message, taskId }: { message: ChatMessage; taskId?: number }) {
+const MessageBubble = memo(function MessageBubble({
+  message,
+  taskId,
+}: {
+  message: ChatMessage;
+  taskId?: number;
+}) {
   const isUser = message.role === 'user';
 
   if (message.event_type === 'permission_request') {
@@ -2202,7 +2467,7 @@ const MessageBubble = memo(function MessageBubble({ message, taskId }: { message
     const text = message.content || '';
     const isEncrypted = text.startsWith('[encrypted thinking');
     return (
-      <div className="mx-4 px-3 py-2 bg-gray-800/30 rounded text-xs border border-gray-700/30">
+      <div className="group mx-4 px-3 py-2 bg-gray-800/30 rounded text-xs border border-gray-700/30">
         <div className="flex items-center gap-1.5 text-gray-500">
           <span>💭</span>
           <span className="font-medium">Thinking</span>

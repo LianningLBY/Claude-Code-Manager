@@ -32,6 +32,26 @@ class LogEntry(Base):
     @property
     def item_id(self) -> str | None:
         """Extract the public stream correlation id without exposing raw_json."""
+        payload = self._raw_payload()
+        if payload is None:
+            return None
+        item = payload.get("item")
+        nested_id = item.get("id") if isinstance(item, dict) else None
+        value = payload.get("item_id") or payload.get("itemId") or nested_id
+        return str(value) if value not in (None, "") else None
+
+    @property
+    def turn_id(self) -> str | None:
+        """Extract the native Codex turn id used as a safe fork boundary."""
+        payload = self._raw_payload()
+        if payload is None:
+            return None
+        turn = payload.get("turn")
+        nested_id = turn.get("id") if isinstance(turn, dict) else None
+        value = payload.get("turn_id") or payload.get("turnId") or nested_id
+        return str(value) if value not in (None, "") else None
+
+    def _raw_payload(self) -> dict | None:
         if not self.raw_json:
             return None
         try:
@@ -40,7 +60,4 @@ class LogEntry(Base):
             return None
         if not isinstance(payload, dict):
             return None
-        item = payload.get("item")
-        nested_id = item.get("id") if isinstance(item, dict) else None
-        value = payload.get("item_id") or payload.get("itemId") or nested_id
-        return str(value) if value not in (None, "") else None
+        return payload

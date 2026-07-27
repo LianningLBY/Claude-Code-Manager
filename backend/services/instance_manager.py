@@ -1316,6 +1316,58 @@ class InstanceManager:
                 f"Codex account has an active ephemeral exec: {codex_home}"
             )
 
+    async def read_codex_thread(
+        self, codex_home: str, thread_id: str,
+    ) -> dict:
+        """Read one idle Codex thread with turns from its bound account."""
+
+        async with self.codex_home_app_server_guard(codex_home) as home:
+            registry = self._ensure_codex_app_server_registry()
+            return await registry.read_thread(home, thread_id)
+
+    async def create_codex_thread(
+        self,
+        codex_home: str,
+        *,
+        cwd: str,
+        model: str | None = None,
+    ) -> dict:
+        """Create and register an empty native Codex thread."""
+
+        async with self.codex_home_app_server_guard(codex_home) as home:
+            registry = self._ensure_codex_app_server_registry()
+            return await registry.create_thread(
+                home,
+                cwd=cwd,
+                model=model,
+            )
+
+    async def fork_codex_thread(
+        self,
+        codex_home: str,
+        thread_id: str,
+        *,
+        last_turn_id: str,
+    ) -> dict:
+        """Create and register a native Codex thread fork."""
+
+        async with self.codex_home_app_server_guard(codex_home) as home:
+            registry = self._ensure_codex_app_server_registry()
+            return await registry.fork_thread(
+                home,
+                thread_id,
+                last_turn_id=last_turn_id,
+            )
+
+    async def delete_codex_thread(
+        self, codex_home: str, thread_id: str,
+    ) -> None:
+        """Compensate a failed fork by deleting its unclaimed thread."""
+
+        async with self.codex_home_app_server_guard(codex_home) as home:
+            registry = self._ensure_codex_app_server_registry()
+            await registry.delete_thread(home, thread_id)
+
     def _codex_home_lock(self, codex_home: str) -> asyncio.Lock:
         """Return the admission/maintenance lock for a canonical home."""
 

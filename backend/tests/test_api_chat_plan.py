@@ -1,5 +1,6 @@
 """Tests for Chat and Plan API endpoints."""
 import asyncio
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -51,7 +52,15 @@ async def test_codex_fork_starts_before_selected_user_message(
         task.status = "completed"
         task.session_id = "thread-source"
         task.last_cwd = "/tmp/project"
-        task.metadata_ = {"codex_account_id": "codex-a"}
+        task.metadata_ = {
+            "codex_account_id": "codex-a",
+            "attachments": [{
+                "url": "/api/uploads/initial.png",
+                "name": "initial.png",
+                "is_image": True,
+            }],
+            "image_paths": ["/tmp/not-an-upload/initial.png"],
+        }
         first = LogEntry(
             instance_id=1, task_id=task_id, event_type="message",
             role="assistant", content="first answer", is_error=False,
@@ -60,7 +69,11 @@ async def test_codex_fork_starts_before_selected_user_message(
         anchor = LogEntry(
             instance_id=1, task_id=task_id, event_type="user_message",
             role="user", content="fork here", is_error=False,
-            raw_json='{"raw_content":"fork here"}',
+            raw_json=(
+                '{"raw_content":"fork here","attachments":[{'
+                '"url":"/api/uploads/followup.txt","name":"followup.txt",'
+                '"is_image":false}],"file_paths":["/tmp/not-an-upload/followup.txt"]}'
+            ),
         )
         second = LogEntry(
             instance_id=1, task_id=task_id, event_type="message",
@@ -143,6 +156,17 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert payload["metadata_"]["forked_from_turn_id"] == "turn-1"
     assert payload["metadata_"]["fork_seed_message"] == "fork here"
     assert payload["metadata_"]["fork_seed_log_id"] == anchor_id
+    assert payload["metadata_"]["fork_seed_uploads"] == [{
+        "id": "fork-seed-0",
+        "filename": "followup.txt",
+        "path": str(
+            (
+                Path(__file__).resolve().parents[2] / "uploads/followup.txt"
+            ).resolve()
+        ),
+        "url": "/api/uploads/followup.txt",
+        "is_image": False,
+    }]
     read_thread.assert_awaited_once_with("/tmp/codex-home", "thread-source")
     fork_thread.assert_awaited_once_with(
         "/tmp/codex-home",
@@ -179,7 +203,15 @@ async def test_codex_fork_from_initial_prompt_creates_empty_thread(
         task.status = "completed"
         task.session_id = "thread-source"
         task.last_cwd = "/tmp/project"
-        task.metadata_ = {"codex_account_id": "codex-a"}
+        task.metadata_ = {
+            "codex_account_id": "codex-a",
+            "attachments": [{
+                "url": "/api/uploads/initial.png",
+                "name": "initial.png",
+                "is_image": True,
+            }],
+            "image_paths": ["/tmp/not-an-upload/initial.png"],
+        }
         await db.commit()
 
     with (
@@ -212,6 +244,11 @@ async def test_codex_fork_from_initial_prompt_creates_empty_thread(
     assert payload["metadata_"]["forked_from_log_id"] is None
     assert payload["metadata_"]["forked_from_turn_id"] is None
     assert payload["metadata_"]["fork_seed_message"] == "start again"
+    assert payload["metadata_"]["fork_seed_uploads"][0]["url"] == (
+        "/api/uploads/initial.png"
+    )
+    assert "attachments" not in payload["metadata_"]
+    assert "image_paths" not in payload["metadata_"]
     create_thread.assert_awaited_once_with(
         "/tmp/codex-home",
         cwd="/tmp/project",

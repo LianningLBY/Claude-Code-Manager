@@ -139,15 +139,25 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [task.project_id, projects]);
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
+  const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
+  const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
+  const [forkSeedUploads, setForkSeedUploads] = useState<UploadResult[]>(() => {
+    try {
+      if (localStorage.getItem(forkSeedUploadsConsumedKey)) return [];
+      const saved = localStorage.getItem(forkSeedUploadsKey);
+      if (saved) return JSON.parse(saved) as UploadResult[];
+    } catch { /* storage may be unavailable */ }
+    return task.metadata_?.fork_seed_uploads || [];
+  });
   // Draft buffer: unsent input survives refresh / re-entering the chat
   const [input, setInput] = useState(() => {
     try {
       const draft = localStorage.getItem(`ccm-chat-draft-${task.id}`);
       if (draft) return draft;
       const seed = task.metadata_?.fork_seed_message;
-      const seedKey = `ccm-fork-seed-consumed-${task.id}`;
-      if (seed && !localStorage.getItem(seedKey)) {
-        localStorage.setItem(seedKey, '1');
+      if (seed && !localStorage.getItem(forkSeedKey)) {
+        localStorage.setItem(forkSeedKey, '1');
         return seed;
       }
       return '';
@@ -255,6 +265,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       else localStorage.removeItem(`ccm-chat-draft-${task.id}`);
     } catch { /* storage may be unavailable */ }
   }, [input, task.id]);
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(forkSeedUploadsConsumedKey)) {
+        localStorage.removeItem(forkSeedUploadsKey);
+      } else {
+        localStorage.setItem(forkSeedUploadsKey, JSON.stringify(forkSeedUploads));
+      }
+    } catch { /* storage may be unavailable */ }
+  }, [forkSeedUploads, forkSeedUploadsConsumedKey, forkSeedUploadsKey]);
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
 
@@ -1029,6 +1048,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       } else if (fileUpload.uploadedResults.length > 0) {
         uploadedResults = fileUpload.uploadedResults;
       }
+      if (!fromQueue && forkSeedUploads.length > 0) {
+        uploadedResults = [...forkSeedUploads, ...uploadedResults];
+      }
       if (uploadedResults.length > 0) uploadedPaths = uploadedResults.map((r) => r.path);
       if (!fromQueue) fileUpload.clear();
 
@@ -1052,6 +1074,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
 
       await api.sendTaskChat(task.id, text || '(files attached)', uploadedPaths, selectedSecretIds.length > 0 ? selectedSecretIds : undefined, modelOverride);
+      if (!fromQueue) {
+        try {
+          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
+          localStorage.removeItem(forkSeedUploadsKey);
+        } catch { /* storage may be unavailable */ }
+        setForkSeedUploads([]);
+      }
       setModelOverride(null);
     } catch (e) {
       setSending(false);
@@ -1650,8 +1679,30 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       <div className="border-t border-gray-800 bg-gray-900 p-3">
         <div className="flex flex-col gap-2 max-w-3xl mx-auto">
           {/* File preview strip */}
-          {fileUpload.uploads.length > 0 && (
+          {(forkSeedUploads.length > 0 || fileUpload.uploads.length > 0) && (
             <div className="flex gap-2 flex-wrap">
+              {forkSeedUploads.map((upload) => (
+                <div key={upload.id} className="relative rounded overflow-hidden border border-indigo-500/60">
+                  {upload.is_image ? (
+                    <div className="w-14 h-14">
+                      <img src={resolveAssetUrl(upload.url)} alt="" className="w-full h-full object-cover" />
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-800 text-xs text-gray-300 max-w-[150px]">
+                      <Paperclip size={12} className="shrink-0" />
+                      <span className="truncate">{upload.filename || upload.url.split('/').pop()}</span>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${upload.filename || 'fork attachment'}`}
+                    onClick={() => setForkSeedUploads((prev) => prev.filter((item) => item.id !== upload.id))}
+                    className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              ))}
               {fileUpload.uploads.map((upload) => (
                 <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
                   {upload.preview ? (

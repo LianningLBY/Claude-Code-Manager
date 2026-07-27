@@ -112,6 +112,57 @@ def _raw_log_metadata(row: LogEntry) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _fork_seed_uploads(metadata: dict) -> list[dict]:
+    """Rebuild composer-ready upload records without trusting client paths."""
+
+    from backend.api.uploads import UPLOAD_DIR
+
+    attachments = metadata.get("attachments") or []
+    explicit_paths = (
+        metadata.get("file_paths") or metadata.get("image_paths") or []
+    )
+    upload_root = UPLOAD_DIR.resolve()
+    uploads: list[dict] = []
+    for index, attachment in enumerate(attachments):
+        if not isinstance(attachment, dict):
+            continue
+        url = attachment.get("url")
+        name = attachment.get("name")
+        if not isinstance(url, str) or not isinstance(name, str):
+            continue
+
+        path: str | None = None
+        if index < len(explicit_paths) and isinstance(explicit_paths[index], str):
+            candidate = os.path.realpath(explicit_paths[index])
+            try:
+                if (
+                    os.path.commonpath((candidate, str(upload_root)))
+                    == str(upload_root)
+                ):
+                    path = candidate
+            except ValueError:
+                pass
+        if path is None and url.startswith("/api/uploads/"):
+            filename = url.removeprefix("/api/uploads/")
+            candidate_path = (upload_root / filename).resolve()
+            try:
+                candidate_path.relative_to(upload_root)
+            except ValueError:
+                continue
+            path = str(candidate_path)
+        if path is None:
+            continue
+
+        uploads.append({
+            "id": f"fork-seed-{index}",
+            "filename": name,
+            "path": path,
+            "url": url,
+            "is_image": bool(attachment.get("is_image")),
+        })
+    return uploads
+
+
 def _is_forkable_user_message(row: LogEntry) -> bool:
     """Only ordinary human follow-up messages are precise fork boundaries."""
 
@@ -337,6 +388,7 @@ async def send_chat_message(
     log_metadata: dict = {"raw_content": model_message}
     if attachments:
         log_metadata["attachments"] = attachments
+        log_metadata["file_paths"] = all_paths
     if sender_display_name:
         # Model-facing history rebuilds must use this exact original text,
         # never guess by regex (the user's real message may start with [BUG]).
@@ -473,7 +525,7 @@ async def fork_codex_task(
         if not source.description:
             raise HTTPException(404, "Initial prompt not found")
         seed_message = source.description
-        selected_metadata: dict = {}
+        selected_metadata = source.metadata_ or {}
     else:
         selected = next(
             (row for row in rows if row.id == body.anchor.id),
@@ -546,6 +598,12 @@ async def fork_codex_task(
         metadata["fork_seed_log_id"] = (
             body.anchor.id if body.anchor.type == "user_message" else None
         )
+        metadata["fork_seed_uploads"] = _fork_seed_uploads(selected_metadata)
+        if body.anchor.type == "initial":
+            # The empty native thread has not consumed the initial prompt or
+            # its files yet. Keep them only in the editable seed composer.
+            metadata.pop("attachments", None)
+            metadata.pop("image_paths", None)
 
         default_title = (
             f"Fork of #{source.id}: {source.title}"
@@ -801,6 +859,7 @@ async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, req
         log_metadata: dict = {"raw_content": model_message}
         if attachments:
             log_metadata["attachments"] = attachments
+            log_metadata["file_paths"] = all_paths
         if sender_display_name:
             log_metadata["sender_name"] = sender_display_name
         db.add(LogEntry(

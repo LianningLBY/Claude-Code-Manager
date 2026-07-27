@@ -167,6 +167,7 @@ export interface Task {
     forked_from_turn_id?: string;
     fork_seed_message?: string;
     fork_seed_log_id?: number | null;
+    fork_seed_uploads?: UploadResult[];
   } | null;
   context_window_usage: {
     input_tokens: number;

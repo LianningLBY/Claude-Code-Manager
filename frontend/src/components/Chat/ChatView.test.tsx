@@ -282,6 +282,67 @@ describe('ChatView', () => {
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
       expect(screen.getByRole('textbox')).toHaveValue('');
     });
+
+    it('shows and sends fork seed attachments with the editable message', async () => {
+      const task = makeTask({
+        id: 102,
+        provider: 'codex',
+        session_id: 'fork-thread',
+        metadata_: {
+          fork_seed_message: 'inspect this file',
+          fork_seed_log_id: 456,
+          fork_seed_uploads: [{
+            id: 'fork-seed-0',
+            filename: 'evidence.txt',
+            path: '/repo/uploads/evidence.txt',
+            url: '/api/uploads/evidence.txt',
+            is_image: false,
+          }],
+        },
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalledWith(
+        task.id,
+        'inspect this file',
+        ['/repo/uploads/evidence.txt'],
+        undefined,
+        null,
+      ));
+    });
+
+    it('allows removing a fork seed attachment before sending', async () => {
+      const task = makeTask({
+        id: 103,
+        provider: 'codex',
+        session_id: 'fork-thread',
+        metadata_: {
+          fork_seed_message: 'text only now',
+          fork_seed_uploads: [{
+            id: 'fork-seed-0',
+            filename: 'remove.txt',
+            path: '/repo/uploads/remove.txt',
+            url: '/api/uploads/remove.txt',
+            is_image: false,
+          }],
+        },
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByRole('button', { name: 'Remove remove.txt' }));
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalledWith(
+        task.id,
+        'text only now',
+        undefined,
+        undefined,
+        null,
+      ));
+    });
   });
 
   describe('Title display', () => {

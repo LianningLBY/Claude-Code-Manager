@@ -27,7 +27,14 @@ from backend.services.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerError,
     CodexRequiredMcpError,
+    CodexRequiredMcpPreTurnError,
     CodexThreadHomeMismatchError,
+)
+from backend.services.mcp_config import (
+    McpServerSpec,
+    build_mcp_server_specs,
+    build_sub_agent_controller_mcp_server_specs,
+    render_codex_exec_config_args,
 )
 from backend.config import Settings, settings
 from backend.models.instance import Instance
@@ -367,6 +374,60 @@ def test_build_command_codex_default_model_not_passed():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(provider="codex", prompt="hi", model="default", resume_session_id=None, effort_level=None)
     assert "--model" not in cmd
+
+
+@pytest.mark.parametrize(
+    ("resume_session_id", "expected_tail"),
+    [
+        (None, ["use required MCP"]),
+        ("thread-mcp", ["thread-mcp", "use required MCP"]),
+    ],
+    ids=["fresh", "resume"],
+)
+def test_build_command_codex_renders_required_mcp_as_exact_argv_tokens(
+    resume_session_id, expected_tail,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+    specs = build_mcp_server_specs(73, {"monitor": True})
+
+    cmd = im._build_command(
+        provider="codex",
+        prompt="use required MCP",
+        model="gpt-5.6-sol",
+        resume_session_id=resume_session_id,
+        effort_level="high",
+        codex_mcp_specs=specs,
+    )
+
+    expected_mcp_args = render_codex_exec_config_args(specs)
+    mcp_flag_index = cmd.index("-c", cmd.index("-c") + 1)
+    assert cmd[mcp_flag_index : mcp_flag_index + 2] == expected_mcp_args
+    assert cmd[-len(expected_tail) :] == expected_tail
+    assert expected_mcp_args[1] in cmd
+    assert "--task-id" in expected_mcp_args[1]
+    assert '"73"' in expected_mcp_args[1]
+
+
+def test_build_command_codex_rejects_invalid_required_exec_mcp():
+    im = InstanceManager(MagicMock(), MagicMock())
+    invalid_spec = McpServerSpec(
+        name="invalid.name",
+        command="python",
+        required=True,
+    )
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="Invalid required Codex exec MCP configuration",
+    ):
+        im._build_command(
+            provider="codex",
+            prompt="must not launch",
+            model=None,
+            resume_session_id=None,
+            effort_level=None,
+            codex_mcp_specs=(invalid_spec,),
+        )
 
 
 def test_build_command_unsupported_provider():
@@ -961,6 +1022,107 @@ async def test_launch_codex_provider_command(db_factory, monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-main-mcp-exec")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="exec MCP task",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    mock_proc = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=mock_proc,
+    ) as exec_mock:
+        await im.launch(
+            instance_id=inst.id,
+            prompt="use CCM help",
+            task_id=task.id,
+            cwd="/tmp",
+            provider="codex",
+            config_dir=str(tmp_path / "codex-main-mcp-exec-home"),
+        )
+
+    argv = list(exec_mock.await_args.args)
+    expected_mcp_args = render_codex_exec_config_args(
+        build_mcp_server_specs(task.id, {})
+    )
+    flag_index = argv.index("-c")
+    assert argv[flag_index : flag_index + 2] == expected_mcp_args
+    assert argv[-1] == "use CCM help"
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_invalid_required_exec_mcp_fails_before_subprocess_spawn(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-invalid-required-exec-mcp")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="invalid exec MCP task",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    invalid_spec = McpServerSpec(
+        name="invalid.name",
+        command="python",
+        required=True,
+    )
+    im = InstanceManager(db_factory, MagicMock())
+    with (
+        patch(
+            "backend.services.mcp_config.build_mcp_server_specs",
+            return_value=(invalid_spec,),
+        ),
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as exec_mock,
+    ):
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="Invalid required Codex exec MCP configuration",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must not spawn",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-invalid-exec-mcp-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_launch_codex_prefers_persistent_app_server(
     db_factory, monkeypatch, tmp_path,
 ):
@@ -988,6 +1150,221 @@ async def test_launch_codex_prefers_persistent_app_server(
     assert im._launch_codex_app_server.await_args.kwargs["resume_session_id"] == "thread-1"
     assert im._launch_codex_app_server.await_args.kwargs["config_dir"] == str(
         codex_home.resolve()
+    )
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_app_server_rejects_home_owned_by_exec_generation(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-app-server-vs-exec")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    codex_home = str((tmp_path / "codex-shared-home").resolve())
+    im = InstanceManager(db_factory, MagicMock())
+    im._codex_exec_homes[999] = codex_home
+    im._launch_codex_app_server = AsyncMock(return_value=4321)
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="still has an exec generation",
+    ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="must not overlap",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=codex_home,
+        )
+
+    im._launch_codex_app_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_codex_quota_rejects_home_owned_by_exec_generation(
+    tmp_path,
+):
+    codex_home = str((tmp_path / "codex-live-quota-vs-exec").resolve())
+    registry = MagicMock()
+    registry.read_rate_limits = AsyncMock(return_value={"rateLimits": {}})
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im.processes[7] = MagicMock(returncode=None)
+    im._codex_exec_homes[7] = codex_home
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="still has an exec generation",
+    ):
+        await im.read_codex_rate_limits(codex_home)
+
+    im._ensure_codex_app_server_registry.assert_not_called()
+    registry.read_rate_limits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_codex_quota_rejects_active_ephemeral_exec(tmp_path):
+    codex_home = str((tmp_path / "codex-live-quota-vs-ephemeral").resolve())
+    registry = MagicMock()
+    registry.read_rate_limits = AsyncMock(return_value={"rateLimits": {}})
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im._codex_ephemeral_home_users[codex_home] = 1
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="active ephemeral exec",
+    ):
+        await im.read_codex_rate_limits(codex_home)
+
+    im._ensure_codex_app_server_registry.assert_not_called()
+    registry.read_rate_limits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_codex_quota_holds_home_gate_until_rpc_finishes(tmp_path):
+    codex_home = str((tmp_path / "codex-live-quota-gate").resolve())
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    exec_attempted = asyncio.Event()
+    exec_entered = asyncio.Event()
+
+    async def read_rate_limits(_codex_home):
+        read_started.set()
+        await release_read.wait()
+        return {"rateLimits": {}}
+
+    registry = MagicMock()
+    registry.read_rate_limits = AsyncMock(side_effect=read_rate_limits)
+    registry.shutdown_home = AsyncMock(return_value=True)
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_app_server = registry
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+
+    quota_task = asyncio.create_task(im.read_codex_rate_limits(codex_home))
+    await read_started.wait()
+
+    async def enter_exec():
+        exec_attempted.set()
+        async with im.codex_home_exec_guard(codex_home):
+            exec_entered.set()
+
+    exec_task = asyncio.create_task(enter_exec())
+    await exec_attempted.wait()
+    await asyncio.sleep(0)
+    exec_overlapped_quota = exec_entered.is_set()
+    release_read.set()
+
+    assert await quota_task == {"rateLimits": {}}
+    await exec_task
+    assert exec_overlapped_quota is False
+    registry.read_rate_limits.assert_awaited_once_with(codex_home)
+    registry.shutdown_home.assert_awaited_once_with(
+        codex_home,
+        require_idle=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_codex_exec_rejects_active_app_server(tmp_path):
+    codex_home = str((tmp_path / "codex-ephemeral-vs-app-server").resolve())
+    registry = MagicMock()
+    registry.shutdown_home = AsyncMock(
+        side_effect=CodexAppServerBusyError("active app-server turn")
+    )
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_app_server = registry
+
+    with pytest.raises(CodexAppServerBusyError, match="active app-server turn"):
+        async with im.codex_home_exec_guard(codex_home):
+            pytest.fail("busy app-server must reject ephemeral exec admission")
+
+    registry.shutdown_home.assert_awaited_once_with(
+        codex_home,
+        require_idle=True,
+    )
+    assert im._codex_ephemeral_home_users == {}
+
+
+@pytest.mark.asyncio
+async def test_codex_exec_shuts_down_idle_app_server_before_spawn(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-exec-after-idle-app-server")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    registry = MagicMock()
+    registry.shutdown_home = AsyncMock(return_value=True)
+    mock_proc = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._codex_app_server = registry
+    codex_home = str((tmp_path / "codex-idle-app-server-home").resolve())
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=mock_proc,
+    ) as exec_mock:
+        await im.launch(
+            instance_id=inst.id,
+            prompt="exec after idle transport",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=codex_home,
+        )
+
+    registry.shutdown_home.assert_awaited_once_with(
+        codex_home,
+        require_idle=True,
+    )
+    exec_mock.assert_awaited_once()
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_codex_exec_does_not_spawn_while_app_server_home_is_busy(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-exec-vs-busy-app-server")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    registry = MagicMock()
+    registry.shutdown_home = AsyncMock(
+        side_effect=CodexAppServerBusyError("active app-server turn")
+    )
+    im = InstanceManager(db_factory, MagicMock())
+    im._codex_app_server = registry
+    codex_home = str((tmp_path / "codex-busy-app-server-home").resolve())
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(CodexAppServerBusyError, match="active app-server turn"):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must not overlap",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
+
+    registry.shutdown_home.assert_awaited_once_with(
+        codex_home,
+        require_idle=True,
     )
     exec_mock.assert_not_awaited()
 
@@ -1030,15 +1407,11 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("failure_mode", "error_match"),
-    [
-        ("startup", "could not start required MCP transport"),
-        ("missing-thread", "Required MCP configuration was not admitted"),
-        ("unknown", "required ccm_skills could be guaranteed"),
-    ],
+    "failure_mode",
+    ["startup", "missing-thread"],
 )
-async def test_required_mcp_app_server_failure_does_not_launch_exec(
-    db_factory, monkeypatch, tmp_path, failure_mode, error_match,
+async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
+    db_factory, monkeypatch, tmp_path, failure_mode,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
@@ -1058,11 +1431,10 @@ async def test_required_mcp_app_server_failure_does_not_launch_exec(
         await db.refresh(inst)
         await db.refresh(task)
 
-    im = InstanceManager(db_factory, MagicMock())
-    if failure_mode == "unknown":
-        im._launch_codex_app_server = AsyncMock(
-            side_effect=RuntimeError("unexpected adapter failure")
-        )
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    im.task_message_enqueuer = AsyncMock()
+    mock_proc = _make_mock_process()
     startup_error = (
         CodexAppServerError("initialize failed")
         if failure_mode == "startup"
@@ -1083,11 +1455,68 @@ async def test_required_mcp_app_server_failure_does_not_launch_exec(
         patch(
             "backend.services.instance_manager.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
+            return_value=mock_proc,
         ) as exec_mock,
     ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="must keep required MCP",
+            task_id=task.id,
+            cwd="/tmp",
+            provider="codex",
+            config_dir=str(tmp_path / "codex-required-mcp-home"),
+        )
+
+    if failure_mode == "startup":
+        ensure_started.assert_awaited_once()
+        request.assert_not_awaited()
+    elif failure_mode == "missing-thread":
+        ensure_started.assert_awaited_once()
+        request.assert_awaited_once()
+    exec_mock.assert_awaited_once()
+    argv = list(exec_mock.await_args.args)
+    expected_mcp_args = render_codex_exec_config_args(
+        build_mcp_server_specs(task.id, {})
+    )
+    flag_index = argv.index("-c")
+    assert argv[flag_index : flag_index + 2] == expected_mcp_args
+    assert argv[-1] == "must keep required MCP"
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_unknown_app_server_failure_does_not_launch_exec(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-required-mcp-unknown-fail-closed")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="required MCP task",
+            description="must fail closed",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock())
+    im._launch_codex_app_server = AsyncMock(
+        side_effect=RuntimeError("unexpected adapter failure")
+    )
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
         with pytest.raises(
             CodexRequiredMcpError,
-            match=error_match,
+            match="required ccm_skills could be guaranteed",
         ):
             await im.launch(
                 instance_id=inst.id,
@@ -1098,24 +1527,68 @@ async def test_required_mcp_app_server_failure_does_not_launch_exec(
                 config_dir=str(tmp_path / "codex-required-mcp-home"),
             )
 
-    if failure_mode == "startup":
-        ensure_started.assert_awaited_once()
-        request.assert_not_awaited()
-    elif failure_mode == "missing-thread":
-        ensure_started.assert_awaited_once()
-        request.assert_awaited_once()
-    else:
-        ensure_started.assert_not_awaited()
-        request.assert_not_awaited()
+    exec_mock.assert_not_awaited()
+    specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
+    assert len(specs) == 1
+    assert specs[0].args[specs[0].args.index("--task-id") + 1] == str(task.id)
+    assert "ccm_command_help" in specs[0].enabled_tools
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_requires_app_server_and_never_uses_exec(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-sub-agent-app-server-only")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="sub-agent task",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            enabled_skills={"sub-agent": True},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock())
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="requires the app-server transport",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="delegate",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-sub-agent-no-app-server"),
+                enabled_skills={"sub-agent": True},
+            )
+
     exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("main_mcp_enabled", [False, True])
 async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
-    db_factory, monkeypatch, tmp_path,
+    db_factory, monkeypatch, tmp_path, main_mcp_enabled,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
-    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    monkeypatch.setattr(
+        settings,
+        "codex_main_mcp_enabled",
+        main_mcp_enabled,
+    )
     async with db_factory() as db:
         inst = Instance(name="codex-sub-agent-mcp-fail-closed")
         db.add(inst)
@@ -1135,13 +1608,18 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
 
     im = InstanceManager(db_factory, MagicMock())
     im._launch_codex_app_server = AsyncMock(
-        side_effect=RuntimeError("unexpected adapter failure")
+        side_effect=CodexRequiredMcpPreTurnError(
+            "sub-agent transport failed before turn/start"
+        )
     )
     with patch(
         "backend.services.instance_manager.asyncio.create_subprocess_exec",
         new_callable=AsyncMock,
     ) as exec_mock:
-        with pytest.raises(CodexRequiredMcpError):
+        with pytest.raises(
+            CodexRequiredMcpPreTurnError,
+            match="before turn/start",
+        ):
             await im.launch(
                 instance_id=inst.id,
                 prompt="must keep sub-agent tools",
@@ -1153,6 +1631,17 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
             )
 
     exec_mock.assert_not_awaited()
+    specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
+    if main_mcp_enabled:
+        assert "ccm_command_help" in specs[0].enabled_tools
+        assert "create_sub_agent" in specs[0].enabled_tools
+    else:
+        assert set(specs[0].enabled_tools) == {
+            "ccm_read_skill",
+            "create_sub_agent",
+            "check_sub_agents",
+            "stop_sub_agent",
+        }
 
 
 @pytest.mark.asyncio
@@ -1289,7 +1778,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
 
 
 @pytest.mark.asyncio
-async def test_launch_codex_app_server_injects_task_scoped_specs_when_enabled(
+async def test_launch_codex_app_server_uses_passed_task_scoped_specs(
     db_factory, monkeypatch,
 ):
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
@@ -1314,6 +1803,7 @@ async def test_launch_codex_app_server_injects_task_scoped_specs_when_enabled(
         config_dir="/tmp/codex-mcp",
         enable_workflows=False,
         enabled_skills={"monitor": True},
+        mcp_specs=build_mcp_server_specs(73, {"monitor": True}),
     )
 
     assert pid == 7655
@@ -1327,7 +1817,7 @@ async def test_launch_codex_app_server_injects_task_scoped_specs_when_enabled(
 
 
 @pytest.mark.asyncio
-async def test_codex_sub_agent_controller_bypasses_full_main_mcp_flag(
+async def test_codex_app_server_uses_passed_sub_agent_controller_specs(
     db_factory, monkeypatch,
 ):
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
@@ -1352,6 +1842,7 @@ async def test_codex_sub_agent_controller_bypasses_full_main_mcp_flag(
         config_dir="/tmp/codex-sub-agent",
         enable_workflows=False,
         enabled_skills={"sub-agent": True},
+        mcp_specs=build_sub_agent_controller_mcp_server_specs(74),
     )
 
     specs = registry.start_turn.await_args.kwargs["mcp_specs"]

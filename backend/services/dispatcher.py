@@ -7155,19 +7155,22 @@ class GlobalDispatcher:
                     f"No available Codex account supports sub-agent model {model!r}"
                 )
 
-        registry = self.instance_manager._ensure_codex_app_server_registry()
-        process, thread_id = await registry.start_turn(
-            codex_home=codex_home,
-            prompt=prompt,
-            cwd=cwd,
-            model=model,
-            effort=clamp_codex_effort(model, effort_level),
-            resume_session_id=None,
-            git_env=None,
-            task_id=task_id,
-            mcp_specs=mcp_specs,
-        )
-        self._sub_agent_codex_homes[session_id] = codex_home
+        async with self.instance_manager.codex_home_app_server_guard(
+            codex_home
+        ) as admitted_home:
+            registry = self.instance_manager._ensure_codex_app_server_registry()
+            process, thread_id = await registry.start_turn(
+                codex_home=admitted_home,
+                prompt=prompt,
+                cwd=cwd,
+                model=model,
+                effort=clamp_codex_effort(model, effort_level),
+                resume_session_id=None,
+                git_env=None,
+                task_id=task_id,
+                mcp_specs=mcp_specs,
+            )
+        self._sub_agent_codex_homes[session_id] = admitted_home
         self._sub_agent_codex_processes[session_id] = process
         self._sub_agent_codex_threads[session_id] = thread_id
         if codex_home and pool:
@@ -7176,7 +7179,7 @@ class GlobalDispatcher:
             "Codex sub-agent launched: session=%s thread=%s home=%s",
             session_id,
             thread_id,
-            codex_home or "<default>",
+            admitted_home,
         )
         return process
 

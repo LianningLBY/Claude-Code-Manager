@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Sequence
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,9 @@ from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
 from backend.services.task_queue import task_retry_not_superseded_predicate
 from backend.services.ws_broadcaster import WebSocketBroadcaster
+
+if TYPE_CHECKING:
+    from backend.services.mcp_config import McpServerSpec
 
 logger = logging.getLogger(__name__)
 _EXPECTED_GENERATION_UNSET = object()
@@ -242,9 +246,9 @@ class InstanceManager:
         self._codex_home_locks: dict[str, asyncio.Lock] = {}
         self._codex_exec_homes: dict[int, str] = {}
         # Non-task Codex subprocesses (currently task distillation) share the
-        # same credential-home maintenance barrier as normal exec turns.
-        # Count by canonical home because they do not own a reusable Instance
-        # slot and therefore cannot safely be represented in _codex_exec_homes.
+        # same credential-home and app-server admission barrier as normal exec
+        # turns. Count by canonical home because they do not own a reusable
+        # Instance slot and cannot safely be represented in _codex_exec_homes.
         self._codex_ephemeral_home_users: dict[str, int] = {}
         # Direct CLI subprocesses start in their own POSIX session.  Remember
         # the exact process generation so stop can signal the whole process
@@ -717,6 +721,7 @@ class InstanceManager:
             from backend.services.codex_app_server import (
                 CodexAppServerBusyError,
                 CodexRequiredMcpError,
+                CodexRequiredMcpPreTurnError,
                 CodexThreadHomeMismatchError,
                 normalize_codex_home,
             )
@@ -799,27 +804,47 @@ class InstanceManager:
                     raise
                 logger.debug("Container setup failed, falling back to bare process")
 
-        codex_mcp_required = bool(
+        codex_main_mcp_required = bool(
             provider == "codex"
             and task_id is not None
-            and (
-                settings.codex_main_mcp_enabled
-                or (enabled_skills and enabled_skills.get("sub-agent"))
-            )
+            and settings.codex_main_mcp_enabled
         )
-        if provider == "codex" and codex_mcp_required and not settings.codex_app_server_enabled:
+        codex_sub_agent_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and enabled_skills
+            and enabled_skills.get("sub-agent")
+        )
+        codex_mcp_required = (
+            codex_main_mcp_required or codex_sub_agent_mcp_required
+        )
+        codex_mcp_specs: tuple["McpServerSpec", ...] = ()
+        if codex_main_mcp_required:
+            from backend.services.mcp_config import build_mcp_server_specs
+
+            codex_mcp_specs = build_mcp_server_specs(
+                task_id,
+                enabled_skills or {},
+            )
+        elif codex_sub_agent_mcp_required:
+            from backend.services.mcp_config import (
+                build_sub_agent_controller_mcp_server_specs,
+            )
+
+            codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
+
+        if (
+            provider == "codex"
+            and codex_sub_agent_mcp_required
+            and not settings.codex_app_server_enabled
+        ):
             raise CodexRequiredMcpError(
-                "Codex Sub-Agent/main MCP requires the app-server transport; "
-                "MCP-less exec fallback is disabled"
+                "Codex Sub-Agent MCP requires the app-server transport; "
+                "exec fallback does not provide live thread control"
             )
 
         if provider == "codex" and settings.codex_app_server_enabled:
-            home_lock = self._codex_home_lock(config_dir)
-            async with home_lock:
-                if config_dir in self._codex_home_maintenance:
-                    raise CodexAppServerBusyError(
-                        f"Codex account is under maintenance: {config_dir}"
-                    )
+            async with self.codex_home_app_server_guard(config_dir):
                 try:
                     return await self._launch_codex_app_server(
                         instance_id=instance_id,
@@ -836,7 +861,19 @@ class InstanceManager:
                         enable_workflows=enable_workflows,
                         enabled_skills=enabled_skills,
                         task_retry_count=task_retry_count,
+                        mcp_specs=codex_mcp_specs,
                     )
+                except CodexRequiredMcpPreTurnError:
+                    if (
+                        codex_main_mcp_required
+                        and not codex_sub_agent_mcp_required
+                    ):
+                        logger.warning(
+                            "Codex app-server rejected required MCP before "
+                            "turn/start; retrying once through MCP-equivalent exec"
+                        )
+                    else:
+                        raise
                 except (
                     asyncio.TimeoutError,
                     CodexAppServerBusyError,
@@ -909,6 +946,9 @@ class InstanceManager:
             system_prompt_mode=system_prompt_mode,
             cwd=cwd,
             task_id=task_id,
+            codex_mcp_specs=(
+                codex_mcp_specs if codex_main_mcp_required else ()
+            ),
         )
 
         # Must unset CLAUDE_CODE env var to avoid nested session detection
@@ -1051,6 +1091,18 @@ class InstanceManager:
                     if config_dir in self._codex_home_maintenance:
                         raise CodexAppServerBusyError(
                             f"Codex account is under maintenance: {config_dir}"
+                        )
+                    # app-server keeps threads and MCP clients resident in
+                    # memory.  Before an exec generation enters the same home,
+                    # stop an idle transport or reject an active one.  Holding
+                    # the home lock through spawn + ownership registration
+                    # closes the reverse race with a concurrent app-server
+                    # launch.
+                    registry = self._codex_app_server
+                    if registry is not None:
+                        await registry.shutdown_home(
+                            config_dir,
+                            require_idle=True,
                         )
                     spawn_kwargs = {
                         "stdout": asyncio.subprocess.PIPE,
@@ -1224,8 +1276,45 @@ class InstanceManager:
     async def read_codex_rate_limits(self, codex_home: str) -> dict:
         """Read live quota from the app-server bound to ``codex_home``."""
 
-        registry = self._ensure_codex_app_server_registry()
-        return await registry.read_rate_limits(codex_home)
+        async with self.codex_home_app_server_guard(codex_home) as home:
+            registry = self._ensure_codex_app_server_registry()
+            return await registry.read_rate_limits(home)
+
+    @asynccontextmanager
+    async def codex_home_app_server_guard(self, codex_home: str | None):
+        """Serialize any app-server admission against exec and maintenance."""
+
+        from backend.services.codex_app_server import normalize_codex_home
+
+        home = normalize_codex_home(codex_home)
+        home_lock = self._codex_home_lock(home)
+        async with home_lock:
+            self._assert_codex_app_server_home_available(home)
+            yield home
+
+    def _assert_codex_app_server_home_available(self, codex_home: str) -> None:
+        """Reject app-server admission while another transport owns a home.
+
+        The caller must hold the canonical home's admission lock so the check
+        and the subsequent app-server operation form one atomic admission.
+        """
+
+        from backend.services.codex_app_server import CodexAppServerBusyError
+
+        if codex_home in self._codex_home_maintenance:
+            raise CodexAppServerBusyError(
+                f"Codex account is under maintenance: {codex_home}"
+            )
+        for exec_instance_id, exec_home in self._codex_exec_homes.items():
+            if exec_home == codex_home:
+                raise CodexAppServerBusyError(
+                    "Codex account still has an exec generation "
+                    f"owned by instance {exec_instance_id}: {codex_home}"
+                )
+        if self._codex_ephemeral_home_users.get(codex_home, 0):
+            raise CodexAppServerBusyError(
+                f"Codex account has an active ephemeral exec: {codex_home}"
+            )
 
     def _codex_home_lock(self, codex_home: str) -> asyncio.Lock:
         """Return the admission/maintenance lock for a canonical home."""
@@ -1243,7 +1332,9 @@ class InstanceManager:
         Admission and maintenance use the same per-home lock. Maintenance
         therefore either reserves the home first and rejects this process, or
         observes the active user and fails busy before touching credentials.
-        The synchronous finalizer cannot be interrupted by task cancellation.
+        An idle app-server transport is stopped before admission; an active
+        transport rejects the exec instead. The synchronous finalizer cannot
+        be interrupted by task cancellation.
         """
 
         from backend.services.codex_app_server import (
@@ -1258,6 +1349,9 @@ class InstanceManager:
                 raise CodexAppServerBusyError(
                     f"Codex account is under maintenance: {home}"
                 )
+            registry = self._codex_app_server
+            if registry is not None:
+                await registry.shutdown_home(home, require_idle=True)
             self._codex_ephemeral_home_users[home] = (
                 self._codex_ephemeral_home_users.get(home, 0) + 1
             )
@@ -1287,29 +1381,13 @@ class InstanceManager:
         enable_workflows: bool,
         enabled_skills: dict | None,
         task_retry_count: int | None = None,
+        mcp_specs: Sequence["McpServerSpec"] = (),
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
 
         actual_cwd = cwd or os.getcwd()
         codex_effort = clamp_codex_effort(model, effort_level)
-        mcp_specs = ()
-        if task_id is not None:
-            if settings.codex_main_mcp_enabled:
-                from backend.services.mcp_config import build_mcp_server_specs
-
-                mcp_specs = build_mcp_server_specs(
-                    task_id,
-                    enabled_skills or {},
-                )
-            elif enabled_skills and enabled_skills.get("sub-agent"):
-                from backend.services.mcp_config import (
-                    build_sub_agent_controller_mcp_server_specs,
-                )
-
-                # Sub-Agent is independently supported on Codex even while
-                # the broader main-task MCP rollout remains feature-gated.
-                mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
         process, _thread_id = await registry.start_turn(
             codex_home=config_dir,
             prompt=prompt,
@@ -2444,6 +2522,7 @@ class InstanceManager:
         system_prompt_mode: str | None = None,
         cwd: str | None = None,
         task_id: int | None = None,
+        codex_mcp_specs: Sequence["McpServerSpec"] = (),
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -2508,6 +2587,21 @@ class InstanceManager:
             codex_effort = clamp_codex_effort(model, effort_level)
             if codex_effort:
                 cmd.extend(["-c", f'model_reasoning_effort="{codex_effort}"'])
+            if codex_mcp_specs:
+                from backend.services.codex_app_server import CodexRequiredMcpError
+                from backend.services.mcp_config import (
+                    render_codex_exec_config_args,
+                )
+
+                try:
+                    cmd.extend(render_codex_exec_config_args(codex_mcp_specs))
+                except (TypeError, ValueError) as exc:
+                    if any(spec.required for spec in codex_mcp_specs):
+                        raise CodexRequiredMcpError(
+                            "Invalid required Codex exec MCP configuration: "
+                            f"{exc}"
+                        ) from exc
+                    raise
             if resume_session_id:
                 cmd.append(resume_session_id)
             cmd.append(prompt)

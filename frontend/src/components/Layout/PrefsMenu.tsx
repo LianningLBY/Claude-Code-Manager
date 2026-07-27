@@ -346,14 +346,9 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
                   if (!oldPwd) return;
                   const newPwd = prompt('新密码：');
                   if (!newPwd) return;
-                  fetch('/api/auth/me/password', {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('cc_token')}` },
-                    body: JSON.stringify({ old_password: oldPwd, new_password: newPwd }),
-                  }).then(r => {
-                    if (r.ok) alert('密码修改成功');
-                    else r.json().then(d => alert(d.detail || '修改失败'));
-                  }).catch(() => alert('修改失败'));
+                  api.changePassword(oldPwd, newPwd)
+                    .then(() => alert('密码修改成功'))
+                    .catch((error) => alert(error instanceof Error ? error.message : '修改失败'));
                 }}
                 className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors w-full"
               >

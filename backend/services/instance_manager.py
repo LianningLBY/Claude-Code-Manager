@@ -67,6 +67,27 @@ _CLOUDROUTER_AUTH_RE = re.compile(
 )
 
 
+async def _settle_instance_cleanup(awaitable):
+    """Finish a lifecycle release before delivering caller cancellation."""
+
+    cleanup = asyncio.create_task(awaitable)
+    delayed_cancellation: asyncio.CancelledError | None = None
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as exc:
+            if delayed_cancellation is None:
+                delayed_cancellation = exc
+        except BaseException:
+            if cleanup.done():
+                break
+            raise
+    result = cleanup.result()
+    if delayed_cancellation is not None:
+        raise delayed_cancellation
+    return result
+
+
 class InstanceAlreadyRunningError(RuntimeError):
     """A second turn attempted to claim an occupied instance slot."""
 
@@ -975,7 +996,40 @@ class InstanceManager:
                         config_dir,
                     )
 
+        user_skill_prompt_path = None
+        if provider == "claude" and task_id:
+            from backend.services.user_skill_injector import (
+                build_user_skill_prompt,
+            )
+
+            user_skill_prompt_path = await build_user_skill_prompt(
+                task_id,
+                self.db_factory,
+            )
+
         if provider == "claude" and self.pty_mode_enabled:
+            if user_skill_prompt_path:
+                try:
+                    user_skill_directory = Path(
+                        user_skill_prompt_path
+                    ).read_text(encoding="utf-8")
+                except OSError:
+                    user_skill_directory = ""
+                finally:
+                    try:
+                        os.unlink(user_skill_prompt_path)
+                    except OSError:
+                        pass
+                if user_skill_directory:
+                    # claude-pty's pinned PTYConfig has no equivalent of
+                    # --append-system-prompt-file.  Put the small L0 skill
+                    # directory in the turn prompt so the default PTY path has
+                    # the same user-skill discovery capability as direct -p.
+                    prompt = (
+                        f"{user_skill_directory}\n\n"
+                        "## Current user request\n\n"
+                        f"{prompt}"
+                    )
             return await self._launch_pty(
                 instance_id=instance_id,
                 prompt=prompt,
@@ -1017,6 +1071,8 @@ class InstanceManager:
                 codex_mcp_specs if codex_main_mcp_required else ()
             ),
             codex_api_account=cloudrouter_account is not None,
+            user_skill_prompt_path=user_skill_prompt_path,
+            resolve_user_skill_prompt=False,
         )
         if provider == "codex":
             logger.info(
@@ -2039,12 +2095,14 @@ class InstanceManager:
 
         home = normalize_codex_home(codex_home)
         home_lock = self._codex_home_lock(home)
-        async with home_lock:
-            try:
+
+        async def _release_home() -> None:
+            async with home_lock:
                 if self._codex_app_server is not None:
                     await self._codex_app_server.end_home_maintenance(home)
-            finally:
                 self._codex_home_maintenance.discard(home)
+
+        await _settle_instance_cleanup(_release_home())
 
     async def begin_codex_app_server_home_maintenance(
         self, codex_home: str, *, require_idle: bool = True,
@@ -2718,6 +2776,8 @@ class InstanceManager:
         task_id: int | None = None,
         codex_mcp_specs: Sequence["McpServerSpec"] = (),
         codex_api_account: bool = False,
+        user_skill_prompt_path: str | None = None,
+        resolve_user_skill_prompt: bool = True,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -2752,7 +2812,12 @@ class InstanceManager:
             if skill_prompt_path:
                 cmd.extend(["--append-system-prompt-file", skill_prompt_path])
             # User skill injection (L0 directory in prompt)
-            if task_id:
+            if user_skill_prompt_path:
+                cmd.extend([
+                    "--append-system-prompt-file",
+                    user_skill_prompt_path,
+                ])
+            elif task_id and resolve_user_skill_prompt:
                 from backend.services.user_skill_injector import build_user_skill_prompt_sync
                 user_skill_path = build_user_skill_prompt_sync(task_id)
                 if user_skill_path:

@@ -1,6 +1,7 @@
 """Phase 3 测试：TaskMigrator 状态机 / PUT 触发迁移 / 销毁批量迁回。"""
 import asyncio
-from pathlib import PurePosixPath
+import threading
+from pathlib import Path, PurePosixPath
 from unittest.mock import AsyncMock
 
 import pytest
@@ -394,6 +395,75 @@ async def test_worker_sync_response_cannot_borrow_new_manager_generation(
     assert current.session_id == "old-session"
 
 
+async def test_worker_sync_explicit_empty_fields_clear_stale_manager_mirror(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        session_id="stale-session",
+        last_cwd="/stale/cwd",
+        target_repo="/stale/repo",
+        error_message="stale error",
+    )
+    migrator = TaskMigrator(
+        db_factory=db_factory,
+        relay=FakeRelay(),
+        broadcaster=None,
+    )
+    claimed = await migrator._claim_migration(
+        migration_task_generation(task)
+    )
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "id": task.id,
+                "status": "completed",
+                "retry_count": task.retry_count,
+                "session_id": None,
+                "last_cwd": None,
+                "target_repo": "",
+                "error_message": None,
+            }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(
+        task_migrator_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+
+    await migrator._sync_task_fields_from_worker(
+        worker,
+        claimed,
+        expected_remote_status="completed",
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.session_id is None
+        assert current.last_cwd is None
+        assert current.target_repo == ""
+        assert current.error_message is None
+
+
 async def test_worker_task_import_is_one_inert_request(
     session_factory, monkeypatch,
 ):
@@ -447,6 +517,7 @@ async def test_worker_task_import_is_one_inert_request(
 
 
 async def test_put_worker_id_triggers_migration(client, session_factory, monkeypatch):
+    await _mk_worker(session_factory, id=7)
     t = await _mk_task(session_factory)
     migrator = AsyncMock()
     monkeypatch.setattr(main_module, "task_migrator", migrator)
@@ -463,6 +534,7 @@ async def test_put_worker_id_triggers_migration(client, session_factory, monkeyp
 
 
 async def test_put_migration_error_maps_409(client, session_factory, monkeypatch):
+    await _mk_worker(session_factory, id=7)
     t = await _mk_task(session_factory)
     migrator = AsyncMock()
     migrator.migrate.side_effect = MigrationError("先停止再切换")
@@ -545,6 +617,140 @@ async def test_migrate_claude_task_keeps_claude_session_mover(db_factory, sessio
 
     m._move_session.assert_called_once()
     m._move_codex_session.assert_not_called()
+
+
+async def test_local_claude_session_moves_sidecar_tree_to_worker(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    session_id = "session-with-sidecar"
+    project_dir = tmp_path / ".claude" / "projects" / "encoded"
+    sidecar = project_dir / session_id
+    tool_result = sidecar / "tool-results" / "large.txt"
+    tool_result.parent.mkdir(parents=True)
+    tool_result.write_text("large output", encoding="utf-8")
+    jsonl = project_dir / f"{session_id}.jsonl"
+    jsonl.write_text("{}\n", encoding="utf-8")
+
+    destination = Worker(
+        id=8,
+        name="destination",
+        status="ready",
+        private_ip="10.0.0.8",
+        auth_token="t",
+        ssh_user="ubuntu",
+    )
+    fake_ssh = AsyncMock()
+    migrator = TaskMigrator(db_factory=None, relay=FakeRelay())
+    monkeypatch.setattr(migrator, "_ssh", lambda _worker: fake_ssh)
+
+    await migrator._move_session(None, destination, session_id)
+
+    fake_ssh.copy_file.assert_awaited_once_with(
+        str(jsonl),
+        f"/home/ubuntu/.claude/projects/encoded/{session_id}.jsonl",
+    )
+    fake_ssh.rsync_to.assert_awaited_once_with(
+        str(sidecar) + "/",
+        f"/home/ubuntu/.claude/projects/encoded/{session_id}/",
+        excludes=[],
+        timeout=1200,
+    )
+
+
+async def test_remote_claude_session_moves_sidecar_and_cleans_temporary_copy(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    session_id = "remote-session"
+    remote_jsonl = (
+        f"/home/ubuntu/.claude-account-2/projects/encoded/"
+        f"{session_id}.jsonl"
+    )
+    remote_sidecar = remote_jsonl.removesuffix(".jsonl")
+    temporary = tmp_path / "sensitive-download"
+
+    class FakeSSH:
+        async def run(self, command):
+            if command.startswith("ls "):
+                return 0, remote_jsonl + "\n"
+            if command.startswith("test -d "):
+                return 0, ""
+            raise AssertionError(command)
+
+        async def rsync_from(
+            self,
+            remote_path,
+            local_path,
+            delete=False,
+        ):
+            assert delete is False
+            if remote_path == remote_jsonl:
+                Path(local_path).write_text("{}\n", encoding="utf-8")
+                return
+            assert remote_path == remote_sidecar + "/"
+            result = Path(local_path) / "tool-results" / "large.txt"
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("sensitive", encoding="utf-8")
+
+    source = Worker(
+        id=7,
+        name="source",
+        status="ready",
+        private_ip="10.0.0.7",
+        auth_token="t",
+        ssh_user="ubuntu",
+    )
+    fake_ssh = FakeSSH()
+    migrator = TaskMigrator(db_factory=None, relay=FakeRelay())
+    monkeypatch.setattr(migrator, "_ssh", lambda _worker: fake_ssh)
+
+    def make_temp(*_args, **_kwargs):
+        temporary.mkdir()
+        return str(temporary)
+
+    monkeypatch.setattr(
+        task_migrator_module.tempfile,
+        "mkdtemp",
+        make_temp,
+    )
+    event_loop_thread = threading.get_ident()
+    copytree_threads: list[int] = []
+    rmtree_threads: list[int] = []
+    real_copytree = task_migrator_module.shutil.copytree
+    real_rmtree = task_migrator_module.shutil.rmtree
+
+    def tracked_copytree(*args, **kwargs):
+        copytree_threads.append(threading.get_ident())
+        return real_copytree(*args, **kwargs)
+
+    def tracked_rmtree(*args, **kwargs):
+        rmtree_threads.append(threading.get_ident())
+        return real_rmtree(*args, **kwargs)
+
+    monkeypatch.setattr(
+        task_migrator_module.shutil,
+        "copytree",
+        tracked_copytree,
+    )
+    monkeypatch.setattr(
+        task_migrator_module.shutil,
+        "rmtree",
+        tracked_rmtree,
+    )
+
+    await migrator._move_session(source, None, session_id)
+
+    target_root = tmp_path / ".claude" / "projects" / "encoded"
+    assert (target_root / f"{session_id}.jsonl").read_text() == "{}\n"
+    assert (
+        target_root / session_id / "tool-results" / "large.txt"
+    ).read_text() == "sensitive"
+    assert not temporary.exists()
+    assert copytree_threads and copytree_threads[0] != event_loop_thread
+    assert rmtree_threads and rmtree_threads[0] != event_loop_thread
 
 
 async def test_local_codex_session_glob_finds_rollout_file(tmp_path, monkeypatch):

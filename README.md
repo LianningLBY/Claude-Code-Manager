@@ -479,11 +479,30 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `PUBLIC_BASE_URL` | （空） | 部署的公网地址（如 `https://ccm.example.com`） |
 | `OPENAI_API_KEY` | (可选) | 语音功能所需 |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./claude_manager.db` | 数据库连接（支持 SQLite/PostgreSQL/MySQL） |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | （空） | 飞书 OAuth 应用凭据 |
+| `FEISHU_OAUTH_STATE_SECRET` | （空） | 可选独立 OAuth state 签名密钥；留空时安全复用 `FEISHU_APP_SECRET` |
+| `FEISHU_OAUTH_STATE_TTL_SECONDS` | `600` | 飞书 OAuth state 有效期（上限 3600 秒） |
+| `SMTP_HOST` / `SMTP_PORT` | `smtp.feishu.cn` / `465` | 注册验证码 SMTP 服务 |
+| `SMTP_USER` / `SMTP_PASSWORD` | （空） | 注册验证码凭据；必须由部署环境提供 |
+| `SMTP_FROM` | （空） | 可选发件地址，留空时使用 `SMTP_USER` |
+| `VERIFICATION_CODE_CAPACITY` | `4096` | 单进程内存中待验证验证码及限流事件的容量上限 |
+| `VERIFICATION_CODE_RATE_WINDOW_SECONDS` | `600` | 验证码发送限流窗口（秒） |
+| `VERIFICATION_CODE_EMAIL_LIMIT` / `VERIFICATION_CODE_IP_LIMIT` | `5` / `30` | 每个窗口内单邮箱/来源 IP 的发送上限 |
+| `VERIFICATION_CODE_RESEND_COOLDOWN_SECONDS` | `60` | 同一邮箱两次发送的最短间隔（秒） |
+| `VERIFICATION_CODE_SMTP_CONCURRENCY` | `4` | 单进程同时进行的 SMTP 投递上限 |
 | `WORKSPACE_DIR` | `~/Projects` | 项目 clone 目标目录 |
 | `MAX_CONCURRENT_INSTANCES` | `5` | 最大并发 worker 数 |
 | `AUTO_START_DISPATCHER` | `true` | 启动时自动开始调度 |
 | `TASK_TIMEOUT_SECONDS` | `1800` | 单个任务最长执行时间（秒） |
 | `SERVICE_NAME` | (自动检测) | systemd 服务名，一键更新重启时使用 |
+
+新安装不会生成固定口令管理员：首个完成邮箱验证的注册用户成为
+`super_admin`。当配置了 `AUTH_TOKEN` 且尚无 active 用户时，注册表单还必须
+在可选的 “Bootstrap Token” 输入框填写该 Token，避免公网访客抢占首个管理员。
+升级会自动禁用旧版本曾写入的共享默认管理员；单 Token 部署可继续使用
+`AUTH_TOKEN` 进入，团队部署需配置 `SMTP_*` 后注册真实管理员。验证码服务会
+按邮箱和 `Request.client.host` 限速；多进程/多副本部署还应在反向代理或网关
+配置共享限流，因为应用内状态按进程隔离。
 
 ### PTY 模式
 
@@ -591,6 +610,7 @@ socket 才会被清理；未知或已被替换的 socket 继续 fail-closed。Ch
 ### 数据库自动备份（可选）
 
 集成 [auto-backup](https://github.com/zjw49246/auto-backup)，支持定期备份 SQLite 数据库到本机、AWS S3 或阿里云 OSS。
+PostgreSQL/MySQL 请使用对应数据库的原生备份工具；内置调度器会拒绝把外部数据库 URL 当成本地文件。
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|

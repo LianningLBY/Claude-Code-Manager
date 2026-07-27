@@ -93,6 +93,47 @@ async def test_upload_invalid_type(client, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_multi_upload_validation_is_atomic(client, tmp_path, monkeypatch):
+    """A later invalid file must not leave an earlier file on disk."""
+    import backend.api.uploads as uploads_mod
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+
+    resp = await client.post(
+        "/api/uploads",
+        files=[
+            ("files", _file_tuple("kept.txt", b"must-not-remain", "text/plain")),
+            (
+                "files",
+                ("blocked.exe", io.BytesIO(b"MZ..."), "application/octet-stream"),
+            ),
+        ],
+    )
+
+    assert resp.status_code == 400
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_multi_upload_total_limit_is_atomic(client, tmp_path, monkeypatch):
+    """The request-wide cap bounds memory and leaves no promoted prefix."""
+    import backend.api.uploads as uploads_mod
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(uploads_mod, "_MAX_TOTAL_SIZE_BYTES", 5)
+
+    resp = await client.post(
+        "/api/uploads",
+        files=[
+            ("files", _file_tuple("first.txt", b"abc", "text/plain")),
+            ("files", _file_tuple("second.txt", b"def", "text/plain")),
+        ],
+    )
+
+    assert resp.status_code == 400
+    assert "combined" in resp.json()["detail"].lower()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_upload_saves_file_to_disk(client, tmp_path, monkeypatch):
     """Uploaded file actually exists on disk after upload."""
     import backend.api.uploads as uploads_mod
@@ -168,3 +209,28 @@ async def test_get_path_traversal_rejected(client, tmp_path, monkeypatch):
     with pytest.raises(_HTTPException) as exc_info:
         await get_file("../secret.txt")
     assert exc_info.value.status_code in (400, 404)
+
+
+@pytest.mark.asyncio
+async def test_get_sibling_prefix_path_and_symlink_are_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+    from fastapi import HTTPException as _HTTPException
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    sibling = tmp_path.parent / f"{tmp_path.name}-sibling"
+    sibling.mkdir()
+    secret = sibling / "secret.txt"
+    secret.write_text("outside")
+
+    with pytest.raises(_HTTPException) as traversal_error:
+        await uploads_mod.get_file(f"../{sibling.name}/secret.txt")
+    assert traversal_error.value.status_code == 400
+
+    link = tmp_path / "link.txt"
+    link.symlink_to(secret)
+    with pytest.raises(_HTTPException) as symlink_error:
+        await uploads_mod.get_file(link.name)
+    assert symlink_error.value.status_code == 400

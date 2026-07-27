@@ -1,18 +1,36 @@
 import asyncio
+import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-router = APIRouter(prefix="/api/files", tags=["files"])
+from backend.api.deps import require_admin
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/files",
+    tags=["files"],
+    dependencies=[Depends(require_admin)],
+)
 
 MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB (for reading)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB (for uploading)
+MAX_UPLOAD_TOTAL_SIZE = 50 * 1024 * 1024  # bound request memory
 MAX_UPLOAD_FILES = 10
 
 
@@ -21,6 +39,20 @@ def _unlink_temporary_download(path: str) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+
+
+def _safe_upload_filename(filename: str | None) -> str:
+    """Return one plain filename, rejecting path-bearing client values."""
+    name = filename or "upload"
+    if (
+        name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+        or Path(name).name != name
+    ):
+        raise HTTPException(400, "Upload filename must not contain a path")
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -83,25 +115,51 @@ async def upload_to_directory(
     if len(files) > MAX_UPLOAD_FILES:
         raise HTTPException(400, f"Maximum {MAX_UPLOAD_FILES} files per request")
 
-    results = []
+    pending: list[tuple[str, bytes]] = []
+    total_size = 0
     for f in files:
-        data = await f.read()
+        safe_name = _safe_upload_filename(f.filename)
+        remaining = MAX_UPLOAD_TOTAL_SIZE - total_size
+        data = await f.read(min(MAX_UPLOAD_SIZE, remaining) + 1)
         if len(data) > MAX_UPLOAD_SIZE:
             raise HTTPException(400, f"File '{f.filename}' exceeds 50 MB limit")
-        save_path = target / (f.filename or "upload")
-        if save_path.exists():
+        if len(data) > remaining:
+            raise HTTPException(400, "Combined uploads exceed 50 MB limit")
+        total_size += len(data)
+        pending.append((safe_name, data))
+
+    # Validate every part before touching disk.  Unexpected write failures are
+    # also rolled back so a failed multipart request never leaves an
+    # unreported prefix of files behind.
+    results = []
+    written: list[Path] = []
+    try:
+        for safe_name, data in pending:
+            save_path = target / safe_name
             stem = save_path.stem
             suffix = save_path.suffix
             counter = 1
-            while save_path.exists():
-                save_path = target / f"{stem}_{counter}{suffix}"
-                counter += 1
-        save_path.write_bytes(data)
-        results.append({
-            "name": save_path.name,
-            "path": str(save_path),
-            "size": len(data),
-        })
+            while True:
+                try:
+                    with save_path.open("xb") as destination:
+                        written.append(save_path)
+                        destination.write(data)
+                    break
+                except FileExistsError:
+                    save_path = target / f"{stem}_{counter}{suffix}"
+                    counter += 1
+            results.append({
+                "name": save_path.name,
+                "path": str(save_path),
+                "size": len(data),
+            })
+    except BaseException:
+        for path in written:
+            try:
+                path.unlink()
+            except OSError:
+                logger.exception("Failed to roll back partial file upload %s", path)
+        raise
     return results
 
 

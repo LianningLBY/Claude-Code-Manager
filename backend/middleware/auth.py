@@ -20,7 +20,6 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         "/api/github/webhook",
         "/api/feishu/callback",
         "/api/shared/receive", "/api/shared/revoke",
-        "/api/org/register",
     }
 
     # Instance state contains process metadata and cross-task output. Unlike
@@ -257,7 +256,13 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         try:
             async with async_session() as db:
                 result = await db.execute(
-                    select(User.id).where(User.role.in_(["admin", "super_admin"])).order_by(User.id).limit(1)
+                    select(User.id)
+                    .where(
+                        User.role.in_(["admin", "super_admin"]),
+                        User.is_active.is_(True),
+                    )
+                    .order_by(User.id)
+                    .limit(1)
                 )
                 cls._admin_user_id = result.scalar_one_or_none()
         except Exception:

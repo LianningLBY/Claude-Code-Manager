@@ -113,8 +113,11 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
     { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, show: isAdmin },
     { key: 'tasks', label: 'Tasks', icon: ListTodo, show: true },
     { key: 'projects', label: 'Projects', icon: FolderGit2, show: true },
-    { key: 'secrets', label: 'Secrets', icon: KeyRound, show: true },
-    { key: 'files', label: 'Files', icon: FolderOpen, show: true },
+    // These pages expose Manager-host data rather than per-tenant resources.
+    // Their backend routers are admin-only, so do not advertise dead links to
+    // members (task attachments continue to use the scoped uploads API).
+    { key: 'secrets', label: 'Secrets', icon: KeyRound, show: isAdmin },
+    { key: 'files', label: 'Files', icon: FolderOpen, show: isAdmin },
     { key: 'discussions', label: 'Discussions', icon: MessagesSquare, show: true },
     { key: 'pr-monitor', label: 'PR Monitor', icon: GitPullRequest, show: isAdmin || hasWorker },
     { key: 'workers', label: 'Workers', icon: Server, show: isAdmin || hasWorker },

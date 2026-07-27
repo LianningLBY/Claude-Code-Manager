@@ -21,7 +21,7 @@ async def test_dispatcher_shutdown_error_propagates_after_other_cleanup(
     instance_manager._pty_backend = pty_backend
     instance_manager.shutdown_codex_app_server = AsyncMock()
 
-    watcher = MagicMock()
+    watcher = MagicMock(shutdown=AsyncMock())
     heartbeat = MagicMock()
     worker_health = MagicMock()
     upload_cleanup = MagicMock()
@@ -47,7 +47,7 @@ async def test_dispatcher_shutdown_error_propagates_after_other_cleanup(
     tmp_cleanup.cancel.assert_called_once_with()
     pty_backend.shutdown.assert_awaited_once_with()
     instance_manager.shutdown_codex_app_server.assert_awaited_once_with()
-    watcher.stop.assert_called_once_with()
+    watcher.shutdown.assert_awaited_once_with()
     backup.stop.assert_called_once_with()
     assert dispatcher.shutdown.await_count == 2
 
@@ -66,7 +66,7 @@ async def test_dispatcher_shutdown_retry_can_recover_after_transport_cleanup(
     instance_manager = MagicMock()
     instance_manager._pty_backend = pty_backend
     instance_manager.shutdown_codex_app_server = AsyncMock()
-    watcher = MagicMock()
+    watcher = MagicMock(shutdown=AsyncMock())
 
     monkeypatch.setattr(main, "dispatcher", dispatcher)
     monkeypatch.setattr(main, "instance_manager", instance_manager)
@@ -87,7 +87,7 @@ async def test_dispatcher_shutdown_retry_can_recover_after_transport_cleanup(
     instance_manager.shutdown_codex_app_server.assert_awaited_once_with()
     upload_cleanup.cancel.assert_called_once_with()
     tmp_cleanup.cancel.assert_called_once_with()
-    watcher.stop.assert_called_once_with()
+    watcher.shutdown.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -98,7 +98,7 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
     instance_manager = MagicMock()
     instance_manager._pty_backend = None
     instance_manager.shutdown_codex_app_server = AsyncMock()
-    watcher = MagicMock()
+    watcher = MagicMock(shutdown=AsyncMock())
     monkeypatch.setattr(main, "dispatcher", dispatcher)
     monkeypatch.setattr(main, "instance_manager", instance_manager)
     monkeypatch.setattr(main, "sub_agent_watcher", watcher)
@@ -127,6 +127,7 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
 
     assert all(task.done() for task in tasks)
     assert all(done.is_set() for done in finalized)
+    watcher.shutdown.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

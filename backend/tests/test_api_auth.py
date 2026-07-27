@@ -1,10 +1,15 @@
 """Tests for Auth API endpoints."""
+import asyncio
+from unittest.mock import patch
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
+from backend.api.auth import _hash_password
 from backend.config import settings
+from backend.models.user import User
 
 
 @pytest_asyncio.fixture
@@ -106,3 +111,250 @@ async def test_no_auth_mode_grants_full_access(client):
         "auth_type": "none",
         "role": "super_admin",
     }
+
+
+@pytest.mark.asyncio
+async def test_first_registered_user_is_only_super_admin(auth_client):
+    original = settings.auth_token
+    settings.auth_token = "deployment-bootstrap-token"
+    try:
+        with patch(
+            "backend.services.email_service.verify_code",
+            return_value=True,
+        ):
+            first, second = await asyncio.gather(
+                auth_client.post(
+                    "/api/auth/register",
+                    json={
+                        "email": "first@example.com",
+                        "name": "First",
+                        "password": "safe-password-1",
+                        "code": "123456",
+                        "bootstrap_token": "deployment-bootstrap-token",
+                    },
+                ),
+                auth_client.post(
+                    "/api/auth/register",
+                    json={
+                        "email": "second@example.com",
+                        "name": "Second",
+                        "password": "safe-password-2",
+                        "code": "123456",
+                        "bootstrap_token": "deployment-bootstrap-token",
+                    },
+                ),
+            )
+    finally:
+        settings.auth_token = original
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert sorted(
+        [first.json()["user"]["role"], second.json()["user"]["role"]]
+    ) == ["member", "super_admin"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bootstrap_token", ["", "wrong-token"])
+async def test_first_admin_requires_configured_bootstrap_token(
+    auth_client,
+    bootstrap_token,
+):
+    original = settings.auth_token
+    settings.auth_token = "deployment-bootstrap-token"
+    try:
+        with patch(
+            "backend.services.email_service.verify_code",
+            return_value=True,
+        ) as verify:
+            response = await auth_client.post(
+                "/api/auth/register",
+                json={
+                    "email": "first@example.com",
+                    "name": "First",
+                    "password": "safe-password-1",
+                    "code": "123456",
+                    "bootstrap_token": bootstrap_token,
+                },
+            )
+    finally:
+        settings.auth_token = original
+
+    assert response.status_code == 403
+    # A wrong deployment token must not consume a valid one-time email code.
+    verify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_first_admin_accepts_configured_bootstrap_token(auth_client):
+    original = settings.auth_token
+    settings.auth_token = "deployment-bootstrap-token"
+    try:
+        with patch(
+            "backend.services.email_service.verify_code",
+            return_value=True,
+        ):
+            response = await auth_client.post(
+                "/api/auth/register",
+                json={
+                    "email": "owner@example.com",
+                    "name": "Owner",
+                    "password": "safe-password-1",
+                    "code": "123456",
+                    "bootstrap_token": "deployment-bootstrap-token",
+                },
+            )
+    finally:
+        settings.auth_token = original
+
+    assert response.status_code == 200
+    assert response.json()["user"]["role"] == "super_admin"
+
+
+@pytest.mark.asyncio
+async def test_first_admin_needs_no_bootstrap_token_without_auth_token(
+    auth_client,
+):
+    original = settings.auth_token
+    settings.auth_token = ""
+    try:
+        with patch(
+            "backend.services.email_service.verify_code",
+            return_value=True,
+        ):
+            response = await auth_client.post(
+                "/api/auth/register",
+                json={
+                    "email": "owner@example.com",
+                    "name": "Owner",
+                    "password": "safe-password-1",
+                    "code": "123456",
+                },
+            )
+    finally:
+        settings.auth_token = original
+
+    assert response.status_code == 200
+    assert response.json()["user"]["role"] == "super_admin"
+
+
+@pytest.mark.asyncio
+async def test_disabled_users_do_not_bypass_first_active_user_bootstrap(
+    auth_client,
+    db_engine,
+):
+    session_factory = async_sessionmaker(
+        db_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with session_factory() as session:
+        session.add(User(
+            email="disabled@example.com",
+            name="Disabled",
+            password_hash=_hash_password("disabled-password"),
+            role="super_admin",
+            is_active=False,
+        ))
+        await session.commit()
+
+    original = settings.auth_token
+    settings.auth_token = "deployment-bootstrap-token"
+    try:
+        with patch(
+            "backend.services.email_service.verify_code",
+            return_value=True,
+        ) as verify:
+            denied = await auth_client.post(
+                "/api/auth/register",
+                json={
+                    "email": "owner@example.com",
+                    "name": "Owner",
+                    "password": "safe-password-1",
+                    "code": "123456",
+                },
+            )
+            allowed = await auth_client.post(
+                "/api/auth/register",
+                json={
+                    "email": "owner@example.com",
+                    "name": "Owner",
+                    "password": "safe-password-1",
+                    "code": "123456",
+                    "bootstrap_token": "deployment-bootstrap-token",
+                },
+            )
+    finally:
+        settings.auth_token = original
+
+    assert denied.status_code == 403
+    assert allowed.status_code == 200
+    assert allowed.json()["user"]["role"] == "super_admin"
+    verify.assert_called_once_with("owner@example.com", "123456")
+
+
+@pytest.mark.asyncio
+async def test_send_code_passes_request_client_ip(auth_client):
+    with patch(
+        "backend.services.email_service.send_verification_code",
+        return_value=True,
+    ) as send:
+        response = await auth_client.post(
+            "/api/auth/send-code",
+            json={"email": "user@example.com"},
+        )
+
+    assert response.status_code == 200
+    send.assert_called_once_with("user@example.com", "127.0.0.1")
+
+
+@pytest.mark.asyncio
+async def test_send_code_returns_429_with_retry_after(auth_client):
+    from backend.services.email_service import (
+        VerificationCodeRateLimitError,
+    )
+
+    with patch(
+        "backend.services.email_service.send_verification_code",
+        side_effect=VerificationCodeRateLimitError(17),
+    ):
+        response = await auth_client.post(
+            "/api/auth/send-code",
+            json={"email": "user@example.com"},
+        )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "17"
+
+
+@pytest.mark.asyncio
+async def test_send_code_returns_503_at_bounded_capacity(auth_client):
+    from backend.services.email_service import (
+        VerificationCodeCapacityError,
+    )
+
+    with patch(
+        "backend.services.email_service.send_verification_code",
+        side_effect=VerificationCodeCapacityError(),
+    ):
+        response = await auth_client.post(
+            "/api/auth/send-code",
+            json={"email": "user@example.com"},
+        )
+
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_send_code_rejects_unbounded_email_keys(auth_client):
+    with patch(
+        "backend.services.email_service.send_verification_code",
+        return_value=True,
+    ) as send:
+        response = await auth_client.post(
+            "/api/auth/send-code",
+            json={"email": f"user@{'x' * 400}.example"},
+        )
+
+    assert response.status_code == 422
+    send.assert_not_called()

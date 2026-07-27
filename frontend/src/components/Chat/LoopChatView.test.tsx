@@ -88,6 +88,7 @@ describe('LoopChatView', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.getTaskChatHistory).mockReset().mockResolvedValue([]);
     capturedOnMessage = undefined;
   });
 
@@ -208,11 +209,57 @@ describe('LoopChatView', () => {
         resolveHistory(historyMsgs);
       });
 
-      // The WS message's generated id > 50 (history max), so it's kept as "fresh"
-      // But content is the same — this is acceptable, the important thing is no crash
       await waitFor(() => {
-        expect(screen.getAllByText('Will be in history too').length).toBeGreaterThanOrEqual(1);
+        expect(screen.getAllByText('Will be in history too')).toHaveLength(1);
       });
+    });
+
+    it('keeps buffered WS messages across a status refresh and ignores the stale request', async () => {
+      const resolvers: Array<(messages: ChatMessage[]) => void> = [];
+      vi.mocked(api.getTaskChatHistory)
+        .mockImplementationOnce(
+          () => new Promise<ChatMessage[]>((resolve) => resolvers.push(resolve)),
+        )
+        .mockImplementationOnce(
+          () => new Promise<ChatMessage[]>((resolve) => resolvers.push(resolve)),
+        );
+
+      const task = makeTask({ status: 'executing' });
+      const { rerender } = render(<LoopChatView task={task} onBack={onBack} />);
+      await waitFor(() => expect(resolvers).toHaveLength(1));
+
+      act(() => {
+        sendWs({
+          event_type: 'message',
+          role: 'assistant',
+          content: 'Buffered across status change',
+          loop_iteration: 0,
+          is_error: false,
+        });
+      });
+
+      rerender(
+        <LoopChatView
+          task={{ ...task, status: 'completed' }}
+          onBack={onBack}
+        />,
+      );
+      await waitFor(() => expect(resolvers).toHaveLength(2));
+
+      await act(async () => {
+        resolvers[1]([]);
+      });
+      await waitFor(() => {
+        expect(screen.getByText('Buffered across status change')).toBeInTheDocument();
+      });
+
+      await act(async () => {
+        resolvers[0]([
+          makeMsg({ id: 999, content: 'Stale history response', loop_iteration: 0 }),
+        ]);
+      });
+      expect(screen.queryByText('Stale history response')).not.toBeInTheDocument();
+      expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
     });
   });
 

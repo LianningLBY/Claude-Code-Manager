@@ -5,6 +5,7 @@ import { api } from '../../api/client';
 import type { ChatMessage, Task } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ArrowLeft, ChevronDown, ChevronRight, Copy, Check, XCircle, ArrowDown } from '../icons';
+import { mergeChatHistory } from './messageMerge';
 
 interface LoopChatViewProps {
   task: Task;
@@ -365,6 +366,12 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
   const scrollBottomRef = useRef<HTMLDivElement>(null);
   const historyLoadedRef = useRef(false);
   const pendingWsRef = useRef<ChatMessage[]>([]);
+  const historyGenerationRef = useRef(0);
+  const currentTaskIdRef = useRef(task.id);
+  const initializedTaskIdRef = useRef<number | null>(null);
+  const taskStatusRef = useRef(task.status);
+  currentTaskIdRef.current = task.id;
+  taskStatusRef.current = task.status;
 
   useEffect(() => {
     const prev = document.title;
@@ -404,8 +411,11 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
     const content = (msg.data.content as string) || null;
     if ((eventType === 'message' || eventType === 'result') && !content) return;
 
+    const persistedId = Number(msg.data.id);
+    const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
+    const itemId = (msg.data.item_id as string) || null;
     const entry: ChatMessage = {
-      id: Date.now() + Math.random(),
+      id: isPersisted ? persistedId : Date.now() + Math.random(),
       role: (msg.data.role as string) || 'assistant',
       event_type: eventType,
       content,
@@ -414,9 +424,12 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       tool_output: (msg.data.tool_output as string) || null,
       is_error: (msg.data.is_error as boolean) || false,
       loop_iteration: (msg.data.loop_iteration as number) ?? 0,
-      timestamp: new Date().toISOString(),
+      timestamp: (msg.data.timestamp as string) || new Date().toISOString(),
       image_urls: null,
       attachments: null,
+      item_id: itemId,
+      stream_item_id: itemId,
+      persisted: isPersisted,
     };
 
     if (!historyLoadedRef.current) {
@@ -426,29 +439,62 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
     setMessages((prev) => [...prev, entry]);
   }, [task.id]);
 
-  useWebSocket([`task:${task.id}`], handleWsMessage);
-
-  useEffect(() => {
-    historyLoadedRef.current = false;
-    pendingWsRef.current = [];
-    api.getTaskChatHistory(task.id, true, 0, 0, true).then((msgs) => {
-      const filtered = msgs.filter((m) =>
-        !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
-      );
-      const maxHistoryId = filtered.length > 0
-        ? Math.max(...filtered.map((m) => m.id))
-        : 0;
-      const fresh = pendingWsRef.current.filter((m) => m.id > maxHistoryId);
-      setMessages([...filtered, ...fresh]);
+  const refreshHistory = useCallback(() => {
+    const requestedTaskId = task.id;
+    const generation = ++historyGenerationRef.current;
+    return api.getTaskChatHistory(task.id, true, 0, 0, true).then((msgs) => {
+      if (
+        generation !== historyGenerationRef.current
+        || requestedTaskId !== currentTaskIdRef.current
+      ) return;
+      const filtered = msgs
+        .filter((m) =>
+          !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
+        )
+        .map((message) => ({ ...message, persisted: true }));
+      const buffered = pendingWsRef.current;
       pendingWsRef.current = [];
       historyLoadedRef.current = true;
-      if (['executing', 'in_progress'].includes(task.status)) {
-        const allMsgs = [...filtered, ...fresh];
-        const maxIter = allMsgs.reduce((acc, m) => Math.max(acc, m.loop_iteration ?? 0), 0);
-        setActiveIteration(maxIter);
+      setMessages((current) => mergeChatHistory(filtered, [...current, ...buffered]));
+      if (['executing', 'in_progress'].includes(taskStatusRef.current)) {
+        const maxIter = [...filtered, ...buffered]
+          .reduce((acc, m) => Math.max(acc, m.loop_iteration ?? 0), 0);
+        setActiveIteration((current) => Math.max(current ?? 0, maxIter));
+      } else {
+        setActiveIteration(null);
       }
-    }).catch(() => {});
-  }, [task.id, task.status]);
+    }).catch(() => {
+      if (
+        generation !== historyGenerationRef.current
+        || requestedTaskId !== currentTaskIdRef.current
+      ) return;
+      const buffered = pendingWsRef.current;
+      pendingWsRef.current = [];
+      historyLoadedRef.current = true;
+      if (buffered.length > 0) {
+        setMessages((current) => mergeChatHistory([], [...current, ...buffered]));
+      }
+    });
+  }, [task.id]);
+
+  const handleSubscribed = useCallback((channels: string[]) => {
+    if (channels.includes(`task:${task.id}`)) void refreshHistory();
+  }, [refreshHistory, task.id]);
+
+  useWebSocket([`task:${task.id}`], handleWsMessage, undefined, handleSubscribed);
+
+  useEffect(() => {
+    if (initializedTaskIdRef.current !== task.id) {
+      initializedTaskIdRef.current = task.id;
+      historyGenerationRef.current += 1;
+      historyLoadedRef.current = false;
+      pendingWsRef.current = [];
+      setMessages([]);
+      setIterMeta(new Map());
+      setActiveIteration(null);
+    }
+    void refreshHistory();
+  }, [refreshHistory, task.id, task.status]);
 
   useEffect(() => {
     const el = scrollContainerRef.current;

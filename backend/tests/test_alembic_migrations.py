@@ -266,6 +266,101 @@ class TestLegacyMigration:
         engine.dispose()
 
 
+class TestLegacyDefaultAdminMigration:
+    def test_known_seeded_account_is_disabled_and_password_rotated(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "legacy-admin.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d8f0a1b2c3d4")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        import bcrypt
+
+        old_hash = bcrypt.hashpw(
+            b"admin123456",
+            bcrypt.gensalt(),
+        ).decode()
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users "
+                    "(email, name, password_hash, role, avatar_url, "
+                    "is_active, feishu_open_id, feishu_name, created_at) "
+                    "VALUES "
+                    "(:email, 'Admin', :password_hash, 'super_admin', "
+                    "'', TRUE, '', '', CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "email": "admin@apexin.ai",
+                    "password_hash": old_hash,
+                },
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT password_hash, is_active FROM users "
+                    "WHERE email = :email"
+                ),
+                {"email": "admin@apexin.ai"},
+            ).one()
+        engine.dispose()
+
+        assert row.password_hash != old_hash
+        assert bool(row.is_active) is False
+
+    def test_changed_legacy_admin_password_is_preserved(self, tmp_path):
+        import bcrypt
+
+        db_path = str(tmp_path / "changed-legacy-admin.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d8f0a1b2c3d4")
+
+        changed_hash = bcrypt.hashpw(
+            b"a-deployment-owned-password",
+            bcrypt.gensalt(),
+        ).decode()
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users "
+                    "(email, name, password_hash, role, avatar_url, "
+                    "is_active, feishu_open_id, feishu_name, created_at) "
+                    "VALUES "
+                    "(:email, 'Admin', :password_hash, 'super_admin', "
+                    "'', TRUE, '', '', CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "email": "admin@apexin.ai",
+                    "password_hash": changed_hash,
+                },
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT password_hash, is_active FROM users "
+                    "WHERE email = :email"
+                ),
+                {"email": "admin@apexin.ai"},
+            ).one()
+        engine.dispose()
+
+        assert row.password_hash == changed_hash
+        assert bool(row.is_active) is True
+
+
 class TestFreshMigration:
     """A fresh database (no tables) can be fully created via Alembic upgrade."""
 

@@ -48,10 +48,17 @@ vi.mock('../../api/client', () => ({
 // Store the onMessage/onReconnect callbacks so tests can trigger them
 let capturedOnReconnect: (() => void) | undefined;
 let capturedOnMessage: ((msg: Record<string, unknown>) => void) | undefined;
+let capturedOnSubscribed: ((channels: string[]) => void) | undefined;
 vi.mock('../../hooks/useWebSocket', () => ({
-  useWebSocket: vi.fn((_channels: string[], onMessage?: unknown, onReconnect?: () => void) => {
+  useWebSocket: vi.fn((
+    _channels: string[],
+    onMessage?: unknown,
+    onReconnect?: () => void,
+    onSubscribed?: (channels: string[]) => void,
+  ) => {
     capturedOnMessage = onMessage as typeof capturedOnMessage;
     capturedOnReconnect = onReconnect;
+    capturedOnSubscribed = onSubscribed;
     return { lastMessage: null, isConnected: true };
   }),
 }));
@@ -107,6 +114,7 @@ describe('ChatView', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       use_pty_mode: false,
@@ -679,6 +687,157 @@ describe('ChatView', () => {
 
       expect(capturedOnReconnect).toBeDefined();
       expect(typeof capturedOnReconnect).toBe('function');
+      expect(capturedOnSubscribed).toBeDefined();
+      expect(typeof capturedOnSubscribed).toBe('function');
+    });
+
+    it('keeps a live message when an older history snapshot finishes later', async () => {
+      let resolveHistory!: (messages: ChatMessage[]) => void;
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        new Promise<ChatMessage[]>((resolve) => { resolveHistory = resolve; }),
+      );
+      const task = makeTask({ id: 12, description: null });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:12',
+          data: {
+            event_type: 'message',
+            role: 'assistant',
+            content: 'live while snapshot is in flight',
+            is_error: false,
+          },
+        });
+      });
+      expect(screen.getByText('live while snapshot is in flight')).toBeInTheDocument();
+
+      await act(async () => { resolveHistory([]); });
+      expect(screen.getByText('live while snapshot is in flight')).toBeInTheDocument();
+    });
+
+    it('backfills again after the task-channel subscription is acknowledged', async () => {
+      const task = makeTask({ id: 13 });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalledTimes(1));
+
+      act(() => { capturedOnSubscribed?.(['task:13']); });
+      await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalledTimes(2));
+    });
+
+    it('does not revive an answered ask-user card from a stale pending snapshot', async () => {
+      let resolvePending!: (value: {
+        pending: { request_id: string; questions: {
+          question: string;
+          options: { label: string }[];
+        }[] }[];
+      }) => void;
+      (api.getAskUserPending as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        new Promise((resolve) => { resolvePending = resolve; }),
+      );
+      render(
+        <ChatView
+          task={makeTask({ id: 14, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:14',
+          data: {
+            event_type: 'ask_user_question',
+            request_id: 'ask-1',
+            questions: [{
+              question: 'Proceed?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          },
+        });
+      });
+      expect(screen.getByText('Proceed?')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:14',
+          data: {
+            event_type: 'ask_user_resolved',
+            request_id: 'ask-1',
+            timed_out: false,
+          },
+        });
+      });
+      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+
+      await act(async () => {
+        resolvePending({
+          pending: [{
+            request_id: 'ask-1',
+            questions: [{
+              question: 'Proceed?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          }],
+        });
+      });
+
+      expect(screen.getAllByText('Proceed?')).toHaveLength(1);
+      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText('或自定义回答…')).not.toBeInTheDocument();
+    });
+
+    it('tombstones a locally submitted answer before a stale pending snapshot returns', async () => {
+      let resolvePending!: (value: {
+        pending: { request_id: string; questions: {
+          question: string;
+          options: { label: string }[];
+        }[] }[];
+      }) => void;
+      (api.getAskUserPending as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        new Promise((resolve) => { resolvePending = resolve; }),
+      );
+      render(
+        <ChatView
+          task={makeTask({ id: 15, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:15',
+          data: {
+            event_type: 'ask_user_question',
+            request_id: 'ask-local',
+            questions: [{
+              question: 'Ship it?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          },
+        });
+      });
+      await userEvent.click(screen.getByRole('button', { name: /Yes/ }));
+      await userEvent.click(screen.getByRole('button', { name: '提交' }));
+      await waitFor(() => expect(api.submitAskUser).toHaveBeenCalled());
+      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+
+      await act(async () => {
+        resolvePending({
+          pending: [{
+            request_id: 'ask-local',
+            questions: [{
+              question: 'Ship it?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          }],
+        });
+      });
+
+      expect(screen.getAllByText('Ship it?')).toHaveLength(1);
+      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText('或自定义回答…')).not.toBeInTheDocument();
     });
 
     it('copies a user message without its sender prefix', async () => {
@@ -1132,5 +1291,29 @@ describe('Codex app-server 增量消息', () => {
       });
     });
     expect(screen.getAllByText('Hello')).toHaveLength(1);
+  });
+});
+
+describe('failed attachment sending', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
+  });
+
+  it('keeps Send disabled instead of posting an empty attachment placeholder', async () => {
+    (api.uploadImages as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('upload failed'));
+    render(<ChatView task={makeTask()} projects={[]} onBack={vi.fn()} />);
+
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(['evidence'], 'evidence.txt', { type: 'text/plain' })] },
+    });
+    await screen.findByTitle('Click to retry');
+
+    const send = screen.getByTitle('Retry or remove failed attachments before sending');
+    expect(send).toBeDisabled();
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
   });
 });

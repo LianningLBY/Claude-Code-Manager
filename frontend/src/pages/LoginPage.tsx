@@ -14,6 +14,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
+  const [bootstrapToken, setBootstrapToken] = useState('');
   const [codeSent, setCodeSent] = useState(false);
   const [codeCooldown, setCodeCooldown] = useState(0);
   const [serverUrl, setServerUrlValue] = useState(getServerUrl());
@@ -126,7 +127,13 @@ export function LoginPage({ onLogin }: LoginPageProps) {
       const res = await fetch(`${base()}/api/auth/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, name, password, code }),
+        body: JSON.stringify({
+          email,
+          name,
+          password,
+          code,
+          bootstrap_token: bootstrapToken,
+        }),
       });
       const data = await res.json();
       if (res.ok && data.token) {
@@ -269,6 +276,14 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
+            />
+            <input
+              type="password"
+              className={inputCls}
+              placeholder="Bootstrap Token (first admin only)"
+              value={bootstrapToken}
+              onChange={(e) => setBootstrapToken(e.target.value)}
+              autoComplete="off"
             />
             <button type="submit" disabled={loading || !codeSent}
               className={primaryBtnCls}>

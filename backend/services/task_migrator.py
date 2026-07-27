@@ -468,7 +468,7 @@ class TaskMigrator:
                     "target_repo",
                     "error_message",
                 )
-                if wt.get(field)
+                if field in wt
             }
             # Even an empty response must prove that the claimed generation is
             # still current after the network await.
@@ -519,38 +519,120 @@ class TaskMigrator:
         return out
 
     async def _move_session(self, src: Worker | None, dst: Worker | None, session_id: str):
-        """session JSONL：源机定位（任意账号 config_dir）→ 目标机 ~/.claude 同编码路径。"""
-        if src is None:
-            matches = self._local_session_glob(session_id)
-            if not matches:
-                logger.warning("session %s 本机未找到，跳过 session 搬运", session_id)
-                return
-            src_file = matches[0]
-            encoded = os.path.basename(os.path.dirname(src_file))
-        else:
-            ssh = self._ssh(src)
-            code, out = await ssh.run(
-                f"ls ~/.claude/projects/*/{session_id}.jsonl "
-                f"~/.claude-*/projects/*/{session_id}.jsonl 2>/dev/null | head -1"
-            )
-            remote_file = out.strip().splitlines()[0].strip() if out.strip() else ""
-            if not remote_file:
-                logger.warning("session %s 在 worker %s 未找到，跳过", session_id, src.id)
-                return
-            encoded = os.path.basename(os.path.dirname(remote_file))
-            tmp = tempfile.mkdtemp(prefix="ccm-sess-")
-            src_file = os.path.join(tmp, f"{session_id}.jsonl")
-            await ssh.rsync_from(remote_file, src_file, delete=False)
+        """Move a complete Claude session JSONL plus its sibling sidecar tree."""
 
-        if dst is None:
-            config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-            target = os.path.join(config_dir, f"projects/{encoded}/{session_id}.jsonl")
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            if os.path.abspath(src_file) != os.path.abspath(target):
-                shutil.copy2(src_file, target)
-        else:
-            target = f"/home/{dst.ssh_user}/.claude/projects/{encoded}/{session_id}.jsonl"
-            await self._ssh(dst).copy_file(src_file, target)
+        temporary_dir: str | None = None
+        try:
+            if src is None:
+                matches = self._local_session_glob(session_id)
+                if not matches:
+                    logger.warning(
+                        "session %s 本机未找到，跳过 session 搬运",
+                        session_id,
+                    )
+                    return
+                src_file = matches[0]
+                encoded = os.path.basename(os.path.dirname(src_file))
+                src_sidecar = os.path.join(
+                    os.path.dirname(src_file),
+                    session_id,
+                )
+            else:
+                ssh = self._ssh(src)
+                _code, out = await ssh.run(
+                    f"ls ~/.claude/projects/*/{session_id}.jsonl "
+                    f"~/.claude-*/projects/*/{session_id}.jsonl "
+                    "2>/dev/null | head -1"
+                )
+                remote_file = (
+                    out.strip().splitlines()[0].strip()
+                    if out.strip()
+                    else ""
+                )
+                if not remote_file:
+                    logger.warning(
+                        "session %s 在 worker %s 未找到，跳过",
+                        session_id,
+                        src.id,
+                    )
+                    return
+                encoded = os.path.basename(os.path.dirname(remote_file))
+                remote_sidecar = remote_file.removesuffix(".jsonl")
+                temporary_dir = tempfile.mkdtemp(prefix="ccm-sess-")
+                src_file = os.path.join(
+                    temporary_dir,
+                    f"{session_id}.jsonl",
+                )
+                src_sidecar = os.path.join(temporary_dir, session_id)
+                await ssh.rsync_from(
+                    remote_file,
+                    src_file,
+                    delete=False,
+                )
+                sidecar_code, _sidecar_out = await ssh.run(
+                    f"test -d {shlex.quote(remote_sidecar)}"
+                )
+                if sidecar_code == 0:
+                    await ssh.rsync_from(
+                        remote_sidecar + "/",
+                        src_sidecar + "/",
+                        delete=False,
+                    )
+
+            sidecar_exists = os.path.isdir(src_sidecar)
+            if dst is None:
+                config_dir = (
+                    os.environ.get("CLAUDE_CONFIG_DIR")
+                    or os.path.expanduser("~/.claude")
+                )
+                target = os.path.join(
+                    config_dir,
+                    f"projects/{encoded}/{session_id}.jsonl",
+                )
+                target_sidecar = os.path.join(
+                    os.path.dirname(target),
+                    session_id,
+                )
+                await asyncio.to_thread(
+                    os.makedirs,
+                    os.path.dirname(target),
+                    exist_ok=True,
+                )
+                if os.path.abspath(src_file) != os.path.abspath(target):
+                    await asyncio.to_thread(shutil.copy2, src_file, target)
+                if (
+                    sidecar_exists
+                    and os.path.abspath(src_sidecar)
+                    != os.path.abspath(target_sidecar)
+                ):
+                    await asyncio.to_thread(
+                        shutil.copytree,
+                        src_sidecar,
+                        target_sidecar,
+                        dirs_exist_ok=True,
+                    )
+            else:
+                target = (
+                    f"/home/{dst.ssh_user}/.claude/projects/"
+                    f"{encoded}/{session_id}.jsonl"
+                )
+                target_sidecar = target.removesuffix(".jsonl")
+                destination_ssh = self._ssh(dst)
+                await destination_ssh.copy_file(src_file, target)
+                if sidecar_exists:
+                    await destination_ssh.rsync_to(
+                        src_sidecar + "/",
+                        target_sidecar + "/",
+                        excludes=[],
+                        timeout=1200,
+                    )
+        finally:
+            if temporary_dir is not None:
+                await asyncio.to_thread(
+                    shutil.rmtree,
+                    temporary_dir,
+                    ignore_errors=True,
+                )
 
     # -- codex session 搬运 ---------------------------------------------
     # codex 的 session 是 rollout 文件：~/.codex/sessions/YYYY/MM/DD/

@@ -10,9 +10,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.services.dispatcher import GlobalDispatcher
+from backend.services.dispatcher import (
+    GlobalDispatcher,
+    QueuedMessage,
+    QueuedMessagePrelaunchError,
+)
 from backend.services.deployment_start_guard import (
     DeploymentTaskStartBlocked,
+)
+from backend.services.task_skill_overrides import (
+    TEMP_SKILLS_GENERATION_KEY,
 )
 from backend.models.instance import Instance
 from backend.models.task import Task
@@ -4568,6 +4575,62 @@ async def test_queued_resume_waits_at_maintenance_gate_and_stays_blocking(
 
 
 @pytest.mark.asyncio
+async def test_internal_report_without_session_waits_for_initial_generation(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    msg.source = "monitor:complete"
+    msg.allow_new_session = True
+    msg.defer_for_initial_session = True
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = None
+        task.status = "in_progress"
+        await db.commit()
+
+    with pytest.raises(
+        QueuedMessagePrelaunchError,
+        match="establishing its first session",
+    ):
+        await d._process_queued_message(task_id, msg)
+    d.instance_manager.launch.assert_not_awaited()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+    assert (
+        d.instance_manager.launch.await_args.kwargs["resume_session_id"]
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_internal_report_enqueue_allows_new_session_by_default(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    d._ensure_queue_worker = MagicMock()
+
+    await d.enqueue_message(
+        42,
+        "monitor result",
+        source="monitor:complete",
+    )
+
+    queued = d._get_task_queue(42).get_nowait()
+    assert queued.allow_new_session is True
+    assert queued.defer_for_initial_session is True
+
+
+@pytest.mark.asyncio
 async def test_pause_wins_after_queued_resume_preparation_before_launch(
     db_factory, monkeypatch,
 ):
@@ -4929,6 +4992,261 @@ async def test_cancelled_queued_pty_launch_restores_skills_without_completion(
         or payload.get("event_type") == "process_exit"
         for payload in payloads
     )
+
+
+@pytest.mark.asyncio
+async def test_initial_command_skill_claim_uses_save_before_write_barrier(
+    db_factory,
+    monkeypatch,
+):
+    """A settings save after dequeue must become the launch/cleanup baseline."""
+    from backend.services.command_registry import COMMAND_REGISTRY, Command
+
+    monkeypatch.setitem(
+        COMMAND_REGISTRY,
+        "delegate-race",
+        Command(
+            name="delegate-race",
+            description="race test",
+            prompt_template="delegate",
+            required_skills={"temporary": True},
+        ),
+    )
+    d = _make_dispatcher(db_factory)
+    before_claim = asyncio.Event()
+    allow_claim = asyncio.Event()
+    blocked_once = False
+
+    async def block_after_stale_snapshot(_channel, payload):
+        nonlocal blocked_once
+        if (
+            not blocked_once
+            and payload.get("old_status") == "pending"
+            and payload.get("new_status") == "in_progress"
+        ):
+            blocked_once = True
+            before_claim.set()
+            await allow_claim.wait()
+
+    d.broadcaster.broadcast.side_effect = block_after_stale_snapshot
+
+    async with db_factory() as db:
+        instance = Instance(name="initial-skill-save-race")
+        task = Task(
+            title="initial skill save race",
+            description="$delegate-race do work",
+            status="in_progress",
+            enabled_skills={"old": True},
+            metadata_={"keep": "old"},
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        await db.refresh(task)
+        instance_id, task_id, task_obj = instance.id, task.id, task
+
+    async def successful_launch(**kwargs):
+        process = MagicMock(returncode=0)
+        process.wait = AsyncMock(return_value=0)
+        d.instance_manager.processes[kwargs["instance_id"]] = process
+
+    d.instance_manager.launch = AsyncMock(side_effect=successful_launch)
+    lifecycle = asyncio.create_task(
+        d._run_task_lifecycle(instance_id, task_obj)
+    )
+    await asyncio.wait_for(before_claim.wait(), timeout=1)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.enabled_skills = {"saved": True}
+        current.metadata_ = {"keep": "saved"}
+        await db.commit()
+
+    allow_claim.set()
+    await asyncio.wait_for(lifecycle, timeout=2)
+
+    assert d.instance_manager.launch.await_args.kwargs["enabled_skills"] == {
+        "saved": True,
+        "temporary": True,
+    }
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.enabled_skills == {"saved": True}
+        assert current.metadata_ == {"keep": "saved"}
+
+
+@pytest.mark.asyncio
+async def test_queued_command_skill_claim_uses_save_before_write_barrier(
+    db_factory,
+    monkeypatch,
+):
+    """A queued turn overlays its command on the last pre-claim user save."""
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    msg.command_skills = {"temporary": True}
+    before_claim = asyncio.Event()
+    allow_claim = asyncio.Event()
+
+    @asynccontextmanager
+    async def blocked_start_guard():
+        before_claim.set()
+        await allow_claim.wait()
+        yield
+
+    d.task_start_guard = blocked_start_guard
+    queued_turn = asyncio.create_task(
+        d._process_queued_message(task_id, msg)
+    )
+    await asyncio.wait_for(before_claim.wait(), timeout=1)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.enabled_skills = {"saved": True}
+        current.metadata_ = {"keep": "saved"}
+        await db.commit()
+
+    allow_claim.set()
+    await asyncio.wait_for(queued_turn, timeout=2)
+
+    assert d.instance_manager.launch.await_args.kwargs["enabled_skills"] == {
+        "saved": True,
+        "temporary": True,
+    }
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.enabled_skills == {"saved": True}
+        assert current.metadata_ == {"keep": "saved"}
+
+
+@pytest.mark.asyncio
+async def test_queued_skill_restore_keeps_unrelated_edit_and_clears_temp_key(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    msg = QueuedMessage(
+        priority=0,
+        timestamp=0,
+        prompt="continue",
+        command_skills={"temporary": True},
+    )
+    original = {"base": True}
+    token = "queued-skill-generation"
+
+    async with db_factory() as db:
+        task = Task(
+            title="skill-cas",
+            status="executing",
+            enabled_skills={
+                "base": True,
+                "temporary": True,
+                "user_saved": True,
+            },
+            metadata_={TEMP_SKILLS_GENERATION_KEY: token},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    await d._restore_queued_message_skills(
+        task_id,
+        msg,
+        original,
+        token,
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.enabled_skills == {
+            "base": True,
+            "user_saved": True,
+        }
+        assert TEMP_SKILLS_GENERATION_KEY not in (task.metadata_ or {})
+
+
+@pytest.mark.asyncio
+async def test_queued_skill_restore_preserves_new_value_for_same_key(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    msg = QueuedMessage(
+        priority=0,
+        timestamp=0,
+        prompt="continue",
+        command_skills={"temporary": True},
+    )
+    token = "queued-skill-key-generation"
+
+    async with db_factory() as db:
+        task = Task(
+            title="skill-key-cas",
+            status="executing",
+            enabled_skills={
+                "base": True,
+                "temporary": False,
+            },
+            metadata_={TEMP_SKILLS_GENERATION_KEY: token},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    await d._restore_queued_message_skills(
+        task_id,
+        msg,
+        {"base": True},
+        token,
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.enabled_skills == {
+            "base": True,
+            "temporary": False,
+        }
+        assert TEMP_SKILLS_GENERATION_KEY not in (task.metadata_ or {})
+
+
+@pytest.mark.asyncio
+async def test_queued_skill_restore_preserves_same_value_explicit_save(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    msg = QueuedMessage(
+        priority=0,
+        timestamp=0,
+        prompt="continue",
+        command_skills={"temporary": True},
+    )
+
+    async with db_factory() as db:
+        task = Task(
+            title="skill-same-value-save",
+            status="executing",
+            enabled_skills={"base": True, "temporary": True},
+            # The settings API clears the marker on every explicit save, even
+            # when the saved JSON equals the temporary view.
+            metadata_={},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    await d._restore_queued_message_skills(
+        task_id,
+        msg,
+        {"base": True},
+        "old-temporary-generation",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.enabled_skills == {
+            "base": True,
+            "temporary": True,
+        }
 
 
 @pytest.mark.asyncio

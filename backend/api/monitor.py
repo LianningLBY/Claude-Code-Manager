@@ -2,11 +2,16 @@ import asyncio
 from weakref import WeakValueDictionary
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
+from backend.api.deps import (
+    require_internal_service,
+    require_task_access,
+    require_task_control,
+)
 from backend.models.task import Task
 from backend.models.monitor_session import MonitorSession, MonitorCheck
 from backend.schemas.monitor_session import (
@@ -125,6 +130,7 @@ async def _monitor_session_or_error(
 async def create_monitor_session(
     task_id: int,
     body: MonitorSessionCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     # Route Worker tasks before taking a local row lock: the proxy is a network
@@ -132,6 +138,7 @@ async def create_monitor_session(
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
     if task.worker_id is not None:
         # Worker task：monitor 子进程依赖 task 所在机器的文件系统（ps/tail/signal
         # file），必须在 worker 上跑。本地镜像行由 relay 的 monitor_session_created
@@ -254,7 +261,15 @@ async def create_monitor_session(
 
 
 @router.get("", response_model=list[MonitorSessionResponse])
-async def list_monitor_sessions(task_id: int, db: AsyncSession = Depends(get_db)):
+async def list_monitor_sessions(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
     result = await db.execute(
         select(MonitorSession)
         .where(MonitorSession.task_id == task_id)
@@ -265,8 +280,15 @@ async def list_monitor_sessions(task_id: int, db: AsyncSession = Depends(get_db)
 
 @router.get("/{session_id}", response_model=MonitorSessionResponse)
 async def get_monitor_session(
-    task_id: int, session_id: int, db: AsyncSession = Depends(get_db),
+    task_id: int,
+    session_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ):
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
     ms = await db.get(MonitorSession, session_id)
     if not ms or ms.task_id != task_id:
         raise HTTPException(404, "Monitor session not found")
@@ -275,13 +297,19 @@ async def get_monitor_session(
 
 @router.delete("/{session_id}")
 async def delete_monitor_session(
-    task_id: int, session_id: int, db: AsyncSession = Depends(get_db),
+    task_id: int,
+    session_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ):
     ms = await db.get(MonitorSession, session_id)
     if not ms or ms.task_id != task_id:
         raise HTTPException(404, "Monitor session not found")
 
     task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
     if task is not None and task.worker_id is not None:
         # 本地行是镜像（id 是 Manager 自增），worker 端要用 remote_id
         from backend.main import worker_proxy
@@ -338,8 +366,15 @@ async def delete_monitor_session(
 
 @router.get("/{session_id}/checks", response_model=list[MonitorCheckResponse])
 async def get_monitor_checks(
-    task_id: int, session_id: int, db: AsyncSession = Depends(get_db),
+    task_id: int,
+    session_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ):
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
     ms = await db.get(MonitorSession, session_id)
     if not ms or ms.task_id != task_id:
         raise HTTPException(404, "Monitor session not found")
@@ -356,9 +391,11 @@ async def create_monitor_check(
     task_id: int,
     session_id: int,
     body: MonitorCheckCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Sub-agent reports a status check via MCP tool."""
+    require_internal_service(request)
     import json as _json
     from backend.main import dispatcher
     from backend.models.log_entry import LogEntry
@@ -521,9 +558,11 @@ async def complete_monitor_session(
     task_id: int,
     session_id: int,
     body: MonitorCompleteRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Sub-agent marks itself as complete."""
+    require_internal_service(request)
     completed = await db.execute(
         update(MonitorSession)
         .where(

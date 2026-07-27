@@ -1,9 +1,33 @@
 """Tests for BackupService."""
-from unittest.mock import MagicMock, call
+import sqlite3
+import time
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from backend.services.backup_service import BackupService
+from backend.services.backup_service import BackupService, _PROJECT_ROOT
+
+_REAL_CREATE_SQLITE_SNAPSHOT = BackupService._create_sqlite_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _isolate_scheduled_snapshots(monkeypatch):
+    def create_test_snapshot(_db_file: str, snapshot_file: str) -> None:
+        Path(snapshot_file).write_bytes(b"isolated sqlite snapshot")
+
+    monkeypatch.setattr(
+        BackupService,
+        "_create_sqlite_snapshot",
+        staticmethod(create_test_snapshot),
+    )
+
+
+def _wait_for_call(mock, timeout: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not mock.called and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert mock.called
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -108,6 +132,7 @@ class TestResolveDbPath:
         path = svc._resolve_db_path()
         assert "sqlite+aiosqlite" not in path
         assert path.endswith("claude_manager.db")
+        assert path == str((_PROJECT_ROOT / "claude_manager.db").resolve())
 
     def test_strips_sync_prefix(self):
         svc = _make_svc(db_path="sqlite:///./mydb.db")
@@ -119,6 +144,18 @@ class TestResolveDbPath:
         db = str(tmp_path / "data.db")
         svc = _make_svc(db_path=f"sqlite+aiosqlite:///{db}")
         assert svc._resolve_db_path() == db
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "postgresql+asyncpg://user:pass@db/ccm",
+            "mysql+aiomysql://user:pass@db/ccm",
+        ],
+    )
+    def test_rejects_external_database_urls(self, url):
+        svc = _make_svc(db_path=url)
+        with pytest.raises(ValueError, match="only supports SQLite"):
+            svc._resolve_db_path()
 
 
 # ── start ─────────────────────────────────────────────────────────────────────
@@ -134,11 +171,11 @@ class TestStart:
 
         assert result is True
         mock_cls.assert_called_once()
-        mock_instance.add_task.assert_called_once()
-        kwargs = mock_instance.add_task.call_args.kwargs
-        assert kwargs["interval_seconds"] == 3600
+        _wait_for_call(mock_instance.run_once)
+        kwargs = mock_instance.run_once.call_args.kwargs
         assert kwargs["max_copies"] == 10
-        mock_instance.start.assert_called_once()
+        assert svc._interval_seconds == 3600
+        svc.stop()
 
     def test_returns_false_when_destination_not_configured(self):
         mock_cls = MagicMock()
@@ -147,6 +184,16 @@ class TestStart:
         result = svc.start()
 
         assert result is False
+        mock_cls.assert_not_called()
+
+    def test_external_database_does_not_start_fake_file_backup(self):
+        mock_cls = MagicMock()
+        svc = _make_svc(
+            db_path="postgresql+asyncpg://user:pass@db/ccm",
+            _auto_backup_cls=mock_cls,
+        )
+
+        assert svc.start() is False
         mock_cls.assert_not_called()
 
     def test_s3_passes_correct_destination(self):
@@ -163,9 +210,11 @@ class TestStart:
 
         svc.start()
 
-        destinations = mock_instance.add_task.call_args.kwargs["destinations"]
+        _wait_for_call(mock_instance.run_once)
+        destinations = mock_instance.run_once.call_args.kwargs["destinations"]
         assert destinations[0]["type"] == "s3"
         assert destinations[0]["bucket"] == "bucket"
+        svc.stop()
 
     def test_oss_passes_correct_destination(self):
         mock_instance = MagicMock()
@@ -181,9 +230,11 @@ class TestStart:
 
         svc.start()
 
-        destinations = mock_instance.add_task.call_args.kwargs["destinations"]
+        _wait_for_call(mock_instance.run_once)
+        destinations = mock_instance.run_once.call_args.kwargs["destinations"]
         assert destinations[0]["type"] == "oss"
         assert destinations[0]["endpoint"] == "oss-cn-hangzhou.aliyuncs.com"
+        svc.stop()
 
     def test_custom_interval_and_max_copies(self):
         mock_instance = MagicMock()
@@ -196,11 +247,14 @@ class TestStart:
 
         svc.start()
 
-        kwargs = mock_instance.add_task.call_args.kwargs
-        assert kwargs["interval_seconds"] == 7200
+        _wait_for_call(mock_instance.run_once)
+        kwargs = mock_instance.run_once.call_args.kwargs
+        assert svc._interval_seconds == 7200
         assert kwargs["max_copies"] == 5
+        svc.stop()
 
-    def test_temp_dir_passed_to_auto_backup(self):
+    def test_temp_dir_passed_to_auto_backup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
         mock_instance = MagicMock()
         mock_cls = MagicMock(return_value=mock_instance)
         svc = _make_svc(
@@ -214,6 +268,7 @@ class TestStart:
         assert "tmp_base_dir" in init_kwargs
         assert "~" not in init_kwargs["tmp_base_dir"]
         assert init_kwargs["tmp_base_dir"].startswith("/")
+        svc.stop()
 
     def test_no_temp_dir_passes_none(self):
         mock_instance = MagicMock()
@@ -224,6 +279,7 @@ class TestStart:
 
         init_kwargs = mock_cls.call_args.kwargs
         assert init_kwargs.get("tmp_base_dir") is None
+        svc.stop()
 
     def test_tilde_destination_expanded_in_destination_dict(self):
         mock_instance = MagicMock()
@@ -236,9 +292,11 @@ class TestStart:
 
         svc.start()
 
-        destinations = mock_instance.add_task.call_args.kwargs["destinations"]
+        _wait_for_call(mock_instance.run_once)
+        destinations = mock_instance.run_once.call_args.kwargs["destinations"]
         assert "~" not in destinations[0]["path"]
         assert destinations[0]["path"].startswith("/")
+        svc.stop()
 
 
 # ── stop ──────────────────────────────────────────────────────────────────────
@@ -253,8 +311,8 @@ class TestStop:
 
         svc.stop()
 
-        mock_instance.stop.assert_called_once()
         assert svc._backup is None
+        assert svc._thread is None
 
     def test_stop_without_start_is_safe(self):
         svc = _make_svc()
@@ -269,4 +327,33 @@ class TestStop:
         svc.stop()
         svc.stop()  # second call is safe
 
-        assert mock_instance.stop.call_count == 1
+        assert svc._backup is None
+        assert svc._thread is None
+
+
+def test_sqlite_snapshot_includes_committed_wal_pages(tmp_path):
+    source = tmp_path / "wal-source.db"
+    snapshot = tmp_path / "snapshot.db"
+    writer = sqlite3.connect(source)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE entries (value TEXT NOT NULL)")
+        writer.commit()
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer.execute("INSERT INTO entries VALUES ('committed-in-wal')")
+        writer.commit()
+        assert Path(f"{source}-wal").stat().st_size > 0
+
+        _REAL_CREATE_SQLITE_SNAPSHOT(str(source), str(snapshot))
+    finally:
+        writer.close()
+
+    restored = sqlite3.connect(snapshot)
+    try:
+        assert restored.execute("SELECT value FROM entries").fetchall() == [
+            ("committed-in-wal",)
+        ]
+        assert restored.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    finally:
+        restored.close()

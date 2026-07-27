@@ -102,8 +102,11 @@ export function useFileUpload() {
     removeFile,
     retryFile,
     clear,
-    uploadedResults: uploads.filter(u => u.status === 'uploaded').map(u => u.result!),
+    uploadedResults: uploads
+      .filter((u): u is UploadEntry & { result: UploadResult } => u.status === 'uploaded' && !!u.result)
+      .map(u => u.result),
     isUploading: uploads.some(u => u.status === 'uploading'),
+    hasFailed: uploads.some(u => u.status === 'failed'),
     allDone: uploads.length > 0 && uploads.every(u => u.status !== 'uploading'),
   };
 }

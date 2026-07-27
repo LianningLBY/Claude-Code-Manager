@@ -20,6 +20,7 @@ _CLEANUP_INTERVAL_HOURS = 24
 _BLOCKED_EXTENSIONS = {".exe"}
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+_MAX_TOTAL_SIZE_BYTES = 50 * 1024 * 1024  # bound request memory
 _MAX_FILES = 10
 
 
@@ -34,31 +35,52 @@ async def upload_files(files: list[UploadFile] = File(...)):
     if len(files) > _MAX_FILES:
         raise HTTPException(400, f"Maximum {_MAX_FILES} files allowed per request")
 
-    results = []
+    pending: list[tuple[UploadFile, str, bytes, str, str]] = []
+    total_size = 0
     for file in files:
         ext = Path(file.filename or "file").suffix.lower()
         if ext in _BLOCKED_EXTENSIONS:
             raise HTTPException(400, f"File type '{ext}' is not allowed")
 
-        data = await file.read()
+        remaining = _MAX_TOTAL_SIZE_BYTES - total_size
+        data = await file.read(min(_MAX_SIZE_BYTES, remaining) + 1)
         if len(data) > _MAX_SIZE_BYTES:
             raise HTTPException(400, f"File '{file.filename}' exceeds 50 MB limit")
+        if len(data) > remaining:
+            raise HTTPException(400, "Combined uploads exceed 50 MB limit")
+        total_size += len(data)
 
         file_id = str(uuid.uuid4())
         saved_name = f"{file_id}{ext}" if ext else file_id
+        pending.append((file, ext, data, file_id, saved_name))
 
-        save_path = _get_upload_dir() / saved_name
-        save_path.write_bytes(data)
-
-        results.append(
-            {
-                "id": file_id,
-                "filename": file.filename,
-                "path": str(save_path.resolve()),
-                "url": f"/api/uploads/{saved_name}",
-                "is_image": ext in _IMAGE_EXTENSIONS,
-            }
-        )
+    # Validation is intentionally all-or-nothing.  If any later write fails,
+    # remove files created by this request so a 4xx/5xx never leaves uploads
+    # that the client did not receive identifiers for.
+    upload_dir = _get_upload_dir()
+    written: list[Path] = []
+    results = []
+    try:
+        for file, ext, data, file_id, saved_name in pending:
+            save_path = upload_dir / saved_name
+            save_path.write_bytes(data)
+            written.append(save_path)
+            results.append(
+                {
+                    "id": file_id,
+                    "filename": file.filename,
+                    "path": str(save_path.resolve()),
+                    "url": f"/api/uploads/{saved_name}",
+                    "is_image": ext in _IMAGE_EXTENSIONS,
+                }
+            )
+    except BaseException:
+        for path in written:
+            try:
+                path.unlink()
+            except OSError:
+                logger.exception("Failed to roll back partial upload %s", path)
+        raise
 
     return results
 
@@ -66,16 +88,24 @@ async def upload_files(files: list[UploadFile] = File(...)):
 @router.get("/{filename}")
 async def get_file(filename: str):
     """Serve an uploaded file."""
-    upload_dir = _get_upload_dir()
+    upload_dir = _get_upload_dir().resolve()
     file_path = upload_dir / filename
 
-    # Prevent path traversal
-    if not str(file_path.resolve()).startswith(str(upload_dir.resolve())):
-        raise HTTPException(400, "Invalid filename")
-    if not file_path.exists():
+    try:
+        resolved_path = file_path.resolve(strict=True)
+    except FileNotFoundError:
         raise HTTPException(404, "File not found")
+    try:
+        resolved_path.relative_to(upload_dir)
+    except ValueError:
+        raise HTTPException(400, "Invalid filename")
+    # Uploads are regular files created by this endpoint.  Never follow a
+    # repository/user-created symlink through the unauthenticated download
+    # route.
+    if file_path.is_symlink() or not resolved_path.is_file():
+        raise HTTPException(400, "Invalid filename")
 
-    return FileResponse(str(file_path))
+    return FileResponse(str(resolved_path))
 
 
 def cleanup_expired_uploads() -> int:

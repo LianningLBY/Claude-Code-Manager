@@ -29,7 +29,7 @@ export function TeamShareModal({ type, itemId, itemTitle, onClose }: TeamShareMo
     Promise.all([
       api.getTeamUsers(),
       type === 'project' ? api.teamGetProjectShares(itemId) : api.getTaskSharesTeam(itemId),
-      fetch('/api/team/groups', { headers: { Authorization: `Bearer ${localStorage.getItem('cc_token')}` } }).then(r => r.ok ? r.json() : []),
+      api.getTeamGroups(),
     ]).then(([u, s, g]) => {
       setUsers(u);
       setShares(s.map((x: any) => ({ target_id: x.target_id, target_type: x.target_type })));

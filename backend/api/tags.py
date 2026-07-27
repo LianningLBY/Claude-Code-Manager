@@ -6,7 +6,11 @@ from backend.database import get_db
 from backend.models.tag import Tag
 from backend.models.project import Project
 from backend.schemas.tag import TagCreate, TagUpdate, TagResponse
-from backend.api.deps import get_current_user_id, get_current_user_role
+from backend.api.deps import (
+    get_current_user_id,
+    get_current_user_role,
+    require_admin,
+)
 
 router = APIRouter(prefix="/api/tags", tags=["tags"])
 
@@ -48,6 +52,9 @@ async def update_tag(tag_id: int, body: TagUpdate, request: Request, db: AsyncSe
     old_name = tag.name
 
     if body.name is not None and body.name != old_name:
+        # Tag names are global strings embedded in every Project row.  A
+        # rename therefore mutates Projects outside the tag creator's tenant.
+        require_admin(request)
         dup = await db.execute(select(Tag).where(Tag.name == body.name))
         if dup.scalar_one_or_none():
             raise HTTPException(400, f"Tag '{body.name}' already exists")
@@ -70,6 +77,9 @@ async def update_tag(tag_id: int, body: TagUpdate, request: Request, db: AsyncSe
 
 @router.delete("/{tag_id}")
 async def delete_tag(tag_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+    # Deletion removes this global name from every Project, so per-Tag
+    # ownership is insufficient authorization.
+    require_admin(request)
     tag = await db.get(Tag, tag_id)
     if not tag:
         raise HTTPException(404, "Tag not found")

@@ -12,7 +12,8 @@ import { resolveTagColor } from '../components/TagColors';
 import { ChevronLeft, ChevronRight, ChevronDown, Filter, PanelLeftClose, PanelLeftOpen, Search, X, Star, Archive, ArchiveRestore, Share2 } from '../components/icons';
 import { PluginsBadge, SubAgentsBadge } from '../components/Tasks/TaskBadges';
 import { TAG_COLOR_OPTIONS } from '../components/TagColors';
-import { useTaskReorder } from '../hooks/useTaskReorder';
+import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
+import { useTaskSearch } from '../hooks/useTaskSearch';
 import { TeamShareModal } from '../components/TeamShareModal';
 
 const PAGE_SIZE = 20;
@@ -34,6 +35,11 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const [starredFilter, setStarredFilter] = useState(false);
   const [unreadFilter, setUnreadFilter] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
+  // Regex search over task titles (falls back to plain substring on invalid regex)
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useTaskSearch(searchQuery, showArchived);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
   const [chatTask, setChatTask] = useState<Task | null>(null);
   const [teamSharingTask, setTeamSharingTask] = useState<Task | null>(null);
@@ -88,7 +94,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     if (msg.channel === 'tasks' && msg.data?.event === 'status_change') {
       refreshRef.current();
     }
-  }, []);
+  }, [setSearchResults]);
   useWebSocket(['system', 'tasks'], handleGlobalWs);
 
   const [isWide, setIsWide] = useState(() => window.innerWidth >= 1280);
@@ -176,36 +182,6 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter]);
 
-  // Regex search over task titles (falls back to plain substring on invalid regex)
-  const [showSearch, setShowSearch] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<Task[] | null>(null);
-  const searchInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    const q = searchQuery.trim();
-    if (!q) {
-      setSearchResults(null);
-      return;
-    }
-    const handle = setTimeout(async () => {
-      try {
-        // Fetch across all pages so the search isn't limited to the current page
-        const all = await api.listTasks(undefined, false, undefined, undefined, 1000, 0, showArchived);
-        let re: RegExp | null = null;
-        try { re = new RegExp(q, 'i'); } catch { re = null; }
-        const matches = all.filter((t) => {
-          const title = t.title || t.description || '';
-          return re ? re.test(title) : title.toLowerCase().includes(q.toLowerCase());
-        });
-        setSearchResults(matches);
-      } catch {
-        setSearchResults([]);
-      }
-    }, 300);
-    return () => clearTimeout(handle);
-  }, [searchQuery, showArchived]);
-
   const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'failed'];
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
   const filterDropdownRef = useRef<HTMLDivElement>(null);
@@ -269,11 +245,14 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const sidebarTasks = searchResults ?? filteredTasks;
   const reorderRefresh = useCallback((optimistic?: Task[]) => {
     if (optimistic) {
-      setTasks(optimistic);
+      setTasks((current) => mergeVisibleTaskOrder(current, optimistic));
+      setAllTasks((current) => mergeVisibleTaskOrder(current, optimistic));
+      setSearchResults((current) => current ? optimistic : current);
+      return;
     }
     skipFreezeOnce.current = true;
-    refresh();
-  }, [refresh]);
+    void refresh();
+  }, [refresh, setSearchResults]);
   const sidebarReorder = useTaskReorder(sidebarTasks, reorderRefresh, autoSortOnAccess);
 
   const handleOpenChat = useCallback((t: Task) => {
@@ -483,6 +462,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         activeTaskId={chatTask?.id ?? null}
         autoSortOnAccess={autoSortOnAccess}
         onBeforeArchive={() => { skipFreezeOnce.current = true; }}
+        onReorder={reorderRefresh}
       />
 
       {totalPages > 1 && searchResults === null && (

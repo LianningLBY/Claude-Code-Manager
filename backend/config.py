@@ -64,8 +64,27 @@ class Settings(BaseSettings):
     # --- Team CCM: Feishu + Org Registry ---
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
+    # Stable deployment secret used to authenticate the OAuth state across
+    # workers/restarts.  When omitted, the Feishu app secret is used.
+    feishu_oauth_state_secret: str = ""
+    feishu_oauth_state_ttl_seconds: int = 600
     org_registry_enabled: bool = False
     org_registry_url: str = ""
+
+    # --- Registration email verification ---
+    # Credentials must be supplied by the deployment; never ship a shared
+    # mailbox password in the application source.
+    smtp_host: str = "smtp.feishu.cn"
+    smtp_port: int = 465
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    verification_code_capacity: int = 4096
+    verification_code_rate_window_seconds: int = 600
+    verification_code_email_limit: int = 5
+    verification_code_ip_limit: int = 30
+    verification_code_resend_cooldown_seconds: int = 60
+    verification_code_smtp_concurrency: int = 4
 
     # --- Custom system prompt (appended to Claude's default) ---
     append_system_prompt_file: str = ""  # path to .md file, e.g. system-prompts/fable5.md

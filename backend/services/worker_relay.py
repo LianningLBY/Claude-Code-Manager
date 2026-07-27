@@ -360,6 +360,7 @@ class WorkerRelay:
         self._tasks: dict[int, set[int]] = {}       # worker_id -> relayed task ids
         self._loops: dict[int, asyncio.Task] = {}    # worker_id -> relay loop（强引用）
         self._closing: set[int] = set()
+        self._connection_locks: dict[int, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -376,31 +377,57 @@ class WorkerRelay:
     def _headers(self, worker: Worker) -> dict:
         return {"Authorization": f"Bearer {worker.auth_token}"}
 
-    async def ensure_connection(self, worker: Worker):
+    def _connection_lock(self, worker_id: int) -> asyncio.Lock:
+        return self._connection_locks.setdefault(worker_id, asyncio.Lock())
+
+    async def _ensure_connection_locked(self, worker: Worker):
         if worker.id in self._ws:
+            # A replacement connection may have been installed while an older
+            # relay is backing off.  Keep the subscription owner present even
+            # when no new socket needs to be created.
+            self._tasks.setdefault(worker.id, set())
             return
+        self._closing.discard(worker.id)
         ws = await websockets.connect(
             self._ws_url(worker),
             additional_headers=self._headers(worker),
             open_timeout=15,
         )
-        await ws.send(json.dumps({"action": "subscribe", "channels": ["tasks"]}))
+        try:
+            await ws.send(
+                json.dumps({"action": "subscribe", "channels": ["tasks"]})
+            )
+        except BaseException:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            raise
         self._ws[worker.id] = ws
         self._tasks.setdefault(worker.id, set())
-        self._closing.discard(worker.id)
         loop_task = asyncio.create_task(self._relay_loop(ws, worker))
         self._loops[worker.id] = loop_task
         logger.info("worker relay connected: worker %s (%s)", worker.id, worker.private_ip)
 
+    async def ensure_connection(self, worker: Worker):
+        async with self._connection_lock(worker.id):
+            await self._ensure_connection_locked(worker)
+
     async def subscribe_task(self, worker: Worker, task_id: int):
         """幂等订阅某 task 的事件中继。必须在向 worker 创建/操作 task 之前调用，
         否则初始事件会丢。"""
-        await self.ensure_connection(worker)
-        if task_id in self._tasks.get(worker.id, set()):
-            return
-        ws = self._ws[worker.id]
-        await ws.send(json.dumps({"action": "subscribe", "channels": [f"task:{task_id}"]}))
-        self._tasks[worker.id].add(task_id)
+        async with self._connection_lock(worker.id):
+            await self._ensure_connection_locked(worker)
+            if task_id in self._tasks.get(worker.id, set()):
+                return
+            ws = self._ws[worker.id]
+            await ws.send(
+                json.dumps({
+                    "action": "subscribe",
+                    "channels": [f"task:{task_id}"],
+                })
+            )
+            self._tasks[worker.id].add(task_id)
 
     def unsubscribe_task(self, worker_id: int, task_id: int):
         """迁移后停止中继该 task（_handle 按 self._tasks 过滤，移除即生效）。"""
@@ -408,17 +435,18 @@ class WorkerRelay:
 
     async def stop_worker(self, worker_id: int):
         """断开并停止重连（worker 关机/销毁前必须调，否则重连风暴）。"""
-        self._closing.add(worker_id)
-        ws = self._ws.pop(worker_id, None)
-        self._tasks.pop(worker_id, None)
-        loop_task = self._loops.pop(worker_id, None)
-        if ws is not None:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-        if loop_task is not None:
-            loop_task.cancel()
+        async with self._connection_lock(worker_id):
+            self._closing.add(worker_id)
+            ws = self._ws.pop(worker_id, None)
+            self._tasks.pop(worker_id, None)
+            loop_task = self._loops.pop(worker_id, None)
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            if loop_task is not None:
+                loop_task.cancel()
 
     async def recover(self, worker: Worker):
         """worker 恢复（开机/健康自动恢复/Manager 重启）后重建中继 + 补日志。"""
@@ -534,13 +562,35 @@ class WorkerRelay:
             pass
         except asyncio.CancelledError:
             return
-        if worker.id not in self._closing:
-            logger.warning("worker %s relay disconnected, reconnecting", worker.id)
-            self._ws.pop(worker.id, None)
-            asyncio.create_task(self._reconnect(worker))
+        async with self._connection_lock(worker.id):
+            if (
+                worker.id not in self._closing
+                and self._ws.get(worker.id) is ws
+            ):
+                logger.warning(
+                    "worker %s relay disconnected, reconnecting",
+                    worker.id,
+                )
+                self._ws.pop(worker.id, None)
+                if self._loops.get(worker.id) is asyncio.current_task():
+                    self._loops.pop(worker.id, None)
+                # Detach only the subscriptions owned by this exact dead
+                # socket while still holding the connection lock.  Popping in
+                # _reconnect raced subscribe_task(), which could install a new
+                # socket/set before this task first ran.
+                task_ids = self._tasks.pop(worker.id, set())
+                asyncio.create_task(self._reconnect(worker, task_ids))
 
-    async def _reconnect(self, worker: Worker):
-        task_ids = self._tasks.pop(worker.id, set())
+    async def _reconnect(
+        self,
+        worker: Worker,
+        task_ids: set[int] | None = None,
+    ):
+        if task_ids is None:
+            # Compatibility for direct recovery callers/tests.  The relay-loop
+            # path always supplies its lock-protected snapshot.
+            async with self._connection_lock(worker.id):
+                task_ids = self._tasks.pop(worker.id, set())
         worker_id = worker.id
         # Capture the generations owned by this disconnected relay before any
         # backoff/network await.  Reconnect exhaustion belongs only to these

@@ -68,8 +68,19 @@ class RegistryChangedBody(BaseModel):
 # ---------- Registry member endpoints ----------
 
 @router.post("/register")
-async def register_member(body: RegisterBody, db: AsyncSession = Depends(get_db)):
-    """Accept registration from a CCM (called by other CCMs or self)."""
+async def register_member(
+    body: RegisterBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Register a CCM member through the authenticated administration plane.
+
+    Cross-CCM registration used to be a public, unsigned write endpoint.  Until
+    the peers have an authenticated trust protocol, accepting arbitrary
+    ``open_id``/``ccm_url`` pairs would let an attacker redirect later shares.
+    """
+    if not is_admin(request):
+        raise HTTPException(403, "Admin only")
     if not settings.org_registry_enabled:
         raise HTTPException(403, "This CCM is not the org registry")
 
@@ -213,8 +224,14 @@ async def transfer_registry(body: TransferBody, request: Request, db: AsyncSessi
 
 
 @router.post("/import")
-async def import_registry(body: ImportBody, db: AsyncSession = Depends(get_db)):
+async def import_registry(
+    body: ImportBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """Receive registry data from a transfer."""
+    if not is_admin(request):
+        raise HTTPException(403, "Admin only")
     # Import members
     for m_data in body.members:
         result = await db.execute(
@@ -278,8 +295,14 @@ async def import_registry(body: ImportBody, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/registry-changed")
-async def registry_changed(body: RegistryChangedBody, db: AsyncSession = Depends(get_db)):
+async def registry_changed(
+    body: RegistryChangedBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """Notification that the org registry has moved — persist to DB so no restart needed."""
+    if not is_admin(request):
+        raise HTTPException(403, "Admin only")
     logger.info("Org registry moved to %s", body.new_registry_url)
     gs = await db.get(GlobalSettings, 1)
     if gs:

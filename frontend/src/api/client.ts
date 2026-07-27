@@ -54,6 +54,27 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+async function formRequest<T>(path: string, formData: FormData): Promise<T> {
+  const token = getToken();
+  const res = await fetch(`${getBase()}${path}`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: formData,
+  });
+  if (res.status === 401) {
+    clearToken();
+    window.location.reload();
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(typeof err.detail === 'string' ? err.detail : res.statusText);
+  }
+  const refreshedToken = res.headers.get('X-Refreshed-Token');
+  if (refreshedToken) setToken(refreshedToken);
+  return res.json();
+}
+
 export interface RuntimeSettings {
   use_pty_mode: boolean;
   pty_available: boolean;
@@ -786,6 +807,13 @@ async function listUserSkillsCached() {
 }
 
 export const api = {
+  // Current user
+  changePassword: (oldPassword: string, newPassword: string) =>
+    request<{ ok: boolean }>('/api/auth/me/password', {
+      method: 'PUT',
+      body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+    }),
+
   // Feishu
   getFeishuAuthUrl: () => request<{ url: string }>('/api/feishu/auth-url'),
   getFeishuStatus: () => request<{ bound: boolean; name?: string; open_id?: string; avatar_url?: string; is_registry?: boolean }>('/api/feishu/status'),
@@ -953,6 +981,11 @@ export const api = {
     request<{ ok: boolean }>(`/api/tags/${id}`, { method: 'DELETE' }),
 
   // Uploads
+  transcribeVoice: (file: Blob) => {
+    const formData = new FormData();
+    formData.append('file', file, 'audio.webm');
+    return formRequest<{ text: string }>('/api/voice/transcribe', formData);
+  },
   uploadImages: (files: File[]): Promise<UploadResult[]> => {
     const token = getToken();
     const formData = new FormData();
@@ -1288,6 +1321,11 @@ export const api = {
 
   // Team CCM
   getTeamUsers: () => request<TeamUser[]>('/api/team/users'),
+  updateTeamUserRole: (userId: number, role: 'admin' | 'member') =>
+    request<{ ok: boolean; user_id: number; role: string }>(`/api/team/users/${userId}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ role }),
+    }),
   getTeamGroups: () => request<any[]>('/api/team/groups'),
   createTeamGroup: (name: string, description?: string) =>
     request<any>('/api/team/groups', { method: 'POST', body: JSON.stringify({ name, description }) }),

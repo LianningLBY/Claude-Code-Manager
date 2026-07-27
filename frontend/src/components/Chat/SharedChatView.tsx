@@ -20,6 +20,75 @@ interface ChatMsg {
   tool_output?: string;
   is_error?: boolean;
   timestamp?: string;
+  raw_content?: string;
+  optimistic?: boolean;
+  persisted?: boolean;
+}
+
+function sharedMessageFingerprint(message: ChatMsg): string {
+  return JSON.stringify([
+    message.event_type,
+    message.role,
+    message.raw_content ?? message.content,
+    message.tool_name ?? null,
+    message.tool_input ?? null,
+    message.tool_output ?? null,
+  ]);
+}
+
+function consumeFingerprint(counts: Map<string, number>, key: string): boolean {
+  const count = counts.get(key) || 0;
+  if (count <= 0) return false;
+  if (count === 1) counts.delete(key);
+  else counts.set(key, count - 1);
+  return true;
+}
+
+/**
+ * Shared history is fetched through a remote relay and can be older than WS
+ * events already rendered locally. Reconcile matching occurrences while
+ * preserving unconfirmed optimistic bubbles and newer persisted WS rows.
+ */
+export function mergeSharedHistory(
+  history: ChatMsg[],
+  current: ChatMsg[],
+  confirmedOptimisticIds: ReadonlySet<number> = new Set(),
+): ChatMsg[] {
+  const snapshot = history.map((message) => ({ ...message, persisted: true }));
+  const snapshotIds = new Set(snapshot.map((message) => message.id));
+  const snapshotCounts = new Map<string, number>();
+  for (const message of snapshot) {
+    const key = sharedMessageFingerprint(message);
+    snapshotCounts.set(key, (snapshotCounts.get(key) || 0) + 1);
+  }
+
+  const extras: ChatMsg[] = [];
+  for (const message of current) {
+    const key = sharedMessageFingerprint(message);
+    if (message.persisted && snapshotIds.has(message.id)) {
+      consumeFingerprint(snapshotCounts, key);
+      continue;
+    }
+    if (
+      !message.persisted
+      && (!message.optimistic || confirmedOptimisticIds.has(message.id))
+      && consumeFingerprint(snapshotCounts, key)
+    ) {
+      continue;
+    }
+    extras.push(message);
+  }
+
+  const persistedById = new Map<number, ChatMsg>();
+  for (const message of extras) {
+    if (message.persisted) persistedById.set(message.id, message);
+  }
+  for (const message of snapshot) persistedById.set(message.id, message);
+
+  return [
+    ...[...persistedById.values()].sort((a, b) => a.id - b.id),
+    ...extras.filter((message) => !message.persisted),
+  ];
 }
 
 export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
@@ -32,6 +101,9 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
   const [config, setConfig] = useState<any>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const nextOptimisticIdRef = useRef(-1);
+  const inFlightOptimisticRef = useRef(new Map<number, string>());
+  const confirmedOptimisticRef = useRef(new Set<number>());
 
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -39,21 +111,24 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
 
   // Load history and config
   useEffect(() => {
+    let active = true;
     (async () => {
       try {
         const [history, cfg] = await Promise.all([
           api.getSharedHistory(shared.id),
           api.getSharedConfig(shared.id),
         ]);
-        setMessages(history);
+        if (!active) return;
+        setMessages((current) => mergeSharedHistory(history, current));
         setConfig(cfg);
         setError(null);
       } catch (e) {
-        setError(String(e));
+        if (active) setError(String(e));
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     })();
+    return () => { active = false; };
   }, [shared.id]);
 
   // Connect WebSocket directly to the sharer's CCM
@@ -81,12 +156,48 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
 
         if (eventType === 'user_message') {
           setSending(true);
-          setMessages(prev => [...prev, {
-            id: Date.now(),
-            role: 'user',
-            event_type: 'user_message',
-            content: data.content || null,
-          }]);
+          const rawContent = typeof data.raw_content === 'string'
+            ? data.raw_content
+            : String(data.content || '');
+          const optimisticId = [...inFlightOptimisticRef.current.entries()]
+            .find(([, content]) => content === rawContent)?.[0];
+          if (optimisticId !== undefined) {
+            confirmedOptimisticRef.current.add(optimisticId);
+          }
+          const persistedId = Number(data.id);
+          const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
+          setMessages((prev) => {
+            const optimisticIndex = prev.findIndex((message) =>
+              message.role === 'user'
+              && message.event_type === 'user_message'
+              && message.optimistic
+              && (message.raw_content ?? message.content) === rawContent
+            );
+            if (optimisticIndex >= 0) {
+              const next = [...prev];
+              next[optimisticIndex] = {
+                ...next[optimisticIndex],
+                id: isPersisted ? persistedId : next[optimisticIndex].id,
+                content: data.content || null,
+                raw_content: rawContent,
+                optimistic: false,
+                persisted: isPersisted,
+                timestamp: typeof data.timestamp === 'string'
+                  ? data.timestamp
+                  : next[optimisticIndex].timestamp,
+              };
+              return next;
+            }
+            return [...prev, {
+              id: isPersisted ? persistedId : Date.now(),
+              role: 'user',
+              event_type: 'user_message',
+              content: data.content || null,
+              raw_content: rawContent,
+              persisted: isPersisted,
+              timestamp: typeof data.timestamp === 'string' ? data.timestamp : undefined,
+            }];
+          });
           return;
         }
 
@@ -105,13 +216,19 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
         }
 
         if (data.content || data.tool_name) {
+          const persistedId = Number(data.id);
+          const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
           setMessages(prev => [...prev, {
-            id: Date.now() + Math.random(),
+            id: isPersisted ? persistedId : Date.now() + Math.random(),
             role: data.role || 'assistant',
             event_type: eventType,
             content: data.content || null,
             tool_name: data.tool_name,
+            tool_input: data.tool_input,
+            tool_output: data.tool_output,
             is_error: data.is_error,
+            persisted: isPersisted,
+            timestamp: typeof data.timestamp === 'string' ? data.timestamp : undefined,
           }]);
         }
       } catch { /* ignore */ }
@@ -121,7 +238,7 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
       ws.close();
       wsRef.current = null;
     };
-  }, [shared.owner_ccm_url, shared.remote_task_id]);
+  }, [shared.owner_ccm_url, shared.remote_task_id, shared.share_token]);
 
   // Fallback polling when WS is not connected
   useEffect(() => {
@@ -129,7 +246,7 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
     const interval = setInterval(async () => {
       try {
         const history = await api.getSharedHistory(shared.id);
-        setMessages(history);
+        setMessages((current) => mergeSharedHistory(history, current));
       } catch { /* ignore */ }
     }, 3000);
     return () => clearInterval(interval);
@@ -145,20 +262,43 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
 
     setSending(true);
     setInput('');
+    const optimisticId = nextOptimisticIdRef.current--;
+    inFlightOptimisticRef.current.set(optimisticId, text);
 
     // Optimistic local message
     setMessages(prev => [...prev, {
-      id: Date.now(),
+      id: optimisticId,
       role: 'user',
       event_type: 'user_message',
       content: text,
+      raw_content: text,
+      optimistic: true,
     }]);
 
     try {
       await api.sendSharedChat(shared.id, text);
+      // This request starts only after the owner has committed the message.
+      // It may therefore reconcile this optimistic bubble. Older in-flight
+      // history requests are deliberately not allowed to do so.
+      void api.getSharedHistory(shared.id).then((history) => {
+        setMessages((current) => mergeSharedHistory(
+          history,
+          current,
+          new Set([optimisticId]),
+        ));
+      }).catch(() => {
+        // The WS echo or a later page load can still confirm the message.
+      });
     } catch (e) {
       setError(String(e));
       setSending(false);
+      if (!confirmedOptimisticRef.current.has(optimisticId)) {
+        setMessages((prev) => prev.filter((message) => message.id !== optimisticId));
+        setInput(text);
+      }
+    } finally {
+      inFlightOptimisticRef.current.delete(optimisticId);
+      confirmedOptimisticRef.current.delete(optimisticId);
     }
   };
 
@@ -166,7 +306,7 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
     setLoading(true);
     try {
       const history = await api.getSharedHistory(shared.id);
-      setMessages(history);
+      setMessages((current) => mergeSharedHistory(history, current));
       setError(null);
     } catch (e) {
       setError(String(e));

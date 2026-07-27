@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { effectiveKey, newSortFor } from './useTaskReorder';
+import { effectiveKey, mergeVisibleTaskOrder, newSortFor } from './useTaskReorder';
 import type { Task } from '../api/client';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -68,6 +68,42 @@ describe('effectiveKey', () => {
   it('returns 0 when no timestamps', () => {
     const t = makeTask({ created_at: undefined as unknown as string, last_accessed_at: null });
     expect(effectiveKey(t)).toBe(0);
+  });
+});
+
+describe('mergeVisibleTaskOrder', () => {
+  it('does not substitute a search result that is absent from the local page', () => {
+    const page = [
+      makeTask({ id: 5, title: 'page match' }),
+      makeTask({ id: 6, title: 'unrelated page task' }),
+    ];
+    const serverWideSearchOrder = [
+      makeTask({ id: 50, title: 'off-page match' }),
+      makeTask({ id: 5, title: 'page match' }),
+    ];
+
+    const merged = mergeVisibleTaskOrder(page, serverWideSearchOrder);
+
+    expect(merged.map((task) => task.id)).toEqual([5, 6]);
+    expect(merged[0].title).toBe('page match');
+  });
+
+  it('reorders only matching slots while preserving unrelated rows', () => {
+    const page = [
+      makeTask({ id: 1 }),
+      makeTask({ id: 2 }),
+      makeTask({ id: 3 }),
+      makeTask({ id: 4 }),
+    ];
+    const optimistic = [
+      makeTask({ id: 30 }),
+      makeTask({ id: 3 }),
+      makeTask({ id: 1 }),
+    ];
+
+    expect(mergeVisibleTaskOrder(page, optimistic).map((task) => task.id)).toEqual([
+      3, 2, 1, 4,
+    ]);
   });
 });
 

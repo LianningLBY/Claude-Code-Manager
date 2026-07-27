@@ -134,6 +134,46 @@ async def test_http_rejects_disabled_or_deleted_jwt_user(
 
 
 @pytest.mark.asyncio
+async def test_service_token_does_not_bind_disabled_seeded_admin(
+    secured_client,
+):
+    client, session_factory = secured_client
+    async with session_factory() as db:
+        seeded = User(
+            email="admin@apexin.ai",
+            name="Disabled seeded admin",
+            password_hash="rotated",
+            role="super_admin",
+            is_active=False,
+        )
+        db.add(seeded)
+        await db.commit()
+        await db.refresh(seeded)
+        seeded_id = seeded.id
+
+    headers = {"Authorization": "Bearer security-service-token"}
+    me = await client.get("/api/auth/me", headers=headers)
+    assert me.status_code == 200
+    assert me.json() == {
+        "ok": True,
+        "auth_type": "token",
+        "role": "super_admin",
+    }
+
+    created = await client.post(
+        "/api/tasks",
+        headers=headers,
+        json={"title": "token-owned task", "description": "work"},
+    )
+    assert created.status_code == 201
+    async with session_factory() as db:
+        task = await db.get(Task, created.json()["id"])
+        assert task is not None
+        assert task.created_by is None
+        assert task.created_by != seeded_id
+
+
+@pytest.mark.asyncio
 async def test_member_cannot_control_process_wide_system_operations(
     secured_client,
 ):

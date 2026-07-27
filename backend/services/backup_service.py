@@ -1,10 +1,17 @@
 """Backup service: wraps auto-backup SDK to periodically back up the SQLite database."""
 import logging
-import os
+import shutil
+import sqlite3
+import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
+from sqlalchemy.engine import make_url
+
 logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class BackupService:
@@ -59,6 +66,8 @@ class BackupService:
         self._oss_secret_key = oss_secret_key
         self._auto_backup_cls = _auto_backup_cls
         self._backup = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
 
     def _build_destination(self) -> Optional[dict]:
         t = self._backup_type
@@ -91,12 +100,20 @@ class BackupService:
         return None
 
     def _resolve_db_path(self) -> str:
-        raw = self._db_path
-        for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
-            if raw.startswith(prefix):
-                raw = raw[len(prefix):]
-                break
-        return str(Path(raw).resolve())
+        url = make_url(self._db_path)
+        if not url.drivername.startswith("sqlite"):
+            raise ValueError(
+                "The built-in backup service only supports SQLite database files"
+            )
+        raw = url.database
+        if not raw or raw == ":memory:":
+            raise ValueError("In-memory SQLite databases cannot be backed up")
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            # Keep this identical to backend.database: relative SQLite URLs are
+            # anchored at the repository root, not the systemd working dir.
+            path = _PROJECT_ROOT / path
+        return str(path.resolve())
 
     def start(self) -> bool:
         """Start the background backup scheduler. Returns True if started."""
@@ -113,17 +130,23 @@ class BackupService:
             from auto_backup import AutoBackup  # noqa: PLC0415 — lazy import
             cls = AutoBackup
 
-        db_file = self._resolve_db_path()
+        try:
+            db_file = self._resolve_db_path()
+        except (TypeError, ValueError) as exc:
+            logger.error("Backup service not started: %s", exc)
+            return False
         tmp_dir = str(Path(self._temp_dir).expanduser().resolve()) if self._temp_dir else None
+        if tmp_dir:
+            Path(tmp_dir).mkdir(parents=True, exist_ok=True)
         self._backup = cls(tmp_base_dir=tmp_dir)
-        self._backup.add_task(
-            name="claude-manager-db",
-            source_paths=[db_file],
-            destinations=[destination],
-            interval_seconds=self._interval_seconds,
-            max_copies=self._max_copies,
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._backup_loop,
+            args=(db_file, destination, tmp_dir),
+            name="ccm-sqlite-backup",
+            daemon=True,
         )
-        self._backup.start()
+        self._thread.start()
         logger.info(
             "Backup service started (type=%r, db=%r, interval=%ds)",
             self._backup_type,
@@ -132,9 +155,78 @@ class BackupService:
         )
         return True
 
+    @staticmethod
+    def _create_sqlite_snapshot(db_file: str, snapshot_file: str) -> None:
+        """Create a transactionally consistent SQLite snapshot, including WAL."""
+        source = sqlite3.connect(
+            f"{Path(db_file).resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=30,
+        )
+        destination = sqlite3.connect(snapshot_file)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+
+    def _run_backup_once(
+        self,
+        db_file: str,
+        destination: dict,
+        tmp_dir: str | None,
+    ) -> None:
+        snapshot_dir = tempfile.mkdtemp(
+            prefix="ccm-sqlite-snapshot-",
+            dir=tmp_dir,
+        )
+        try:
+            snapshot_file = str(Path(snapshot_dir) / Path(db_file).name)
+            self._create_sqlite_snapshot(db_file, snapshot_file)
+            results = self._backup.run_once(
+                source_paths=[snapshot_file],
+                destinations=[destination],
+                task_name="claude-manager-db",
+                max_copies=self._max_copies,
+                tmp_base_dir=tmp_dir,
+            )
+            failed = [
+                result
+                for result in (results or [])
+                if result.get("status") != "success"
+            ]
+            if failed:
+                logger.error("SQLite backup destination failed: %s", failed)
+        finally:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+    def _backup_loop(
+        self,
+        db_file: str,
+        destination: dict,
+        tmp_dir: str | None,
+    ) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._run_backup_once(db_file, destination, tmp_dir)
+            except Exception:
+                logger.exception("SQLite backup attempt failed")
+            if self._stop_event.wait(max(1, self._interval_seconds)):
+                break
+
     def stop(self):
         """Stop the background backup scheduler."""
-        if self._backup is not None:
-            self._backup.stop()
-            self._backup = None
-            logger.info("Backup service stopped")
+        if self._backup is None:
+            return
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=30)
+            if thread.is_alive():
+                logger.error(
+                    "SQLite backup worker did not stop within 30 seconds"
+                )
+                return
+        self._thread = None
+        self._backup = None
+        logger.info("Backup service stopped")

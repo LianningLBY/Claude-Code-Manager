@@ -3,10 +3,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
+from backend.api.deps import require_admin
 from backend.models.secret import Secret
 from backend.schemas.secret import SecretCreate, SecretUpdate, SecretResponse
 
-router = APIRouter(prefix="/api/secrets", tags=["secrets"])
+router = APIRouter(
+    prefix="/api/secrets",
+    tags=["secrets"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.get("", response_model=list[SecretResponse])

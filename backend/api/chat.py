@@ -7,7 +7,11 @@ import json
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from backend.api.deps import get_current_user_id, require_task_access
+from backend.api.deps import (
+    get_current_user_id,
+    require_task_access,
+    require_task_control,
+)
 from pydantic import BaseModel, model_validator
 from sqlalchemy import and_, not_, select, func, update as sa_update  # still used by chat history
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -343,6 +347,10 @@ async def send_chat_message(
         return await _send_shared_chat(task, body, db)
     if task.worker_id is not None:
         return await _send_worker_chat(task, body, db, request)
+    if body.secret_ids:
+        from backend.api.deps import require_admin
+
+        require_admin(request)
     if not task.session_id:
         raise HTTPException(400, "No previous session on this task. Run the task first.")
 
@@ -473,7 +481,7 @@ async def list_codex_fork_anchors(
     source = await db.get(Task, task_id)
     if not source:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, source, db)
+    await require_task_control(request, source, db)
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if not source.session_id:
@@ -533,7 +541,7 @@ async def fork_codex_task(
     source = await db.get(Task, task_id)
     if not source:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, source, db)
+    await require_task_control(request, source, db)
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if source.shared_from_id is not None:
@@ -1402,7 +1410,7 @@ async def distill_task(
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
 
     conversation = await _collect_conversation_for_distill(task_id, db)
     if not conversation.strip():
@@ -1475,6 +1483,7 @@ async def save_distilled_skill(
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
 
     existing = await db.execute(
         select(UserSkill).where(UserSkill.name == body.name)

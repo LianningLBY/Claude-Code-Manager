@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
+from backend.api.deps import require_task_access
 from backend.models.task import Task
 from backend.models.sub_agent import SubAgentSession
 
@@ -12,12 +13,14 @@ router = APIRouter(prefix="/api/tasks/{task_id}/sub-agents", tags=["sub-agents"]
 @router.get("/summary")
 async def get_sub_agent_summary(
     task_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """按类别汇总该 task 的子 agent（monitor / native-agent / native-monitor / ...）。"""
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
 
     rows = (
         await db.execute(

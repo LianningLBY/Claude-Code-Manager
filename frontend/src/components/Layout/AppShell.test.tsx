@@ -103,10 +103,25 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.queryByTitle('更新并重启')).not.toBeInTheDocument();
   });
 
+  it('does not advertise admin-only host files or global secrets to members', () => {
+    localStorage.setItem('cc_user', JSON.stringify({
+      id: 9,
+      name: 'Member',
+      role: 'member',
+    }));
+
+    renderShell();
+
+    expect(screen.queryByRole('button', { name: 'Files' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Secrets' })).not.toBeInTheDocument();
+  });
+
   it('keeps the process-wide update control available to administrators', () => {
     renderShell();
 
     expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
   });
 
   describe('header stacking context', () => {

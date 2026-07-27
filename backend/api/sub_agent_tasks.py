@@ -8,12 +8,17 @@ from weakref import WeakValueDictionary
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
+from backend.api.deps import (
+    require_internal_service,
+    require_task_access,
+    require_task_control,
+)
 from backend.models.task import Task
 from backend.models.sub_agent import SubAgentSession, SubAgentReport
 from backend.models.project import Project
@@ -154,6 +159,7 @@ class SubAgentResultRequest(BaseModel):
 async def create_sub_agent_session(
     task_id: int,
     body: SubAgentSessionCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Create a sub-agent session and start its subprocess via dispatcher."""
@@ -162,6 +168,7 @@ async def create_sub_agent_session(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
     if task.worker_id is not None:
         from backend.main import worker_proxy
         if worker_proxy is None:
@@ -289,10 +296,15 @@ async def create_sub_agent_session(
 @router.get("", response_model=list[SubAgentSessionResponse])
 async def list_sub_agent_sessions(
     task_id: int,
+    request: Request,
     agent_type: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """List sub-agent sessions, optionally filtered by agent_type."""
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
     stmt = (
         select(SubAgentSession)
         .where(SubAgentSession.task_id == task_id)
@@ -310,8 +322,13 @@ async def list_sub_agent_sessions(
 async def get_sub_agent_session(
     task_id: int,
     session_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
     sa = await db.get(SubAgentSession, session_id)
     if not sa or sa.task_id != task_id:
         raise HTTPException(404, "Sub-agent session not found")
@@ -322,12 +339,17 @@ async def get_sub_agent_session(
 async def delete_sub_agent_session(
     task_id: int,
     session_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Stop/cancel a running sub-agent."""
     sa = await db.get(SubAgentSession, session_id)
     if not sa or sa.task_id != task_id:
         raise HTTPException(404, "Sub-agent session not found")
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
 
     transitioned = await db.execute(
         update(SubAgentSession)
@@ -366,9 +388,11 @@ async def sub_agent_report_progress(
     task_id: int,
     session_id: int,
     body: SubAgentProgressRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Sub-agent reports progress via MCP tool."""
+    require_internal_service(request)
     advanced = await db.execute(
         update(SubAgentSession)
         .where(
@@ -446,9 +470,11 @@ async def sub_agent_submit_result(
     task_id: int,
     session_id: int,
     body: SubAgentResultRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Sub-agent submits final result and marks completed."""
+    require_internal_service(request)
     completed = await db.execute(
         update(SubAgentSession)
         .where(
@@ -530,9 +556,11 @@ async def sub_agent_submit_result(
 async def get_sub_agent_context(
     task_id: int,
     session_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Get task context for a sub-agent."""
+    require_internal_service(request)
     sa = await db.get(SubAgentSession, session_id)
     if not sa or sa.task_id != task_id:
         raise HTTPException(404, "Sub-agent session not found")

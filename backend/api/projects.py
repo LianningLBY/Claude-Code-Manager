@@ -12,7 +12,12 @@ from backend.config import settings
 from backend.database import get_db, async_session
 from backend.services.agent_docs import inject_agents_md
 from backend.models.project import Project
-from backend.api.deps import get_current_user_id, get_current_user_role
+from backend.api.deps import (
+    get_current_user_id,
+    get_current_user_role,
+    require_project_access,
+    require_worker_target_access,
+)
 from backend.models.project_todo import ProjectTodo
 from backend.models.tag import Tag
 from backend.models.global_settings import GlobalSettings
@@ -23,34 +28,8 @@ from backend.services.dispatcher import _build_git_env
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 async def _require_project_access(request: Request, project_id: int, db: AsyncSession):
-    """Check if user has access to this project."""
-    from backend.api.deps import is_admin as _is_admin, get_current_user_id as _get_uid
-    if _is_admin(request):
-        return
-    uid = _get_uid(request)
-    if not uid:
-        raise HTTPException(403, "Not authenticated")
-    from backend.models.team_share import TeamProjectShare
-    from backend.models.worker import Worker
-    from backend.models.task import Task
-    from backend.models.user_group import UserGroupMember
-    user_group_ids = select(UserGroupMember.group_id).where(UserGroupMember.user_id == uid)
-    shared = (await db.execute(
-        select(TeamProjectShare.id).where(
-            TeamProjectShare.project_id == project_id,
-            ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == uid))
-            | ((TeamProjectShare.target_type == "group") & TeamProjectShare.target_id.in_(user_group_ids))
-        ).limit(1)
-    )).scalar_one_or_none()
-    if shared:
-        return
-    # Check if project is on a worker owned by this user
-    proj = await db.get(Project, project_id)
-    if proj and proj.worker_id:
-        w = await db.get(Worker, proj.worker_id)
-        if w and w.owner_user_id == uid:
-            return
-    raise HTTPException(403, "No access to this project")
+    """Backward-compatible local alias for the shared Project ACL."""
+    await require_project_access(request, project_id, db)
 
 
 
@@ -101,7 +80,6 @@ async def list_project_tags(request: Request, db: AsyncSession = Depends(get_db)
     if user_role not in ("admin", "super_admin") and user_id:
         from backend.models.team_share import TeamProjectShare
         from backend.models.worker import Worker
-        from backend.models.task import Task
         from backend.models.user_group import UserGroupMember
         user_group_ids = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
         shared_project_ids = select(TeamProjectShare.project_id).where(
@@ -109,11 +87,9 @@ async def list_project_tags(request: Request, db: AsyncSession = Depends(get_db)
             | ((TeamProjectShare.target_type == "group") & TeamProjectShare.target_id.in_(user_group_ids))
         )
         owned_worker_ids = select(Worker.id).where(Worker.owner_user_id == user_id)
-        worker_project_ids = select(Task.project_id).where(
-            Task.worker_id.in_(owned_worker_ids), Task.project_id.is_not(None)
-        ).distinct()
         stmt = stmt.where(
-            Project.id.in_(shared_project_ids) | Project.id.in_(worker_project_ids)
+            Project.id.in_(shared_project_ids)
+            | Project.worker_id.in_(owned_worker_ids)
         )
     result = await db.execute(stmt)
     all_tags: set[str] = set()
@@ -125,29 +101,28 @@ async def list_project_tags(request: Request, db: AsyncSession = Depends(get_db)
 
 @router.put("/reorder", response_model=list[ProjectResponse])
 async def reorder_projects(
-    body: list[ProjectReorderItem], db: AsyncSession = Depends(get_db)
+    body: list[ProjectReorderItem],
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ):
     """Bulk-update sort_order for a list of projects."""
     for item in body:
+        project = await db.get(Project, item.id)
+        if project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, item.id, db)
         await db.execute(
             update(Project).where(Project.id == item.id).values(sort_order=item.sort_order)
         )
     await db.commit()
-    result = await db.execute(
-        select(Project).order_by(Project.sort_order.asc(), Project.name.asc())
-    )
-    return list(result.scalars().all())
+    # Reuse the canonical visibility filter.  Returning the whole Project table
+    # here used to disclose credentials even when the request body was empty.
+    return await list_projects(request, db)
 
 
 @router.post("", response_model=ProjectResponse, status_code=201)
 async def create_project(request: Request, body: ProjectCreate, db: AsyncSession = Depends(get_db)):
-    user_id = get_current_user_id(request)
-    user_role = get_current_user_role(request)
-    if user_role not in ("admin", "super_admin") and user_id:
-        from backend.models.worker import Worker
-        owned = await db.execute(select(Worker.id).where(Worker.owner_user_id == user_id).limit(1))
-        if not owned.scalar_one_or_none():
-            raise HTTPException(403, "You need a Worker to create Projects")
+    await require_worker_target_access(request, body.worker_id, db)
     # Check duplicate name
     existing = await db.execute(select(Project).where(Project.name == body.name))
     if existing.scalar_one_or_none():
@@ -669,8 +644,13 @@ class ScanEnvFilesResponse(BaseModel):
 
 
 @router.get("/{project_id}/env-files", response_model=EnvFilesListResponse)
-async def list_env_files(project_id: int, db: AsyncSession = Depends(get_db)):
+async def list_env_files(
+    project_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """List all configured env file paths and whether each exists on disk."""
+    await require_project_access(request, project_id, db)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -685,9 +665,13 @@ async def list_env_files(project_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/{project_id}/env-files/{filepath:path}", response_model=EnvFileContent)
 async def get_env_file(
-    project_id: int, filepath: str, db: AsyncSession = Depends(get_db)
+    project_id: int,
+    filepath: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ):
     """Read content of a configured env file. Returns empty string if not yet created."""
+    await require_project_access(request, project_id, db)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -703,9 +687,14 @@ async def get_env_file(
 
 @router.put("/{project_id}/env-files/{filepath:path}", response_model=EnvFileContent)
 async def update_env_file(
-    project_id: int, filepath: str, body: EnvFileContent, db: AsyncSession = Depends(get_db)
+    project_id: int,
+    filepath: str,
+    body: EnvFileContent,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ):
     """Write content to a configured env file. Creates the file (and dirs) if needed."""
+    await require_project_access(request, project_id, db)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -720,8 +709,13 @@ async def update_env_file(
 
 
 @router.post("/{project_id}/scan-env-files", response_model=ScanEnvFilesResponse)
-async def scan_env_files(project_id: int, db: AsyncSession = Depends(get_db)):
+async def scan_env_files(
+    project_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """Scan the project repo for .env-style files and return discovered paths."""
+    await require_project_access(request, project_id, db)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")

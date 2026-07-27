@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { HelpCircle, X } from './icons';
 import { api } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
@@ -22,30 +22,54 @@ interface PendingAsk {
  */
 export function AskUserNotifications() {
   const [pending, setPending] = useState<PendingAsk[]>([]);
+  const stateVersionRef = useRef(0);
+  const refreshGenerationRef = useRef(0);
+  const dismissedRef = useRef(new Set<string>());
 
   const refresh = useCallback(() => {
+    const generation = ++refreshGenerationRef.current;
+    const stateVersion = stateVersionRef.current;
     api.getAskUserPendingAll()
-      .then(({ pending }) => setPending(pending))
+      .then(({ pending }) => {
+        // Do not let an older HTTP snapshot erase a WS event received while
+        // the request was in flight.
+        if (
+          generation === refreshGenerationRef.current
+          && stateVersion === stateVersionRef.current
+        ) {
+          setPending(pending.filter((entry) => !dismissedRef.current.has(entry.request_id)));
+        }
+      })
       .catch(() => { /* 后端不可达时静默，WS 事件会补 */ });
   }, []);
 
-  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    refresh();
+    // Members cannot subscribe to global channels. This ACL-safe HTTP fallback
+    // keeps the App-level notification working for them on other pages.
+    const interval = window.setInterval(refresh, 5000);
+    return () => window.clearInterval(interval);
+  }, [refresh]);
 
   const handleWs = useCallback((raw: Record<string, unknown>) => {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
     if (msg.channel !== 'tasks') return;
     const data = msg.data || {};
     if (data.event === 'ask_user_pending') {
+      stateVersionRef.current += 1;
       const entry: PendingAsk = {
         task_id: Number(data.task_id),
         request_id: String(data.request_id),
         summary: String(data.summary || 'A task is asking for your input'),
       };
+      if (dismissedRef.current.has(entry.request_id)) return;
       setPending((prev) =>
         prev.some((p) => p.request_id === entry.request_id) ? prev : [...prev, entry]
       );
     } else if (data.event === 'ask_user_resolved') {
       const rid = String(data.request_id);
+      stateVersionRef.current += 1;
+      dismissedRef.current.delete(rid);
       setPending((prev) => prev.filter((p) => p.request_id !== rid));
     }
   }, []);
@@ -55,10 +79,14 @@ export function AskUserNotifications() {
   const open = useCallback((taskId: number, requestId: string) => {
     // 跳转到该 task 的聊天页；App 监听 hashchange 完成路由
     window.location.hash = `#/tasks/chat/${taskId}`;
+    stateVersionRef.current += 1;
+    dismissedRef.current.add(requestId);
     setPending((prev) => prev.filter((p) => p.request_id !== requestId));
   }, []);
 
   const dismiss = useCallback((requestId: string) => {
+    stateVersionRef.current += 1;
+    dismissedRef.current.add(requestId);
     setPending((prev) => prev.filter((p) => p.request_id !== requestId));
   }, []);
 

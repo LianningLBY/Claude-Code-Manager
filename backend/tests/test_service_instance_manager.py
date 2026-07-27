@@ -7586,6 +7586,39 @@ async def test_launch_delegates_to_pty_backend_for_claude():
 
 
 @pytest.mark.asyncio
+async def test_pty_launch_injects_async_user_skill_directory(tmp_path):
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    calls = {}
+    prompt_file = tmp_path / "user-skills.md"
+    prompt_file.write_text("## User Skills\n- **Review** (id=2): edge cases")
+
+    class FakeBackend:
+        async def launch_for_ccm(self, **kwargs):
+            calls.update(kwargs)
+            im.processes[kwargs["instance_id"]] = MagicMock(pid=4244)
+            return "sess-user-skills"
+
+    im._pty_backend = FakeBackend()
+    im._pty_enabled = True
+    with patch(
+        "backend.services.user_skill_injector.build_user_skill_prompt",
+        new=AsyncMock(return_value=str(prompt_file)),
+    ):
+        await im.launch(
+            instance_id=8,
+            prompt="review this",
+            task_id=4,
+            cwd="/w",
+            provider="claude",
+        )
+
+    assert "## User Skills" in calls["prompt"]
+    assert "**Review** (id=2)" in calls["prompt"]
+    assert calls["prompt"].endswith("## Current user request\n\nreview this")
+    assert not prompt_file.exists()
+
+
+@pytest.mark.asyncio
 async def test_launch_pty_rejects_dead_startup_before_persisting_running(
     db_factory,
 ):

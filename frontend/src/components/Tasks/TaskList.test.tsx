@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, createEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TaskList } from './TaskList';
 import type { Task, Project } from '../../api/client';
@@ -270,5 +270,93 @@ describe('Drag reorder (main list)', () => {
     // 新键必须大于原第 1 行的键，才能真正排到最前
     expect((data as { sort_order: number }).sort_order).toBeGreaterThan(now + 300);
     await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+  });
+
+  it('persists the same downward position shown optimistically and refreshes after PUT', async () => {
+    let resolveUpdate!: (value: object) => void;
+    (api.updateTask as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((resolve) => { resolveUpdate = resolve; }),
+    );
+    const onRefresh = vi.fn();
+    const onReorder = vi.fn();
+    const tasks = [
+      makeTask({ id: 11, sort_order: 300 }),
+      makeTask({ id: 12, sort_order: 200 }),
+      makeTask({ id: 13, sort_order: 100 }),
+    ];
+    const { container } = render(
+      <TaskList
+        tasks={tasks}
+        projects={[]}
+        onRefresh={onRefresh}
+        onReorder={onReorder}
+        onOpenChat={vi.fn()}
+      />,
+    );
+
+    const rows = container.querySelectorAll('[data-reorder-idx]');
+    const handle = rows[0].querySelector('[title="按住拖动排序"]')!;
+    fireEvent.pointerDown(handle, { button: 0, clientX: 10, clientY: 10 });
+    const dataTransfer = { effectAllowed: '', setData: vi.fn(), getData: vi.fn() };
+    fireEvent.dragOver(rows[2], { dataTransfer });
+    fireEvent.drop(rows[2], { dataTransfer });
+
+    await waitFor(() => expect(onReorder).toHaveBeenCalled());
+    const optimistic = onReorder.mock.calls[0][0] as Task[];
+    expect(optimistic.map((task) => task.id)).toEqual([12, 11, 13]);
+    const [, update] = (api.updateTask as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
+    expect(update.sort_order).toBe(150);
+    expect(onRefresh).not.toHaveBeenCalled();
+
+    resolveUpdate({});
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+  });
+
+  it('moves the first of two same-group tasks to the end via the lower drop zone', async () => {
+    const onRefresh = vi.fn();
+    const onReorder = vi.fn();
+    const tasks = [
+      makeTask({ id: 11, sort_order: 300 }),
+      makeTask({ id: 12, sort_order: 200 }),
+    ];
+    const { container } = render(
+      <TaskList
+        tasks={tasks}
+        projects={[]}
+        onRefresh={onRefresh}
+        onReorder={onReorder}
+        onOpenChat={vi.fn()}
+      />,
+    );
+
+    const rows = container.querySelectorAll('[data-reorder-idx]');
+    vi.spyOn(rows[1], 'getBoundingClientRect').mockReturnValue({
+      top: 100,
+      bottom: 200,
+      height: 100,
+      left: 0,
+      right: 300,
+      width: 300,
+      x: 0,
+      y: 100,
+      toJSON: () => ({}),
+    });
+    const handle = rows[0].querySelector('[title="按住拖动排序"]')!;
+    fireEvent.pointerDown(handle, { button: 0, clientX: 10, clientY: 10 });
+    const dataTransfer = { effectAllowed: '', setData: vi.fn(), getData: vi.fn() };
+    const dragOver = createEvent.dragOver(rows[1], { dataTransfer });
+    const drop = createEvent.drop(rows[1], { dataTransfer });
+    Object.defineProperty(dragOver, 'clientY', { value: 175 });
+    Object.defineProperty(drop, 'clientY', { value: 175 });
+    fireEvent(rows[1], dragOver);
+    fireEvent(rows[1], drop);
+
+    await waitFor(() => expect(onReorder).toHaveBeenCalled());
+    const optimistic = onReorder.mock.calls[0][0] as Task[];
+    expect(optimistic.map((task) => task.id)).toEqual([12, 11]);
+    const [id, update] = (api.updateTask as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
+    expect(id).toBe(11);
+    expect(update.sort_order).toBe(140);
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
   });
 });

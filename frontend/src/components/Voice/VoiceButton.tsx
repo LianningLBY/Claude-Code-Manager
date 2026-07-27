@@ -1,5 +1,6 @@
 import { useState, useRef } from 'react';
 import { Mic, MicOff, Loader } from '../icons';
+import { api } from '../../api/client';
 
 interface VoiceButtonProps {
   onTranscribed: (text: string) => void;
@@ -29,13 +30,8 @@ export function VoiceButton({ onTranscribed }: VoiceButtonProps) {
 
         setLoading(true);
         try {
-          const formData = new FormData();
-          formData.append('file', blob, 'audio.webm');
-          const res = await fetch('/api/voice/transcribe', { method: 'POST', body: formData });
-          if (res.ok) {
-            const data = await res.json();
-            if (data.text) onTranscribed(data.text);
-          }
+          const data = await api.transcribeVoice(blob);
+          if (data.text) onTranscribed(data.text);
         } catch (err) {
           console.error('Transcription error:', err);
         } finally {

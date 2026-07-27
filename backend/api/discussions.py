@@ -3,7 +3,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
-from backend.api.deps import get_current_user_id, get_current_user_role
+from backend.api.deps import (
+    get_current_user_id,
+    get_current_user_role,
+    require_project_access,
+)
 from backend.models.discussion import (
     Discussion,
     DiscussionAgent,
@@ -102,6 +106,8 @@ async def create_discussion(
 ):
     if not await _can_create_discussion(request, db):
         raise HTTPException(403, "You need a Worker or Project access to create Discussions")
+    if data.project_id is not None:
+        await require_project_access(request, data.project_id, db)
     disc = Discussion(
         title=data.title,
         project_id=data.project_id,
@@ -303,9 +309,14 @@ async def stop_agent(
 async def get_agent_events(
     discussion_id: int,
     agent_id: int,
+    request: Request,
     limit: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
+    discussion = await db.get(Discussion, discussion_id)
+    if discussion is None:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    await _require_discussion_owner(request, discussion)
     result = await db.execute(
         select(DiscussionEvent)
         .where(

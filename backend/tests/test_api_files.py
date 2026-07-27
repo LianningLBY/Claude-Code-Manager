@@ -64,6 +64,7 @@ async def test_ssh_download_removes_temporary_file_after_response(
 
     app = FastAPI()
     app.include_router(files_module.router)
+    app.dependency_overrides[files_module.require_admin] = lambda: None
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(

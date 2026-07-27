@@ -3,12 +3,27 @@ import asyncio
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import func, select, update
 
 from backend.models.task import Task
 from backend.models.monitor_session import MonitorSession, MonitorCheck
 from backend.models.sub_agent import SubAgentReport
+
+
+def _admin_request() -> Request:
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [],
+        "query_string": b"",
+    })
+    request.state.user_id = None
+    request.state.user_role = "super_admin"
+    request.state.auth_type = "none"
+    return request
 
 
 async def _create_task_with_monitor(client, session_factory, status="in_progress"):
@@ -107,6 +122,7 @@ async def test_cancelled_monitor_create_still_admits_committed_row(
                 create_monitor_session(
                     task_id,
                     MonitorSessionCreate(description="cancel-window"),
+                    _admin_request(),
                     db,
                 )
             )
@@ -170,6 +186,7 @@ async def test_cancelled_sub_agent_create_still_admits_committed_row(
                         name="cancel-window",
                         prompt="work",
                     ),
+                    _admin_request(),
                     db,
                 )
             )
@@ -432,6 +449,7 @@ async def test_worker_sub_agent_create_is_proxied_without_local_start(
             result = await create_sub_agent_session(
                 task_id,
                 SubAgentSessionCreate(name="remote", prompt="work"),
+                _admin_request(),
                 db,
             )
 
@@ -474,6 +492,7 @@ async def test_worker_monitor_create_routes_before_local_codex_gate(
             result = await create_monitor_session(
                 task_id,
                 MonitorSessionCreate(description="remote monitor"),
+                _admin_request(),
                 db,
             )
 
@@ -528,6 +547,7 @@ async def test_sub_agent_create_routes_migration_before_local_write_guard(
             result = await create_sub_agent_session(
                 task_id,
                 SubAgentSessionCreate(name="migrated", prompt="work"),
+                _admin_request(),
                 db,
             )
 
@@ -670,6 +690,7 @@ async def test_monitor_complete_loses_cas_to_concurrent_cancel(
                     task_id,
                     session_id,
                     MonitorCompleteRequest(reason="too late"),
+                    _admin_request(),
                     callback_db,
                 )
             )
@@ -762,6 +783,7 @@ async def test_sub_agent_result_loses_cas_to_concurrent_stop(
                     task_id,
                     session_id,
                     SubAgentResultRequest(result="too late"),
+                    _admin_request(),
                     callback_db,
                 )
             )

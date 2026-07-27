@@ -19,12 +19,36 @@ from backend.models.discussion import (
     DiscussionMessage,
 )
 from backend.models.project import Project
+from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
 
 MAX_AUTO_ROUNDS = 10
+_PROCESS_EXIT_AFTER_EOF_TIMEOUT = 2.0
+_PROCESS_SIGNAL_TIMEOUTS = (10.0, 5.0, 5.0)
+_STDERR_DRAIN_TIMEOUT = 2.0
+_CONSUMER_SHUTDOWN_TIMEOUT = sum(_PROCESS_SIGNAL_TIMEOUTS) + 5.0
+
+
+class DiscussionProcessCleanupError(RuntimeError):
+    """A discussion child could not be proven terminal within the deadline."""
+
+
+async def _settle_despite_cancellation(awaitable):
+    """Settle a finite lifecycle operation before delivering cancellation."""
+    operation = asyncio.ensure_future(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException:
+            break
+    return operation, cancellation
 
 
 class DiscussionService:
@@ -34,6 +58,11 @@ class DiscussionService:
         self.parser = StreamParser()
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._consumers: dict[int, asyncio.Task] = {}
+        self._agent_locks: dict[int, asyncio.Lock] = {}
+        self._facilitator_processes: dict[
+            asyncio.Task, asyncio.subprocess.Process
+        ] = {}
+        self._facilitator_tasks: set[asyncio.Task] = set()
         self._facilitator_locks: dict[int, asyncio.Lock] = {}
         self._round_count: dict[int, int] = {}
 
@@ -41,6 +70,50 @@ class DiscussionService:
         if discussion_id not in self._facilitator_locks:
             self._facilitator_locks[discussion_id] = asyncio.Lock()
         return self._facilitator_locks[discussion_id]
+
+    def _get_agent_lock(self, agent_id: int) -> asyncio.Lock:
+        return self._agent_locks.setdefault(agent_id, asyncio.Lock())
+
+    async def _claim_agent_start_locked(
+        self,
+        db: AsyncSession,
+        agent_id: int,
+    ) -> DiscussionAgent:
+        """Atomically claim one idle/error agent before scheduling its process."""
+        retained = self._processes.get(agent_id)
+        if retained is not None and self._process_tree_alive(retained):
+            raise ValueError(f"Agent {agent_id} is already running")
+        consumer = self._consumers.get(agent_id)
+        if consumer is not None and not consumer.done():
+            raise ValueError(f"Agent {agent_id} is already running")
+
+        claimed = await db.execute(
+            update(DiscussionAgent)
+            .where(
+                DiscussionAgent.id == agent_id,
+                DiscussionAgent.status.in_(("idle", "error")),
+            )
+            .values(status="running")
+        )
+        if claimed.rowcount != 1:
+            await db.rollback()
+            current = await db.get(
+                DiscussionAgent,
+                agent_id,
+                populate_existing=True,
+            )
+            if current is None:
+                raise ValueError(f"Agent {agent_id} not found")
+            raise ValueError(f"Agent {agent_id} is already running")
+        await db.commit()
+        agent = await db.get(
+            DiscussionAgent,
+            agent_id,
+            populate_existing=True,
+        )
+        if agent is None:
+            raise ValueError(f"Agent {agent_id} not found")
+        return agent
 
     async def _resolve_project_cwd(self, db: AsyncSession, disc: Discussion) -> str | None:
         if not disc.project_id:
@@ -153,8 +226,9 @@ class DiscussionService:
         )
         db.add(user_evt)
 
-        agent.status = "running"
-        await db.commit()
+        async with self._get_agent_lock(agent_id):
+            agent = await self._claim_agent_start_locked(db, agent_id)
+            self._launch_agent_resume(agent, disc, message)
 
         await self.broadcaster.broadcast(
             f"discussion:{agent.discussion_id}:agent:{agent_id}",
@@ -170,8 +244,6 @@ class DiscussionService:
             "agent_id": agent_id,
             "status": "running",
         })
-
-        self._launch_agent_resume(agent, disc, message)
 
     # ------------------------------------------------------------------
     # Public: trigger an idle agent
@@ -194,15 +266,6 @@ class DiscussionService:
         history = await self._get_history(db, agent.discussion_id)
         history_file = self._write_history_file(agent.discussion_id, history)
 
-        agent.status = "running"
-        await db.commit()
-
-        await self.broadcaster.broadcast(f"discussion:{agent.discussion_id}", {
-            "event_type": "agent_status",
-            "agent_id": agent_id,
-            "status": "running",
-        })
-
         prompt = f"""\
 {agent.system_prompt}
 
@@ -211,23 +274,256 @@ Updated discussion history is at: {history_file}
 Read it, then provide your updated analysis from your perspective as "{agent.role_name}".
 Write in Chinese."""
 
-        self._launch_agent_with_prompt(agent, disc, prompt, history_file)
+        try:
+            async with self._get_agent_lock(agent_id):
+                agent = await self._claim_agent_start_locked(db, agent_id)
+                self._launch_agent_with_prompt(
+                    agent,
+                    disc,
+                    prompt,
+                    history_file,
+                )
+        except BaseException:
+            try:
+                os.unlink(history_file)
+            except OSError:
+                pass
+            raise
+
+        await self.broadcaster.broadcast(f"discussion:{agent.discussion_id}", {
+            "event_type": "agent_status",
+            "agent_id": agent_id,
+            "status": "running",
+        })
 
     # ------------------------------------------------------------------
     # Public: stop a running agent
     # ------------------------------------------------------------------
     async def stop_agent(self, agent_id: int) -> None:
         process = self._processes.get(agent_id)
-        if process and process.returncode is None:
+        if process and self._process_tree_alive(process):
+            await self._terminate_process(process)
+
+    async def shutdown(self) -> None:
+        """Stop every discussion consumer and prove its child has exited."""
+        operation, cancellation = await _settle_despite_cancellation(
+            self._shutdown_bounded()
+        )
+        try:
+            operation.result()
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation
+            raise
+        if cancellation is not None:
+            raise cancellation
+
+    async def _shutdown_bounded(self) -> None:
+        """Bounded shutdown implementation retaining every unresolved owner."""
+        owned_tasks = list(self._consumers.values()) + list(
+            self._facilitator_tasks
+        )
+        current = asyncio.current_task()
+        owned_tasks = [task for task in owned_tasks if task is not current]
+        for task in owned_tasks:
+            task.cancel()
+        if owned_tasks:
+            done, pending = await asyncio.wait(
+                owned_tasks,
+                timeout=_CONSUMER_SHUTDOWN_TIMEOUT,
+            )
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
+        else:
+            pending = set()
+
+        # A cancellation can race the short spawn→consumer registration
+        # window. Reap every exact process still retained, including processes
+        # whose consumer timed out in database/event finalization.
+        failures: list[str] = []
+        process_items = list(self._processes.items())
+        if process_items:
+            results = await asyncio.gather(
+                *(
+                    self._terminate_process(process)
+                    for _, process in process_items
+                ),
+                return_exceptions=True,
+            )
+            for (agent_id, process), result in zip(process_items, results):
+                process_reaped = (
+                    process.returncode is not None
+                    and not self._process_tree_alive(process)
+                )
+                if process_reaped:
+                    if self._processes.get(agent_id) is process:
+                        self._processes.pop(agent_id, None)
+                elif isinstance(result, BaseException):
+                    failures.append(f"agent {agent_id}: {result}")
+                else:
+                    failures.append(f"agent {agent_id}: still running")
+
+        facilitator_items = list(self._facilitator_processes.items())
+        if facilitator_items:
+            results = await asyncio.gather(
+                *(
+                    self._terminate_process(process)
+                    for _, process in facilitator_items
+                ),
+                return_exceptions=True,
+            )
+            for (owner, process), result in zip(
+                facilitator_items,
+                results,
+            ):
+                process_reaped = (
+                    process.returncode is not None
+                    and not self._process_tree_alive(process)
+                )
+                if process_reaped:
+                    if self._facilitator_processes.get(owner) is process:
+                        self._facilitator_processes.pop(owner, None)
+                elif isinstance(result, BaseException):
+                    failures.append(f"facilitator: {result}")
+                else:
+                    failures.append("facilitator: still running")
+
+        for agent_id, consumer in list(self._consumers.items()):
+            if consumer.done() and self._consumers.get(agent_id) is consumer:
+                self._consumers.pop(agent_id, None)
+        self._facilitator_tasks = {
+            task for task in self._facilitator_tasks if not task.done()
+        }
+
+        if pending:
+            failures.append(
+                f"{len(pending)} discussion consumer(s) ignored cancellation"
+            )
+        if self._processes:
+            failures.append(
+                f"{len(self._processes)} discussion process(es) remain live"
+            )
+        if self._facilitator_processes:
+            failures.append(
+                f"{len(self._facilitator_processes)} facilitator process(es) "
+                "remain live"
+            )
+        if failures:
+            raise DiscussionProcessCleanupError("; ".join(failures))
+
+    @staticmethod
+    def _send_process_signal(
+        process: asyncio.subprocess.Process,
+        sig: signal.Signals,
+    ) -> None:
+        pid = getattr(process, "pid", None)
+        if os.name == "posix":
+            process_group_id = require_safe_process_group_id(
+                pid,
+                context="DiscussionService child termination",
+            )
             try:
-                process.send_signal(signal.SIGINT)
-                await asyncio.wait_for(process.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                process.terminate()
+                os.killpg(process_group_id, sig)
+                return
+            except ProcessLookupError:
+                return
+        process.send_signal(sig)
+
+    @staticmethod
+    def _process_tree_alive(
+        process: asyncio.subprocess.Process,
+    ) -> bool:
+        if os.name != "posix":
+            return process.returncode is None
+        process_group_id = require_safe_process_group_id(
+            getattr(process, "pid", None),
+            context="DiscussionService child liveness check",
+        )
+        try:
+            os.killpg(process_group_id, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    async def _wait_for_process_tree_exit(
+        self,
+        process: asyncio.subprocess.Process,
+        timeout: float,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            tree_alive = self._process_tree_alive(process)
+            if process.returncode is not None and not tree_alive:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            if (
+                process.returncode is None
+                or self._process_tree_alive(process)
+            ):
                 try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
+                    await asyncio.wait_for(
+                        process.wait(),
+                        timeout=min(0.05, remaining),
+                    )
                 except asyncio.TimeoutError:
-                    process.kill()
+                    pass
+            else:
+                await asyncio.sleep(min(0.05, remaining))
+
+    async def _terminate_process(
+        self,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        """Bounded SIGINT→SIGTERM→SIGKILL escalation for the whole process group."""
+        if not self._process_tree_alive(process):
+            if process.returncode is None:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=0.1)
+                except asyncio.TimeoutError as exc:
+                    raise DiscussionProcessCleanupError(
+                        "Discussion process disappeared but could not be reaped"
+                    ) from exc
+            return
+        self._send_process_signal(process, signal.SIGINT)
+        try:
+            await self._wait_for_process_tree_exit(
+                process,
+                _PROCESS_SIGNAL_TIMEOUTS[0],
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if process.returncode is None:
+            self._send_process_signal(process, signal.SIGTERM)
+        elif self._process_tree_alive(process):
+            self._send_process_signal(process, signal.SIGTERM)
+        try:
+            await self._wait_for_process_tree_exit(
+                process,
+                _PROCESS_SIGNAL_TIMEOUTS[1],
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if self._process_tree_alive(process):
+            self._send_process_signal(process, signal.SIGKILL)
+        try:
+            await self._wait_for_process_tree_exit(
+                process,
+                _PROCESS_SIGNAL_TIMEOUTS[2],
+            )
+        except asyncio.TimeoutError as exc:
+            raise DiscussionProcessCleanupError(
+                "Discussion process "
+                f"{getattr(process, 'pid', None)} survived SIGKILL"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Public: add one more agent via facilitator
@@ -384,8 +680,33 @@ Write in Chinese."""
                     if not agent or agent.status == "running":
                         continue
 
-                    agent.status = "running"
-                    await db.commit()
+                    try:
+                        async with self._get_agent_lock(agent.id):
+                            agent = await self._claim_agent_start_locked(
+                                db,
+                                agent.id,
+                            )
+                            effective_cwd = agent.last_cwd or project_cwd
+                            if agent.session_id:
+                                self._launch_agent_resume(
+                                    agent,
+                                    disc,
+                                    instruction,
+                                    cwd=effective_cwd,
+                                )
+                            else:
+                                full_prompt = (
+                                    f"{agent.system_prompt}\n\n{instruction}"
+                                )
+                                self._launch_agent_with_prompt(
+                                    agent,
+                                    disc,
+                                    full_prompt,
+                                    cwd=effective_cwd,
+                                )
+                    except ValueError:
+                        # A manual trigger/chat request won the same DB claim.
+                        continue
 
                     await self.broadcaster.broadcast(
                         f"discussion:{discussion_id}",
@@ -395,13 +716,6 @@ Write in Chinese."""
                             "status": "running",
                         },
                     )
-
-                    effective_cwd = agent.last_cwd or project_cwd
-                    if agent.session_id:
-                        self._launch_agent_resume(agent, disc, instruction, cwd=effective_cwd)
-                    else:
-                        full_prompt = f"{agent.system_prompt}\n\n{instruction}"
-                        self._launch_agent_with_prompt(agent, disc, full_prompt, cwd=effective_cwd)
 
     async def _run_facilitator_decide(
         self,
@@ -484,64 +798,185 @@ Write in Chinese."""
         discussion_id = disc.id
         collected_text: list[str] = []
         captured_session_id: str | None = None
-
-        await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
-            "event_type": "facilitator_status",
-            "status": "running",
-        })
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("Facilitator process has no owning task")
+        self._facilitator_tasks.add(owner)
+        process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[bytes] | None = None
+        stderr_data = b""
+        cancelled: asyncio.CancelledError | None = None
+        run_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=cwd,
-                limit=10 * 1024 * 1024,
-            )
-
-            while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").strip()
-                if not text:
-                    continue
-
-                events = self.parser.parse_line(text)
-                for event in events:
-                    sid = event.pop("session_id", None)
-                    if sid and not captured_session_id:
-                        captured_session_id = sid
-                    event.pop("cost_usd", None)
-                    event.pop("context_usage", None)
-                    et = event.get("event_type", "")
-
-                    if et in ("message", "result") and event.get("content"):
-                        collected_text.append(event["content"])
-
-                    await self._save_facilitator_event(discussion_id, et, event)
-
-                    broadcast_data = {
-                        k: v for k, v in event.items() if k != "raw_json"
-                    }
-                    broadcast_data["event_type"] = (
-                        f"facilitator_{et}" if et else "facilitator_unknown"
-                    )
-                    await self.broadcaster.broadcast(
-                        f"discussion:{discussion_id}", broadcast_data
-                    )
-
-            await process.wait()
-
-        except Exception as e:
-            logger.exception("Facilitator process failed")
             await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
                 "event_type": "facilitator_status",
-                "status": "error",
-                "error": str(e),
+                "status": "running",
             })
+            spawn, spawn_cancellation = await _settle_despite_cancellation(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    cwd=cwd,
+                    limit=10 * 1024 * 1024,
+                    start_new_session=(os.name == "posix"),
+                )
+            )
+            try:
+                process = spawn.result()
+            except BaseException:
+                if spawn_cancellation is not None:
+                    raise spawn_cancellation
+                raise
+            self._facilitator_processes[owner] = process
+            stderr_task = asyncio.create_task(process.stderr.read())
+            cancelled = spawn_cancellation
+
+            try:
+                while cancelled is None:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+
+                    events = self.parser.parse_line(text)
+                    for event in events:
+                        sid = event.pop("session_id", None)
+                        if sid and not captured_session_id:
+                            captured_session_id = sid
+                        event.pop("cost_usd", None)
+                        event.pop("context_usage", None)
+                        et = event.get("event_type", "")
+
+                        if et in ("message", "result") and event.get("content"):
+                            collected_text.append(event["content"])
+
+                        await self._save_facilitator_event(
+                            discussion_id,
+                            et,
+                            event,
+                        )
+
+                        broadcast_data = {
+                            k: v for k, v in event.items() if k != "raw_json"
+                        }
+                        broadcast_data["event_type"] = (
+                            f"facilitator_{et}"
+                            if et
+                            else "facilitator_unknown"
+                        )
+                        await self.broadcaster.broadcast(
+                            f"discussion:{discussion_id}",
+                            broadcast_data,
+                        )
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except BaseException as exc:
+                run_error = exc
+
+            async def _finish_process() -> None:
+                if (
+                    cancelled is None
+                    and run_error is None
+                    and process.returncode is None
+                ):
+                    try:
+                        await asyncio.wait_for(
+                            process.wait(),
+                            timeout=_PROCESS_EXIT_AFTER_EOF_TIMEOUT,
+                        )
+                        if not self._process_tree_alive(process):
+                            return
+                    except asyncio.TimeoutError:
+                        pass
+                if (
+                    process.returncode is None
+                    or self._process_tree_alive(process)
+                ):
+                    await self._terminate_process(process)
+
+            finish, finish_cancellation = await _settle_despite_cancellation(
+                _finish_process()
+            )
+            if cancelled is None:
+                cancelled = finish_cancellation
+            try:
+                finish.result()
+            except BaseException as exc:
+                cleanup_error = exc
+
+            process_reaped = (
+                process.returncode is not None
+                and not self._process_tree_alive(process)
+            )
+            if (
+                process_reaped
+                and self._facilitator_processes.get(owner) is process
+            ):
+                self._facilitator_processes.pop(owner, None)
+
+            if stderr_task is not None:
+                if not stderr_task.done():
+                    try:
+                        stderr_data = await asyncio.wait_for(
+                            asyncio.shield(stderr_task),
+                            timeout=_STDERR_DRAIN_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        stderr_task.cancel()
+                    except asyncio.CancelledError as exc:
+                        if cancelled is None:
+                            cancelled = exc
+                if stderr_task.done() and not stderr_task.cancelled():
+                    try:
+                        stderr_data = stderr_task.result()
+                    except Exception:
+                        logger.exception("Failed to drain facilitator stderr")
+
+            if cleanup_error is not None:
+                raise cleanup_error
+            if cancelled is not None:
+                raise cancelled
+            if run_error is not None:
+                raise run_error
+            if process.returncode != 0:
+                stderr_text = stderr_data.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+                raise RuntimeError(
+                    f"Facilitator exited with code {process.returncode}"
+                    + (f": {stderr_text[:2000]}" if stderr_text else "")
+                )
+
+        except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                logger.exception("Facilitator process failed")
+                await self.broadcaster.broadcast(
+                    f"discussion:{discussion_id}",
+                    {
+                        "event_type": "facilitator_status",
+                        "status": "error",
+                        "error": str(exc),
+                    },
+                )
             raise
+        finally:
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                try:
+                    await asyncio.wait(
+                        {stderr_task},
+                        timeout=_STDERR_DRAIN_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    pass
+            self._facilitator_tasks.discard(owner)
 
         if captured_session_id:
             async with self.db_factory() as db:
@@ -729,6 +1164,41 @@ Guidelines:
     # ------------------------------------------------------------------
     # Internal: run subprocess and consume stream
     # ------------------------------------------------------------------
+    async def _rollback_unspawned_agent(
+        self,
+        agent_id: int,
+        discussion_id: int,
+        *,
+        status: str,
+        error: BaseException | None = None,
+    ) -> None:
+        """Release a DB claim when subprocess creation never produced a PID."""
+        async with self.db_factory() as db:
+            await db.execute(
+                update(DiscussionAgent)
+                .where(
+                    DiscussionAgent.id == agent_id,
+                    DiscussionAgent.status == "running",
+                )
+                .values(status=status, pid=None)
+            )
+            await db.commit()
+        try:
+            await self.broadcaster.broadcast(
+                f"discussion:{discussion_id}",
+                {
+                    "event_type": "agent_status",
+                    "agent_id": agent_id,
+                    "status": status,
+                    "error": str(error) if error is not None else None,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to broadcast unspawned discussion agent %s rollback",
+                agent_id,
+            )
+
     async def _run_and_consume(
         self,
         agent_id: int,
@@ -738,19 +1208,34 @@ Guidelines:
         cwd: str | None = None,
         cleanup_file: str | None = None,
     ) -> None:
+        process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[bytes] | None = None
+        cancelled: asyncio.CancelledError | None = None
+        cleanup_error: BaseException | None = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=cwd,
-                limit=10 * 1024 * 1024,
+            spawn, spawn_cancellation = await _settle_despite_cancellation(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    cwd=cwd,
+                    limit=10 * 1024 * 1024,
+                    start_new_session=(os.name == "posix"),
+                )
             )
+            try:
+                process = spawn.result()
+            except BaseException:
+                if spawn_cancellation is not None:
+                    raise spawn_cancellation
+                raise
             self._processes[agent_id] = process
+            stderr_task = asyncio.create_task(process.stderr.read())
+            cancelled = spawn_cancellation
 
             try:
-                while True:
+                while cancelled is None:
                     try:
                         line = await process.stdout.readline()
                         if not line:
@@ -772,48 +1257,155 @@ Guidelines:
                         raise
                     except Exception:
                         logger.exception("Error in consume loop for agent %s", agent_id)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                await process.wait()
-                exit_code = process.returncode
+            except asyncio.CancelledError as exc:
+                cancelled = exc
 
-                stderr_data = await process.stderr.read()
-                stderr_text = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""
+            async def _finish_process() -> None:
+                if cancelled is None and process.returncode is None:
+                    try:
+                        await asyncio.wait_for(
+                            process.wait(),
+                            timeout=_PROCESS_EXIT_AFTER_EOF_TIMEOUT,
+                        )
+                        if not self._process_tree_alive(process):
+                            return
+                    except asyncio.TimeoutError:
+                        pass
+                if (
+                    process.returncode is None
+                    or self._process_tree_alive(process)
+                ):
+                    await self._terminate_process(process)
 
-                new_status = "idle" if exit_code in (0, -2, 130) else "error"
+            reap_task, reap_cancellation = await _settle_despite_cancellation(
+                _finish_process()
+            )
+            if cancelled is None:
+                cancelled = reap_cancellation
+            try:
+                reap_task.result()
+            except BaseException as exc:
+                cleanup_error = exc
 
-                async with self.db_factory() as db:
-                    await db.execute(
-                        update(DiscussionAgent)
-                        .where(DiscussionAgent.id == agent_id)
-                        .values(status=new_status, pid=None)
-                    )
-                    await db.commit()
-
-                await self.broadcaster.broadcast(
-                    f"discussion:{discussion_id}:agent:{agent_id}",
-                    {
-                        "event_type": "process_exit",
-                        "agent_id": agent_id,
-                        "exit_code": exit_code,
-                        "stderr": stderr_text[:2000] if stderr_text else None,
-                    },
-                )
-                await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
-                    "event_type": "agent_status",
-                    "agent_id": agent_id,
-                    "status": new_status,
-                })
-
+            exit_code = process.returncode
+            process_reaped = (
+                exit_code is not None
+                and not self._process_tree_alive(process)
+            )
+            if process_reaped and self._processes.get(agent_id) is process:
                 self._processes.pop(agent_id, None)
-                self._consumers.pop(agent_id, None)
 
-                if new_status == "idle":
-                    asyncio.get_event_loop().create_task(
-                        self._maybe_auto_advance(discussion_id)
+            stderr_data = b""
+            if stderr_task is not None:
+                if not stderr_task.done():
+                    try:
+                        stderr_data = await asyncio.wait_for(
+                            asyncio.shield(stderr_task),
+                            timeout=_STDERR_DRAIN_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        stderr_task.cancel()
+                    except asyncio.CancelledError as exc:
+                        if cancelled is None:
+                            cancelled = exc
+                if stderr_task.done() and not stderr_task.cancelled():
+                    try:
+                        stderr_data = stderr_task.result()
+                    except Exception:
+                        logger.exception(
+                            "Failed to drain stderr for discussion agent %s",
+                            agent_id,
+                        )
+            stderr_text = (
+                stderr_data.decode("utf-8", errors="replace").strip()
+                if stderr_data
+                else ""
+            )
+
+            new_status = (
+                "idle"
+                if (
+                    process_reaped
+                    and (cancelled is not None or exit_code in (0, -2, 130))
+                )
+                else "error"
+            )
+            values: dict[str, object] = {"status": new_status}
+            if process_reaped:
+                values["pid"] = None
+
+            async with self.db_factory() as db:
+                await db.execute(
+                    update(DiscussionAgent)
+                    .where(DiscussionAgent.id == agent_id)
+                    .values(**values)
+                )
+                await db.commit()
+
+            await self.broadcaster.broadcast(
+                f"discussion:{discussion_id}:agent:{agent_id}",
+                {
+                    "event_type": "process_exit",
+                    "agent_id": agent_id,
+                    "exit_code": exit_code,
+                    "stderr": stderr_text[:2000] if stderr_text else None,
+                },
+            )
+            await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
+                "event_type": "agent_status",
+                "agent_id": agent_id,
+                "status": new_status,
+            })
+
+            if new_status == "idle" and cancelled is None:
+                asyncio.get_event_loop().create_task(
+                    self._maybe_auto_advance(discussion_id)
+                )
+
+            if cleanup_error is not None:
+                raise cleanup_error
+            if cancelled is not None:
+                raise cancelled
+        except asyncio.CancelledError as exc:
+            if process is None:
+                rollback, _ = await _settle_despite_cancellation(
+                    self._rollback_unspawned_agent(
+                        agent_id,
+                        discussion_id,
+                        status="idle",
                     )
+                )
+                rollback.result()
+            raise exc
+        except BaseException as exc:
+            if process is None:
+                rollback, cancellation = await _settle_despite_cancellation(
+                    self._rollback_unspawned_agent(
+                        agent_id,
+                        discussion_id,
+                        status="error",
+                        error=exc,
+                    )
+                )
+                rollback.result()
+                if cancellation is not None:
+                    raise cancellation
+            raise
         finally:
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                try:
+                    await asyncio.wait(
+                        {stderr_task},
+                        timeout=_STDERR_DRAIN_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    # The reader no longer owns a live process at this point;
+                    # retain caller cancellation without an unbounded gather.
+                    pass
+            current_consumer = asyncio.current_task()
+            if self._consumers.get(agent_id) is current_consumer:
+                self._consumers.pop(agent_id, None)
             if cleanup_file:
                 try:
                     os.unlink(cleanup_file)

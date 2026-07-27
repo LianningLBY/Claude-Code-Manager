@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
+from backend.api.deps import require_project_access
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
 from backend.schemas.project_todo import ProjectTodoCreate, ProjectTodoResponse, ProjectTodoUpdate
@@ -30,9 +31,11 @@ async def _require_todo(project_id: int, todo_id: int, db: AsyncSession) -> Proj
 @router.get("", response_model=list[ProjectTodoResponse])
 async def list_project_todos(
     project_id: int,
+    request: Request,
     include_archived: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
+    await require_project_access(request, project_id, db)
     await _require_project(project_id, db)
     stmt = select(ProjectTodo).where(ProjectTodo.project_id == project_id)
     if not include_archived:
@@ -47,8 +50,10 @@ async def list_project_todos(
 async def create_project_todo(
     project_id: int,
     body: ProjectTodoCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    await require_project_access(request, project_id, db)
     await _require_project(project_id, db)
     title = body.title.strip()
     prompt = body.prompt.strip()
@@ -77,10 +82,12 @@ async def update_project_todo(
     project_id: int,
     todo_id: int,
     body: ProjectTodoUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Partial update. Also the canonical way to archive (status='archived')
     or restore (status='open') — DELETE is reserved for permanent removal."""
+    await require_project_access(request, project_id, db)
     todo = await _require_todo(project_id, todo_id, db)
     updates = body.model_dump(exclude_unset=True)
 
@@ -111,9 +118,11 @@ async def update_project_todo(
 async def delete_project_todo(
     project_id: int,
     todo_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Permanently delete a todo. To hide without destroying, PATCH status='archived'."""
+    await require_project_access(request, project_id, db)
     todo = await _require_todo(project_id, todo_id, db)
     await db.delete(todo)
     await db.commit()

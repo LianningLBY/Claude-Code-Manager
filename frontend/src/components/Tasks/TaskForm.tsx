@@ -312,7 +312,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     (mode !== 'loop' || todoFilePath) &&
     (mode !== 'goal' || goalCondition) &&
     (projectId || (isNewProject && newProjectName)) &&
-    !fileUpload.isUploading;
+    !fileUpload.isUploading &&
+    !fileUpload.hasFailed;
 
   useEffect(() => {
     // workers list removed — Run on moved to Project level

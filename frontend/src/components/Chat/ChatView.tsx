@@ -16,6 +16,7 @@ import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
+import { mergeChatHistory } from './messageMerge';
 
 interface ChatViewProps {
   task: Task;
@@ -174,6 +175,21 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState<string | null>(null);
   const refreshHistoryRef = useRef<() => void>(() => {});
+  // A pending HTTP snapshot can arrive after the corresponding WS resolution.
+  // Keep request-scoped tombstones for this mounted task so such a snapshot
+  // cannot turn an answered/timed-out card back into an actionable one.
+  const resolvedAskRequestIdsRef = useRef(new Set<string>());
+  const markAskUserResolved = useCallback((
+    requestId: string,
+    status: 'answered' | 'timed_out' | 'expired',
+  ) => {
+    resolvedAskRequestIdsRef.current.add(requestId);
+    setMessages((prev) => prev.map((message) =>
+      message.event_type === 'ask_user_question' && message.request_id === requestId
+        ? { ...message, ask_status: status }
+        : message
+    ));
+  }, []);
   // WS 驱动的实时状态覆盖。task.status prop（5s 轮询）才是最终一致的事实源：
   // prop 变化时清掉覆盖（见下方 effect），否则错过一次 WS 事件就永久陈旧。
   const [localStatus, setLocalStatus] = useState<string | null>(null);
@@ -507,6 +523,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (eventType === 'ask_user_question') {
       const rid = (msg.data.request_id as string) || null;
       const questions = (msg.data.questions as AskUserQuestion[]) || [];
+      if (rid && resolvedAskRequestIdsRef.current.has(rid)) return;
       setMessages((prev) => {
         if (rid && prev.some((m) => m.event_type === 'ask_user_question' && m.request_id === rid)) {
           return prev; // 去重（重连回填可能与 WS 撞车）
@@ -535,11 +552,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (eventType === 'ask_user_resolved') {
       const rid = msg.data.request_id as string;
       const timedOut = !!msg.data.timed_out;
-      setMessages((prev) => prev.map((m) =>
-        m.event_type === 'ask_user_question' && m.request_id === rid
-          ? { ...m, ask_status: timedOut ? 'timed_out' : 'answered' }
-          : m
-      ));
+      if (rid) markAskUserResolved(rid, timedOut ? 'timed_out' : 'answered');
       return;
     }
 
@@ -680,6 +693,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const rawContent = typeof msg.data.raw_content === 'string' ? msg.data.raw_content : null;
       const imageUrls = (msg.data.image_urls as string[]) || null;
       const attachments = (msg.data.attachments as { url: string; name: string; is_image: boolean }[]) || null;
+      const persistedId = Number(msg.data.id);
+      const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
+      const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
       setSending(true);
       setMessages((prev) => {
         // Skip if last message is an optimistic duplicate (same content, recent).
@@ -693,10 +709,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           return prev;
         }
         return [...prev, {
-          id: Date.now() + Math.random(), role: 'user', event_type: 'user_message',
+          id: isPersisted ? persistedId : Date.now() + Math.random(), role: 'user', event_type: 'user_message',
           content, tool_name: null, tool_input: null, tool_output: null,
-          is_error: false, loop_iteration: null, timestamp: new Date().toISOString(),
+          is_error: false, loop_iteration: null,
+          timestamp: eventTimestamp,
           image_urls: imageUrls, attachments: attachments, source, raw_content: rawContent,
+          persisted: isPersisted,
         }];
       });
       return;
@@ -740,8 +758,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     // Skip CC internal messages (compact summaries, task-notifications) — real user input uses event_type=user_message
     if (eventType === 'message' && (msg.data.role as string) === 'user') return;
 
+    const persistedId = Number(msg.data.id);
+    const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
+    const itemId = (msg.data.item_id as string) || null;
     const entry: ChatMessage = {
-      id: Date.now() + Math.random(),
+      id: isPersisted ? persistedId : Date.now() + Math.random(),
       role: (msg.data.role as string) || 'assistant',
       event_type: eventType,
       content,
@@ -750,12 +771,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       tool_output: (msg.data.tool_output as string) || null,
       is_error: (msg.data.is_error as boolean) || false,
       loop_iteration: (msg.data.loop_iteration as number) || null,
-      timestamp: new Date().toISOString(),
+      timestamp: (msg.data.timestamp as string) || new Date().toISOString(),
       image_urls: (msg.data.image_urls as string[]) || null,
       attachments: (msg.data.attachments as FileAttachment[]) || null,
       source: (msg.data.source as string) || null,
+      item_id: itemId,
+      stream_item_id: itemId,
+      persisted: isPersisted,
     };
-    const itemId = (msg.data.item_id as string) || null;
     setMessages((prev) => {
       if (itemId) {
         const index = prev.findIndex((candidate) => candidate.stream_item_id === itemId);
@@ -767,7 +790,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       return [...prev, entry];
     });
-  }, [task.id, task.worker_id]);
+  }, [markAskUserResolved, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -785,7 +808,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         filtered.filter((m) => m.event_type === 'ask_user_question').map((m) => m.request_id)
       );
       const cards: ChatMessage[] = (askPending.pending || [])
-        .filter((p) => !existingIds.has(p.request_id))
+        .filter((p) =>
+          !existingIds.has(p.request_id)
+          && !resolvedAskRequestIdsRef.current.has(p.request_id)
+        )
         .map((p) => ({
           id: Date.now() + Math.random(),
           role: 'system' as const,
@@ -803,7 +829,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           ask_questions: p.questions,
           ask_status: 'pending',
         }));
-      setMessages(cards.length ? [...filtered, ...cards] : filtered);
+      const snapshot = cards.length ? [...filtered, ...cards] : filtered;
+      setMessages((current) => mergeChatHistory(snapshot, current));
     }).catch(() => {}).finally(() => setHistoryLoading(false));
   }, [task.id]);
   useEffect(() => {
@@ -820,9 +847,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (container) scrollRestorationRef.current = container.scrollHeight;
     setLoadingMore(true);
     api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, oldestId).then((msgs) => {
-      const filtered = msgs.filter((m) =>
-        !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
-      );
+      const filtered = msgs
+        .filter((m) =>
+          !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
+        )
+        .map((m) => ({ ...m, persisted: true }));
       if (filtered.length > 0) {
         setMessages((prev) => [...filtered, ...prev]);
       }
@@ -846,7 +875,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     fetchHistory();
   }, [fetchHistory]);
 
-  useWebSocket([`task:${task.id}`, 'system', 'tasks'], handleWsMessage, handleReconnect);
+  const handleSubscribed = useCallback((channels: string[]) => {
+    if (channels.includes(`task:${task.id}`)) fetchHistory();
+  }, [fetchHistory, task.id]);
+
+  useWebSocket(
+    [`task:${task.id}`, 'system', 'tasks'],
+    handleWsMessage,
+    handleReconnect,
+    handleSubscribed,
+  );
 
   // Fresh server data arrived via polling — drop the WS override so a missed
   // status_change/process_exit can't pin the header/spinner on a stale status.
@@ -1038,11 +1076,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
     const text = (overrideText ?? input).trim();
-    if (!text && fileUpload.uploads.length === 0 && !preUploadedResults?.length) return;
+    const sendableAttachmentCount = fromQueue
+      ? (preUploadedResults?.length || 0)
+      : fileUpload.uploadedResults.length + forkSeedUploads.length;
+    if (!text && sendableAttachmentCount === 0) return;
 
     // 注入模式：发送动作直达当前 turn（仅文本；不开新 turn、不排队）
     if (injectMode && canInject && !fromQueue) {
       if (text) await handleInject();
+      return;
+    }
+    if (!fromQueue && fileUpload.hasFailed) {
+      setError('Retry or remove failed attachments before sending.');
       return;
     }
 
@@ -1618,6 +1663,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               key={group.message.id}
               message={group.message}
               taskId={task.id}
+              onAskUserResolved={markAskUserResolved}
             />
           )
         )}
@@ -1910,8 +1956,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploads.length === 0) || (!task.session_id && !task.shared_from_id) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading}
-              title={injectMode && canInject
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || (!task.session_id && !task.shared_from_id) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              title={fileUpload.hasFailed
+                ? 'Retry or remove failed attachments before sending'
+                : injectMode && canInject
                 ? (isProcessing ? '注入到运行中的 turn (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
                 : isProcessing ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
@@ -2371,7 +2419,15 @@ function PermissionCard({ message, taskId }: { message: ChatMessage; taskId?: nu
   );
 }
 
-function AskUserCard({ message, taskId }: { message: ChatMessage; taskId?: number }) {
+function AskUserCard({
+  message,
+  taskId,
+  onResolved,
+}: {
+  message: ChatMessage;
+  taskId?: number;
+  onResolved?: (requestId: string, status: 'answered' | 'expired') => void;
+}) {
   const questions = message.ask_questions || [];
   const [submitting, setSubmitting] = useState(false);
   const [localStatus, setLocalStatus] = useState<string | null>(null);
@@ -2407,8 +2463,10 @@ function AskUserCard({ message, taskId }: { message: ChatMessage; taskId?: numbe
     try {
       await api.submitAskUser(taskId!, message.request_id!, answers);
       setLocalStatus('answered');
+      onResolved?.(message.request_id!, 'answered');
     } catch {
       setLocalStatus('expired');
+      onResolved?.(message.request_id!, 'expired');
     } finally {
       setSubmitting(false);
     }
@@ -2494,9 +2552,11 @@ function AskUserCard({ message, taskId }: { message: ChatMessage; taskId?: numbe
 const MessageBubble = memo(function MessageBubble({
   message,
   taskId,
+  onAskUserResolved,
 }: {
   message: ChatMessage;
   taskId?: number;
+  onAskUserResolved?: (requestId: string, status: 'answered' | 'expired') => void;
 }) {
   const isUser = message.role === 'user';
 
@@ -2505,7 +2565,13 @@ const MessageBubble = memo(function MessageBubble({
   }
 
   if (message.event_type === 'ask_user_question') {
-    return <AskUserCard message={message} taskId={taskId} />;
+    return (
+      <AskUserCard
+        message={message}
+        taskId={taskId}
+        onResolved={onAskUserResolved}
+      />
+    );
   }
 
   if (message.event_type === 'thinking') {

@@ -12,7 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.config import settings
 from backend.database import get_db
 from backend.models.pr_monitor import MonitoredRepo, PRReview
-from backend.api.deps import get_current_user_id, get_current_user_role
+from backend.api.deps import (
+    get_current_user_id,
+    get_current_user_role,
+    has_worker_access,
+    require_project_access,
+    require_worker_target_access,
+)
 from backend.schemas.pr_monitor import (
     MonitoredRepoCreate,
     MonitoredRepoUpdate,
@@ -114,42 +120,40 @@ async def list_repos(request: Request, db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
-async def _require_pr_monitor_write(request: Request, db: AsyncSession):
-    """Admin or Worker owner can manage PR monitors."""
-    role = get_current_user_role(request)
-    if role in ("admin", "super_admin"):
-        return
-    user_id = get_current_user_id(request)
-    if user_id:
-        from backend.models.worker import Worker
-        has_worker = (await db.execute(
-            select(Worker.id).where(Worker.owner_user_id == user_id).limit(1)
-        )).scalar_one_or_none()
-        if has_worker:
-            return
-    raise HTTPException(403, "You need a Worker or admin role to manage PR monitors")
+async def _require_pr_monitor_access(
+    request: Request,
+    db: AsyncSession,
+    repo: MonitoredRepo,
+) -> None:
+    """Require ownership of this repo's exact execution Worker."""
+    if not await has_worker_access(request, repo.worker_id, db):
+        raise HTTPException(403, "No access to this PR monitor")
 
 
 @router.post("/repos", response_model=MonitoredRepoDetailResponse)
 async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSession = Depends(get_db)):
-    await _require_pr_monitor_write(request, db)
+    worker_id = body.worker_id
+    await require_worker_target_access(request, worker_id, db)
+    if body.project_id is not None:
+        from backend.models.project import Project
+
+        project = await db.get(Project, body.project_id)
+        if project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, project.id, db)
+        if project.worker_id != worker_id:
+            raise HTTPException(
+                400,
+                "PR monitor Worker must match the selected Project location",
+            )
+
+    # Authorize the exact target first so the global uniqueness check cannot
+    # be used by another Worker owner to enumerate monitored repositories.
     existing = await db.execute(
         select(MonitoredRepo).where(MonitoredRepo.repo_full_name == body.repo_full_name)
     )
     if existing.scalar_one_or_none():
         raise HTTPException(409, f"Repository '{body.repo_full_name}' already monitored")
-
-    # Validate worker_id: admin can use NULL (local) or any worker; member only own workers
-    worker_id = getattr(body, 'worker_id', None)
-    user_role = get_current_user_role(request)
-    user_id = get_current_user_id(request)
-    if worker_id is None and user_role not in ("admin", "super_admin"):
-        raise HTTPException(403, "Only admin can create PR monitors on local machine")
-    if worker_id is not None and user_role not in ("admin", "super_admin"):
-        from backend.models.worker import Worker
-        w = await db.get(Worker, worker_id)
-        if not w or w.owner_user_id != user_id:
-            raise HTTPException(403, "You can only create PR monitors on your own Worker")
 
     repo = MonitoredRepo(
         repo_full_name=body.repo_full_name,
@@ -170,10 +174,15 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
 
 
 @router.get("/repos/{repo_id}", response_model=MonitoredRepoDetailResponse)
-async def get_repo(repo_id: int, db: AsyncSession = Depends(get_db)):
+async def get_repo(
+    repo_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:
         raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
     return repo
 
 
@@ -184,12 +193,25 @@ async def update_repo(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    await _require_pr_monitor_write(request, db)
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:
         raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
 
     update_data = body.model_dump(exclude_unset=True)
+    project_id = update_data.get("project_id")
+    if project_id is not None:
+        from backend.models.project import Project
+
+        project = await db.get(Project, project_id)
+        if project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, project_id, db)
+        if project.worker_id != repo.worker_id:
+            raise HTTPException(
+                400,
+                "PR monitor Worker must match the selected Project location",
+            )
     for key, value in update_data.items():
         setattr(repo, key, value)
 
@@ -200,10 +222,10 @@ async def update_repo(
 
 @router.delete("/repos/{repo_id}")
 async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    await _require_pr_monitor_write(request, db)
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:
         raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
 
     await db.execute(
         select(PRReview).where(PRReview.repo_id == repo_id)
@@ -221,10 +243,10 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
 
 @router.post("/repos/{repo_id}/toggle", response_model=MonitoredRepoResponse)
 async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    await _require_pr_monitor_write(request, db)
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:
         raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
     repo.enabled = not repo.enabled
     await db.commit()
     await db.refresh(repo)
@@ -233,10 +255,10 @@ async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends
 
 @router.post("/repos/{repo_id}/regenerate-secret", response_model=MonitoredRepoDetailResponse)
 async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    await _require_pr_monitor_write(request, db)
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:
         raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
     repo.webhook_secret = secrets.token_hex(32)
     await db.commit()
     await db.refresh(repo)
@@ -246,6 +268,7 @@ async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = D
 @router.get("/repos/{repo_id}/reviews", response_model=list[PRReviewResponse])
 async def list_reviews(
     repo_id: int,
+    request: Request,
     page: int = 1,
     size: int = 20,
     db: AsyncSession = Depends(get_db),
@@ -253,6 +276,7 @@ async def list_reviews(
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:
         raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
 
     offset = (page - 1) * size
     result = await db.execute(
@@ -266,10 +290,18 @@ async def list_reviews(
 
 
 @router.get("/reviews/{review_id}", response_model=PRReviewResponse)
-async def get_review(review_id: int, db: AsyncSession = Depends(get_db)):
+async def get_review(
+    review_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     review = await db.get(PRReview, review_id)
     if not review:
         raise HTTPException(404, "Review not found")
+    repo = await db.get(MonitoredRepo, review.repo_id)
+    if repo is None:
+        raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
     return review
 
 

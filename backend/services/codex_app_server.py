@@ -45,6 +45,27 @@ _NO_ACTIVE_GOAL_RE = re.compile(
 )
 
 
+async def _settle_registry_cleanup(awaitable):
+    """Complete registry bookkeeping before propagating caller cancellation."""
+
+    cleanup = asyncio.create_task(awaitable)
+    delayed_cancellation: asyncio.CancelledError | None = None
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as exc:
+            if delayed_cancellation is None:
+                delayed_cancellation = exc
+        except BaseException:
+            if cleanup.done():
+                break
+            raise
+    result = cleanup.result()
+    if delayed_cancellation is not None:
+        raise delayed_cancellation
+    return result
+
+
 class CodexAppServerError(RuntimeError):
     """Raised when app-server rejects a request or loses its transport."""
 
@@ -1833,16 +1854,19 @@ class CodexAppServerRegistry:
             succeeded = True
             return result
         finally:
-            async with self._lock:
-                self._decrement_starting_locked(home)
-                if self._starting_threads.get(thread_id) is token:
-                    self._starting_threads.pop(thread_id, None)
-                if (
-                    reserved_owner
-                    and not succeeded
-                    and self._thread_owners.get(thread_id) == home
-                ):
-                    self._thread_owners.pop(thread_id, None)
+            async def _release_read_thread() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+                    if (
+                        reserved_owner
+                        and not succeeded
+                        and self._thread_owners.get(thread_id) == home
+                    ):
+                        self._thread_owners.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_read_thread())
 
     async def create_thread(
         self,
@@ -1891,8 +1915,11 @@ class CodexAppServerRegistry:
                 self._thread_owners[thread_id] = home
             return result
         finally:
-            async with self._lock:
-                self._decrement_starting_locked(home)
+            async def _release_create_thread() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+
+            await _settle_registry_cleanup(_release_create_thread())
 
     async def fork_thread(
         self,
@@ -1958,16 +1985,19 @@ class CodexAppServerRegistry:
                 self._thread_owners[fork_id] = home
             return result
         finally:
-            async with self._lock:
-                self._decrement_starting_locked(home)
-                if self._starting_threads.get(thread_id) is token:
-                    self._starting_threads.pop(thread_id, None)
-                if (
-                    reserved_owner
-                    and fork_id is None
-                    and self._thread_owners.get(thread_id) == home
-                ):
-                    self._thread_owners.pop(thread_id, None)
+            async def _release_fork_thread() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+                    if (
+                        reserved_owner
+                        and fork_id is None
+                        and self._thread_owners.get(thread_id) == home
+                    ):
+                        self._thread_owners.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_fork_thread())
 
     async def delete_thread(
         self,
@@ -2016,12 +2046,15 @@ class CodexAppServerRegistry:
             await server.delete_thread(thread_id)
             deleted = True
         finally:
-            async with self._lock:
-                self._decrement_starting_locked(home)
-                if self._starting_threads.get(thread_id) is token:
-                    self._starting_threads.pop(thread_id, None)
-                if deleted and self._thread_owners.get(thread_id) == home:
-                    self._thread_owners.pop(thread_id, None)
+            async def _release_delete_thread() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+                    if deleted and self._thread_owners.get(thread_id) == home:
+                        self._thread_owners.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_delete_thread())
 
     async def unsubscribe_thread(self, thread_id: str) -> str:
         """Release one idle subscription without dropping its resumable owner."""
@@ -2063,10 +2096,13 @@ class CodexAppServerRegistry:
         try:
             return await server.unsubscribe_thread(thread_id)
         finally:
-            async with self._lock:
-                self._decrement_starting_locked(owner)
-                if self._starting_threads.get(thread_id) is token:
-                    self._starting_threads.pop(thread_id, None)
+            async def _release_unsubscribe_thread() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(owner)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_unsubscribe_thread())
 
     async def abort_unclaimed_turn(
         self,
@@ -2074,7 +2110,7 @@ class CodexAppServerRegistry:
         process: CodexTurnProcess,
         *,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Ensure a successfully-started turn cannot outlive its cancelled caller."""
 
         home = normalize_codex_home(codex_home)
@@ -2091,7 +2127,7 @@ class CodexAppServerRegistry:
                 reason,
                 termination_kind="internal_abort",
             )
-            return
+            return True
 
         abandon = getattr(server, "abandon_turn", None)
         interrupt_confirmed = False
@@ -2111,9 +2147,12 @@ class CodexAppServerRegistry:
                 home,
             )
         if interrupt_confirmed:
-            async with self._lock:
-                self._draining.discard(home)
-            return
+            async def _reopen_interrupted_home() -> None:
+                async with self._lock:
+                    self._draining.discard(home)
+
+            await _settle_registry_cleanup(_reopen_interrupted_home())
+            return False
 
         # If the interrupt was not acknowledged, stopping this account's
         # transport is the only way to rule out real model work continuing
@@ -2131,13 +2170,19 @@ class CodexAppServerRegistry:
             raise
         finally:
             if shutdown_completed:
-                async with self._lock:
-                    if self._servers.get(home) is server:
-                        self._servers.pop(home, None)
-                    for owned_thread, owner in list(self._thread_owners.items()):
-                        if owner == home:
-                            self._thread_owners.pop(owned_thread, None)
-                    self._draining.discard(home)
+                async def _detach_shutdown_home() -> None:
+                    async with self._lock:
+                        if self._servers.get(home) is server:
+                            self._servers.pop(home, None)
+                        for owned_thread, owner in list(
+                            self._thread_owners.items()
+                        ):
+                            if owner == home:
+                                self._thread_owners.pop(owned_thread, None)
+                        self._draining.discard(home)
+
+                await _settle_registry_cleanup(_detach_shutdown_home())
+        return True
 
     async def steer_turn(self, thread_id: str, content: str) -> bool:
         async with self._lock:
@@ -2265,10 +2310,15 @@ class CodexAppServerRegistry:
         try:
             if restart_server is not None:
                 await restart_server.shutdown()
-                async with self._lock:
-                    if self._servers.get(target) is restart_server:
-                        self._servers.pop(target, None)
-                    self._draining.discard(target)
+                async def _detach_restarted_target() -> None:
+                    async with self._lock:
+                        if self._servers.get(target) is restart_server:
+                            self._servers.pop(target, None)
+                        self._draining.discard(target)
+
+                await _settle_registry_cleanup(
+                    _detach_restarted_target()
+                )
 
             async with self._lock:
                 owner = self._thread_owners.get(thread_id)
@@ -2279,8 +2329,11 @@ class CodexAppServerRegistry:
                     )
                 self._thread_owners[thread_id] = target
         finally:
-            async with self._lock:
-                self._rebindings.pop(thread_id, None)
+            async def _release_rebinding() -> None:
+                async with self._lock:
+                    self._rebindings.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_rebinding())
 
     async def clear_thread_owner_for_recovery(
         self,
@@ -2406,8 +2459,12 @@ class CodexAppServerRegistry:
         """Release a reservation created by ``begin_home_maintenance``."""
 
         home = normalize_codex_home(codex_home)
-        async with self._lock:
-            self._draining.discard(home)
+
+        async def _release_home() -> None:
+            async with self._lock:
+                self._draining.discard(home)
+
+        await _settle_registry_cleanup(_release_home())
 
     async def shutdown_home(
         self,

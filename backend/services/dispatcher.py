@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import shutil
 import tempfile
@@ -51,6 +52,10 @@ from backend.services.task_queue import (
     TaskQueue,
     task_is_pr_review_superseded,
     task_retry_not_superseded_predicate,
+)
+from backend.services.task_skill_overrides import (
+    TEMP_SKILLS_GENERATION_KEY,
+    clear_temporary_skills_marker,
 )
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
@@ -269,6 +274,12 @@ class QueuedMessage:
     # start a new native session.  Preserve that admission fact on the exact
     # queued object if routing/slot contention requires another queue attempt.
     allow_new_session: bool = field(compare=False, default=False)
+    # Default monitor/sub-agent reports may arrive while the initial Task turn
+    # owns an active generation but has not persisted its native session id.
+    # They must wait for that session instead of starting a duplicate turn.
+    # Recovery/compaction messages intentionally starting a replacement
+    # session leave this false even though ``allow_new_session`` is true.
+    defer_for_initial_session: bool = field(compare=False, default=False)
 
 
 def _binary_available(binary: str) -> bool:
@@ -4537,10 +4548,11 @@ class GlobalDispatcher:
         lifecycle_generation: _TaskLifecycleGeneration | None = (
             self._task_lifecycle_generation(task)
         )
-        original_task_skills = dict(task.enabled_skills or {})
-        launch_skills, has_temporary_initial_skills = (
-            _initial_task_launch_skills(task)
-        )
+        original_task_skills: dict = {}
+        launch_skills: dict = {}
+        has_temporary_initial_skills = False
+        initial_skill_overrides: dict = {}
+        initial_skill_token: str | None = None
         try:
             # === Step 1: Mark in_progress ===
             await self._broadcast_task_status_generation(
@@ -4561,15 +4573,10 @@ class GlobalDispatcher:
             thinking_budget = task.thinking_budget
             effort_level = task.effort_level or settings.default_effort
             async with self.db_factory() as db:
-                claim_values: dict = {
-                    "status": "executing",
-                    "instance_id": instance_id,
-                }
-                if has_temporary_initial_skills:
-                    # The API checks Task.enabled_skills when the model calls
-                    # create_sub_agent. Publish the temporary command skill in
-                    # the same transaction as execution ownership.
-                    claim_values["enabled_skills"] = launch_skills
+                # This no-op generation UPDATE is also the Task write barrier.
+                # Refresh skills only after it succeeds: a settings save may
+                # have committed after dequeue handed us ``task`` but before
+                # this lifecycle reached its final launch claim.
                 claimed = await db.execute(
                     update(Task)
                     .where(
@@ -4591,10 +4598,62 @@ class GlobalDispatcher:
                         Task.shared_from_id.is_(None),
                         task_retry_not_superseded_predicate(),
                     )
-                    .values(**claim_values)
+                    .values(status=Task.status)
                 )
                 executing_generation = None
                 if claimed.rowcount:
+                    current = await db.get(
+                        Task,
+                        task.id,
+                        populate_existing=True,
+                    )
+                    if current is not None:
+                        original_task_skills = dict(
+                            current.enabled_skills or {}
+                        )
+                        # The command/prompt belongs to the dequeued lifecycle
+                        # generation; only its persistent skill baseline is
+                        # refreshed here.  Mixing a concurrently edited
+                        # description with the already-built lifecycle prompt
+                        # could advertise a command that this turn will not
+                        # execute (or vice versa).
+                        initial_command, _ = _initial_task_command(task)
+                        required_skills = (
+                            dict(initial_command.required_skills or {})
+                            if initial_command
+                            else {}
+                        )
+                        launch_skills = dict(original_task_skills)
+                        launch_skills.update(required_skills)
+                        has_temporary_initial_skills = (
+                            launch_skills != original_task_skills
+                        )
+                        missing_skill = object()
+                        initial_skill_overrides = {
+                            key: value
+                            for key, value in launch_skills.items()
+                            if original_task_skills.get(key, missing_skill)
+                            != value
+                        }
+                        initial_skill_token = (
+                            secrets.token_urlsafe(24)
+                            if has_temporary_initial_skills
+                            else None
+                        )
+                        current.status = "executing"
+                        current.instance_id = instance_id
+                        if has_temporary_initial_skills:
+                            # The API checks Task.enabled_skills when the model
+                            # calls create_sub_agent. Publish the temporary
+                            # command skill in the ownership transaction.
+                            current.enabled_skills = launch_skills
+                            temporary_metadata = dict(
+                                current.metadata_ or {}
+                            )
+                            temporary_metadata[
+                                TEMP_SKILLS_GENERATION_KEY
+                            ] = initial_skill_token
+                            current.metadata_ = temporary_metadata
                     executing_generation = (
                         await self._read_task_status_generation(db, task.id)
                     )
@@ -4608,8 +4667,9 @@ class GlobalDispatcher:
             lifecycle_generation = self._task_lifecycle_generation(
                 executing_generation
             )
-            if has_temporary_initial_skills:
-                task.enabled_skills = launch_skills
+            # Launch and cleanup must use the same post-barrier skill snapshot,
+            # including ordinary user saves that won the race before claim.
+            task.enabled_skills = launch_skills
             claim_validated = True
             await self._broadcast_task_status_generation(
                 executing_generation,
@@ -4976,13 +5036,52 @@ class GlobalDispatcher:
             if has_temporary_initial_skills:
                 try:
                     async with self.db_factory() as db:
-                        current = await db.get(Task, task.id)
-                        if (
-                            current is not None
-                            and dict(current.enabled_skills or {}) == launch_skills
-                        ):
-                            current.enabled_skills = original_task_skills
-                            await db.commit()
+                        guarded = await db.execute(
+                            update(Task)
+                            .where(Task.id == task.id)
+                            .values(status=Task.status)
+                        )
+                        if not guarded.rowcount:
+                            await db.rollback()
+                        else:
+                            current = await db.get(
+                                Task,
+                                task.id,
+                                populate_existing=True,
+                            )
+                            metadata = dict(
+                                current.metadata_ or {}
+                            ) if current is not None else {}
+                            if (
+                                current is None
+                                or metadata.get(
+                                    TEMP_SKILLS_GENERATION_KEY
+                                )
+                                != initial_skill_token
+                            ):
+                                await db.rollback()
+                            else:
+                                skills = dict(
+                                    current.enabled_skills or {}
+                                )
+                                missing = object()
+                                for key, temporary_value in (
+                                    initial_skill_overrides.items()
+                                ):
+                                    if (
+                                        skills.get(key, missing)
+                                        != temporary_value
+                                    ):
+                                        continue
+                                    if key in original_task_skills:
+                                        skills[key] = original_task_skills[key]
+                                    else:
+                                        skills.pop(key, None)
+                                current.enabled_skills = skills
+                                current.metadata_ = (
+                                    clear_temporary_skills_marker(metadata)
+                                )
+                                await db.commit()
                 except Exception:
                     logger.exception(
                         "Failed to restore initial command skills for task %s",
@@ -6641,14 +6740,15 @@ class GlobalDispatcher:
             return
 
         registry = self.instance_manager._ensure_codex_app_server_registry()
+        transport_removed = False
         if candidate is not None and getattr(candidate, "returncode", None) is None:
-            await registry.abort_unclaimed_turn(
+            transport_removed = bool(await registry.abort_unclaimed_turn(
                 home,
                 candidate,
                 reason=reason,
-            )
+            ))
 
-        if thread_id is not None:
+        if thread_id is not None and not transport_removed:
             await registry.delete_thread(home, thread_id)
 
         if candidate is None or getattr(candidate, "returncode", None) is not None:
@@ -7350,6 +7450,7 @@ class GlobalDispatcher:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        allow_new_session: bool | None = None,
     ):
         """Enqueue a message for the main agent of a task.
 
@@ -7362,6 +7463,9 @@ class GlobalDispatcher:
             raise RuntimeError(
                 "Dispatcher is shutting down; message admission is closed"
             )
+        internal_session_report = source.startswith(
+            ("monitor:", "sub-agent:")
+        )
         msg = QueuedMessage(
             priority=priority,
             timestamp=(
@@ -7377,6 +7481,14 @@ class GlobalDispatcher:
             monitor_session_id=monitor_session_id,
             source_log_id=source_log_id,
             current_message=prompt if current_message is None else current_message,
+            allow_new_session=(
+                internal_session_report
+                if allow_new_session is None
+                else allow_new_session
+            ),
+            defer_for_initial_session=(
+                allow_new_session is None and internal_session_report
+            ),
         )
         async with self._dispatch_claim_lock:
             if self._maintenance_shutdown_committed:
@@ -7759,6 +7871,7 @@ class GlobalDispatcher:
         cleanup_state = {
             "has_temp_skills": False,
             "original_skills": {},
+            "temporary_skill_token": None,
         }
         try:
             return await self._process_queued_message_inner(
@@ -7781,6 +7894,7 @@ class GlobalDispatcher:
                     task_id,
                     msg,
                     cleanup_state["original_skills"],
+                    cleanup_state["temporary_skill_token"],
                 )
                 cleanup_state["has_temp_skills"] = False
 
@@ -7789,21 +7903,57 @@ class GlobalDispatcher:
         task_id: int,
         msg: QueuedMessage,
         original_skills: dict,
+        temporary_skill_token: str | None,
     ) -> None:
         """Restore one-message skill overrides before queue cancellation settles."""
 
         try:
             async with self.db_factory() as db:
-                task = await db.get(Task, task_id)
+                # Acquire the Task write barrier before reading the expected
+                # temporary view.  PostgreSQL/MySQL row-lock this UPDATE and
+                # SQLite serializes the write transaction, so a concurrent
+                # config save is ordered before or after this restoration.
+                guarded = await db.execute(
+                    update(Task)
+                    .where(Task.id == task_id)
+                    .values(status=Task.status)
+                )
+                if not guarded.rowcount:
+                    await db.rollback()
+                    return
+                task = await db.get(Task, task_id, populate_existing=True)
                 if task is None:
+                    await db.rollback()
+                    return
+                metadata = dict(task.metadata_ or {})
+                if (
+                    temporary_skill_token is None
+                    or metadata.get(TEMP_SKILLS_GENERATION_KEY)
+                    != temporary_skill_token
+                ):
+                    await db.rollback()
                     return
                 current = dict(task.enabled_skills or {})
-                for key in msg.command_skills or {}:
+                missing = object()
+                changed = False
+                for key, temporary_value in (msg.command_skills or {}).items():
+                    if current.get(key, missing) != temporary_value:
+                        # This same key was changed after launch; the newer
+                        # value wins.
+                        continue
                     if key in original_skills:
-                        current[key] = original_skills[key]
+                        if current.get(key, missing) != original_skills[key]:
+                            current[key] = original_skills[key]
+                            changed = True
                     else:
                         current.pop(key, None)
-                task.enabled_skills = current
+                        changed = True
+                metadata = clear_temporary_skills_marker(metadata)
+                # Unrelated keys are intentionally retained: they may have
+                # been saved while this one-message override was running.
+                if changed:
+                    task.enabled_skills = current
+                task.metadata_ = metadata
                 await db.commit()
         except Exception:
             logger.exception(
@@ -7826,6 +7976,7 @@ class GlobalDispatcher:
         # Phase 1: read task state, find idle instance, launch process
         inst_id: int | None = None
         original_skills: dict = {}
+        temporary_skill_token: str | None = None
         queued_turn_generation: _TaskStatusGeneration | None = None
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
@@ -7882,6 +8033,18 @@ class GlobalDispatcher:
             ):
                 logger.warning(f"Task {task_id} no session, skipping queued message")
                 return
+            if (
+                not task.session_id
+                and msg.defer_for_initial_session
+                and task.status in ("in_progress", "executing")
+            ):
+                # The initial task claim is committed before its native
+                # system-init event can persist session_id.  Preserve internal
+                # monitor/sub-agent reports through that window instead of
+                # either dropping them or launching a second initial turn.
+                raise QueuedMessagePrelaunchError(
+                    f"Task {task_id} is still establishing its first session"
+                )
 
             # Recover before resuming when the session can't be resumed:
             #   - task=failed after an abnormal exit (session may still be on disk), OR
@@ -8129,12 +8292,10 @@ class GlobalDispatcher:
                 f"on instance {inst.id}"
             )
 
-            # Merge command_skills with task's enabled_skills for this launch
-            original_skills = dict(task.enabled_skills or {})
-            cleanup_state["original_skills"] = original_skills
-            effective_skills = dict(original_skills)
-            if msg.command_skills:
-                effective_skills.update(msg.command_skills)
+            # The authoritative skill snapshot is taken later, after the final
+            # Task write barrier.  This provisional value is replaced before
+            # launch and is never persisted.
+            effective_skills = dict(task.enabled_skills or {})
 
             # 上下文超阈值时自动摘要 + 新 session（无限续聊）
             if task.session_id and task.context_window_usage:
@@ -8272,19 +8433,14 @@ class GlobalDispatcher:
             instance_id_before_launch = task.instance_id
             session_id_before_launch = task.session_id
             started_at_before_launch = task.started_at
-            claim_values: dict = {
-                "status": "executing",
-                "instance_id": inst.id,
-                "completed_at": None,
-            }
-            if msg.command_skills:
-                # The skill view becomes visible atomically with launch
-                # ownership, before the process can make its first MCP call.
-                claim_values["enabled_skills"] = effective_skills
             # The exact status/owner transition is the maintenance admission
             # commit point. A paused updater either observes this executing
             # generation or prevents the launch before the CAS is committed.
             async with self.task_start_guard():
+                # Acquire the Task write barrier without publishing execution
+                # yet.  A concurrent settings save that committed before this
+                # point is then visible to the refresh below; one that starts
+                # later waits and clears our marker after commit.
                 status_claim = await db.execute(
                     update(Task)
                     .where(
@@ -8315,7 +8471,7 @@ class GlobalDispatcher:
                         Task.shared_from_id.is_(None),
                         task_retry_not_superseded_predicate(),
                     )
-                    .values(**claim_values)
+                    .values(status=Task.status)
                 )
                 if not status_claim.rowcount:
                     await db.rollback()
@@ -8340,6 +8496,41 @@ class GlobalDispatcher:
                         "Queued task ownership changed before launch; preserving "
                         "the exact message for retry"
                     )
+                current = await db.get(
+                    Task,
+                    task_id,
+                    populate_existing=True,
+                )
+                if current is None:
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Queued task disappeared after launch barrier"
+                    )
+                task = current
+                original_skills = dict(task.enabled_skills or {})
+                cleanup_state["original_skills"] = original_skills
+                effective_skills = dict(original_skills)
+                if msg.command_skills:
+                    effective_skills.update(msg.command_skills)
+                    temporary_skill_token = secrets.token_urlsafe(24)
+                    cleanup_state["temporary_skill_token"] = (
+                        temporary_skill_token
+                    )
+                launch_kwargs["enabled_skills"] = effective_skills
+
+                task.status = "executing"
+                task.instance_id = inst.id
+                task.completed_at = None
+                if msg.command_skills:
+                    # The skill view becomes visible atomically with launch
+                    # ownership, before the process can make its first MCP
+                    # call.
+                    task.enabled_skills = effective_skills
+                    temporary_metadata = dict(task.metadata_ or {})
+                    temporary_metadata[TEMP_SKILLS_GENERATION_KEY] = (
+                        temporary_skill_token
+                    )
+                    task.metadata_ = temporary_metadata
                 queued_turn_generation = (
                     await self._read_task_status_generation(db, task_id)
                 )
@@ -8425,9 +8616,6 @@ class GlobalDispatcher:
                             f"started: {exc}"
                         )[:2000],
                     )
-                if cleanup_state["has_temp_skills"]:
-                    rollback_values["enabled_skills"] = dict(original_skills)
-                    cleanup_state["has_temp_skills"] = False
                 restored = await db.execute(
                     update(Task)
                     .where(

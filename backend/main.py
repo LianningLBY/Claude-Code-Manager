@@ -457,6 +457,23 @@ async def _shutdown_runtime_services(
             failures.append(exc)
             logger.exception("Background task shutdown failed")
 
+    # Discussion agents are independent subprocess trees and are not owned by
+    # Dispatcher/InstanceManager.  Stop them explicitly before the remaining
+    # process supervisors are dismantled.
+    try:
+        from backend.api import discussions as discussions_api
+
+        discussion_svc = getattr(
+            discussions_api,
+            "_discussion_service",
+            None,
+        )
+        if discussion_svc is not None:
+            await discussion_svc.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Discussion service shutdown failed")
+
     # Legacy Ralph loops are independent dequeue producers. Stop them before
     # Dispatcher takes its final InstanceManager generation snapshot.
     try:
@@ -510,7 +527,7 @@ async def _shutdown_runtime_services(
             )
 
     try:
-        sub_agent_watcher.stop()
+        await sub_agent_watcher.shutdown()
     except BaseException as exc:
         failures.append(exc)
         logger.exception("Sub-agent watcher shutdown failed")
@@ -590,20 +607,9 @@ async def _runtime_lifespan(app: FastAPI):
 
     if not deployment_start.skip_mutations:
         await init_db()
-    # Create default admin on first startup
-    from backend.models.user import User
-    from backend.api.auth import _hash_password
-    async with async_session() as db:
-        result = await db.execute(select(User))
-        if result.scalars().first() is None:
-            db.add(User(
-                email="admin@apexin.ai",
-                name="Admin",
-                password_hash=_hash_password("admin123456"),
-                role="super_admin",
-            ))
-            await db.commit()
-            logger.info("Default admin account created: admin@apexin.ai")
+    # Do not seed a shared/default administrator credential.  The registration
+    # endpoint promotes the first real user to super_admin, while AUTH_TOKEN
+    # remains the bootstrap administrator path for single-token deployments.
     # Build Docker sandbox image if Docker is available (for shared project isolation)
     try:
         from backend.services.container_manager import ContainerManager, build_sandbox_image

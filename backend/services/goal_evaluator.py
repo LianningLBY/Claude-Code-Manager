@@ -596,10 +596,16 @@ Respond with ONLY the JSON object, nothing else."""
 
             try:
                 data = json.loads(cleaned)
-                if isinstance(data, dict) and "achieved" in data:
+                if (
+                    isinstance(data, dict)
+                    and isinstance(data.get("achieved"), bool)
+                ):
+                    reason = data.get("reason", "")
+                    if not isinstance(reason, str):
+                        reason = str(reason)
                     return GoalEvalResult(
-                        achieved=bool(data["achieved"]),
-                        reason=data.get("reason", ""),
+                        achieved=data["achieved"],
+                        reason=reason,
                     )
             except (json.JSONDecodeError, TypeError):
                 pass

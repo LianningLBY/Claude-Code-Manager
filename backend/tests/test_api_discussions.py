@@ -1,6 +1,6 @@
 """Tests for Discussion API endpoints."""
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from datetime import datetime
 
 from backend.models.discussion import Discussion, DiscussionAgent, DiscussionMessage
@@ -163,25 +163,50 @@ async def test_stop_running_agent_calls_service(client, session_factory):
 
 @pytest.mark.asyncio
 async def test_stop_agent_service_sigint_then_wait():
-    """stop_agent sends SIGINT, waits, process exits cleanly."""
+    """stop_agent signals the exact process group and proves it exited."""
     from backend.services.discussion_service import DiscussionService
+    import signal
 
     mock_broadcaster = MagicMock()
     svc = DiscussionService(db_factory=AsyncMock(), broadcaster=mock_broadcaster)
 
     mock_proc = AsyncMock()
     mock_proc.returncode = None
+    mock_proc.pid = 4242
     mock_proc.send_signal = MagicMock()
 
-    wait_future = AsyncMock()
-    mock_proc.wait = wait_future
+    async def wait_for_exit():
+        mock_proc.returncode = 0
+        return 0
+
+    mock_proc.wait = AsyncMock(side_effect=wait_for_exit)
 
     svc._processes[42] = mock_proc
-    await svc.stop_agent(42)
+    process_group_signalled = False
 
-    mock_proc.send_signal.assert_called_once()
-    import signal
-    assert mock_proc.send_signal.call_args[0][0] == signal.SIGINT
+    def fake_killpg(pgid, sig):
+        nonlocal process_group_signalled
+        assert pgid == 4242
+        if sig == 0:
+            if process_group_signalled:
+                raise ProcessLookupError
+            return
+        assert sig == signal.SIGINT
+        process_group_signalled = True
+
+    with patch(
+        "backend.services.discussion_service.os.killpg",
+        side_effect=fake_killpg,
+    ) as killpg:
+        await svc.stop_agent(42)
+
+    killpg.assert_any_call(4242, signal.SIGINT)
+    assert [
+        call
+        for call in killpg.call_args_list
+        if call.args[1] != 0
+    ] == [call(4242, signal.SIGINT)]
+    mock_proc.send_signal.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -195,16 +220,23 @@ async def test_stop_agent_service_no_process():
 
 @pytest.mark.asyncio
 async def test_stop_agent_service_already_exited():
-    """stop_agent with already-exited process is a no-op."""
+    """A reaped leader with no live descendants is a no-op."""
     from backend.services.discussion_service import DiscussionService
 
     svc = DiscussionService(db_factory=AsyncMock(), broadcaster=MagicMock())
 
     mock_proc = MagicMock()
     mock_proc.returncode = 0
+    mock_proc.pid = 4242
     svc._processes[42] = mock_proc
 
-    await svc.stop_agent(42)
+    with patch(
+        "backend.services.discussion_service.os.killpg",
+        side_effect=ProcessLookupError,
+    ) as killpg:
+        await svc.stop_agent(42)
+
+    killpg.assert_called_once_with(4242, 0)
     mock_proc.send_signal.assert_not_called()
 
 

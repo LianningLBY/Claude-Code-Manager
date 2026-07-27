@@ -21,6 +21,9 @@ from backend.schemas.task import (
     TaskUpdate,
 )
 from backend.services.task_queue import TaskQueue, task_delete_fence
+from backend.services.task_skill_overrides import (
+    clear_temporary_skills_marker,
+)
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
     _finish_despite_cancellation as _finish_task_operation,
@@ -37,7 +40,16 @@ from backend.services.worker_relay import (
     worker_task_generation_predicates,
 )
 from backend.services.worker_proxy import get_task_operation_lock
-from backend.api.deps import get_current_user_id, get_current_user_role, require_task_access, require_admin
+from backend.api.deps import (
+    get_current_user_id,
+    get_current_user_role,
+    is_admin,
+    require_admin,
+    require_project_access,
+    require_task_access,
+    require_task_control,
+    require_worker_target_access,
+)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 _MANUAL_RETRYABLE_STATUSES = frozenset(
@@ -233,35 +245,36 @@ async def list_tasks(
 @router.post("", response_model=TaskResponse, status_code=201)
 async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     user_id = get_current_user_id(request)
-    user_role = get_current_user_role(request)
-    if user_role not in ("admin", "super_admin") and user_id:
-        from backend.models.worker import Worker
-        from backend.models.team_share import TeamProjectShare
-        from backend.models.user_group import UserGroupMember
-        has_worker = (await db.execute(
-            select(Worker.id).where(Worker.owner_user_id == user_id).limit(1)
-        )).scalar_one_or_none()
-        project_id = body.project_id if hasattr(body, 'project_id') else None
-        has_project = False
-        if project_id:
-            user_group_ids = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
-            has_project = (await db.execute(
-                select(TeamProjectShare.id).where(
-                    TeamProjectShare.project_id == project_id,
-                    ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == user_id))
-                    | ((TeamProjectShare.target_type == "group") & TeamProjectShare.target_id.in_(user_group_ids))
-                ).limit(1)
-            )).scalar_one_or_none() is not None
-        if not has_worker and not has_project:
-            raise HTTPException(403, "You need a Worker or Project access to create Tasks")
+    if body.secret_ids:
+        require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
-    # Task inherits worker_id from its Project
-    if data.get("project_id") and not data.get("worker_id"):
-        from backend.models.project import Project as _Proj
-        _proj = await db.get(_Proj, data["project_id"])
-        if _proj and _proj.worker_id:
-            data["worker_id"] = _proj.worker_id
+
+    # Resolve the exact execution target before persisting anything.  A member
+    # owning Worker A must not be able to name Worker B (or the Manager) merely
+    # because some Worker exists in their account.
+    project = None
+    if body.project_id is not None:
+        from backend.models.project import Project
+
+        project = await db.get(Project, body.project_id)
+        if project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, project.id, db)
+        if (
+            body.worker_id is not None
+            and body.worker_id != project.worker_id
+        ):
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+        data["worker_id"] = project.worker_id
+
+    target_worker_id = data.get("worker_id")
+    if project is None:
+        await require_worker_target_access(request, target_worker_id, db)
+
     if data.get("id") is None:
         data.pop("id", None)  # 未指定 → 正常自增；指定 → 用 Manager 分配的全局 ID
     image_paths = data.pop("image_paths", None)
@@ -281,6 +294,10 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         data["metadata_"] = meta
 
     if clone_from_task_id:
+        source = await db.get(Task, clone_from_task_id)
+        if source is None:
+            raise HTTPException(404, "Clone source task not found")
+        await require_task_control(request, source, db)
         cloned = await _clone_session(clone_from_task_id, db)
         if cloned:
             data["session_id"] = cloned["session_id"]
@@ -411,14 +428,38 @@ async def get_task(task_id: int, request: Request, queue: TaskQueue = Depends(_g
 async def update_task(
     task_id: int, body: TaskUpdate, request: Request, queue: TaskQueue = Depends(_get_queue)
 ):
-    # Permission: only creator or admin can modify task config
-    user_id = get_current_user_id(request)
-    user_role = get_current_user_role(request)
-    if user_role not in ("admin", "super_admin"):
-        task = await queue.get(task_id)
-        if task and task.created_by != user_id:
-            raise HTTPException(403, "Only the task creator or admin can modify task config")
+    task = await queue.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, queue.db)
     updates = body.model_dump(exclude_unset=True)
+    if "enabled_skills" in updates:
+        # An explicit save is authoritative even when its JSON happens to equal
+        # a currently active one-turn override. Clearing the generation marker
+        # lets lifecycle cleanup distinguish that user write from its own
+        # temporary value.
+        updates["metadata_"] = clear_temporary_skills_marker(task.metadata_)
+
+    target_project = None
+    target_project_id = updates.get("project_id", task.project_id)
+    if target_project_id is not None:
+        from backend.models.project import Project
+
+        target_project = await queue.db.get(Project, target_project_id)
+        if target_project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, target_project_id, queue.db)
+        if (
+            "project_id" in updates
+            and "worker_id" not in updates
+            and task.worker_id != target_project.worker_id
+        ):
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+    elif "project_id" in updates and "worker_id" not in updates:
+        await require_worker_target_access(request, task.worker_id, queue.db)
 
     # 执行位置切换走 TaskMigrator（同 mode/model 一样在 task 详情改，
     # 但语义是迁移而非改字段）。-1 = 切回本机
@@ -426,9 +467,13 @@ async def update_task(
         target = updates.pop("worker_id")
         if target == -1:
             target = None
-        task = await queue.get(task_id)
-        if not task:
-            raise HTTPException(404, "Task not found")
+        if target_project is not None and target != target_project.worker_id:
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+        if target_project is None:
+            await require_worker_target_access(request, target, queue.db)
         if task.worker_id != target:
             from backend.main import task_migrator
             if task_migrator is None:
@@ -444,7 +489,8 @@ async def update_task(
             # 还缓存着旧 worker_id，必须 expire 否则响应返回迁移前的值
             queue.db.expire_all()
 
-    # "off" sentinel → None (exclude_unset can't distinguish None from unset)
+    # "off" sentinel → explicit NULL. model_dump(exclude_unset=True) has
+    # already removed fields that were not part of this PATCH-like request.
     if updates.get("system_prompt_mode") == "off":
         updates["system_prompt_mode"] = None
 
@@ -712,7 +758,7 @@ async def _retry_local_task_safely(
 async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     from backend.main import instance_manager, task_migrator, worker_proxy
 
     if task is None:
@@ -748,7 +794,7 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
             worker_task = await db.get(Task, task_id)
             if worker_task is None:
                 raise HTTPException(404, "Task not found")
-            await require_task_access(request, worker_task, db)
+            await require_task_control(request, worker_task, db)
             if worker_task.worker_id is None:
                 raise HTTPException(
                     409,
@@ -983,7 +1029,7 @@ async def terminate_task_generation(
 
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     if task is None:
         raise HTTPException(404, "Task not found")
     metadata_marker = type((task.metadata_ or {}).get("pr_review_id")) is int
@@ -1226,7 +1272,7 @@ async def stop_task_session(
 
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     wt = await _worker_task_or_none(db, task_id)
     if wt is not None:
         return await _proxy(wt, "POST", f"/api/tasks/{task_id}/stop-session")
@@ -1424,7 +1470,7 @@ async def cancel_task(
 ):
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     wt = await _worker_task_or_none(db, task_id)
     if wt is not None:
         observed = worker_task_generation(wt)
@@ -1447,7 +1493,7 @@ async def cancel_task(
 async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     # The operation lock is shared with TaskMigrator.  Keep it through the
     # remote response CAS/local retry commit and status publication, otherwise
     # migration can copy an old generation while retry is still in flight.
@@ -1457,7 +1503,7 @@ async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(
         current = await db.get(Task, task_id)
         if current is None:
             raise HTTPException(404, "Task not found")
-        await require_task_access(request, current, db)
+        await require_task_control(request, current, db)
         if current.status not in _MANUAL_RETRYABLE_STATUSES:
             raise HTTPException(
                 409,
@@ -1508,7 +1554,7 @@ async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(
 async def star_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     task = await queue.star(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -1519,7 +1565,7 @@ async def star_task(task_id: int, request: Request, queue: TaskQueue = Depends(_
 async def mark_task_read(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     task = await queue.update_task(task_id, has_unread=False)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -1530,7 +1576,7 @@ async def mark_task_read(task_id: int, request: Request, queue: TaskQueue = Depe
 async def mark_task_unread(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     task = await queue.update_task(task_id, has_unread=True)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -1541,7 +1587,7 @@ async def mark_task_unread(task_id: int, request: Request, queue: TaskQueue = De
 async def archive_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     task = await db.get(Task, task_id)
     if task:
-        await require_task_access(request, task, db)
+        await require_task_control(request, task, db)
     task = await queue.archive(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -1549,8 +1595,15 @@ async def archive_task(task_id: int, request: Request, queue: TaskQueue = Depend
 
 
 @router.get("/queue/next", response_model=list[TaskResponse])
-async def get_queue(queue: TaskQueue = Depends(_get_queue)):
-    return await queue.list_tasks(status="pending")
+async def get_queue(
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    user_id = get_current_user_id(request)
+    return await queue.list_tasks(
+        status="pending",
+        user_id=None if is_admin(request) else user_id,
+    )
 
 
 @router.post("/{task_id}/plan/approve", response_model=TaskResponse)
@@ -1559,14 +1612,14 @@ async def approve_plan(task_id: int, request: Request, queue: TaskQueue = Depend
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     await db.rollback()
     async with get_task_operation_lock(task_id):
         db.expire_all()
         current = await db.get(Task, task_id)
         if current is None:
             raise HTTPException(404, "Task not found")
-        await require_task_access(request, current, db)
+        await require_task_control(request, current, db)
         if current.mode != "plan" or current.status != "plan_review":
             raise HTTPException(400, "Task is not in plan review state")
 
@@ -1621,14 +1674,14 @@ async def reject_plan(task_id: int, request: Request, queue: TaskQueue = Depends
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     await db.rollback()
     async with get_task_operation_lock(task_id):
         db.expire_all()
         current = await db.get(Task, task_id)
         if current is None:
             raise HTTPException(404, "Task not found")
-        await require_task_access(request, current, db)
+        await require_task_control(request, current, db)
         if current.mode != "plan" or current.status != "plan_review":
             raise HTTPException(400, "Task is not in plan review state")
 

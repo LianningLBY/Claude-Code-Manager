@@ -4,6 +4,8 @@ from datetime import datetime
 
 from sqlalchemy import Float, case, delete as sa_delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.functions import FunctionElement
 
 from backend.config import settings
 from backend.models.instance import Instance
@@ -12,6 +14,37 @@ from backend.models.task import Task
 
 
 PR_REVIEW_SUPERSEDED_METADATA_KEY = "pr_review_superseded"
+
+
+class _UnixTimestamp(FunctionElement):
+    """Cross-dialect epoch conversion used by the mixed manual/time sort key."""
+
+    type = Float()
+    inherit_cache = True
+
+
+@compiles(_UnixTimestamp, "sqlite")
+def _compile_unix_timestamp_sqlite(element, compiler, **kw):
+    value = compiler.process(list(element.clauses)[0], **kw)
+    return f"CAST(strftime('%s', {value}) AS FLOAT)"
+
+
+@compiles(_UnixTimestamp, "postgresql")
+def _compile_unix_timestamp_postgresql(element, compiler, **kw):
+    value = compiler.process(list(element.clauses)[0], **kw)
+    return f"EXTRACT(EPOCH FROM {value})"
+
+
+@compiles(_UnixTimestamp, "mysql")
+def _compile_unix_timestamp_mysql(element, compiler, **kw):
+    value = compiler.process(list(element.clauses)[0], **kw)
+    return f"UNIX_TIMESTAMP({value})"
+
+
+@compiles(_UnixTimestamp)
+def _compile_unix_timestamp_default(element, compiler, **kw):
+    value = compiler.process(list(element.clauses)[0], **kw)
+    return f"EXTRACT(EPOCH FROM {value})"
 
 
 def task_retry_not_superseded_predicate():
@@ -142,10 +175,12 @@ def _effective_key_expr(auto_sort_on_access: bool = True):
     auto_sort_on_access=False: COALESCE(sort_order, ts(created_at))
     """
     if auto_sort_on_access:
-        fallback = func.strftime("%s", func.coalesce(Task.last_accessed_at, Task.created_at))
+        fallback = _UnixTimestamp(
+            func.coalesce(Task.last_accessed_at, Task.created_at)
+        )
     else:
-        fallback = func.strftime("%s", Task.created_at)
-    return func.coalesce(Task.sort_order, func.cast(fallback, Float))
+        fallback = _UnixTimestamp(Task.created_at)
+    return func.coalesce(Task.sort_order, fallback)
 
 
 class TaskQueue:
@@ -298,8 +333,20 @@ class TaskQueue:
         if not task:
             return None
         for key, value in kwargs.items():
-            if value is not None:
-                setattr(task, key, value)
+            if value is None:
+                mapped_attr = getattr(Task, key, None)
+                columns = getattr(
+                    getattr(mapped_attr, "property", None),
+                    "columns",
+                    (),
+                )
+                # Patch schemas use Optional both for "not supplied" and for
+                # genuinely nullable fields.  The API has already removed
+                # fields that were not supplied, so preserve explicit NULL only
+                # when the mapped column permits it.
+                if not columns or not columns[0].nullable:
+                    continue
+            setattr(task, key, value)
         await self.db.commit()
         await self.db.refresh(task)
         return task

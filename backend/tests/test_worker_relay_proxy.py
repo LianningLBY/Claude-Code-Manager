@@ -42,6 +42,58 @@ def relay(db_factory, broadcaster):
     return r
 
 
+async def test_concurrent_worker_connection_admission_creates_one_transport(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    sockets = []
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        async def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            self.closed = True
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+
+    async def connect(*_args, **_kwargs):
+        socket = FakeWebSocket()
+        sockets.append(socket)
+        entered.set()
+        await release.wait()
+        return socket
+
+    monkeypatch.setattr(
+        worker_relay_module.websockets,
+        "connect",
+        connect,
+    )
+    first = asyncio.create_task(relay.ensure_connection(worker))
+    await entered.wait()
+    second = asyncio.create_task(relay.ensure_connection(worker))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert len(sockets) == 1
+    assert relay._ws[worker.id] is sockets[0]
+    assert len(relay._loops) == 1
+    await relay.stop_worker(worker.id)
+
+
 async def _mk_worker(session_factory, **fields) -> Worker:
     fields.setdefault("status", "ready")
     fields.setdefault("private_ip", "10.0.0.9")
@@ -830,6 +882,35 @@ async def test_reconnect_exhaustion_fails_only_exact_generation_and_publishes(
     ]
 
 
+async def test_reconnect_snapshot_does_not_pop_new_connection_tasks(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    old_task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="executing",
+    )
+    new_task_ids = {999_001}
+    relay._tasks[worker.id] = new_task_ids
+    relay._ws[worker.id] = object()
+    relay.ensure_connection = AsyncMock()
+    relay.subscribe_task = AsyncMock()
+    relay._backfill_missing_logs = AsyncMock()
+    monkeypatch.setattr(
+        worker_relay_module.asyncio,
+        "sleep",
+        AsyncMock(),
+    )
+
+    await relay._reconnect(worker, {old_task.id})
+
+    assert relay._tasks[worker.id] is new_task_ids
+    relay.subscribe_task.assert_awaited_once()
+
+
 # === Dispatcher 双路径 ===
 
 
@@ -1320,6 +1401,7 @@ async def test_generic_worker_proxy_hides_other_upstream_error_bodies(
 
 
 async def test_create_task_with_worker_id_and_explicit_id(client, session_factory):
+    await _mk_worker(session_factory, id=3)
     resp = await client.post("/api/tasks", json={
         "id": 4242, "worker_id": 3, "title": "x", "description": "remote",
     })

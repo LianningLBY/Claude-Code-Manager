@@ -37,6 +37,21 @@ export function newSortFor(list: Task[], fromIdx: number, toIdx: number, autoSor
   return Date.now() / 1000;
 }
 
+/**
+ * Apply an optimistic order to the matching slots of a possibly smaller local
+ * page. Server-wide search results may contain tasks that are absent from that
+ * page; those entries must never be substituted for an unrelated local row.
+ */
+export function mergeVisibleTaskOrder(current: Task[], optimistic: Task[]): Task[] {
+  const currentIds = new Set(current.map((task) => task.id));
+  const visibleInCurrent = optimistic.filter((task) => currentIds.has(task.id));
+  const visibleIds = new Set(visibleInCurrent.map((task) => task.id));
+  let visibleIndex = 0;
+  return current.map((task) =>
+    visibleIds.has(task.id) ? visibleInCurrent[visibleIndex++] : task
+  );
+}
+
 /** 同 starred 分组内的下标范围（标星置顶逻辑：不允许跨组拖动）。 */
 function groupRange(list: Task[], idx: number): [number, number] {
   const starred = list[idx]?.starred ?? false;
@@ -49,6 +64,14 @@ function groupRange(list: Task[], idx: number): [number, number] {
     if ((list[i].starred ?? false) === starred) { end = i; break; }
   }
   return [start, end];
+}
+
+/** 将目标行的上/下半区映射为该行之前/之后的插入槽位。 */
+function insertionSlot(target: Element, idx: number, clientY: number): number {
+  const rect = target.getBoundingClientRect();
+  // jsdom 等无布局环境会返回零高；此时沿用历史语义（插到目标行前）。
+  if (rect.height <= 0 || !Number.isFinite(clientY)) return idx;
+  return clientY >= rect.top + rect.height / 2 ? idx + 1 : idx;
 }
 
 interface ReorderApi {
@@ -96,17 +119,22 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
     const fromIdx = list.findIndex((t) => t.id === fromId);
     if (fromIdx < 0) return;
     const [gs, ge] = groupRange(list, fromIdx);
-    const toIdx = Math.min(Math.max(toIdxRaw, gs), ge);
+    // Drop positions are insertion slots in the pre-removal list. A group
+    // spanning rows gs..ge therefore owns slots gs..ge+1.
+    const targetSlot = Math.min(Math.max(toIdxRaw, gs), ge + 1);
+    // newSortFor and Array.splice both expect the index after removing the item.
+    const toIdx = targetSlot > fromIdx ? targetSlot - 1 : targetSlot;
     if (toIdx === fromIdx) return;
     const sort = newSortFor(list, fromIdx, toIdx, autoSortRef.current);
     // Optimistic: reorder locally first for instant feedback
     const reordered = [...list];
     const [moved] = reordered.splice(fromIdx, 1);
-    reordered.splice(toIdx > fromIdx ? toIdx - 1 : toIdx, 0, moved);
+    reordered.splice(toIdx, 0, moved);
     onReordered(reordered);
     try {
       await api.updateTask(fromId, { sort_order: sort });
-    } catch { /* keep optimistic order */ }
+    } catch { /* the authoritative refresh below restores the server order */ }
+    onReordered();
   }, [onReordered]);
 
   const endDrag = useCallback((commitDrop: boolean) => {
@@ -133,7 +161,7 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
       const item = el?.closest('[data-reorder-idx]');
       if (item) {
         const idx = Number(item.getAttribute('data-reorder-idx'));
-        overRef.current = idx;
+        overRef.current = insertionSlot(item, idx, e.clientY);
         setOverIndex(idx);
       }
     };
@@ -159,7 +187,7 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
       const item = el?.closest('[data-reorder-idx]');
       if (item) {
         const idx = Number(item.getAttribute('data-reorder-idx'));
-        overRef.current = idx;
+        overRef.current = insertionSlot(item, idx, touch.clientY);
         setOverIndex(idx);
       }
     };
@@ -175,7 +203,7 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
     };
   }, [draggingId, endDrag]);
 
-  const handleProps = useCallback((t: Task, _idx: number) => ({
+  const handleProps = useCallback((t: Task) => ({
     draggable: true,
     onDragStart: (e: React.DragEvent) => {
       e.dataTransfer.effectAllowed = 'move';
@@ -191,12 +219,12 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
     onDragOver: (e: React.DragEvent) => {
       if (dragRef.current == null) return;
       e.preventDefault();
-      overRef.current = idx;
+      overRef.current = insertionSlot(e.currentTarget, idx, e.clientY);
       setOverIndex(idx);
     },
     onDrop: (e: React.DragEvent) => {
       e.preventDefault();
-      overRef.current = idx;
+      overRef.current = insertionSlot(e.currentTarget, idx, e.clientY);
       endDrag(true);
     },
     // 移动端长按激活
@@ -256,7 +284,7 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
 
   const itemProps = useCallback((t: Task, idx: number) => ({
     ...targetProps(t, idx),
-    ...handleProps(t, idx),
+    ...handleProps(t),
   }), [targetProps, handleProps]);
 
   return { draggingId, overIndex, itemProps, targetProps, handleProps, pointerHandleProps, ghost };

@@ -240,11 +240,7 @@ export default function TeamPage() {
                         const label = newRole === 'admin' ? '管理员' : '普通用户';
                         if (!confirm(`将 ${u.name} 设为${label}？`)) return;
                         try {
-                          await fetch(`/api/team/users/${u.id}/role`, {
-                            method: 'PUT',
-                            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('cc_token')}` },
-                            body: JSON.stringify({ role: newRole }),
-                          });
+                          await api.updateTeamUserRole(u.id, newRole);
                           fetchAll();
                         } catch {}
                       }}

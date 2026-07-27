@@ -31,25 +31,29 @@ export function clearServerUrl() {
 }
 
 export function getApiBase(): string {
-  if (!isCapacitor()) return '';
+  // A manually configured server is authoritative on both web and Capacitor.
+  // This keeps the login probe, subsequent API calls, assets, and WebSocket on
+  // the same origin instead of authenticating against one CCM and using another.
   return getServerUrl();
 }
 
 /** 后端返回的资源相对路径（如 /api/uploads/x.png）在 Capacitor App 里
  *  会相对 capacitor://localhost 解析而 404 —— 统一经此拼上远程服务器地址。
- *  Web 端 getApiBase() 为空串，原样返回。 */
+ *  Web 端未配置远程地址时 getApiBase() 为空串，仍保持同源。 */
 export function resolveAssetUrl(url: string): string {
   return url.startsWith('/') ? `${getApiBase()}${url}` : url;
 }
 
 export function getWsUrl(): string {
+  const server = getServerUrl();
+  if (server) {
+    const wsProtocol = server.startsWith('https') ? 'wss:' : 'ws:';
+    const host = server.replace(/^https?:\/\//, '');
+    return `${wsProtocol}//${host}/ws`;
+  }
   if (!isCapacitor()) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${protocol}//${window.location.host}/ws`;
   }
-  const server = getServerUrl();
-  if (!server) return '';
-  const wsProtocol = server.startsWith('https') ? 'wss:' : 'ws:';
-  const host = server.replace(/^https?:\/\//, '');
-  return `${wsProtocol}//${host}/ws`;
+  return '';
 }

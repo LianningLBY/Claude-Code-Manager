@@ -217,10 +217,10 @@ class TestParseResponse:
         assert result.achieved is False
 
     def test_achieved_false_string(self):
-        raw = json.dumps({"achieved": False, "reason": "lint errors remain"})
+        raw = json.dumps({"achieved": "false", "reason": "lint errors remain"})
         result = self.evaluator._parse_response(raw)
         assert result.achieved is False
-        assert result.reason == "lint errors remain"
+        assert "Could not parse" in result.reason
 
     def test_missing_reason_field(self):
         raw = json.dumps({"achieved": True})

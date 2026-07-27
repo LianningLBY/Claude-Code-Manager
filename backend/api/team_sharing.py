@@ -1,16 +1,17 @@
 """Team CCM sharing API — share Projects/Tasks to users/groups."""
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.models.team_share import TeamProjectShare, TeamTaskShare
-from backend.models.task import Task
 from backend.models.project import Project
+from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.api.deps import get_current_user_id, get_current_user_role
 
@@ -20,35 +21,47 @@ router = APIRouter(prefix="/api/team", tags=["team-sharing"])
 
 
 class ShareBody(BaseModel):
-    target_type: str = "user"  # 'user' | 'group'
-    target_id: int
-    permission: str = "chat"
+    target_type: Literal["user", "group"] = "user"
+    target_id: int = Field(gt=0)
+    permission: Literal["chat"] = "chat"
 
 
 class UnshareBody(BaseModel):
-    target_type: str = "user"
-    target_id: int
+    target_type: Literal["user", "group"] = "user"
+    target_id: int = Field(gt=0)
+
+
+async def _require_share_target(
+    target_type: Literal["user", "group"],
+    target_id: int,
+    db: AsyncSession,
+) -> None:
+    if target_type == "user":
+        from backend.models.user import User
+
+        target = await db.get(User, target_id)
+    else:
+        from backend.models.user_group import UserGroup
+
+        target = await db.get(UserGroup, target_id)
+    if target is None or (
+        target_type == "user"
+        and not getattr(target, "is_active", False)
+    ):
+        raise HTTPException(404, "Share target not found")
 
 
 async def _can_share_project(user_id: int | None, user_role: str, project_id: int, db: AsyncSession) -> bool:
     """Admin can share any project. Worker owner can share projects on their worker."""
+    project = await db.get(Project, project_id)
+    if project is None:
+        return False
     if user_role in ("admin", "super_admin"):
         return True
-    if not user_id:
+    if not user_id or project.worker_id is None:
         return False
-    owned_worker_ids = await db.execute(
-        select(Worker.id).where(Worker.owner_user_id == user_id)
-    )
-    worker_ids = [w for w in owned_worker_ids.scalars().all()]
-    if not worker_ids:
-        return False
-    has_task = await db.execute(
-        select(Task.id).where(
-            Task.project_id == project_id,
-            Task.worker_id.in_(worker_ids),
-        ).limit(1)
-    )
-    return has_task.scalar_one_or_none() is not None
+    worker = await db.get(Worker, project.worker_id)
+    return bool(worker and worker.owner_user_id == user_id)
 
 
 async def _can_share_task(user_id: int | None, user_role: str, task: Task, db: AsyncSession) -> bool:
@@ -66,8 +79,11 @@ async def _can_share_task(user_id: int | None, user_role: str, task: Task, db: A
 async def share_project(project_id: int, body: ShareBody, request: Request, db: AsyncSession = Depends(get_db)):
     user_id = get_current_user_id(request)
     user_role = get_current_user_role(request)
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to share this project")
+    await _require_share_target(body.target_type, body.target_id, db)
     existing = await db.execute(
         select(TeamProjectShare).where(
             TeamProjectShare.project_id == project_id,
@@ -107,6 +123,8 @@ async def share_project(project_id: int, body: ShareBody, request: Request, db: 
 async def unshare_project(project_id: int, body: UnshareBody, request: Request, db: AsyncSession = Depends(get_db)):
     user_id = get_current_user_id(request)
     user_role = get_current_user_role(request)
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to manage this project's sharing")
     await db.execute(
@@ -140,6 +158,8 @@ async def unshare_project(project_id: int, body: UnshareBody, request: Request, 
 async def list_project_shares(project_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     user_id = get_current_user_id(request)
     user_role = get_current_user_role(request)
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to view this project's shares")
     result = await db.execute(
@@ -161,6 +181,7 @@ async def share_task(task_id: int, body: ShareBody, request: Request, db: AsyncS
         raise HTTPException(404, "Task not found")
     if not await _can_share_task(user_id, user_role, task, db):
         raise HTTPException(403, "No permission to share this task")
+    await _require_share_target(body.target_type, body.target_id, db)
     # Verify target has Project access
     if task.project_id:
         proj_share = await db.execute(

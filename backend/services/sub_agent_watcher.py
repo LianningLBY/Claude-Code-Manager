@@ -42,8 +42,20 @@ class SubAgentWatcher:
             logger.info("SubAgentWatcher started")
 
     def stop(self):
+        """Request shutdown without waiting (legacy compatibility)."""
         if self._task and not self._task.done():
             self._task.cancel()
+
+    async def shutdown(self):
+        """Cancel and await the poller so it cannot outlive app shutdown."""
+        task = self._task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if self._task is task:
+            self._task = None
 
     async def _poll_loop(self):
         while True:
@@ -63,23 +75,25 @@ class SubAgentWatcher:
 
         async with self.db_factory() as db:
             result = await db.execute(
-                select(SubAgentSession).where(
+                select(SubAgentSession, Task.session_id)
+                .join(Task, Task.id == SubAgentSession.task_id)
+                .where(
                     SubAgentSession.source == "native",
                     SubAgentSession.status == "running",
                     SubAgentSession.agent_type.in_(["native-agent", "native-monitor"]),
                 )
             )
-            running = result.scalars().all()
+            running = result.all()
 
         if not running:
             self._tracked.clear()
             return
 
-        for sa in running:
+        for sa, task_session_id in running:
             sid = sa.id
             if sid not in self._tracked:
                 # Resolve transcript path from meta
-                info = self._resolve_paths(sa)
+                info = self._resolve_paths(sa, task_session_id)
                 if not info:
                     continue
                 self._tracked[sid] = {
@@ -148,17 +162,84 @@ class SubAgentWatcher:
                 else:
                     idle_secs = (datetime.utcnow() - tracked["idle_since"]).total_seconds()
                     if idle_secs >= IDLE_THRESHOLD:
-                        # Check if the process is still alive
-                        if not self._process_alive(tracked["agent_id"], sa.task_id):
+                        # Silence is not proof of exit: a live agent can spend
+                        # minutes inside one Bash/tool call without appending to
+                        # its transcript.  Only Claude's explicit final
+                        # assistant end_turn marker is safe to interpret as
+                        # native-agent completion.
+                        if self._transcript_has_terminal_event(jsonl_path):
                             await self._mark_completed(sid, tracked)
 
         # Clean up tracked entries for sessions no longer running
-        running_ids = {sa.id for sa in running}
+        running_ids = {sa.id for sa, _session_id in running}
         for sid in list(self._tracked):
             if sid not in running_ids:
                 del self._tracked[sid]
 
-    def _resolve_paths(self, sa) -> dict | None:
+    @staticmethod
+    def _candidate_config_dirs() -> list[Path]:
+        """Return every configured/default Claude home without opening the DB."""
+
+        from backend.config import settings
+
+        candidates: list[Path] = []
+        env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if env_dir:
+            candidates.append(Path(os.path.expanduser(env_dir)))
+        candidates.append(Path.home() / ".claude")
+
+        pool_path = Path(
+            os.path.expandvars(os.path.expanduser(settings.pool_config_path))
+        )
+        try:
+            pool_data = json.loads(pool_path.read_text(encoding="utf-8"))
+            for account in pool_data.get("accounts", []):
+                config_dir = account.get("config_dir")
+                if isinstance(config_dir, str) and config_dir:
+                    candidates.append(
+                        Path(
+                            os.path.expandvars(
+                                os.path.expanduser(config_dir)
+                            )
+                        )
+                    )
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+        cloudrouter_root = Path(
+            os.path.expandvars(
+                os.path.expanduser(settings.cloudrouter_accounts_dir)
+            )
+        )
+        try:
+            candidates.extend(
+                account_dir / "claude"
+                for account_dir in cloudrouter_root.iterdir()
+                if account_dir.is_dir()
+            )
+        except OSError:
+            pass
+
+        try:
+            candidates.extend(
+                path
+                for path in Path.home().iterdir()
+                if path.name.startswith(".claude") and path.is_dir()
+            )
+        except OSError:
+            pass
+
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            spelling = str(candidate)
+            if spelling in seen:
+                continue
+            seen.add(spelling)
+            unique.append(candidate)
+        return unique
+
+    def _resolve_paths(self, sa, session_id: str | None) -> dict | None:
         """Resolve agent_id and transcript path from sub-agent meta + task session."""
         try:
             meta = json.loads(sa.meta) if sa.meta else {}
@@ -169,27 +250,11 @@ class SubAgentWatcher:
         if not tool_use_id:
             return None
 
-        # Find session directory from task
-        import sqlite3
-        from backend.config import settings
-        db_url = settings.database_url
-        if "sqlite" not in db_url:
+        if not session_id:
             return None
-        raw = db_url.split("///", 1)[-1] if "///" in db_url else db_url
-        conn = sqlite3.connect(raw)
-        try:
-            row = conn.execute(
-                "SELECT session_id FROM tasks WHERE id = ?", (sa.task_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-
-        if not row or not row[0]:
-            return None
-        session_id = row[0]
 
         # Search for subagents directory in claude config dirs
-        for config_dir in Path.home().glob(".claude-account-*"):
+        for config_dir in self._candidate_config_dirs():
             projects_dir = config_dir / "projects"
             if not projects_dir.exists():
                 continue
@@ -235,23 +300,29 @@ class SubAgentWatcher:
         except OSError:
             return None
 
-    def _process_alive(self, agent_id: str, task_id: int) -> bool:
-        """Check if the sub-agent process is likely still running.
+    @staticmethod
+    def _transcript_has_terminal_event(jsonl_path: str) -> bool:
+        """Return True only for an explicit final assistant ``end_turn``."""
 
-        Uses file modification time as proxy — if the transcript hasn't
-        been modified for longer than IDLE_THRESHOLD, the process is gone.
-        """
-        tracked = None
-        for t in self._tracked.values():
-            if t.get("agent_id") == agent_id:
-                tracked = t
-                break
-        if not tracked:
-            return False
         try:
-            mtime = os.path.getmtime(tracked["jsonl_path"])
-            age = (datetime.utcnow() - datetime.utcfromtimestamp(mtime)).total_seconds()
-            return age < IDLE_THRESHOLD
+            last_event = None
+            with open(jsonl_path, encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        parsed = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if isinstance(parsed, dict):
+                        last_event = parsed
+            if not isinstance(last_event, dict):
+                return False
+            message = last_event.get("message")
+            return bool(
+                last_event.get("type") == "assistant"
+                and isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and message.get("stop_reason") == "end_turn"
+            )
         except OSError:
             return False
 

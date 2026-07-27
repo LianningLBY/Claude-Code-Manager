@@ -43,6 +43,75 @@ async def test_create_task_wakes_dispatcher_after_commit(client):
 
 
 @pytest.mark.asyncio
+async def test_update_task_can_clear_nullable_runtime_configuration(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    response = await client.post("/api/tasks", json={
+        "title": "Clear nullable config",
+        "description": "d",
+        "thinking_budget": 123,
+        "timeout_hours": 4,
+        "system_prompt_mode": "append",
+    })
+    task_id = response.json()["id"]
+
+    response = await client.put(f"/api/tasks/{task_id}", json={
+        "thinking_budget": None,
+        "timeout_hours": None,
+        "system_prompt_mode": "off",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["thinking_budget"] is None
+    assert response.json()["timeout_hours"] is None
+    assert response.json()["system_prompt_mode"] is None
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.thinking_budget is None
+        assert task.timeout_hours is None
+        assert task.system_prompt_mode is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_skill_save_clears_temporary_generation_marker(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.services.task_skill_overrides import (
+        TEMP_SKILLS_GENERATION_KEY,
+    )
+
+    response = await client.post("/api/tasks", json={
+        "title": "Save temporary-looking skills",
+        "description": "d",
+        "enabled_skills": {"monitor": True},
+    })
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.metadata_ = {
+            TEMP_SKILLS_GENERATION_KEY: "temporary-generation",
+            "keep": "metadata",
+        }
+        await db.commit()
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"enabled_skills": {"monitor": True}},
+    )
+
+    assert response.status_code == 200
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.enabled_skills == {"monitor": True}
+        assert task.metadata_ == {"keep": "metadata"}
+
+
+@pytest.mark.asyncio
 async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
     client, session_factory,
 ):
@@ -152,15 +221,28 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
 
 
 @pytest.mark.asyncio
-async def test_create_task_with_project_id(client):
+async def test_create_task_with_project_id(client, session_factory):
+    from backend.models.project import Project
+
+    async with session_factory() as db:
+        project = Project(
+            name="task-project",
+            local_path="/tmp/task-project",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        await db.refresh(project)
+        project_id = project.id
+
     resp = await client.post("/api/tasks", json={
         "title": "Test",
         "description": "Do something",
-        "project_id": 1,
+        "project_id": project_id,
     })
     assert resp.status_code == 201
     data = resp.json()
-    assert data["project_id"] == 1
+    assert data["project_id"] == project_id
 
 
 @pytest.mark.asyncio

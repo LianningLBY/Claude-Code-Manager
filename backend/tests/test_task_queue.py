@@ -4,13 +4,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.database import Base
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
-from backend.services.task_queue import TaskQueue, task_generation_fence
+from backend.services.task_queue import (
+    TaskQueue,
+    _effective_key_expr,
+    task_generation_fence,
+)
 
 
 @pytest_asyncio.fixture
@@ -771,6 +777,26 @@ async def test_list_tasks_filter_status(queue):
     pending = await queue.list_tasks(status="pending")
     assert len(pending) == 1
     assert pending[0].title == "pending"
+
+
+@pytest.mark.parametrize(
+    ("dialect", "expected", "forbidden"),
+    [
+        (sqlite.dialect(), "strftime", "UNIX_TIMESTAMP"),
+        (postgresql.dialect(), "EXTRACT(EPOCH FROM", "strftime"),
+        (mysql.dialect(), "UNIX_TIMESTAMP", "strftime"),
+    ],
+)
+def test_effective_sort_key_compiles_for_supported_database_dialects(
+    dialect,
+    expected,
+    forbidden,
+):
+    statement = select(Task.id).order_by(_effective_key_expr())
+    sql = str(statement.compile(dialect=dialect))
+
+    assert expected in sql
+    assert forbidden not in sql
 
 
 # === Dequeue picks any pending task ===

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from backend.database import Base, get_db
 from backend.models.pr_monitor import MonitoredRepo, PRReview
 from backend.models.task import Task
+from backend.models.worker import Worker
 
 
 # === Helpers ===
@@ -32,6 +33,18 @@ async def _create_repo(client, repo_full_name="owner/repo", **overrides):
     resp = await client.post("/api/pr-monitor/repos", json=payload)
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+async def _create_worker(session_factory, worker_id: int) -> None:
+    async with session_factory() as db:
+        db.add(
+            Worker(
+                id=worker_id,
+                name=f"pr-monitor-worker-{worker_id}",
+                status="ready",
+            )
+        )
+        await db.commit()
 
 
 def _sign(secret: str, body: bytes) -> str:
@@ -1060,6 +1073,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
     import backend.main
     from backend.services.worker_proxy import get_task_operation_lock
 
+    await _create_worker(session_factory, 77)
     repo = await _create_repo(
         client,
         "owner/worker-review",
@@ -1180,6 +1194,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
     import backend.main
     from backend.services.worker_proxy import get_task_operation_lock
 
+    await _create_worker(session_factory, 78)
     repo = await _create_repo(
         client,
         "owner/worker-review-timeout",

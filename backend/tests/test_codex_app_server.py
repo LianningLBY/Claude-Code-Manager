@@ -16,6 +16,7 @@ from backend.services.codex_app_server import (
     CodexAppServerError,
     CodexAppServerRegistry,
     CodexRequiredMcpError,
+    CodexRequiredMcpPreTurnError,
     CodexThreadHomeMismatchError,
     CodexTurnProcess,
     normalize_codex_home,
@@ -235,7 +236,7 @@ async def test_required_mcp_thread_rejection_is_explicit():
         )
     )
 
-    with pytest.raises(CodexRequiredMcpError, match="required MCP"):
+    with pytest.raises(CodexRequiredMcpPreTurnError, match="required MCP"):
         await server.start_turn(
             prompt="start",
             cwd="/tmp",
@@ -287,7 +288,7 @@ async def test_required_mcp_app_server_startup_failure_is_explicit():
     server._request = AsyncMock()
 
     with pytest.raises(
-        CodexRequiredMcpError,
+        CodexRequiredMcpPreTurnError,
         match="could not start required MCP transport",
     ):
         await server.start_turn(
@@ -312,7 +313,7 @@ async def test_required_mcp_missing_thread_id_is_explicit():
     server._request = AsyncMock(return_value={"thread": {}})
 
     with pytest.raises(
-        CodexRequiredMcpError,
+        CodexRequiredMcpPreTurnError,
         match="Required MCP configuration was not admitted",
     ):
         await server.start_turn(
@@ -327,6 +328,36 @@ async def test_required_mcp_missing_thread_id_is_explicit():
         )
 
     assert server._request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_startup_cleanup_uncertain_is_not_replay_safe():
+    server = CodexAppServer("codex")
+
+    async def fail_after_uncertain_cleanup():
+        server._shutdown_requested = True
+        raise CodexAppServerError("initialize failed and cleanup was not confirmed")
+
+    server.ensure_started = AsyncMock(side_effect=fail_after_uncertain_cleanup)
+    server._request = AsyncMock()
+
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="could not start required MCP transport",
+    ) as exc_info:
+        await server.start_turn(
+            prompt="start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=56,
+            mcp_specs=(_task_mcp_spec(56),),
+        )
+
+    assert not isinstance(exc_info.value, CodexRequiredMcpPreTurnError)
+    server._request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

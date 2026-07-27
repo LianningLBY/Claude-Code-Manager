@@ -391,26 +391,41 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_start_turn_injects_mcp_config_into_new_thread` | `thread/start` 收到 task-scoped `config.mcp_servers.ccm_skills` |
 | `test_start_turn_uses_native_resume_and_turn_start` | `thread/resume` 同时合并 MCP 配置和线程级 Git 环境，不互相覆盖 |
 | `test_concurrent_task_threads_keep_mcp_context_isolated` | 同一 app-server 并发任务保留各自 `task_id`，配置对象不串线 |
-| `test_required_mcp_thread_rejection_is_explicit` | required MCP 的 thread 创建失败转为 `CodexRequiredMcpError` |
+| `test_required_mcp_thread_rejection_is_explicit` | required MCP 的 thread admission 失败转为可安全重试的 `CodexRequiredMcpPreTurnError` |
 | `test_invalid_required_mcp_config_is_explicit_before_thread_rpc` | required spec 在本地校验失败时 fail closed，且不发送 thread RPC |
-| `test_required_mcp_app_server_startup_failure_is_explicit` | required MCP 已选中后，app-server transport 启动失败转为显式能力错误 |
-| `test_required_mcp_missing_thread_id_is_explicit` | malformed/no-thread-id 响应 fail closed，不进入 `turn/start` |
+| `test_required_mcp_app_server_startup_failure_is_explicit` | cleanup 已确认的 app-server transport 启动失败标为 pre-turn，可由上层安全回退 |
+| `test_required_mcp_missing_thread_id_is_explicit` | malformed/no-thread-id 响应标为 pre-turn，不进入 `turn/start` |
+| `test_required_mcp_startup_cleanup_uncertain_is_not_replay_safe` | app-server 启动清理未确认时保留普通 required 错误，禁止重放 |
 | `test_required_mcp_missing_turn_id_is_explicit_and_detaches_context` | malformed/no-turn-id 响应 fail closed，并清理未成立的 turn context |
-| `test_required_mcp_app_server_failure_does_not_launch_exec` | transport 启动失败、no-thread-id 与未知 adapter 异常都不得启动无 MCP 的 `codex exec` |
-| `test_launch_codex_does_not_fallback_when_replay_is_unsafe[required-mcp]` | required MCP 失败不静默降级到当前尚无 MCP 的 exec fallback |
+| `test_build_command_codex_renders_required_mcp_as_exact_argv_tokens` | fresh/resume 的 exec 均把同一 spec 渲染成精确 `-c` argv，且置于 thread id/prompt 前 |
+| `test_build_command_codex_rejects_invalid_required_exec_mcp` | required exec spec 非法时转为显式能力错误 |
+| `test_codex_main_mcp_uses_exec_when_app_server_is_disabled` | app-server 关闭时主任务直接通过带 required MCP 的 exec 启动 |
+| `test_invalid_required_exec_mcp_fails_before_subprocess_spawn` | production launch 在非法 required exec config 下不得创建子进程 |
+| `test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | transport 启动失败/no-thread-id 只在 turn 前回退，且 exec argv 保留当前 task 的 required MCP |
+| `test_required_mcp_unknown_app_server_failure_does_not_launch_exec` | required MCP 下未知 adapter 异常继续 fail closed |
+| `test_launch_codex_does_not_fallback_when_replay_is_unsafe` | timeout、busy、required 非 pre-turn、owner mismatch 和已启动 turn 的持久化失败均禁止重放 |
+| `test_codex_sub_agent_requires_app_server_and_never_uses_exec` | app-server 关闭时 Sub-Agent 明确失败，绝不降级到没有 live thread control 的 exec |
+| `test_codex_sub_agent_mcp_failure_does_not_launch_exec` | 即使是 pre-turn 错误，Sub-Agent 仍不得走 exec |
+| `test_codex_app_server_rejects_home_owned_by_exec_generation` | 同一 `CODEX_HOME` 有 exec generation 时 app-server 返回 busy |
+| `test_codex_exec_shuts_down_idle_app_server_before_spawn` | exec 启动前关闭同 home 的空闲 app-server |
+| `test_codex_exec_does_not_spawn_while_app_server_home_is_busy` | 同 home app-server 有活跃 turn 时 exec 不得创建进程 |
 | `test_codex_main_mcp_capability_defaults_off` | `CODEX_MAIN_MCP_ENABLED` 服务端 capability 默认关闭 |
-| `test_launch_codex_app_server_injects_task_scoped_specs_when_enabled` | capability 开启时每次 app-server launch 从当前 `task_id` 重建 required spec |
+| `test_launch_codex_app_server_uses_passed_task_scoped_specs` | app-server adapter 使用 launch 层一次性构建的完整 task-scoped spec |
+| `test_codex_app_server_uses_passed_sub_agent_controller_specs` | app-server adapter 使用 launch 层构建的窄化 Sub-Agent controller spec |
 | `test_launch_codex_app_server_routes_turn_to_canonical_home` | capability 关闭时 app-server 行为保持原样且不注入空配置 |
 | `test_codex_main_mcp_capability_does_not_change_claude_launch` | capability 开启不改变 Claude provider 的启动路径 |
 
-人工 app-server smoke（仅测试环境）：
+人工 app-server/exec smoke（仅测试环境）：
 
 1. 设置 `CODEX_APP_SERVER_ENABLED=true`、`CODEX_MAIN_MCP_ENABLED=true` 并重启后端。
 2. 创建本地 Codex task，要求它“必须调用 `ccm_command_help` 查询一个 CCM 命令后原样报告工具结果”。
 3. 确认日志出现 `mcp_tool_call`，server/tool 为 `ccm_skills/ccm_command_help`，且工具参数中的 task 上下文对应当前任务。
 4. 在同一 task 发送第二条消息并确认 resume 仍可调用；再并发运行另一个 task，确认两边查询结果和 `task_id` 不串线。
-5. 将测试 MCP command 临时改为不存在路径，或模拟 app-server 启动失败/no-thread-id 响应；任务应明确报告 required MCP 错误，且不得启动 `codex exec`。
-6. 测试完恢复 `CODEX_MAIN_MCP_ENABLED=false`。PR 4 完成前，exec fallback 不具备此 MCP。
+5. 设置 `CODEX_APP_SERVER_ENABLED=false` 并重启，再建同类 task；应改走 `codex exec`，但仍出现同一个 `ccm_skills/ccm_command_help` 成功调用。
+6. 恢复 app-server，并模拟 transport 启动失败或 no-thread-id：只允许出现一次带 MCP 的 exec 回退；模拟 `turn/start` timeout/错误时则不得出现 exec 重放。
+7. 同一账号有活跃 app-server turn 时尝试启动 exec，应返回 busy；turn 结束后 exec 可关闭空闲 app-server 再启动。反向在 exec generation 未收尾时启动 app-server也应返回 busy。
+8. 关闭 app-server 后启用 Codex Sub-Agent task，应明确报告其需要 app-server，且不得启动 exec。
+9. 测试完恢复 `CODEX_MAIN_MCP_ENABLED=false` 和原来的 `CODEX_APP_SERVER_ENABLED` 设置。
 
 真实验收记录（2026-07-24）：
 
@@ -418,6 +433,12 @@ Codex 版本兼容基线（2026-07-24）：
 - app-server `thread/start` 成功启动 required `ccm_skills`，模型显式调用 `ccm_command_help` 一次。
 - `mcp_tool_call` 状态为 `completed`，耗时约 864 ms，返回 JSON `success=true`；turn 正常完成且 returncode 为 0。
 - smoke 使用独立 SQLite 数据库中的 task 1，结束后已关闭测试后端并清理隔离 CODEX_HOME。
+
+真实 exec 验收记录（2026-07-27）：
+
+- Codex CLI `0.145.0`、`gpt-5.6-sol`，命令由生产 `InstanceManager._build_command()` 构造，包含 reasoning 与 MCP 两个独立 `-c` argv token。
+- MCP 指向仅返回测试 task 1 的隔离 localhost API；模型实际产生 `ccm_skills/ccm_command_help` 的 `item.started` → `item.completed(status=completed)`。
+- turn 最终严格输出 `PR4_EXEC_MCP_OK`，returncode 为 0；隔离 API、进程和临时 smoke 脚本随后全部清理。
 
 #### `test_monitor_dispatcher.py` — Monitor Dispatcher 生命周期
 

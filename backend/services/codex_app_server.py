@@ -43,6 +43,10 @@ class CodexRequiredMcpError(CodexAppServerError):
     """A thread could not be created with its required MCP configuration."""
 
 
+class CodexRequiredMcpPreTurnError(CodexRequiredMcpError):
+    """Required MCP failed before turn/start, so MCP-equivalent exec is safe."""
+
+
 class CodexThreadHomeMismatchError(CodexAppServerError):
     """A thread was routed to a different account without an explicit rebind."""
 
@@ -356,7 +360,12 @@ class CodexAppServer:
             raise
         except Exception as exc:
             if required_mcp:
-                raise CodexRequiredMcpError(
+                error_type = (
+                    CodexRequiredMcpError
+                    if self.shutdown_requested
+                    else CodexRequiredMcpPreTurnError
+                )
+                raise error_type(
                     "Codex app-server could not start required MCP transport: "
                     f"{exc}"
                 ) from exc
@@ -391,7 +400,7 @@ class CodexAppServer:
             response = await self._request(thread_method, thread_params)
         except Exception as exc:
             if required_mcp:
-                raise CodexRequiredMcpError(
+                raise CodexRequiredMcpPreTurnError(
                     f"{thread_method} could not initialize required MCP "
                     f"configuration: {exc}"
                 ) from exc
@@ -402,7 +411,7 @@ class CodexAppServer:
         if not thread_id:
             message = "thread start/resume returned no thread id"
             if required_mcp:
-                raise CodexRequiredMcpError(
+                raise CodexRequiredMcpPreTurnError(
                     f"Required MCP configuration was not admitted: {message}"
                 )
             raise CodexAppServerError(message)

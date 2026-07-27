@@ -844,9 +844,7 @@ class InstanceManager:
             )
 
         if provider == "codex" and settings.codex_app_server_enabled:
-            home_lock = self._codex_home_lock(config_dir)
-            async with home_lock:
-                self._assert_codex_app_server_home_available(config_dir)
+            async with self.codex_home_app_server_guard(config_dir):
                 try:
                     return await self._launch_codex_app_server(
                         instance_id=instance_id,
@@ -1278,14 +1276,21 @@ class InstanceManager:
     async def read_codex_rate_limits(self, codex_home: str) -> dict:
         """Read live quota from the app-server bound to ``codex_home``."""
 
+        async with self.codex_home_app_server_guard(codex_home) as home:
+            registry = self._ensure_codex_app_server_registry()
+            return await registry.read_rate_limits(home)
+
+    @asynccontextmanager
+    async def codex_home_app_server_guard(self, codex_home: str | None):
+        """Serialize any app-server admission against exec and maintenance."""
+
         from backend.services.codex_app_server import normalize_codex_home
 
         home = normalize_codex_home(codex_home)
         home_lock = self._codex_home_lock(home)
         async with home_lock:
             self._assert_codex_app_server_home_available(home)
-            registry = self._ensure_codex_app_server_registry()
-            return await registry.read_rate_limits(home)
+            yield home
 
     def _assert_codex_app_server_home_available(self, codex_home: str) -> None:
         """Reject app-server admission while another transport owns a home.

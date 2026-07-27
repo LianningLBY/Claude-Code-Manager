@@ -9,6 +9,7 @@ Current design (replaces the old per-check subprocess loop):
   endpoints, not by the dispatcher; tests for those live at the API level below.
 """
 import asyncio
+from contextlib import asynccontextmanager
 import os
 import signal
 import sys
@@ -142,6 +143,12 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     registry.start_turn = AsyncMock(return_value=(process, "thread-child"))
     dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = registry
 
+    @asynccontextmanager
+    async def admit(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = admit
+
     from backend.services.mcp_config import build_sub_agent_mcp_server_specs
 
     specs = build_sub_agent_mcp_server_specs(41, 7)
@@ -169,6 +176,77 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     }
     assert dispatcher._sub_agent_codex_processes[41] is process
     assert dispatcher._sub_agent_codex_threads[41] == "thread-child"
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_rejects_home_owned_by_exec_generation(
+    dispatcher, monkeypatch, tmp_path,
+):
+    from backend.services.codex_app_server import CodexAppServerBusyError
+    from backend.services.instance_manager import InstanceManager
+    from backend.services.mcp_config import build_sub_agent_mcp_server_specs
+
+    home = str((tmp_path / "codex-exec-owner").resolve())
+    monkeypatch.setenv("CODEX_HOME", home)
+    manager = InstanceManager(MagicMock(), MagicMock())
+    registry = MagicMock()
+    registry.start_turn = AsyncMock()
+    manager._codex_app_server = registry
+    manager._codex_exec_homes[81] = home
+    dispatcher.instance_manager = manager
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="still has an exec generation",
+    ):
+        await dispatcher._launch_codex_sub_agent(
+            prompt="must not overlap",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=51,
+            task_id=7,
+            task_metadata={},
+            mcp_specs=build_sub_agent_mcp_server_specs(51, 7),
+        )
+
+    registry.start_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_rejects_active_ephemeral_exec(
+    dispatcher, monkeypatch, tmp_path,
+):
+    from backend.services.codex_app_server import CodexAppServerBusyError
+    from backend.services.instance_manager import InstanceManager
+    from backend.services.mcp_config import build_sub_agent_mcp_server_specs
+
+    home = str((tmp_path / "codex-ephemeral-owner").resolve())
+    monkeypatch.setenv("CODEX_HOME", home)
+    manager = InstanceManager(MagicMock(), MagicMock())
+    registry = MagicMock()
+    registry.shutdown_home = AsyncMock(return_value=True)
+    registry.start_turn = AsyncMock()
+    manager._codex_app_server = registry
+    dispatcher.instance_manager = manager
+
+    async with manager.codex_home_exec_guard(home):
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="active ephemeral exec",
+        ):
+            await dispatcher._launch_codex_sub_agent(
+                prompt="must not overlap",
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+                effort_level="high",
+                session_id=52,
+                task_id=7,
+                task_metadata={},
+                mcp_specs=build_sub_agent_mcp_server_specs(52, 7),
+            )
+
+    registry.start_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio

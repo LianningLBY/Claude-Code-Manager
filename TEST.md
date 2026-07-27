@@ -413,6 +413,8 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_ephemeral_codex_exec_rejects_active_app_server` | app-server 有活跃 turn 时，临时 Codex exec 不得进入同一 home |
 | `test_codex_exec_shuts_down_idle_app_server_before_spawn` | exec 启动前关闭同 home 的空闲 app-server |
 | `test_codex_exec_does_not_spawn_while_app_server_home_is_busy` | 同 home app-server 有活跃 turn 时 exec 不得创建进程 |
+| `test_codex_sub_agent_rejects_home_owned_by_exec_generation` | 普通 exec generation 占用同 home 时，Codex 子 Agent 不得绕过 app-server admission gate |
+| `test_codex_sub_agent_rejects_active_ephemeral_exec` | 临时 exec 占用同 home 时，Codex 子 Agent 同样不得启动 app-server |
 | `test_codex_main_mcp_capability_defaults_off` | `CODEX_MAIN_MCP_ENABLED` 服务端 capability 默认关闭 |
 | `test_launch_codex_app_server_uses_passed_task_scoped_specs` | app-server adapter 使用 launch 层一次性构建的完整 task-scoped spec |
 | `test_codex_app_server_uses_passed_sub_agent_controller_specs` | app-server adapter 使用 launch 层构建的窄化 Sub-Agent controller spec |

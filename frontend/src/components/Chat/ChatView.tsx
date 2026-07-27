@@ -1021,8 +1021,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     try {
       const forked = await api.forkTask(
         task.id,
-        selectedForkAnchor.type === 'initial'
-          ? { type: 'initial' }
+        selectedForkAnchor.type !== 'user_message'
+          ? { type: selectedForkAnchor.type }
           : { type: 'user_message', id: selectedForkAnchor.id! },
         forkTitle,
       );
@@ -1278,7 +1278,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             <div className="flex items-center justify-between border-b border-gray-700 px-4 py-3">
               <div className="flex items-center gap-2 text-sm font-medium text-gray-100">
                 <GitBranch size={16} className="text-indigo-400" />
-                选择用户消息作为分叉点
+                复制或分叉 Codex Task
               </div>
               <button
                 onClick={() => !forking && setForkOpen(false)}
@@ -1290,7 +1290,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             </div>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
               <p className="text-sm text-gray-300">
-                新任务会保留所选消息之前的上下文，并把这条消息预填到输入框中，不会自动发送。
+                “完整复制”会保留最后一个已完成 turn 的全部上下文；选择用户消息则从该消息之前分叉，并把消息预填到输入框中。
               </p>
               <p className="text-xs text-amber-400/90">
                 注入消息属于运行中 turn，无法作为精确边界，因此不会出现在列表中。两个 Task 仍使用同一工作目录。
@@ -1322,6 +1322,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     <div className="line-clamp-3 whitespace-pre-wrap text-sm text-gray-200">
                       {anchor.content}
                     </div>
+                    {anchor.type === 'latest' && (
+                      <div className="mt-1 text-[11px] text-indigo-300">
+                        包含全部用户消息和回答，新 Task 输入框为空
+                      </div>
+                    )}
                     <div className="mt-1.5 flex items-center gap-2 text-[11px] text-gray-500">
                       {anchor.timestamp && <span>{formatMessageTime(anchor.timestamp)}</span>}
                       {anchor.attachments.length > 0 && (

@@ -365,6 +365,46 @@ describe('ChatView', () => {
       });
     });
 
+    it('can copy the complete latest Codex context without a seed message', async () => {
+      const task = makeTask({ id: 14, provider: 'codex', status: 'completed' });
+      const latest = {
+        type: 'latest' as const,
+        id: null,
+        content: '完整复制当前上下文',
+        timestamp: '2024-01-01T00:02:00Z',
+        attachments: [],
+      };
+      const forked = makeTask({
+        id: 100,
+        provider: 'codex',
+        session_id: 'full-copy-thread',
+        metadata_: { fork_mode: 'full_copy' },
+      });
+      (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([latest]);
+      (api.forkTask as ReturnType<typeof vi.fn>).mockResolvedValue(forked);
+
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskForked={vi.fn()}
+        />,
+      );
+
+      await userEvent.click(screen.getByLabelText('Fork Codex session'));
+      await userEvent.click(await screen.findByText('完整复制当前上下文'));
+      await userEvent.click(screen.getByRole('button', { name: 'Create fork' }));
+
+      await waitFor(() => {
+        expect(api.forkTask).toHaveBeenCalledWith(
+          task.id,
+          { type: 'latest' },
+          '',
+        );
+      });
+    });
+
     it('does not offer native fork actions for Claude sessions', () => {
       const task = makeTask({ provider: 'claude', status: 'completed' });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);

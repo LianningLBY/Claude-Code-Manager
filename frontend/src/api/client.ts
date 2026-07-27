@@ -167,6 +167,7 @@ export interface Task {
     forked_from_task_id?: number;
     forked_from_log_id?: number | null;
     forked_from_turn_id?: string;
+    fork_mode?: 'branch' | 'full_copy';
     fork_seed_message?: string;
     fork_seed_log_id?: number | null;
     fork_seed_uploads?: UploadResult[];
@@ -241,7 +242,7 @@ export interface ChatMessage {
 }
 
 export interface CodexForkAnchor {
-  type: 'initial' | 'user_message';
+  type: 'initial' | 'latest' | 'user_message';
   id: number | null;
   content: string;
   timestamp: string | null;
@@ -993,7 +994,7 @@ export const api = {
     request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
   forkTask: (
     id: number,
-    anchor: { type: 'initial'; id?: never } | { type: 'user_message'; id: number },
+    anchor: { type: 'initial' | 'latest'; id?: never } | { type: 'user_message'; id: number },
     title?: string,
   ) =>
     request<Task>(`/api/tasks/${id}/fork`, {

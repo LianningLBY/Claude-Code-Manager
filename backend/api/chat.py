@@ -39,15 +39,15 @@ class ChatMessage(BaseModel):
 
 
 class ForkAnchor(BaseModel):
-    type: Literal["initial", "user_message"]
+    type: Literal["initial", "latest", "user_message"]
     id: int | None = None
 
     @model_validator(mode="after")
     def validate_anchor(self):
         if self.type == "user_message" and (self.id is None or self.id <= 0):
             raise ValueError("user message fork anchors require a positive id")
-        if self.type == "initial" and self.id is not None:
-            raise ValueError("initial fork anchors cannot include an id")
+        if self.type in {"initial", "latest"} and self.id is not None:
+            raise ValueError(f"{self.type} fork anchors cannot include an id")
         return self
 
 
@@ -251,6 +251,26 @@ def _resolve_fork_turn(
         raise HTTPException(409, "The preceding Codex turn is still running")
 
     return target_turn_id, selected.id - 1
+
+
+def _resolve_latest_fork_turn(
+    turns: list[dict],
+    rows: list[LogEntry],
+) -> tuple[str, int]:
+    """Resolve an exact full-context copy through the latest completed turn."""
+
+    if not turns:
+        raise HTTPException(409, "Codex session has no persisted turns to copy")
+    latest = turns[-1]
+    turn_id = str(latest.get("id") or "")
+    if not turn_id:
+        raise HTTPException(409, "Codex returned an invalid turn history")
+    if str(latest.get("status") or "") != "completed":
+        raise HTTPException(
+            409,
+            "The latest Codex turn is not completed and cannot be copied exactly",
+        )
+    return turn_id, (rows[-1].id if rows else -1)
 
 
 def _codex_fork_home(task: Task) -> tuple[str, str | None]:
@@ -464,7 +484,16 @@ async def list_codex_fork_anchors(
         .where(LogEntry.task_id == task_id)
         .order_by(LogEntry.id.asc())
     )).scalars().all())
-    anchors = []
+    anchors = [{
+        "type": "latest",
+        "id": None,
+        "content": "完整复制当前上下文",
+        "timestamp": (
+            source.completed_at.isoformat() + "Z"
+            if source.completed_at else None
+        ),
+        "attachments": [],
+    }]
     if source.description:
         anchors.append({
             "type": "initial",
@@ -522,12 +551,14 @@ async def fork_codex_task(
         .order_by(LogEntry.id.asc())
     )).scalars().all())
     selected: LogEntry | None = None
+    seed_message: str | None = None
+    selected_metadata: dict = {}
     if body.anchor.type == "initial":
         if not source.description:
             raise HTTPException(404, "Initial prompt not found")
         seed_message = source.description
         selected_metadata = source.metadata_ or {}
-    else:
+    elif body.anchor.type == "user_message":
         selected = next(
             (row for row in rows if row.id == body.anchor.id),
             None,
@@ -569,11 +600,14 @@ async def fork_codex_task(
                 turn for turn in (native_thread.get("turns") or [])
                 if isinstance(turn, dict)
             ]
-            last_turn_id, cutoff = _resolve_fork_turn(
-                anchor=body.anchor,
-                rows=rows,
-                turns=turns,
-            )
+            if body.anchor.type == "latest":
+                last_turn_id, cutoff = _resolve_latest_fork_turn(turns, rows)
+            else:
+                last_turn_id, cutoff = _resolve_fork_turn(
+                    anchor=body.anchor,
+                    rows=rows,
+                    turns=turns,
+                )
             forked_thread = await instance_manager.fork_codex_thread(
                 codex_home,
                 source.session_id,
@@ -595,11 +629,19 @@ async def fork_codex_task(
             body.anchor.id if body.anchor.type == "user_message" else None
         )
         metadata["forked_from_turn_id"] = last_turn_id
-        metadata["fork_seed_message"] = seed_message
-        metadata["fork_seed_log_id"] = (
-            body.anchor.id if body.anchor.type == "user_message" else None
+        metadata["fork_mode"] = (
+            "full_copy" if body.anchor.type == "latest" else "branch"
         )
-        metadata["fork_seed_uploads"] = _fork_seed_uploads(selected_metadata)
+        if seed_message is not None:
+            metadata["fork_seed_message"] = seed_message
+            metadata["fork_seed_log_id"] = (
+                body.anchor.id if body.anchor.type == "user_message" else None
+            )
+            metadata["fork_seed_uploads"] = _fork_seed_uploads(selected_metadata)
+        else:
+            metadata.pop("fork_seed_message", None)
+            metadata.pop("fork_seed_log_id", None)
+            metadata.pop("fork_seed_uploads", None)
         if body.anchor.type == "initial":
             # The empty native thread has not consumed the initial prompt or
             # its files yet. Keep them only in the editable seed composer.
@@ -616,7 +658,7 @@ async def fork_codex_task(
             title=(body.title.strip() if body.title and body.title.strip() else default_title)[:200],
             description=(
                 source.description
-                if body.anchor.type == "user_message"
+                if body.anchor.type in {"user_message", "latest"}
                 else None
             ),
             status="completed",

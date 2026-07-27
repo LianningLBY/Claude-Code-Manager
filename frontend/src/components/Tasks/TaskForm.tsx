@@ -493,7 +493,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           </div>
         )}
       </div>
-      {contextTasks.length > 0 && (
+      {provider === 'claude' && contextTasks.length > 0 && (
         <div className="flex items-center gap-2 min-w-0">
           <label className="text-sm text-gray-400 whitespace-nowrap shrink-0">Copy context from:</label>
           <select

@@ -5,22 +5,54 @@ import { Plus, ArrowLeft, X, Copy, RefreshCw, ToggleLeft, ToggleRight, Trash2, G
 
 const DEFAULT_WEBHOOK_URL = `${window.location.origin}/api/github/webhook`;
 
-function useProviderModels(): { providers: string[]; defaultProvider: string; modelsFor: (p: string) => string[] } {
-  const [cfg, setCfg] = useState<{ providers: string[]; defaultProvider: string; claude: string[]; codex: string[] }>({
-    providers: ['claude', 'codex'], defaultProvider: 'codex', claude: [], codex: [],
+function useProviderModels(): {
+  providers: string[];
+  defaultProvider: string;
+  modelsFor: (p: string) => string[];
+  effortsFor: (p: string, model: string) => string[];
+} {
+  const [cfg, setCfg] = useState<{
+    providers: string[];
+    defaultProvider: string;
+    defaultClaudeModel: string;
+    defaultCodexModel: string;
+    claude: string[];
+    codex: string[];
+    claudeEfforts: Record<string, string[]>;
+    codexEfforts: Record<string, string[]>;
+    defaultEfforts: string[];
+    codexDefaultEfforts: string[];
+  }>({
+    providers: ['claude', 'codex'], defaultProvider: 'codex',
+    defaultClaudeModel: '', defaultCodexModel: '',
+    claude: [], codex: [], claudeEfforts: {}, codexEfforts: {},
+    defaultEfforts: [], codexDefaultEfforts: [],
   });
   useEffect(() => {
     api.config().then((c) => setCfg({
       providers: c.provider_options?.length ? c.provider_options : ['claude', 'codex'],
       defaultProvider: c.default_provider || 'codex',
+      defaultClaudeModel: c.default_model,
+      defaultCodexModel: c.default_codex_model,
       claude: c.model_options.filter((m) => m !== 'default'),
       codex: (c.codex_model_options || []).filter((m) => m !== 'default'),
+      claudeEfforts: c.claude_model_efforts || {},
+      codexEfforts: c.codex_model_efforts || {},
+      defaultEfforts: c.effort_options || [],
+      codexDefaultEfforts: c.codex_effort_options || [],
     })).catch(() => {});
   }, []);
   return {
     providers: cfg.providers,
     defaultProvider: cfg.defaultProvider,
     modelsFor: (p: string) => (p === 'codex' ? cfg.codex : cfg.claude),
+    effortsFor: (p: string, model: string) => {
+      const effectiveModel = model || (p === 'codex' ? cfg.defaultCodexModel : cfg.defaultClaudeModel);
+      const mapped = (p === 'codex' ? cfg.codexEfforts : cfg.claudeEfforts)[effectiveModel];
+      return mapped?.length
+        ? mapped
+        : (p === 'codex' ? cfg.codexDefaultEfforts : cfg.defaultEfforts);
+    },
   };
 }
 
@@ -43,8 +75,10 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   const [autoMerge, setAutoMerge] = useState(false);
   const [provider, setProvider] = useState('codex');
   const [reviewModel, setReviewModel] = useState('');
-  const { providers, defaultProvider, modelsFor } = useProviderModels();
+  const [reviewEffort, setReviewEffort] = useState('');
+  const { providers, defaultProvider, modelsFor, effortsFor } = useProviderModels();
   const modelOptions = modelsFor(provider);
+  const effortOptions = effortsFor(provider, reviewModel);
   const [defaultBranch, setDefaultBranch] = useState('main');
   const [allowedAuthors, setAllowedAuthors] = useState('');
   const [workerId, setWorkerId] = useState('');
@@ -73,6 +107,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
         auto_merge: autoMerge,
         provider,
         review_model: reviewModel.trim() || undefined,
+        review_effort: reviewEffort || undefined,
         default_branch: defaultBranch.trim() || 'main',
         allowed_authors: authors,
         worker_id: workerId ? Number(workerId) : undefined,
@@ -112,7 +147,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
             <label className="block text-xs text-gray-400 mb-1">Provider</label>
             <select
               className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
-              value={provider} onChange={(e) => { setProvider(e.target.value); setReviewModel(''); }}
+              value={provider} onChange={(e) => { setProvider(e.target.value); setReviewModel(''); setReviewEffort(''); }}
             >
               {providers.map((p) => <option key={p} value={p}>{p === 'codex' ? 'Codex' : 'Claude Code'}</option>)}
             </select>
@@ -121,10 +156,20 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
             <label className="block text-xs text-gray-400 mb-1">Review Model (optional)</label>
             <select
               className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
-              value={reviewModel} onChange={(e) => setReviewModel(e.target.value)}
+              value={reviewModel} onChange={(e) => { setReviewModel(e.target.value); setReviewEffort(''); }}
             >
               <option value="">default</option>
               {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Review Effort (optional)</label>
+            <select
+              className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
+              value={reviewEffort} onChange={(e) => setReviewEffort(e.target.value)}
+            >
+              <option value="">default</option>
+              {effortOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
             </select>
           </div>
           <div>
@@ -172,8 +217,10 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [autoMerge, setAutoMerge] = useState(repo.auto_merge);
   const [provider, setProvider] = useState(repo.provider || 'claude');
   const [reviewModel, setReviewModel] = useState(repo.review_model || '');
-  const { providers, modelsFor } = useProviderModels();
+  const [reviewEffort, setReviewEffort] = useState(repo.review_effort || '');
+  const { providers, modelsFor, effortsFor } = useProviderModels();
   const modelOptions = modelsFor(provider);
+  const effortOptions = effortsFor(provider, reviewModel);
   const [defaultBranch, setDefaultBranch] = useState(repo.default_branch);
   const [authorsInput, setAuthorsInput] = useState((repo.allowed_authors || []).join(', '));
   const [saving, setSaving] = useState(false);
@@ -212,6 +259,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
         // 显式 null 才能清空（undefined 会被后端 exclude_unset 丢弃，
         // 换 provider 后旧模型残留会让 CLI 拿到错家族的 --model）
         review_model: reviewModel.trim() ? reviewModel.trim() : null,
+        review_effort: reviewEffort || null,
         default_branch: defaultBranch.trim() || 'main',
         allowed_authors: authors,
       });
@@ -253,19 +301,30 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
           <div>
             <label className="block text-xs text-gray-400 mb-1">Provider</label>
             <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
-              value={provider} onChange={(e) => { setProvider(e.target.value); setReviewModel(''); }}>
+              value={provider} onChange={(e) => { setProvider(e.target.value); setReviewModel(''); setReviewEffort(''); }}>
               {providers.map((p) => <option key={p} value={p}>{p === 'codex' ? 'Codex' : 'Claude Code'}</option>)}
             </select>
           </div>
           <div>
             <label className="block text-xs text-gray-400 mb-1">Review Model</label>
             <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
-              value={reviewModel} onChange={(e) => setReviewModel(e.target.value)}>
+              value={reviewModel} onChange={(e) => { setReviewModel(e.target.value); setReviewEffort(''); }}>
               <option value="">default</option>
               {reviewModel && !modelOptions.includes(reviewModel) && (
                 <option value={reviewModel}>{reviewModel}</option>
               )}
               {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Review Effort</label>
+            <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
+              value={reviewEffort} onChange={(e) => setReviewEffort(e.target.value)}>
+              <option value="">default</option>
+              {reviewEffort && !effortOptions.includes(reviewEffort) && (
+                <option value={reviewEffort}>{reviewEffort}</option>
+              )}
+              {effortOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
             </select>
           </div>
           <div>

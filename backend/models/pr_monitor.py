@@ -25,6 +25,7 @@ class MonitoredRepo(Base):
     webhook_secret: Mapped[str] = mapped_column(String(128), nullable=False)
     provider: Mapped[str] = mapped_column(String(20), default="claude", server_default="claude")
     review_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    review_effort: Mapped[str | None] = mapped_column(String(20), nullable=True)
     default_branch: Mapped[str] = mapped_column(String(100), default="main", server_default="main")
     allowed_authors: Mapped[dict | None] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(20), default="active", server_default="active")

@@ -162,6 +162,7 @@ async def create_pr_review_task(
         metadata_={"pr_review_id": review.id},
         provider=provider,
         model=model,
+        effort_level=repo.review_effort,
         project_id=await _get_or_create_pr_monitor_project(db),
         worker_id=repo.worker_id,
     )

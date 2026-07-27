@@ -89,11 +89,15 @@ async def _post_webhook(
 
 @pytest.mark.asyncio
 async def test_create_repo_success(client):
-    data = await _create_repo(client, "owner/repo", auto_merge=True, allowed_authors=["alice"])
+    data = await _create_repo(
+        client, "owner/repo", auto_merge=True, allowed_authors=["alice"],
+        review_effort="high",
+    )
     assert data["repo_full_name"] == "owner/repo"
     assert data["auto_merge"] is True
     assert data["enabled"] is True
     assert data["allowed_authors"] == ["alice"]
+    assert data["review_effort"] == "high"
     # Detail response: full (unmasked) webhook secret
     assert len(data["webhook_secret"]) == 64
 
@@ -129,12 +133,14 @@ async def test_update_repo_settings(client):
         "auto_merge": True,
         "default_branch": "develop",
         "allowed_authors": ["bob"],
+        "review_effort": "xhigh",
     })
     assert resp.status_code == 200
     data = resp.json()
     assert data["auto_merge"] is True
     assert data["default_branch"] == "develop"
     assert data["allowed_authors"] == ["bob"]
+    assert data["review_effort"] == "xhigh"
 
 
 @pytest.mark.asyncio

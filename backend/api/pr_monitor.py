@@ -158,6 +158,7 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
         auto_merge=body.auto_merge,
         provider=body.provider,
         review_model=body.review_model,
+        review_effort=body.review_effort,
         default_branch=body.default_branch,
         allowed_authors=body.allowed_authors,
         webhook_secret=secrets.token_hex(32),

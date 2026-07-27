@@ -11,6 +11,7 @@ class MonitoredRepoCreate(BaseModel):
     auto_merge: bool = False
     provider: str = Field(default_factory=lambda: settings.default_provider)
     review_model: str | None = None
+    review_effort: str | None = None
     default_branch: str = "main"
     allowed_authors: list[str] = []
 
@@ -27,6 +28,7 @@ class MonitoredRepoUpdate(BaseModel):
     auto_merge: bool | None = None
     provider: str | None = None
     review_model: str | None = None
+    review_effort: str | None = None
     default_branch: str | None = None
     allowed_authors: list[str] | None = None
     enabled: bool | None = None
@@ -42,6 +44,7 @@ class MonitoredRepoResponse(BaseModel):
     webhook_secret: str
     provider: str = "claude"
     review_model: str | None
+    review_effort: str | None
     default_branch: str
     allowed_authors: list[str]
     status: str

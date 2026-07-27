@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 from collections import deque
@@ -29,6 +30,15 @@ _APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_TERM_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_KILL_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_GROUP_POLL_INTERVAL = 0.05
+_ACTIVE_TURN_MISMATCH_RE = re.compile(
+    r"expected active turn id\s+[`'\"]?"
+    r"(?P<expected>[^\s`'\"]+)[`'\"]?\s+but found\s+[`'\"]?"
+    r"(?P<actual>[^\s`'\"]+)"
+)
+_GOALS_FEATURE_DISABLED_RE = re.compile(
+    r"\bgoals feature is disabled\b",
+    re.IGNORECASE,
+)
 
 
 class CodexAppServerError(RuntimeError):
@@ -67,6 +77,17 @@ class _UnconfirmedTurnStartFailure(CodexAppServerError):
         super().__init__(reason)
         self.process = process
         self.reason = reason
+
+
+def _active_turn_id_from_error(error: BaseException | str) -> str | None:
+    """Extract app-server's authoritative active turn from a mismatch error."""
+
+    match = _ACTIVE_TURN_MISMATCH_RE.search(str(error))
+    if match is None:
+        return None
+    actual = match.group("actual").rstrip("`'\".,:;)")
+    expected = match.group("expected").rstrip("`'\".,:;)")
+    return actual if actual and actual != expected else None
 
 
 def normalize_codex_home(codex_home: str | os.PathLike[str] | None = None) -> str:
@@ -150,6 +171,8 @@ class _TurnContext:
     launch_started: float
     task_id: int | None
     turn_id: str | None = None
+    admitted_turn_id: str | None = None
+    observed_turn_id: str | None = None
     usage: dict[str, int] | None = None
     first_input_seen: bool = False
     first_output_seen: bool = False
@@ -217,6 +240,152 @@ class CodexAppServer:
 
     def knows_thread(self, thread_id: str) -> bool:
         return thread_id in self._known_threads
+
+    def _detach_turn_context(self, context: _TurnContext) -> None:
+        """Remove every identity mapping for one exact adapter generation."""
+
+        if self._contexts_by_thread.get(context.thread_id) is context:
+            self._contexts_by_thread.pop(context.thread_id, None)
+        for turn_id, candidate in list(self._contexts_by_turn.items()):
+            if candidate is context:
+                self._contexts_by_turn.pop(turn_id, None)
+
+    def _bind_turn_context(
+        self,
+        context: _TurnContext,
+        turn_id: str,
+        *,
+        observed: bool,
+    ) -> bool:
+        """Bind an adapter to one turn without leaving stale reverse mappings."""
+
+        if not turn_id:
+            return False
+        existing = self._contexts_by_turn.get(turn_id)
+        if existing is not None and existing is not context:
+            logger.error(
+                "Refusing to bind Codex turn %s for task %s over task %s",
+                turn_id,
+                context.task_id,
+                existing.task_id,
+            )
+            return False
+        old_turn_id = context.turn_id
+        if (
+            old_turn_id
+            and old_turn_id != turn_id
+            and self._contexts_by_turn.get(old_turn_id) is context
+        ):
+            self._contexts_by_turn.pop(old_turn_id, None)
+        context.turn_id = turn_id
+        if observed:
+            context.observed_turn_id = turn_id
+        self._contexts_by_turn[turn_id] = context
+        return True
+
+    def _interrupt_context_is_current(self, context: _TurnContext) -> bool:
+        """Return whether an exact turn context still owns live work."""
+
+        if context.process.returncode is not None:
+            return False
+        if self._contexts_by_thread.get(context.thread_id) is not context:
+            raise CodexAppServerError(
+                f"Codex thread {context.thread_id} changed owner during interrupt"
+            )
+        return True
+
+    @staticmethod
+    def _notification_turn_id(
+        method: str,
+        params: dict[str, Any],
+    ) -> str | None:
+        """Return the real turn id from either v2 notification shape."""
+
+        if method in {"turn/started", "turn/completed"}:
+            turn = params.get("turn")
+            if isinstance(turn, dict) and turn.get("id"):
+                return str(turn["id"])
+        turn_id = params.get("turnId")
+        return str(turn_id) if turn_id else None
+
+    async def _pause_active_goal(self, thread_id: str) -> None:
+        """Prevent an interrupted native goal turn from immediately continuing."""
+
+        try:
+            response = await self._request(
+                "thread/goal/get",
+                {"threadId": thread_id},
+            )
+        except CodexAppServerError as exc:
+            # Submission ids can be adopted by any steerable active turn, not
+            # only a native goal turn. A build with Goals explicitly disabled
+            # reports this exact protocol error; there is then no goal to pause,
+            # so continue to interrupt the authoritative active turn. Other
+            # failures remain fail-closed.
+            if _GOALS_FEATURE_DISABLED_RE.search(str(exc)):
+                logger.debug(
+                    "Codex Goals feature disabled for thread %s; "
+                    "continuing direct turn interrupt",
+                    thread_id,
+                )
+                return
+            raise
+        goal = response.get("goal") if isinstance(response, dict) else None
+        if isinstance(goal, dict) and goal.get("status") == "active":
+            await self._request(
+                "thread/goal/set",
+                {"threadId": thread_id, "status": "paused"},
+            )
+
+    async def _interrupt_turn_context(self, context: _TurnContext) -> None:
+        """Interrupt the actual active turn, reconciling steer-style admission ids."""
+
+        if not self._interrupt_context_is_current(context):
+            return
+        turn_id = context.turn_id
+        if not turn_id:
+            raise CodexAppServerError(
+                f"Codex thread {context.thread_id} has no interruptible turn id"
+            )
+
+        goal_checked = False
+        if (
+            context.admitted_turn_id is not None
+            and turn_id != context.admitted_turn_id
+        ):
+            await self._pause_active_goal(context.thread_id)
+            goal_checked = True
+            if not self._interrupt_context_is_current(context):
+                return
+
+        for attempt in range(2):
+            try:
+                await self._request(
+                    "turn/interrupt",
+                    {"threadId": context.thread_id, "turnId": turn_id},
+                )
+                return
+            except CodexAppServerError as exc:
+                actual_turn_id = _active_turn_id_from_error(exc)
+                if attempt or not actual_turn_id:
+                    raise
+                if not self._interrupt_context_is_current(context):
+                    return
+                if not goal_checked:
+                    await self._pause_active_goal(context.thread_id)
+                    goal_checked = True
+                    if not self._interrupt_context_is_current(context):
+                        return
+                if not self._bind_turn_context(
+                    context,
+                    actual_turn_id,
+                    observed=True,
+                ):
+                    raise CodexAppServerError(
+                        "Could not bind authoritative Codex active turn "
+                        f"{actual_turn_id}"
+                    ) from exc
+                turn_id = actual_turn_id
 
     async def ensure_started(self) -> None:
         if self._shutdown_requested:
@@ -422,13 +591,11 @@ class CodexAppServer:
                 f"thread {thread_id} already has an active turn"
             )
 
+        context: _TurnContext | None = None
+
         async def _interrupt() -> None:
-            context = self._contexts_by_thread.get(thread_id)
-            if context and context.turn_id:
-                await self._request(
-                    "turn/interrupt",
-                    {"threadId": thread_id, "turnId": context.turn_id},
-                )
+            if context is not None:
+                await self._interrupt_turn_context(context)
 
         turn_process = CodexTurnProcess(
             self.pid,
@@ -481,7 +648,7 @@ class CodexAppServer:
                 raise _UnconfirmedTurnCancellation(turn_process, reason) from exc
             raise _UnconfirmedTurnStartFailure(turn_process, reason) from exc
         except BaseException as exc:
-            self._contexts_by_thread.pop(thread_id, None)
+            self._detach_turn_context(context)
             turn_process.finish(1, "Codex app-server rejected turn/start")
             if required_mcp and isinstance(exc, Exception):
                 raise CodexRequiredMcpError(
@@ -493,7 +660,7 @@ class CodexAppServer:
         turn = turn_response.get("turn") if isinstance(turn_response, dict) else None
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if not turn_id:
-            self._contexts_by_thread.pop(thread_id, None)
+            self._detach_turn_context(context)
             turn_process.finish(1, "Codex app-server turn/start returned no turn id")
             message = "turn/start returned no turn id"
             if required_mcp:
@@ -501,8 +668,16 @@ class CodexAppServer:
                     f"Required MCP turn was not admitted: {message}"
                 )
             raise CodexAppServerError(message)
-        context.turn_id = turn_id
-        self._contexts_by_turn[turn_id] = context
+        context.admitted_turn_id = str(turn_id)
+        # An already-running steerable turn can emit notifications before this
+        # response arrives. In that case its notification turn id is the real
+        # active generation and must not be overwritten by this submission id.
+        if context.observed_turn_id is None:
+            self._bind_turn_context(
+                context,
+                str(turn_id),
+                observed=False,
+            )
         if turn_cancelled:
             cleanup = asyncio.create_task(self.abandon_turn(
                 turn_process,
@@ -680,13 +855,7 @@ class CodexAppServer:
         interrupt_confirmed = False
         try:
             if context is not None and context.turn_id:
-                await self._request(
-                    "turn/interrupt",
-                    {
-                        "threadId": context.thread_id,
-                        "turnId": context.turn_id,
-                    },
-                )
+                await self._interrupt_turn_context(context)
                 interrupt_confirmed = True
         except BaseException:
             logger.exception(
@@ -695,9 +864,7 @@ class CodexAppServer:
             )
         finally:
             if context is not None:
-                self._contexts_by_thread.pop(context.thread_id, None)
-                if context.turn_id:
-                    self._contexts_by_turn.pop(context.turn_id, None)
+                self._detach_turn_context(context)
             process.finish(130, reason)
         return interrupt_confirmed
 
@@ -729,6 +896,29 @@ class CodexAppServer:
                 },
             )
         except Exception as exc:
+            actual_turn_id = _active_turn_id_from_error(exc)
+            if (
+                actual_turn_id
+                and self._contexts_by_thread.get(thread_id) is context
+                and self._bind_turn_context(
+                    context,
+                    actual_turn_id,
+                    observed=True,
+                )
+            ):
+                try:
+                    response = await self._request(
+                        "turn/steer",
+                        {
+                            "threadId": thread_id,
+                            "expectedTurnId": actual_turn_id,
+                            "input": [{"type": "text", "text": content}],
+                        },
+                    )
+                except Exception as retry_exc:
+                    exc = retry_exc
+                else:
+                    return response.get("turnId") == actual_turn_id
             # A normal turn-boundary race and non-steerable turns (review or
             # manual compact) are protocol rejections, not transport crashes.
             logger.info(
@@ -880,19 +1070,57 @@ class CodexAppServer:
 
     def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
         thread_id = params.get("threadId")
-        turn_id = params.get("turnId")
+        turn_id = self._notification_turn_id(method, params)
         context = self._contexts_by_turn.get(turn_id) if turn_id else None
+        if (
+            context is not None
+            and thread_id
+            and str(thread_id) != context.thread_id
+        ):
+            logger.error(
+                "Ignoring Codex notification with mismatched thread/turn "
+                "thread=%s expected_thread=%s turn=%s method=%s",
+                thread_id,
+                context.thread_id,
+                turn_id,
+                method,
+            )
+            return
         if context is None and thread_id:
-            context = self._contexts_by_thread.get(thread_id)
+            candidate = self._contexts_by_thread.get(str(thread_id))
+            if candidate is not None and turn_id:
+                # turn/start can return a fresh submission id while its input
+                # is actually steered into an existing goal turn. The first
+                # real notification is authoritative. Once a real turn has
+                # been observed, an unknown id belongs to another lifecycle
+                # and must not be cross-routed by thread fallback.
+                if (
+                    candidate.observed_turn_id is not None
+                    and candidate.observed_turn_id != turn_id
+                ):
+                    logger.debug(
+                        "Ignoring Codex notification for unrelated turn "
+                        "thread=%s expected=%s actual=%s method=%s",
+                        thread_id,
+                        candidate.observed_turn_id,
+                        turn_id,
+                        method,
+                    )
+                    return
+                if not self._bind_turn_context(
+                    candidate,
+                    turn_id,
+                    observed=True,
+                ):
+                    return
+            context = candidate
         if context is None:
             return
+        if turn_id and context.observed_turn_id is None:
+            if not self._bind_turn_context(context, turn_id, observed=True):
+                return
 
         if method == "turn/started":
-            turn = params.get("turn") or {}
-            actual_turn_id = turn.get("id")
-            if actual_turn_id:
-                context.turn_id = actual_turn_id
-                self._contexts_by_turn[actual_turn_id] = context
             context.process.feed({"type": "turn.started"})
             return
 
@@ -1002,6 +1230,16 @@ class CodexAppServer:
                 )
                 exit_code = 0
                 stderr = ""
+            elif status == "interrupted":
+                context.process.feed(
+                    {
+                        "type": "turn.completed",
+                        "usage": context.usage or {},
+                        "turn_id": context.turn_id,
+                    }
+                )
+                exit_code = 130
+                stderr = ""
             else:
                 normalized_error = self._normalize_turn_error(
                     error,
@@ -1021,9 +1259,7 @@ class CodexAppServer:
                 status,
             )
             context.process.finish(exit_code, stderr)
-            self._contexts_by_thread.pop(context.thread_id, None)
-            if context.turn_id:
-                self._contexts_by_turn.pop(context.turn_id, None)
+            self._detach_turn_context(context)
 
     @staticmethod
     def _normalize_turn_error(

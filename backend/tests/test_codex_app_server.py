@@ -416,6 +416,276 @@ async def test_steer_turn_targets_the_active_turn():
 
 
 @pytest.mark.asyncio
+async def test_existing_goal_turn_notification_rebinds_submission_id():
+    """A turn/start submission can be steered into an older native goal turn."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "thread/resume":
+            return {"thread": {"id": "thread-goal"}}
+        if method == "turn/start":
+            # Task 208's active goal emitted output before the turn/start RPC
+            # returned its distinct submission id.
+            server._handle_notification("item/agentMessage/delta", {
+                "threadId": "thread-goal",
+                "turnId": "turn-active-goal",
+                "itemId": "msg-goal",
+                "delta": "still working",
+            })
+            return {"turn": {"id": "turn-submission"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="continue watching",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-goal",
+        git_env=None,
+        task_id=208,
+    )
+
+    context = server._contexts_by_thread["thread-goal"]
+    assert context.admitted_turn_id == "turn-submission"
+    assert context.observed_turn_id == "turn-active-goal"
+    assert context.turn_id == "turn-active-goal"
+    assert "turn-submission" not in server._contexts_by_turn
+    assert server._contexts_by_turn["turn-active-goal"] is context
+
+    # Once an actual turn is confirmed, an unrelated late notification must
+    # not be routed into this process by thread-id fallback.
+    server._handle_notification("item/agentMessage/delta", {
+        "threadId": "thread-goal",
+        "turnId": "turn-unrelated",
+        "itemId": "msg-unrelated",
+        "delta": "wrong turn",
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-goal",
+        "turn": {
+            "id": "turn-active-goal",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    deltas = [row.get("delta") for row in rows if "delta" in row]
+    assert deltas == ["still working"]
+    assert await process.wait() == 0
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_terminal_first_notification_settles_provisional_context():
+    """A hook can finish the adopted active turn before any user item event."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "thread/resume":
+            return {"thread": {"id": "thread-hook"}}
+        if method == "turn/start":
+            server._handle_notification("turn/completed", {
+                "threadId": "thread-hook",
+                "turn": {
+                    "id": "turn-active-hook",
+                    "status": "completed",
+                    "error": None,
+                },
+            })
+            return {"turn": {"id": "turn-submission"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="input intercepted by a hook",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-hook",
+        git_env=None,
+        task_id=210,
+    )
+
+    assert await process.wait() == 0
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_signal_interrupt_reconciles_and_pauses_existing_goal_turn():
+    """Stop must pause a native goal and retry its authoritative active id."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    interrupt_ids: list[str] = []
+    goal_statuses: list[str] = []
+
+    async def request(method, params):
+        if method == "thread/resume":
+            return {"thread": {"id": "thread-goal"}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-submission"}}
+        if method == "turn/interrupt":
+            interrupt_ids.append(params["turnId"])
+            if params["turnId"] == "turn-submission":
+                raise CodexAppServerError(
+                    "turn/interrupt failed: expected active turn id "
+                    "turn-submission but found turn-active-goal"
+                )
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/completed",
+                {
+                    "threadId": "thread-goal",
+                    "turn": {
+                        "id": "turn-active-goal",
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                },
+            )
+            return {}
+        if method == "thread/goal/get":
+            return {"goal": {"status": "active"}}
+        if method == "thread/goal/set":
+            goal_statuses.append(params["status"])
+            return {"goal": {"status": params["status"]}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="continue watching",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-goal",
+        git_env=None,
+        task_id=208,
+    )
+
+    process.send_signal(signal.SIGINT)
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 130
+    assert interrupt_ids == ["turn-submission", "turn-active-goal"]
+    assert goal_statuses == ["paused"]
+    assert "turn-submission" not in server._contexts_by_turn
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_interrupt_continues_when_goals_feature_is_disabled():
+    """A normal adopted turn remains stoppable when Goals is disabled."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    interrupt_ids: list[str] = []
+
+    async def request(method, params):
+        if method == "thread/resume":
+            return {"thread": {"id": "thread-regular"}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-submission"}}
+        if method == "turn/interrupt":
+            interrupt_ids.append(params["turnId"])
+            if params["turnId"] == "turn-submission":
+                raise CodexAppServerError(
+                    "turn/interrupt failed: expected active turn id "
+                    "`turn-submission` but found `turn-active-regular`"
+                )
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/completed",
+                {
+                    "threadId": "thread-regular",
+                    "turn": {
+                        "id": "turn-active-regular",
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                },
+            )
+            return {}
+        if method == "thread/goal/get":
+            raise CodexAppServerError(
+                "thread/goal/get failed: goals feature is disabled"
+            )
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="continue regular work",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-regular",
+        git_env=None,
+        task_id=209,
+    )
+
+    process.send_signal(signal.SIGTERM)
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 130
+    assert interrupt_ids == ["turn-submission", "turn-active-regular"]
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_steer_retries_authoritative_active_turn_id():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    steer_ids: list[str] = []
+
+    async def request(method, params):
+        if method == "thread/resume":
+            return {"thread": {"id": "thread-goal"}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-submission"}}
+        if method == "turn/steer":
+            steer_ids.append(params["expectedTurnId"])
+            if params["expectedTurnId"] == "turn-submission":
+                raise CodexAppServerError(
+                    "turn/steer failed: expected active turn id "
+                    "`turn-submission` but found `turn-active-goal`"
+                )
+            return {"turnId": "turn-active-goal"}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="continue watching",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-goal",
+        git_env=None,
+        task_id=208,
+    )
+
+    assert await server.steer_turn("thread-goal", "new evidence") is True
+    assert steer_ids == ["turn-submission", "turn-active-goal"]
+    assert (
+        server._contexts_by_thread["thread-goal"].turn_id
+        == "turn-active-goal"
+    )
+    process.finish(0)
+    server._detach_turn_context(server._contexts_by_thread["thread-goal"])
+
+
+@pytest.mark.asyncio
 async def test_second_turn_on_same_active_thread_is_typed_busy_error():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)

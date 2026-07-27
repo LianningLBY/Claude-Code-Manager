@@ -46,6 +46,10 @@ _CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
     "CLOUDROUTER_API_KEY",
+    "APEX_CODEX_GATEWAY_KEY",
+    "APEX_CODEX_API_KEY",
+    "APEXROUTER_API_KEY",
+    "APEXROUTER_CODEX_API_KEY",
 )
 _CLOUDROUTER_TRANSIENT_RE = re.compile(
     r"(?:API\s+Error|HTTP|status(?:\s+code)?|error|upstream)"
@@ -884,6 +888,7 @@ class InstanceManager:
                         source_log_id=source_log_id,
                         current_message=current_message,
                         queue_timestamp=queue_timestamp,
+                        disable_project_config=cloudrouter_account is not None,
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -1011,6 +1016,7 @@ class InstanceManager:
             codex_mcp_specs=(
                 codex_mcp_specs if codex_main_mcp_required else ()
             ),
+            codex_api_account=cloudrouter_account is not None,
         )
         if provider == "codex":
             logger.info(
@@ -1317,6 +1323,32 @@ class InstanceManager:
         async with guard(provider, config_dir, model) as current:
             yield current
 
+    @asynccontextmanager
+    async def _cloudrouter_configuration_admission(
+        self,
+        provider: str,
+        config_dir: str | None,
+    ):
+        """Validate an API route before a non-model app-server operation."""
+
+        account = self._cloudrouter_account_for_runtime_home(
+            provider, config_dir,
+        )
+        if account is None:
+            yield None
+            return
+        guard = getattr(
+            self.cloudrouter_store,
+            "configuration_admission",
+            None,
+        )
+        if not callable(guard):
+            raise RuntimeError(
+                "CloudRouter account store cannot validate runtime storage"
+            )
+        async with guard(provider, config_dir) as current:
+            yield current
+
     def _codex_env_remove_for_home(self, codex_home: str) -> set[str]:
         if self._cloudrouter_account_for_runtime_home("codex", codex_home):
             return set(_CLOUDROUTER_CODEX_AUTH_ENV_KEYS)
@@ -1351,9 +1383,12 @@ class InstanceManager:
     async def read_codex_rate_limits(self, codex_home: str) -> dict:
         """Read live quota from the app-server bound to ``codex_home``."""
 
-        async with self.codex_home_app_server_guard(codex_home) as home:
-            registry = self._ensure_codex_app_server_registry()
-            return await registry.read_rate_limits(home)
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.read_rate_limits(home)
 
     @asynccontextmanager
     async def codex_home_app_server_guard(self, codex_home: str | None):
@@ -1396,9 +1431,12 @@ class InstanceManager:
     ) -> dict:
         """Read one idle Codex thread with turns from its bound account."""
 
-        async with self.codex_home_app_server_guard(codex_home) as home:
-            registry = self._ensure_codex_app_server_registry()
-            return await registry.read_thread(home, thread_id)
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.read_thread(home, thread_id)
 
     async def create_codex_thread(
         self,
@@ -1409,13 +1447,22 @@ class InstanceManager:
     ) -> dict:
         """Create and register an empty native Codex thread."""
 
-        async with self.codex_home_app_server_guard(codex_home) as home:
-            registry = self._ensure_codex_app_server_registry()
-            return await registry.create_thread(
-                home,
-                cwd=cwd,
-                model=model,
-            )
+        from backend.services.codex_app_server import normalize_codex_home
+
+        home = normalize_codex_home(codex_home)
+        # Match ordinary launch lock ordering: API-store admission precedes
+        # the per-home app-server gate, never the reverse.
+        async with self._cloudrouter_runtime_admission(
+            "codex", home, model,
+        ) as api_account:
+            async with self.codex_home_app_server_guard(home) as admitted_home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.create_thread(
+                    admitted_home,
+                    cwd=cwd,
+                    model=model,
+                    disable_project_config=api_account is not None,
+                )
 
     async def fork_codex_thread(
         self,
@@ -1426,22 +1473,28 @@ class InstanceManager:
     ) -> dict:
         """Create and register a native Codex thread fork."""
 
-        async with self.codex_home_app_server_guard(codex_home) as home:
-            registry = self._ensure_codex_app_server_registry()
-            return await registry.fork_thread(
-                home,
-                thread_id,
-                last_turn_id=last_turn_id,
-            )
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                return await registry.fork_thread(
+                    home,
+                    thread_id,
+                    last_turn_id=last_turn_id,
+                )
 
     async def delete_codex_thread(
         self, codex_home: str, thread_id: str,
     ) -> None:
         """Compensate a failed fork by deleting its unclaimed thread."""
 
-        async with self.codex_home_app_server_guard(codex_home) as home:
-            registry = self._ensure_codex_app_server_registry()
-            await registry.delete_thread(home, thread_id)
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                await registry.delete_thread(home, thread_id)
 
     def _codex_home_lock(self, codex_home: str) -> asyncio.Lock:
         """Return the admission/maintenance lock for a canonical home."""
@@ -1512,6 +1565,7 @@ class InstanceManager:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        disable_project_config: bool = False,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -1528,6 +1582,7 @@ class InstanceManager:
             git_env=git_env,
             task_id=task_id,
             mcp_specs=mcp_specs,
+            disable_project_config=disable_project_config,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -2662,6 +2717,7 @@ class InstanceManager:
         cwd: str | None = None,
         task_id: int | None = None,
         codex_mcp_specs: Sequence["McpServerSpec"] = (),
+        codex_api_account: bool = False,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -2726,6 +2782,19 @@ class InstanceManager:
             codex_effort = clamp_codex_effort(model, effort_level)
             if codex_effort:
                 cmd.extend(["-c", f'model_reasoning_effort="{codex_effort}"'])
+            if codex_api_account:
+                from backend.services.codex_app_server import (
+                    codex_untrusted_project_override,
+                )
+
+                # Codex otherwise persists this danger-full-access workspace
+                # as trusted in the API account's managed user config.  Keep
+                # project-local config disabled for API-key isolation while
+                # leaving ordinary Codex accounts unchanged.
+                cmd.extend([
+                    "-c",
+                    codex_untrusted_project_override(cwd or os.getcwd()),
+                ])
             if codex_mcp_specs:
                 from backend.services.codex_app_server import CodexRequiredMcpError
                 from backend.services.mcp_config import (

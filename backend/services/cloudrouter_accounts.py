@@ -1,9 +1,11 @@
-"""Private on-disk CloudRouter API accounts.
+"""Private on-disk API gateway accounts.
 
 An API account deliberately looks like an ordinary Claude/Codex pool account:
 it owns one ``CLAUDE_CONFIG_DIR`` and one ``CODEX_HOME``.  The API key is kept
 outside both CLI configuration files and is only exposed through a small
-credential helper.
+credential helper.  The historical module/class names remain for compatibility
+with existing CloudRouter installations; account metadata identifies the
+actual gateway.
 """
 
 from __future__ import annotations
@@ -33,6 +35,20 @@ CLAUDE_BASE_URL = "https://console.cloudrouter.online"
 CODEX_BASE_URL = "https://console.cloudrouter.online/v1"
 MODELS_URL = f"{CODEX_BASE_URL}/models"
 USAGE_URL = f"{CODEX_BASE_URL}/usage"
+APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+APEX_MODELS_URL = f"{APEX_CODEX_BASE_URL}/models"
+APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
+# Keep this aligned with the Codex CLI version pinned by scripts/setup.sh and
+# WorkerProvisioner.  Apex exposes the native Codex model catalog endpoint,
+# which requires the caller version in order to filter compatible models.
+APEX_CODEX_CLIENT_VERSION = "0.144.6"
+API_PROVIDER_CLOUDROUTER = "cloudrouter"
+API_PROVIDER_APEX = "apex"
+APEX_CODEX_PROVIDER = "apexrouter"
+# Existing installs may already have the pre-rename provider in their managed
+# config. Accept only its exact CCM-owned shape and atomically rewrite it.
+LEGACY_APEX_CODEX_PROVIDER = "apex_gateway"
+LEGACY_APEX_LABEL = "Apex Gateway"
 ENDPOINTS = {
     "claude_base_url": CLAUDE_BASE_URL,
     "codex_base_url": CODEX_BASE_URL,
@@ -40,10 +56,57 @@ ENDPOINTS = {
     "usage_url": USAGE_URL,
 }
 
-ACCOUNT_ID_RE = re.compile(r"^cloudrouter-([1-9][0-9]*)$")
+
+@dataclass(frozen=True, slots=True)
+class ApiProviderSpec:
+    id: str
+    label: str
+    account_prefix: str
+    codex_provider: str
+    codex_base_url: str
+    models_url: str
+    usage_url: str | None
+    claude_base_url: str | None = None
+
+    @property
+    def endpoints(self) -> dict[str, str | None]:
+        return {
+            "claude_base_url": self.claude_base_url,
+            "codex_base_url": self.codex_base_url,
+            "models_url": self.models_url,
+            "usage_url": self.usage_url,
+        }
+
+
+API_PROVIDER_SPECS = {
+    API_PROVIDER_CLOUDROUTER: ApiProviderSpec(
+        id=API_PROVIDER_CLOUDROUTER,
+        label="CloudRouter",
+        account_prefix="cloudrouter",
+        codex_provider="cloudrouter",
+        claude_base_url=CLAUDE_BASE_URL,
+        codex_base_url=CODEX_BASE_URL,
+        models_url=MODELS_URL,
+        usage_url=USAGE_URL,
+    ),
+    API_PROVIDER_APEX: ApiProviderSpec(
+        id=API_PROVIDER_APEX,
+        label="ApexRouter",
+        account_prefix="apex",
+        codex_provider=APEX_CODEX_PROVIDER,
+        codex_base_url=APEX_CODEX_BASE_URL,
+        models_url=APEX_MODELS_URL,
+        usage_url=APEX_USAGE_URL,
+    ),
+}
+ACCOUNT_ID_RE = re.compile(
+    r"^(?P<provider>cloudrouter|apex)-(?P<number>[1-9][0-9]*)$"
+)
 MAX_METADATA_BYTES = 256 * 1024
 MAX_API_RESPONSE_BYTES = 1024 * 1024
 MAX_API_KEY_BYTES = 16 * 1024
+MAX_DISCOVERED_MODELS = 1024
+MAX_MODEL_ID_BYTES = 512
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 DEFAULT_QUOTA_CACHE_TTL = 60.0
 CLAUDE_SKIP_DANGEROUS_PROMPT = "skipDangerousModePermissionPrompt"
@@ -62,7 +125,7 @@ class CloudRouterUnsafePathError(CloudRouterAccountError):
 
 
 class CloudRouterUpstreamError(CloudRouterAccountError):
-    """CloudRouter rejected or could not complete a request."""
+    """An API gateway rejected or could not complete a request."""
 
     def __init__(self, code: str, *, status_code: int | None = None):
         self.code = code
@@ -72,6 +135,51 @@ class CloudRouterUpstreamError(CloudRouterAccountError):
 
 def _now() -> float:
     return time.time()
+
+
+def normalize_api_provider(value: str | None) -> str:
+    provider = str(value or API_PROVIDER_CLOUDROUTER).strip().lower()
+    if provider not in API_PROVIDER_SPECS:
+        raise ValueError("Unknown API provider")
+    return provider
+
+
+def api_auth_kind(api_provider: str | None) -> str:
+    return f"{normalize_api_provider(api_provider)}_api"
+
+
+def is_api_auth_kind(value: str | None) -> bool:
+    return str(value or "").lower() in {
+        api_auth_kind(provider) for provider in API_PROVIDER_SPECS
+    }
+
+
+def _is_codex_managed_projects_state(value: Any) -> bool:
+    """Accept only the project-trust shape Codex itself persists.
+
+    Codex 0.144.6 writes the canonical Git root to ``config.toml`` when
+    ``thread/start`` receives a writable sandbox.  Keep this CLI-owned state
+    compatible without turning the managed user config into a general-purpose
+    configuration surface.
+    """
+
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    for project_path, project in value.items():
+        if (
+            not isinstance(project_path, str)
+            or not project_path
+            or "\x00" in project_path
+            or not os.path.isabs(project_path)
+            or os.path.normpath(project_path) != project_path
+            or not isinstance(project, dict)
+            or project.get("trust_level") not in {"trusted", "untrusted"}
+            or set(project) != {"trust_level"}
+        ):
+            return False
+    return True
 
 
 def _mode(path: Path) -> int:
@@ -206,14 +314,61 @@ def _atomic_private_write(path: Path, payload: bytes, *, mode: int = 0o600) -> N
         temporary.unlink(missing_ok=True)
 
 
-def _atomic_private_json(path: Path, value: dict[str, Any]) -> None:
+def _atomic_private_json(
+    path: Path,
+    value: dict[str, Any],
+    *,
+    maximum: int | None = None,
+) -> None:
     payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
+    if maximum is not None and len(payload) > maximum:
+        raise CloudRouterUpstreamError("metadata_too_large")
     _atomic_private_write(path, payload)
+
+
+def _codex_config_payload(
+    spec: ApiProviderSpec,
+    helper_path: Path,
+    *,
+    personality: str | None = None,
+) -> bytes:
+    """Render the complete CCM-owned Codex user configuration."""
+
+    personality_line = (
+        f"personality = {json.dumps(personality)}\n"
+        if personality is not None
+        else ""
+    )
+    provider_entries = [(spec.codex_provider, spec.label)]
+    if spec.id == API_PROVIDER_APEX:
+        # Native Codex rollouts and state_5.sqlite persist the provider id.
+        # Keep the exact old route as an alias so pre-rename threads can resume
+        # while every newly started thread defaults to ``apexrouter``.
+        provider_entries.append((LEGACY_APEX_CODEX_PROVIDER, spec.label))
+    provider_config = ""
+    for provider_id, provider_label in provider_entries:
+        provider_config += (
+            f"[model_providers.{provider_id}]\n"
+            f"name = {json.dumps(provider_label)}\n"
+            f"base_url = {json.dumps(spec.codex_base_url)}\n"
+            'wire_api = "responses"\n'
+            "supports_websockets = false\n\n"
+            f"[model_providers.{provider_id}.auth]\n"
+            f"command = {json.dumps(str(helper_path))}\n"
+            "timeout_ms = 5000\n"
+            "refresh_interval_ms = 0\n\n"
+        )
+    config = (
+        f"model_provider = {json.dumps(spec.codex_provider)}\n"
+        f"{personality_line}\n"
+        f"{provider_config}"
+    )
+    return config.encode("utf-8")
 
 
 def _validate_account_id(account_id: str) -> str:
     if not isinstance(account_id, str) or not ACCOUNT_ID_RE.fullmatch(account_id):
-        raise CloudRouterAccountNotFound("Unknown CloudRouter account")
+        raise CloudRouterAccountNotFound("Unknown API account")
     return account_id
 
 
@@ -252,6 +407,8 @@ def _provider_for_model(model: str) -> str | None:
 def _normalise_models(payload: Any) -> dict[str, list[str]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise CloudRouterUpstreamError("invalid_models_response")
+    if len(payload["data"]) > MAX_DISCOVERED_MODELS:
+        raise CloudRouterUpstreamError("too_many_models")
     result: dict[str, list[str]] = {"claude": [], "codex": []}
     seen: set[str] = set()
     for item in payload["data"]:
@@ -259,6 +416,12 @@ def _normalise_models(payload: Any) -> dict[str, list[str]]:
         if not isinstance(model_id, str):
             continue
         model_id = model_id.strip()
+        if (
+            not model_id
+            or len(model_id.encode("utf-8")) > MAX_MODEL_ID_BYTES
+            or any(character.isspace() for character in model_id)
+        ):
+            raise CloudRouterUpstreamError("invalid_models_response")
         provider = _provider_for_model(model_id)
         if not provider or model_id in seen:
             continue
@@ -269,6 +432,47 @@ def _normalise_models(payload: Any) -> dict[str, list[str]]:
     if not any(result.values()):
         raise CloudRouterUpstreamError("no_supported_models")
     return result
+
+
+def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
+    """Normalise Apex's native Codex model catalog response.
+
+    Unlike an OpenAI-compatible ``/models`` response (``data[].id``), the
+    Codex client endpoint returns ``models[].slug`` plus visibility and API
+    support flags.  Hidden/internal and explicitly unsupported models must not
+    become selectable CCM API models.
+    """
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        raise CloudRouterUpstreamError("invalid_models_response")
+    items = payload["models"]
+    if len(items) > MAX_DISCOVERED_MODELS:
+        raise CloudRouterUpstreamError("too_many_models")
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("supported_in_api") is False or item.get("visibility") == "hide":
+            continue
+        model_id = item.get("slug")
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        if (
+            not model_id
+            or len(model_id.encode("utf-8")) > MAX_MODEL_ID_BYTES
+            or any(character.isspace() for character in model_id)
+        ):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        if _provider_for_model(model_id) != "codex" or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append(model_id)
+    models.sort()
+    if not models:
+        raise CloudRouterUpstreamError("no_supported_models")
+    return {"claude": [], "codex": models}
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -554,6 +758,103 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
     return snapshot
 
 
+def _normalise_apex_usage(
+    account_id: str,
+    payload: Any,
+) -> dict[str, Any]:
+    """Keep per-Key usage separate from the shared Apex group limits."""
+
+    if not isinstance(payload, dict):
+        raise CloudRouterUpstreamError("invalid_usage_response")
+    raw_used = payload.get("used")
+    raw_remaining = payload.get("remaining")
+    raw_limits = payload.get("limits")
+    if not all(
+        isinstance(value, dict)
+        for value in (raw_used, raw_remaining, raw_limits)
+    ):
+        raise CloudRouterUpstreamError("invalid_usage_response")
+
+    definitions = (
+        ("requests_5h", "5h 请求（分组共享）", "requests"),
+        ("requests_day", "每日请求（分组共享）", "requests"),
+        ("tokens_day", "每日 Tokens（分组共享）", "tokens"),
+        ("tokens_month", "每月 Tokens（分组共享）", "tokens"),
+    )
+    windows: list[dict[str, Any]] = []
+    key_usage: dict[str, float | int] = {}
+    exhausted = False
+    for window_id, label, unit in definitions:
+        key_used = _decimal(raw_used.get(window_id))
+        remaining = _decimal(raw_remaining.get(window_id))
+        limit = _decimal(raw_limits.get(window_id))
+        # Availability is governed by the shared group, so a partial response
+        # must never become a known-healthy snapshot based only on this Key's
+        # own usage. Apex documents all three values for every fixed window.
+        if (
+            key_used is None
+            or remaining is None
+            or limit is None
+            or key_used < 0
+            or remaining < 0
+            or limit < 0
+            or remaining > limit
+        ):
+            raise CloudRouterUpstreamError("invalid_usage_response")
+        group_used = limit - remaining
+        item, window_exhausted = _window(
+            window_id=window_id,
+            label=label,
+            currency=unit,
+            raw_used=group_used,
+            raw_limit=limit,
+            raw_remaining=remaining,
+        )
+        item["scope"] = "group"
+        if (parsed_key_used := _json_number(key_used)) is not None:
+            item["key_used"] = parsed_key_used
+            key_usage[window_id] = parsed_key_used
+        windows.append(item)
+        exhausted = (
+            exhausted
+            or window_exhausted
+            or remaining <= 0
+        )
+
+    concurrency_decimal = _decimal(raw_limits.get("concurrency"))
+    if concurrency_decimal is None or concurrency_decimal < 0:
+        raise CloudRouterUpstreamError("invalid_usage_response")
+    concurrency = _json_number(concurrency_decimal)
+    exhausted = exhausted or concurrency_decimal <= 0
+    key_name = payload.get("key_name")
+    group_name = payload.get("group_name")
+    state = "exhausted" if exhausted else "active"
+    snapshot: dict[str, Any] = {
+        "account_id": account_id,
+        "fetched_at": _now(),
+        "stale": False,
+        "state": state,
+        "status": state,
+        "mode": "shared_group",
+        "currency": None,
+        "unit": None,
+        "quota": None,
+        "windows": windows,
+        "usage": {"key": key_usage},
+        "key_usage": key_usage,
+        "available": not exhausted,
+        "known": True,
+        "reason": state,
+    }
+    if isinstance(key_name, str) and key_name.strip():
+        snapshot["key_name"] = key_name.strip()
+    if isinstance(group_name, str) and group_name.strip():
+        snapshot["group_name"] = group_name.strip()
+    if concurrency is not None:
+        snapshot["concurrency"] = concurrency
+    return snapshot
+
+
 def _unknown_snapshot(
     account_id: str,
     reason: str,
@@ -604,6 +905,7 @@ def _unavailable_snapshot(account_id: str, reason: str) -> dict[str, Any]:
 class CloudRouterAccount:
     id: str
     name: str
+    api_provider: str
     enabled: bool
     retired: bool
     cleanup_pending: bool
@@ -622,6 +924,14 @@ class CloudRouterAccount:
     @property
     def providers(self) -> list[str]:
         return [provider for provider in ("claude", "codex") if self.models.get(provider)]
+
+    @property
+    def auth_kind(self) -> str:
+        return api_auth_kind(self.api_provider)
+
+    @property
+    def provider_label(self) -> str:
+        return API_PROVIDER_SPECS[self.api_provider].label
 
     def supports_model(self, provider: str, model: str | None) -> bool:
         provider = str(provider or "").lower()
@@ -651,6 +961,8 @@ class CloudRouterAccount:
         return {
             "id": self.id,
             "name": self.name,
+            "api_provider": self.api_provider,
+            "auth_kind": self.auth_kind,
             "enabled": self.enabled,
             "retired": self.retired,
             "cleanup_pending": self.cleanup_pending,
@@ -661,7 +973,9 @@ class CloudRouterAccount:
             "claude_config_dir": self.claude_config_dir,
             "codex_home": self.codex_home,
             "supported_models": supported_models,
-            "endpoints": dict(ENDPOINTS),
+            "endpoints": dict(
+                API_PROVIDER_SPECS[self.api_provider].endpoints
+            ),
         }
 
 
@@ -693,7 +1007,7 @@ sys.stdout.write(payload.decode("utf-8"))
 
 
 class CloudRouterAccountStore:
-    """Manage CloudRouter accounts rooted under one caller-selected directory."""
+    """Manage API-gateway accounts under one caller-selected directory."""
 
     def __init__(
         self,
@@ -737,7 +1051,19 @@ class CloudRouterAccountStore:
             ) from exc
         if not isinstance(data, dict) or data.get("id") != account_id:
             raise CloudRouterUnsafePathError(f"Mismatched account metadata: {account_id}")
-        if data.get("endpoints") != ENDPOINTS:
+        try:
+            api_provider = normalize_api_provider(data.get("api_provider"))
+        except ValueError as exc:
+            raise CloudRouterUnsafePathError(
+                f"Invalid API provider metadata: {account_id}"
+            ) from exc
+        match = ACCOUNT_ID_RE.fullmatch(account_id)
+        spec = API_PROVIDER_SPECS[api_provider]
+        if match is None or match.group("provider") != spec.account_prefix:
+            raise CloudRouterUnsafePathError(
+                f"Mismatched API provider metadata: {account_id}"
+            )
+        if data.get("endpoints") != spec.endpoints:
             raise CloudRouterUnsafePathError(f"Modified fixed endpoints: {account_id}")
         name = data.get("name")
         models = data.get("models")
@@ -750,9 +1076,15 @@ class CloudRouterAccountStore:
             })
             for provider in ("claude", "codex")
         }
+        if api_provider == API_PROVIDER_APEX:
+            # Only the Codex-compatible Apex route has been supplied.  Never
+            # project a coincidentally named Claude model into an unconfigured
+            # CLAUDE_CONFIG_DIR.
+            normalised_models["claude"] = []
         account = CloudRouterAccount(
             id=account_id,
             name=name,
+            api_provider=api_provider,
             enabled=bool(data.get("enabled", True)) and not bool(data.get("retired", False)),
             retired=bool(data.get("retired", False)),
             cleanup_pending=bool(data.get("cleanup_pending", False)),
@@ -774,11 +1106,14 @@ class CloudRouterAccountStore:
                 ("account.json", 0o600), ("api.key", 0o600), ("key-helper", 0o700),
             ):
                 _require_owned_regular(path / file_name, expected_mode)
-            _require_owned_regular(path / "claude" / "settings.json", 0o600)
-            self._converge_claude_runtime_settings(account)
-            _converge_cli_mutable_private_file(
-                path / "claude" / ".claude.json",
-            )
+            if spec.claude_base_url is not None:
+                _require_owned_regular(
+                    path / "claude" / "settings.json", 0o600
+                )
+                self._converge_claude_runtime_settings(account)
+                _converge_cli_mutable_private_file(
+                    path / "claude" / ".claude.json",
+                )
             _require_owned_regular(path / "codex" / "config.toml", 0o600)
             self._validate_runtime_configuration(account)
         return account
@@ -830,48 +1165,52 @@ class CloudRouterAccountStore:
             )
         except CloudRouterUnsafePathError as exc:
             raise CloudRouterUnsafePathError(
-                f"Modified CloudRouter credential helper: {account.id}",
+                f"Modified API credential helper: {account.id}",
             ) from exc
         if helper_payload != KEY_HELPER.encode("utf-8"):
             raise CloudRouterUnsafePathError(
-                f"Modified CloudRouter credential helper: {account.id}",
+                f"Modified API credential helper: {account.id}",
             )
 
-        try:
-            settings = json.loads(_open_regular_nofollow(
-                account.root / "claude" / "settings.json",
-                maximum=MAX_METADATA_BYTES,
-            ).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CloudRouterUnsafePathError(
-                f"Invalid Claude settings: {account.id}",
-            ) from exc
-        if (
-            not isinstance(settings, dict)
-            or settings.get("env") != {"ANTHROPIC_BASE_URL": CLAUDE_BASE_URL}
-            or settings.get("apiKeyHelper") != _claude_helper_command(account.root)
-            or settings.get(CLAUDE_SKIP_DANGEROUS_PROMPT) is not True
-        ):
-            raise CloudRouterUnsafePathError(
-                f"Modified Claude API routing: {account.id}",
-            )
+        spec = API_PROVIDER_SPECS[account.api_provider]
+        if spec.claude_base_url is not None:
+            try:
+                settings = json.loads(_open_regular_nofollow(
+                    account.root / "claude" / "settings.json",
+                    maximum=MAX_METADATA_BYTES,
+                ).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Invalid Claude settings: {account.id}",
+                ) from exc
+            if (
+                not isinstance(settings, dict)
+                or settings.get("env")
+                != {"ANTHROPIC_BASE_URL": spec.claude_base_url}
+                or settings.get("apiKeyHelper")
+                != _claude_helper_command(account.root)
+                or settings.get(CLAUDE_SKIP_DANGEROUS_PROMPT) is not True
+            ):
+                raise CloudRouterUnsafePathError(
+                    f"Modified Claude API routing: {account.id}",
+                )
 
-        try:
-            onboarding = json.loads(_open_regular_nofollow(
-                account.root / "claude" / ".claude.json",
-                maximum=MAX_METADATA_BYTES,
-            ).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CloudRouterUnsafePathError(
-                f"Invalid Claude onboarding state: {account.id}",
-            ) from exc
-        if (
-            not isinstance(onboarding, dict)
-            or onboarding.get("hasCompletedOnboarding") is not True
-        ):
-            raise CloudRouterUnsafePathError(
-                f"Invalid Claude onboarding state: {account.id}",
-            )
+            try:
+                onboarding = json.loads(_open_regular_nofollow(
+                    account.root / "claude" / ".claude.json",
+                    maximum=MAX_METADATA_BYTES,
+                ).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Invalid Claude onboarding state: {account.id}",
+                ) from exc
+            if (
+                not isinstance(onboarding, dict)
+                or onboarding.get("hasCompletedOnboarding") is not True
+            ):
+                raise CloudRouterUnsafePathError(
+                    f"Invalid Claude onboarding state: {account.id}",
+                )
 
         try:
             codex = tomllib.loads(_open_regular_nofollow(
@@ -882,11 +1221,9 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Invalid Codex configuration: {account.id}",
             ) from exc
-        providers = codex.get("model_providers")
-        provider = providers.get("cloudrouter") if isinstance(providers, dict) else None
         expected_provider = {
-            "name": "CloudRouter",
-            "base_url": CODEX_BASE_URL,
+            "name": spec.label,
+            "base_url": spec.codex_base_url,
             "wire_api": "responses",
             "supports_websockets": False,
             "auth": {
@@ -895,13 +1232,75 @@ class CloudRouterAccountStore:
                 "refresh_interval_ms": 0,
             },
         }
-        if (
-            codex.get("model_provider") != "cloudrouter"
-            or provider != expected_provider
-        ):
+        expected_providers = {
+            spec.codex_provider: expected_provider,
+        }
+        if account.api_provider == API_PROVIDER_APEX:
+            expected_providers[LEGACY_APEX_CODEX_PROVIDER] = {
+                **expected_provider,
+            }
+        expected_codex = {
+            "model_provider": spec.codex_provider,
+            "model_providers": expected_providers,
+        }
+        legacy_apex_codex = None
+        if account.api_provider == API_PROVIDER_APEX:
+            legacy_apex_codex = {
+                "model_provider": LEGACY_APEX_CODEX_PROVIDER,
+                "model_providers": {
+                    LEGACY_APEX_CODEX_PROVIDER: {
+                        **expected_provider,
+                        "name": LEGACY_APEX_LABEL,
+                    },
+                },
+            }
+        # Codex 0.144.6 mutates config.toml during normal use:
+        #
+        # * its one-time personality migration persists ``pragmatic``;
+        # * thread/start with workspace-write/danger-full-access persists the
+        #   canonical Git root as a trusted project, then immediately reloads
+        #   (an explicit official ``untrusted`` value is strictly safer and
+        #   uses the same one-field ProjectConfig schema).
+        #
+        # Treat project trust only as recoverable official state.  A trusted
+        # project can load project-local MCP/hooks even though Codex strips
+        # provider/auth redirection from that layer, so it must not remain in
+        # an API account's persistent user config.  Runtime launches inject an
+        # explicit session-level ``untrusted`` entry for their cwd.
+        personality = codex.pop("personality", None)
+        if personality not in {None, "pragmatic"}:
             raise CloudRouterUnsafePathError(
                 f"Modified Codex API routing: {account.id}",
             )
+        projects = codex.pop("projects", None)
+        if not _is_codex_managed_projects_state(projects):
+            raise CloudRouterUnsafePathError(
+                f"Modified Codex API routing: {account.id}",
+            )
+        migrate_legacy_apex = (
+            legacy_apex_codex is not None
+            and codex == legacy_apex_codex
+        )
+        if codex != expected_codex and not migrate_legacy_apex:
+            raise CloudRouterUnsafePathError(
+                f"Modified Codex API routing: {account.id}",
+            )
+        if projects is not None or migrate_legacy_apex:
+            try:
+                _atomic_private_write(
+                    account.root / "codex" / "config.toml",
+                    _codex_config_payload(
+                        spec,
+                        account.root / "key-helper",
+                        personality=personality,
+                    ),
+                )
+            except CloudRouterAccountError:
+                raise
+            except OSError as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Could not secure Codex project state: {account.id}",
+                ) from exc
 
     def reload(self) -> list[CloudRouterAccount]:
         _ensure_private_directory(self.root)
@@ -923,7 +1322,12 @@ class CloudRouterAccountStore:
     def all_accounts(self, include_retired: bool = False) -> list[CloudRouterAccount]:
         accounts = sorted(
             self._accounts.values(),
-            key=lambda account: int(ACCOUNT_ID_RE.fullmatch(account.id).group(1)),  # type: ignore[union-attr]
+            key=lambda account: (
+                list(API_PROVIDER_SPECS).index(account.api_provider),
+                int(
+                    ACCOUNT_ID_RE.fullmatch(account.id).group("number")  # type: ignore[union-attr]
+                ),
+            ),
         )
         if not include_retired:
             accounts = [account for account in accounts if not account.retired]
@@ -970,6 +1374,50 @@ class CloudRouterAccountStore:
             or self.account_for_codex_home(path)
         )
 
+    def _reload_runtime_account(
+        self,
+        provider: str,
+        runtime_home: str | os.PathLike[str],
+    ) -> CloudRouterAccount:
+        """Reload and resolve one enabled account while mutation is fenced."""
+
+        try:
+            self.reload()
+            finder = (
+                self.account_for_codex_home
+                if provider == "codex"
+                else self.account_for_claude_config_dir
+            )
+            account = finder(runtime_home)
+        except CloudRouterAccountError:
+            raise
+        except OSError as exc:
+            # Filesystem races/read-only mounts are permanent for this
+            # admission attempt. Convert them to the same sanitized,
+            # non-requeued safety failure as an invalid managed path.
+            raise CloudRouterUnsafePathError(
+                "API account storage is unavailable"
+            ) from exc
+        if account is None or account.retired or not account.enabled:
+            raise CloudRouterAccountError(
+                "API account is disabled or missing"
+            )
+        return account
+
+    @asynccontextmanager
+    async def configuration_admission(
+        self,
+        provider: str,
+        runtime_home: str | os.PathLike[str],
+    ):
+        """Validate storage/routing without applying model or quota gates."""
+
+        provider = str(provider or "").lower()
+        if provider not in {"claude", "codex"}:
+            raise CloudRouterAccountError("Unknown provider")
+        async with self._mutation_lock:
+            yield self._reload_runtime_account(provider, runtime_home)
+
     @asynccontextmanager
     async def runtime_admission(
         self,
@@ -988,30 +1436,10 @@ class CloudRouterAccountStore:
         if provider not in {"claude", "codex"}:
             raise CloudRouterAccountError("Unknown provider")
         async with self._mutation_lock:
-            try:
-                self.reload()
-                finder = (
-                    self.account_for_codex_home
-                    if provider == "codex"
-                    else self.account_for_claude_config_dir
-                )
-                account = finder(runtime_home)
-            except CloudRouterAccountError:
-                raise
-            except OSError as exc:
-                # Filesystem races/read-only mounts are permanent for this
-                # admission attempt. Convert them to the same sanitized,
-                # non-requeued safety failure as an invalid managed path.
-                raise CloudRouterUnsafePathError(
-                    "CloudRouter account storage is unavailable"
-                ) from exc
-            if account is None or account.retired or not account.enabled:
-                raise CloudRouterAccountError(
-                    "CloudRouter API account is disabled or missing"
-                )
+            account = self._reload_runtime_account(provider, runtime_home)
             if not account.supports_model(provider, model):
                 raise CloudRouterAccountError(
-                    f"CloudRouter API account does not support model {model!r}"
+                    f"API account does not support model {model!r}"
                 )
             decision = self.cached_quota_decision(account.id)
             if (
@@ -1019,7 +1447,7 @@ class CloudRouterAccountStore:
                 and decision.get("available") is False
             ):
                 raise CloudRouterAccountError(
-                    "CloudRouter API account is unavailable: "
+                    "API account is unavailable: "
                     f"{decision.get('reason') or 'quota'}"
                 )
             yield account
@@ -1029,19 +1457,21 @@ class CloudRouterAccountStore:
     ) -> CloudRouterAccount:
         account = self.account(account_id)
         if account is None or (account.retired and not allow_retired):
-            raise CloudRouterAccountNotFound("Unknown CloudRouter account")
+            raise CloudRouterAccountNotFound("Unknown API account")
         return account
 
-    def _next_account_id(self) -> str:
+    def _next_account_id(self, api_provider: str) -> str:
+        spec = API_PROVIDER_SPECS[normalize_api_provider(api_provider)]
         used = {
-            int(match.group(1))
+            int(match.group("number"))
             for child in self.root.iterdir()
             if (match := ACCOUNT_ID_RE.fullmatch(child.name))
+            and match.group("provider") == spec.account_prefix
         }
         number = 1
         while number in used:
             number += 1
-        return f"cloudrouter-{number}"
+        return f"{spec.account_prefix}-{number}"
 
     async def _request_json(self, url: str, api_key: str) -> Any:
         headers = {
@@ -1088,8 +1518,26 @@ class CloudRouterAccountStore:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CloudRouterUpstreamError("invalid_json") from exc
 
-    async def probe_models(self, api_key: str) -> dict[str, list[str]]:
-        return _normalise_models(await self._request_json(MODELS_URL, api_key))
+    async def probe_models(
+        self,
+        api_key: str,
+        *,
+        api_provider: str = API_PROVIDER_CLOUDROUTER,
+    ) -> dict[str, list[str]]:
+        provider = normalize_api_provider(api_provider)
+        spec = API_PROVIDER_SPECS[provider]
+        if provider == API_PROVIDER_APEX:
+            models_url = str(
+                httpx.URL(spec.models_url).copy_set_param(
+                    "client_version", APEX_CODEX_CLIENT_VERSION,
+                )
+            )
+            return _normalise_apex_models(
+                await self._request_json(models_url, api_key)
+            )
+        return _normalise_models(
+            await self._request_json(spec.models_url, api_key)
+        )
 
     def _read_api_key(self, account: CloudRouterAccount) -> str:
         path = account.root / "api.key"
@@ -1115,21 +1563,24 @@ class CloudRouterAccountStore:
         models: dict[str, list[str]],
         key_hint: str,
         *,
+        api_provider: str = API_PROVIDER_CLOUDROUTER,
         enabled: bool = True,
         retired: bool = False,
         created_at: float | None = None,
     ) -> dict[str, Any]:
         current = _now()
+        provider = normalize_api_provider(api_provider)
         return {
-            "version": 1,
+            "version": 2,
             "id": account_id,
             "name": name,
+            "api_provider": provider,
             "enabled": enabled,
             "retired": retired,
             "cleanup_pending": False,
             "models": models,
             "key_hint": key_hint,
-            "endpoints": dict(ENDPOINTS),
+            "endpoints": dict(API_PROVIDER_SPECS[provider].endpoints),
             "created_at": created_at or current,
             "updated_at": current,
         }
@@ -1143,7 +1594,10 @@ class CloudRouterAccountStore:
         name: str,
         api_key: str,
         models: dict[str, list[str]],
+        api_provider: str = API_PROVIDER_CLOUDROUTER,
     ) -> None:
+        provider = normalize_api_provider(api_provider)
+        spec = API_PROVIDER_SPECS[provider]
         _ensure_private_directory(root)
         claude_dir = root / "claude"
         codex_dir = root / "codex"
@@ -1155,38 +1609,42 @@ class CloudRouterAccountStore:
         _atomic_private_write(helper, KEY_HELPER.encode("utf-8"), mode=0o700)
         _atomic_private_write(root / "api.key", api_key.encode("utf-8"))
 
-        settings = {
-            "env": {"ANTHROPIC_BASE_URL": CLAUDE_BASE_URL},
-            "apiKeyHelper": _claude_helper_command(runtime_root or root),
-            CLAUDE_SKIP_DANGEROUS_PROMPT: True,
-        }
-        _atomic_private_json(claude_dir / "settings.json", settings)
-        _atomic_private_json(
-            claude_dir / ".claude.json", {"hasCompletedOnboarding": True},
-        )
+        if spec.claude_base_url is not None:
+            settings = {
+                "env": {"ANTHROPIC_BASE_URL": spec.claude_base_url},
+                "apiKeyHelper": _claude_helper_command(runtime_root or root),
+                CLAUDE_SKIP_DANGEROUS_PROMPT: True,
+            }
+            _atomic_private_json(claude_dir / "settings.json", settings)
+            _atomic_private_json(
+                claude_dir / ".claude.json",
+                {"hasCompletedOnboarding": True},
+            )
 
-        quoted_helper = json.dumps(str(runtime_helper))
-        codex_config = (
-            'model_provider = "cloudrouter"\n\n'
-            "[model_providers.cloudrouter]\n"
-            'name = "CloudRouter"\n'
-            f"base_url = {json.dumps(CODEX_BASE_URL)}\n"
-            'wire_api = "responses"\n'
-            "supports_websockets = false\n\n"
-            "[model_providers.cloudrouter.auth]\n"
-            f"command = {quoted_helper}\n"
-            "timeout_ms = 5000\n"
-            "refresh_interval_ms = 0\n"
-        )
         _atomic_private_write(
-            codex_dir / "config.toml", codex_config.encode("utf-8"),
+            codex_dir / "config.toml",
+            _codex_config_payload(spec, runtime_helper),
         )
         _atomic_private_json(
             root / "account.json",
-            self._metadata(account_id, name, models, _key_hint(api_key)),
+            self._metadata(
+                account_id,
+                name,
+                models,
+                _key_hint(api_key),
+                api_provider=provider,
+            ),
+            maximum=MAX_METADATA_BYTES,
         )
 
-    async def add_account(self, name: str, api_key: str) -> CloudRouterAccount:
+    async def add_account(
+        self,
+        name: str,
+        api_key: str,
+        *,
+        api_provider: str = API_PROVIDER_CLOUDROUTER,
+    ) -> CloudRouterAccount:
+        provider = normalize_api_provider(api_provider)
         clean_name = str(name or "").strip()
         if not clean_name or len(clean_name) > 100 or any(
             ord(character) < 32 for character in clean_name
@@ -1202,10 +1660,13 @@ class CloudRouterAccountStore:
         ):
             raise ValueError("Invalid API key")
 
-        models = await self.probe_models(api_key)
+        models = await self.probe_models(
+            api_key,
+            api_provider=provider,
+        )
         async with self._mutation_lock:
             self.reload()
-            account_id = self._next_account_id()
+            account_id = self._next_account_id(provider)
             target = self._account_root(account_id)
             temporary = Path(tempfile.mkdtemp(
                 prefix=f".{account_id}.", suffix=".tmp", dir=self.root,
@@ -1219,6 +1680,7 @@ class CloudRouterAccountStore:
                     name=clean_name,
                     api_key=api_key,
                     models=models,
+                    api_provider=provider,
                 )
                 if target.exists() or target.is_symlink():
                     raise CloudRouterUnsafePathError("Account destination already exists")
@@ -1235,7 +1697,10 @@ class CloudRouterAccountStore:
             self.reload()
             account = self._require_account(account_id)
             api_key = self._read_api_key(account)
-            models = await self.probe_models(api_key)
+            models = await self.probe_models(
+                api_key,
+                api_provider=account.api_provider,
+            )
             metadata_path = account.root / "account.json"
             data = json.loads(
                 _open_regular_nofollow(
@@ -1244,7 +1709,11 @@ class CloudRouterAccountStore:
             )
             data["models"] = models
             data["updated_at"] = _now()
-            _atomic_private_json(metadata_path, data)
+            _atomic_private_json(
+                metadata_path,
+                data,
+                maximum=MAX_METADATA_BYTES,
+            )
             self.reload()
             return self._require_account(account_id)
 
@@ -1261,11 +1730,25 @@ class CloudRouterAccountStore:
             < self._quota_cache_ttl
         ):
             return dict(cached)
+        spec = API_PROVIDER_SPECS[account.api_provider]
+        if spec.usage_url is None:
+            snapshot = _unknown_snapshot(
+                account_id,
+                "usage_not_supported",
+                previous=cached,
+            )
+            self._quota_cache[account_id] = snapshot
+            self._quota_cached_at[account_id] = current
+            return dict(snapshot)
         try:
             payload = await self._request_json(
-                USAGE_URL, self._read_api_key(account),
+                spec.usage_url, self._read_api_key(account),
             )
-            snapshot = _normalise_usage(account_id, payload)
+            snapshot = (
+                _normalise_apex_usage(account_id, payload)
+                if account.api_provider == API_PROVIDER_APEX
+                else _normalise_usage(account_id, payload)
+            )
         except CloudRouterUpstreamError as exc:
             if exc.status_code in {401, 403}:
                 snapshot = _unavailable_snapshot(account_id, exc.code)

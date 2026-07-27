@@ -47,6 +47,12 @@ def dispatcher(db_factory, mock_broadcaster):
     d._sub_agent_codex_homes = {}
     d._sub_agent_codex_threads = {}
     d.codex_pool = None
+
+    @asynccontextmanager
+    async def runtime_admission(_provider, _home, _model):
+        yield None
+
+    d.instance_manager._cloudrouter_runtime_admission = runtime_admission
     return d
 
 
@@ -169,6 +175,7 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     assert "ephemeral" not in kwargs
     assert kwargs["mcp_specs"] == specs
     assert kwargs["mcp_specs"][0].required is True
+    assert kwargs["disable_project_config"] is False
     assert set(kwargs["mcp_specs"][0].enabled_tools) == {
         "get_context",
         "report_progress",
@@ -176,6 +183,56 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     }
     assert dispatcher._sub_agent_codex_processes[41] is process
     assert dispatcher._sub_agent_codex_threads[41] == "thread-child"
+
+
+@pytest.mark.asyncio
+async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
+    process = _fake_proc(returncode=None)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(return_value=(process, "thread-api-child"))
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+    api_home = "/tmp/apex-1/codex"
+    account = object()
+    dispatcher.cloudrouter_store = MagicMock()
+    dispatcher.cloudrouter_store.account_for_codex_home.return_value = account
+    dispatcher.codex_pool = MagicMock(enabled=True)
+    dispatcher.codex_pool.select.return_value = api_home
+    dispatcher.codex_pool.canonical_home.side_effect = lambda home: home
+
+    admission_calls = []
+
+    @asynccontextmanager
+    async def runtime_admission(provider, home, model):
+        admission_calls.append((provider, home, model))
+        yield account
+
+    @asynccontextmanager
+    async def home_admission(home):
+        yield home
+
+    dispatcher.instance_manager._cloudrouter_runtime_admission = (
+        runtime_admission
+    )
+    dispatcher.instance_manager.codex_home_app_server_guard = home_admission
+
+    await dispatcher._launch_codex_sub_agent(
+        prompt="review",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort_level="high",
+        session_id=61,
+        task_id=7,
+        task_metadata={},
+        mcp_specs=(),
+    )
+
+    assert admission_calls == [("codex", api_home, "gpt-5.6-sol")]
+    assert (
+        registry.start_turn.await_args.kwargs["disable_project_config"]
+        is True
+    )
 
 
 @pytest.mark.asyncio

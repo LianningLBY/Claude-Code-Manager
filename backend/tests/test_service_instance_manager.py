@@ -6,6 +6,7 @@ import signal
 import sys
 import threading
 import time
+import tomllib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -379,6 +380,55 @@ def test_build_command_codex_default_model_not_passed():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(provider="codex", prompt="hi", model="default", resume_session_id=None, effort_level=None)
     assert "--model" not in cmd
+
+
+def test_build_command_codex_api_forces_git_root_untrusted(tmp_path):
+    repo = tmp_path / 'repo "quoted\\path'
+    nested = repo / "nested"
+    (repo / ".git").mkdir(parents=True)
+    nested.mkdir()
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    cmd = im._build_command(
+        provider="codex",
+        prompt="hi",
+        model="gpt-5.6-sol",
+        resume_session_id=None,
+        effort_level=None,
+        cwd=str(nested),
+        codex_api_account=True,
+    )
+
+    overrides = [
+        cmd[index + 1]
+        for index, token in enumerate(cmd[:-1])
+        if token == "-c"
+    ]
+    parsed = [tomllib.loads(override) for override in overrides]
+    assert {
+        "projects": {
+            str(repo.resolve()): {"trust_level": "untrusted"},
+        }
+    } in parsed
+
+
+def test_build_command_native_codex_does_not_override_project_trust(tmp_path):
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    cmd = im._build_command(
+        provider="codex",
+        prompt="hi",
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        cwd=str(tmp_path),
+    )
+
+    assert not any(
+        value.startswith("projects=")
+        for index, value in enumerate(cmd)
+        if index > 0 and cmd[index - 1] == "-c"
+    )
 
 
 @pytest.mark.parametrize(
@@ -858,6 +908,23 @@ def test_cloudrouter_429_is_transient_only_for_exact_api_account_home(
     )
 
 
+def test_api_codex_home_scrubs_all_inherited_gateway_keys(db_factory):
+    im = InstanceManager(db_factory, MagicMock())
+    store = MagicMock()
+    store.account_for_codex_home.return_value = object()
+    im.cloudrouter_store = store
+
+    assert im._codex_env_remove_for_home("/api/apex/codex") == {
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CLOUDROUTER_API_KEY",
+        "APEX_CODEX_GATEWAY_KEY",
+        "APEX_CODEX_API_KEY",
+        "APEXROUTER_API_KEY",
+        "APEXROUTER_CODEX_API_KEY",
+    }
+
+
 @pytest.mark.asyncio
 async def test_default_claude_launch_clears_stale_instance_account_home(db_factory):
     async with db_factory() as db:
@@ -1027,6 +1094,67 @@ async def test_launch_codex_provider_command(db_factory, monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_api_codex_exec_forces_project_config_untrusted(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-api-exec-inst")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    repo = tmp_path / "repo"
+    nested = repo / "nested"
+    (repo / ".git").mkdir(parents=True)
+    nested.mkdir()
+    account_root = tmp_path / "apex-1"
+    codex_home = account_root / "codex"
+    codex_home.mkdir(parents=True)
+    account = MagicMock(root=account_root)
+    store = MagicMock()
+    store.account_for_codex_home.side_effect = (
+        lambda path: account
+        if Path(path).resolve() == codex_home.resolve()
+        else None
+    )
+
+    @asynccontextmanager
+    async def runtime_admission(*_args):
+        yield account
+
+    store.runtime_admission = runtime_admission
+    mock_proc = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.cloudrouter_store = store
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=mock_proc,
+    ) as mock_exec:
+        await im.launch(
+            instance_id=inst.id,
+            prompt="hi",
+            cwd=str(nested),
+            provider="codex",
+            config_dir=str(codex_home),
+        )
+
+    overrides = [
+        mock_exec.await_args.args[index + 1]
+        for index, token in enumerate(mock_exec.await_args.args[:-1])
+        if token == "-c"
+    ]
+    assert {
+        "projects": {
+            str(repo.resolve()): {"trust_level": "untrusted"},
+        }
+    } in [tomllib.loads(override) for override in overrides]
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
 async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
     db_factory, monkeypatch, tmp_path, caplog,
 ):
@@ -1164,8 +1292,62 @@ async def test_launch_codex_prefers_persistent_app_server(
     assert im._launch_codex_app_server.await_args.kwargs["config_dir"] == str(
         codex_home.resolve()
     )
+    assert (
+        im._launch_codex_app_server.await_args.kwargs[
+            "disable_project_config"
+        ]
+        is False
+    )
     assert "route=app-server" in caplog.text
     exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_api_codex_app_server_disables_project_config(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-api-app-inst")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    account_root = tmp_path / "apex-1"
+    codex_home = account_root / "codex"
+    codex_home.mkdir(parents=True)
+    account = MagicMock(root=account_root)
+    store = MagicMock()
+    store.account_for_codex_home.side_effect = (
+        lambda path: account
+        if Path(path).resolve() == codex_home.resolve()
+        else None
+    )
+
+    @asynccontextmanager
+    async def runtime_admission(*_args):
+        yield account
+
+    store.runtime_admission = runtime_admission
+    im = InstanceManager(db_factory, MagicMock())
+    im.cloudrouter_store = store
+    im._launch_codex_app_server = AsyncMock(return_value=4323)
+
+    pid = await im.launch(
+        instance_id=inst.id,
+        prompt="hi",
+        cwd="/tmp",
+        provider="codex",
+        config_dir=str(codex_home),
+    )
+
+    assert pid == 4323
+    assert (
+        im._launch_codex_app_server.await_args.kwargs[
+            "disable_project_config"
+        ]
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -1327,6 +1509,101 @@ async def test_codex_thread_operations_reject_exec_owned_home(
             await im.delete_codex_thread(codex_home, "thread-fork")
 
     getattr(registry, registry_method).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_account", "expected_disabled"),
+    [(False, False), (True, True)],
+    ids=["native", "api"],
+)
+async def test_create_codex_thread_disables_project_config_only_for_api_home(
+    tmp_path, api_account, expected_disabled,
+):
+    codex_home = str((tmp_path / "codex-create-thread-home").resolve())
+    registry = MagicMock()
+    registry.create_thread = AsyncMock(
+        return_value={"id": "thread-created"},
+    )
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_app_server = registry
+    admissions = []
+
+    if api_account:
+        account = object()
+        store = MagicMock()
+        store.account_for_codex_home.return_value = account
+
+        @asynccontextmanager
+        async def runtime_admission(*args):
+            admissions.append(args)
+            yield account
+
+        store.runtime_admission = runtime_admission
+        im.cloudrouter_store = store
+
+    result = await im.create_codex_thread(
+        codex_home,
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+    )
+
+    assert result == {"id": "thread-created"}
+    assert (
+        registry.create_thread.await_args.kwargs[
+            "disable_project_config"
+        ]
+        is expected_disabled
+    )
+    assert admissions == (
+        [("codex", codex_home, "gpt-5.6-sol")]
+        if api_account
+        else []
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_codex_config_read_enters_store_before_home_gate(tmp_path):
+    codex_home = str((tmp_path / "api-codex-home").resolve())
+    account = object()
+    events = []
+    store = MagicMock()
+    store.account_for_codex_home.return_value = account
+
+    @asynccontextmanager
+    async def configuration_admission(provider, home):
+        events.append(("store-enter", provider, home))
+        try:
+            yield account
+        finally:
+            events.append(("store-exit", provider, home))
+
+    store.configuration_admission = configuration_admission
+    registry = MagicMock()
+    registry.read_rate_limits = AsyncMock(return_value={"rateLimits": {}})
+    im = InstanceManager(MagicMock(), MagicMock())
+    im.cloudrouter_store = store
+    im._codex_app_server = registry
+
+    @asynccontextmanager
+    async def home_admission(home):
+        events.append(("home-enter", home))
+        try:
+            yield home
+        finally:
+            events.append(("home-exit", home))
+
+    im.codex_home_app_server_guard = home_admission
+
+    result = await im.read_codex_rate_limits(codex_home)
+
+    assert result == {"rateLimits": {}}
+    assert [event[0] for event in events] == [
+        "store-enter",
+        "home-enter",
+        "home-exit",
+        "store-exit",
+    ]
 
 
 @pytest.mark.asyncio

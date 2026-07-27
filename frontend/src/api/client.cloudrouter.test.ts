@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from './client';
 
-describe('CloudRouter account API routing', () => {
+describe('API account compatibility routing', () => {
   const fetchMock = vi.fn();
 
   beforeEach(() => {
@@ -25,6 +25,7 @@ describe('CloudRouter account API routing', () => {
     await api.createCloudRouterAccount({
       name: 'CloudRouter Claude',
       api_key: 'cr-secret',
+      api_provider: 'cloudrouter',
     });
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
@@ -36,8 +37,29 @@ describe('CloudRouter account API routing', () => {
       body: JSON.stringify({
         name: 'CloudRouter Claude',
         api_key: 'cr-secret',
+        api_provider: 'cloudrouter',
       }),
     });
+  });
+
+  it('creates an Apex account through the same compatibility endpoint', async () => {
+    await api.createCloudRouterAccount({
+      name: 'Apex Codex',
+      api_key: 'lck_test_only_not_real',
+      api_provider: 'apex',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/cloudrouter/accounts',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          name: 'Apex Codex',
+          api_key: 'lck_test_only_not_real',
+          api_provider: 'apex',
+        }),
+      }),
+    );
   });
 
   it('encodes account ids for refresh and safe retirement', async () => {

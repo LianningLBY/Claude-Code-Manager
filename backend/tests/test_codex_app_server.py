@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import signal
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +21,9 @@ from backend.services.codex_app_server import (
     CodexRequiredMcpPreTurnError,
     CodexThreadHomeMismatchError,
     CodexTurnProcess,
+    codex_project_trust_target,
+    codex_untrusted_project_config,
+    codex_untrusted_project_override,
     normalize_codex_home,
 )
 from backend.services.mcp_config import McpServerSpec
@@ -42,6 +47,61 @@ def _task_mcp_spec(task_id: int) -> McpServerSpec:
     )
 
 
+def test_codex_project_trust_target_uses_regular_repository_root(tmp_path):
+    repository = tmp_path / "repository"
+    nested = repository / "nested" / "project"
+    (repository / ".git").mkdir(parents=True)
+    nested.mkdir(parents=True)
+
+    assert codex_project_trust_target(nested) == str(repository.resolve())
+
+
+def test_codex_project_trust_target_uses_main_root_for_linked_worktree(tmp_path):
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "worktree"
+    git_dir = repository / ".git" / "worktrees" / "feature-x"
+    git_dir.mkdir(parents=True)
+    nested = worktree / "nested"
+    nested.mkdir(parents=True)
+    git_dir_relative_to_worktree = os.path.relpath(git_dir, worktree)
+    (worktree / ".git").write_text(
+        f"gitdir: {git_dir_relative_to_worktree}\n",
+        encoding="utf-8",
+    )
+
+    assert codex_project_trust_target(nested) == str(repository.resolve())
+
+
+def test_codex_project_trust_target_rejects_non_worktree_gitdir(tmp_path):
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    (workspace / ".git").write_text(
+        f"gitdir: {tmp_path / 'arbitrary-git-dir'}\n",
+        encoding="utf-8",
+    )
+
+    assert codex_project_trust_target(nested) == str(nested.resolve())
+
+
+def test_codex_untrusted_project_helpers_quote_canonical_target(tmp_path):
+    workspace = tmp_path / 'workspace "quoted"'
+    workspace.mkdir()
+    target = str(workspace.resolve())
+
+    assert codex_untrusted_project_config(workspace) == {
+        "projects": {target: {"trust_level": "untrusted"}}
+    }
+    override = codex_untrusted_project_override(workspace)
+    assert override == (
+        f"projects={{{json.dumps(target, ensure_ascii=False)}="
+        '{trust_level="untrusted"}}'
+    )
+    assert tomllib.loads(override) == {
+        "projects": {target: {"trust_level": "untrusted"}}
+    }
+
+
 @pytest.mark.asyncio
 async def test_start_turn_uses_native_resume_and_turn_start():
     server = CodexAppServer("codex")
@@ -61,6 +121,7 @@ async def test_start_turn_uses_native_resume_and_turn_start():
         git_env={"GIT_AUTHOR_NAME": "CCM"},
         task_id=9,
         mcp_specs=(_task_mcp_spec(9),),
+        disable_project_config=True,
     )
 
     assert thread_id == "thread-123"
@@ -85,6 +146,9 @@ async def test_start_turn_uses_native_resume_and_turn_start():
         "enabled_tools": ["ccm_command_help"],
         "startup_timeout_sec": 10,
         "tool_timeout_sec": 60,
+    }
+    assert resume_call.args[1]["config"]["projects"] == {
+        str(Path("/tmp").resolve()): {"trust_level": "untrusted"}
     }
     assert turn_call.args[0] == "turn/start"
     assert turn_call.args[1]["effort"] == "max"
@@ -113,6 +177,7 @@ async def test_start_turn_injects_mcp_config_into_new_thread():
         git_env=None,
         task_id=41,
         mcp_specs=(_task_mcp_spec(41),),
+        disable_project_config=True,
     )
 
     thread_call = server._request.await_args_list[0]
@@ -122,6 +187,34 @@ async def test_start_turn_injects_mcp_config_into_new_thread():
         "41",
     ]
     assert thread_call.args[1]["config"]["mcp_servers"]["ccm_skills"]["required"] is True
+    assert thread_call.args[1]["config"]["projects"] == {
+        str(Path("/tmp").resolve()): {"trust_level": "untrusted"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_turn_keeps_native_project_trust_behavior_by_default():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-default-trust"}},
+        {"turn": {"id": "turn-default-trust"}},
+    ])
+
+    await server.start_turn(
+        prompt="start",
+        cwd="/tmp",
+        model=None,
+        effort=None,
+        resume_session_id=None,
+        git_env=None,
+        task_id=42,
+    )
+
+    thread_call = server._request.await_args_list[0]
+    assert thread_call.args[0] == "thread/start"
+    assert "config" not in thread_call.args[1]
 
 
 @pytest.mark.asyncio
@@ -956,6 +1049,41 @@ async def test_create_empty_thread_uses_native_start_without_turn():
 
 
 @pytest.mark.asyncio
+async def test_create_empty_thread_can_disable_project_config(tmp_path):
+    repository = tmp_path / "repository"
+    nested = repository / "nested"
+    (repository / ".git").mkdir(parents=True)
+    nested.mkdir()
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "thread": {"id": "thread-api-empty", "turns": []},
+    })
+
+    await server.create_thread(
+        cwd=str(nested),
+        model=None,
+        disable_project_config=True,
+    )
+
+    server._request.assert_awaited_once_with(
+        "thread/start",
+        {
+            "cwd": str(nested),
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "config": {
+                "projects": {
+                    str(repository.resolve()): {
+                        "trust_level": "untrusted",
+                    }
+                }
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_fork_thread_settles_mutating_rpc_after_cancellation():
     server = CodexAppServer("codex")
     server.ensure_started = AsyncMock()
@@ -1514,6 +1642,7 @@ class _RegistryFakeServer:
         self.known_threads = set()
         self.shutdown_count = 0
         self.steered = []
+        self.create_thread_calls = []
         type(self).instances.append(self)
 
     @property
@@ -1543,7 +1672,18 @@ class _RegistryFakeServer:
             "turns": [{"id": "turn-1", "status": "completed", "items": []}],
         }
 
-    async def create_thread(self, *, cwd, model=None):
+    async def create_thread(
+        self,
+        *,
+        cwd,
+        model=None,
+        disable_project_config=False,
+    ):
+        self.create_thread_calls.append({
+            "cwd": cwd,
+            "model": model,
+            "disable_project_config": disable_project_config,
+        })
         thread_id = f"thread-empty-{len(self.known_threads) + 1}"
         self.known_threads.add(thread_id)
         return {"id": thread_id, "cwd": cwd, "model": model, "turns": []}
@@ -1917,6 +2057,30 @@ async def test_registry_registers_new_empty_thread_owner(
 
     assert registry._thread_owners[created["id"]] == home
     assert home not in registry._starting
+
+
+@pytest.mark.asyncio
+async def test_registry_forwards_project_config_disable_for_empty_thread(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "api-home")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        await registry.create_thread(
+            home,
+            cwd="/tmp/project",
+            disable_project_config=True,
+        )
+
+    assert _RegistryFakeServer.instances[0].create_thread_calls == [{
+        "cwd": "/tmp/project",
+        "model": None,
+        "disable_project_config": True,
+    }]
 
 
 @pytest.mark.asyncio

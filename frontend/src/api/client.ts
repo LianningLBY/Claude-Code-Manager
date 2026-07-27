@@ -454,6 +454,9 @@ export interface CloudRouterQuotaWindow {
   reset_at?: string | number | null;
   resets_at?: string | number | null;
   currency?: string | null;
+  scope?: string | null;
+  /** Usage attributed to this individual API key for a shared window. */
+  key_used?: number | null;
 }
 
 export interface CloudRouterQuotaTotal {
@@ -483,6 +486,14 @@ export interface CloudRouterApiQuota {
   fetched_at?: string | number | null;
   usage?: Record<string, unknown> | null;
   account_id?: string;
+  /** Gateway label for the individual credential, when supplied. */
+  key_name?: string | null;
+  /** Shared quota group containing this credential, when supplied. */
+  group_name?: string | null;
+  /** Usage attributed to this individual API key, keyed by quota-window id. */
+  key_usage?: Record<string, number> | null;
+  /** Maximum concurrent requests allowed for the shared group. */
+  concurrency?: number | null;
 }
 
 export interface CloudRouterModelMap {
@@ -490,11 +501,16 @@ export interface CloudRouterModelMap {
   codex: string[];
 }
 
+export type ApiAccountProvider = 'cloudrouter' | 'apex';
+
 export interface CloudRouterAccount {
   id: string;
   name: string;
+  api_provider: ApiAccountProvider;
+  auth_kind: 'cloudrouter_api' | 'apex_api';
   enabled: boolean;
   retired: boolean;
+  cleanup_pending?: boolean;
   key_hint: string;
   models: CloudRouterModelMap;
   providers: string[];
@@ -502,7 +518,7 @@ export interface CloudRouterAccount {
   claude_config_dir: string;
   codex_home: string;
   supported_models: string[];
-  endpoints: Record<string, string>;
+  endpoints: Record<string, string | null>;
   api_quota?: CloudRouterApiQuota | null;
 }
 
@@ -512,6 +528,7 @@ export interface CloudRouterRetireResult extends CloudRouterAccount {
 
 export interface CloudRouterAccountProjection {
   auth_kind?: string | null;
+  api_provider?: ApiAccountProvider | null;
   display_name?: string | null;
   api_account_id?: string | null;
   supported_models?: string[];
@@ -884,11 +901,15 @@ export const api = {
   poolReloginStatus: (accountId: string) =>
     request<{ status: string; detail?: string }>(`/api/pool/accounts/${accountId}/relogin`),
 
-  // CloudRouter API accounts are projected into both existing pools. Their
-  // secret is accepted only when creating the dedicated account directory.
+  // API accounts keep using the CloudRouter compatibility route. Their secret
+  // is accepted only when creating the dedicated account directory.
   getCloudRouterAccounts: (force?: boolean) =>
     request<CloudRouterAccount[]>('/api/cloudrouter/accounts' + (force ? '?force=true' : '')),
-  createCloudRouterAccount: (data: { name: string; api_key: string }) =>
+  createCloudRouterAccount: (data: {
+    name: string;
+    api_key: string;
+    api_provider?: ApiAccountProvider;
+  }) =>
     request<CloudRouterAccount>('/api/cloudrouter/accounts', {
       method: 'POST',
       body: JSON.stringify(data),

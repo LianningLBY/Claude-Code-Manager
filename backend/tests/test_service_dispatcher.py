@@ -4,7 +4,7 @@ import os
 import signal
 import sys
 import pytest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
@@ -63,6 +63,17 @@ def _make_dispatcher(db_factory):
     # PTY proactive pool switch path (dispatcher._process_task_lifecycle)
     instance_manager.pty_rate_limit_seen = MagicMock(return_value=False)
     instance_manager._try_proactive_pool_switch = AsyncMock()
+
+    @asynccontextmanager
+    async def runtime_admission(_provider, _home, _model):
+        yield None
+
+    @asynccontextmanager
+    async def codex_exec_admission(home):
+        yield home
+
+    instance_manager._cloudrouter_runtime_admission = runtime_admission
+    instance_manager.codex_home_exec_guard = codex_exec_admission
     instance_manager._pty_rate_limit_seen = set()
 
     broadcaster = MagicMock()

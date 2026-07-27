@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Eye, EyeOff, Plus, RefreshCw, X, Users, Settings } from '../icons';
 import { api } from '../../api/client';
 import type {
+  ApiAccountProvider,
   CloudRouterApiQuota,
   CodexLoginMethod,
   CodexLoginStatus,
@@ -16,6 +17,20 @@ import type {
 const ACTIVE_CODEX_LOGIN_STATUSES = new Set([
   'running', 'awaiting_otp', 'verifying_otp', 'finalizing',
 ]);
+
+const API_AUTH_KINDS = new Set(['cloudrouter_api', 'apex_api']);
+
+function isApiAuthKind(authKind: string | null | undefined): boolean {
+  return authKind != null && API_AUTH_KINDS.has(authKind);
+}
+
+function resolveApiProvider(
+  authKind: string | null | undefined,
+  provider: ApiAccountProvider | null | undefined,
+): ApiAccountProvider {
+  if (provider) return provider;
+  return authKind === 'apex_api' ? 'apex' : 'cloudrouter';
+}
 
 function barColor(utilization: number): string {
   if (utilization >= 90) return 'bg-red-500';
@@ -117,6 +132,7 @@ function ApiQuotaPanel({ quota, onRefresh }: {
     && quota.expires_at == null
     && quota.days_until_expiry == null;
   const total = quota.quota;
+  const hasSharedGroup = Boolean(quota.group_name);
   const totalUtilization = total?.used != null && total.limit != null && total.limit > 0
     ? Math.min(100, Math.max(0, (total.used / total.limit) * 100))
     : null;
@@ -136,6 +152,12 @@ function ApiQuotaPanel({ quota, onRefresh }: {
         {quota.mode && <span className="text-gray-500">模式 <span className="text-gray-300">{quota.mode}</span></span>}
         {currency && <span className="text-gray-500">单位 <span className="text-gray-300">{currency}</span></span>}
         {quota.plan_name && <span className="text-gray-500">套餐 <span className="text-gray-300">{quota.plan_name}</span></span>}
+        {quota.key_name && <span className="text-gray-500">Key <span className="text-gray-300">{quota.key_name}</span></span>}
+        {quota.group_name && (
+          <span className="text-gray-500">
+            分组 <span className="text-gray-300">{quota.group_name}</span>
+          </span>
+        )}
         <button
           onClick={onRefresh}
           className="ml-auto text-[10px] text-gray-400 hover:text-foreground underline"
@@ -143,10 +165,20 @@ function ApiQuotaPanel({ quota, onRefresh }: {
           刷新额度
         </button>
       </div>
+      {hasSharedGroup && (
+        <div className="text-[10px] text-amber-300">
+          剩余、上限和额度窗口均为分组共享值；“本 Key 已用”仅统计当前 Key。
+        </div>
+      )}
+      {quota.concurrency != null && (
+        <div className="text-xs text-gray-400">
+          分组并发上限 <span className="font-medium text-foreground">{quota.concurrency.toLocaleString()}</span>
+        </div>
+      )}
       {total && (total.used != null || total.limit != null || total.remaining != null) ? (
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2 text-[10px]">
-            <span className="text-gray-400">总额度</span>
+            <span className="text-gray-400">{hasSharedGroup ? '分组共享总额度' : '总额度'}</span>
             {totalUtilization != null && <span className={textColor(totalUtilization)}>已用 {totalUtilization.toFixed(0)}%</span>}
           </div>
           {totalUtilization != null && (
@@ -155,15 +187,15 @@ function ApiQuotaPanel({ quota, onRefresh }: {
             </div>
           )}
           <div className="flex flex-wrap gap-x-3 text-[10px] text-gray-500">
-            {total.used != null && <span>已用 {formatApiAmount(total.used, total.currency || currency)}</span>}
-            {total.limit != null && <span>上限 {formatApiAmount(total.limit, total.currency || currency)}</span>}
-            {total.remaining != null && <span>剩余 {formatApiAmount(total.remaining, total.currency || currency)}</span>}
+            {total.used != null && <span>{hasSharedGroup ? '分组共享已用' : '已用'} {formatApiAmount(total.used, total.currency || currency)}</span>}
+            {total.limit != null && <span>{hasSharedGroup ? '分组共享上限' : '上限'} {formatApiAmount(total.limit, total.currency || currency)}</span>}
+            {total.remaining != null && <span>{hasSharedGroup ? '分组共享剩余' : '剩余'} {formatApiAmount(total.remaining, total.currency || currency)}</span>}
           </div>
         </div>
       ) : (remaining != null || quota.balance != null) ? (
         <div className="flex gap-4 text-xs">
           {remaining != null && (
-            <span className="text-gray-400">剩余 <span className="font-medium text-foreground">{formatApiAmount(remaining, currency)}</span></span>
+            <span className="text-gray-400">{hasSharedGroup ? '分组共享剩余' : '剩余'} <span className="font-medium text-foreground">{formatApiAmount(remaining, currency)}</span></span>
           )}
           {quota.balance != null && (
             <span className="text-gray-400">余额 <span className="font-medium text-foreground">{formatApiAmount(quota.balance, currency)}</span></span>
@@ -192,10 +224,17 @@ function ApiQuotaPanel({ quota, onRefresh }: {
             : null;
         const pct = utilization == null ? null : Math.min(100, Math.max(0, utilization));
         const resetAt = window.reset_at ?? window.resets_at ?? null;
+        const windowId = window.id || `${window.label || 'window'}-${index}`;
+        const isSharedWindow = window.scope === 'group' || hasSharedGroup;
+        const keyUsed = window.key_used ?? quota.key_usage?.[window.id || ''];
+        const windowLabel = window.label || window.id || `额度窗口 ${index + 1}`;
         return (
-          <div key={window.id || `${window.label || 'window'}-${index}`} className="space-y-1">
+          <div key={windowId} className="space-y-1">
             <div className="flex items-center justify-between gap-2 text-[10px]">
-              <span className="text-gray-400">{window.label || window.id || `额度窗口 ${index + 1}`}</span>
+              <span className="text-gray-400">
+                {windowLabel}
+                {isSharedWindow && !windowLabel.includes('分组共享') ? '（分组共享）' : ''}
+              </span>
               <span className="text-gray-500">
                 {resetAt == null ? '重置时间无法确认' : formatApiTimestamp(resetAt)}
               </span>
@@ -208,11 +247,12 @@ function ApiQuotaPanel({ quota, onRefresh }: {
                 <span className={`w-10 shrink-0 text-right text-xs font-medium ${textColor(pct)}`}>{pct.toFixed(0)}%</span>
               </div>
             )}
-            {(window.used != null || window.limit != null || window.remaining != null) && (
+            {(window.used != null || window.limit != null || window.remaining != null || keyUsed != null) && (
               <div className="flex flex-wrap gap-x-3 text-[10px] text-gray-500">
-                {window.used != null && <span>已用 {formatApiAmount(window.used, window.currency || quota.currency)}</span>}
-                {window.limit != null && <span>上限 {formatApiAmount(window.limit, window.currency || quota.currency)}</span>}
-                {window.remaining != null && <span>剩余 {formatApiAmount(window.remaining, window.currency || quota.currency)}</span>}
+                {window.used != null && <span>{isSharedWindow ? '分组共享已用' : '已用'} {formatApiAmount(window.used, window.currency || quota.currency)}</span>}
+                {window.limit != null && <span>{isSharedWindow ? '分组共享上限' : '上限'} {formatApiAmount(window.limit, window.currency || quota.currency)}</span>}
+                {window.remaining != null && <span>{isSharedWindow ? '分组共享剩余' : '剩余'} {formatApiAmount(window.remaining, window.currency || quota.currency)}</span>}
+                {keyUsed != null && <span>本 Key 已用 {formatApiAmount(keyUsed, window.currency || quota.currency)}</span>}
               </div>
             )}
           </div>
@@ -292,7 +332,8 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
   onDelete?: (id: string) => void;
   reloginState?: { status: string; message?: string };
 }) {
-  const isApi = account.auth_kind === 'cloudrouter_api';
+  const isApi = isApiAuthKind(account.auth_kind);
+  const apiProvider = resolveApiProvider(account.auth_kind, account.api_provider);
   const statusDot = !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
@@ -310,7 +351,7 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            API
+            {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
           </span>
         )}
         {!isApi && account.subscription_type && (
@@ -485,7 +526,8 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
   onRetryUsage: () => void;
   reloginState?: CodexLoginStatus;
 }) {
-  const isApi = account.auth_kind === 'cloudrouter_api';
+  const isApi = isApiAuthKind(account.auth_kind);
+  const apiProvider = resolveApiProvider(account.auth_kind, account.api_provider);
   const statusDot = !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
@@ -505,7 +547,7 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            API
+            {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
           </span>
         )}
         {!isApi && account.plan_type && (
@@ -664,14 +706,16 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
   );
 }
 
-function AddCloudRouterAccountModal({ onClose, onAdded }: {
+function AddApiAccountModal({ onClose, onAdded }: {
   onClose: () => void;
   onAdded: () => void | Promise<void>;
 }) {
+  const [apiProvider, setApiProvider] = useState<ApiAccountProvider>('cloudrouter');
   const [name, setName] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const providerName = apiProvider === 'apex' ? 'ApexRouter' : 'CloudRouter';
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -685,7 +729,11 @@ function AddCloudRouterAccountModal({ onClose, onAdded }: {
     // quota discovery are in flight.
     setApiKey('');
     try {
-      await api.createCloudRouterAccount({ name: trimmedName, api_key: secret });
+      await api.createCloudRouterAccount({
+        name: trimmedName,
+        api_key: secret,
+        api_provider: apiProvider,
+      });
       await onAdded();
       onClose();
     } catch (e) {
@@ -699,38 +747,59 @@ function AddCloudRouterAccountModal({ onClose, onAdded }: {
     <div className="absolute inset-0 bg-gray-900/80 z-10 flex items-start justify-center pt-16">
       <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-xs">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
-          <h3 className="text-sm font-semibold text-foreground">添加 CloudRouter API 账号</h3>
+          <h3 className="text-sm font-semibold text-foreground">添加 API 账号</h3>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-200"><X size={14} /></button>
         </div>
         <form onSubmit={handleSubmit} className="p-4 space-y-3">
           <div>
-            <label htmlFor="cloudrouter-account-name" className="block text-xs text-gray-400 mb-1">账号名称</label>
+            <label htmlFor="api-account-provider" className="block text-xs text-gray-400 mb-1">API 渠道</label>
+            <select
+              id="api-account-provider"
+              className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
+              value={apiProvider}
+              onChange={(event) => setApiProvider(event.target.value as ApiAccountProvider)}
+              disabled={submitting}
+            >
+              <option value="cloudrouter">CloudRouter</option>
+              <option value="apex">ApexRouter</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="api-account-name" className="block text-xs text-gray-400 mb-1">账号名称</label>
             <input
-              id="cloudrouter-account-name"
+              id="api-account-name"
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder="例如：CloudRouter Claude"
+              placeholder={apiProvider === 'apex' ? '例如：ApexRouter Codex' : '例如：CloudRouter Claude'}
               autoComplete="off"
               required
             />
           </div>
           <div>
-            <label htmlFor="cloudrouter-api-key" className="block text-xs text-gray-400 mb-1">CloudRouter API Key</label>
+            <label htmlFor="api-account-key" className="block text-xs text-gray-400 mb-1">{providerName} API Key</label>
             <input
-              id="cloudrouter-api-key"
+              id="api-account-key"
               type="password"
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={apiKey}
               onChange={(event) => setApiKey(event.target.value)}
-              placeholder="cr-..."
+              placeholder={apiProvider === 'apex' ? 'lck_...' : 'cr-...'}
               autoComplete="new-password"
               required
             />
           </div>
           <div className="space-y-1 text-[11px] leading-relaxed text-gray-500">
             <p>每把 Key 建立一个独立 API 账号目录，Key 会以 0600 权限持久保存，不会显示在账号列表或日志中。</p>
-            <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>
+            {apiProvider === 'cloudrouter' ? (
+              <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>
+            ) : (
+              <>
+                <p>ApexRouter 仅用于 Codex；系统会通过 /v1/models 验证 Key 并读取支持的模型。</p>
+                <p>额度通过 /v1/usage 获取：“已用”为当前 Key 用量，剩余、上限与并发限制由同组 Key 共享。</p>
+                <p>ApexRouter 当前不返回到期时间，因此到期时间和剩余天数会显示为无法确认。</p>
+              </>
+            )}
             <p>API 账号会直接加入现有账号池，任务、换模型、会话与自动轮换方式不变。</p>
           </div>
           {error && <p className="text-xs text-red-400 break-all">{error}</p>}
@@ -1065,7 +1134,7 @@ type PoolTab = 'claude' | 'codex';
 export function PoolDrawer() {
   const [claudeEnabled, setClaudeEnabled] = useState(false);
   const [codexEnabled, setCodexEnabled] = useState(false);
-  const [cloudRouterAvailable, setCloudRouterAvailable] = useState(false);
+  const [apiAccountsAvailable, setApiAccountsAvailable] = useState(false);
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<PoolTab>('claude');
 
@@ -1090,8 +1159,8 @@ export function PoolDrawer() {
     // The API-account manager remains available even when both native pools
     // are disabled, so users can add the first key from the same drawer.
     api.getCloudRouterAccounts()
-      .then(() => setCloudRouterAvailable(true))
-      .catch(() => setCloudRouterAvailable(false));
+      .then(() => setApiAccountsAvailable(true))
+      .catch(() => setApiAccountsAvailable(false));
   }, []);
 
   const loadClaudeUsage = useCallback(async (force?: boolean) => {
@@ -1155,7 +1224,7 @@ export function PoolDrawer() {
   const [relogin, setRelogin] = useState<Record<string, { status: string; message?: string }>>({});
   const [showAdd, setShowAdd] = useState(false);
   const [showCodexAdd, setShowCodexAdd] = useState(false);
-  const [showCloudRouterAdd, setShowCloudRouterAdd] = useState(false);
+  const [showApiAdd, setShowApiAdd] = useState(false);
   const [showCcSettings, setShowCcSettings] = useState(false);
 
   const handleClaudeRelogin = useCallback(async (accountId: string) => {
@@ -1276,7 +1345,7 @@ export function PoolDrawer() {
   }, []);
 
   const refreshBothPools = useCallback(async () => {
-    // create/refresh already performs the live CloudRouter requests. Read the
+    // create/refresh already performs the live API-provider requests. Read the
     // resulting pool snapshots without issuing duplicate force requests.
     await Promise.all([loadClaudeUsage(false), loadCodexUsage(false)]);
     const [claudeResult, codexResult] = await Promise.allSettled([
@@ -1293,10 +1362,10 @@ export function PoolDrawer() {
     }
     if (!nextClaudeEnabled && nextCodexEnabled) setTab('codex');
     else if (nextClaudeEnabled && !nextCodexEnabled) setTab('claude');
-    setCloudRouterAvailable(true);
+    setApiAccountsAvailable(true);
   }, [loadClaudeUsage, loadCodexUsage]);
 
-  const handleCloudRouterRefresh = useCallback(async (accountId: string | null | undefined) => {
+  const handleApiRefresh = useCallback(async (accountId: string | null | undefined) => {
     if (!accountId) {
       window.alert('API 账号标识缺失，无法安全刷新');
       return;
@@ -1305,11 +1374,11 @@ export function PoolDrawer() {
       await api.refreshCloudRouterAccount(accountId);
       await refreshBothPools();
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : 'CloudRouter 额度刷新失败');
+      window.alert(e instanceof Error ? e.message : 'API 账号刷新失败');
     }
   }, [refreshBothPools]);
 
-  if (!claudeEnabled && !codexEnabled && !cloudRouterAvailable) return null;
+  if (!claudeEnabled && !codexEnabled && !apiAccountsAvailable) return null;
 
   const hasBothPools = claudeEnabled && codexEnabled;
   const hasActivePool = claudeEnabled || codexEnabled;
@@ -1367,9 +1436,9 @@ export function PoolDrawer() {
                   </button>
                 )}
                 <button
-                  onClick={() => setShowCloudRouterAdd(true)}
+                  onClick={() => setShowApiAdd(true)}
                   className="px-1.5 py-1 rounded text-[10px] font-semibold text-sky-300 border border-sky-600/40 hover:bg-sky-600/15"
-                  title="添加 CloudRouter API 账号"
+                  title="添加 API 账号"
                 >
                   API
                 </button>
@@ -1423,9 +1492,9 @@ export function PoolDrawer() {
             <div className="flex-1 overflow-y-auto p-3 space-y-2 relative">
               {showAdd && <AddAccountModal onClose={() => setShowAdd(false)} onAdded={loadClaudeUsage} />}
               {showCodexAdd && <AddCodexAccountModal onClose={() => setShowCodexAdd(false)} onAdded={loadCodexUsage} />}
-              {showCloudRouterAdd && (
-                <AddCloudRouterAccountModal
-                  onClose={() => setShowCloudRouterAdd(false)}
+              {showApiAdd && (
+                <AddApiAccountModal
+                  onClose={() => setShowApiAdd(false)}
                   onAdded={refreshBothPools}
                 />
               )}
@@ -1434,7 +1503,7 @@ export function PoolDrawer() {
               {!hasActivePool && (
                 <div className="rounded-lg border border-sky-700/40 bg-sky-950/20 p-3 text-xs leading-relaxed text-gray-400">
                   还没有可用账号。点击右上角 <span className="font-semibold text-sky-300">API</span>，
-                  添加 CloudRouter Key 后会自动识别 Claude 或 Codex 模型，并显示额度与到期时间。
+                  选择 CloudRouter 或 ApexRouter，并添加相应的 API Key。
                 </div>
               )}
 
@@ -1453,13 +1522,13 @@ export function PoolDrawer() {
                       onSetPreferred={handleClaudeSetPreferred}
                       onRelogin={handleClaudeRelogin}
                       onRetryUsage={() => {
-                        if (a.auth_kind === 'cloudrouter_api') {
-                          void handleCloudRouterRefresh(a.api_account_id);
+                        if (isApiAuthKind(a.auth_kind)) {
+                          void handleApiRefresh(a.api_account_id);
                         } else {
                           void loadClaudeUsage(true);
                         }
                       }}
-                      onDelete={a.auth_kind === 'cloudrouter_api' ? undefined : async (id) => {
+                      onDelete={isApiAuthKind(a.auth_kind) ? undefined : async (id) => {
                         if (!window.confirm(`从 Claude 号池中删除 ${id}？`)) return;
                         try { await api.poolDeleteAccount(id); await loadClaudeUsage(); } catch (e) { window.alert(String(e)); }
                       }}
@@ -1484,13 +1553,13 @@ export function PoolDrawer() {
                       onSetPreferred={handleCodexSetPreferred}
                       onRelogin={handleCodexRelogin}
                       onSubmitOtp={(state, code) => handleCodexSubmitOtp(a.id, state, code)}
-                      onDelete={a.auth_kind === 'cloudrouter_api' ? undefined : async (id) => {
+                      onDelete={isApiAuthKind(a.auth_kind) ? undefined : async (id) => {
                         if (!window.confirm(`从 Codex 号池中删除 ${id}？将清除 OAuth、邮箱 Token、OpenAI 密码以及该账号的日志、历史和配置；仅保留原生会话文件用于任务上下文迁移。`)) return;
                         try { await api.codexPoolDeleteAccount(id); await loadCodexUsage(); } catch (e) { window.alert(String(e)); }
                       }}
                       onRetryUsage={() => {
-                        if (a.auth_kind === 'cloudrouter_api') {
-                          void handleCloudRouterRefresh(a.api_account_id);
+                        if (isApiAuthKind(a.auth_kind)) {
+                          void handleApiRefresh(a.api_account_id);
                         } else {
                           void loadCodexUsage(true);
                         }

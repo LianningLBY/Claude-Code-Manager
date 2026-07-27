@@ -5672,16 +5672,33 @@ class GlobalDispatcher:
                     provider=provider,
                 )
             try:
-                result = await evaluator.evaluate(
-                    condition=task.goal_condition,
-                    conversation_summary=conversation_summary,
-                    model=task.goal_evaluator_model,
-                    provider=provider,
-                    codex_home=evaluation_home,
-                    task_id=task.id,
-                    config_dir=evaluation_home,
-                    cloudrouter_store=self.cloudrouter_store,
-                )
+                async def evaluate_with_home(admitted_home):
+                    return await evaluator.evaluate(
+                        condition=task.goal_condition,
+                        conversation_summary=conversation_summary,
+                        model=task.goal_evaluator_model,
+                        provider=provider,
+                        codex_home=admitted_home,
+                        task_id=task.id,
+                        config_dir=admitted_home,
+                        cloudrouter_store=self.cloudrouter_store,
+                    )
+
+                # Validate/sanitize an API home before any process can read it.
+                # For Codex, retain the same store → home/exec lock order used
+                # by normal launches and stop an idle app-server before exec.
+                async with self.instance_manager._cloudrouter_runtime_admission(
+                    provider,
+                    evaluation_home,
+                    evaluator_model,
+                ):
+                    if provider == "codex":
+                        async with self.instance_manager.codex_home_exec_guard(
+                            evaluation_home,
+                        ) as admitted_home:
+                            result = await evaluate_with_home(admitted_home)
+                    else:
+                        result = await evaluate_with_home(evaluation_home)
                 record_evaluator_route()
                 return result, turn_home
             except GoalEvaluationError as exc:
@@ -7162,20 +7179,37 @@ class GlobalDispatcher:
                     f"No available Codex account supports sub-agent model {model!r}"
                 )
 
-        async with self.instance_manager.codex_home_app_server_guard(
-            codex_home
-        ) as admitted_home:
-            registry = self.instance_manager._ensure_codex_app_server_registry()
-            process, thread_id = await registry.start_turn(
-                codex_home=admitted_home,
-                prompt=prompt,
-                cwd=cwd,
-                model=model,
-                effort=clamp_codex_effort(model, effort_level),
-                resume_session_id=None,
-                git_env=None,
-                task_id=task_id,
-                mcp_specs=mcp_specs,
+        async def launch_admitted_turn(disable_project_config: bool):
+            async with self.instance_manager.codex_home_app_server_guard(
+                codex_home
+            ) as admitted_home:
+                registry = (
+                    self.instance_manager._ensure_codex_app_server_registry()
+                )
+                process, thread_id = await registry.start_turn(
+                    codex_home=admitted_home,
+                    prompt=prompt,
+                    cwd=cwd,
+                    model=model,
+                    effort=clamp_codex_effort(model, effort_level),
+                    resume_session_id=None,
+                    git_env=None,
+                    task_id=task_id,
+                    mcp_specs=mcp_specs,
+                    disable_project_config=disable_project_config,
+                )
+                return process, thread_id, admitted_home
+
+        # Preserve the global lock order used by ordinary task launches:
+        # API-store mutation/admission first, then the per-home transport lock.
+        # Native homes pass through and yield None.
+        async with self.instance_manager._cloudrouter_runtime_admission(
+            "codex",
+            codex_home,
+            model,
+        ) as api_account:
+            process, thread_id, admitted_home = await launch_admitted_turn(
+                api_account is not None,
             )
         self._sub_agent_codex_homes[session_id] = admitted_home
         self._sub_agent_codex_processes[session_id] = process

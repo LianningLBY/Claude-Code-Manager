@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.models.global_settings import GlobalSettings
+from backend.services.cloudrouter_accounts import is_api_auth_kind
 from backend.services.login_runtime import (
     LoginRuntimeError,
     ensure_login_runtime,
@@ -30,6 +31,10 @@ router = APIRouter(prefix="/api/pool", tags=["pool"])
 _relogin_state: dict[str, dict] = {}
 # Claude/Codex 自动登录共用同一个浏览器运行时锁。
 _login_lock = login_lock
+
+
+def _is_api_account(account) -> bool:
+    return is_api_auth_kind(getattr(account, "auth_kind", ""))
 
 
 def _get_pool():
@@ -107,10 +112,10 @@ async def relogin_account(request: Request, account_id: str):
     acc = pool.account(account_id)
     if acc is None:
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
-    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+    if _is_api_account(acc):
         raise HTTPException(
             status_code=400,
-            detail="CloudRouter API 账号不使用 OAuth 登录，请通过 API 账号刷新入口校验",
+            detail="API 账号不使用 OAuth 登录，请通过 API 账号刷新入口校验",
         )
 
     # 1) OAuth refresh——绝大多数"过期"到这一步就解决了
@@ -182,10 +187,10 @@ async def delete_account(request: Request, account_id: str):
     acc = pool.account(account_id)
     if acc is None:
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
-    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+    if _is_api_account(acc):
         raise HTTPException(
             status_code=400,
-            detail="CloudRouter API 账号请通过 API 账号删除入口处理",
+            detail="API 账号请通过 API 账号删除入口处理",
         )
     # 从 accounts.json 中删除
     accounts_path = Path.home() / ".claude-pool" / "accounts.json"

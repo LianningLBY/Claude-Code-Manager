@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from backend.api.deps import require_admin
 from backend.services.codex_app_server import CodexAppServerBusyError
+from backend.services.cloudrouter_accounts import is_api_auth_kind
 from backend.services.login_runtime import (
     LoginRuntimeError,
     ensure_login_runtime,
@@ -1572,10 +1573,10 @@ async def codex_relogin(request: Request, account_id: str):
     acc = pool.account(account_id)
     if not acc or getattr(acc, "retired", False):
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
-    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+    if is_api_auth_kind(getattr(acc, "auth_kind", "")):
         raise HTTPException(
             status_code=400,
-            detail="CloudRouter API 账号不使用 OAuth 登录，请通过 API 账号刷新入口校验",
+            detail="API 账号不使用 OAuth 登录，请通过 API 账号刷新入口校验",
         )
 
     state = _relogin_state.get(account_id)
@@ -2177,10 +2178,10 @@ async def codex_delete_account(request: Request, account_id: str):
         and not getattr(acc, "cleanup_pending", False)
     ):
         raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
-    if getattr(acc, "auth_kind", "") == "cloudrouter_api":
+    if is_api_auth_kind(getattr(acc, "auth_kind", "")):
         raise HTTPException(
             status_code=400,
-            detail="CloudRouter API 账号请通过 API 账号删除入口处理",
+            detail="API 账号请通过 API 账号删除入口处理",
         )
 
     if _login_lock.locked():

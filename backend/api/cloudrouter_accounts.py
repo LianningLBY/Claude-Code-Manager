@@ -1,8 +1,13 @@
-"""Administrative API for CloudRouter-backed Claude/Codex accounts."""
+"""Administrative API for managed API-gateway Claude/Codex accounts.
+
+The historical route is retained so existing CloudRouter clients continue to
+work; the request's ``api_provider`` selects CloudRouter or ApexRouter.
+"""
 
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, SecretStr
@@ -24,6 +29,7 @@ router = APIRouter(
 class CloudRouterAccountCreate(BaseModel):
     name: str
     api_key: SecretStr
+    api_provider: Literal["cloudrouter", "apex"] = "cloudrouter"
 
 
 def _get_store() -> CloudRouterAccountStore:
@@ -90,20 +96,20 @@ def _reload_runtime_pools() -> None:
 
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, CloudRouterAccountNotFound):
-        return HTTPException(404, "CloudRouter account not found")
+        return HTTPException(404, "API account not found")
     if isinstance(exc, CloudRouterUnsafePathError):
-        return HTTPException(409, "CloudRouter account storage is unsafe")
+        return HTTPException(409, "API account storage is unsafe")
     if isinstance(exc, CloudRouterUpstreamError):
         if exc.status_code in {401, 403}:
-            return HTTPException(400, "CloudRouter API key is invalid or unauthorized")
+            return HTTPException(400, "API key is invalid or unauthorized")
         if exc.code in {
             "timeout", "network_error", "upstream_unavailable", "rate_limited",
         }:
-            return HTTPException(503, "CloudRouter is temporarily unavailable")
-        return HTTPException(400, f"CloudRouter validation failed: {exc.code}")
+            return HTTPException(503, "API gateway is temporarily unavailable")
+        return HTTPException(400, f"API gateway validation failed: {exc.code}")
     if isinstance(exc, ValueError):
         return HTTPException(422, str(exc))
-    return HTTPException(500, "CloudRouter account operation failed")
+    return HTTPException(500, "API account operation failed")
 
 
 @router.get("")
@@ -126,7 +132,9 @@ async def create_account(request: Request, body: CloudRouterAccountCreate):
     try:
         store = _get_store()
         account = await store.add_account(
-            body.name, body.api_key.get_secret_value(),
+            body.name,
+            body.api_key.get_secret_value(),
+            api_provider=body.api_provider,
         )
         quota = await store.fetch_usage(account.id, force=True)
         _reload_runtime_pools()
@@ -167,11 +175,11 @@ async def retire_account(request: Request, account_id: str):
     except Exception as exc:
         raise _http_error(exc) from exc
     if account is None:
-        raise HTTPException(404, "CloudRouter account not found")
+        raise HTTPException(404, "API account not found")
     if account.retired and not account.cleanup_pending:
         return {"ok": True, **account.public_dict()}
     raise HTTPException(
         409,
-        "CloudRouter API account deletion is temporarily disabled while "
+        "API account deletion is temporarily disabled while "
         "runtime credential-use fencing is unavailable",
     )

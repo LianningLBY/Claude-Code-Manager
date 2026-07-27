@@ -1513,6 +1513,8 @@ class _FakeCloudRouterAccount:
     def __init__(self, root: Path):
         self.id = "cloudrouter-1"
         self.name = "CloudRouter test"
+        self.auth_kind = "cloudrouter_api"
+        self.api_provider = "cloudrouter"
         self.enabled = True
         self.retired = False
         self.models = {
@@ -1616,6 +1618,7 @@ class TestCloudRouterClaudeProjection:
         assert pool.select(model="claude-opus-4-8") is None
         public = pool.list_accounts()[0]
         assert public["auth_kind"] == "cloudrouter_api"
+        assert public["api_provider"] == "cloudrouter"
         assert public["api_account_id"] == "cloudrouter-1"
         assert public["supported_models"] == ["claude-sonnet-5"]
 
@@ -1764,3 +1767,31 @@ class TestCloudRouterClaudeProjection:
             current.claude_config_dir,
             model="claude-sonnet-5",
         ) is None
+
+    @pytest.mark.asyncio
+    async def test_apex_api_projection_is_generic_and_hidden_from_claude(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterAccount(tmp_path / "apex-1")
+        account.id = "apex-1"
+        account.name = "Apex API"
+        account.auth_kind = "apex_api"
+        account.api_provider = "apex"
+        account.models = {
+            "claude": [],
+            "codex": ["gpt-5.4"],
+        }
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account),
+            bootstrap_default=False,
+        )
+
+        projection = pool.account("apex-1")
+        assert projection is not None
+        assert projection.auth_kind == "apex_api"
+        assert projection.api_provider == "apex"
+        assert projection.enabled is False
+        assert pool.is_cloudrouter_account(account.claude_config_dir) is True
+        assert pool.list_accounts() == []
+        assert await pool.fetch_usage(force=True) == []

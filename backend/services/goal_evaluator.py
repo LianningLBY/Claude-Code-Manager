@@ -9,8 +9,10 @@ import json
 import logging
 import os
 import signal
+import tempfile
 
 from backend.config import settings
+from backend.services.codex_app_server import codex_untrusted_project_override
 from backend.services.process_safety import require_safe_process_group_id
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,10 @@ _CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
     "CLOUDROUTER_API_KEY",
+    "APEX_CODEX_GATEWAY_KEY",
+    "APEX_CODEX_API_KEY",
+    "APEXROUTER_API_KEY",
+    "APEXROUTER_CODEX_API_KEY",
 )
 # Exact handles remain reachable when cleanup cannot prove a process tree
 # terminal.  Evaluators are otherwise short-lived local objects, so swallowing
@@ -344,12 +350,13 @@ class GoalEvaluator:
             else:
                 env["CLAUDE_CONFIG_DIR"] = provider_home
 
-        if (
+        cloudrouter_api = bool(
             provider_home
             and self._is_cloudrouter_projection(
                 cloudrouter_store, provider, provider_home,
             )
-        ):
+        )
+        if cloudrouter_api:
             auth_keys = (
                 _CLOUDROUTER_CODEX_AUTH_ENV_KEYS
                 if provider == "codex"
@@ -359,6 +366,17 @@ class GoalEvaluator:
                 env.pop(key, None)
 
         cmd = self._build_eval_command(provider, prompt, eval_model)
+        evaluator_cwd = tempfile.gettempdir()
+        if provider == "codex" and cloudrouter_api:
+            # Loading the managed API provider/auth configuration is required,
+            # but trusting the evaluator cwd would also enable project-local
+            # Codex configuration.  Replace the whole projects map for this
+            # process so neither a persisted entry nor a project file can
+            # launch project-local MCP servers or hooks beside that credential.
+            cmd[-1:-1] = [
+                "-c",
+                codex_untrusted_project_override(evaluator_cwd),
+            ]
 
         process: asyncio.subprocess.Process | None = None
         communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
@@ -368,6 +386,8 @@ class GoalEvaluator:
             "stderr": asyncio.subprocess.PIPE,
             "env": env,
         }
+        if provider == "codex" and cloudrouter_api:
+            spawn_kwargs["cwd"] = evaluator_cwd
         if managed_process_group:
             spawn_kwargs["start_new_session"] = True
         try:

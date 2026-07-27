@@ -101,6 +101,98 @@ def normalize_codex_home(codex_home: str | os.PathLike[str] | None = None) -> st
     return str(Path(configured).expanduser().resolve(strict=False))
 
 
+def _canonical_path(path: str | os.PathLike[str]) -> Path:
+    """Best-effort equivalent of Codex's canonical project trust key path."""
+
+    expanded = Path(path).expanduser()
+    try:
+        return expanded.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(os.fspath(expanded)))
+
+
+def codex_project_trust_target(cwd: str | os.PathLike[str]) -> str:
+    """Resolve the project key Codex 0.144.6 uses for trust decisions.
+
+    A regular checkout trusts its nearest repository root.  A linked worktree
+    trusts the main checkout root referenced by
+    ``.git/worktrees/<worktree-name>``.  Codex falls back to the requested cwd
+    when neither case can be proven, including malformed/non-worktree gitdir
+    pointers.
+    """
+
+    requested_cwd = _canonical_path(cwd)
+    base = requested_cwd if requested_cwd.is_dir() else requested_cwd.parent
+    repository_root: Path | None = None
+    dot_git: Path | None = None
+    for candidate in (base, *base.parents):
+        candidate_dot_git = candidate / ".git"
+        try:
+            candidate_dot_git.stat()
+        except OSError:
+            continue
+        repository_root = candidate
+        dot_git = candidate_dot_git
+        break
+
+    if repository_root is None or dot_git is None:
+        return str(requested_cwd)
+
+    try:
+        if dot_git.is_dir():
+            return str(_canonical_path(repository_root))
+        pointer = dot_git.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return str(requested_cwd)
+
+    prefix = "gitdir:"
+    if not pointer.startswith(prefix):
+        return str(requested_cwd)
+    git_dir_value = pointer[len(prefix):].strip()
+    if not git_dir_value:
+        return str(requested_cwd)
+
+    git_dir = Path(git_dir_value).expanduser()
+    if not git_dir.is_absolute():
+        git_dir = repository_root / git_dir
+    git_dir = _canonical_path(git_dir)
+    worktrees_dir = git_dir.parent
+    if worktrees_dir.name != "worktrees":
+        return str(requested_cwd)
+    common_dir = worktrees_dir.parent
+    return str(_canonical_path(common_dir.parent))
+
+
+def codex_untrusted_project_config(
+    cwd: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Build a session-only config that disables project-local Codex config."""
+
+    target = codex_project_trust_target(cwd)
+    return {"projects": {target: {"trust_level": "untrusted"}}}
+
+
+def codex_untrusted_project_override(cwd: str | os.PathLike[str]) -> str:
+    """Build the equivalent safe whole-map TOML override for ``codex -c``."""
+
+    target = json.dumps(codex_project_trust_target(cwd), ensure_ascii=False)
+    return f'projects={{{target}={{trust_level="untrusted"}}}}'
+
+
+def _deep_merge_config(
+    target: dict[str, Any],
+    override: dict[str, Any],
+) -> None:
+    """Merge a thread override without discarding unrelated nested config."""
+
+    for key, value in override.items():
+        current = target.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            _deep_merge_config(current, value)
+        else:
+            target[key] = value
+
+
 class CodexTurnProcess:
     """Process-like view of one app-server turn.
 
@@ -547,6 +639,7 @@ class CodexAppServer:
         git_env: dict[str, str] | None,
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
+        disable_project_config: bool = False,
     ) -> tuple[CodexTurnProcess, str]:
         required_mcp = any(spec.required for spec in mcp_specs)
         try:
@@ -559,6 +652,11 @@ class CodexAppServer:
                     f"Invalid required Codex MCP configuration: {exc}"
                 ) from exc
             raise
+        if disable_project_config:
+            _deep_merge_config(
+                thread_config,
+                codex_untrusted_project_config(cwd),
+            )
         try:
             await self.ensure_started()
         except CodexAppServerBusyError:
@@ -767,6 +865,7 @@ class CodexAppServer:
         *,
         cwd: str,
         model: str | None = None,
+        disable_project_config: bool = False,
     ) -> dict[str, Any]:
         """Create an empty persisted thread without starting a turn."""
 
@@ -780,6 +879,8 @@ class CodexAppServer:
         }
         if model and model != "default":
             params["model"] = model
+        if disable_project_config:
+            params["config"] = codex_untrusted_project_config(cwd)
         request = asyncio.create_task(self._request("thread/start", params))
         while not request.done():
             try:
@@ -1749,6 +1850,7 @@ class CodexAppServerRegistry:
         *,
         cwd: str,
         model: str | None = None,
+        disable_project_config: bool = False,
     ) -> dict[str, Any]:
         """Create an empty thread in one exact account home."""
 
@@ -1774,7 +1876,11 @@ class CodexAppServerRegistry:
 
         thread_id: str | None = None
         try:
-            result = await server.create_thread(cwd=cwd, model=model)
+            result = await server.create_thread(
+                cwd=cwd,
+                model=model,
+                disable_project_config=disable_project_config,
+            )
             thread_id = str(result["id"])
             async with self._lock:
                 existing = self._thread_owners.get(thread_id)

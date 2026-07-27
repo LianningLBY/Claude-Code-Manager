@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,12 +27,20 @@ def _process(*, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
 
 def _guard_manager():
     manager = MagicMock()
+    manager.runtime_admission_calls = []
 
     @asynccontextmanager
     async def guard(home):
         yield str(Path(home).resolve()) if home else str(Path.home() / ".codex")
 
     manager.codex_home_exec_guard = guard
+
+    @asynccontextmanager
+    async def runtime_admission(*args):
+        manager.runtime_admission_calls.append(args)
+        yield object()
+
+    manager._cloudrouter_runtime_admission = runtime_admission
     return manager
 
 
@@ -220,7 +229,15 @@ async def test_codex_api_distill_loads_provider_config_and_scrubs_auth(
         "item": {"type": "agent_message", "text": "# Codex API result"},
     }).encode())
     manager = _guard_manager()
-    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "CLOUDROUTER_API_KEY"):
+    for key in (
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CLOUDROUTER_API_KEY",
+        "APEX_CODEX_GATEWAY_KEY",
+        "APEX_CODEX_API_KEY",
+        "APEXROUTER_API_KEY",
+        "APEXROUTER_CODEX_API_KEY",
+    ):
         monkeypatch.setenv(key, f"secret-{key}")
 
     with patch(
@@ -243,14 +260,30 @@ async def test_codex_api_distill_loads_provider_config_and_scrubs_auth(
     )
     cmd = create_process.await_args.args
     assert "--ignore-user-config" not in cmd
+    override_index = cmd.index("-c")
+    assert tomllib.loads(cmd[override_index + 1]) == {
+        "projects": {
+            str(Path(tempfile.gettempdir()).resolve()): {
+                "trust_level": "untrusted",
+            },
+        },
+    }
+    assert override_index < len(cmd) - 2
     child_env = create_process.await_args.kwargs["env"]
     assert child_env["CODEX_HOME"] == str(codex_home)
     assert not {
         "OPENAI_API_KEY",
         "CODEX_API_KEY",
         "CLOUDROUTER_API_KEY",
+        "APEX_CODEX_GATEWAY_KEY",
+        "APEX_CODEX_API_KEY",
+        "APEXROUTER_API_KEY",
+        "APEXROUTER_CODEX_API_KEY",
     } & child_env.keys()
     store._read_api_key.assert_not_called()
+    assert manager.runtime_admission_calls == [
+        ("codex", str(codex_home), settings.default_codex_model),
+    ]
     assert result["content"] == "# Codex API result"
 
 

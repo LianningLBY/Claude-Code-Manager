@@ -1040,6 +1040,8 @@ class _FakeCloudRouterCodexAccount:
     def __init__(self, root: Path):
         self.id = "cloudrouter-1"
         self.name = "CloudRouter Codex"
+        self.auth_kind = "cloudrouter_api"
+        self.api_provider = "cloudrouter"
         self.enabled = True
         self.retired = False
         self.models = {
@@ -1149,6 +1151,7 @@ class TestCloudRouterCodexProjection:
         assert pool.select(model="gpt-5.6-sol") is None
         public = pool.list_accounts()[0]
         assert public["auth_kind"] == "cloudrouter_api"
+        assert public["api_provider"] == "cloudrouter"
         assert public["api_account_id"] == "cloudrouter-1"
         assert public["supported_models"] == ["gpt-5.5"]
 
@@ -1257,3 +1260,44 @@ class TestCloudRouterCodexProjection:
         )
 
         assert [item.id for item in pool._accounts] == ["cloudrouter-1"]
+
+    @pytest.mark.asyncio
+    async def test_apex_api_projection_uses_generic_api_paths(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "apex-1")
+        account.id = "apex-1"
+        account.name = "Apex API"
+        account.auth_kind = "apex_api"
+        account.api_provider = "apex"
+        account.models = {
+            "claude": [],
+            "codex": ["gpt-5.4"],
+        }
+        snapshot = {
+            "available": True,
+            "known": True,
+            "reason": "active",
+            "state": "active",
+            "windows": [{"used": 2, "limit": 100}],
+        }
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="gpt-5.4") == str(
+            Path(account.codex_home).resolve()
+        )
+        assert pool.select(model="gpt-5.5") is None
+        public = pool.list_accounts()[0]
+        assert public["auth_kind"] == "apex_api"
+        assert public["api_provider"] == "apex"
+        assert public["supported_models"] == ["gpt-5.4"]
+
+        rows = await pool.fetch_quota(force=True, live=True)
+        assert rows[0]["api_provider"] == "apex"
+        assert rows[0]["api_quota"] == snapshot
+        assert codex_pool_module.verify_login(
+            account.codex_home,
+            auth_kind="apex_api",
+        )["logged_in"] is True

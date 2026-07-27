@@ -408,6 +408,8 @@ describe('PoolDrawer', () => {
     const apiAccount = {
       id: 'cloudrouter-1',
       name: 'CloudRouter Claude',
+      api_provider: 'cloudrouter' as const,
+      auth_kind: 'cloudrouter_api' as const,
       enabled: true,
       retired: false,
       key_hint: 'cr-…1234',
@@ -448,7 +450,7 @@ describe('PoolDrawer', () => {
       expect(screen.getByText(/还没有可用账号/)).toBeInTheDocument();
       expect(screen.queryByTitle('添加账号')).not.toBeInTheDocument();
 
-      await user.click(screen.getByTitle('添加 CloudRouter API 账号'));
+      await user.click(screen.getByTitle('添加 API 账号'));
       await user.type(screen.getByLabelText('账号名称'), 'First API');
       await user.type(screen.getByLabelText('CloudRouter API Key'), 'cr-first-secret');
       await user.click(screen.getByRole('button', { name: '验证并添加' }));
@@ -457,6 +459,7 @@ describe('PoolDrawer', () => {
         expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
           name: 'First API',
           api_key: 'cr-first-secret',
+          api_provider: 'cloudrouter',
         });
       });
     });
@@ -470,11 +473,12 @@ describe('PoolDrawer', () => {
 
       await renderAndWaitForPro();
       await openDrawer(user);
-      await user.click(screen.getByTitle('添加 CloudRouter API 账号'));
+      await user.click(screen.getByTitle('添加 API 账号'));
 
       expect(screen.getByText(/每把 Key 建立一个独立 API 账号目录/)).toBeInTheDocument();
       expect(screen.getByText(/0600 权限持久保存/)).toBeInTheDocument();
       expect(screen.getByText(/通常需要分别添加两把 Key/)).toBeInTheDocument();
+      expect(screen.getByLabelText('API 渠道')).toHaveValue('cloudrouter');
       await user.type(screen.getByLabelText('账号名称'), 'CloudRouter Claude');
       await user.type(screen.getByLabelText('CloudRouter API Key'), 'cr-secret-value');
       await user.click(screen.getByRole('button', { name: '验证并添加' }));
@@ -483,11 +487,73 @@ describe('PoolDrawer', () => {
         expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
           name: 'CloudRouter Claude',
           api_key: 'cr-secret-value',
+          api_provider: 'cloudrouter',
         });
-        expect(screen.queryByText('添加 CloudRouter API 账号')).not.toBeInTheDocument();
+        expect(screen.queryByText('添加 API 账号')).not.toBeInTheDocument();
       });
       expect(api.getPoolUsage).toHaveBeenCalledWith(false);
       expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
+    });
+
+    it('adds an ApexRouter key as a Codex-only API account', async () => {
+      vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        id: 'apex-1',
+        name: 'Apex Codex',
+        api_provider: 'apex',
+        auth_kind: 'apex_api',
+        models: {
+          claude: [],
+          codex: ['gpt-5.4'],
+        },
+        providers: ['codex'],
+        supported_models: ['gpt-5.4'],
+        api_quota: {
+          state: 'active',
+          mode: 'shared_group',
+          unit: 'credits',
+          known: true,
+          key_name: 'test-key',
+          group_name: 'test-group',
+          key_usage: { requests_5h: 3 },
+          windows: [{
+            id: 'requests_5h',
+            label: '5h 请求（分组共享）',
+            scope: 'group',
+            key_used: 3,
+            used: 12,
+            limit: 100,
+            remaining: 88,
+            currency: 'requests',
+          }],
+          concurrency: 3,
+        },
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByTitle('添加 API 账号'));
+      await user.selectOptions(screen.getByLabelText('API 渠道'), 'apex');
+
+      expect(screen.getByLabelText('ApexRouter API Key')).toBeInTheDocument();
+      expect(screen.getByText(/ApexRouter 仅用于 Codex/)).toBeInTheDocument();
+      expect(screen.getByText(/通过 \/v1\/models 验证 Key/)).toBeInTheDocument();
+      expect(screen.getByText(/额度通过 \/v1\/usage 获取/)).toBeInTheDocument();
+      expect(screen.getByText(/剩余、上限与并发限制由同组 Key 共享/)).toBeInTheDocument();
+      expect(screen.getByText(/当前不返回到期时间/)).toBeInTheDocument();
+
+      await user.type(screen.getByLabelText('账号名称'), 'Apex Codex');
+      await user.type(screen.getByLabelText('ApexRouter API Key'), 'lck_test_only_not_real');
+      await user.click(screen.getByRole('button', { name: '验证并添加' }));
+
+      await waitFor(() => {
+        expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
+          name: 'Apex Codex',
+          api_key: 'lck_test_only_not_real',
+          api_provider: 'apex',
+        });
+      });
     });
 
     it('renders a Claude API projection with models and generic quota without exposing unsafe runtime deletion', async () => {
@@ -600,6 +666,89 @@ describe('PoolDrawer', () => {
       });
       expect(api.getPoolUsage).toHaveBeenCalledWith(false);
       expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
+    });
+
+    it('renders an Apex projection with separate Key and shared-group quota', async () => {
+      enableCodexPool({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'apex:apex-1:codex',
+          codex_home: '/tmp/apex-1/codex',
+          email: '',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'apex_api',
+          api_provider: 'apex',
+          display_name: 'Apex Codex',
+          api_account_id: 'apex-1',
+          supported_models: ['gpt-5.4'],
+          api_quota: {
+            state: 'active',
+            mode: 'shared_group',
+            known: true,
+            key_name: 'apex-test-key',
+            group_name: 'apex-test-group',
+            key_usage: { requests_5h: 3 },
+            concurrency: 3,
+            windows: [{
+              id: 'requests_5h',
+              label: '5h 请求（分组共享）',
+              scope: 'group',
+              key_used: 3,
+              used: 12,
+              limit: 100,
+              remaining: 88,
+              currency: 'requests',
+            }],
+          },
+        }],
+      });
+      vi.mocked(api.refreshCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        id: 'apex-1',
+        name: 'Apex Codex',
+        api_provider: 'apex',
+        auth_kind: 'apex_api',
+        models: {
+          claude: [],
+          codex: ['gpt-5.4'],
+        },
+        providers: ['codex'],
+        supported_models: ['gpt-5.4'],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+
+      const card = (await screen.findByText('Apex Codex')).closest('.rounded-lg') as HTMLElement;
+      expect(within(card).getByText('APEXROUTER API')).toBeInTheDocument();
+      expect(within(card).getByText('gpt-5.4')).toBeInTheDocument();
+      expect(within(card).queryByRole('button', { name: '重新登录' })).not.toBeInTheDocument();
+
+      await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
+      expect(card).toHaveTextContent('Key apex-test-key');
+      expect(card).toHaveTextContent('分组 apex-test-group');
+      expect(card).toHaveTextContent('本 Key 已用 3 requests');
+      expect(card).toHaveTextContent('分组共享已用 12 requests');
+      expect(card).toHaveTextContent('分组共享剩余 88 requests');
+      expect(card).toHaveTextContent('分组并发上限 3');
+      expect(card).toHaveTextContent('5h 请求（分组共享）');
+      expect(card).toHaveTextContent('到期时间：无法确认');
+      expect(card).toHaveTextContent('剩余天数：无法确认');
+
+      await user.click(within(card).getByRole('button', { name: '刷新额度' }));
+      await waitFor(() => {
+        expect(api.refreshCloudRouterAccount).toHaveBeenCalledWith('apex-1');
+      });
     });
 
     it('marks missing quota and expiry fields as unconfirmed instead of displaying zero', async () => {

@@ -26,6 +26,9 @@ from backend.services.claude_pool import (
     is_codex_transient,
     is_codex_usage_limited,
 )
+from backend.services.cloudrouter_accounts import (
+    is_api_auth_kind as _is_api_auth_kind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +88,9 @@ def api_quota_at_or_above(
     *,
     threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
 ) -> bool:
-    """Whether a generic CloudRouter quota snapshot reached ``threshold``.
+    """Whether a generic API quota snapshot reached ``threshold``.
 
-    The adapter deliberately keeps CloudRouter's wallet/credit/quota schema in
+    The adapter deliberately keeps provider-specific wallet/credit/quota data in
     ``api_quota`` rather than pretending it is Codex's native 5-hour/weekly
     subscription shape.  Ratios are evaluated only when the upstream supplied
     a real limit.
@@ -195,7 +198,8 @@ class CodexPoolAccount:
     __slots__ = (
         "id", "codex_home", "email", "enabled", "retired", "cleanup_pending",
         "login_recovery_failed", "quota_valid_after", "quota_cutoff_invalid",
-        "auth_kind", "display_name", "api_account_id", "supported_models",
+        "auth_kind", "api_provider", "display_name", "api_account_id",
+        "supported_models",
         "_api_account",
     )
 
@@ -229,6 +233,9 @@ class CodexPoolAccount:
         self.quota_cutoff_invalid: bool = has_quota_cutoff and not valid_quota_cutoff
         self.enabled: bool = bool(data.get("enabled", True)) and not self.retired
         self.auth_kind: str = str(data.get("auth_kind") or "oauth")
+        self.api_provider: str | None = data.get("api_provider")
+        if self.api_provider is None and _is_api_auth_kind(self.auth_kind):
+            self.api_provider = self.auth_kind.removesuffix("_api")
         self.display_name: str = str(
             data.get("display_name") or self.email or self.id
         )
@@ -238,6 +245,7 @@ class CodexPoolAccount:
 
     @classmethod
     def from_cloudrouter(cls, account) -> "CodexPoolAccount":
+        auth_kind = str(getattr(account, "auth_kind", "") or "cloudrouter_api")
         return cls({
             "id": account.id,
             "codex_home": str(account.codex_home),
@@ -250,7 +258,11 @@ class CodexPoolAccount:
                 and bool((account.models or {}).get("codex"))
             ),
             "retired": bool(account.retired),
-            "auth_kind": "cloudrouter_api",
+            "auth_kind": auth_kind,
+            "api_provider": (
+                getattr(account, "api_provider", None)
+                or auth_kind.removesuffix("_api")
+            ),
             "display_name": account.name,
             "api_account_id": account.id,
             "supported_models": list((account.models or {}).get("codex", [])),
@@ -258,13 +270,13 @@ class CodexPoolAccount:
         })
 
     def supports_model(self, model: str | None) -> bool:
-        if self.auth_kind != "cloudrouter_api":
+        if not _is_api_auth_kind(self.auth_kind):
             return True
         try:
             return bool(self._api_account.supports_model("codex", model))
         except Exception:
             logger.exception(
-                "Could not evaluate CloudRouter model support for %s", self.id
+                "Could not evaluate API account model support for %s", self.id
             )
             return False
 
@@ -339,7 +351,7 @@ class CodexPool:
                         or projection.codex_home in known_homes
                     ):
                         logger.error(
-                            "Skipping duplicate CloudRouter Codex projection "
+                            "Skipping duplicate API Codex projection "
                             "%s (%s)",
                             projection.id,
                             projection.codex_home,
@@ -477,6 +489,7 @@ class CodexPool:
                 max(0, cooldown_until - now) if cooldown_until > now else 0
             ),
             "auth_kind": account.auth_kind,
+            "api_provider": account.api_provider,
             "display_name": account.display_name,
             "api_account_id": account.api_account_id,
             "supported_models": account.supported_models,
@@ -485,7 +498,7 @@ class CodexPool:
 
     def _api_quota_decision(self, account: CodexPoolAccount) -> dict:
         if (
-            account.auth_kind != "cloudrouter_api"
+            not _is_api_auth_kind(account.auth_kind)
             or self._cloudrouter_store is None
             or not account.api_account_id
         ):
@@ -501,7 +514,7 @@ class CodexPool:
             }
         except Exception:
             logger.exception(
-                "Could not read cached CloudRouter quota for %s", account.id
+                "Could not read cached API quota for %s", account.id
             )
             return {"available": True, "known": False, "reason": ""}
 
@@ -555,7 +568,7 @@ class CodexPool:
                 continue
             if account.id in self._terminal_failures:
                 continue
-            if account.auth_kind != "cloudrouter_api":
+            if not _is_api_auth_kind(account.auth_kind):
                 return True
             decision = self._api_quota_decision(account)
             if not (
@@ -571,7 +584,7 @@ class CodexPool:
         return any(
             account.enabled
             and not account.retired
-            and account.auth_kind != "cloudrouter_api"
+            and not _is_api_auth_kind(account.auth_kind)
             for account in self._accounts
         )
 
@@ -591,7 +604,7 @@ class CodexPool:
             # task bindings can migrate their rollout, but they are deleted
             # from the user-facing pool and are never selectable.
             if account.retired or (
-                account.auth_kind == "cloudrouter_api"
+                _is_api_auth_kind(account.auth_kind)
                 and not account.supported_models
             ):
                 continue
@@ -661,19 +674,19 @@ class CodexPool:
             if preferred:
                 return self._record_selection(preferred, now)
 
-        # Fresh launches prefer a compatible CloudRouter API account.  True
+        # Fresh launches prefer a compatible API account.  True
         # round-robin is preserved within the API and native groups; if every
         # API projection is unavailable/unsupported, the native group follows
         # exactly the former config-order rotation.
         api_candidates = [
             account
             for account in candidates
-            if account.auth_kind == "cloudrouter_api"
+            if _is_api_auth_kind(account.auth_kind)
         ]
         native_candidates = [
             account
             for account in candidates
-            if account.auth_kind != "cloudrouter_api"
+            if not _is_api_auth_kind(account.auth_kind)
         ]
         for group in (api_candidates, native_candidates):
             chosen = self._round_robin_candidate(group)
@@ -869,7 +882,7 @@ class CodexPool:
         async def _read_account_quota(
             acc: CodexPoolAccount,
         ) -> tuple[dict | None, dict | None, str | None]:
-            if acc.auth_kind == "cloudrouter_api":
+            if _is_api_auth_kind(acc.auth_kind):
                 if self._cloudrouter_store is None or not acc.api_account_id:
                     return None, None, "api_store_unavailable"
                 try:
@@ -879,7 +892,7 @@ class CodexPool:
                     )
                 except Exception as exc:
                     logger.warning(
-                        "CloudRouter usage read failed for %s: %s", acc.id, exc
+                        "API usage read failed for %s: %s", acc.id, exc
                     )
                     return None, None, f"request_failed: {exc}"[:200]
                 if not isinstance(snapshot, dict):
@@ -953,6 +966,7 @@ class CodexPool:
                 "quota": quota,
                 "api_quota": api_quota,
                 "auth_kind": acc.auth_kind,
+                "api_provider": acc.api_provider,
                 "display_name": acc.display_name,
                 "api_account_id": acc.api_account_id,
                 "supported_models": acc.supported_models,
@@ -1000,13 +1014,13 @@ class CodexPool:
         )
         if local.get("logged_in") is not True:
             return local
-        if account.auth_kind == "cloudrouter_api":
+        if _is_api_auth_kind(account.auth_kind):
             if self._cloudrouter_store is None or not account.api_account_id:
                 return {
                     **local,
                     "logged_in": None,
                     "live_verified": False,
-                    "detail": "CloudRouter account store unavailable",
+                    "detail": "API account store unavailable",
                 }
             try:
                 snapshot = await self._cloudrouter_store.fetch_usage(
@@ -1366,13 +1380,13 @@ def verify_login(
 ) -> dict:
     """Check whether a CODEX_HOME has the expected local auth projection.
 
-    CloudRouter uses a command-backed custom-provider credential rather than
-    OAuth ``auth.json``.  Its live key validity is checked asynchronously by
+    Managed API accounts use command-backed custom-provider credentials rather
+    than OAuth ``auth.json``. Their live key validity is checked asynchronously by
     :meth:`CodexPool.verify_account_live`; this local branch only identifies
     the deliberately configured API projection and never reads OAuth files.
     """
 
-    if auth_kind == "cloudrouter_api":
+    if _is_api_auth_kind(auth_kind):
         return {
             "logged_in": True,
             "email": "",

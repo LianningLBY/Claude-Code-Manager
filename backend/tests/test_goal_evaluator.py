@@ -4,8 +4,12 @@ import json
 import os
 import signal
 import sys
-import pytest
+import tempfile
+import tomllib
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from backend.services.goal_evaluator import (
     GoalEvaluationError,
@@ -619,7 +623,9 @@ class TestEvaluateIntegration:
 
         assert result.achieved is True
         assert mock_exec.call_args.kwargs["env"]["CODEX_HOME"] == str(codex_home)
+        assert "cwd" not in mock_exec.call_args.kwargs
         assert mock_exec.call_args.args[1] == "exec"
+        assert "-c" not in mock_exec.call_args.args
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider", ["claude", "codex"])
@@ -642,6 +648,10 @@ class TestEvaluateIntegration:
                 "OPENAI_API_KEY",
                 "CODEX_API_KEY",
                 "CLOUDROUTER_API_KEY",
+                "APEX_CODEX_GATEWAY_KEY",
+                "APEX_CODEX_API_KEY",
+                "APEXROUTER_API_KEY",
+                "APEXROUTER_CODEX_API_KEY",
             )
             home_key = "CODEX_HOME"
             evaluate_home = {"codex_home": str(provider_home)}
@@ -682,9 +692,25 @@ class TestEvaluateIntegration:
             )
 
         child_env = mock_exec.call_args.kwargs["env"]
+        command = list(mock_exec.call_args.args)
         assert result.achieved is True
         assert child_env[home_key] == str(provider_home)
         assert not set(auth_keys) & child_env.keys()
+        if provider == "codex":
+            assert mock_exec.call_args.kwargs["cwd"] == tempfile.gettempdir()
+            override_index = command.index("-c")
+            override = tomllib.loads(command[override_index + 1])
+            assert override == {
+                "projects": {
+                    str(Path(tempfile.gettempdir()).resolve()): {
+                        "trust_level": "untrusted",
+                    },
+                },
+            }
+            assert override_index < len(command) - 2
+        else:
+            assert "cwd" not in mock_exec.call_args.kwargs
+            assert "-c" not in command
         store._read_api_key.assert_not_called()
 
     @pytest.mark.asyncio

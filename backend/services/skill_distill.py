@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
+from backend.services.codex_app_server import codex_untrusted_project_override
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,10 @@ _CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
     "CLOUDROUTER_API_KEY",
+    "APEX_CODEX_GATEWAY_KEY",
+    "APEX_CODEX_API_KEY",
+    "APEXROUTER_API_KEY",
+    "APEXROUTER_CODEX_API_KEY",
 )
 
 
@@ -343,6 +348,16 @@ async def distill_task_conversation(
         model,
         load_user_config=provider == "codex" and cloudrouter_api,
     )
+    distill_cwd = tempfile.gettempdir()
+    if provider == "codex" and cloudrouter_api:
+        # The API projection must load its managed provider/auth config, but
+        # must never inherit project-local Codex configuration from /tmp or a
+        # persisted trust entry.  A read-only sandbox alone does not prevent
+        # MCP processes or hooks from starting during configuration loading.
+        cmd[-1:-1] = [
+            "-c",
+            codex_untrusted_project_override(distill_cwd),
+        ]
 
     async def run_process() -> tuple[object, bytes, bytes]:
         process = None
@@ -355,7 +370,7 @@ async def distill_task_conversation(
                 env=env,
                 # Avoid loading the source task's CLAUDE.md/AGENTS.md. Distill
                 # only needs the transcript supplied on stdin.
-                cwd=tempfile.gettempdir(),
+                cwd=distill_cwd,
             )
             # ``select()`` only proposes an account. Publish "recently used"
             # once the provider process really exists, including runs that
@@ -400,12 +415,25 @@ async def distill_task_conversation(
             )
         from backend.services.codex_app_server import CodexAppServerBusyError
 
-        try:
+        async def run_admitted_codex():
             async with instance_manager.codex_home_exec_guard(
                 codex_home
             ) as admitted_home:
                 env["CODEX_HOME"] = admitted_home
-                process, stdout, stderr = await run_process()
+                return await run_process()
+
+        try:
+            if cloudrouter_api:
+                # Keep API-store → home/exec as the single lock order shared
+                # with normal task and app-server admissions.
+                async with instance_manager._cloudrouter_runtime_admission(
+                    "codex",
+                    codex_home,
+                    model,
+                ):
+                    process, stdout, stderr = await run_admitted_codex()
+            else:
+                process, stdout, stderr = await run_admitted_codex()
         except CodexAppServerBusyError as exc:
             raise CodexDistillAccountUnavailableError(
                 "Codex account is busy or under maintenance",

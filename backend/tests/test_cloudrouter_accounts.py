@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import sys
+import tomllib
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -16,6 +17,9 @@ from starlette.requests import Request
 import backend.services.cloudrouter_accounts as cloudrouter_module
 import backend.api.cloudrouter_accounts as cloudrouter_api
 from backend.services.cloudrouter_accounts import (
+    APEX_CODEX_BASE_URL,
+    APEX_MODELS_URL,
+    APEX_USAGE_URL,
     CLAUDE_BASE_URL,
     CODEX_BASE_URL,
     MAX_API_RESPONSE_BYTES,
@@ -30,6 +34,13 @@ MODELS = {
     "claude": ["claude-opus-4-8", "claude-sonnet-5"],
     "codex": ["gpt-5.4", "gpt-5.5"],
 }
+
+
+def test_api_auth_kind_is_limited_to_registered_gateways():
+    assert cloudrouter_module.is_api_auth_kind("cloudrouter_api")
+    assert cloudrouter_module.is_api_auth_kind("apex_api")
+    assert not cloudrouter_module.is_api_auth_kind("legacy_api")
+    assert not cloudrouter_module.is_api_auth_kind("oauth")
 
 
 async def _add(
@@ -101,6 +112,273 @@ async def test_add_builds_private_dual_cli_home_without_leaking_key(
 
     helper_output = os.popen(str(root / "key-helper")).read()
     assert helper_output == "cr-secret-value"
+
+
+@pytest.mark.asyncio
+async def test_add_apex_builds_private_codex_only_home_without_leaking_key(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": ["claude-opus-4-8"],
+            "codex": ["gpt-5.4"],
+        }),
+    )
+
+    account = await store.add_account(
+        "Apex primary",
+        "lck-test-secret",
+        api_provider="apex",
+    )
+    root = account.root
+
+    assert account.id == "apex-1"
+    assert account.api_provider == "apex"
+    assert account.auth_kind == "apex_api"
+    assert account.providers == ["codex"]
+    assert account.models == {"claude": [], "codex": ["gpt-5.4"]}
+    assert not (root / "claude" / "settings.json").exists()
+    assert not (root / "claude" / ".claude.json").exists()
+
+    metadata = json.loads((root / "account.json").read_text())
+    assert metadata["api_provider"] == "apex"
+    assert metadata["endpoints"]["codex_base_url"] == APEX_CODEX_BASE_URL
+    assert metadata["endpoints"]["usage_url"] == APEX_USAGE_URL
+    assert "lck-test-secret" not in json.dumps(metadata)
+
+    codex_config = (root / "codex" / "config.toml").read_text()
+    assert 'model_provider = "apexrouter"' in codex_config
+    assert "[model_providers.apexrouter]" in codex_config
+    assert 'name = "ApexRouter"' in codex_config
+    assert f'base_url = "{APEX_CODEX_BASE_URL}"' in codex_config
+    assert "[model_providers.apexrouter.auth]" in codex_config
+    assert "[model_providers.apex_gateway]" in codex_config
+    assert "[model_providers.apex_gateway.auth]" in codex_config
+    assert str(root / "key-helper") in codex_config
+    assert "lck-test-secret" not in codex_config
+    assert os.popen(str(root / "key-helper")).read() == "lck-test-secret"
+
+
+@pytest.mark.asyncio
+async def test_legacy_apex_gateway_config_migrates_with_resume_alias(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    helper = account.root / "key-helper"
+    config = account.root / "codex" / "config.toml"
+    config.write_text(
+        'model_provider = "apex_gateway"\n'
+        'personality = "pragmatic"\n\n'
+        "[model_providers.apex_gateway]\n"
+        'name = "Apex Gateway"\n'
+        f'base_url = "{APEX_CODEX_BASE_URL}"\n'
+        'wire_api = "responses"\n'
+        "supports_websockets = false\n\n"
+        "[model_providers.apex_gateway.auth]\n"
+        f'command = "{helper}"\n'
+        "timeout_ms = 5000\n"
+        "refresh_interval_ms = 0\n\n"
+        '[projects."/tmp/project"]\n'
+        'trust_level = "trusted"\n',
+    )
+    os.chmod(config, 0o600)
+
+    assert [item.id for item in store.reload()] == [account.id]
+    migrated = tomllib.loads(config.read_text())
+    assert migrated["model_provider"] == "apexrouter"
+    assert migrated["personality"] == "pragmatic"
+    assert "projects" not in migrated
+    assert set(migrated["model_providers"]) == {
+        "apexrouter",
+        "apex_gateway",
+    }
+    assert (
+        migrated["model_providers"]["apexrouter"]
+        == migrated["model_providers"]["apex_gateway"]
+    )
+    assert migrated["model_providers"]["apexrouter"]["name"] == "ApexRouter"
+
+
+@pytest.mark.asyncio
+async def test_apex_resume_alias_tampering_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    config = account.root / "codex" / "config.toml"
+    config.write_text(
+        config.read_text().replace(
+            "[model_providers.apex_gateway]\n"
+            'name = "ApexRouter"\n'
+            f'base_url = "{APEX_CODEX_BASE_URL}"',
+            "[model_providers.apex_gateway]\n"
+            'name = "ApexRouter"\n'
+            'base_url = "https://attacker.invalid/v1"',
+        ),
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Codex API routing",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
+async def test_apex_usage_separates_key_usage_from_shared_group_quota(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "key_name": "test-key",
+            "group_name": "apex-research",
+            "used": {
+                "requests_5h": 0,
+                "requests_day": 0,
+                "tokens_day": 0,
+                "tokens_month": 0,
+            },
+            "remaining": {
+                "requests_5h": 25_000,
+                "requests_day": 50_000,
+                "tokens_day": 10_000_000,
+                "tokens_month": 100_000_000,
+            },
+            "limits": {
+                "requests_5h": 25_000,
+                "requests_day": 50_000,
+                "tokens_day": 10_000_000,
+                "tokens_month": 100_000_000,
+                "concurrency": 20,
+            },
+        }),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex"
+    )
+    request = AsyncMock(return_value={
+        "key_name": "test-key",
+        "group_name": "apex-research",
+        "used": {
+            "requests_5h": 3,
+            "requests_day": 7,
+            "tokens_day": 1_000,
+            "tokens_month": 2_000,
+        },
+        "remaining": {
+            "requests_5h": 24_000,
+            "requests_day": 49_000,
+            "tokens_day": 9_000_000,
+            "tokens_month": 90_000_000,
+        },
+        "limits": {
+            "requests_5h": 25_000,
+            "requests_day": 50_000,
+            "tokens_day": 10_000_000,
+            "tokens_month": 100_000_000,
+            "concurrency": 20,
+        },
+    })
+    monkeypatch.setattr(store, "_request_json", request)
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["known"] is True
+    assert snapshot["available"] is True
+    assert snapshot["mode"] == "shared_group"
+    assert snapshot["key_name"] == "test-key"
+    assert snapshot["group_name"] == "apex-research"
+    assert snapshot["concurrency"] == 20
+    assert snapshot["key_usage"]["requests_5h"] == 3
+    assert snapshot["windows"][0]["used"] == 1_000
+    assert snapshot["windows"][0]["remaining"] == 24_000
+    assert snapshot["windows"][0]["limit"] == 25_000
+    assert snapshot["windows"][0]["key_used"] == 3
+    assert snapshot["windows"][0]["scope"] == "group"
+    assert store.cached_quota_decision(account.id) == {
+        "available": True,
+        "known": True,
+        "reason": "active",
+    }
+    request.assert_awaited_once_with(
+        APEX_USAGE_URL,
+        "lck-test-secret",
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_apex_group_usage_cannot_replace_known_exhaustion(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex"
+    )
+    store._quota_cache[account.id] = {
+        "account_id": account.id,
+        "known": True,
+        "available": False,
+        "state": "exhausted",
+        "reason": "exhausted",
+    }
+    store._quota_cached_at[account.id] = 1
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "used": {
+                "requests_5h": 3,
+                "requests_day": 7,
+                "tokens_day": 1_000,
+                "tokens_month": 2_000,
+            },
+            # A partial response cannot prove that the shared group is usable.
+            "remaining": {},
+            "limits": {"concurrency": 20},
+        }),
+    )
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["known"] is False
+    assert snapshot["last_known_available"] is False
+    assert snapshot["reason"] == "invalid_usage_response"
+    assert store.cached_quota_decision(account.id) == {
+        "available": False,
+        "known": True,
+        "reason": "exhausted",
+    }
 
 
 @pytest.mark.asyncio
@@ -497,6 +775,86 @@ async def test_probe_models_uses_bounded_non_redirecting_request(
 
 
 @pytest.mark.asyncio
+async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    request = AsyncMock(return_value={
+        "models": [
+            {"slug": "claude-opus-4-8", "supported_in_api": True},
+            {"slug": "gpt-5.4", "supported_in_api": True, "visibility": "list"},
+            {"slug": "gpt-hidden", "supported_in_api": True, "visibility": "hide"},
+            {"slug": "gpt-disabled", "supported_in_api": False},
+        ],
+    })
+    monkeypatch.setattr(store, "_request_json", request)
+
+    models = await store.probe_models(
+        "lck-test-secret",
+        api_provider="apex",
+    )
+
+    assert models == {"claude": [], "codex": ["gpt-5.4"]}
+    request.assert_awaited_once_with(
+        (
+            f"{APEX_MODELS_URL}?client_version="
+            f"{cloudrouter_module.APEX_CODEX_CLIENT_VERSION}"
+        ),
+        "lck-test-secret",
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_probe_rejects_unbounded_model_lists(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "models": [
+                {"slug": f"gpt-test-{index}"}
+                for index in range(cloudrouter_module.MAX_DISCOVERED_MODELS + 1)
+            ],
+        }),
+    )
+
+    with pytest.raises(CloudRouterUpstreamError, match="too_many_models"):
+        await store.probe_models("lck-test-secret", api_provider="apex")
+
+
+@pytest.mark.asyncio
+async def test_oversized_model_metadata_never_leaves_a_poisoned_account(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": [],
+            "codex": [
+                f"gpt-{index}-{'x' * 400}"
+                for index in range(cloudrouter_module.MAX_DISCOVERED_MODELS)
+            ],
+        }),
+    )
+
+    with pytest.raises(CloudRouterUpstreamError, match="metadata_too_large"):
+        await store.add_account(
+            "Apex", "lck-test-secret", api_provider="apex"
+        )
+
+    assert store.all_accounts() == []
+    assert not (store.root / "apex-1").exists()
+    assert not any(
+        child.name.startswith(".apex-1.")
+        for child in store.root.iterdir()
+    )
+
+
+@pytest.mark.asyncio
 async def test_upstream_response_size_is_bounded(tmp_path, monkeypatch):
     class Response:
         status_code = 200
@@ -629,6 +987,36 @@ async def test_runtime_admission_converts_storage_oserror_to_safe_failure(
 
 
 @pytest.mark.asyncio
+async def test_configuration_admission_validates_route_without_quota_gate(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    store._quota_cache[account.id] = {
+        "known": True,
+        "available": False,
+        "reason": "exhausted",
+    }
+
+    async with store.configuration_admission(
+        "codex", account.codex_home,
+    ) as admitted:
+        assert admitted.id == account.id
+
+    config = account.root / "codex" / "config.toml"
+    config.write_text(
+        config.read_text().replace(
+            CODEX_BASE_URL,
+            "https://attacker.invalid/v1",
+        ),
+    )
+    with pytest.raises(CloudRouterUnsafePathError, match="Codex API routing"):
+        async with store.configuration_admission(
+            "codex", account.codex_home,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_codex_provider_and_key_helper_tampering_fail_closed(
     tmp_path, monkeypatch,
 ):
@@ -649,6 +1037,180 @@ async def test_codex_provider_and_key_helper_tampering_fail_closed(
     helper.write_text(helper.read_text() + "\n# modified\n")
     os.chmod(helper, 0o700)
     with pytest.raises(CloudRouterUnsafePathError, match="credential helper"):
+        store.reload()
+
+
+@pytest.mark.asyncio
+async def test_codex_cli_personality_migration_is_allowed(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.5"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    config = account.root / "codex" / "config.toml"
+    config.write_text(
+        config.read_text().replace(
+            'model_provider = "apexrouter"\n',
+            'model_provider = "apexrouter"\npersonality = "pragmatic"\n',
+        )
+    )
+    os.chmod(config, 0o600)
+
+    assert [item.id for item in store.reload()] == [account.id]
+    async with store.runtime_admission(
+        "codex", account.codex_home, "gpt-5.5",
+    ) as admitted:
+        assert admitted.id == account.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trust_level", ["trusted", "untrusted"])
+async def test_codex_cli_project_trust_state_is_allowed(
+    tmp_path, monkeypatch, trust_level,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.5"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    project_root = (tmp_path / "project").absolute()
+    config = account.root / "codex" / "config.toml"
+    with config.open("a") as stream:
+        stream.write(
+            f'\n[projects.{json.dumps(str(project_root))}]\n'
+            f'trust_level = "{trust_level}"\n'
+        )
+
+    assert [item.id for item in store.reload()] == [account.id]
+    migrated = tomllib.loads(config.read_text())
+    assert "projects" not in migrated
+    assert migrated["model_provider"] == "apexrouter"
+    async with store.runtime_admission(
+        "codex", account.codex_home, "gpt-5.5",
+    ) as admitted:
+        assert admitted.id == account.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "project_path, project_config",
+    [
+        ("relative/project", 'trust_level = "trusted"'),
+        ("/tmp/project", 'trust_level = "unknown"'),
+        (
+            "/tmp/project",
+            'trust_level = "trusted"\ncommand = "/tmp/untrusted-command"',
+        ),
+    ],
+)
+async def test_modified_codex_project_trust_state_fails_closed(
+    tmp_path, monkeypatch, project_path, project_config,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    config = account.root / "codex" / "config.toml"
+    with config.open("a") as stream:
+        stream.write(
+            f'\n[projects.{json.dumps(project_path)}]\n{project_config}\n'
+        )
+
+    with pytest.raises(CloudRouterUnsafePathError, match="Codex API routing"):
+        store.reload()
+
+
+@pytest.mark.asyncio
+async def test_codex_project_trust_rewrite_failure_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    config = account.root / "codex" / "config.toml"
+    with config.open("a") as stream:
+        stream.write(
+            '\n[projects."/tmp/project"]\ntrust_level = "trusted"\n'
+        )
+    monkeypatch.setattr(
+        cloudrouter_module,
+        "_atomic_private_write",
+        Mock(side_effect=OSError("read-only filesystem")),
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Could not secure Codex project state",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
+async def test_unknown_codex_personality_still_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    config = account.root / "codex" / "config.toml"
+    config.write_text(
+        config.read_text().replace(
+            'model_provider = "cloudrouter"\n',
+            'model_provider = "cloudrouter"\npersonality = "injected"\n',
+        )
+    )
+    os.chmod(config, 0o600)
+
+    with pytest.raises(CloudRouterUnsafePathError, match="Codex API routing"):
+        store.reload()
+
+
+@pytest.mark.asyncio
+async def test_apex_codex_provider_tampering_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex"
+    )
+    config = account.root / "codex" / "config.toml"
+    config.write_text(
+        config.read_text().replace(
+            APEX_CODEX_BASE_URL,
+            "https://attacker.invalid/v1",
+        )
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Codex API routing",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
+async def test_api_codex_extra_persistent_command_config_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    config = account.root / "codex" / "config.toml"
+    with config.open("a") as stream:
+        stream.write(
+            '\n[mcp_servers.injected]\ncommand = "/tmp/untrusted-command"\n'
+        )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Codex API routing",
+    ):
         store.reload()
 
 
@@ -782,6 +1344,70 @@ async def test_create_endpoint_returns_public_account_quota_and_reloads_pools(
     assert result["supported_models"] == sorted(MODELS["claude"] + MODELS["codex"])
     assert result["api_quota"]["state"] == "active"
     assert "cr-private-value" not in json.dumps(result)
+    reload_pools.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_create_endpoint_accepts_apex_provider_without_exposing_key(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "key_name": "test-key",
+            "group_name": "apex-research",
+            "used": {
+                "requests_5h": 0,
+                "requests_day": 0,
+                "tokens_day": 0,
+                "tokens_month": 0,
+            },
+            "remaining": {
+                "requests_5h": 25_000,
+                "requests_day": 50_000,
+                "tokens_day": 10_000_000,
+                "tokens_month": 100_000_000,
+            },
+            "limits": {
+                "requests_5h": 25_000,
+                "requests_day": 50_000,
+                "tokens_day": 10_000_000,
+                "tokens_month": 100_000_000,
+                "concurrency": 20,
+            },
+        }),
+    )
+    reload_pools = Mock()
+    monkeypatch.setattr(cloudrouter_api, "_get_store", lambda: store)
+    monkeypatch.setattr(
+        cloudrouter_api,
+        "_reload_runtime_pools",
+        reload_pools,
+    )
+
+    result = await cloudrouter_api.create_account(
+        _admin_request(),
+        cloudrouter_api.CloudRouterAccountCreate(
+            name="Apex API",
+            api_key=SecretStr("lck-test-secret"),
+            api_provider="apex",
+        ),
+    )
+
+    assert result["id"] == "apex-1"
+    assert result["api_provider"] == "apex"
+    assert result["auth_kind"] == "apex_api"
+    assert result["providers"] == ["codex"]
+    assert result["api_quota"]["known"] is True
+    assert result["api_quota"]["group_name"] == "apex-research"
+    assert "lck-test-secret" not in json.dumps(result)
     reload_pools.assert_called_once_with()
 
 

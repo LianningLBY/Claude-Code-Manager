@@ -19,6 +19,10 @@ import subprocess
 import time
 from pathlib import Path
 
+from backend.services.cloudrouter_accounts import (
+    is_api_auth_kind as _is_api_auth_kind,
+)
+
 logger = logging.getLogger(__name__)
 _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -351,6 +355,7 @@ class PoolAccount:
         "enabled",
         "retired",
         "auth_kind",
+        "api_provider",
         "display_name",
         "api_account_id",
         "supported_models",
@@ -368,6 +373,9 @@ class PoolAccount:
         self.enabled: bool = data.get("enabled", True)
         self.retired: bool = bool(data.get("retired", False))
         self.auth_kind: str = str(data.get("auth_kind") or "subscription")
+        self.api_provider: str | None = data.get("api_provider")
+        if self.api_provider is None and _is_api_auth_kind(self.auth_kind):
+            self.api_provider = self.auth_kind.removesuffix("_api")
         self.display_name: str = str(
             data.get("display_name") or self.email or self.id
         )
@@ -377,6 +385,7 @@ class PoolAccount:
 
     @classmethod
     def from_cloudrouter(cls, account) -> "PoolAccount":
+        auth_kind = str(getattr(account, "auth_kind", "") or "cloudrouter_api")
         return cls({
             "id": account.id,
             "config_dir": str(account.claude_config_dir),
@@ -391,7 +400,11 @@ class PoolAccount:
                 and bool((account.models or {}).get("claude"))
             ),
             "retired": bool(account.retired),
-            "auth_kind": "cloudrouter_api",
+            "auth_kind": auth_kind,
+            "api_provider": (
+                getattr(account, "api_provider", None)
+                or auth_kind.removesuffix("_api")
+            ),
             "display_name": account.name,
             "api_account_id": account.id,
             "supported_models": list((account.models or {}).get("claude", [])),
@@ -399,13 +412,13 @@ class PoolAccount:
         })
 
     def supports_model(self, model: str | None) -> bool:
-        if self.auth_kind != "cloudrouter_api":
+        if not _is_api_auth_kind(self.auth_kind):
             return True
         try:
             return bool(self._api_account.supports_model("claude", model))
         except Exception:
             logger.exception(
-                "Could not evaluate CloudRouter model support for %s", self.id
+                "Could not evaluate API account model support for %s", self.id
             )
             return False
 
@@ -484,7 +497,7 @@ class ClaudePool:
                         or projection.config_dir in known_dirs
                     ):
                         logger.error(
-                            "Skipping duplicate CloudRouter Claude projection "
+                            "Skipping duplicate API Claude projection "
                             "%s (%s)",
                             projection.id,
                             projection.config_dir,
@@ -549,7 +562,7 @@ class ClaudePool:
 
     def _api_quota_decision(self, account: PoolAccount) -> dict:
         if (
-            account.auth_kind != "cloudrouter_api"
+            not _is_api_auth_kind(account.auth_kind)
             or self._cloudrouter_store is None
             or not account.api_account_id
         ):
@@ -565,7 +578,7 @@ class ClaudePool:
             }
         except Exception:
             logger.exception(
-                "Could not read cached CloudRouter quota for %s", account.id
+                "Could not read cached API quota for %s", account.id
             )
             return {"available": True, "known": False, "reason": ""}
 
@@ -587,7 +600,7 @@ class ClaudePool:
         result = []
         for a in self._accounts:
             if a.retired or (
-                a.auth_kind == "cloudrouter_api"
+                _is_api_auth_kind(a.auth_kind)
                 and not a.supported_models
             ):
                 continue
@@ -603,6 +616,7 @@ class ClaudePool:
                 "cooldown_until": cd_until if cd_until > now else None,
                 "cooldown_remaining": max(0, cd_until - now) if cd_until > now else 0,
                 "auth_kind": a.auth_kind,
+                "api_provider": a.api_provider,
                 "display_name": a.display_name,
                 "api_account_id": a.api_account_id,
                 "supported_models": a.supported_models,
@@ -672,12 +686,12 @@ class ClaudePool:
             logger.warning("Pool has no available accounts (exclude=%s)", exclude)
             return None
 
-        # Fresh launches prefer a compatible CloudRouter API account.  Keep
+        # Fresh launches prefer a compatible API account.  Keep
         # the existing cooldown-expiry order within each account kind so the
         # native pool remains the unchanged fallback when no API projection is
         # usable for this model.
         candidates.sort(key=lambda a: (
-            0 if a.auth_kind == "cloudrouter_api" else 1,
+            0 if _is_api_auth_kind(a.auth_kind) else 1,
             self._cooldowns.get(a.id, 0),
         ))
         # Manual switch: preferred account jumps the queue; if it fails the
@@ -741,7 +755,7 @@ class ClaudePool:
         """Run a small Claude CLI probe before assigning work to an account."""
         # Same nested-session cleanup as InstanceManager.launch
         env = {k: v for k, v in os.environ.items() if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
-        if account.auth_kind == "cloudrouter_api":
+        if _is_api_auth_kind(account.auth_kind):
             for key in (
                 "ANTHROPIC_AUTH_TOKEN",
                 "ANTHROPIC_API_KEY",
@@ -846,7 +860,7 @@ class ClaudePool:
         """Whether a registered account is selectable without a live probe.
 
         Besides the native enabled/cooldown checks this also honors a cached
-        CloudRouter quota decision.  Resume routing uses this instead of
+        API quota decision.  Resume routing uses this instead of
         separately checking cooldown/disabled so a key with a proven exhausted
         quota cannot keep receiving turns merely because its session is
         resident in that account directory.
@@ -863,7 +877,7 @@ class ClaudePool:
         """Whether a known account can execute ``model``.
 
         Subscription accounts retain their existing unrestricted behavior.
-        CloudRouter projections are restricted to the models reported for the
+        API projections are restricted to the models reported for the
         key's bound model group.
         """
 
@@ -905,7 +919,7 @@ class ClaudePool:
                 continue
             if account.id in self._terminal_failures:
                 continue
-            if account.auth_kind != "cloudrouter_api":
+            if not _is_api_auth_kind(account.auth_kind):
                 return True
             decision = self._api_quota_decision(account)
             if not (
@@ -919,15 +933,17 @@ class ClaudePool:
         return any(
             account.enabled
             and not account.retired
-            and account.auth_kind != "cloudrouter_api"
+            and not _is_api_auth_kind(account.auth_kind)
             for account in self._accounts
         )
 
     def is_cloudrouter_account(self, config_dir: str) -> bool:
+        """Backward-compatible API-account predicate used by routing callers."""
+
         account = next(
             (a for a in self._accounts if a.config_dir == config_dir), None
         )
-        return bool(account and account.auth_kind == "cloudrouter_api")
+        return bool(account and _is_api_auth_kind(account.auth_kind))
 
     def is_known_account(self, config_dir: str) -> bool:
         """Whether this config_dir is a registered pool account.
@@ -1046,7 +1062,7 @@ class ClaudePool:
         acc = self.account(account_id)
         if acc is None:
             raise KeyError(account_id)
-        if acc.auth_kind == "cloudrouter_api":
+        if _is_api_auth_kind(acc.auth_kind):
             return False
         creds = await self._refresh_oauth(acc, Path(acc.config_dir) / ".credentials.json")
         if creds is None:
@@ -1131,6 +1147,7 @@ class ClaudePool:
             base = {"id": account.id, "email": account.email, "enabled": account.enabled,
                     "subscription_type": None, "error": None, "usage": None,
                     "auth_kind": account.auth_kind,
+                    "api_provider": account.api_provider,
                     "display_name": account.display_name,
                     "api_account_id": account.api_account_id,
                     "supported_models": account.supported_models,
@@ -1142,7 +1159,7 @@ class ClaudePool:
             if not account.enabled:
                 base["error"] = "disabled"
                 return base
-            if account.auth_kind == "cloudrouter_api":
+            if _is_api_auth_kind(account.auth_kind):
                 if self._cloudrouter_store is None or not account.api_account_id:
                     base["error"] = "api_store_unavailable"
                     return base
@@ -1153,7 +1170,7 @@ class ClaudePool:
                     )
                 except Exception as exc:
                     logger.warning(
-                        "CloudRouter usage read failed for %s: %s",
+                        "API usage read failed for %s: %s",
                         account.id,
                         exc,
                     )
@@ -1216,7 +1233,7 @@ class ClaudePool:
             for account in self._accounts
             if not account.retired
             and not (
-                account.auth_kind == "cloudrouter_api"
+                _is_api_auth_kind(account.auth_kind)
                 and not account.supported_models
             )
         ]
@@ -1250,7 +1267,7 @@ class ClaudePool:
             row["id"]: row for row in await self.fetch_usage(force=True)
         }
         current_account = self.account(current_id)
-        if current_account and current_account.auth_kind == "cloudrouter_api":
+        if current_account and _is_api_auth_kind(current_account.auth_kind):
             current_row = usage_by_id.get(current_id)
             current_snapshot = (
                 current_row.get("api_quota")
@@ -1267,7 +1284,7 @@ class ClaudePool:
             if account.id == current_id:
                 continue
             row = usage_by_id.get(account.id)
-            if account.auth_kind == "cloudrouter_api":
+            if _is_api_auth_kind(account.auth_kind):
                 snapshot = (
                     row.get("api_quota") if isinstance(row, dict) else None
                 )

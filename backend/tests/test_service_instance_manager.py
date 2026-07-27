@@ -1186,6 +1186,112 @@ async def test_codex_app_server_rejects_home_owned_by_exec_generation(
 
 
 @pytest.mark.asyncio
+async def test_live_codex_quota_rejects_home_owned_by_exec_generation(
+    tmp_path,
+):
+    codex_home = str((tmp_path / "codex-live-quota-vs-exec").resolve())
+    registry = MagicMock()
+    registry.read_rate_limits = AsyncMock(return_value={"rateLimits": {}})
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im.processes[7] = MagicMock(returncode=None)
+    im._codex_exec_homes[7] = codex_home
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="still has an exec generation",
+    ):
+        await im.read_codex_rate_limits(codex_home)
+
+    im._ensure_codex_app_server_registry.assert_not_called()
+    registry.read_rate_limits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_codex_quota_rejects_active_ephemeral_exec(tmp_path):
+    codex_home = str((tmp_path / "codex-live-quota-vs-ephemeral").resolve())
+    registry = MagicMock()
+    registry.read_rate_limits = AsyncMock(return_value={"rateLimits": {}})
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im._codex_ephemeral_home_users[codex_home] = 1
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="active ephemeral exec",
+    ):
+        await im.read_codex_rate_limits(codex_home)
+
+    im._ensure_codex_app_server_registry.assert_not_called()
+    registry.read_rate_limits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_codex_quota_holds_home_gate_until_rpc_finishes(tmp_path):
+    codex_home = str((tmp_path / "codex-live-quota-gate").resolve())
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    exec_attempted = asyncio.Event()
+    exec_entered = asyncio.Event()
+
+    async def read_rate_limits(_codex_home):
+        read_started.set()
+        await release_read.wait()
+        return {"rateLimits": {}}
+
+    registry = MagicMock()
+    registry.read_rate_limits = AsyncMock(side_effect=read_rate_limits)
+    registry.shutdown_home = AsyncMock(return_value=True)
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_app_server = registry
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+
+    quota_task = asyncio.create_task(im.read_codex_rate_limits(codex_home))
+    await read_started.wait()
+
+    async def enter_exec():
+        exec_attempted.set()
+        async with im.codex_home_exec_guard(codex_home):
+            exec_entered.set()
+
+    exec_task = asyncio.create_task(enter_exec())
+    await exec_attempted.wait()
+    await asyncio.sleep(0)
+    exec_overlapped_quota = exec_entered.is_set()
+    release_read.set()
+
+    assert await quota_task == {"rateLimits": {}}
+    await exec_task
+    assert exec_overlapped_quota is False
+    registry.read_rate_limits.assert_awaited_once_with(codex_home)
+    registry.shutdown_home.assert_awaited_once_with(
+        codex_home,
+        require_idle=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_codex_exec_rejects_active_app_server(tmp_path):
+    codex_home = str((tmp_path / "codex-ephemeral-vs-app-server").resolve())
+    registry = MagicMock()
+    registry.shutdown_home = AsyncMock(
+        side_effect=CodexAppServerBusyError("active app-server turn")
+    )
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_app_server = registry
+
+    with pytest.raises(CodexAppServerBusyError, match="active app-server turn"):
+        async with im.codex_home_exec_guard(codex_home):
+            pytest.fail("busy app-server must reject ephemeral exec admission")
+
+    registry.shutdown_home.assert_awaited_once_with(
+        codex_home,
+        require_idle=True,
+    )
+    assert im._codex_ephemeral_home_users == {}
+
+
+@pytest.mark.asyncio
 async def test_codex_exec_shuts_down_idle_app_server_before_spawn(
     db_factory, monkeypatch, tmp_path,
 ):

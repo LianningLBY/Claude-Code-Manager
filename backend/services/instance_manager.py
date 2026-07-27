@@ -246,9 +246,9 @@ class InstanceManager:
         self._codex_home_locks: dict[str, asyncio.Lock] = {}
         self._codex_exec_homes: dict[int, str] = {}
         # Non-task Codex subprocesses (currently task distillation) share the
-        # same credential-home maintenance barrier as normal exec turns.
-        # Count by canonical home because they do not own a reusable Instance
-        # slot and therefore cannot safely be represented in _codex_exec_homes.
+        # same credential-home and app-server admission barrier as normal exec
+        # turns. Count by canonical home because they do not own a reusable
+        # Instance slot and cannot safely be represented in _codex_exec_homes.
         self._codex_ephemeral_home_users: dict[str, int] = {}
         # Direct CLI subprocesses start in their own POSIX session.  Remember
         # the exact process generation so stop can signal the whole process
@@ -846,16 +846,7 @@ class InstanceManager:
         if provider == "codex" and settings.codex_app_server_enabled:
             home_lock = self._codex_home_lock(config_dir)
             async with home_lock:
-                if config_dir in self._codex_home_maintenance:
-                    raise CodexAppServerBusyError(
-                        f"Codex account is under maintenance: {config_dir}"
-                    )
-                for exec_instance_id, exec_home in self._codex_exec_homes.items():
-                    if exec_home == config_dir:
-                        raise CodexAppServerBusyError(
-                            "Codex account still has an exec generation "
-                            f"owned by instance {exec_instance_id}: {config_dir}"
-                        )
+                self._assert_codex_app_server_home_available(config_dir)
                 try:
                     return await self._launch_codex_app_server(
                         instance_id=instance_id,
@@ -1287,8 +1278,38 @@ class InstanceManager:
     async def read_codex_rate_limits(self, codex_home: str) -> dict:
         """Read live quota from the app-server bound to ``codex_home``."""
 
-        registry = self._ensure_codex_app_server_registry()
-        return await registry.read_rate_limits(codex_home)
+        from backend.services.codex_app_server import normalize_codex_home
+
+        home = normalize_codex_home(codex_home)
+        home_lock = self._codex_home_lock(home)
+        async with home_lock:
+            self._assert_codex_app_server_home_available(home)
+            registry = self._ensure_codex_app_server_registry()
+            return await registry.read_rate_limits(home)
+
+    def _assert_codex_app_server_home_available(self, codex_home: str) -> None:
+        """Reject app-server admission while another transport owns a home.
+
+        The caller must hold the canonical home's admission lock so the check
+        and the subsequent app-server operation form one atomic admission.
+        """
+
+        from backend.services.codex_app_server import CodexAppServerBusyError
+
+        if codex_home in self._codex_home_maintenance:
+            raise CodexAppServerBusyError(
+                f"Codex account is under maintenance: {codex_home}"
+            )
+        for exec_instance_id, exec_home in self._codex_exec_homes.items():
+            if exec_home == codex_home:
+                raise CodexAppServerBusyError(
+                    "Codex account still has an exec generation "
+                    f"owned by instance {exec_instance_id}: {codex_home}"
+                )
+        if self._codex_ephemeral_home_users.get(codex_home, 0):
+            raise CodexAppServerBusyError(
+                f"Codex account has an active ephemeral exec: {codex_home}"
+            )
 
     def _codex_home_lock(self, codex_home: str) -> asyncio.Lock:
         """Return the admission/maintenance lock for a canonical home."""
@@ -1306,7 +1327,9 @@ class InstanceManager:
         Admission and maintenance use the same per-home lock. Maintenance
         therefore either reserves the home first and rejects this process, or
         observes the active user and fails busy before touching credentials.
-        The synchronous finalizer cannot be interrupted by task cancellation.
+        An idle app-server transport is stopped before admission; an active
+        transport rejects the exec instead. The synchronous finalizer cannot
+        be interrupted by task cancellation.
         """
 
         from backend.services.codex_app_server import (
@@ -1321,6 +1344,9 @@ class InstanceManager:
                 raise CodexAppServerBusyError(
                     f"Codex account is under maintenance: {home}"
                 )
+            registry = self._codex_app_server
+            if registry is not None:
+                await registry.shutdown_home(home, require_idle=True)
             self._codex_ephemeral_home_users[home] = (
                 self._codex_ephemeral_home_users.get(home, 0) + 1
             )

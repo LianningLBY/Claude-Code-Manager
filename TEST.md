@@ -407,6 +407,10 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_codex_sub_agent_requires_app_server_and_never_uses_exec` | app-server 关闭时 Sub-Agent 明确失败，绝不降级到没有 live thread control 的 exec |
 | `test_codex_sub_agent_mcp_failure_does_not_launch_exec` | 即使是 pre-turn 错误，Sub-Agent 仍不得走 exec |
 | `test_codex_app_server_rejects_home_owned_by_exec_generation` | 同一 `CODEX_HOME` 有 exec generation 时 app-server 返回 busy |
+| `test_live_codex_quota_rejects_home_owned_by_exec_generation` | exec generation 已占用同一 `CODEX_HOME` 时，实时额度读取不得创建或调用 app-server |
+| `test_live_codex_quota_rejects_active_ephemeral_exec` | 临时 Codex exec 占用同一 home 时，实时额度读取同样返回 busy |
+| `test_live_codex_quota_holds_home_gate_until_rpc_finishes` | 实时额度 RPC 全程持有 home 门禁，后来的 exec 必须等待并在进入前关闭空闲 app-server |
+| `test_ephemeral_codex_exec_rejects_active_app_server` | app-server 有活跃 turn 时，临时 Codex exec 不得进入同一 home |
 | `test_codex_exec_shuts_down_idle_app_server_before_spawn` | exec 启动前关闭同 home 的空闲 app-server |
 | `test_codex_exec_does_not_spawn_while_app_server_home_is_busy` | 同 home app-server 有活跃 turn 时 exec 不得创建进程 |
 | `test_codex_main_mcp_capability_defaults_off` | `CODEX_MAIN_MCP_ENABLED` 服务端 capability 默认关闭 |
@@ -423,7 +427,7 @@ Codex 版本兼容基线（2026-07-24）：
 4. 在同一 task 发送第二条消息并确认 resume 仍可调用；再并发运行另一个 task，确认两边查询结果和 `task_id` 不串线。
 5. 设置 `CODEX_APP_SERVER_ENABLED=false` 并重启，再建同类 task；应改走 `codex exec`，但仍出现同一个 `ccm_skills/ccm_command_help` 成功调用。
 6. 恢复 app-server，并模拟 transport 启动失败或 no-thread-id：只允许出现一次带 MCP 的 exec 回退；模拟 `turn/start` timeout/错误时则不得出现 exec 重放。
-7. 同一账号有活跃 app-server turn 时尝试启动 exec，应返回 busy；turn 结束后 exec 可关闭空闲 app-server 再启动。反向在 exec generation 未收尾时启动 app-server也应返回 busy。
+7. 同一账号有活跃 app-server turn 时尝试启动 exec，应返回 busy；turn 结束后 exec 可关闭空闲 app-server 再启动。反向在 exec generation 未收尾时启动 app-server 也应返回 busy；此时在 Codex 账号池强制刷新额度应显示该账号暂不可实时读取，且日志中不得出现同 home 的新 app-server 启动。
 8. 关闭 app-server 后启用 Codex Sub-Agent task，应明确报告其需要 app-server，且不得启动 exec。
 9. 测试完恢复 `CODEX_MAIN_MCP_ENABLED=false` 和原来的 `CODEX_APP_SERVER_ENABLED` 设置。
 

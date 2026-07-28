@@ -20,6 +20,7 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
+from backend.services.worker_relay import worker_task_generation
 
 logger = logging.getLogger(__name__)
 
@@ -234,9 +235,36 @@ class WorkerProxy:
                 "支持 Codex Fast，任务未转发"
             )
 
-    async def forward_task_to_worker(self, task: Task):
+    async def forward_task_to_worker(
+        self,
+        task: Task,
+        *,
+        operation_lock_held: bool = False,
+    ):
+        if operation_lock_held:
+            current = await self._authoritative_forward_task(task)
+            return await self._forward_task_to_worker_locked(current)
         async with self.task_operation_lock(task.id):
-            return await self._forward_task_to_worker_locked(task)
+            current = await self._authoritative_forward_task(task)
+            return await self._forward_task_to_worker_locked(current)
+
+    async def _authoritative_forward_task(self, task: Task) -> Task:
+        """Reload one claimed generation before serializing Worker create."""
+
+        if self.db_factory is None:
+            return task
+        expected = worker_task_generation(task)
+        if expected is None:
+            raise RuntimeError(
+                "Task is no longer assigned to a Worker before forwarding"
+            )
+        async with self.db_factory() as db:
+            current = await db.get(Task, task.id)
+        if current is None or worker_task_generation(current) != expected:
+            raise RuntimeError(
+                "Task Worker generation changed before initial forwarding"
+            )
+        return current
 
     async def _forward_task_to_worker_locked(self, task: Task):
         worker = await self.get_worker(task.worker_id)

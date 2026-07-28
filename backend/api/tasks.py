@@ -89,6 +89,9 @@ _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
 _LOCAL_ROUTING_EDITABLE_STATUSES = (
     WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 )
+_WORKER_SKILL_EDITABLE_STATUSES = (
+    WORKER_ROUTING_SAFE_STATUSES | {"pending"}
+)
 
 
 class _WorkerRoutingConfirmationUnavailable(HTTPException):
@@ -1754,6 +1757,13 @@ async def _update_worker_task_with_skill_configuration(
                 409,
                 "Task Worker assignment changed before Skill configuration "
                 "could be saved",
+            )
+        if current.status not in _WORKER_SKILL_EDITABLE_STATUSES:
+            raise HTTPException(
+                409,
+                "Worker Task Skill configuration cannot change after an "
+                "execution claim became active; wait for the current Worker "
+                "turn to finish",
             )
         updated = await queue.update_task(task_id, **updates)
         if updated is None:

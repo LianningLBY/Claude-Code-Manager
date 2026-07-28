@@ -943,3 +943,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **生产事故**：Task 212 的 Codex rollout 已生成 assistant 与 `task_complete`，但 CCM 只收到 synthetic `thread.started`；Task 被显示为 completed，Instance/worker 仍保持 running，后续消息持续等待旧 generation。Task 208 Cancel 后，chat API 先落库并返回 queued，dispatcher 随后按 cancelled 静默丢弃。Interrupt 又会在 adopted goal 上依次执行 `goal/get`、`goal/set` 后才中断，异常通知丢失时进一步落入 15s/30s 清理等待。
 - **原因与解决**：原生 goal/steer 会让一个 adapter 同时收到 active turn id 与 `turn/start` submission id；旧修复只保留 active 映射，后续 submission-id assistant/terminal 通知被判为 unrelated。现同一 context 在终态前保留两种合法 alias，terminal 后禁止重新挂回映射；goal 停止直接一次 `thread/goal/set paused`，再中断权威 active id。Codex adapter 区分 `user_interrupt` 与 `internal_abort`，transport/admission 清理的 130 不再伪装成功。Cancel 只终止当前 generation，后续 chat 仍可用完整 Task/Instance/session CAS 重新领取原生 session。
 - **验证**：Codex app-server、InstanceManager、Dispatcher、Chat 专项 `540 passed`；前端 `tsc --noEmit` 通过。后端全量 `2433 passed, 21 failed`，21 项均在未触及模块：20 项由当前 shell `umask 0002` 生成 0664 安全租约文件而触发既有 fail-closed 断言（以 `umask 022` 单项复跑即通过），另 1 项为生产环境首个管理员强制映射成 super_admin 的既有认证环境差异。
+
+### 2026-07-28 — PR6：Codex Task/User Skills 对等（commit 5402355）
+
+- **问题**：Codex 主任务只具备 MCP 工具注入，尚未获得与 Claude 一致的 task-scoped Skill 目录、User Skill 按需读取及 Worker/Fork/exec fallback 继承；`$monitor` 还能从任务描述或后续消息绕过 Provider 能力校验。
+- **解决**：统一生成 Claude/Codex Skill context，按 Provider 和主 MCP kill switch 过滤能力；User Skill 仅允许读取任务已选择的 ID，并用 Manager 快照跨 Worker 传递。命令所需 Skill 在任务创建、描述更新和 follow-up 入队前校验。Worker 快照字段只要存在即为权威来源（包括空快照），禁止回退读取 Worker 本地同 ID Skill。
+- **预防**：能力校验必须发生在持久化和排队之前；跨节点安全上下文必须携带显式权威标记，不能用“非空”判断来源，也不能在缺失快照时按本地 ID 猜测。
+- **验证**：前端 PR6 定向 `31 passed`、生产构建通过；后端 API/MCP/Codex 组 `301 passed`，Skill Context `6 passed`，实例管理新增路径 `5 passed`，Worker Relay `72 passed`，权威快照补充回归 `10 passed` 与相邻 MCP/迁移回归 `16 passed`。Windows 全量另有既存时区、路径分隔符、POSIX signal/path 和任务排序环境差异，均不在本次改动路径。

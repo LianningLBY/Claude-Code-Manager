@@ -269,6 +269,56 @@ async def test_check_and_update_review_cannot_overwrite_superseded_during_gh_wai
     no_broadcast.broadcast.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_review_terminal_commit_defers_if_task_background_arms_during_gh(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    task = Task(
+        title="guarded PR task",
+        description="review",
+        status="completed",
+        retry_count=3,
+    )
+    db_session.add(task)
+    await db_session.flush()
+    review = await _make_review(db_session, repo)
+    review.task_id = task.id
+    await db_session.commit()
+
+    async def arm_before_gh_returns(*_args, **_kwargs):
+        await db_session.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(pty_background_generation="late-background")
+        )
+        await db_session.commit()
+        return {
+            "state": "OPEN",
+            "mergedAt": None,
+            "reviews": [{"state": "APPROVED"}],
+        }
+
+    with patch.object(
+        pr_review_service,
+        "_gh_pr_view",
+        side_effect=arm_before_gh_returns,
+    ):
+        await check_and_update_review(
+            db_session,
+            review.id,
+            "owner/repo",
+            terminal_task_id=task.id,
+            terminal_task_retry_count=3,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "reviewing"
+    assert review.completed_at is None
+    no_broadcast.broadcast.assert_not_awaited()
+
+
 # === _gh_pr_view (subprocess mocked) ===
 
 

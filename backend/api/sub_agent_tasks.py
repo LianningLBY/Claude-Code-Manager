@@ -22,6 +22,7 @@ from backend.api.deps import (
 from backend.models.task import Task
 from backend.models.sub_agent import SubAgentSession, SubAgentReport
 from backend.models.project import Project
+from backend.services.task_queue import task_retry_not_superseded_predicate
 
 router = APIRouter(prefix="/api/tasks/{task_id}/sub-agent-sessions", tags=["sub-agent-tasks"])
 
@@ -194,6 +195,7 @@ async def create_sub_agent_session(
                     Task.id == task_id,
                     Task.worker_id.is_(None),
                     Task.status.in_(("in_progress", "executing")),
+                    task_retry_not_superseded_predicate(),
                 )
                 .values(status=Task.status)
             )

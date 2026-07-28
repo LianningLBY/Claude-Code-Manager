@@ -551,6 +551,150 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_chat_history_strictly_filters_legacy_codex_collab_completed(
+    client,
+    session_factory,
+):
+    """Only the proven historical collab item shape is compatibility noise."""
+    create_resp = await client.post("/api/tasks", json={
+        "title": "T", "description": "d", "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+
+    def raw_item(
+        item_type: str,
+        *,
+        outer_type: str = "item.completed",
+        status: str = "completed",
+    ) -> str:
+        return json.dumps({
+            "type": outer_type,
+            "item": {
+                "id": f"{item_type}-{outer_type}-{status}",
+                "type": item_type,
+                "tool": "wait",
+                "status": status,
+            },
+        })
+
+    async with session_factory() as db:
+        for item_type in (
+            "collabAgentToolCall",
+            "collab_agent_tool_call",
+        ):
+            db.add(LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="system_event",
+                content="completed",
+                raw_json=raw_item(item_type),
+                is_error=False,
+            ))
+        # Near misses remain visible: text alone is not enough, and every raw
+        # discriminator must match before the compatibility filter applies.
+        db.add_all([
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="system_event",
+                content="completed",
+                tool_name="bare",
+                is_error=False,
+            ),
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="system_event",
+                content="completed",
+                tool_name="failed",
+                raw_json=raw_item("collabAgentToolCall", status="failed"),
+                is_error=False,
+            ),
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="system_event",
+                content="completed",
+                tool_name="wrong-item",
+                raw_json=raw_item("commandExecution"),
+                is_error=False,
+            ),
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="system_event",
+                content="completed",
+                tool_name="wrong-lifecycle",
+                raw_json=raw_item(
+                    "collabAgentToolCall",
+                    outer_type="item.started",
+                ),
+                is_error=False,
+            ),
+        ])
+        await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task_id}/chat/history")
+    assert resp.status_code == 200
+    msgs = resp.json()
+    assert [message["tool_name"] for message in msgs] == [
+        "bare",
+        "failed",
+        "wrong-item",
+        "wrong-lifecycle",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_codex_collab_noise_does_not_consume_history_limit(
+    client,
+    session_factory,
+):
+    """A dense historical noise run must not hide the older visible page."""
+    create_resp = await client.post("/api/tasks", json={
+        "title": "T", "description": "d", "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+
+    async with session_factory() as db:
+        for index in range(3):
+            db.add(LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content=f"visible-{index}",
+                is_error=False,
+            ))
+        for index in range(625):
+            db.add(LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="system_event",
+                content="completed",
+                raw_json=json.dumps({
+                    "type": "item.completed",
+                    "item": {
+                        "id": f"collab-{index}",
+                        "type": "collabAgentToolCall",
+                        "tool": "wait",
+                        "status": "completed",
+                    },
+                }),
+                is_error=False,
+            ))
+        await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task_id}/chat/history?limit=3")
+    assert resp.status_code == 200
+    assert [message["content"] for message in resp.json()] == [
+        "visible-0",
+        "visible-1",
+        "visible-2",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_history_includes_all_event_types(client, session_factory):
     """Chat history should include message, tool_use, tool_result, thinking, system_init."""
     create_resp = await client.post("/api/tasks", json={

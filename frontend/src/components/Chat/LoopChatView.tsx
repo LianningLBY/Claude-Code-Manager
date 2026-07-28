@@ -5,7 +5,10 @@ import { api } from '../../api/client';
 import type { ChatMessage, Task } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ArrowLeft, ChevronDown, ChevronRight, Copy, Check, XCircle, ArrowDown } from '../icons';
-import { mergeChatHistory } from './messageMerge';
+import {
+  isLegacyCodexCollabCompleted,
+  mergeChatHistory,
+} from './messageMerge';
 
 interface LoopChatViewProps {
   task: Task;
@@ -369,9 +372,21 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
   const historyGenerationRef = useRef(0);
   const currentTaskIdRef = useRef(task.id);
   const initializedTaskIdRef = useRef<number | null>(null);
-  const taskStatusRef = useRef(task.status);
+  const [localStatus, setLocalStatus] = useState<string | null>(null);
+  const [localBackgroundActive, setLocalBackgroundActive] = useState<boolean | null>(null);
+  const lastWsStatusAt = useRef(0);
+  const lastWsBackgroundAt = useRef(0);
+  const effectiveStatus = localStatus || task.status;
+  const backgroundActive = localBackgroundActive ?? task.background_active === true;
+  const isProcessing = (
+    backgroundActive
+    || ['executing', 'in_progress'].includes(effectiveStatus)
+  );
+  const taskStatusRef = useRef(effectiveStatus);
+  const backgroundActiveRef = useRef(backgroundActive);
   currentTaskIdRef.current = task.id;
-  taskStatusRef.current = task.status;
+  taskStatusRef.current = effectiveStatus;
+  backgroundActiveRef.current = backgroundActive;
 
   useEffect(() => {
     const prev = document.title;
@@ -383,7 +398,58 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
 
   const handleWsMessage = useCallback((raw: Record<string, unknown>) => {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
-    if (msg.channel !== `task:${task.id}` || !msg.data) return;
+    if (!msg.data) return;
+
+    const isStatusChange = (
+      (
+        msg.channel === 'tasks'
+        && msg.data.event === 'status_change'
+        && Number(msg.data.task_id) === task.id
+      )
+      || (
+        msg.channel === `task:${task.id}`
+        && (
+          msg.data.event === 'status_change'
+          || msg.data.event_type === 'status_change'
+        )
+      )
+    );
+    if (isStatusChange) {
+      if (typeof msg.data.background_active === 'boolean') {
+        lastWsBackgroundAt.current = Date.now();
+        setLocalBackgroundActive(msg.data.background_active);
+      }
+      const newStatus = msg.data.new_status;
+      if (typeof newStatus === 'string' && newStatus) {
+        lastWsStatusAt.current = Date.now();
+        setLocalStatus(newStatus);
+      }
+      return;
+    }
+
+    const isBackgroundActivity = (
+      (
+        msg.channel === 'tasks'
+        && msg.data.event === 'background_activity'
+        && Number(msg.data.task_id) === task.id
+      )
+      || (
+        msg.channel === `task:${task.id}`
+        && (
+          msg.data.event === 'background_activity'
+          || msg.data.event_type === 'background_activity'
+        )
+      )
+    );
+    if (isBackgroundActivity) {
+      if (typeof msg.data.background_active === 'boolean') {
+        lastWsBackgroundAt.current = Date.now();
+        setLocalBackgroundActive(msg.data.background_active);
+      }
+      return;
+    }
+
+    if (msg.channel !== `task:${task.id}`) return;
 
     const eventType = msg.data.event_type as string;
 
@@ -406,6 +472,12 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
 
     const showTypes = ['message', 'result', 'tool_use', 'tool_result', 'system_init', 'system_event', 'thinking'];
     if (!showTypes.includes(eventType)) return;
+    if (isLegacyCodexCollabCompleted({
+      event_type: eventType,
+      content: (msg.data.content as string) || null,
+      native_item_type: (msg.data.native_item_type as string) || null,
+      native_item_status: (msg.data.native_item_status as string) || null,
+    })) return;
     const skipSystemContent = ['task_progress', 'thinking_tokens', 'token_usage', 'api_request', 'api_response'];
     if (eventType === 'system_event' && skipSystemContent.includes(msg.data.content as string)) return;
     const content = (msg.data.content as string) || null;
@@ -429,6 +501,8 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       attachments: null,
       item_id: itemId,
       stream_item_id: itemId,
+      native_item_type: (msg.data.native_item_type as string) || null,
+      native_item_status: (msg.data.native_item_status as string) || null,
       persisted: isPersisted,
     };
 
@@ -449,6 +523,7 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       ) return;
       const filtered = msgs
         .filter((m) =>
+          !isLegacyCodexCollabCompleted(m) &&
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((message) => ({ ...message, persisted: true }));
@@ -456,7 +531,10 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       pendingWsRef.current = [];
       historyLoadedRef.current = true;
       setMessages((current) => mergeChatHistory(filtered, [...current, ...buffered]));
-      if (['executing', 'in_progress'].includes(taskStatusRef.current)) {
+      if (
+        backgroundActiveRef.current
+        || ['executing', 'in_progress'].includes(taskStatusRef.current)
+      ) {
         const maxIter = [...filtered, ...buffered]
           .reduce((acc, m) => Math.max(acc, m.loop_iteration ?? 0), 0);
         setActiveIteration((current) => Math.max(current ?? 0, maxIter));
@@ -481,7 +559,12 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
     if (channels.includes(`task:${task.id}`)) void refreshHistory();
   }, [refreshHistory, task.id]);
 
-  useWebSocket([`task:${task.id}`], handleWsMessage, undefined, handleSubscribed);
+  useWebSocket(
+    [`task:${task.id}`, 'tasks'],
+    handleWsMessage,
+    undefined,
+    handleSubscribed,
+  );
 
   useEffect(() => {
     if (initializedTaskIdRef.current !== task.id) {
@@ -492,9 +575,59 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       setMessages([]);
       setIterMeta(new Map());
       setActiveIteration(null);
+      setLocalStatus(null);
+      setLocalBackgroundActive(null);
     }
     void refreshHistory();
-  }, [refreshHistory, task.id, task.status]);
+  }, [refreshHistory, task.id, task.status, task.background_active]);
+
+  // A poll response may have started before a newer WebSocket event.  Keep
+  // either local override for one full polling cycle so stale props cannot
+  // briefly hide a still-live background generation (or resurrect a settled
+  // one).
+  useEffect(() => {
+    if (localStatus === null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const clearWhenStale = () => {
+      const remaining = 7000 - (Date.now() - lastWsStatusAt.current);
+      if (remaining <= 0) {
+        setLocalStatus(null);
+      } else {
+        timer = setTimeout(clearWhenStale, remaining);
+      }
+    };
+    const remaining = 7000 - (Date.now() - lastWsStatusAt.current);
+    if (remaining <= 0) {
+      setLocalStatus(null);
+      return;
+    }
+    timer = setTimeout(clearWhenStale, remaining);
+    return () => clearTimeout(timer);
+  }, [localStatus, task.status]);
+
+  useEffect(() => {
+    if (localBackgroundActive === null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const clearWhenStale = () => {
+      const remaining = 7000 - (
+        Date.now() - lastWsBackgroundAt.current
+      );
+      if (remaining <= 0) {
+        setLocalBackgroundActive(null);
+      } else {
+        timer = setTimeout(clearWhenStale, remaining);
+      }
+    };
+    const remaining = 7000 - (
+      Date.now() - lastWsBackgroundAt.current
+    );
+    if (remaining <= 0) {
+      setLocalBackgroundActive(null);
+      return;
+    }
+    timer = setTimeout(clearWhenStale, remaining);
+    return () => clearTimeout(timer);
+  }, [localBackgroundActive, task.background_active]);
 
   useEffect(() => {
     const el = scrollContainerRef.current;
@@ -529,7 +662,12 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
     }
   };
 
-  const isRunning = ['executing', 'in_progress'].includes(task.status);
+  useEffect(() => {
+    if (!isProcessing) {
+      setActiveIteration(null);
+      setCancelling(false);
+    }
+  }, [isProcessing]);
 
   return (
     <div className={inline ? "flex flex-col h-full bg-gray-950" : "fixed inset-0 bg-gray-950 flex flex-col z-50"}>
@@ -564,7 +702,7 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
             iteration={iter}
             messages={msgs}
             meta={iterMeta.get(iter) ?? null}
-            isActive={isRunning && iter === (activeIteration ?? maxIteration)}
+            isActive={isProcessing && iter === (activeIteration ?? maxIteration)}
             defaultOpen={iter === maxIteration}
             taskId={task.id}
           />
@@ -582,7 +720,7 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       )}
 
       {/* Footer */}
-      {isRunning && (
+      {isProcessing && (
         <div className="border-t border-gray-800 bg-gray-900 p-3 flex flex-col items-center gap-2">
           {cancelError && (
             <p className="text-xs text-red-400">{cancelError}</p>

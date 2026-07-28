@@ -218,6 +218,77 @@ class RalphLoop:
         returncode = getattr(process, "returncode", None)
         return returncode if isinstance(returncode, int) else -1
 
+    async def _mark_completed_with_background_handoff(
+        self,
+        task_id: int,
+        instance_id: int,
+        foreground_generation: TaskGenerationFence,
+    ) -> TaskGenerationFence | None:
+        """Complete the exact Ralph turn even if its PTY marker just changed.
+
+        The PTY idle callback can arm the detached background marker after
+        Ralph captured its foreground fence but before ``mark_completed``.
+        That marker-only transition is part of the same turn, not an ABA.
+        Re-read it under the Task row lock, reject every other field change,
+        then retry with the newly observed exact fence.  The returned value is
+        the DB-normalized post-commit snapshot used for publication.
+        """
+
+        async with self.db_factory() as db:
+            completed = await TaskQueue(db).mark_completed(
+                task_id,
+                instance_id=instance_id,
+                generation_fence=foreground_generation,
+            )
+
+        if not completed:
+            async with self.db_factory() as db:
+                current = (
+                    await db.execute(
+                        select(Task)
+                        .where(Task.id == task_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    current is None
+                    or current.status not in ("in_progress", "executing")
+                    or task_generation_fence(current)[:4]
+                    != foreground_generation[:4]
+                ):
+                    await db.rollback()
+                    return None
+                adopted_generation = task_generation_fence(current)
+                completed = await TaskQueue(db).mark_completed(
+                    task_id,
+                    instance_id=instance_id,
+                    generation_fence=adopted_generation,
+                )
+            if not completed:
+                return None
+
+        async with self.db_factory() as db:
+            current = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                current is None
+                or current.status != "completed"
+                or current.retry_count != foreground_generation[0]
+                or current.instance_id != foreground_generation[1]
+                or current.started_at != foreground_generation[2]
+                or current.completed_at is None
+            ):
+                await db.rollback()
+                return None
+            resulting_generation = task_generation_fence(current)
+            await db.commit()
+            return resulting_generation
+
     async def _broadcast_generation_event(
         self,
         task_id: int,
@@ -241,6 +312,7 @@ class RalphLoop:
             original_instance_id,
             original_started_at,
             original_completed_at,
+            original_background_generation,
         ) = original_generation
         expected_retry_count = original_retry_count + retry_count_delta
         expected_instance_id = None if released else original_instance_id
@@ -254,6 +326,8 @@ class RalphLoop:
                 or current.retry_count != expected_retry_count
                 or current.instance_id != expected_instance_id
                 or current.started_at != expected_started_at
+                or current.pty_background_generation
+                != original_background_generation
                 or (
                     terminal
                     and current.completed_at is None
@@ -284,7 +358,18 @@ class RalphLoop:
                 await db.rollback()
                 return False
             try:
-                await self.broadcaster.broadcast("tasks", event)
+                await self.broadcaster.broadcast(
+                    "tasks",
+                    {
+                        **event,
+                        # Publish the exact post-commit durable snapshot.  In
+                        # particular, never infer detached PTY activity from
+                        # the foreground status supplied by the caller.
+                        "background_active": (
+                            current.pty_background_generation is not None
+                        ),
+                    },
+                )
             except Exception:
                 logger.exception(
                     "Failed to broadcast Ralph generation event for task %s",
@@ -476,6 +561,54 @@ class RalphLoop:
             )
         return bool(task_result.rowcount)
 
+    async def _read_settled_failed_generation(
+        self,
+        task_id: int,
+        instance_id: int,
+        *,
+        task_generation: TaskGenerationFence,
+        expected_instance_started_at: datetime | None,
+    ) -> TaskGenerationFence | None:
+        """Read the exact failed result committed by ``InstanceManager.stop``."""
+
+        async with self.db_factory() as db:
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                task is None
+                or task.status != "failed"
+                or task_generation_fence(task)[:4]
+                != task_generation[:4]
+                or task.pty_background_generation is not None
+            ):
+                await db.rollback()
+                return None
+
+            instance = (
+                await db.execute(
+                    select(Instance)
+                    .where(Instance.id == instance_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                instance is None
+                or instance.status != "error"
+                or instance.pid is not None
+                or instance.current_task_id is not None
+                or instance.started_at != expected_instance_started_at
+            ):
+                await db.rollback()
+                return None
+            resulting_generation = task_generation_fence(task)
+            await db.commit()
+            return resulting_generation
+
     async def _release_cancelled_claim(
         self,
         instance_id: int,
@@ -493,6 +626,8 @@ class RalphLoop:
             return
 
         task_id = task.id
+        observed_generation = task_generation_fence(task)
+        current_generation = observed_generation
         instance_snapshot: tuple[
             str,
             int | None,
@@ -501,16 +636,28 @@ class RalphLoop:
         ] | None = None
         try:
             async with self.db_factory() as db:
-                current = await db.get(Task, task_id)
+                current = (
+                    await db.execute(
+                        select(Task)
+                        .where(Task.id == task_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
                 instance = await db.get(Instance, instance_id)
                 if (
                     current is None
                     or current.instance_id != instance_id
                     or current.status not in ("in_progress", "executing")
-                    or task_generation_fence(current)
-                    != task_generation_fence(task)
+                    or task_generation_fence(current)[:4]
+                    != observed_generation[:4]
                 ):
                     return
+                # A PTY idle callback can arm or settle the detached marker
+                # after Ralph captured its foreground Task.  The first four
+                # fields prove this is still the same dequeue generation; use
+                # the marker currently protected by the Task row lock for all
+                # subsequent exact stop/defer/failure operations.
+                current_generation = task_generation_fence(current)
                 if instance is not None:
                     instance_snapshot = (
                         instance.status,
@@ -567,7 +714,7 @@ class RalphLoop:
                         "Ralph loop stopped but process cleanup could not be "
                         f"confirmed: {exc}",
                         instance_snapshot=instance_snapshot,
-                        generation_fence=task_generation_fence(task),
+                        generation_fence=current_generation,
                     )
             except Exception:
                 logger.exception(
@@ -583,7 +730,7 @@ class RalphLoop:
                     task_id,
                     "Ralph loop stopped; task returned to the queue",
                     instance_id=instance_id,
-                    generation_fence=task_generation_fence(task),
+                    generation_fence=current_generation,
                 )
         except Exception:
             logger.exception(
@@ -595,7 +742,7 @@ class RalphLoop:
         if released:
             await self._broadcast_generation_event(
                 task_id,
-                task_generation_fence(task),
+                current_generation,
                 "pending",
                 {
                     "event": "status_change",
@@ -631,9 +778,7 @@ class RalphLoop:
 
         task_id = task.id
         reason = f"Ralph loop failed: {exc}"[:500]
-        expected_retry_count = task.retry_count
-        expected_started_at = task.started_at
-        expected_completed_at = task.completed_at
+        observed_generation = task_generation_fence(task)
         instance_snapshot: tuple[
             str,
             int | None,
@@ -643,17 +788,29 @@ class RalphLoop:
         process = None
 
         async with self.db_factory() as db:
-            current = await db.get(Task, task_id)
+            current = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             instance = await db.get(Instance, instance_id)
             if (
                 current is None
                 or current.status not in ("in_progress", "executing")
                 or current.instance_id != instance_id
-                or current.retry_count != expected_retry_count
-                or current.started_at != expected_started_at
-                or current.completed_at != expected_completed_at
+                or task_generation_fence(current)[:4]
+                != observed_generation[:4]
             ):
                 return
+            (
+                expected_retry_count,
+                _expected_instance_id,
+                expected_started_at,
+                expected_completed_at,
+                expected_background_generation,
+            ) = task_generation_fence(current)
             if instance is not None:
                 instance_snapshot = (
                     instance.status,
@@ -680,6 +837,12 @@ class RalphLoop:
                     if expected_completed_at is None
                     else Task.completed_at == expected_completed_at
                 ),
+                (
+                    Task.pty_background_generation.is_(None)
+                    if expected_background_generation is None
+                    else Task.pty_background_generation
+                    == expected_background_generation
+                ),
             ]
             result = await db.execute(
                 update(Task)
@@ -705,6 +868,14 @@ class RalphLoop:
         if not result.rowcount:
             return
 
+        failed_generation: TaskGenerationFence = (
+            expected_retry_count,
+            instance_id,
+            expected_started_at,
+            persisted_failed_at,
+            expected_background_generation,
+        )
+        publication_generation = failed_generation
         cleanup_error: Exception | None = None
         if instance_snapshot is not None and instance_snapshot[2] == task_id:
             if process is None:
@@ -713,18 +884,34 @@ class RalphLoop:
                 )
             else:
                 try:
-                    killed = await self.instance_manager.kill_process_generation(
+                    stopped = await self.instance_manager.stop(
                         instance_id,
-                        process,
+                        expected_task_id=task_id,
+                        expected_pid=instance_snapshot[1],
+                        expected_started_at=instance_snapshot[3],
+                        task_status="failed",
+                        task_error_message=reason,
+                        terminal_consumer_timeout=30.0,
+                        consumer_cancel_timeout=10.0,
                     )
-                    if killed:
-                        await self.instance_manager.wait_for_output_consumer(
-                            instance_id,
-                            provider=task.provider,
-                            timeout=30,
-                            expected_process=process,
-                            preserve_error=True,
+                    if not stopped:
+                        raise RuntimeError(
+                            "exact Ralph failed generation could not be stopped"
                         )
+                    settled_generation = (
+                        await self._read_settled_failed_generation(
+                            task_id,
+                            instance_id,
+                            task_generation=failed_generation,
+                            expected_instance_started_at=instance_snapshot[3],
+                        )
+                    )
+                    if settled_generation is None:
+                        raise RuntimeError(
+                            "settled Ralph generation lost its exact "
+                            "Task/Instance cleanup CAS"
+                        )
+                    publication_generation = settled_generation
                     # If the map already points at a replacement process, exact
                     # identity did its job. Never fall back to task-id stop.
                 except Exception as cleanup_exc:
@@ -747,24 +934,14 @@ class RalphLoop:
                 f"{reason}; process cleanup could not be confirmed: "
                 f"{cleanup_error}",
                 instance_snapshot=instance_snapshot,
-                generation_fence=(
-                    expected_retry_count,
-                    instance_id,
-                    expected_started_at,
-                    persisted_failed_at,
-                ),
+                generation_fence=failed_generation,
                 task_statuses=("failed",),
                 broadcast_event=False,
             )
 
         await self._broadcast_generation_event(
             task_id,
-            (
-                expected_retry_count,
-                instance_id,
-                expected_started_at,
-                expected_completed_at,
-            ),
+            publication_generation,
             "failed",
             {
                 "event": "status_change",
@@ -890,17 +1067,22 @@ class RalphLoop:
                 )
 
                 # Handle result
-                async with self.db_factory() as db:
-                    queue = TaskQueue(db)
-                    status = None
-                    if exit_code == 0:
-                        if await queue.mark_completed(
+                publication_generation = task_generation_fence(task)
+                status = None
+                if exit_code == 0:
+                    resulting_generation = (
+                        await self._mark_completed_with_background_handoff(
                             task.id,
-                            instance_id=instance_id,
-                            generation_fence=task_generation_fence(task),
-                        ):
-                            status = "completed"
-                    else:
+                            instance_id,
+                            publication_generation,
+                        )
+                    )
+                    if resulting_generation is not None:
+                        publication_generation = resulting_generation
+                        status = "completed"
+                else:
+                    async with self.db_factory() as db:
+                        queue = TaskQueue(db)
                         if (
                             task.retry_count < task.max_retries
                         ):
@@ -925,7 +1107,7 @@ class RalphLoop:
                 if status is not None:
                     await self._broadcast_generation_event(
                         task.id,
-                        task_generation_fence(task),
+                        publication_generation,
                         "pending" if status == "retrying" else status,
                         {
                             "event": "status_change",

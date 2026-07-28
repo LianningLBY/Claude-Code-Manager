@@ -195,6 +195,7 @@ export interface Task {
   selected_user_skills: number[] | null;
   shared_from_id: number | null;
   active_sub_agents: number;
+  background_active?: boolean;
   tags: string[] | null;
   metadata_: {
     image_paths?: string[];
@@ -268,6 +269,9 @@ export interface ChatMessage {
   /** Native Codex ids used to resolve a safe thread/fork boundary. */
   item_id?: string | null;
   turn_id?: string | null;
+  /** Native item metadata used for narrowly-scoped compatibility filtering. */
+  native_item_type?: string | null;
+  native_item_status?: string | null;
   /** True when this row came from persisted chat history, not live optimism. */
   persisted?: boolean;
   // 权限透传卡片（event_type === 'permission_request' 时存在）

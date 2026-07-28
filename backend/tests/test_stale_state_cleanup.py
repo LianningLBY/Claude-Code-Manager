@@ -1649,6 +1649,130 @@ async def test_stop_session_in_progress_task_marked_completed(client, session_fa
     assert resp.json()["ok"] is True
 
 
+# === Detached PTY recovery ===
+
+
+@pytest.mark.asyncio
+async def test_startup_sub_agent_cleanup_preserves_only_native_background_rows(
+    db_factory,
+):
+    from backend import main as main_module
+
+    async with db_factory() as db:
+        background_task = Task(
+            title="terminal foreground with native tail",
+            description="work",
+            status="completed",
+            pty_background_generation="exact-native-epoch",
+        )
+        ordinary_task = Task(
+            title="ordinary terminal parent",
+            description="work",
+            status="completed",
+        )
+        db.add_all([background_task, ordinary_task])
+        await db.flush()
+        rows = [
+            SubAgentSession(
+                task_id=background_task.id,
+                source="native",
+                agent_type="native-agent",
+                description="dispatcher must recover this row",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=background_task.id,
+                source="ccm",
+                agent_type="monitor",
+                description="ordinary CCM monitor cleanup",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=ordinary_task.id,
+                source="native",
+                agent_type="native-agent",
+                description="no live background generation",
+                status="running",
+            ),
+        ]
+        db.add_all(rows)
+        await db.commit()
+        row_ids = [row.id for row in rows]
+
+    with patch.object(main_module, "async_session", db_factory):
+        await main_module._cleanup_stale_sub_agents()
+
+    async with db_factory() as db:
+        current = [await db.get(SubAgentSession, row_id) for row_id in row_ids]
+        assert current[0].status == "running"
+        assert current[0].completed_at is None
+        assert current[1].status == "completed"
+        assert current[1].completed_at is not None
+        assert current[2].status == "completed"
+        assert current[2].completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_startup_fails_closed_orphaned_pty_background_marker(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    d.instance_manager.active_pty_background_task_ids.return_value = set()
+
+    async with db_factory() as db:
+        task = Task(
+            title="orphaned PTY background",
+            description="background tail was interrupted",
+            status="executing",
+            session_id="lost-session",
+            pty_background_generation="lost-exact-epoch",
+        )
+        db.add(task)
+        await db.flush()
+        native_session = SubAgentSession(
+                task_id=task.id,
+                source="native",
+                agent_type="native-agent",
+                description="lost agent",
+                status="running",
+            )
+        db.add(native_session)
+        await db.commit()
+        task_id = task.id
+        native_session_id = native_session.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "failed"
+        assert current.pty_background_generation is None
+        assert "restarted before Claude PTY background" in (
+            current.error_message or ""
+        )
+        log = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalar_one()
+        assert "restarted before Claude PTY background" in log.content
+        assert (
+            await db.get(SubAgentSession, native_session_id)
+        ).status == "failed"
+
+    assert any(
+        call.args[0] == "tasks"
+        and call.args[1].get("event") == "status_change"
+        and call.args[1].get("task_id") == task_id
+        and call.args[1].get("new_status") == "failed"
+        for call in d.broadcaster.broadcast.await_args_list
+    )
+
+
 # === Mixed scenario: startup with multiple stale entities ===
 
 

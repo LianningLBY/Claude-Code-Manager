@@ -51,10 +51,16 @@ class TaskProcessTerminationConflict(TaskTerminationConflict):
 
     def __init__(self, instance_ids: list[int]):
         self.instance_ids = instance_ids
-        super().__init__(
-            "Process cleanup could not be confirmed for instance(s): "
-            + ", ".join(map(str, instance_ids))
-        )
+        if instance_ids:
+            message = (
+                "Process cleanup could not be confirmed for instance(s): "
+                + ", ".join(map(str, instance_ids))
+            )
+        else:
+            message = (
+                "Detached Task/session cleanup could not be confirmed"
+            )
+        super().__init__(message)
 
 
 class TaskAuxiliaryTerminationConflict(TaskTerminationConflict):
@@ -84,6 +90,7 @@ class TaskTerminationResult:
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
+    pty_background_generation: str | None
 
 
 @dataclass(frozen=True)
@@ -102,9 +109,14 @@ class LocalTaskGeneration:
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
+    pty_background_generation: str | None
 
 
 _T = TypeVar("_T")
+_MAX_LATE_AUXILIARY_REAP_SWEEPS = 8
+_AUXILIARY_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "stopped"}
+)
 
 
 async def _finish_despite_cancellation(awaitable: Awaitable[_T]) -> _T:
@@ -136,6 +148,7 @@ def local_task_generation(task: Task) -> LocalTaskGeneration:
         instance_id=task.instance_id,
         started_at=_utc_naive(task.started_at),
         completed_at=_utc_naive(task.completed_at),
+        pty_background_generation=task.pty_background_generation,
     )
 
 
@@ -148,6 +161,7 @@ def normalize_local_task_generation(
         instance_id=generation.instance_id,
         started_at=_utc_naive(generation.started_at),
         completed_at=_utc_naive(generation.completed_at),
+        pty_background_generation=generation.pty_background_generation,
     )
 
 
@@ -176,6 +190,12 @@ def local_task_generation_predicates(
             Task.completed_at.is_(None)
             if generation.completed_at is None
             else Task.completed_at == generation.completed_at
+        ),
+        (
+            Task.pty_background_generation.is_(None)
+            if generation.pty_background_generation is None
+            else Task.pty_background_generation
+            == generation.pty_background_generation
         ),
     ]
 
@@ -300,6 +320,7 @@ async def lock_task_generation(
     expected_instance_id: int | None,
     expected_started_at: datetime | None,
     expected_completed_at: datetime | None,
+    expected_pty_background_generation: str | None,
 ) -> Task | None:
     """Lock one exact Task generation until its terminal event is published."""
 
@@ -323,6 +344,12 @@ async def lock_task_generation(
             Task.completed_at.is_(None)
             if expected_completed_at is None
             else Task.completed_at == expected_completed_at
+        ),
+        (
+            Task.pty_background_generation.is_(None)
+            if expected_pty_background_generation is None
+            else Task.pty_background_generation
+            == expected_pty_background_generation
         ),
     ]
     locked = await db.execute(
@@ -354,90 +381,156 @@ async def read_persisted_task_completed_at(
     )
 
 
-async def _finish_termination(
-    task_id: int,
-    db: AsyncSession,
-    *,
-    expected_generations: list[
-        tuple[int, int | None, datetime | None]
-    ],
-    expected_status: str,
-    expected_retry_count: int,
-    expected_instance_id: int | None,
-    expected_started_at: datetime | None,
-    expected_completed_at: datetime | None,
-    transitioned: bool,
-    auxiliary_sessions: list[tuple[int, str, str]],
-) -> bool:
-    await settle_task_launch_barrier(task_id, expected_instance_id)
+def _auxiliary_runtime_snapshot(
+    dispatcher,
+    session_ids: list[int],
+) -> tuple[set[int], set[int]]:
+    """Read and validate Dispatcher-owned exact auxiliary evidence."""
+
     try:
-        stopped = await stop_task_process(
-            task_id,
-            db,
-            expected_generations=expected_generations,
-            # InstanceManager only uses this fallback when the Task is still
-            # active. Our generation CAS has already made it terminal, so use
-            # a supported value while reconciling an existing failed Task.
-            task_status=(
-                expected_status
-                if expected_status in {"completed", "cancelled"}
-                else "completed"
-            ),
-        )
-    except asyncio.CancelledError:
-        raise
+        snapshot = dispatcher._active_auxiliary_session_ids()
     except Exception as exc:
-        raise TaskProcessTerminationConflict(
-            [instance_id for instance_id, _pid, _started_at in expected_generations]
-        ) from exc
+        raise TaskAuxiliaryTerminationConflict(session_ids) from exc
+    if (
+        not isinstance(snapshot, tuple)
+        or len(snapshot) != 2
+        or not all(isinstance(ids, set) for ids in snapshot)
+        or any(
+            type(session_id) is not int
+            for ids in snapshot
+            for session_id in ids
+        )
+    ):
+        raise TaskAuxiliaryTerminationConflict(session_ids)
+    return snapshot
+
+
+def _auxiliary_runtime_present(
+    *,
+    session_id: int,
+    agent_type: str,
+    monitor_ids: set[int],
+    sub_agent_ids: set[int],
+) -> bool:
+    """Return exact expected runtime evidence; mismatched evidence is unsafe."""
+
+    if agent_type == "monitor":
+        if session_id in sub_agent_ids:
+            raise TaskAuxiliaryTerminationConflict([session_id])
+        return session_id in monitor_ids
+    if agent_type == "sub_agent":
+        if session_id in monitor_ids:
+            raise TaskAuxiliaryTerminationConflict([session_id])
+        return session_id in sub_agent_ids
+    raise TaskAuxiliaryTerminationConflict([session_id])
+
+
+async def _stop_auxiliary_sessions(
+    auxiliary_sessions: list[tuple[int, str, str, str]],
+) -> set[int]:
+    """Prove each CCM child reaped, including DB-terminal live generations.
+
+    A completed/failed/stopped row is only historical when Dispatcher has no
+    exact lifecycle/process/thread/home evidence for that session id.  Active
+    DB rows still call the idempotent stop path when no registry entry exists,
+    covering a pre-registration launch window.  Any retained or mismatched
+    runtime evidence after stop is fail-closed.
+    """
 
     from backend.main import dispatcher
 
-    for session_id, agent_type, source in auxiliary_sessions:
+    confirmed: set[int] = set()
+    all_ids = [session_id for session_id, *_rest in auxiliary_sessions]
+    for session_id, agent_type, source, status in auxiliary_sessions:
         if source != "ccm":
+            raise TaskAuxiliaryTerminationConflict([session_id])
+        monitor_ids, sub_agent_ids = _auxiliary_runtime_snapshot(
+            dispatcher,
+            all_ids,
+        )
+        runtime_present = _auxiliary_runtime_present(
+            session_id=session_id,
+            agent_type=agent_type,
+            monitor_ids=monitor_ids,
+            sub_agent_ids=sub_agent_ids,
+        )
+        if (
+            not runtime_present
+            and status in _AUXILIARY_TERMINAL_STATUSES
+        ):
+            confirmed.add(session_id)
             continue
         try:
             if agent_type == "sub_agent":
                 await dispatcher.stop_sub_agent_session_process(session_id)
             elif agent_type == "monitor":
                 await dispatcher.stop_monitor_session_process(session_id)
+            else:
+                raise TaskAuxiliaryTerminationConflict([session_id])
         except asyncio.CancelledError:
+            raise
+        except TaskAuxiliaryTerminationConflict:
             raise
         except Exception as exc:
             raise TaskAuxiliaryTerminationConflict([session_id]) from exc
 
-    remaining = await remaining_task_process_generations(
-        task_id,
-        db,
-        expected_generations=expected_generations,
-    )
-    locked_task = await lock_task_generation(
-        task_id,
-        db,
-        expected_status=expected_status,
-        expected_retry_count=expected_retry_count,
-        expected_instance_id=expected_instance_id,
-        expected_started_at=expected_started_at,
-        expected_completed_at=expected_completed_at,
-    )
-    if locked_task is None:
-        raise TaskGenerationTerminationConflict(
-            "Task started a newer generation while its old session was stopping"
+        monitor_ids, sub_agent_ids = _auxiliary_runtime_snapshot(
+            dispatcher,
+            all_ids,
         )
-    if remaining:
-        await db.rollback()
-        raise TaskProcessTerminationConflict(remaining)
+        if _auxiliary_runtime_present(
+            session_id=session_id,
+            agent_type=agent_type,
+            monitor_ids=monitor_ids,
+            sub_agent_ids=sub_agent_ids,
+        ):
+            raise TaskAuxiliaryTerminationConflict([session_id])
+        confirmed.add(session_id)
+    return confirmed
 
-    if transitioned:
-        from backend.services.task_events import broadcast_status_change
 
-        try:
-            await broadcast_status_change(task_id, expected_status)
-        except BaseException:
-            await db.rollback()
-            raise
-    await db.commit()
-    return stopped
+def _auxiliary_sessions_requiring_reap(
+    dispatcher,
+    auxiliary_sessions: list[tuple[int, str, str, str]],
+    confirmed_ids: set[int],
+) -> list[tuple[int, str, str, str]]:
+    """Include new rows and any confirmed id whose runtime evidence reappeared."""
+
+    all_ids = [session_id for session_id, *_rest in auxiliary_sessions]
+    monitor_ids, sub_agent_ids = _auxiliary_runtime_snapshot(
+        dispatcher,
+        all_ids,
+    )
+    requiring_reap = []
+    for row in auxiliary_sessions:
+        session_id, agent_type, source, _status = row
+        if source != "ccm":
+            raise TaskAuxiliaryTerminationConflict([session_id])
+        runtime_present = _auxiliary_runtime_present(
+            session_id=session_id,
+            agent_type=agent_type,
+            monitor_ids=monitor_ids,
+            sub_agent_ids=sub_agent_ids,
+        )
+        if session_id not in confirmed_ids or runtime_present:
+            requiring_reap.append(row)
+    return requiring_reap
+
+
+def _same_local_identity(
+    task: Task,
+    generation: LocalTaskGeneration,
+) -> bool:
+    """Compare fields that cannot legitimately change during exact stop."""
+
+    generation = normalize_local_task_generation(generation)
+    return (
+        task.worker_id is None
+        and task.shared_from_id is None
+        and task.retry_count == generation.retry_count
+        and task.instance_id == generation.instance_id
+        and _utc_naive(task.started_at) == generation.started_at
+    )
 
 
 async def _read_pr_review_supersede_generation(
@@ -448,13 +541,12 @@ async def _read_pr_review_supersede_generation(
     active_statuses: tuple[str, ...],
     terminal_statuses: tuple[str, ...],
 ) -> LocalTaskGeneration:
-    """Take the exact pre-abort generation without leaving a durable gate.
+    """Take the exact pre-abort generation before installing admission gate.
 
     Queue abort can time out before any process ownership is known. Persisting
     a retry block before that wait would strand an active Task when cleanup
-    cannot even begin. The returned scalar generation is instead required by
-    the post-abort locking read, where terminal status, marker and owner
-    snapshot are committed atomically.
+    cannot even begin.  After abort succeeds, the returned scalar generation
+    fences the durable supersede gate and exact owner snapshot.
     """
 
     await db.rollback()
@@ -511,11 +603,10 @@ async def _terminate_local_task_generation_impl(
 ) -> TaskTerminationResult:
     """Safely terminalize one local Task and reap its exact Instance owners.
 
-    Queue admission is aborted first. The Task generation CAS and reverse
-    Instance owner snapshot share one transaction; after commit, cleanup uses
-    those exact ``(instance_id, pid, started_at)`` fences. A newer Task
-    generation or reused Instance slot can therefore never be mistaken for the
-    one being superseded.
+    Queue admission and any pre-owner launch are settled first.  The exact
+    Task/Instance/background generation is then snapshotted, but remains
+    non-terminal while its process tree is stopped.  Only a confirmed reap may
+    be followed by the terminal metadata CAS/publication.
     """
 
     from backend.main import dispatcher
@@ -539,8 +630,13 @@ async def _terminate_local_task_generation_impl(
             ) from exc
         raise
 
-    # Queue cancellation is a suspension point. Start a fresh current/locking
-    # read afterwards so MySQL RR cannot replay the pre-abort local generation.
+    # A launch already inside the lifecycle lock may finish while queue abort
+    # settles.  Wait for that exact slot first, then take a fresh Task→Instance
+    # snapshot.  Nothing terminal has been written yet.
+    await settle_task_launch_barrier(
+        task_id,
+        pre_abort_generation.instance_id,
+    )
     await db.rollback()
     db.expire_all()
     task = (
@@ -562,6 +658,7 @@ async def _terminate_local_task_generation_impl(
     previous_status = task.status
     transitioned = previous_status in active_statuses
     if not transitioned and previous_status not in terminal_statuses:
+        await db.rollback()
         raise TaskGenerationTerminationConflict(
             f"Task {task_id} cannot be terminated from status {previous_status}"
         )
@@ -571,32 +668,22 @@ async def _terminate_local_task_generation_impl(
     marker_already_persisted = (
         metadata.get(PR_REVIEW_SUPERSEDED_METADATA_KEY) is True
     )
-    metadata[PR_REVIEW_SUPERSEDED_METADATA_KEY] = True
-    values = {
-        "status": terminal_status,
-        "metadata_": metadata,
-    }
-    if transitioned:
-        values.update(
-            completed_at=datetime.utcnow(),
-            error_message=reason,
-        )
-    generation_predicates = task_generation_fence(task_id, task)
     if not marker_already_persisted:
-        generation_predicates.append(task_retry_not_superseded_predicate())
-    guarded = await db.execute(
-        sa_update(Task)
-        .where(*generation_predicates)
-        .values(**values)
-    )
-    if not guarded.rowcount:
-        await db.rollback()
-        raise TaskGenerationTerminationConflict(
-            f"Task {task_id} generation changed while termination was starting"
+        metadata[PR_REVIEW_SUPERSEDED_METADATA_KEY] = True
+        gate = await db.execute(
+            sa_update(Task)
+            .where(
+                *task_generation_fence(task_id, task),
+                task_retry_not_superseded_predicate(),
+            )
+            .values(metadata_=metadata)
         )
+        if not gate.rowcount:
+            await db.rollback()
+            raise TaskGenerationTerminationConflict(
+                f"Task {task_id} generation changed while admission was closing"
+            )
 
-    # Global lock order is Task -> Instance. The Task UPDATE above holds the
-    # generation while this reverse-owner snapshot is taken.
     owner_rows = await db.execute(
         select(
             Instance.id,
@@ -615,44 +702,321 @@ async def _terminate_local_task_generation_impl(
             MonitorSession.id,
             MonitorSession.agent_type,
             MonitorSession.source,
+            MonitorSession.status,
         )
         .where(
             MonitorSession.task_id == task_id,
-            MonitorSession.status.in_(("running", "cancelled")),
+            MonitorSession.source == "ccm",
+            MonitorSession.agent_type.in_(("monitor", "sub_agent")),
         )
         .with_for_update()
     )
     auxiliary_sessions = list(auxiliary_rows.all())
-    await db.execute(
-        sa_update(MonitorSession)
-        .where(
-            MonitorSession.task_id == task_id,
-            MonitorSession.status == "running",
-        )
-        .values(status="cancelled", completed_at=datetime.utcnow())
-    )
-    expected_retry_count = task.retry_count
-    expected_instance_id = task.instance_id
-    expected_started_at = task.started_at
-    expected_completed_at = (
-        await read_persisted_task_completed_at(task_id, db)
-        if transitioned
-        else task.completed_at
-    )
+    observed_session_id = task.session_id
+    observed_generation = local_task_generation(task)
+    # The superseded marker is a durable admission gate, not a terminal state.
+    # Commit it with the exact owner snapshot before any process I/O so dequeue,
+    # retry, migration and launch cannot create a replacement during stop.
     await db.commit()
 
-    stopped = await _finish_termination(
-        task_id,
-        db,
-        expected_generations=expected_generations,
-        expected_status=terminal_status,
-        expected_retry_count=expected_retry_count,
-        expected_instance_id=expected_instance_id,
-        expected_started_at=expected_started_at,
-        expected_completed_at=expected_completed_at,
-        transitioned=transitioned,
-        auxiliary_sessions=auxiliary_sessions,
+    if len(expected_generations) > 1:
+        # InstanceManager.stop terminalizes one exact owner after reaping it.
+        # With a corrupt multi-owner Task that would expose terminal state while
+        # another process still runs.  Preserve every owner for explicit
+        # reconciliation instead of choosing an unsafe order.
+        raise TaskProcessTerminationConflict(
+            [instance_id for instance_id, _pid, _started_at in expected_generations]
+        )
+
+    # Stop auxiliary process groups while the Task still advertises its real
+    # active state.  A failure leaves both Task and auxiliary DB evidence
+    # unchanged and retryable.
+    reaped_auxiliary_ids = await _stop_auxiliary_sessions(
+        auxiliary_sessions
     )
+
+    stopped = False
+    detached_stop_used = False
+    stop_error: Exception | None = None
+    if expected_generations:
+        try:
+            stopped = await stop_task_process(
+                task_id,
+                db,
+                expected_generations=expected_generations,
+                task_status=(
+                    terminal_status
+                    if terminal_status in {"completed", "cancelled"}
+                    else "completed"
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # stop() may have reaped and atomically committed its exact terminal
+            # Task/Instance generation before a WS publication failed.  Defer
+            # classification until the authoritative owner read below: retained
+            # owner evidence is failure; an absent owner is safe to finalize and
+            # republish through our own marker-aware fence.
+            stop_error = exc
+
+        remaining = await remaining_task_process_generations(
+            task_id,
+            db,
+            expected_generations=expected_generations,
+        )
+        if remaining:
+            conflict = TaskProcessTerminationConflict(remaining)
+            if stop_error is not None:
+                raise conflict from stop_error
+            raise conflict
+    elif observed_generation.pty_background_generation is not None:
+        # A late PTY tail has no reusable Instance owner.  Stop the retained
+        # Task/session/epoch object directly; never address a historical slot.
+        if not observed_session_id:
+            raise TaskProcessTerminationConflict([])
+        from backend.main import instance_manager
+
+        detached_stopped = (
+            await instance_manager.stop_detached_pty_background_generation(
+                task_id,
+                observed_session_id,
+                observed_generation.pty_background_generation,
+                expected_status=observed_generation.status,
+                expected_retry_count=observed_generation.retry_count,
+                expected_instance_id=observed_generation.instance_id,
+                expected_started_at=observed_generation.started_at,
+                expected_completed_at=observed_generation.completed_at,
+                terminal_status=terminal_status if transitioned else None,
+                error_message=reason if transitioned else None,
+            )
+        )
+        if not detached_stopped:
+            raise TaskProcessTerminationConflict([])
+        stopped = True
+        detached_stop_used = True
+
+    # A pre-owner launch could have been inside its lifecycle critical section
+    # when the durable gate committed.  Re-enter the exact barrier after stop,
+    # then the Task→Instance transaction below proves no reverse owner remains.
+    await settle_task_launch_barrier(
+        task_id,
+        observed_generation.instance_id,
+    )
+
+    # stop() is itself stop-first and may already have written/published the
+    # requested terminal status after reap.  A mocked/no-owner path may leave
+    # the original status for us to transition here.  Before that commit,
+    # converge any CCM-owned auxiliary row that landed after the first
+    # snapshot.  The final Task→Instance→auxiliary lock transaction closes
+    # normal admission; a bounded sweep fails closed if some bypass keeps
+    # manufacturing children.
+    late_auxiliary_sweeps = 0
+    while True:
+        await db.rollback()
+        db.expire_all()
+        current = (
+            await db.execute(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if current is None or not _same_local_identity(
+            current, observed_generation
+        ):
+            await db.rollback()
+            raise TaskGenerationTerminationConflict(
+                "Task started a newer generation while its old session was "
+                "stopping"
+            )
+
+        current_completed_at = _utc_naive(current.completed_at)
+        unchanged_status = (
+            current.status == observed_generation.status
+            and current_completed_at == observed_generation.completed_at
+        )
+        stopped_status = (
+            transitioned
+            and current.status == terminal_status
+            and current.completed_at is not None
+            and bool(expected_generations or detached_stop_used)
+        )
+        if not unchanged_status and not stopped_status:
+            await db.rollback()
+            raise TaskGenerationTerminationConflict(
+                "Task changed status while its exact session was stopping"
+            )
+
+        current_background_generation = current.pty_background_generation
+        if current_background_generation not in {
+            None,
+            observed_generation.pty_background_generation,
+        }:
+            await db.rollback()
+            raise TaskGenerationTerminationConflict(
+                "Task entered a newer PTY background generation while its old "
+                "session was stopping"
+            )
+
+        # Recheck any reverse owner under the global Task→Instance lock order.
+        # This catches a same-Task replacement owner even if it did not reuse
+        # the exact old Instance row.
+        replacement_owner = await db.scalar(
+            select(Instance.id)
+            .where(Instance.current_task_id == task_id)
+            .with_for_update()
+        )
+        if replacement_owner is not None:
+            await db.rollback()
+            raise TaskProcessTerminationConflict([replacement_owner])
+
+        auxiliary_rows = await db.execute(
+            select(
+                MonitorSession.id,
+                MonitorSession.agent_type,
+                MonitorSession.source,
+                MonitorSession.status,
+            )
+            .where(
+                MonitorSession.task_id == task_id,
+                MonitorSession.source == "ccm",
+                MonitorSession.agent_type.in_(("monitor", "sub_agent")),
+            )
+            .with_for_update()
+        )
+        unreaped_auxiliary_sessions = (
+            _auxiliary_sessions_requiring_reap(
+                dispatcher,
+                list(auxiliary_rows.all()),
+                reaped_auxiliary_ids,
+            )
+        )
+        if unreaped_auxiliary_sessions:
+            await db.rollback()
+            if (
+                late_auxiliary_sweeps
+                >= _MAX_LATE_AUXILIARY_REAP_SWEEPS
+            ):
+                raise TaskAuxiliaryTerminationConflict(
+                    [row.id for row in unreaped_auxiliary_sessions]
+                )
+            reaped_auxiliary_ids.update(
+                await _stop_auxiliary_sessions(
+                    unreaped_auxiliary_sessions
+                )
+            )
+            late_auxiliary_sweeps += 1
+            continue
+
+        metadata = dict(current.metadata_ or {})
+        marker_already_persisted = (
+            metadata.get(PR_REVIEW_SUPERSEDED_METADATA_KEY) is True
+        )
+        metadata[PR_REVIEW_SUPERSEDED_METADATA_KEY] = True
+        values = {
+            "status": terminal_status,
+            "metadata_": metadata,
+            "pty_background_generation": None,
+        }
+        if transitioned:
+            values.update(
+                completed_at=(
+                    current.completed_at
+                    if current.status == terminal_status
+                    else datetime.utcnow()
+                ),
+                error_message=reason,
+            )
+        generation_predicates = task_generation_fence(task_id, current)
+        if not marker_already_persisted:
+            generation_predicates.append(
+                task_retry_not_superseded_predicate()
+            )
+        guarded = await db.execute(
+            sa_update(Task)
+            .where(*generation_predicates)
+            .values(**values)
+        )
+        if not guarded.rowcount:
+            await db.rollback()
+            raise TaskGenerationTerminationConflict(
+                f"Task {task_id} generation changed before terminal commit"
+            )
+
+        if reaped_auxiliary_ids:
+            await db.execute(
+                sa_update(MonitorSession)
+                .where(
+                    MonitorSession.id.in_(reaped_auxiliary_ids),
+                    MonitorSession.task_id == task_id,
+                    MonitorSession.source == "ccm",
+                    MonitorSession.agent_type.in_(("monitor", "sub_agent")),
+                    MonitorSession.status == "running",
+                )
+                .values(status="cancelled", completed_at=datetime.utcnow())
+            )
+        expected_retry_count = observed_generation.retry_count
+        expected_instance_id = observed_generation.instance_id
+        expected_started_at = observed_generation.started_at
+        expected_completed_at = await read_persisted_task_completed_at(
+            task_id,
+            db,
+        )
+        await db.commit()
+        break
+
+    # A real owner stop publishes its own exact terminal/background event after
+    # reap.  The local/no-owner and detached paths have not, so publish once
+    # while holding the final marker-aware generation lock.
+    manager_already_published = bool(
+        expected_generations
+        and stop_error is None
+        and current_background_generation is None
+        and (
+            stopped_status
+            or (
+                not transitioned
+                and observed_generation.pty_background_generation is not None
+            )
+        )
+    )
+    should_publish = (
+        transitioned
+        or observed_generation.pty_background_generation is not None
+    ) and not manager_already_published
+    if should_publish:
+        locked_task = await lock_task_generation(
+            task_id,
+            db,
+            expected_status=terminal_status,
+            expected_retry_count=expected_retry_count,
+            expected_instance_id=expected_instance_id,
+            expected_started_at=expected_started_at,
+            expected_completed_at=expected_completed_at,
+            expected_pty_background_generation=None,
+        )
+        if locked_task is None:
+            raise TaskGenerationTerminationConflict(
+                "Task started a newer generation before terminal publication"
+            )
+        from backend.services.task_events import broadcast_status_change
+
+        try:
+            await broadcast_status_change(
+                task_id,
+                terminal_status,
+                background_active=False,
+            )
+        except BaseException:
+            await db.rollback()
+            raise
+        await db.commit()
+
     return TaskTerminationResult(
         task_id=task_id,
         previous_status=previous_status,
@@ -664,6 +1028,7 @@ async def _terminate_local_task_generation_impl(
         instance_id=expected_instance_id,
         started_at=expected_started_at,
         completed_at=expected_completed_at,
+        pty_background_generation=None,
     )
 
 
@@ -819,7 +1184,7 @@ async def _terminate_worker_task_generation_impl(
             remote_before = await worker_proxy.proxy_to_worker(
                 routing_task,
                 "GET",
-                f"/api/tasks/{task_id}",
+                f"/api/tasks/{task_id}/terminate-generation",
                 require_json=True,
                 operation_lock_held=True,
             )
@@ -827,6 +1192,20 @@ async def _terminate_worker_task_generation_impl(
             raise WorkerTaskTerminationConflict(
                 f"Could not read Worker task {task_id} before stop"
             ) from exc
+
+        remote_background_generation = remote_before.get(
+            "pty_background_generation"
+        )
+        if (
+            "pty_background_generation" not in remote_before
+            or (
+                remote_background_generation is not None
+                and not isinstance(remote_background_generation, str)
+            )
+        ):
+            raise WorkerTaskTerminationConflict(
+                f"Worker task {task_id} omitted its opaque termination generation"
+            )
 
         remote_values = authoritative_worker_task_values(
             remote_before,
@@ -858,6 +1237,9 @@ async def _terminate_worker_task_generation_impl(
                     "expected_instance_id": remote_before.get("instance_id"),
                     "expected_started_at": remote_before.get("started_at"),
                     "expected_completed_at": remote_before.get("completed_at"),
+                    "expected_pty_background_generation": (
+                        remote_background_generation
+                    ),
                 },
                 require_json=True,
                 operation_lock_held=True,

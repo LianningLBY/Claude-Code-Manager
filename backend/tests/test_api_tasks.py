@@ -1658,8 +1658,384 @@ async def test_non_goal_task_has_null_goal_fields(client):
 
 
 @pytest.mark.asyncio
-async def test_cancel_task_attempts_process_stop(client, session_factory):
-    """POST /api/tasks/{id}/cancel calls _stop_task_process before cancelling."""
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_tracked_pty_background_terminal_request_clears_marker(
+    client,
+    session_factory,
+    endpoint,
+    terminal_status,
+):
+    """An exact live owner lets terminal CAS retire its PTY marker."""
+
+    import backend.main
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": f"Tracked background {endpoint}",
+        "description": "d",
+    })
+    task_id = created.json()["id"]
+    started_at = datetime(2026, 7, 28, 1, 2, 3)
+    async with session_factory() as db:
+        instance = Instance(
+            name=f"tracked-background-{endpoint}",
+            status="running",
+            pid=41001,
+            started_at=started_at,
+            current_task_id=task_id,
+        )
+        db.add(instance)
+        await db.flush()
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status="executing",
+                instance_id=instance.id,
+                started_at=started_at,
+                session_id=f"tracked-session-{endpoint}",
+                pty_background_generation=f"tracked-generation-{endpoint}",
+            )
+        )
+        await db.commit()
+        instance_id = instance.id
+
+    async def stop_exact(
+        stopped_task_id,
+        _db,
+        *,
+        expected_generations,
+        task_status,
+    ):
+        assert stopped_task_id == task_id
+        assert task_status == terminal_status
+        assert expected_generations == [
+            (instance_id, 41001, started_at)
+        ]
+        async with session_factory() as db:
+            instance = await db.get(Instance, instance_id)
+            instance.status = "idle"
+            instance.pid = None
+            instance.current_task_id = None
+            task = await db.get(Task, task_id)
+            task.status = terminal_status
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = None
+            await db.commit()
+        from backend.services.task_events import broadcast_status_change
+
+        await broadcast_status_change(
+            task_id,
+            terminal_status,
+            background_active=False,
+        )
+        return True
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "wait_for_task_launch_barrier",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "backend.api.tasks._stop_task_process",
+            new_callable=AsyncMock,
+            side_effect=stop_exact,
+        ),
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new_callable=AsyncMock,
+        ) as publish,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 200, response.text
+    publish.assert_awaited_once_with(
+        task_id,
+        terminal_status,
+        background_active=False,
+    )
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == terminal_status
+        assert task.pty_background_generation is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_owner_stop_preserves_new_background_generation(
+    client,
+    session_factory,
+    endpoint,
+    terminal_status,
+):
+    """A post-stop same-Task epoch must never be mistaken for the old tail."""
+
+    import backend.main
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": f"Owner ABA {endpoint}",
+        "description": "d",
+    })
+    task_id = created.json()["id"]
+    started_at = datetime(2026, 7, 28, 4, 5, 6)
+    new_generation = f"new-owner-background-{endpoint}"
+    async with session_factory() as db:
+        instance = Instance(
+            name=f"owner-aba-{endpoint}",
+            status="running",
+            pid=42001,
+            started_at=started_at,
+            current_task_id=task_id,
+        )
+        db.add(instance)
+        await db.flush()
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status="executing",
+                instance_id=instance.id,
+                started_at=started_at,
+                session_id=f"owner-aba-session-{endpoint}",
+            )
+        )
+        await db.commit()
+        instance_id = instance.id
+
+    async def stop_then_new_epoch(
+        _task_id,
+        _db,
+        *,
+        expected_generations,
+        task_status,
+    ):
+        assert _task_id == task_id
+        assert task_status == terminal_status
+        assert expected_generations == [
+            (instance_id, 42001, started_at)
+        ]
+        async with session_factory() as db:
+            instance = await db.get(Instance, instance_id)
+            instance.status = "idle"
+            instance.pid = None
+            instance.current_task_id = None
+            task = await db.get(Task, task_id)
+            task.status = terminal_status
+            task.completed_at = datetime.utcnow()
+            # Models a newer same-task turn completing and arming after the
+            # old Instance stop fence is released.
+            task.pty_background_generation = new_generation
+            await db.commit()
+        return True
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch(
+            "backend.api.tasks._stop_task_process",
+            new_callable=AsyncMock,
+            side_effect=stop_then_new_epoch,
+        ),
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new_callable=AsyncMock,
+        ) as publish,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 409
+    assert "newer PTY background generation" in response.json()["detail"]
+    publish.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == terminal_status
+        assert task.pty_background_generation == new_generation
+
+
+@pytest.mark.asyncio
+async def test_stop_session_stops_ownerless_pty_background_generation(
+    client,
+    session_factory,
+):
+    """Late output is stopped by Task/session token, not historical Instance."""
+
+    import backend.main
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": "Detached background stop",
+        "description": "d",
+    })
+    task_id = created.json()["id"]
+    session_id = "detached-api-session"
+    generation = "detached-api-generation"
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status="completed",
+                session_id=session_id,
+                pty_background_generation=generation,
+            )
+        )
+        await db.commit()
+
+    async def settle_exact(
+        settled_task_id,
+        settled_session_id,
+        settled_generation,
+        **expected,
+    ):
+        assert (
+            settled_task_id,
+            settled_session_id,
+            settled_generation,
+        ) == (task_id, session_id, generation)
+        assert expected["expected_status"] == "completed"
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.pty_background_generation == generation,
+                )
+                .values(pty_background_generation=None)
+            )
+            await db.commit()
+        return True
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch(
+            "backend.api.tasks._stop_task_process",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "stop_detached_pty_background_generation",
+            new_callable=AsyncMock,
+            side_effect=settle_exact,
+        ) as stop_detached,
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new_callable=AsyncMock,
+        ) as publish,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/stop-session"
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["stopped"] is True
+    stop_detached.assert_awaited_once()
+    publish.assert_awaited_once_with(
+        task_id,
+        "completed",
+        background_active=False,
+    )
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.pty_background_generation is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_ownerless_pty_background_requires_stop_session(
+    client,
+    session_factory,
+):
+    """Cancel cannot silently retire a detached Session it does not stop."""
+
+    import backend.main
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": "Detached background cancel failure",
+        "description": "d",
+    })
+    task_id = created.json()["id"]
+    generation = "detached-cancel-failure"
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status="completed",
+                session_id="detached-cancel-session",
+                pty_background_generation=generation,
+            )
+        )
+        await db.commit()
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch(
+            "backend.api.tasks._stop_task_process",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "stop_detached_pty_background_generation",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as stop_detached,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 400
+    stop_detached.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "completed"
+        assert task.pty_background_generation == generation
+
+
+@pytest.mark.asyncio
+async def test_ownerless_pending_cancel_does_not_infer_process(
+    client, session_factory
+):
+    """A pending Task without an exact owner needs no process stop."""
     create_resp = await client.post("/api/tasks", json={
         "title": "Cancel Me", "description": "d", "target_repo": "/tmp",
     })
@@ -1670,9 +2046,7 @@ async def test_cancel_task_attempts_process_stop(client, session_factory):
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "cancelled"
-    mock_stop.assert_awaited_once()
-    call_args = mock_stop.call_args
-    assert call_args[0][0] == task_id
+    mock_stop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1780,6 +2154,162 @@ async def test_terminal_generation_uses_database_normalized_completed_at(
 
 
 @pytest.mark.asyncio
+async def test_ownerless_stop_drops_stale_completed_publication_after_retry(
+    client,
+    session_factory,
+):
+    """A retry committed after stop cannot receive the old completed event."""
+
+    import backend.main
+    from backend.models.task import Task
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Stop publication retry race",
+        "description": "d",
+        "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="executing")
+        )
+        await db.commit()
+
+    async def retry_before_publication(*_args, **_kwargs):
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status="pending",
+                    retry_count=Task.retry_count + 1,
+                    completed_at=None,
+                )
+            )
+            await db.commit()
+        return None
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch(
+            "backend.api.tasks._lock_task_generation",
+            new_callable=AsyncMock,
+            side_effect=retry_before_publication,
+        ),
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new_callable=AsyncMock,
+        ) as publish,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/stop-session"
+        )
+
+    assert response.status_code == 409
+    publish.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "pending"
+        assert task.retry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_detached_stop_drops_false_event_if_new_background_rearms(
+    client,
+    session_factory,
+):
+    """A new exact PTY epoch suppresses the old background=false event."""
+
+    import backend.main
+    from backend.models.task import Task
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Detached publication rearm race",
+        "description": "d",
+        "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    old_generation = "old-detached-generation"
+    new_generation = "new-detached-generation"
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status="completed",
+                completed_at=datetime(2026, 7, 28, 2, 3, 4),
+                session_id="detached-publication-session",
+                pty_background_generation=old_generation,
+            )
+        )
+        await db.commit()
+
+    async def stop_old_generation(*_args, **_kwargs):
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.pty_background_generation == old_generation,
+                )
+                .values(pty_background_generation=None)
+            )
+            await db.commit()
+        return True
+
+    async def rearm_before_publication(*_args, **_kwargs):
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(pty_background_generation=new_generation)
+            )
+            await db.commit()
+            return await db.get(Task, task_id)
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch.object(
+            backend.main.instance_manager,
+            "stop_detached_pty_background_generation",
+            new_callable=AsyncMock,
+            side_effect=stop_old_generation,
+        ),
+        patch(
+            "backend.api.tasks._lock_task_generation",
+            new_callable=AsyncMock,
+            side_effect=rearm_before_publication,
+        ),
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new_callable=AsyncMock,
+        ) as publish,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/stop-session"
+        )
+
+    assert response.status_code == 409
+    publish.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "completed"
+        assert task.pty_background_generation == new_generation
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("endpoint", "terminal_status"),
     (
@@ -1795,7 +2325,6 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
 ):
     """A disconnected caller cannot strand a terminal Task with a live owner."""
 
-    import backend.api.tasks as task_api
     import backend.main
     from backend.models.instance import Instance
     from backend.models.task import Task
@@ -1829,33 +2358,41 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
         await db.commit()
         instance_id = instance.id
 
-    before_commit = asyncio.Event()
-    allow_commit = asyncio.Event()
-    real_read_completed_at = task_api._read_persisted_task_completed_at
-
-    async def pause_before_first_commit(read_task_id, db):
-        completed_at = await real_read_completed_at(read_task_id, db)
-        before_commit.set()
-        await allow_commit.wait()
-        return completed_at
+    stop_entered = asyncio.Event()
+    allow_stop = asyncio.Event()
 
     async def stop_exact(
         stopped_task_id,
         _db,
         *,
         expected_generations,
+        task_status,
     ):
         assert stopped_task_id == task_id
+        assert task_status == terminal_status
         assert [
             (owner_id, pid, owner_started_at)
             for owner_id, pid, owner_started_at in expected_generations
         ] == [(instance_id, 54101, started_at)]
+        stop_entered.set()
+        await allow_stop.wait()
         async with session_factory() as db:
             owner = await db.get(Instance, instance_id)
             owner.status = "idle"
             owner.pid = None
             owner.current_task_id = None
+            task = await db.get(Task, task_id)
+            task.status = terminal_status
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = None
             await db.commit()
+        from backend.services.task_events import broadcast_status_change
+
+        await broadcast_status_change(
+            task_id,
+            terminal_status,
+            background_active=False,
+        )
         return True
 
     with (
@@ -1872,10 +2409,6 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
             return_value=True,
         ),
         patch(
-            "backend.api.tasks._read_persisted_task_completed_at",
-            side_effect=pause_before_first_commit,
-        ),
-        patch(
             "backend.api.tasks._stop_task_process",
             new_callable=AsyncMock,
             side_effect=stop_exact,
@@ -1888,16 +2421,20 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
         request = asyncio.create_task(
             client.post(f"/api/tasks/{task_id}/{endpoint}")
         )
-        await before_commit.wait()
+        await stop_entered.wait()
         request.cancel()
         await asyncio.sleep(0)
         assert not request.done()
-        allow_commit.set()
+        allow_stop.set()
         with pytest.raises(asyncio.CancelledError):
             await request
 
     stop.assert_awaited_once()
-    publish.assert_awaited_once_with(task_id, terminal_status)
+    publish.assert_awaited_once_with(
+        task_id,
+        terminal_status,
+        background_active=False,
+    )
     async with session_factory() as db:
         task = await db.get(Task, task_id)
         instance = await db.get(Instance, instance_id)
@@ -1908,19 +2445,24 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
 
 
 @pytest.mark.asyncio
-async def test_stop_session_uses_helper(client, session_factory):
-    """POST /api/tasks/{id}/stop-session delegates to _stop_task_process."""
+async def test_pending_stop_session_does_not_infer_process(
+    client, session_factory
+):
+    """A pending Task with no exact owner has no running session to stop."""
     create_resp = await client.post("/api/tasks", json={
         "title": "Stop Me", "description": "d", "target_repo": "/tmp",
     })
     task_id = create_resp.json()["id"]
 
-    with patch("backend.api.tasks._stop_task_process", new_callable=AsyncMock, return_value=True) as mock_stop:
+    with patch(
+        "backend.api.tasks._stop_task_process",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as mock_stop:
         resp = await client.post(f"/api/tasks/{task_id}/stop-session")
 
-    assert resp.status_code == 200
-    assert resp.json()["ok"] is True
-    mock_stop.assert_awaited_once()
+    assert resp.status_code == 400
+    mock_stop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1966,7 +2508,7 @@ async def test_stop_session_409_when_hidden_launch_cannot_be_proven_reaped(
     barrier.assert_awaited_once_with(instance_id, task_id)
     async with session_factory() as db:
         task = await db.get(Task, task_id)
-        assert task.status == "completed"
+        assert task.status == "executing"
 
 
 @pytest.mark.asyncio
@@ -2026,7 +2568,7 @@ async def test_stop_session_reports_unresolved_exact_owner(
     async with session_factory() as db:
         task = await db.get(Task, task_id)
         instance = await db.get(Instance, instance_id)
-        assert task.status == "completed"
+        assert task.status == "executing"
         assert instance.pid == 45678
         assert instance.current_task_id == task_id
 
@@ -2074,7 +2616,7 @@ async def test_cancel_reports_unresolved_exact_owner(
     async with session_factory() as db:
         task = await db.get(Task, task_id)
         instance = await db.get(Instance, instance_id)
-        assert task.status == "cancelled"
+        assert task.status == "executing"
         assert instance.pid == 45679
         assert instance.current_task_id == task_id
 
@@ -2316,19 +2858,54 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
 
 
 @pytest.mark.asyncio
-async def test_cancel_sets_status_before_stopping_process(client):
-    """Cancel must set status to cancelled BEFORE stopping process to prevent race."""
+async def test_cancel_stops_exact_owner_before_publishing_status(
+    client, session_factory
+):
+    """The live owner is reaped while its Task generation is still active."""
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+
     create_resp = await client.post("/api/tasks", json={
         "title": "Race Test", "description": "d", "target_repo": "/tmp",
     })
     task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        instance = Instance(
+            name="cancel-order-owner",
+            status="running",
+            pid=9911,
+            current_task_id=task_id,
+        )
+        db.add(instance)
+        await db.flush()
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="executing", instance_id=instance.id)
+        )
+        await db.commit()
+        instance_id = instance.id
 
-    call_order = []
-
-    original_cancel = None
-
-    async def tracking_stop(tid, db, **_kwargs):
-        call_order.append("stop")
+    async def tracking_stop(
+        tid,
+        db,
+        *,
+        expected_generations,
+        task_status,
+    ):
+        assert tid == task_id
+        assert task_status == "cancelled"
+        assert expected_generations == [(instance_id, 9911, None)]
+        async with session_factory() as verify_db:
+            task = await verify_db.get(Task, task_id)
+            assert task.status == "executing"
+            owner = await verify_db.get(Instance, instance_id)
+            owner.status = "idle"
+            owner.pid = None
+            owner.current_task_id = None
+            task.status = "cancelled"
+            task.completed_at = datetime.utcnow()
+            await verify_db.commit()
         return True
 
     with patch("backend.api.tasks._stop_task_process", side_effect=tracking_stop):
@@ -2336,8 +2913,6 @@ async def test_cancel_sets_status_before_stopping_process(client):
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "cancelled"
-    # stop should be called (after cancel sets status)
-    assert "stop" in call_order
 
 
 # === Mark unread tests ===
@@ -2711,23 +3286,32 @@ async def test_create_task_enable_workflows_persisted_in_db(client, session_fact
 
 @pytest.mark.asyncio
 async def test_stop_session_clears_pending_queue(client):
-    """POST /api/tasks/{id}/stop-session drops queued chat messages before stopping."""
+    """A pending Task may clear its queue without inventing a live process."""
     create_resp = await client.post("/api/tasks", json={
         "title": "Stop Queue", "description": "d", "target_repo": "/tmp",
     })
     task_id = create_resp.json()["id"]
 
     import backend.main
-    with patch.object(backend.main.dispatcher, "clear_task_queue", new_callable=AsyncMock, return_value=2) as mock_clear, \
-         patch("backend.api.tasks._stop_task_process", new_callable=AsyncMock, return_value=True):
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+        return_value=2,
+    ) as mock_clear, patch(
+        "backend.api.tasks._stop_task_process",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as mock_stop:
         resp = await client.post(f"/api/tasks/{task_id}/stop-session")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
-    assert body["stopped"] is True
+    assert body["stopped"] is False
     assert body["cleared_messages"] == 2
     mock_clear.assert_awaited_once_with(task_id)
+    mock_stop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2745,24 +3329,32 @@ async def test_stop_session_no_process_reports_not_stopped(client, session_facto
         await db.commit()
 
     import backend.main
-    with patch.object(backend.main.dispatcher, "clear_task_queue", new_callable=AsyncMock, return_value=0), \
-         patch("backend.api.tasks._stop_task_process", new_callable=AsyncMock, return_value=False):
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+        return_value=0,
+    ), patch(
+        "backend.api.tasks._stop_task_process",
+        new_callable=AsyncMock,
+        return_value=False,
+    ) as mock_stop:
         resp = await client.post(f"/api/tasks/{task_id}/stop-session")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["stopped"] is False
     assert "note" in body
+    mock_stop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_stop_session_invalidates_launch_before_owner_lookup(
+async def test_stop_session_ownerless_generation_does_not_infer_process(
     client,
     session_factory,
 ):
-    """A launch appearing after stop begins cannot commit an active Task claim."""
+    """An ownerless active Task is terminalized without addressing a slot."""
 
-    from backend.models.instance import Instance
     from backend.models.task import Task
     from sqlalchemy import update
 
@@ -2773,38 +3365,12 @@ async def test_stop_session_invalidates_launch_before_owner_lookup(
     })
     task_id = create_resp.json()["id"]
     async with session_factory() as db:
-        instance = Instance(name="stop-race-slot", status="idle")
-        db.add(instance)
-        await db.flush()
-        instance_id = instance.id
         await db.execute(
             update(Task)
             .where(Task.id == task_id)
             .values(status="executing")
         )
         await db.commit()
-
-    launch_commit_rows: list[int] = []
-
-    async def owner_lookup_after_launch_attempt(
-        stopped_task_id,
-        db,
-        *,
-        expected_generations,
-    ):
-        assert stopped_task_id == task_id
-        assert expected_generations == []
-        attempted_launch = await db.execute(
-            update(Task)
-            .where(
-                Task.id == task_id,
-                Task.status.in_(("executing", "in_progress")),
-            )
-            .values(status="executing", instance_id=instance_id)
-        )
-        await db.commit()
-        launch_commit_rows.append(attempted_launch.rowcount)
-        return False
 
     import backend.main
     with patch.object(
@@ -2814,13 +3380,14 @@ async def test_stop_session_invalidates_launch_before_owner_lookup(
         return_value=0,
     ), patch(
         "backend.api.tasks._stop_task_process",
-        side_effect=owner_lookup_after_launch_attempt,
-    ):
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as mock_stop:
         resp = await client.post(f"/api/tasks/{task_id}/stop-session")
 
     assert resp.status_code == 200
     assert resp.json()["stopped"] is False
-    assert launch_commit_rows == [0]
+    mock_stop.assert_not_awaited()
     async with session_factory() as db:
         task = await db.get(Task, task_id)
         assert task.status == "completed"
@@ -2836,12 +3403,21 @@ async def test_stop_session_cleared_only_returns_ok(client):
     task_id = create_resp.json()["id"]
 
     import backend.main
-    with patch.object(backend.main.dispatcher, "clear_task_queue", new_callable=AsyncMock, return_value=1), \
-         patch("backend.api.tasks._stop_task_process", new_callable=AsyncMock, return_value=False):
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+        return_value=1,
+    ), patch(
+        "backend.api.tasks._stop_task_process",
+        new_callable=AsyncMock,
+        return_value=False,
+    ) as mock_stop:
         resp = await client.post(f"/api/tasks/{task_id}/stop-session")
 
     assert resp.status_code == 200
     assert resp.json()["stopped"] is False
+    mock_stop.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from backend.schemas.monitor_session import (
     MonitorCheckResponse,
     MonitorCompleteRequest,
 )
+from backend.services.task_queue import task_retry_not_superseded_predicate
 
 router = APIRouter(prefix="/api/tasks/{task_id}/monitor-sessions", tags=["monitor"])
 
@@ -166,6 +167,7 @@ async def create_monitor_session(
                     Task.id == task_id,
                     Task.worker_id.is_(None),
                     Task.status.in_(("in_progress", "executing")),
+                    task_retry_not_superseded_predicate(),
                 )
                 .values(status=Task.status)
             )

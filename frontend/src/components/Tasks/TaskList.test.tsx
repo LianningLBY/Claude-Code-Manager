@@ -9,6 +9,7 @@ vi.mock('../../api/client', () => ({
   api: {
     deleteTask: vi.fn().mockResolvedValue({}),
     cancelTask: vi.fn().mockResolvedValue({}),
+    stopTaskSession: vi.fn().mockResolvedValue({ stopped: true }),
     retryTask: vi.fn().mockResolvedValue({}),
     starTask: vi.fn().mockResolvedValue({}),
     archiveTask: vi.fn().mockResolvedValue({}),
@@ -162,6 +163,20 @@ describe('TaskList', () => {
 
       await userEvent.click(screen.getByTitle('More actions'));
       expect(screen.getByText('Cancel')).toBeInTheDocument();
+    });
+
+    it('shows stop action and hides Delete while detached background work is active', async () => {
+      const tasks = [makeTask({ status: 'completed', background_active: true })];
+      render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+
+      await userEvent.click(screen.getByTitle('More actions'));
+      expect(screen.getByText('Cancel')).toBeInTheDocument();
+      expect(screen.queryByText('Delete')).not.toBeInTheDocument();
+
+      await userEvent.click(screen.getByText('Cancel'));
+      expect(api.stopTaskSession).toHaveBeenCalledWith(1);
+      expect(api.cancelTask).not.toHaveBeenCalled();
+      await waitFor(() => expect(onRefresh).toHaveBeenCalled());
     });
 
     it('shows Retry in overflow menu for failed tasks', async () => {

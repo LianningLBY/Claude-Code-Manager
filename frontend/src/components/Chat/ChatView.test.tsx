@@ -145,6 +145,58 @@ describe('ChatView', () => {
     });
   });
 
+  describe('legacy Codex completion compatibility', () => {
+    it('hides only raw-classified collab item completions from history', async () => {
+      const legacyNoise: ChatMessage = {
+        id: 901,
+        role: 'system',
+        event_type: 'system_event',
+        content: 'completed',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+        native_item_type: 'collabAgentToolCall',
+        native_item_status: 'completed',
+      };
+      const legitimateSystemMessage: ChatMessage = {
+        ...legacyNoise,
+        id: 902,
+        native_item_type: null,
+        native_item_status: null,
+      };
+      const visibleReply: ChatMessage = {
+        ...legacyNoise,
+        id: 903,
+        role: 'assistant',
+        event_type: 'message',
+        content: 'Reply after agent wait',
+        native_item_type: null,
+        native_item_status: null,
+      };
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([
+        legacyNoise,
+        legitimateSystemMessage,
+        visibleReply,
+      ]);
+
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(await screen.findByText('Reply after agent wait')).toBeInTheDocument();
+      expect(screen.getAllByText('— completed —')).toHaveLength(1);
+    });
+  });
+
   describe('Codex main MCP capability', () => {
     it('shows the enabled runtime capability on Codex tasks', async () => {
       render(
@@ -315,6 +367,277 @@ describe('ChatView', () => {
 
       await waitFor(() => expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7));
       expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('PTY background activity', () => {
+    it('shows the background badge while the foreground status is still executing', () => {
+      const task = makeTask({ id: 31, status: 'executing', background_active: false });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: 31,
+            new_status: 'executing',
+            background_active: true,
+          },
+        });
+      });
+
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+    });
+
+    it('consumes only matching strict-boolean global background events', () => {
+      const task = makeTask({ id: 32, background_active: false });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 32,
+            background_active: true,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 32,
+            background_active: 'false',
+          },
+        });
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 999,
+            background_active: false,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 32,
+            background_active: false,
+          },
+        });
+      });
+      expect(screen.queryByText('后台运行中')).not.toBeInTheDocument();
+    });
+
+    it('does not coerce a malformed task-channel marker to false', () => {
+      const task = makeTask({ id: 33, background_active: false });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:33',
+          data: {
+            event_type: 'background_activity',
+            background_active: true,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:33',
+          data: {
+            event_type: 'background_activity',
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+    });
+
+    it('keeps a WS false marker across a stale polling prop that rebounds true', () => {
+      const task = makeTask({
+        id: 36,
+        status: 'completed',
+        background_active: false,
+      });
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 36,
+            background_active: false,
+          },
+        });
+      });
+
+      // Models a request started before the WS false event and resolved after
+      // it with the old durable marker.
+      rerender(
+        <ChatView
+          task={{ ...task, background_active: true }}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.queryByText('后台运行中')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    });
+
+    it('expires a stale WS status even when the polled status never changes', () => {
+      vi.useFakeTimers();
+      try {
+        const task = makeTask({
+          id: 37,
+          status: 'completed',
+          background_active: false,
+        });
+        render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+        act(() => {
+          capturedOnMessage?.({
+            channel: 'tasks',
+            data: {
+              event: 'status_change',
+              task_id: 37,
+              new_status: 'executing',
+              background_active: false,
+            },
+          });
+        });
+        expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
+
+        act(() => {
+          vi.advanceTimersByTime(7001);
+        });
+        expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('treats an ownerless background tail as processing and keeps Interrupt usable', async () => {
+      const task = makeTask({
+        id: 34,
+        status: 'completed',
+        background_active: true,
+      });
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
+      fireEvent.change(textarea, { target: { value: 'wait behind background work' } });
+      expect(screen.getByTitle(/Add to queue/)).toBeInTheDocument();
+
+      const interrupt = screen.getByTitle('Interrupt session');
+      expect(interrupt).toBeEnabled();
+      await userEvent.click(interrupt);
+      await waitFor(() => {
+        expect(api.stopTaskSession).toHaveBeenCalledWith(34);
+      });
+
+      rerender(
+        <ChatView
+          task={{ ...task, background_active: false }}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+      expect(screen.getByTitle(/Send \(Ctrl\+Enter\)/)).toBeInTheDocument();
+    });
+
+    it('does not finish or dequeue at terminal/process_exit until the marker clears', async () => {
+      const task = makeTask({
+        id: 35,
+        status: 'executing',
+        background_active: false,
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:35',
+          data: {
+            event_type: 'user_message',
+            content: 'foreground request',
+          },
+        });
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+
+      const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
+      fireEvent.change(textarea, { target: { value: 'queued follow-up' } });
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: 35,
+            new_status: 'completed',
+            background_active: true,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:35',
+          data: { event_type: 'process_exit', exit_code: 0 },
+        });
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 35,
+            background_active: false,
+          },
+        });
+      });
+
+      await waitFor(
+        () => expect(api.sendTaskChat).toHaveBeenCalled(),
+        { timeout: 2000 },
+      );
+      expect(
+        (api.sendTaskChat as ReturnType<typeof vi.fn>).mock.calls[0][1],
+      ).toBe('queued follow-up');
+      await waitFor(() => {
+        expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      });
     });
   });
 

@@ -22,6 +22,7 @@ from backend.schemas.task import (
     TaskResponse,
     TaskRoutingExpectation,
     TaskTerminationRequest,
+    TaskTerminationSnapshot,
     TaskUpdate,
     WorkerRoutingConfigRequest,
     WorkerRoutingConfigSnapshot,
@@ -66,6 +67,7 @@ from backend.api.deps import (
     get_current_user_role,
     is_admin,
     require_admin,
+    require_internal_service,
     require_project_access,
     require_task_access,
     require_task_control,
@@ -714,6 +716,7 @@ async def _lock_worker_local_routing_task(
         Task.id == task_id,
         Task.worker_id.is_(None),
         Task.shared_from_id.is_(None),
+        Task.pty_background_generation.is_(None),
     ]
     if allowed_statuses is not None:
         predicates.append(Task.status.in_(allowed_statuses))
@@ -1790,6 +1793,7 @@ async def _retry_local_task_safely(
         task.instance_id,
         task.started_at,
         task.completed_at,
+        task.pty_background_generation,
     )
     reverse_owner_ids = set(
         (
@@ -1830,6 +1834,7 @@ async def _retry_local_task_safely(
             current_task.instance_id,
             current_task.started_at,
             current_task.completed_at,
+            current_task.pty_background_generation,
         )
         if (
             current_task.status != observed_status
@@ -1999,6 +2004,14 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
 
     if task is None:
         raise HTTPException(404, "Task not found")
+    if (
+        task.worker_id is None
+        and task.pty_background_generation is not None
+    ):
+        raise HTTPException(
+            409,
+            "Task still has active Claude PTY background output",
+        )
 
     if task is not None and task.worker_id is not None:
         # A Worker task has two durable copies, but only the remote copy owns
@@ -2256,6 +2269,48 @@ async def _sync_task_from_worker_response(
     return current
 
 
+async def _internal_pr_review_termination_task(
+    task_id: int,
+    request: Request,
+    db: AsyncSession,
+) -> Task:
+    """Authorize one hidden Manager→Worker termination protocol request."""
+
+    require_internal_service(request)
+    task = await db.get(Task, task_id)
+    if task:
+        await require_task_control(request, task, db)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    metadata_marker = type((task.metadata_ or {}).get("pr_review_id")) is int
+    tags = task.tags or []
+    tag_marker = (
+        isinstance(tags, (list, tuple, set, dict))
+        and "pr-review" in tags
+    )
+    if not (metadata_marker or tag_marker):
+        raise HTTPException(
+            400,
+            "Exact-generation termination is restricted to PR review tasks",
+        )
+    return task
+
+
+@router.get(
+    "/{task_id}/terminate-generation",
+    response_model=TaskTerminationSnapshot,
+    include_in_schema=False,
+)
+async def get_task_termination_generation(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the Worker's exact opaque generation to its Manager only."""
+
+    return await _internal_pr_review_termination_task(task_id, request, db)
+
+
 @router.post(
     "/{task_id}/terminate-generation",
     response_model=TaskResponse,
@@ -2274,22 +2329,7 @@ async def terminate_task_generation(
     overtake the authoritative terminal snapshot returned to the Manager.
     """
 
-    task = await db.get(Task, task_id)
-    if task:
-        await require_task_control(request, task, db)
-    if task is None:
-        raise HTTPException(404, "Task not found")
-    metadata_marker = type((task.metadata_ or {}).get("pr_review_id")) is int
-    tags = task.tags or []
-    tag_marker = (
-        isinstance(tags, (list, tuple, set, dict))
-        and "pr-review" in tags
-    )
-    if not (metadata_marker or tag_marker):
-        raise HTTPException(
-            400,
-            "Exact-generation termination is restricted to PR review tasks",
-        )
+    await _internal_pr_review_termination_task(task_id, request, db)
 
     from backend.services.task_termination import (
         LocalTaskGeneration,
@@ -2309,6 +2349,9 @@ async def terminate_task_generation(
                 instance_id=body.expected_instance_id,
                 started_at=body.expected_started_at,
                 completed_at=body.expected_completed_at,
+                pty_background_generation=(
+                    body.expected_pty_background_generation
+                ),
             ),
         )
     except TaskTerminationConflict as exc:
@@ -2326,6 +2369,9 @@ async def terminate_task_generation(
         expected_instance_id=terminated.instance_id,
         expected_started_at=terminated.started_at,
         expected_completed_at=terminated.completed_at,
+        expected_pty_background_generation=(
+            terminated.pty_background_generation
+        ),
     )
     if locked_task is None:
         raise HTTPException(
@@ -2341,11 +2387,8 @@ async def _stop_task_session_local_impl(
 ) -> dict:
     """Cancellation-safe local core for ``POST /stop-session``."""
 
-    from backend.main import dispatcher
+    from backend.main import dispatcher, instance_manager
 
-    # Authentication/routing above opened a read transaction. Do not retain a
-    # MySQL REPEATABLE READ snapshot while waiting for a queue consumer that may
-    # itself commit the current Task generation.
     await db.rollback()
     try:
         cleared = await dispatcher.abort_task_queue(task_id)
@@ -2360,10 +2403,26 @@ async def _stop_task_session_local_impl(
             ) from exc
         raise
 
-    # Queue cancellation is a suspension point. Start a fresh current/locking
-    # read before the Task -> Instance transaction so a local→Worker migration
-    # or newer retry cannot be terminalized through a stale RR snapshot.
+    # Settle a launch reservation before deciding whether an exact process
+    # owner exists. A no-owner Task is safe to terminalize only after this
+    # barrier proves no spawned-but-uncommitted generation can appear.
     await db.rollback()
+    db.expire_all()
+    probe = await db.get(Task, task_id)
+    if (
+        probe is None
+        or probe.worker_id is not None
+        or probe.shared_from_id is not None
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task execution location changed while stopping its session",
+        )
+    probe_instance_id = probe.instance_id
+    await db.rollback()
+    await _settle_task_launch_barrier(task_id, probe_instance_id)
+
     db.expire_all()
     active_task = (
         await db.execute(
@@ -2376,130 +2435,348 @@ async def _stop_task_session_local_impl(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if active_task is None:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task execution location changed while stopping its session",
+        )
 
-    expected_generations: list[
-        tuple[int, int | None, datetime | None]
-    ] = []
-    completed_count = 0
-    committed_retry_count: int | None = None
-    committed_instance_id: int | None = None
-    committed_started_at: datetime | None = None
-    committed_completed_at: datetime | None = None
-    guarded_expected_status: str | None = None
-    guarded_terminal_generation = False
-    if active_task is not None and active_task.status in (
+    stoppable_statuses = {
         "executing",
         "in_progress",
-    ):
-        completed = await db.execute(
-            sa_update(Task)
-            .where(*_task_generation_fence(task_id, active_task))
-            .values(status="completed", completed_at=datetime.utcnow())
-        )
-        completed_count = completed.rowcount or 0
-        if completed_count:
-            guarded_expected_status = "completed"
-            committed_retry_count = active_task.retry_count
-            committed_instance_id = active_task.instance_id
-            committed_started_at = active_task.started_at
-            committed_completed_at = await _read_persisted_task_completed_at(
-                task_id,
-                db,
-            )
-    elif active_task is not None and active_task.status in (
         "failed",
         "completed",
         "cancelled",
         "conflict",
-    ):
-        # A terminal Task may deliberately retain a possibly-live owner after a
-        # fail-closed cleanup. The no-op exact UPDATE keeps retry from changing
-        # its generation while reverse owners are snapshotted.
+    }
+    if active_task.status not in stoppable_statuses:
+        if active_task.status == "pending" and cleared:
+            queue_only = await db.execute(
+                sa_update(Task)
+                .where(
+                    *_task_generation_fence(task_id, active_task),
+                    Task.pty_background_generation.is_(None),
+                )
+                .values(status=active_task.status)
+            )
+            if not queue_only.rowcount:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task generation changed while queued messages were "
+                    "being cleared",
+                )
+            await db.commit()
+            return {
+                "ok": True,
+                "stopped": False,
+                "cleared_messages": cleared,
+            }
+        await db.rollback()
+        raise HTTPException(400, "No running session found for this task")
+
+    observed_status = active_task.status
+    observed_retry_count = active_task.retry_count
+    observed_instance_id = active_task.instance_id
+    observed_started_at = active_task.started_at
+    observed_session_id = active_task.session_id
+    observed_completed_at = active_task.completed_at
+    observed_background_generation = (
+        active_task.pty_background_generation
+    )
+    owner_rows = await db.execute(
+        select(
+            Instance.id,
+            Instance.pid,
+            Instance.started_at,
+        )
+        .where(Instance.current_task_id == task_id)
+        .with_for_update()
+    )
+    expected_generations = list(owner_rows.all())
+
+    if expected_generations:
+        # InstanceManager owns PTY terminal arbitration. Stop first while the
+        # Task is still active; it then writes Task+Instance+marker atomically.
+        # Publishing a terminal Task before this call lets on_exit discard its
+        # exact Session and is the race this ordering prevents.
+        await db.commit()
+        stopped = await _stop_task_process(
+            task_id,
+            db,
+            expected_generations=expected_generations,
+            task_status="completed",
+        )
+        remaining_generations = (
+            await _remaining_task_process_generations(
+                task_id,
+                db,
+                expected_generations=expected_generations,
+            )
+        )
+        if remaining_generations:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task process cleanup could not be confirmed for instance(s): "
+                + ", ".join(map(str, remaining_generations)),
+            )
+        await db.rollback()
+        db.expire_all()
+        current = (
+            await db.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        expected_status = (
+            "completed"
+            if observed_status in {"executing", "in_progress"}
+            else observed_status
+        )
+        if (
+            current is None
+            or current.worker_id is not None
+            or current.shared_from_id is not None
+            or current.retry_count != observed_retry_count
+            or current.instance_id != observed_instance_id
+            or current.started_at != observed_started_at
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task generation changed while its session was stopping",
+            )
+        replacement_owner = await db.scalar(
+            select(Instance.id)
+            .where(Instance.current_task_id == task_id)
+            .with_for_update()
+        )
+        if replacement_owner is not None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task acquired a newer process owner while its previous "
+                "session was stopping",
+            )
+        if not stopped or current.status != expected_status:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task owner did not atomically publish its stopped state",
+            )
+
+        background_cleared_by_api = False
+        if (
+            current.pty_background_generation is not None
+            and (
+                observed_background_generation is None
+                or current.pty_background_generation
+                != observed_background_generation
+            )
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task entered a newer PTY background generation while its "
+                "previous session was stopping",
+            )
+        if current.pty_background_generation is not None:
+            current.pty_background_generation = None
+            background_cleared_by_api = True
+        publication_retry_count = current.retry_count
+        publication_instance_id = current.instance_id
+        publication_started_at = current.started_at
+        publication_completed_at = (
+            await _read_persisted_task_completed_at(task_id, db)
+        )
+        await db.commit()
+
+        if background_cleared_by_api:
+            publication_task = await _lock_task_generation(
+                task_id,
+                db,
+                expected_status=expected_status,
+                expected_retry_count=publication_retry_count,
+                expected_instance_id=publication_instance_id,
+                expected_started_at=publication_started_at,
+                expected_completed_at=publication_completed_at,
+                expected_pty_background_generation=None,
+            )
+            if (
+                publication_task is None
+                or publication_task.pty_background_generation is not None
+            ):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task started a newer generation while its stopped status "
+                    "was being published",
+                )
+            from backend.services.task_events import broadcast_status_change
+
+            await broadcast_status_change(
+                task_id,
+                expected_status,
+                background_active=False,
+            )
+            await db.commit()
+        return {
+            "ok": True,
+            "stopped": True,
+            "cleared_messages": cleared,
+        }
+
+    if observed_background_generation is not None:
+        # A truly late autonomous turn has no Instance owner. Stop the exact
+        # Task/session state; never address a historical reusable slot.
+        if observed_status != "completed" or not observed_session_id:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task has PTY background output without a safe detached owner",
+            )
         guarded = await db.execute(
             sa_update(Task)
             .where(*_task_generation_fence(task_id, active_task))
             .values(status=active_task.status)
         )
-        guarded_terminal_generation = bool(guarded.rowcount)
-        if guarded_terminal_generation:
-            guarded_expected_status = active_task.status
-            committed_retry_count = active_task.retry_count
-            committed_instance_id = active_task.instance_id
-            committed_started_at = active_task.started_at
-            committed_completed_at = active_task.completed_at
-
-    if completed_count or guarded_terminal_generation:
-        owner_rows = await db.execute(
-            select(
-                Instance.id,
-                Instance.pid,
-                Instance.started_at,
-            )
-            .where(Instance.current_task_id == task_id)
-            .with_for_update()
-        )
-        expected_generations = list(owner_rows.all())
-    await db.commit()
-
-    await _settle_task_launch_barrier(task_id, committed_instance_id)
-    stopped = await _stop_task_process(
-        task_id,
-        db,
-        expected_generations=expected_generations,
-    )
-    remaining_generations = await _remaining_task_process_generations(
-        task_id,
-        db,
-        expected_generations=expected_generations,
-    )
-    generation_still_guarded = False
-    if completed_count or guarded_terminal_generation:
-        locked_task = await _lock_task_generation(
-            task_id,
-            db,
-            expected_status=guarded_expected_status,
-            expected_retry_count=committed_retry_count,
-            expected_instance_id=committed_instance_id,
-            expected_started_at=committed_started_at,
-            expected_completed_at=committed_completed_at,
-        )
-        generation_still_guarded = locked_task is not None
-        if not generation_still_guarded:
+        if not guarded.rowcount:
+            await db.rollback()
             raise HTTPException(
                 409,
-                "Task started a newer generation while its old session was stopping",
+                "Task generation changed while detached output was stopping",
             )
-    if remaining_generations:
+        await db.commit()
+        detached_stopped = (
+            await instance_manager.stop_detached_pty_background_generation(
+                task_id,
+                observed_session_id,
+                observed_background_generation,
+                expected_status=observed_status,
+                expected_retry_count=observed_retry_count,
+                expected_instance_id=observed_instance_id,
+                expected_started_at=observed_started_at,
+                expected_completed_at=observed_completed_at,
+            )
+        )
+        if not detached_stopped:
+            raise HTTPException(
+                409,
+                "Detached Claude PTY background session could not be "
+                "proven stopped",
+            )
+        publication_task = await _lock_task_generation(
+            task_id,
+            db,
+            expected_status=observed_status,
+            expected_retry_count=observed_retry_count,
+            expected_instance_id=observed_instance_id,
+            expected_started_at=observed_started_at,
+            expected_completed_at=observed_completed_at,
+            expected_pty_background_generation=None,
+        )
+        if (
+            publication_task is None
+            or publication_task.pty_background_generation is not None
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task started a newer background generation while its "
+                "detached session stop was being published",
+            )
+        from backend.services.task_events import broadcast_status_change
+
+        await broadcast_status_change(
+            task_id,
+            observed_status,
+            background_active=False,
+        )
+        await db.commit()
+        return {
+            "ok": True,
+            "stopped": True,
+            "cleared_messages": cleared,
+        }
+
+    transitioned = observed_status in {"executing", "in_progress"}
+    if transitioned:
+        completed_at = datetime.utcnow()
+        completed = await db.execute(
+            sa_update(Task)
+            .where(
+                *_task_generation_fence(task_id, active_task),
+                Task.pty_background_generation.is_(None),
+            )
+            .values(status="completed", completed_at=completed_at)
+        )
+        if not completed.rowcount:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task generation changed while stopping its session",
+            )
+        publication_completed_at = (
+            await _read_persisted_task_completed_at(task_id, db)
+        )
+        await db.commit()
+        publication_task = await _lock_task_generation(
+            task_id,
+            db,
+            expected_status="completed",
+            expected_retry_count=observed_retry_count,
+            expected_instance_id=observed_instance_id,
+            expected_started_at=observed_started_at,
+            expected_completed_at=publication_completed_at,
+            expected_pty_background_generation=None,
+        )
+        if (
+            publication_task is None
+            or publication_task.pty_background_generation is not None
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task started a newer generation while its stopped status "
+                "was being published",
+            )
+        from backend.services.task_events import broadcast_status_change
+
+        await broadcast_status_change(
+            task_id,
+            "completed",
+            background_active=False,
+        )
+        await db.commit()
+        return {
+            "ok": True,
+            "stopped": False,
+            "cleared_messages": cleared,
+            "note": "No running process found, task marked as completed",
+        }
+
+    guarded = await db.execute(
+        sa_update(Task)
+        .where(*_task_generation_fence(task_id, active_task))
+        .values(status=active_task.status)
+    )
+    if not guarded.rowcount:
         await db.rollback()
         raise HTTPException(
             409,
-            "Task was marked completed, but process cleanup could not be "
-            "confirmed for instance(s): "
-            + ", ".join(map(str, remaining_generations)),
+            "Task generation changed while stopping its session",
         )
-
-    if completed_count and generation_still_guarded:
-        from backend.services.task_events import broadcast_status_change
-
-        try:
-            await broadcast_status_change(task_id, "completed")
-        except BaseException:
-            await db.rollback()
-            raise
-    if completed_count or guarded_terminal_generation:
-        await db.commit()
-    if not stopped:
-        if completed_count and generation_still_guarded:
-            return {
-                "ok": True,
-                "stopped": False,
-                "cleared_messages": cleared,
-                "note": "No running process found, task marked as completed",
-            }
-        if cleared:
-            return {"ok": True, "stopped": False, "cleared_messages": cleared}
-        raise HTTPException(400, "No running session found for this task")
-    return {"ok": True, "stopped": True, "cleared_messages": cleared}
+    await db.commit()
+    if cleared:
+        return {
+            "ok": True,
+            "stopped": False,
+            "cleared_messages": cleared,
+        }
+    raise HTTPException(400, "No running session found for this task")
 
 
 @router.post("/{task_id}/stop-session")
@@ -2510,11 +2787,10 @@ async def stop_task_session(
 ):
     """Stop the running Claude Code session for a task.
 
-    Clear queued messages and atomically make the active Task terminal before
-    looking for its Instance process.  The status CAS is the launch
-    invalidation barrier: a fresh/queued launch that has not committed its
-    owner yet must observe the terminal Task and abort, rather than appearing
-    immediately after a no-owner SELECT.
+    Abort queued work, settle any launch reservation, and snapshot the exact
+    reverse Instance owner. A proven owner is stopped before its terminal Task
+    state is published; an ownerless generation is terminalized only after the
+    launch barrier proves that no spawned-but-uncommitted process can appear.
     """
 
     task = await db.get(Task, task_id)
@@ -2537,8 +2813,6 @@ async def _cancel_local_task_impl(
 
     from backend.main import dispatcher
 
-    # End the authentication/routing snapshot before waiting. A queue consumer
-    # may need to commit its final launch state before it can terminate.
     await db.rollback()
     try:
         await dispatcher.abort_task_queue(task_id)
@@ -2553,10 +2827,25 @@ async def _cancel_local_task_impl(
             ) from exc
         raise
 
-    # Re-enter with a current locking read after the suspension point. This is
-    # both the MySQL RR reset and the first row in the global Task -> Instance
-    # -> auxiliary lock order.
+    # Close the spawn-without-owner window before choosing the running-owner
+    # path or the ownerless terminal CAS path.
     await db.rollback()
+    db.expire_all()
+    probe = await db.get(Task, task_id)
+    if (
+        probe is None
+        or probe.worker_id is not None
+        or probe.shared_from_id is not None
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task execution location changed while cancellation was starting",
+        )
+    probe_instance_id = probe.instance_id
+    await db.rollback()
+    await _settle_task_launch_barrier(task_id, probe_instance_id)
+
     db.expire_all()
     active_task = (
         await db.execute(
@@ -2582,26 +2871,13 @@ async def _cancel_local_task_impl(
         await db.rollback()
         raise HTTPException(400, "Cannot cancel task")
 
-    transitioned = active_task.status in active_statuses
-    cancelled_values = (
-        {"status": "cancelled", "completed_at": datetime.utcnow()}
-        if transitioned
-        else {"status": "cancelled"}
+    observed_status = active_task.status
+    observed_retry_count = active_task.retry_count
+    observed_instance_id = active_task.instance_id
+    observed_started_at = active_task.started_at
+    observed_background_generation = (
+        active_task.pty_background_generation
     )
-    cancelled = await db.execute(
-        sa_update(Task)
-        .where(*_task_generation_fence(task_id, active_task))
-        .values(**cancelled_values)
-    )
-    if not cancelled.rowcount:
-        await db.rollback()
-        raise HTTPException(
-            409,
-            "Task generation changed while cancellation was starting",
-        )
-
-    from backend.models.monitor_session import MonitorSession
-
     owner_rows = await db.execute(
         select(
             Instance.id,
@@ -2612,6 +2888,126 @@ async def _cancel_local_task_impl(
         .with_for_update()
     )
     expected_generations = list(owner_rows.all())
+
+    transitioned_by_api = False
+    background_cleared_by_api = False
+    if expected_generations:
+        # Stop while the Task is still active. InstanceManager claims PTY
+        # terminal ownership and commits Task+Instance+marker atomically.
+        await db.commit()
+        stopped = await _stop_task_process(
+            task_id,
+            db,
+            expected_generations=expected_generations,
+            task_status="cancelled",
+        )
+        remaining_generations = (
+            await _remaining_task_process_generations(
+                task_id,
+                db,
+                expected_generations=expected_generations,
+            )
+        )
+        if remaining_generations:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task process cleanup could not be confirmed for instance(s): "
+                + ", ".join(map(str, remaining_generations)),
+            )
+        await db.rollback()
+        db.expire_all()
+        active_task = (
+            await db.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            active_task is None
+            or active_task.worker_id is not None
+            or active_task.shared_from_id is not None
+            or active_task.retry_count != observed_retry_count
+            or active_task.instance_id != observed_instance_id
+            or active_task.started_at != observed_started_at
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task generation changed while cancellation was stopping it",
+            )
+        replacement_owner = await db.scalar(
+            select(Instance.id)
+            .where(Instance.current_task_id == task_id)
+            .with_for_update()
+        )
+        if replacement_owner is not None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task acquired a newer process owner while cancellation was "
+                "stopping its previous generation",
+            )
+        if not stopped or active_task.status != "cancelled":
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task owner did not atomically publish its cancelled state",
+            )
+        if (
+            active_task.pty_background_generation is not None
+            and (
+                observed_background_generation is None
+                or active_task.pty_background_generation
+                != observed_background_generation
+            )
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task entered a newer PTY background generation while "
+                "cancellation was stopping its previous generation",
+            )
+        if active_task.pty_background_generation is not None:
+            active_task.pty_background_generation = None
+            background_cleared_by_api = True
+    else:
+        if active_task.pty_background_generation is not None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task still has active detached PTY output; use stop-session",
+            )
+        transitioned_by_api = active_task.status in active_statuses
+        cancelled_values = (
+            {
+                "status": "cancelled",
+                "completed_at": datetime.utcnow(),
+            }
+            if transitioned_by_api
+            else {"status": "cancelled"}
+        )
+        cancelled = await db.execute(
+            sa_update(Task)
+            .where(
+                *_task_generation_fence(task_id, active_task),
+                Task.pty_background_generation.is_(None),
+            )
+            .values(**cancelled_values)
+        )
+        if not cancelled.rowcount:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task generation changed while cancellation was starting",
+            )
+        active_task = await db.get(
+            Task, task_id, populate_existing=True
+        )
+
+    from backend.models.monitor_session import MonitorSession
+
     monitor_rows = await db.execute(
         select(
             MonitorSession.id,
@@ -2638,17 +3034,8 @@ async def _cancel_local_task_impl(
     committed_started_at = active_task.started_at
     committed_completed_at = (
         await _read_persisted_task_completed_at(task_id, db)
-        if transitioned
-        else active_task.completed_at
     )
     await db.commit()
-
-    await _settle_task_launch_barrier(task_id, committed_instance_id)
-    await _stop_task_process(
-        task_id,
-        db,
-        expected_generations=expected_generations,
-    )
 
     for session_id, agent_type, source in auxiliary_sessions:
         # Native agents are part of the main process tree. CCM-owned auxiliary
@@ -2669,11 +3056,6 @@ async def _cancel_local_task_impl(
                 f"be confirmed for session {session_id}",
             ) from exc
 
-    remaining_generations = await _remaining_task_process_generations(
-        task_id,
-        db,
-        expected_generations=expected_generations,
-    )
     current_task = await _lock_task_generation(
         task_id,
         db,
@@ -2682,29 +3064,22 @@ async def _cancel_local_task_impl(
         expected_instance_id=committed_instance_id,
         expected_started_at=committed_started_at,
         expected_completed_at=committed_completed_at,
+        expected_pty_background_generation=None,
     )
     if current_task is None:
         raise HTTPException(
             409,
             "Task started a newer generation while cancellation was finishing",
         )
-    if remaining_generations:
-        await db.rollback()
-        raise HTTPException(
-            409,
-            "Task was cancelled, but process cleanup could not be confirmed "
-            "for instance(s): "
-            + ", ".join(map(str, remaining_generations)),
-        )
 
-    if transitioned:
+    if transitioned_by_api or background_cleared_by_api:
         from backend.services.task_events import broadcast_status_change
 
-        try:
-            await broadcast_status_change(task_id, "cancelled")
-        except BaseException:
-            await db.rollback()
-            raise
+        await broadcast_status_change(
+            task_id,
+            "cancelled",
+            background_active=False,
+        )
     await db.commit()
     return current_task
 
@@ -2767,6 +3142,11 @@ async def retry_task(
                 409,
                 f"Task status {current.status} is not retryable",
             )
+        if current.pty_background_generation is not None:
+            raise HTTPException(
+                409,
+                "Task still has active Claude PTY background output",
+            )
 
         if current.worker_id is not None:
             await _ensure_worker_routing_ready(
@@ -2802,6 +3182,9 @@ async def retry_task(
             expected_instance_id=retried.instance_id,
             expected_started_at=retried.started_at,
             expected_completed_at=retried.completed_at,
+            expected_pty_background_generation=(
+                retried.pty_background_generation
+            ),
         )
         if locked_task is None:
             raise HTTPException(

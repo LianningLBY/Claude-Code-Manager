@@ -611,6 +611,20 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
 
     lifecycle_order: list[str] = []
 
+    async def publish_after_cleanup(
+        task_id,
+        status,
+        *,
+        background_active,
+    ):
+        assert task_id == old_task_id
+        assert status == "completed"
+        assert background_active is False
+        assert lifecycle_order == ["stopped"]
+        lifecycle_order.append("published")
+
+    publish = AsyncMock(side_effect=publish_after_cleanup)
+
     async def stop_exact(stopped_instance_id, **kwargs):
         assert stopped_instance_id == instance_id
         assert kwargs == {
@@ -622,22 +636,26 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
             "consumer_cancel_timeout": 10.0,
         }
         async with session_factory() as db:
+            stopped_task = await db.get(Task, old_task_id)
             owner = await db.get(Instance, instance_id)
             assert owner.current_task_id == old_task_id
             assert owner.pid == 51001
             assert owner.started_at == old_started_at
+            stopped_task.status = "completed"
+            stopped_task.completed_at = datetime.utcnow()
+            stopped_task.pty_background_generation = None
             owner.status = "idle"
             owner.current_task_id = None
             owner.pid = None
             await db.commit()
         lifecycle_order.append("stopped")
+        # Model InstanceManager.stop's post-reap terminal publication.
+        await publish(
+            old_task_id,
+            "completed",
+            background_active=False,
+        )
         return True
-
-    async def publish_after_cleanup(task_id, status):
-        assert task_id == old_task_id
-        assert status == "completed"
-        assert lifecycle_order == ["stopped"]
-        lifecycle_order.append("published")
 
     with (
         patch.object(
@@ -660,8 +678,7 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
         ) as stop,
         patch(
             "backend.services.task_events.broadcast_status_change",
-            new_callable=AsyncMock,
-            side_effect=publish_after_cleanup,
+            new=publish,
         ),
     ):
         synchronized = await _post_webhook(
@@ -677,8 +694,14 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
     assert synchronized.status_code == 200, synchronized.text
     assert synchronized.json()["status"] == "accepted"
     abort_queue.assert_awaited_once_with(old_task_id)
-    launch_barrier.assert_awaited_once_with(instance_id, old_task_id)
+    assert launch_barrier.await_count == 2
+    launch_barrier.assert_awaited_with(instance_id, old_task_id)
     stop.assert_awaited_once()
+    publish.assert_awaited_once_with(
+        old_task_id,
+        "completed",
+        background_active=False,
+    )
     assert lifecycle_order == ["stopped", "published"]
 
     async with session_factory() as db:
@@ -898,8 +921,12 @@ async def test_webhook_synchronize_refuses_new_review_when_cleanup_unconfirmed(
         ).scalars().all()
         assert len(reviews) == 1
         assert old_review.status == "reviewing"
-        assert old_task.status == "completed"
-        assert old_task.error_message == "Superseded by new push"
+        assert old_task.status == "executing"
+        assert old_task.error_message is None
+        assert (
+            (old_task.metadata_ or {}).get("pr_review_superseded")
+            is True
+        )
         assert instance.current_task_id == old_task_id
         assert instance.pid == 53001
 
@@ -1095,6 +1122,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
     operation_lock = get_task_operation_lock(old_task_id)
     migration_lock = asyncio.Lock()
     calls: list[tuple[str, str]] = []
+    remote_background_generation = "worker-opaque-tail-1"
 
     async def authoritative_worker_call(
         routing_task,
@@ -1115,6 +1143,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
                 "id": old_task_id,
                 "status": remote_initial_status,
                 "retry_count": 0,
+                "pty_background_generation": remote_background_generation,
             }
         assert method == "POST"
         assert path == f"/api/tasks/{old_task_id}/terminate-generation"
@@ -1124,6 +1153,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
             "expected_instance_id": None,
             "expected_started_at": None,
             "expected_completed_at": None,
+            "expected_pty_background_generation": remote_background_generation,
         }
         return {
             "id": old_task_id,
@@ -1163,7 +1193,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
     assert synchronized.status_code == 200, synchronized.text
     assert synchronized.json()["status"] == "accepted"
     assert calls == [
-        ("GET", f"/api/tasks/{old_task_id}"),
+        ("GET", f"/api/tasks/{old_task_id}/terminate-generation"),
         ("POST", f"/api/tasks/{old_task_id}/terminate-generation"),
     ]
     assert not operation_lock.locked()
@@ -1234,6 +1264,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
                     else "completed"
                 ),
                 "retry_count": 0,
+                "pty_background_generation": None,
                 "metadata_": (
                     {"pr_review_superseded": True}
                     if post_attempts
@@ -1248,6 +1279,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
             "expected_instance_id": None,
             "expected_started_at": None,
             "expected_completed_at": None,
+            "expected_pty_background_generation": None,
         }
         post_attempts += 1
         if post_attempts == 1:

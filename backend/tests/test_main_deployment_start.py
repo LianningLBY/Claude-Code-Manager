@@ -99,6 +99,7 @@ async def test_incomplete_controlled_handoff_only_starts_recovery_app(
             }
         )
     )
+    lease.chmod(0o600)
     decision = assess_deployment_start(
         tmp_path, port=8000, running_commit=commit
     )

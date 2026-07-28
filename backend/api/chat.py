@@ -112,6 +112,40 @@ def _native_ids(raw_json: str | None) -> tuple[str | None, str | None]:
     )
 
 
+def _is_legacy_codex_collab_completed(
+    event_type: str | None,
+    content: str | None,
+    raw_json: str | None,
+) -> bool:
+    """Identify only the historical false-completed Codex item rows.
+
+    Older app-server parsing promoted a collab tool's item-local
+    ``status=completed`` to a chat ``system_event``.  Bare system messages
+    with the same text must remain visible, so every native discriminator is
+    checked against the persisted raw event before filtering.
+    """
+
+    if (
+        event_type != "system_event"
+        or content != "completed"
+        or not raw_json
+    ):
+        return False
+    try:
+        raw = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(raw, dict) or raw.get("type") != "item.completed":
+        return False
+    item = raw.get("item")
+    return bool(
+        isinstance(item, dict)
+        and item.get("type")
+        in {"collabAgentToolCall", "collab_agent_tool_call"}
+        and item.get("status") == "completed"
+    )
+
+
 def _turn_item_ids(item: object) -> set[str]:
     """Collect native item ids from the lossy thread/read response."""
 
@@ -1138,23 +1172,46 @@ async def get_chat_history(
             LogEntry.content.in_(noisy_system),
         )),
     ]
-    if before_id > 0:
-        conditions.append(LogEntry.id < before_id)
-
     if limit > 0:
         # Over-fetch to compensate for Python-level filtering (message+user
-        # rows are skipped below). Without this, a page of exactly `limit`
-        # rows can shrink below `limit` after filtering, and the client
-        # interprets that as "no more history" — hiding the Load More button.
-        stmt = (
-            select(*cols)
-            .where(*conditions)
-            .order_by(LogEntry.id.desc())
-            .limit(limit + 20)
-        )
-        result = await db.execute(stmt)
-        rows = list(reversed(result.all()))
+        # rows are skipped below). Historical collab noise can occur in long
+        # consecutive runs, so keep paging until it cannot consume the whole
+        # visible page.
+        visible_target = limit + 20
+        batch_size = max(visible_target, 500)
+        rows_desc = []
+        cursor = before_id if before_id > 0 else None
+        while len(rows_desc) < visible_target:
+            page_conditions = list(conditions)
+            if cursor is not None:
+                page_conditions.append(LogEntry.id < cursor)
+            stmt = (
+                select(*cols)
+                .where(*page_conditions)
+                .order_by(LogEntry.id.desc())
+                .limit(batch_size)
+            )
+            result = await db.execute(stmt)
+            batch = result.all()
+            if not batch:
+                break
+            for row in batch:
+                if _is_legacy_codex_collab_completed(
+                    row.event_type,
+                    row.content,
+                    row.raw_json,
+                ):
+                    continue
+                rows_desc.append(row)
+                if len(rows_desc) >= visible_target:
+                    break
+            if len(batch) < batch_size:
+                break
+            cursor = batch[-1].id
+        rows = list(reversed(rows_desc))
     else:
+        if before_id > 0:
+            conditions.append(LogEntry.id < before_id)
         stmt = (
             select(*cols)
             .where(*conditions)
@@ -1168,6 +1225,12 @@ async def get_chat_history(
     messages = []
     current_source = None  # track monitor context
     for row in rows:
+        if _is_legacy_codex_collab_completed(
+            row.event_type,
+            row.content,
+            row.raw_json,
+        ):
+            continue
         tool_input = row.tool_input
         tool_output = row.tool_output
 
@@ -1187,6 +1250,8 @@ async def get_chat_history(
         raw_content = None
         item_id = None
         turn_id = None
+        native_item_type = None
+        native_item_status = None
         if row.raw_json:
             try:
                 raw = json.loads(row.raw_json)
@@ -1205,6 +1270,17 @@ async def get_chat_history(
                     )
                     item_id = str(native_item) if native_item else None
                     turn_id = str(native_turn) if native_turn else None
+                    if isinstance(item, dict):
+                        item_type = item.get("type")
+                        item_status = item.get("status")
+                        native_item_type = (
+                            str(item_type) if item_type not in (None, "") else None
+                        )
+                        native_item_status = (
+                            str(item_status)
+                            if item_status not in (None, "")
+                            else None
+                        )
                     if raw.get("attachments"):
                         attachments = raw["attachments"]
                         image_urls = [a["url"] for a in attachments if a.get("is_image")]
@@ -1247,6 +1323,8 @@ async def get_chat_history(
             "raw_content": raw_content,
             "item_id": item_id,
             "turn_id": turn_id,
+            "native_item_type": native_item_type,
+            "native_item_status": native_item_status,
         })
 
     # Trim back to requested limit (we over-fetched to compensate for

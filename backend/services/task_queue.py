@@ -101,6 +101,7 @@ TaskGenerationFence = tuple[
     int | None,
     datetime | None,
     datetime | None,
+    str | None,
 ]
 
 TaskDeleteFence = tuple[
@@ -110,6 +111,7 @@ TaskDeleteFence = tuple[
     int | None,
     datetime | None,
     datetime | None,
+    str | None,
 ]
 
 
@@ -121,6 +123,7 @@ def task_generation_fence(task: Task) -> TaskGenerationFence:
         task.instance_id,
         task.started_at,
         task.completed_at,
+        task.pty_background_generation,
     )
 
 
@@ -134,6 +137,7 @@ def task_delete_fence(task: Task) -> TaskDeleteFence:
         task.instance_id,
         task.started_at,
         task.completed_at,
+        task.pty_background_generation,
     )
 
 
@@ -148,6 +152,7 @@ def append_task_generation_predicates(
         expected_instance_id,
         expected_started_at,
         expected_completed_at,
+        expected_background_generation,
     ) = generation_fence
     predicates.extend(
         [
@@ -166,6 +171,12 @@ def append_task_generation_predicates(
                 Task.completed_at.is_(None)
                 if expected_completed_at is None
                 else Task.completed_at == expected_completed_at
+            ),
+            (
+                Task.pty_background_generation.is_(None)
+                if expected_background_generation is None
+                else Task.pty_background_generation
+                == expected_background_generation
             ),
         ]
     )
@@ -371,6 +382,7 @@ class TaskQueue:
             observed_instance_id,
             observed_started_at,
             observed_completed_at,
+            observed_background_generation,
         ) = expected_fence or task_delete_fence(task)
         if (
             not remote_worker_deleted
@@ -383,6 +395,10 @@ class TaskQueue:
                 "completed",
             )
         ):
+            return False
+        if not remote_worker_deleted and task.pty_background_generation:
+            # The foreground status is terminal, but the persistent Claude
+            # session still owns detached output for this Task.
             return False
         # A Worker task is authoritative on the remote CCM.  Directly deleting
         # its Manager mirror would lose the only management handle while the
@@ -414,6 +430,12 @@ class TaskQueue:
                 Task.completed_at.is_(None)
                 if observed_completed_at is None
                 else Task.completed_at == observed_completed_at
+            ),
+            (
+                Task.pty_background_generation.is_(None)
+                if observed_background_generation is None
+                else Task.pty_background_generation
+                == observed_background_generation
             ),
         ]
         # Establish the global lifecycle DB lock order at Task first. A no-op
@@ -817,6 +839,7 @@ class TaskQueue:
         predicates = [
             Task.id == task_id,
             Task.status.in_(expected_statuses),
+            Task.pty_background_generation.is_(None),
             task_retry_not_superseded_predicate(),
         ]
         if instance_id is not None:
@@ -832,6 +855,7 @@ class TaskQueue:
                 error_message=None,
                 started_at=None,
                 completed_at=None,
+                pty_background_generation=None,
             )
         )
         if not result.rowcount:

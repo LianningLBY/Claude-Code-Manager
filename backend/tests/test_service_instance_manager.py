@@ -496,6 +496,156 @@ def test_parse_codex_command_completed():
     assert event["is_error"] is False
 
 
+def test_parse_codex_collab_wait_started_as_tool_use():
+    im = InstanceManager(MagicMock(), MagicMock())
+    event = im._parse_codex_line(json.dumps({
+        "type": "item.started",
+        "item": {
+            "type": "collab_agent_tool_call",
+            "id": "collab-1",
+            "tool": "wait",
+            "status": "inProgress",
+            "sender_thread_id": "thread-parent",
+            "receiver_thread_ids": ["thread-child"],
+            "agents_states": {},
+        },
+    }))
+
+    assert event["event_type"] == "tool_use"
+    assert event["role"] == "assistant"
+    assert event["tool_name"] == "Agent.wait"
+    assert json.loads(event["tool_input"]) == {
+        "sender_thread_id": "thread-parent",
+        "receiver_thread_ids": ["thread-child"],
+    }
+    assert event["content"] is None
+
+
+def test_parse_codex_collab_wait_completed_as_tool_result():
+    """An agent wait finishing is not a parent turn-completed event."""
+    im = InstanceManager(MagicMock(), MagicMock())
+    event = im._parse_codex_line(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "type": "collabAgentToolCall",
+            "id": "collab-1",
+            "tool": "wait",
+            "status": "completed",
+            "senderThreadId": "thread-parent",
+            "receiverThreadIds": ["thread-child"],
+            "model": None,
+            "reasoningEffort": None,
+            "agentsStates": {},
+        },
+    }))
+
+    assert event["event_type"] == "tool_result"
+    assert event["role"] == "tool"
+    assert event["tool_name"] == "Agent.wait"
+    assert json.loads(event["tool_input"]) == {
+        "sender_thread_id": "thread-parent",
+        "receiver_thread_ids": ["thread-child"],
+    }
+    assert json.loads(event["tool_output"]) == {"status": "completed"}
+    assert event["content"] is None
+    assert event["is_error"] is False
+
+
+def test_parse_codex_collab_agent_failure_is_tool_error():
+    im = InstanceManager(MagicMock(), MagicMock())
+    event = im._parse_codex_line(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "type": "collab_agent_tool_call",
+            "id": "collab-2",
+            "tool": "spawnAgent",
+            "status": "failed",
+            "agents_states": {
+                "thread-child": {
+                    "status": "errored",
+                    "message": "launch failed",
+                },
+            },
+        },
+    }))
+
+    assert event["event_type"] == "tool_result"
+    assert event["tool_name"] == "Agent.spawn_agent"
+    assert event["is_error"] is True
+    assert json.loads(event["tool_output"]) == {
+        "status": "failed",
+        "agents_states": {
+            "thread-child": {
+                "status": "errored",
+                "message": "launch failed",
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "item_type",
+    [
+        "sub_agent_activity",
+        "subAgentActivity",
+        "context_compaction",
+        "contextCompaction",
+    ],
+)
+def test_parse_codex_metadata_item_completion_is_ignored(item_type):
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    event = im._parse_codex_line(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "type": item_type,
+            "id": "metadata-1",
+        },
+    }))
+
+    assert event is None
+
+
+@pytest.mark.parametrize(
+    ("item_type", "extra"),
+    [
+        (
+            "dynamicToolCall",
+            {
+                "tool": "lookup",
+                "arguments": {"query": "status"},
+                "success": True,
+            },
+        ),
+        (
+            "imageGeneration",
+            {
+                "result": "generated",
+                "savedPath": "/tmp/generated.png",
+            },
+        ),
+    ],
+)
+def test_parse_codex_unsupported_item_completion_never_uses_status(
+    item_type,
+    extra,
+):
+    """An item completing is not evidence that the parent turn completed."""
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    event = im._parse_codex_line(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "type": item_type,
+            "id": "unsupported-1",
+            "status": "completed",
+            **extra,
+        },
+    }))
+
+    assert event is None
+
+
 def test_parse_codex_turn_completed_usage():
     im = InstanceManager(MagicMock(), MagicMock())
     event = im._parse_codex_line(json.dumps({
@@ -4616,14 +4766,12 @@ async def test_instance_stop_releases_active_claim_back_to_pending(db_factory):
         return 130
 
     process.wait = wait_process
-    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    im = InstanceManager(db_factory, broadcaster)
     im.processes[instance_id] = process
 
-    with patch(
-        "backend.services.task_events.broadcast_status_change",
-        new_callable=AsyncMock,
-    ) as broadcast:
-        assert await im.stop(instance_id, expected_task_id=task_id) is True
+    assert await im.stop(instance_id, expected_task_id=task_id) is True
 
     async with db_factory() as db:
         task = await db.get(Task, task_id)
@@ -4634,7 +4782,16 @@ async def test_instance_stop_releases_active_claim_back_to_pending(db_factory):
         assert task.completed_at is None
         assert instance.status == "idle"
         assert instance.current_task_id is None
-    broadcast.assert_awaited_once_with(task_id, "pending", instance_id)
+    broadcaster.broadcast.assert_any_await(
+        "tasks",
+        {
+            "event": "status_change",
+            "task_id": task_id,
+            "new_status": "pending",
+            "instance_id": instance_id,
+            "background_active": False,
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -4749,22 +4906,17 @@ async def test_instance_stop_suppresses_old_events_after_replacement_claim(
         replacement_after_terminal_commit_factory,
         broadcaster,
     )
-    with patch(
-        "backend.services.task_events.broadcast_status_change",
-        new_callable=AsyncMock,
-    ) as status_broadcast:
-        assert await im._stop_locked(
-            instance_id,
-            expected_task_id=task_id,
-            task_status="pending",
-            allow_settled_cleanup=True,
-        )
+    assert await im._stop_locked(
+        instance_id,
+        expected_task_id=task_id,
+        task_status="pending",
+        allow_settled_cleanup=True,
+    )
 
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         assert task.status == "executing"
         assert task.retry_count == 1
-    status_broadcast.assert_not_awaited()
     broadcaster.broadcast.assert_not_awaited()
 
 
@@ -7195,17 +7347,13 @@ async def test_consumer_recovery_db_failure_retains_evidence_until_stop_retry(
     assert instance.current_task_id == task_id
 
     manager.db_factory = db_factory
-    with patch(
-        "backend.services.task_events.broadcast_status_change",
-        new=AsyncMock(),
-    ):
-        assert await manager.stop(
-            instance_id,
-            expected_task_id=task_id,
-            expected_pid=process.pid,
-            expected_started_at=started_at,
-            task_status="cancelled",
-        )
+    assert await manager.stop(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=process.pid,
+        expected_started_at=started_at,
+        task_status="cancelled",
+    )
 
     assert recovery_key not in manager._consumer_recovery_pending
     assert recovery_key not in manager._consumer_errors
@@ -8064,6 +8212,91 @@ async def test_launch_pty_rejects_dead_startup_before_persisting_running(
         task = await db.get(Task, task_id)
         instance = await db.get(Instance, instance_id)
         assert task.session_id is None
+        assert instance.status == "idle"
+        assert instance.pid is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_launch_pty_does_not_clear_concurrent_background_epoch(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="pty-background-race", status="idle")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="pty-background-race",
+            description="late autonomous activity wins launch fence",
+            status="executing",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    class Process:
+        def __init__(self):
+            self.pid = 42_433
+            self.returncode = None
+
+        async def wait(self):
+            return self.returncode
+
+    process = Process()
+    consumer = None
+    stopped = []
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class FakeBackend:
+        async def launch_for_ccm(self, **kwargs):
+            nonlocal consumer
+            consumer = asyncio.create_task(asyncio.Event().wait())
+            im.processes[kwargs["instance_id"]] = process
+            im._tasks[kwargs["instance_id"]] = consumer
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                task.pty_background_generation = "late-background-epoch"
+                await db.commit()
+            return "session-background-race"
+
+        async def stop(self, instance_arg):
+            stopped.append(instance_arg)
+            process.returncode = -signal.SIGKILL
+
+    im._pty_backend = FakeBackend()
+    with pytest.raises(LaunchSupersededError):
+        await im._launch_pty(
+            instance_id=instance_id,
+            prompt="run",
+            task_id=task_id,
+            cwd="/tmp",
+            model=None,
+            resume_session_id=None,
+            loop_iteration=None,
+            git_env=None,
+            thinking_budget=None,
+            effort_level=None,
+            chat_initiated=True,
+            config_dir=None,
+            enable_workflows=False,
+            enabled_skills=None,
+            mcp_config_path=None,
+        )
+
+    assert stopped == [instance_id]
+    assert consumer is not None and consumer.cancelled()
+    assert instance_id not in im.processes
+    assert instance_id not in im._tasks
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert (
+            task.pty_background_generation == "late-background-epoch"
+        )
         assert instance.status == "idle"
         assert instance.pid is None
         assert instance.current_task_id is None

@@ -234,7 +234,14 @@ async def _reset_stale_discussion_agents():
 
 
 async def _cleanup_stale_sub_agents():
-    """Mark running sub-agents as completed if their parent task is already done."""
+    """Close terminal parents' stale children, except live PTY generations.
+
+    A foreground Task may already be terminal while its exact persistent-PTY
+    generation still owns native child output.  The dispatcher startup
+    recovery is authoritative for an orphaned background marker and will fail
+    both the parent and its native children; pre-emptively calling those rows
+    completed here would erase that failure evidence.
+    """
     from backend.models.sub_agent import SubAgentSession
     from backend.models.task import Task
     from datetime import datetime
@@ -245,7 +252,14 @@ async def _cleanup_stale_sub_agents():
         stale = []
         for sa in result.scalars().all():
             task = await db.get(Task, sa.task_id)
-            if task and task.status in ("completed", "failed", "cancelled"):
+            if (
+                task
+                and not (
+                    task.pty_background_generation is not None
+                    and sa.source == "native"
+                )
+                and task.status in ("completed", "failed", "cancelled")
+            ):
                 sa.status = "completed"
                 sa.completed_at = datetime.utcnow()
                 stale.append(sa)

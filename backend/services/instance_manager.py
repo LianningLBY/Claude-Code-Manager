@@ -1,14 +1,17 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
 import re
+import secrets
 import signal
+import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +42,8 @@ logger = logging.getLogger(__name__)
 _EXPECTED_GENERATION_UNSET = object()
 DEFAULT_TERMINAL_CONSUMER_TIMEOUT = 30.0
 DEFAULT_CONSUMER_CANCEL_TIMEOUT = 5.0
+PTY_BACKGROUND_POLL_SECONDS = 5.0
+PTY_BACKGROUND_MAX_SECONDS = 4 * 60 * 60
 _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -139,6 +144,32 @@ class _OutputConsumerRecord:
     # DB finalization; ``consumer`` finalizes first and stop waits outside the
     # lock.  Compare/set is deliberately synchronous on the event-loop thread.
     pty_terminal_owner: str | None = None
+    # Exact on_exit consumer is waiting for its Task/session background epoch.
+    # A matching stop may take over this quiescent wait immediately instead of
+    # burning the generic 30-second terminal-consumer timeout.
+    pty_background_waiting: bool = False
+
+
+@dataclass
+class _PtyPostExitGeneration:
+    """Exact PTY foreground generation retained across terminal handoff.
+
+    ``FullMirrorCCMBackend.on_exit`` completes its proxy before dispatcher/Ralph
+    commits the Task result.  The ordinary instance-keyed process/consumer maps
+    are intentionally released at that point, but an already-arriving idle
+    watcher callback still needs immutable proof that it belongs to that exact
+    Task/session/turn.  This record is that short-lived proof; it is never an
+    execution owner and cannot be used to address a reusable Instance slot.
+    """
+
+    token: object
+    instance_id: int
+    task_id: int
+    session_id: str
+    session: Any
+    process: Any
+    record: _OutputConsumerRecord
+    watcher: asyncio.Task | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +190,25 @@ class _ConsumerRecoveryEvidence:
     task_id: int | None
     task_retry_count: int | None
     instance_started_at: datetime | None
+
+
+@dataclass
+class _PtyBackgroundState:
+    """One exact autonomous PTY epoch keyed by Task and native session."""
+
+    task_id: int
+    session_id: str
+    generation: str
+    session: Any
+    started_monotonic: float
+    last_event_monotonic: float
+    pending_tools: int = 0
+    terminal_seen: bool = False
+    watcher: asyncio.Task | None = None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    outcome: str | None = None
+    accepting_events: bool = True
+    watchdog_stopping: bool = False
 
 
 @dataclass(frozen=True)
@@ -189,6 +239,10 @@ class InstanceManager:
         # tests) from importing the process-global Dispatcher and enqueueing
         # work against an unrelated database.
         self.task_message_enqueuer = None
+        # Dispatcher installs this optional terminal hook.  It is invoked only
+        # after a completed Task's exact detached epoch is durably cleared, so
+        # PR/share-style terminal consumers cannot observe partial output.
+        self.pty_background_completion_handler = None
         # Injected by backend.main. Runtime lookup is path-only and never reads
         # or stores the API key in launch params, git env, or process argv.
         self.cloudrouter_store = None
@@ -305,6 +359,48 @@ class InstanceManager:
         # commit `running`; without ordering, a very short turn can write idle
         # first and then be overwritten by the late running commit.
         self._pty_launch_barriers: dict[int, asyncio.Event] = {}
+        # Claude PTY background work is Task/session scoped. Known foreground
+        # native work keeps its exact Instance owner until the tail settles;
+        # genuinely late turns on an already-completed Task are detached and
+        # never touch a possibly reused Instance slot. The durable token plus
+        # this registry prevents old sentinels from completing a newer turn.
+        self._pty_background_states: dict[
+            tuple[int, str], _PtyBackgroundState
+        ] = {}
+        self._pty_background_transition_locks: dict[
+            tuple[int, str], asyncio.Lock
+        ] = {}
+        # Launch-time idle callbacks publish a synchronous handoff before
+        # awaiting the transition lock. This lets on_exit observe an already
+        # arrived autonomous event even when it currently owns that lock.
+        self._pty_autonomous_activity_handoffs: dict[
+            tuple[int, str], object
+        ] = {}
+        # Remember the immutable handoff observed by the exact coroutine that
+        # is about to wait for ``pty_background_transition``.  Looking up only
+        # by Task/session after the wait is insufficient: a successful stop
+        # can clear the old token and a later callback can install a new one
+        # under the same key (ABA), which must not revive the stopped Session.
+        self._pty_autonomous_activity_handoff_owners: dict[
+            tuple[asyncio.Task[Any], tuple[int, str]], object
+        ] = {}
+        self._pty_autonomous_activity_handoff_owner_callbacks: set[
+            asyncio.Task[Any]
+        ] = set()
+        # A successful non-chat PTY consumer releases its process proxy before
+        # dispatcher/Ralph commits the Task terminal state. Retain one immutable
+        # proof across that handoff so an autonomous callback already arriving
+        # in the gap can pre-arm only its exact Task/session/consumer epoch.
+        self._pty_post_exit_generations: dict[
+            tuple[int, str], _PtyPostExitGeneration
+        ] = {}
+        # Capture the exact proof visible when a callback synchronously notes
+        # activity. Looking it up only after awaiting the transition lock would
+        # let an old callback borrow a replacement proof under the same key.
+        self._pty_autonomous_activity_post_exit_owners: dict[
+            tuple[asyncio.Task[Any], tuple[int, str]],
+            _PtyPostExitGeneration,
+        ] = {}
         if settings.use_pty_mode:
             self.set_pty_mode(True)
 
@@ -539,6 +635,7 @@ class InstanceManager:
         owner: str,
         *,
         take_over_completed_consumer: bool = False,
+        take_over_background_waiter: bool = False,
     ) -> str:
         """Atomically claim one PTY turn's terminal bookkeeping owner.
 
@@ -559,8 +656,16 @@ class InstanceManager:
         if (
             current == "consumer"
             and owner == "stop"
-            and take_over_completed_consumer
-            and record.task.done()
+            and (
+                (
+                    take_over_completed_consumer
+                    and record.task.done()
+                )
+                or (
+                    take_over_background_waiter
+                    and record.pty_background_waiting
+                )
+            )
         ):
             object.__setattr__(record, "pty_terminal_owner", owner)
             return owner
@@ -2086,6 +2191,14 @@ class InstanceManager:
         task in ``_tasks`` that every future Codex launch re-awaits forever.
         """
 
+        # A new output generation on this reusable slot supersedes every
+        # post-exit handoff proof retained by an older process. Do this before
+        # publishing the replacement record so an old autonomous callback can
+        # never borrow the new turn's instance-keyed identity.
+        self.discard_pty_post_exit_generations(
+            instance_id=instance_id,
+            invalidate_handoffs=True,
+        )
         record = _OutputConsumerRecord(
             process,
             consumer,
@@ -2733,6 +2846,7 @@ class InstanceManager:
                             Task.id == task_id,
                             Task.instance_id == instance_id,
                             Task.status.in_(["in_progress", "executing"]),
+                            Task.pty_background_generation.is_(None),
                             task_retry_not_superseded_predicate(),
                             (
                                 Task.id == task_id
@@ -2949,12 +3063,1622 @@ class InstanceManager:
         if barrier is not None:
             await barrier.wait()
 
+    @staticmethod
+    def _is_pty_autonomous_terminal(event: dict) -> bool:
+        """Whether an idle-watcher event is Claude's exact turn sentinel."""
+
+        return (
+            event.get("event_type") == "system_event"
+            and event.get("content") == "turn_duration"
+        )
+
+    @classmethod
+    def _is_pty_autonomous_activity(cls, event: dict) -> bool:
+        """Ignore stale channel echoes and a standalone trailing sentinel."""
+
+        if cls._is_pty_autonomous_terminal(event):
+            return False
+        if event.get("role") != "user":
+            return True
+        return "<task-notification>" in str(event.get("content") or "")
+
+    def active_pty_background_task_ids(self) -> set[int]:
+        """Return live PTY background Tasks for same-process reconciliation."""
+
+        return {state.task_id for state in self._pty_background_states.values()}
+
+    def pty_background_generation_for(
+        self,
+        task_id: int,
+        session_id: str,
+    ) -> str | None:
+        state = self._pty_background_states.get((task_id, session_id))
+        return state.generation if state is not None else None
+
+    def pty_background_state_for(
+        self,
+        task_id: int,
+        session_id: str,
+        generation: str,
+    ) -> _PtyBackgroundState | None:
+        """Return the exact in-memory epoch, never a same-key replacement."""
+
+        state = self._pty_background_states.get((task_id, session_id))
+        if state is None or state.generation != generation:
+            return None
+        return state
+
+    def _pty_background_state_for_task(
+        self,
+        task_id: int,
+    ) -> _PtyBackgroundState | None:
+        """Resolve a unique retained state for exact-stop recovery only."""
+
+        matches = [
+            state
+            for state in self._pty_background_states.values()
+            if state.task_id == task_id
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _has_reapable_pty_background_state(
+        self,
+        task_id: int | None,
+    ) -> bool:
+        if task_id is None:
+            return False
+        state = self._pty_background_state_for_task(task_id)
+        return bool(
+            state is not None
+            and not state.accepting_events
+            and getattr(state.session, "is_alive", True) is False
+        )
+
+    def retain_pty_post_exit_generation(
+        self,
+        instance_id: int,
+        task_id: int,
+        session_id: str,
+        session: Any,
+        record: _OutputConsumerRecord,
+    ) -> _PtyPostExitGeneration | None:
+        """Retain one exact non-chat PTY turn across proxy→Task handoff.
+
+        Registration is deliberately synchronous and succeeds only while all
+        ordinary instance-keyed maps still identify ``record``.  The retained
+        proof is therefore immutable evidence of the generation that is about
+        to disappear from those maps, not a late lookup of a reusable slot.
+        """
+
+        process = record.process
+        if (
+            record.chat_initiated
+            or record.provider != "claude"
+            or record.task_id != task_id
+            or record.task_retry_count is None
+            or record.instance_started_at is None
+            or record.pty_terminal_owner != "consumer"
+            or record.task.done()
+            or instance_id in self._stopping
+            or getattr(session, "session_id", None) != session_id
+            or getattr(session, "is_alive", True) is False
+            or getattr(process, "session", None) is not session
+            or self._consumer_records.get(instance_id) is not record
+            or self._tasks.get(instance_id) is not record.task
+            or self.processes.get(instance_id) is not process
+        ):
+            return None
+
+        key = (task_id, session_id)
+        current = self._pty_post_exit_generations.get(key)
+        if (
+            current is not None
+            and current.instance_id == instance_id
+            and current.session is session
+            and current.process is process
+            and current.record is record
+        ):
+            return current
+        if current is not None:
+            self._discard_pty_post_exit_generation(key, current)
+
+        proof = _PtyPostExitGeneration(
+            token=object(),
+            instance_id=instance_id,
+            task_id=task_id,
+            session_id=session_id,
+            session=session,
+            process=process,
+            record=record,
+        )
+        self._pty_post_exit_generations[key] = proof
+        proof.watcher = asyncio.create_task(
+            self._watch_pty_post_exit_generation(proof)
+        )
+        return proof
+
+    def _discard_pty_post_exit_generation(
+        self,
+        key: tuple[int, str],
+        proof: _PtyPostExitGeneration,
+    ) -> bool:
+        """Discard only the exact retained proof, never a same-key replacement."""
+
+        if self._pty_post_exit_generations.get(key) is not proof:
+            return False
+        self._pty_post_exit_generations.pop(key, None)
+        watcher = proof.watcher
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if watcher is not None and watcher is not current and not watcher.done():
+            watcher.cancel()
+        return True
+
+    def discard_pty_post_exit_generations(
+        self,
+        *,
+        task_id: int | None = None,
+        session_id: str | None = None,
+        instance_id: int | None = None,
+        process: Any = None,
+        record: _OutputConsumerRecord | None = None,
+        invalidate_handoffs: bool = False,
+    ) -> int:
+        """Discard retained proofs matching an explicit immutable generation."""
+
+        removed = 0
+        for key, proof in list(self._pty_post_exit_generations.items()):
+            if task_id is not None and proof.task_id != task_id:
+                continue
+            if session_id is not None and proof.session_id != session_id:
+                continue
+            if instance_id is not None and proof.instance_id != instance_id:
+                continue
+            if process is not None and proof.process is not process:
+                continue
+            if record is not None and proof.record is not record:
+                continue
+            discarded = self._discard_pty_post_exit_generation(key, proof)
+            removed += int(discarded)
+            if discarded and invalidate_handoffs:
+                # Stop/replacement is an explicit invalidation, unlike natural
+                # Task terminal commit. Make every already-waiting callback's
+                # immutable handoff mismatch so it cannot fall through to the
+                # completed-only detached admission path.
+                self._pty_autonomous_activity_handoffs.pop(key, None)
+        return removed
+
+    def _pty_post_exit_generation_for_instance(
+        self,
+        instance_id: int,
+        task_id: int | None = None,
+    ) -> _PtyPostExitGeneration | None:
+        matches = [
+            proof
+            for proof in self._pty_post_exit_generations.values()
+            if (
+                proof.instance_id == instance_id
+                and (task_id is None or proof.task_id == task_id)
+            )
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    async def _watch_pty_post_exit_generation(
+        self,
+        proof: _PtyPostExitGeneration,
+    ) -> None:
+        """Remove a handoff proof as soon as its durable owner is no longer active."""
+
+        key = (proof.task_id, proof.session_id)
+        poll_delay = 0.05
+        try:
+            while self._pty_post_exit_generations.get(key) is proof:
+                # Let the dispatcher/Ralph waiter that was awakened by
+                # process.complete() reach its result CAS before polling.
+                await asyncio.sleep(poll_delay)
+                if proof.instance_id in self._stopping:
+                    # A successful exact stop invalidates both proof and
+                    # handoff after its Task+Instance CAS. Do not let this
+                    # observer retire only the proof in the middle of that
+                    # operation and leave a waiting callback reusable.
+                    continue
+                if self._pty_background_states.get(key) is not None:
+                    self._discard_pty_post_exit_generation(key, proof)
+                    return
+                if getattr(proof.session, "is_alive", True) is False:
+                    self._discard_pty_post_exit_generation(key, proof)
+                    return
+                try:
+                    async with self.db_factory() as db:
+                        task = await db.get(Task, proof.task_id)
+                        owner = await db.get(Instance, proof.instance_id)
+                        still_exact = bool(
+                            task is not None
+                            and owner is not None
+                            and task.status in ("in_progress", "executing")
+                            and task.worker_id is None
+                            and task.shared_from_id is None
+                            and task.instance_id == proof.instance_id
+                            and task.session_id == proof.session_id
+                            and task.retry_count
+                            == proof.record.task_retry_count
+                            and owner.current_task_id == proof.task_id
+                            and owner.pid
+                            == getattr(proof.process, "pid", None)
+                            and owner.started_at
+                            == proof.record.instance_started_at
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A transient database failure is not evidence that the
+                    # generation changed. Keep the proof fail-closed and retry.
+                    logger.exception(
+                        "Failed to verify PTY post-exit proof for task %s",
+                        proof.task_id,
+                    )
+                    poll_delay = min(1.0, poll_delay * 2)
+                    continue
+                if not still_exact:
+                    if any(
+                        owner_proof is proof
+                        for owner_proof in (
+                            self
+                            ._pty_autonomous_activity_post_exit_owners
+                            .values()
+                        )
+                    ):
+                        # A callback captured this proof before the durable
+                        # terminal CAS and is still waiting to enter the
+                        # transition lock. Keep the immutable bridge until that
+                        # exact coroutine either admits via completed-only state
+                        # or its done callback releases ownership.
+                        continue
+                    self._discard_pty_post_exit_generation(key, proof)
+                    return
+                poll_delay = min(1.0, poll_delay * 2)
+        except asyncio.CancelledError:
+            return
+
+    def note_pty_autonomous_activity(
+        self,
+        task_id: int,
+        session_id: str,
+    ) -> object:
+        key = (task_id, session_id)
+        token = self._pty_autonomous_activity_handoffs.get(key)
+        if token is None:
+            token = object()
+            self._pty_autonomous_activity_handoffs[key] = token
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
+        if owner is not None:
+            owner_key = (owner, key)
+            self._pty_autonomous_activity_handoff_owners[owner_key] = token
+            proof = self._pty_post_exit_generations.get(key)
+            if proof is not None:
+                self._pty_autonomous_activity_post_exit_owners[
+                    owner_key
+                ] = proof
+            else:
+                self._pty_autonomous_activity_post_exit_owners.pop(
+                    owner_key, None
+                )
+            if (
+                owner
+                not in self._pty_autonomous_activity_handoff_owner_callbacks
+            ):
+                self._pty_autonomous_activity_handoff_owner_callbacks.add(
+                    owner
+                )
+                owner.add_done_callback(
+                    self._forget_pty_autonomous_activity_handoff_owner
+                )
+        return token
+
+    def _forget_pty_autonomous_activity_handoff_owner(
+        self,
+        owner: asyncio.Task[Any],
+    ) -> None:
+        self._pty_autonomous_activity_handoff_owner_callbacks.discard(owner)
+        for owner_key in [
+            owner_key
+            for owner_key in self._pty_autonomous_activity_handoff_owners
+            if owner_key[0] is owner
+        ]:
+            self._pty_autonomous_activity_handoff_owners.pop(
+                owner_key, None
+            )
+            self._pty_autonomous_activity_post_exit_owners.pop(
+                owner_key, None
+            )
+
+    def _owned_pty_autonomous_activity_handoff(
+        self,
+        key: tuple[int, str],
+    ) -> object | None:
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            return None
+        if owner is None:
+            return None
+        return self._pty_autonomous_activity_handoff_owners.get(
+            (owner, key)
+        )
+
+    def _owned_pty_post_exit_generation(
+        self,
+        key: tuple[int, str],
+    ) -> _PtyPostExitGeneration | None:
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            return None
+        if owner is None:
+            return None
+        return self._pty_autonomous_activity_post_exit_owners.get(
+            (owner, key)
+        )
+
+    def has_pty_autonomous_activity_handoff(
+        self,
+        task_id: int,
+        session_id: str,
+    ) -> bool:
+        return (task_id, session_id) in (
+            self._pty_autonomous_activity_handoffs
+        )
+
+    def clear_pty_autonomous_activity_handoff(
+        self,
+        task_id: int,
+        session_id: str,
+        token: object | None,
+    ) -> None:
+        if token is None:
+            return
+        key = (task_id, session_id)
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
+        if owner is not None:
+            owner_key = (owner, key)
+            if (
+                self._pty_autonomous_activity_handoff_owners.get(owner_key)
+                is token
+            ):
+                self._pty_autonomous_activity_handoff_owners.pop(
+                    owner_key, None
+                )
+                self._pty_autonomous_activity_post_exit_owners.pop(
+                    owner_key, None
+                )
+        if self._pty_autonomous_activity_handoffs.get(key) is token:
+            self._pty_autonomous_activity_handoffs.pop(key, None)
+
+    def reset_pty_autonomous_activity_handoff(
+        self,
+        task_id: int,
+        session_id: str,
+    ) -> None:
+        key = (task_id, session_id)
+        self._pty_autonomous_activity_handoffs.pop(key, None)
+        proof = self._pty_post_exit_generations.get(key)
+        if proof is not None:
+            self._discard_pty_post_exit_generation(key, proof)
+
+    def _restore_pty_background_after_failed_stop(
+        self,
+        state: _PtyBackgroundState,
+        handoff: object | None,
+        session: Any,
+        *,
+        instance_id: int | None = None,
+        process: Any = None,
+    ) -> bool:
+        """Re-open only the exact still-live epoch after an unproven stop.
+
+        A backend exception does not prove that the native Session survived.
+        Restoration is therefore deliberately identity- and liveness-fenced:
+        a stopped Session, a replacement state/handoff, or a reaped active
+        process remains frozen so stale output cannot be admitted.
+        """
+
+        key = (state.task_id, state.session_id)
+        if (
+            self._pty_background_states.get(key) is not state
+            or state.session is not session
+            or getattr(session, "session_id", None) != state.session_id
+            or self._pty_autonomous_activity_handoffs.get(key) is not handoff
+            or getattr(session, "is_alive", True) is False
+            or (
+                instance_id is not None
+                and process is not None
+                and self._generation_reap_confirmed(instance_id, process)
+            )
+        ):
+            return False
+
+        state.outcome = None
+        state.accepting_events = True
+        state.done.clear()
+        watcher = state.watcher
+        if (
+            watcher is None
+            or watcher.done()
+            or (
+                hasattr(watcher, "cancelling")
+                and watcher.cancelling()
+            )
+        ):
+            state.watcher = asyncio.create_task(
+                self._watch_pty_background_generation(state)
+            )
+        return True
+
+    @asynccontextmanager
+    async def pty_background_transition(
+        self,
+        task_id: int,
+        session_id: str,
+    ):
+        """Serialize foreground on_exit with idle-watcher pre-arm."""
+
+        key = (task_id, session_id)
+        lock = self._pty_background_transition_locks.setdefault(
+            key, asyncio.Lock()
+        )
+        async with lock:
+            yield
+
+    async def pty_background_activity_pending(
+        self,
+        task_id: int,
+        session: Any,
+    ) -> bool:
+        """Check live native/Bash work and its durable native-agent mirror."""
+
+        ccm_tracker = getattr(
+            session, "_ccm_background_work_tracker", None
+        )
+        if (
+            getattr(
+                ccm_tracker,
+                "has_pending_background_commands",
+                False,
+            )
+            is True
+        ):
+            return True
+        if getattr(session, "has_pending_subagents", False) is True:
+            return True
+        from backend.models.sub_agent import SubAgentSession
+
+        async with self.db_factory() as db:
+            result = await db.execute(
+                select(SubAgentSession.id)
+                .where(
+                    SubAgentSession.task_id == task_id,
+                    SubAgentSession.source == "native",
+                    SubAgentSession.status == "running",
+                )
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+
+    async def arm_pty_background_generation(
+        self,
+        instance_id: int,
+        task_id: int,
+        session_id: str,
+        generation: str,
+        record: _OutputConsumerRecord,
+        *,
+        post_exit_proof: _PtyPostExitGeneration | None = None,
+    ) -> bool:
+        """Persist background activity for a dispatcher-owned foreground turn.
+
+        The foreground proxy stays pending until this marker clears, so no
+        chat/initial/goal/loop terminal consumer can observe partial output.
+        """
+
+        if (
+            record.task_id != task_id
+            or record.task_retry_count is None
+            or record.instance_started_at is None
+        ):
+            return False
+        if post_exit_proof is not None:
+            key = (task_id, session_id)
+            if (
+                self._pty_post_exit_generations.get(key)
+                is not post_exit_proof
+                or post_exit_proof.instance_id != instance_id
+                or post_exit_proof.task_id != task_id
+                or post_exit_proof.session_id != session_id
+                or post_exit_proof.record is not record
+                or post_exit_proof.process is not record.process
+                or getattr(post_exit_proof.session, "session_id", None)
+                != session_id
+                or getattr(post_exit_proof.session, "is_alive", True)
+                is False
+                or instance_id in self._stopping
+            ):
+                return False
+        state = self._pty_background_states.get((task_id, session_id))
+        marker_predicate = (
+            Task.pty_background_generation == generation
+            if state is not None and state.generation == generation
+            else Task.pty_background_generation.is_(None)
+        )
+        async with self.db_factory() as db:
+            armed = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.instance_id == instance_id,
+                    Task.session_id == session_id,
+                    Task.retry_count == record.task_retry_count,
+                    Task.status.in_(("in_progress", "executing")),
+                    marker_predicate,
+                    task_retry_not_superseded_predicate(),
+                )
+                .values(pty_background_generation=generation)
+            )
+            if not armed.rowcount:
+                await db.rollback()
+                return False
+            if post_exit_proof is not None:
+                # The Task row is locked first, preserving the global
+                # Task→Instance lock order. This no-op owner CAS proves the
+                # retained turn still owns the same reusable slot even though
+                # its ordinary in-memory maps have already been released.
+                owner_guard = await db.execute(
+                    update(Instance)
+                    .where(
+                        Instance.id == instance_id,
+                        Instance.current_task_id == task_id,
+                        Instance.pid
+                        == getattr(post_exit_proof.process, "pid", None),
+                        Instance.started_at
+                        == record.instance_started_at,
+                    )
+                    .values(status=Instance.status)
+                )
+                if (
+                    not owner_guard.rowcount
+                    or self._pty_post_exit_generations.get(
+                        (task_id, session_id)
+                    )
+                    is not post_exit_proof
+                    or instance_id in self._stopping
+                ):
+                    await db.rollback()
+                    return False
+            await db.commit()
+        payload = {
+            "event": "background_activity",
+            "event_type": "background_activity",
+            "task_id": task_id,
+            "background_active": True,
+        }
+        await self.broadcaster.broadcast("tasks", payload)
+        await self.broadcaster.broadcast(f"task:{task_id}", payload)
+        return True
+
+    def register_pty_background_generation(
+        self,
+        task_id: int,
+        session_id: str,
+        generation: str,
+        session: Any,
+    ) -> _PtyBackgroundState:
+        """Track an already-persisted foreground→background transition."""
+
+        key = (task_id, session_id)
+        current = self._pty_background_states.get(key)
+        if current is not None and current.generation == generation:
+            current.session = session
+            current.last_event_monotonic = time.monotonic()
+            return current
+        if current is not None:
+            current.outcome = "superseded"
+            self._discard_pty_background_state(key, current.generation)
+        now = time.monotonic()
+        state = _PtyBackgroundState(
+            task_id=task_id,
+            session_id=session_id,
+            generation=generation,
+            session=session,
+            started_monotonic=now,
+            last_event_monotonic=now,
+        )
+        self._pty_background_states[key] = state
+        state.watcher = asyncio.create_task(
+            self._watch_pty_background_generation(state)
+        )
+        return state
+
+    def _discard_pty_background_state(
+        self,
+        key: tuple[int, str],
+        generation: str,
+    ) -> None:
+        state = self._pty_background_states.get(key)
+        if state is None or state.generation != generation:
+            return
+        self._pty_background_states.pop(key, None)
+        state.accepting_events = False
+        state.done.set()
+        watcher = state.watcher
+        if (
+            watcher is not None
+            and watcher is not asyncio.current_task()
+            and not watcher.done()
+            and not state.watchdog_stopping
+        ):
+            watcher.cancel()
+
+    async def wait_pty_background_generation(
+        self,
+        task_id: int,
+        session_id: str,
+        generation: str,
+    ) -> str | None:
+        """Wait for one exact dispatcher-owned PTY epoch to settle.
+
+        Chat, initial, goal, and loop turns must not wake their lifecycle
+        consumer while a native Agent/Monitor is still producing the result.
+        """
+
+        state = self.pty_background_state_for(
+            task_id, session_id, generation
+        )
+        if state is None:
+            return None
+        return await self.wait_pty_background_outcome(state)
+
+    @staticmethod
+    async def wait_pty_background_outcome(
+        state: _PtyBackgroundState,
+    ) -> str:
+        """Wait through dictionary removal using an exact state reference."""
+
+        await state.done.wait()
+        return state.outcome or "superseded"
+
+    def abandon_pty_background_generation(
+        self,
+        task_id: int,
+        session_id: str,
+        generation: str,
+        *,
+        outcome: str = "abandoned",
+    ) -> None:
+        """Wake an owner being stopped while retaining its exact Session.
+
+        PTY backend stop may fail after the foreground consumer is unblocked.
+        The state therefore stays indexed until the exact process stop and
+        Task/Instance transaction both succeed, allowing a later stop retry to
+        address the same Session instead of stranding a durable marker.
+        """
+
+        state = self._pty_background_states.get((task_id, session_id))
+        if state is None or state.generation != generation:
+            return
+        state.outcome = outcome
+        state.accepting_events = False
+        state.done.set()
+        watcher = state.watcher
+        if (
+            watcher is not None
+            and watcher is not asyncio.current_task()
+            and not watcher.done()
+            and not state.watchdog_stopping
+        ):
+            watcher.cancel()
+
+    async def _stop_exact_unattached_pty_session(
+        self,
+        session: Any,
+        session_id: str,
+        task_id: int,
+    ) -> bool:
+        """Stop one Session object without ever addressing a reusable key."""
+
+        if getattr(session, "session_id", None) != session_id:
+            return False
+        attached = getattr(self._pty_backend, "_sessions", {})
+        if isinstance(attached, dict) and any(
+            candidate is session for candidate in attached.values()
+        ):
+            return False
+
+        try:
+            pool = getattr(self._pty_backend, "_pool", None)
+            pool_sessions = getattr(pool, "_sessions", None)
+            pool_lock = getattr(pool, "_lock", None)
+            if isinstance(pool_sessions, dict) and pool_lock is not None:
+                # Keep replacement of this session-id serialized with the
+                # exact stop. Pop only by object identity: an ABA replacement
+                # must remain alive.
+                async with pool_lock:
+                    await session.stop()
+                    if pool_sessions.get(session_id) is session:
+                        pool_sessions.pop(session_id, None)
+                        access_order = getattr(pool, "_access_order", None)
+                        if isinstance(access_order, dict):
+                            access_order.pop(session_id, None)
+            else:
+                await session.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not stop exact detached PTY session %s for task %s",
+                session_id,
+                task_id,
+            )
+            return False
+        # Absence/unknown is not proof that an exact native Session stopped.
+        return getattr(session, "is_alive", True) is False
+
+    async def _stop_exact_detached_pty_session(
+        self,
+        state: _PtyBackgroundState,
+    ) -> bool:
+        return await self._stop_exact_unattached_pty_session(
+            state.session,
+            state.session_id,
+            state.task_id,
+        )
+
+    async def _stop_exact_post_exit_pty_session(
+        self,
+        proof: _PtyPostExitGeneration,
+    ) -> bool:
+        key = (proof.task_id, proof.session_id)
+        if self._pty_post_exit_generations.get(key) is not proof:
+            return False
+        return await self._stop_exact_unattached_pty_session(
+            proof.session,
+            proof.session_id,
+            proof.task_id,
+        )
+
+    async def stop_detached_pty_background_generation(
+        self,
+        task_id: int,
+        session_id: str,
+        generation: str,
+        *,
+        expected_status: str,
+        expected_retry_count: int,
+        expected_instance_id: int | None,
+        expected_started_at: datetime | None,
+        expected_completed_at: datetime | None,
+        terminal_status: str | None = None,
+        error_message: str | None = None,
+    ) -> bool:
+        """Stop one ownerless PTY tail without addressing a reusable slot.
+
+        A genuinely late autonomous turn can begin after the foreground
+        Instance has already become idle (and may already belong to another
+        Task).  The durable marker is Task/session scoped, so cleanup must stop
+        the exact ``Session`` object retained by ``_PtyBackgroundState``.  It
+        must never call the adapter's instance-keyed ``stop()``.
+
+        The marker is cleared only after that exact session is proven stopped.
+        Any missing state, surviving process, pool race, or DB generation
+        mismatch therefore remains fail-closed and can be retried.
+        """
+
+        key = (task_id, session_id)
+        async with self.pty_background_transition(task_id, session_id):
+            state = self._pty_background_states.get(key)
+
+            identity_predicates = [
+                Task.id == task_id,
+                Task.worker_id.is_(None),
+                Task.shared_from_id.is_(None),
+                Task.status == expected_status,
+                Task.retry_count == expected_retry_count,
+                Task.session_id == session_id,
+                (
+                    Task.instance_id.is_(None)
+                    if expected_instance_id is None
+                    else Task.instance_id == expected_instance_id
+                ),
+                (
+                    Task.started_at.is_(None)
+                    if expected_started_at is None
+                    else Task.started_at == expected_started_at
+                ),
+            ]
+
+            # Natural background completion can win just before this lock.
+            # A cleared marker on the same Task/session/retry is already the
+            # desired result even if it refreshed completed_at.
+            async with self.db_factory() as db:
+                already_cleared = await db.scalar(
+                    select(Task.id).where(
+                        *identity_predicates,
+                        Task.pty_background_generation.is_(None),
+                    )
+                )
+                if already_cleared is not None:
+                    return True
+
+                guarded = await db.execute(
+                    update(Task)
+                    .where(
+                        *identity_predicates,
+                        (
+                            Task.completed_at.is_(None)
+                            if expected_completed_at is None
+                            else Task.completed_at == expected_completed_at
+                        ),
+                        Task.pty_background_generation == generation,
+                    )
+                    .values(status=expected_status)
+                )
+                if not guarded.rowcount:
+                    await db.rollback()
+                    return False
+                owner = await db.scalar(
+                    select(Instance.id)
+                    .where(Instance.current_task_id == task_id)
+                    .with_for_update()
+                )
+                if owner is not None:
+                    await db.rollback()
+                    return False
+                await db.commit()
+
+            if state is None or state.generation != generation:
+                return False
+            handoff = self._pty_autonomous_activity_handoffs.get(key)
+            exact_session = state.session
+            self.abandon_pty_background_generation(
+                task_id, session_id, generation
+            )
+            try:
+                session_stopped = (
+                    await self._stop_exact_detached_pty_session(state)
+                )
+            except BaseException:
+                self._restore_pty_background_after_failed_stop(
+                    state,
+                    handoff,
+                    exact_session,
+                )
+                raise
+            if not session_stopped:
+                self._restore_pty_background_after_failed_stop(
+                    state,
+                    handoff,
+                    exact_session,
+                )
+                return False
+
+            completed_at = datetime.utcnow()
+            async with self.db_factory() as db:
+                task_values: dict[str, Any] = {
+                    "pty_background_generation": None
+                }
+                if terminal_status is not None:
+                    task_values.update(
+                        status=terminal_status,
+                        completed_at=completed_at,
+                        error_message=(
+                            (error_message or "")[:2000] or None
+                        ),
+                    )
+                cleared = await db.execute(
+                    update(Task)
+                    .where(
+                        *identity_predicates,
+                        (
+                            Task.completed_at.is_(None)
+                            if expected_completed_at is None
+                            else Task.completed_at == expected_completed_at
+                        ),
+                        Task.pty_background_generation == generation,
+                    )
+                    .values(**task_values)
+                )
+                if not cleared.rowcount:
+                    await db.rollback()
+                    return False
+                from backend.models.sub_agent import SubAgentSession
+
+                await db.execute(
+                    update(SubAgentSession)
+                    .where(
+                        SubAgentSession.task_id == task_id,
+                        SubAgentSession.source == "native",
+                        SubAgentSession.status == "running",
+                    )
+                    .values(
+                        status=(
+                            "failed"
+                            if terminal_status == "failed"
+                            else "cancelled"
+                        ),
+                        completed_at=completed_at,
+                    )
+                )
+                owner = await db.scalar(
+                    select(Instance.id)
+                    .where(Instance.current_task_id == task_id)
+                    .with_for_update()
+                )
+                if owner is not None:
+                    await db.rollback()
+                    return False
+                await db.commit()
+
+            state.outcome = (
+                "failed" if terminal_status == "failed" else "abandoned"
+            )
+            self.clear_pty_autonomous_activity_handoff(
+                task_id,
+                session_id,
+                self._pty_autonomous_activity_handoffs.get(key),
+            )
+            self._discard_pty_background_state(key, generation)
+            return True
+
+    async def begin_pty_autonomous_activity(
+        self,
+        task_id: int,
+        session_id: str,
+        session: Any,
+        event: dict,
+        *,
+        instance_id: int | None = None,
+    ) -> str | None:
+        async with self.pty_background_transition(task_id, session_id):
+            return await self._begin_pty_autonomous_activity_locked(
+                task_id,
+                session_id,
+                session,
+                event,
+                instance_id=instance_id,
+            )
+
+    async def _begin_pty_autonomous_activity_locked(
+        self,
+        task_id: int,
+        session_id: str,
+        session: Any,
+        event: dict,
+        *,
+        instance_id: int | None = None,
+    ) -> str | None:
+        """Move a completed Task into a detached, token-fenced background epoch.
+
+        This method never reads or writes an Instance row.  The instance key
+        supplied by claude-pty is a reusable adapter slot and may already host
+        an unrelated Task by the time an idle-watcher callback arrives.
+        """
+
+        key = (task_id, session_id)
+        state = self._pty_background_states.get(key)
+        owned_handoff = self._owned_pty_autonomous_activity_handoff(key)
+        owned_post_exit_proof = self._owned_pty_post_exit_generation(key)
+        if (
+            owned_handoff is not None
+            and self._pty_autonomous_activity_handoffs.get(key)
+            is not owned_handoff
+        ):
+            # This exact callback announced activity before it blocked on the
+            # transition lock.  A successful exact stop invalidated that
+            # immutable announcement while we were waiting; never let a new
+            # same-key handoff (or the absence of one) resurrect it.
+            return None
+        if (
+            owned_handoff is not None
+            and (
+                getattr(session, "session_id", None) != session_id
+                or getattr(session, "is_alive", True) is False
+            )
+        ):
+            return None
+        if (
+            owned_post_exit_proof is not None
+            and self._pty_post_exit_generations.get(key)
+            is not owned_post_exit_proof
+        ):
+            # Natural terminal reconciliation may retire the short-lived proof
+            # before this already-announced callback enters the lock. It may
+            # still use the completed-only Task/session CAS below. Explicit
+            # stop/replacement also invalidates the handoff token itself and was
+            # rejected above, so no stale callback can borrow that fallback.
+            owned_post_exit_proof = None
+        if (
+            owned_post_exit_proof is not None
+            and owned_post_exit_proof.instance_id in self._stopping
+        ):
+            return None
+        if state is not None and (
+            state.session is not session or not state.accepting_events
+        ):
+            return None
+        if self._is_pty_autonomous_terminal(event):
+            return (
+                state.generation
+                if state is not None and state.accepting_events
+                else None
+            )
+        if not self._is_pty_autonomous_activity(event):
+            return None
+
+        transitioned = False
+        generation: str | None = None
+        # The idle watcher can win the small window between send_prompt
+        # releasing its reader lock and on_exit arming the durable marker.
+        # A callback installed at launch may pre-arm only while the exact
+        # foreground consumer record still proves this Task/session owner.
+        if state is None and instance_id is not None:
+            record = self._consumer_records.get(instance_id)
+            process = getattr(record, "process", None)
+            if (
+                record is not None
+                and record.task_id == task_id
+                and getattr(process, "session", None) is session
+                and self.processes.get(instance_id) is process
+                and instance_id not in self._stopping
+                and record.pty_terminal_owner != "stop"
+            ):
+                candidate = secrets.token_urlsafe(24)
+                if await self.arm_pty_background_generation(
+                    instance_id,
+                    task_id,
+                    session_id,
+                    candidate,
+                    record,
+                ):
+                    self.register_pty_background_generation(
+                        task_id,
+                        session_id,
+                        candidate,
+                        session,
+                    )
+                    state = self._pty_background_states.get(key)
+                    generation = candidate
+
+        # ``process.complete()`` wakes dispatcher/Ralph before they commit the
+        # Task result. Their exact output maps are already gone by then, so the
+        # ordinary pre-arm branch above cannot prove ownership. A callback that
+        # synchronously captured this immutable retained record may bridge only
+        # that exact gap; no arbitrary executing Task is admitted.
+        if (
+            state is None
+            and owned_post_exit_proof is not None
+            and instance_id == owned_post_exit_proof.instance_id
+            and owned_post_exit_proof.session is session
+            and owned_post_exit_proof.record.task_id == task_id
+            and owned_post_exit_proof.record.task_retry_count is not None
+            and getattr(owned_post_exit_proof.process, "session", None)
+            is session
+            and instance_id not in self._stopping
+        ):
+            candidate = secrets.token_urlsafe(24)
+            if await self.arm_pty_background_generation(
+                instance_id,
+                task_id,
+                session_id,
+                candidate,
+                owned_post_exit_proof.record,
+                post_exit_proof=owned_post_exit_proof,
+            ):
+                self.register_pty_background_generation(
+                    task_id,
+                    session_id,
+                    candidate,
+                    session,
+                )
+                state = self._pty_background_states.get(key)
+                generation = candidate
+                self._discard_pty_post_exit_generation(
+                    key, owned_post_exit_proof
+                )
+
+        async with self.db_factory() as db:
+            # Dispatcher-owned initial/goal/loop turns pre-arm the exact epoch
+            # while their Task is still executing.  Reuse that durable token
+            # before applying the completed-only late-autonomous admission rule.
+            if state is not None:
+                existing_guard = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.session_id == session_id,
+                        Task.status.in_(
+                            ("in_progress", "executing", "completed")
+                        ),
+                        Task.pty_background_generation == state.generation,
+                        task_retry_not_superseded_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                if existing_guard.rowcount:
+                    task = await db.get(
+                        Task, task_id, populate_existing=True
+                    )
+                    if task is not None and not has_pending_worker_routing(task):
+                        generation = state.generation
+                        await db.commit()
+                    else:
+                        await db.rollback()
+                        return None
+                else:
+                    await db.rollback()
+                    return None
+            else:
+                task_guard = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.session_id == session_id,
+                        Task.status == "completed",
+                        task_retry_not_superseded_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                if not task_guard.rowcount:
+                    await db.rollback()
+                    return None
+                task = await db.get(Task, task_id, populate_existing=True)
+                if task is None or has_pending_worker_routing(task):
+                    await db.rollback()
+                    return None
+                generation = task.pty_background_generation
+                if not generation:
+                    generation = secrets.token_urlsafe(24)
+                    task.pty_background_generation = generation
+                    transitioned = True
+                await db.commit()
+
+        if generation is None:
+            return None
+        if owned_post_exit_proof is not None:
+            self._discard_pty_post_exit_generation(
+                key, owned_post_exit_proof
+            )
+        self.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+        )
+        state = self._pty_background_states.get(key)
+        if state is not None and state.generation == generation:
+            state.last_event_monotonic = time.monotonic()
+            # A generation may span several harness autonomous turns while
+            # sibling native agents remain alive.  The first activity after a
+            # prior sentinel starts a new turn; never let that old sentinel
+            # authorize completion of the new turn.
+            state.terminal_seen = False
+            event_type = str(event.get("event_type") or "")
+            if event_type == "tool_use":
+                state.pending_tools += 1
+            elif event_type == "tool_result" and state.pending_tools:
+                state.pending_tools -= 1
+        if transitioned:
+            payload = {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": task_id,
+                "background_active": True,
+            }
+            await self.broadcaster.broadcast("tasks", payload)
+            await self.broadcaster.broadcast(f"task:{task_id}", payload)
+        return generation
+
+    async def finish_pty_autonomous_activity(
+        self,
+        task_id: int,
+        session_id: str,
+        generation: str | None,
+        event: dict,
+    ) -> None:
+        """Complete a background epoch only at its exact turn sentinel."""
+
+        async with self.pty_background_transition(task_id, session_id):
+            await self._finish_pty_autonomous_activity_locked(
+                task_id,
+                session_id,
+                generation,
+                event,
+            )
+
+    async def _finish_pty_autonomous_activity_locked(
+        self,
+        task_id: int,
+        session_id: str,
+        generation: str | None,
+        event: dict,
+    ) -> None:
+        if generation is None:
+            return
+        state = self._pty_background_states.get((task_id, session_id))
+        if state is None or state.generation != generation:
+            return
+        state.last_event_monotonic = time.monotonic()
+        if not self._is_pty_autonomous_terminal(event):
+            return
+        state.terminal_seen = True
+        state.pending_tools = 0
+        await self._try_complete_pty_background_generation_locked(state)
+
+    async def _try_complete_pty_background_generation(
+        self,
+        state: _PtyBackgroundState,
+    ) -> bool:
+        async with self.pty_background_transition(
+            state.task_id, state.session_id
+        ):
+            return await self._try_complete_pty_background_generation_locked(
+                state
+            )
+
+    async def _try_complete_pty_background_generation_locked(
+        self,
+        state: _PtyBackgroundState,
+    ) -> bool:
+        key = (state.task_id, state.session_id)
+        if self._pty_background_states.get(key) is not state:
+            return False
+        if await self.pty_background_activity_pending(
+            state.task_id, state.session
+        ):
+            return False
+        if state.pending_tools:
+            return False
+        if not state.terminal_seen:
+            return False
+
+        completed_at = datetime.utcnow()
+        completed_task = False
+        original_status: str | None = None
+        async with self.db_factory() as db:
+            guarded = await db.execute(
+                select(Task.status, Task.completed_at).where(
+                    Task.id == state.task_id,
+                    Task.session_id == state.session_id,
+                    Task.status.in_(
+                        ("in_progress", "executing", "completed")
+                    ),
+                    Task.pty_background_generation == state.generation,
+                    task_retry_not_superseded_predicate(),
+                )
+            )
+            row = guarded.one_or_none()
+            if row is None:
+                await db.rollback()
+                state.outcome = "superseded"
+                self._discard_pty_background_state(
+                    key, state.generation
+                )
+                return False
+            original_status = row.status
+            completed_task = original_status == "completed"
+            values: dict[str, Any] = {
+                "error_message": None,
+                "pty_background_generation": None,
+            }
+            if completed_task:
+                values["completed_at"] = completed_at
+            completed = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == state.task_id,
+                    Task.session_id == state.session_id,
+                    Task.status == original_status,
+                    Task.pty_background_generation == state.generation,
+                    task_retry_not_superseded_predicate(),
+                )
+                .values(**values)
+            )
+            if not completed.rowcount:
+                await db.rollback()
+                state.outcome = "superseded"
+                self._discard_pty_background_state(
+                    key, state.generation
+                )
+                return False
+            if completed_task:
+                completed_at = (
+                    await db.execute(
+                        select(Task.completed_at).where(
+                            Task.id == state.task_id
+                        )
+                    )
+                ).scalar_one()
+            await db.commit()
+
+        # Fence publication against a new chat/retry generation.
+        async with self.db_factory() as db:
+            publish_predicates = [
+                Task.id == state.task_id,
+                Task.session_id == state.session_id,
+                Task.status == original_status,
+                Task.pty_background_generation.is_(None),
+                task_retry_not_superseded_predicate(),
+            ]
+            if completed_task:
+                publish_predicates.append(
+                    Task.completed_at == completed_at
+                )
+            publish = await db.execute(
+                update(Task)
+                .where(*publish_predicates)
+                .values(status=original_status)
+            )
+            if publish.rowcount:
+                payload = {
+                    "event": "background_activity",
+                    "event_type": "background_activity",
+                    "task_id": state.task_id,
+                    "background_active": False,
+                }
+                await self.broadcaster.broadcast("tasks", payload)
+                await self.broadcaster.broadcast(
+                    f"task:{state.task_id}", payload
+                )
+                if completed_task:
+                    # This is the real terminal notification point. Foreground
+                    # completion carried background_active=true and is
+                    # suppressed by WebSocketBroadcaster's shared notifier.
+                    await self.broadcaster.broadcast(
+                        "tasks",
+                        {
+                            "event": "status_change",
+                            "task_id": state.task_id,
+                            "new_status": "completed",
+                            "background_active": False,
+                        },
+                    )
+                    await self.broadcaster.broadcast(
+                        f"task:{state.task_id}",
+                        {
+                            "event_type": "process_exit",
+                            "exit_code": 0,
+                            "stderr": None,
+                            "background": True,
+                        },
+                    )
+            await db.commit()
+        if publish.rowcount and completed_task:
+            handler = self.pty_background_completion_handler
+            if handler is not None:
+                try:
+                    result = handler(state.task_id)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.exception(
+                        "PTY background terminal handler failed for task %s",
+                        state.task_id,
+                    )
+        state.outcome = (
+            "completed" if publish.rowcount else "superseded"
+        )
+        self._discard_pty_background_state(key, state.generation)
+        return True
+
+    async def _fail_pty_background_generation(
+        self,
+        state: _PtyBackgroundState,
+    ) -> bool:
+        """Stop the exact PTY Session before publishing a hard-bound failure."""
+
+        key = (state.task_id, state.session_id)
+        error = (
+            "Claude PTY background activity did not reach a terminal turn "
+            f"within {PTY_BACKGROUND_MAX_SECONDS:.0f} seconds"
+        )
+
+        async with self.pty_background_transition(
+            state.task_id, state.session_id
+        ):
+            if self._pty_background_states.get(key) is not state:
+                return True
+            # This is an absolute lifetime bound. A stuck tool or stale
+            # durable "running" row is evidence that cleanup is needed, not
+            # permission to renew another four-hour lease indefinitely.
+            if (
+                time.monotonic() - state.started_monotonic
+                < PTY_BACKGROUND_MAX_SECONDS
+            ):
+                return False
+            if state.watchdog_stopping:
+                return False
+            state.watchdog_stopping = True
+            # Freeze new events now, but do not wake an attached foreground
+            # waiter until InstanceManager.stop has claimed terminal ownership.
+            # Waking here would let on_exit remove the adapter mapping before
+            # the watchdog can stop that exact Session.
+            state.accepting_events = False
+
+            async with self.db_factory() as db:
+                task_row = (
+                    await db.execute(
+                        select(
+                            Task.status,
+                            Task.retry_count,
+                            Task.instance_id,
+                            Task.started_at,
+                            Task.completed_at,
+                        ).where(
+                            Task.id == state.task_id,
+                            Task.session_id == state.session_id,
+                            Task.status.in_(
+                                ("in_progress", "executing", "completed")
+                            ),
+                            Task.pty_background_generation
+                            == state.generation,
+                            task_retry_not_superseded_predicate(),
+                        )
+                    )
+                ).one_or_none()
+                if task_row is None:
+                    state.outcome = "superseded"
+                    self._discard_pty_background_state(
+                        key, state.generation
+                    )
+                    return True
+                owner_rows = (
+                    await db.execute(
+                        select(Instance).where(
+                            Instance.current_task_id == state.task_id
+                        )
+                    )
+                ).scalars().all()
+                if len(owner_rows) > 1:
+                    state.watchdog_stopping = False
+                    return False
+                owner = owner_rows[0] if owner_rows else None
+
+        succeeded = False
+        detached = owner is None
+        try:
+            if owner is not None:
+                attached = getattr(self._pty_backend, "_sessions", {})
+                attached_keys = (
+                    [
+                        candidate_key
+                        for candidate_key, candidate in attached.items()
+                        if candidate is state.session
+                    ]
+                    if isinstance(attached, dict)
+                    else []
+                )
+                if attached_keys and attached_keys != [owner.id]:
+                    return False
+                if not attached_keys:
+                    # Backend map cleanup may have won after a prior failed
+                    # stop. Retain Task/Instance evidence, stop the exact
+                    # Session object, then let the settled-cleanup path clear
+                    # those durable owners.
+                    if not await self._stop_exact_detached_pty_session(state):
+                        return False
+                succeeded = await self.stop(
+                    owner.id,
+                    expected_task_id=state.task_id,
+                    expected_pid=owner.pid,
+                    expected_started_at=owner.started_at,
+                    task_status="failed",
+                    task_error_message=error,
+                )
+            else:
+                succeeded = (
+                    await self.stop_detached_pty_background_generation(
+                        state.task_id,
+                        state.session_id,
+                        state.generation,
+                        expected_status=task_row.status,
+                        expected_retry_count=task_row.retry_count,
+                        expected_instance_id=task_row.instance_id,
+                        expected_started_at=task_row.started_at,
+                        expected_completed_at=task_row.completed_at,
+                        terminal_status="failed",
+                        error_message=error,
+                    )
+                )
+        finally:
+            if self._pty_background_states.get(key) is state:
+                state.watchdog_stopping = False
+
+        if not succeeded:
+            return False
+        if detached:
+            await self.broadcaster.broadcast(
+                "tasks",
+                {
+                    "event": "status_change",
+                    "task_id": state.task_id,
+                    "new_status": "failed",
+                    "background_active": False,
+                },
+            )
+            payload = {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": state.task_id,
+                "background_active": False,
+            }
+            await self.broadcaster.broadcast("tasks", payload)
+            await self.broadcaster.broadcast(
+                f"task:{state.task_id}", payload
+            )
+            await self.broadcaster.broadcast(
+                f"task:{state.task_id}",
+                {
+                    "event_type": "process_exit",
+                    "exit_code": 1,
+                    "stderr": error,
+                    "background": True,
+                },
+            )
+        return True
+
+    async def _watch_pty_background_generation(
+        self,
+        state: _PtyBackgroundState,
+    ) -> None:
+        """Fail closed at a hard bound when the exact sentinel never arrives."""
+
+        while True:
+            try:
+                await asyncio.sleep(PTY_BACKGROUND_POLL_SECONDS)
+                key = (state.task_id, state.session_id)
+                if self._pty_background_states.get(key) is not state:
+                    return
+                if (
+                    state.terminal_seen
+                    and await self._try_complete_pty_background_generation(
+                        state
+                    )
+                ):
+                    return
+                now = time.monotonic()
+                if (
+                    now - state.started_monotonic
+                    >= PTY_BACKGROUND_MAX_SECONDS
+                ):
+                    if await self._fail_pty_background_generation(state):
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A transient database failure must not kill the only live
+                # finalizer and strand a durable marker forever.
+                logger.exception(
+                    "PTY background watcher iteration failed for task %s "
+                    "session %s; retrying",
+                    state.task_id,
+                    state.session_id,
+                )
+
     async def finalize_pty_chat_generation(
         self,
         instance_id: int,
         task_id: int,
         exit_code: int | None,
         record: _OutputConsumerRecord,
+        *,
+        background_generation: str | None = None,
+        preserve_background_failure: bool = False,
+        background_session_id: str | None = None,
     ) -> str | None:
         """Finalize one exact PTY chat turn, or discard a stale exit callback.
 
@@ -2995,40 +4719,143 @@ class InstanceManager:
         provider_error = (record.fatal_provider_error or "").strip()
         failure_notice_data = None
 
+        def background_handoff_pending() -> bool:
+            return bool(
+                final_status == "completed"
+                and background_generation is None
+                and background_session_id
+                and self.has_pty_autonomous_activity_handoff(
+                    task_id, background_session_id
+                )
+            )
+
+        async def restore_background_handoff(db) -> bool:
+            """Reverse an unpublished terminal commit into one armed epoch."""
+
+            if not background_handoff_pending():
+                return False
+            generation = secrets.token_urlsafe(24)
+            task_restored = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.status == "completed",
+                    Task.instance_id == instance_id,
+                    Task.retry_count == expected_retry_count,
+                    Task.completed_at == completed_at,
+                    Task.pty_background_generation.is_(None),
+                    task_retry_not_superseded_predicate(),
+                )
+                .values(
+                    status="executing",
+                    completed_at=None,
+                    error_message=None,
+                    pty_background_generation=generation,
+                )
+            )
+            instance_restored = await db.execute(
+                update(Instance)
+                .where(
+                    Instance.id == instance_id,
+                    Instance.status == "idle",
+                    Instance.pid.is_(None),
+                    Instance.current_task_id.is_(None),
+                    Instance.started_at == expected_started_at,
+                )
+                .values(
+                    status="running",
+                    pid=(getattr(process, "pid", 0) or 0),
+                    current_task_id=task_id,
+                )
+            )
+            if (
+                not task_restored.rowcount
+                or not instance_restored.rowcount
+                or not owns_generation()
+            ):
+                await db.rollback()
+                return False
+            await db.commit()
+            state = self.register_pty_background_generation(
+                task_id,
+                background_session_id,
+                generation,
+                getattr(process, "session", None),
+            )
+            state.last_event_monotonic = time.monotonic()
+            payload = {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": task_id,
+                "background_active": True,
+            }
+            await self.broadcaster.broadcast("tasks", payload)
+            await self.broadcaster.broadcast(f"task:{task_id}", payload)
+            return True
+
         async with lifecycle_lock:
             if instance_id in self._stopping or not owns_generation():
                 return None
 
             async with self.db_factory() as db:
-                task_values: dict = {"status": final_status}
-                if final_status == "completed":
-                    task_values.update(
-                        completed_at=completed_at,
-                        error_message=None,
-                    )
-                else:
-                    task_values.update(
-                        completed_at=completed_at,
-                        error_message=(
-                            provider_error[:2000]
-                            if provider_error
-                            else f"Process exited with code {ec}"
-                        ),
-                    )
                 # Lock/update the Task first.  Cancellation and retry use the
                 # same global Task -> Instance order.
-                task_result = await db.execute(
-                    update(Task)
-                    .where(
-                        Task.id == task_id,
-                        Task.status.in_(
-                            ["executing", "in_progress", "failed", "pending"]
-                        ),
-                        Task.instance_id == instance_id,
-                        Task.retry_count == expected_retry_count,
+                if preserve_background_failure:
+                    if final_status != "failed" or (
+                        background_generation is not None
+                    ):
+                        return None
+                    task_result = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == task_id,
+                            Task.status == "failed",
+                            Task.instance_id == instance_id,
+                            Task.retry_count == expected_retry_count,
+                            Task.pty_background_generation.is_(None),
+                        )
+                        .values(status=Task.status)
                     )
-                    .values(**task_values)
-                )
+                else:
+                    task_values: dict = {
+                        "status": final_status,
+                        "pty_background_generation": (
+                            background_generation
+                            if final_status == "completed"
+                            else None
+                        ),
+                    }
+                    if final_status == "completed":
+                        task_values.update(
+                            completed_at=completed_at,
+                            error_message=None,
+                        )
+                    else:
+                        task_values.update(
+                            completed_at=completed_at,
+                            error_message=(
+                                provider_error[:2000]
+                                if provider_error
+                                else f"Process exited with code {ec}"
+                            ),
+                        )
+                    task_result = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == task_id,
+                            Task.status.in_(
+                                [
+                                    "executing",
+                                    "in_progress",
+                                    "failed",
+                                    "pending",
+                                ]
+                            ),
+                            Task.instance_id == instance_id,
+                            Task.retry_count == expected_retry_count,
+                        )
+                        .values(**task_values)
+                    )
                 if not task_result.rowcount:
                     await db.rollback()
                     return None
@@ -3059,7 +4886,11 @@ class InstanceManager:
                 # _process_event. A process that dies before producing any
                 # event still needs a visible chat entry; process_exit alone
                 # only stops the frontend spinner.
-                if final_status == "failed" and not provider_error:
+                if (
+                    final_status == "failed"
+                    and not provider_error
+                    and not preserve_background_failure
+                ):
                     failure_notice = LogEntry(
                         instance_id=instance_id,
                         task_id=task_id,
@@ -3088,12 +4919,27 @@ class InstanceManager:
                 # MySQL DATETIME without fractional precision normalizes away
                 # Python microseconds.  Re-read the locked row before commit
                 # and use that database value for the publication fence.
-                completed_at = (
-                    await db.execute(
-                        select(Task.completed_at).where(Task.id == task_id)
-                    )
-                ).scalar_one()
+                if not preserve_background_failure:
+                    completed_at = (
+                        await db.execute(
+                            select(Task.completed_at).where(
+                                Task.id == task_id
+                            )
+                        )
+                    ).scalar_one()
+                    if (
+                        background_handoff_pending()
+                        and await restore_background_handoff(db)
+                    ):
+                        return "background_armed"
                 await db.commit()
+
+            if preserve_background_failure:
+                # The watchdog already committed and broadcast the precise
+                # timeout failure.  This path owns only the exact Instance
+                # release; overwriting the Task would lose the root cause and
+                # publish a duplicate generic process error.
+                return final_status
 
             # Publish only while an exact no-op Task update holds this terminal
             # generation.  A retry/replacement must take the same row lock and
@@ -3107,14 +4953,42 @@ class InstanceManager:
                         Task.instance_id == instance_id,
                         Task.retry_count == expected_retry_count,
                         Task.completed_at == completed_at,
+                        (
+                            Task.pty_background_generation
+                            == background_generation
+                            if background_generation is not None
+                            else Task.pty_background_generation.is_(None)
+                        ),
                     )
                     .values(status=final_status)
                 )
+                if (
+                    publish_guard.rowcount
+                    and background_handoff_pending()
+                    and await restore_background_handoff(db)
+                ):
+                    return "background_armed"
                 if publish_guard.rowcount:
                     if failure_notice_data is not None:
                         await self.broadcaster.broadcast(
                             f"task:{task_id}",
                             failure_notice_data,
+                        )
+                    if (
+                        final_status == "completed"
+                        and background_generation is not None
+                    ):
+                        background_payload = {
+                            "event": "background_activity",
+                            "event_type": "background_activity",
+                            "task_id": task_id,
+                            "background_active": True,
+                        }
+                        await self.broadcaster.broadcast(
+                            "tasks", background_payload
+                        )
+                        await self.broadcaster.broadcast(
+                            f"task:{task_id}", background_payload
                         )
                     await self.broadcaster.broadcast(
                         "tasks",
@@ -3123,6 +4997,10 @@ class InstanceManager:
                             "task_id": task_id,
                             "new_status": final_status,
                             "instance_id": instance_id,
+                            "background_active": bool(
+                                background_generation
+                                and final_status == "completed"
+                            ),
                         },
                     )
                     await self.broadcaster.broadcast(
@@ -3131,6 +5009,10 @@ class InstanceManager:
                             "event_type": "process_exit",
                             "exit_code": ec,
                             "stderr": None,
+                            "background_active": bool(
+                                background_generation
+                                and final_status == "completed"
+                            ),
                         },
                     )
                 await db.commit()
@@ -5534,6 +7416,87 @@ class InstanceManager:
                 "role": "assistant",
                 "content": text,
             })
+        elif item_type in {"collab_agent_tool_call", "collabAgentToolCall"}:
+            # app-server uses an item-local ``status=completed`` for Codex's
+            # multi-agent tools.  It means this one wait/spawn/send call
+            # finished, not that the parent turn or CCM Task completed.
+            tool = str(item.get("tool") or "unknown")
+            tool_key = re.sub(r"(?<!^)(?=[A-Z])", "_", tool).lower()
+            tool_name = f"Agent.{tool_key}"
+            receiver_thread_ids = (
+                item.get("receiver_thread_ids")
+                if "receiver_thread_ids" in item
+                else item.get("receiverThreadIds")
+            )
+            sender_thread_id = (
+                item.get("sender_thread_id")
+                if "sender_thread_id" in item
+                else item.get("senderThreadId")
+            )
+            reasoning_effort = (
+                item.get("reasoning_effort")
+                if "reasoning_effort" in item
+                else item.get("reasoningEffort")
+            )
+            agents_states = (
+                item.get("agents_states")
+                if "agents_states" in item
+                else item.get("agentsStates")
+            )
+            tool_args = {
+                key: value
+                for key, value in {
+                    "sender_thread_id": sender_thread_id,
+                    "receiver_thread_ids": receiver_thread_ids,
+                    "prompt": item.get("prompt"),
+                    "model": item.get("model"),
+                    "reasoning_effort": reasoning_effort,
+                }.items()
+                if value not in (None, "", [], {})
+            }
+            tool_input = (
+                json.dumps(tool_args, ensure_ascii=False)
+                if tool_args else None
+            )
+            if codex_type == "item.started":
+                event.update({
+                    "event_type": "tool_use",
+                    "role": "assistant",
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                })
+            else:
+                status = str(item.get("status") or "completed")
+                tool_result = {"status": status}
+                if agents_states:
+                    tool_result["agents_states"] = agents_states
+                error = item.get("error")
+                if error:
+                    tool_result["error"] = error
+                event.update({
+                    "event_type": "tool_result",
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "tool_output": json.dumps(
+                        tool_result,
+                        ensure_ascii=False,
+                    ),
+                    "is_error": (
+                        status.lower() in {"failed", "error"}
+                        or bool(error)
+                    ),
+                })
+        elif item_type in {
+            "sub_agent_activity",
+            "subAgentActivity",
+            "context_compaction",
+            "contextCompaction",
+        }:
+            # Metadata-only item lifecycles have no chat payload. In
+            # particular, their item/completed notification must not be
+            # confused with the parent turn's terminal event.
+            return None
         elif item_type == "file_change":
             # 实测（CLI 0.144.6 真实事件流）file_change 有 started + completed
             # 两态——源码注释声称 completed-only 不可信
@@ -5666,10 +7629,18 @@ class InstanceManager:
                 "error_code": error_code,
                 "error_details": error_details,
             })
+        elif codex_type in {"item.started", "item.completed"} and item:
+            # An item-local lifecycle status is never a parent-turn status.
+            # Unsupported app-server items (for example dynamicToolCall or
+            # imageGeneration) must be explicitly normalized before they can
+            # become user-facing tool events.  Falling through and displaying
+            # item.status used to turn their ``completed`` value into a false
+            # chat separator that looked like the whole Task had completed.
+            return None
         else:
             content = data.get("content") or data.get("message") or data.get("text")
             if content is None and item:
-                content = item.get("text") or item.get("command") or item.get("status")
+                content = item.get("text") or item.get("command")
             if isinstance(content, (dict, list)):
                 content = json.dumps(content, ensure_ascii=False)
             # Skip events with no extractable content (heartbeats, metadata),
@@ -5802,6 +7773,7 @@ class InstanceManager:
         consumer_record: _OutputConsumerRecord | None = None,
         detached_autonomous: bool = False,
         expected_session_id: str | None = None,
+        expected_background_generation: str | None = None,
     ):
         """Process a single parsed event: save to DB and broadcast."""
         provider = str(
@@ -5842,8 +7814,14 @@ class InstanceManager:
                 Task.id == task_id,
                 task_retry_not_superseded_predicate(),
             ]
-            if detached_autonomous and expected_session_id is not None:
-                predicates.append(Task.session_id == expected_session_id)
+            if detached_autonomous:
+                predicates.extend(
+                    [
+                        Task.session_id == expected_session_id,
+                        Task.pty_background_generation
+                        == expected_background_generation,
+                    ]
+                )
             elif event_record is not None:
                 predicates.extend(
                     [
@@ -5856,6 +7834,24 @@ class InstanceManager:
         async def guard_managed_event_generation(db) -> bool:
             """Lock the exact durable Task→Instance event generation."""
 
+            if detached_autonomous:
+                if (
+                    task_id is None
+                    or expected_session_id is None
+                    or expected_background_generation is None
+                ):
+                    return False
+                task_guard = await db.execute(
+                    update(Task)
+                    .where(
+                        *task_event_predicates(),
+                        Task.status.in_(
+                            ("in_progress", "executing", "completed")
+                        ),
+                    )
+                    .values(status=Task.status)
+                )
+                return bool(task_guard.rowcount)
             if event_record is None:
                 return True
             if not owns_event_generation():
@@ -5942,6 +7938,18 @@ class InstanceManager:
         # would recreate the raw-json/DB amplification that this path is meant
         # to avoid.  The final item/completed event is still stored normally.
         if event.get("event_type") in ("message_delta", "thinking_delta"):
+            if detached_autonomous:
+                async with self.db_factory() as db:
+                    if not await guard_managed_event_generation(db):
+                        await db.rollback()
+                        logger.info(
+                            "Dropping stale autonomous delta for task %s "
+                            "session %s",
+                            task_id,
+                            expected_session_id,
+                        )
+                        return
+                    await db.commit()
             broadcast_data = {k: v for k, v in event.items() if k != "raw_json"}
             if loop_iteration is not None:
                 broadcast_data["loop_iteration"] = loop_iteration
@@ -7038,6 +9046,7 @@ class InstanceManager:
         expected_pid: int | None | object = _EXPECTED_GENERATION_UNSET,
         expected_started_at: datetime | None | object = _EXPECTED_GENERATION_UNSET,
         task_status: str = "pending",
+        task_error_message: str | None = None,
         terminal_consumer_timeout: float | None = (
             DEFAULT_TERMINAL_CONSUMER_TIMEOUT
         ),
@@ -7054,7 +9063,12 @@ class InstanceManager:
         generation even when it belongs to the same task.
         """
 
-        if task_status not in {"pending", "completed", "cancelled"}:
+        if task_status not in {
+            "pending",
+            "completed",
+            "cancelled",
+            "failed",
+        }:
             raise ValueError(f"Unsupported terminal task status: {task_status}")
 
         operation = asyncio.create_task(
@@ -7064,6 +9078,7 @@ class InstanceManager:
                 expected_pid=expected_pid,
                 expected_started_at=expected_started_at,
                 task_status=task_status,
+                task_error_message=task_error_message,
                 terminal_consumer_timeout=terminal_consumer_timeout,
                 consumer_cancel_timeout=consumer_cancel_timeout,
             )
@@ -7090,6 +9105,7 @@ class InstanceManager:
         expected_pid: int | None | object,
         expected_started_at: datetime | None | object,
         task_status: str,
+        task_error_message: str | None,
         terminal_consumer_timeout: float | None,
         consumer_cancel_timeout: float | None,
     ) -> bool:
@@ -7213,6 +9229,7 @@ class InstanceManager:
                             )
                         pty_consumer_owns_terminal = (
                             terminal_owner == "consumer"
+                            and not record.pty_background_waiting
                         )
                     terminal_consumer = (
                         consumer_live
@@ -7241,10 +9258,19 @@ class InstanceManager:
                             expected_pid=expected_pid,
                             expected_started_at=expected_started_at,
                             task_status=task_status,
+                            task_error_message=task_error_message,
                             consumer_cancel_timeout=consumer_cancel_timeout,
                             allow_settled_cleanup=(
                                 settled_terminal_consumer
                                 or recovery_pending is not None
+                                or self._has_reapable_pty_background_state(
+                                    expected_task_id
+                                )
+                                or self._pty_post_exit_generation_for_instance(
+                                    instance_id,
+                                    expected_task_id,
+                                )
+                                is not None
                             ),
                             verified_owner=owner,
                         )
@@ -7316,6 +9342,113 @@ class InstanceManager:
         *,
         expected_task_id: int | None,
         task_status: str,
+        task_error_message: str | None = None,
+        expected_pid: int | None | object = _EXPECTED_GENERATION_UNSET,
+        expected_started_at: datetime | None | object = _EXPECTED_GENERATION_UNSET,
+        consumer_cancel_timeout: float | None = None,
+        allow_settled_cleanup: bool = False,
+        verified_owner: Instance | None | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
+    ) -> bool:
+        """Serialize an active PTY background epoch against its exact stop."""
+
+        process = (
+            self.processes.get(instance_id)
+            or self._process_groups.get(instance_id)
+            or self._container_exec_processes.get(instance_id)
+        )
+        record = self._consumer_records.get(instance_id)
+        session = getattr(process, "session", None)
+        session_id = getattr(session, "session_id", None)
+        state = (
+            self.pty_background_state_for(
+                record.task_id,
+                session_id,
+                self.pty_background_generation_for(
+                    record.task_id, session_id
+                )
+                or "",
+            )
+            if (
+                record is not None
+                and record.task_id is not None
+                and session_id
+            )
+            else None
+        )
+        if state is None and expected_task_id is not None:
+            state = self._pty_background_state_for_task(expected_task_id)
+        post_exit_proof = self._pty_post_exit_generation_for_instance(
+            instance_id,
+            expected_task_id,
+        )
+
+        async def run_inner() -> bool:
+            return await self._stop_locked_inner(
+                instance_id,
+                expected_task_id=expected_task_id,
+                task_status=task_status,
+                task_error_message=task_error_message,
+                expected_pid=expected_pid,
+                expected_started_at=expected_started_at,
+                consumer_cancel_timeout=consumer_cancel_timeout,
+                allow_settled_cleanup=allow_settled_cleanup,
+                verified_owner=verified_owner,
+            )
+
+        if state is None and post_exit_proof is None:
+            return await run_inner()
+        if state is None and post_exit_proof is not None:
+            async with self.pty_background_transition(
+                post_exit_proof.task_id,
+                post_exit_proof.session_id,
+            ):
+                if (
+                    self._pty_post_exit_generations.get(
+                        (
+                            post_exit_proof.task_id,
+                            post_exit_proof.session_id,
+                        )
+                    )
+                    is not post_exit_proof
+                ):
+                    return False
+                return await run_inner()
+        async with self.pty_background_transition(
+            state.task_id, state.session_id
+        ):
+            key = (state.task_id, state.session_id)
+            handoff = self._pty_autonomous_activity_handoffs.get(key)
+            exact_session = state.session
+            try:
+                stopped = await run_inner()
+            except BaseException:
+                self._restore_pty_background_after_failed_stop(
+                    state,
+                    handoff,
+                    exact_session,
+                    instance_id=instance_id,
+                    process=process,
+                )
+                raise
+            if not stopped:
+                self._restore_pty_background_after_failed_stop(
+                    state,
+                    handoff,
+                    exact_session,
+                    instance_id=instance_id,
+                    process=process,
+                )
+            return stopped
+
+    async def _stop_locked_inner(
+        self,
+        instance_id: int,
+        *,
+        expected_task_id: int | None,
+        task_status: str,
+        task_error_message: str | None = None,
         expected_pid: int | None | object = _EXPECTED_GENERATION_UNSET,
         expected_started_at: datetime | None | object = _EXPECTED_GENERATION_UNSET,
         consumer_cancel_timeout: float | None = None,
@@ -7335,6 +9468,13 @@ class InstanceManager:
             or self._container_exec_processes.get(instance_id)
         )
         record = self._consumer_records.get(instance_id)
+        post_exit_proof = self._pty_post_exit_generation_for_instance(
+            instance_id,
+            expected_task_id,
+        )
+        if process is None and post_exit_proof is not None:
+            process = post_exit_proof.process
+            record = post_exit_proof.record
         task = record.task if record is not None else self._tasks.get(instance_id)
         recovery_evidence = (
             self._consumer_recovery_pending.get((instance_id, process))
@@ -7404,8 +9544,29 @@ class InstanceManager:
             and not self._generation_reap_confirmed(instance_id, process)
         )
         consumer_live = task is not None and not task.done()
+        stopping_background_state = (
+            self._pty_background_state_for_task(expected_task_id)
+            if expected_task_id is not None
+            else None
+        )
         if not process_live and not consumer_live and not allow_settled_cleanup:
             return False
+        if (
+            not process_live
+            and not consumer_live
+            and stopping_background_state is not None
+            and getattr(
+                stopping_background_state.session, "is_alive", True
+            )
+            is not False
+        ):
+            return False
+
+        if post_exit_proof is not None:
+            if not await self._stop_exact_post_exit_pty_session(
+                post_exit_proof
+            ):
+                return False
 
         pty_managed = (
             process_live
@@ -7425,12 +9586,38 @@ class InstanceManager:
                     record,
                     "stop",
                     take_over_completed_consumer=True,
+                    take_over_background_waiter=True,
                 )
                 if terminal_owner != "stop":
                     raise RuntimeError(
                         "PTY consumer already owns terminal finalization; "
                         "stop must wait outside the lifecycle lock"
                     )
+                if record.task_id is not None:
+                    session = getattr(process, "session", None)
+                    session_id = getattr(session, "session_id", None)
+                    if session_id:
+                        generation = self.pty_background_generation_for(
+                            record.task_id, session_id
+                        )
+                        if generation:
+                            stopping_background_state = (
+                                self.pty_background_state_for(
+                                    record.task_id,
+                                    session_id,
+                                    generation,
+                                )
+                            )
+                            self.abandon_pty_background_generation(
+                                record.task_id,
+                                session_id,
+                                generation,
+                                outcome=(
+                                    "failed"
+                                    if task_status == "failed"
+                                    else "abandoned"
+                                ),
+                            )
             container_signal_error: Exception | None = None
             if self._is_managed_container_exec(instance_id, process):
                 try:
@@ -7533,6 +9720,8 @@ class InstanceManager:
                 ).scalar_one_or_none()
 
         changed_task_status = False
+        cleared_background = False
+        cleared_background_generation: str | None = None
         published_generation: dict | None = None
         async with self.db_factory() as db:
             if task_id is not None:
@@ -7567,6 +9756,7 @@ class InstanceManager:
                             Task.instance_id,
                             Task.started_at,
                             Task.completed_at,
+                            Task.pty_background_generation,
                         ).where(Task.id == task_id)
                     )
                 ).one()
@@ -7576,7 +9766,12 @@ class InstanceManager:
                 }:
                     task_values: dict = {
                         "status": task_status,
-                        "error_message": None,
+                        "error_message": (
+                            (task_error_message or "")[:2000] or None
+                            if task_status == "failed"
+                            else None
+                        ),
+                        "pty_background_generation": None,
                     }
                     if task_status == "pending":
                         task_values.update(
@@ -7598,6 +9793,63 @@ class InstanceManager:
                         .values(**task_values)
                     )
                     changed_task_status = bool(task_update.rowcount)
+                    cleared_background = bool(
+                        task_update.rowcount
+                        and current_task_generation
+                        .pty_background_generation is not None
+                    )
+                    if cleared_background:
+                        cleared_background_generation = (
+                            current_task_generation
+                            .pty_background_generation
+                        )
+                elif (
+                    current_task_generation.pty_background_generation
+                    is not None
+                ):
+                    background_clear = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == task_id,
+                            Task.status
+                            == current_task_generation.status,
+                            Task.retry_count
+                            == current_task_generation.retry_count,
+                            Task.instance_id == instance_id,
+                            Task.pty_background_generation
+                            == current_task_generation
+                            .pty_background_generation,
+                        )
+                        .values(pty_background_generation=None)
+                    )
+                    cleared_background = bool(
+                        background_clear.rowcount
+                    )
+                    if cleared_background:
+                        cleared_background_generation = (
+                            current_task_generation
+                            .pty_background_generation
+                        )
+
+                if changed_task_status or cleared_background:
+                    from backend.models.sub_agent import SubAgentSession
+
+                    await db.execute(
+                        update(SubAgentSession)
+                        .where(
+                            SubAgentSession.task_id == task_id,
+                            SubAgentSession.source == "native",
+                            SubAgentSession.status == "running",
+                        )
+                        .values(
+                            status=(
+                                "failed"
+                                if task_status == "failed"
+                                else "cancelled"
+                            ),
+                            completed_at=datetime.utcnow(),
+                        )
+                    )
 
                 resulting_task_generation = (
                     await db.execute(
@@ -7607,6 +9859,7 @@ class InstanceManager:
                             Task.instance_id,
                             Task.started_at,
                             Task.completed_at,
+                            Task.pty_background_generation,
                         ).where(Task.id == task_id)
                     )
                 ).one()
@@ -7616,6 +9869,10 @@ class InstanceManager:
                     "instance_id": resulting_task_generation.instance_id,
                     "started_at": resulting_task_generation.started_at,
                     "completed_at": resulting_task_generation.completed_at,
+                    "pty_background_generation": (
+                        resulting_task_generation
+                        .pty_background_generation
+                    ),
                 }
 
             instance_predicates = [Instance.id == instance_id]
@@ -7642,12 +9899,56 @@ class InstanceManager:
             instance_update = await db.execute(
                 update(Instance)
                 .where(*instance_predicates)
-                .values(status="idle", pid=None, current_task_id=None)
+                .values(
+                    status=(
+                        "error" if task_status == "failed" else "idle"
+                    ),
+                    pid=None,
+                    current_task_id=None,
+                )
             )
             if instance_update.rowcount == 0:
                 await db.rollback()
                 return False
             await db.commit()
+
+        if task_id is not None:
+            # The Task+Instance exact stop CAS above is now durable. Any
+            # pre-terminal post-exit bridge for that owner is obsolete; remove
+            # it before terminal publication so a queued old callback cannot
+            # revive the stopped generation.
+            self.discard_pty_post_exit_generations(
+                task_id=task_id,
+                instance_id=instance_id,
+                invalidate_handoffs=True,
+            )
+
+        if (
+            stopping_background_state is not None
+            and cleared_background
+            and stopping_background_state.generation
+            == cleared_background_generation
+        ):
+            stopping_background_state.outcome = (
+                "failed" if task_status == "failed" else "abandoned"
+            )
+            self.clear_pty_autonomous_activity_handoff(
+                stopping_background_state.task_id,
+                stopping_background_state.session_id,
+                self._pty_autonomous_activity_handoffs.get(
+                    (
+                        stopping_background_state.task_id,
+                        stopping_background_state.session_id,
+                    )
+                ),
+            )
+            self._discard_pty_background_state(
+                (
+                    stopping_background_state.task_id,
+                    stopping_background_state.session_id,
+                ),
+                stopping_background_state.generation,
+            )
 
         if task_id is not None and published_generation is not None:
             # Keep a row lock across publication. A rapid retry/replacement
@@ -7676,6 +9977,16 @@ class InstanceManager:
                         else Task.completed_at
                         == published_generation["completed_at"]
                     ),
+                    (
+                        Task.pty_background_generation.is_(None)
+                        if published_generation[
+                            "pty_background_generation"
+                        ] is None
+                        else Task.pty_background_generation
+                        == published_generation[
+                            "pty_background_generation"
+                        ]
+                    ),
                 ]
                 publish_guard = await db.execute(
                     update(Task)
@@ -7684,12 +9995,33 @@ class InstanceManager:
                 )
                 if publish_guard.rowcount:
                     if changed_task_status:
-                        from backend.services.task_events import (
-                            broadcast_status_change,
+                        # InstanceManager already owns the exact broadcaster
+                        # for this runtime.  Importing ``backend.main`` through
+                        # task_events here creates an application-entrypoint
+                        # cycle and can run startup recovery while an exact
+                        # stop still holds its transition lock.
+                        await self.broadcaster.broadcast(
+                            "tasks",
+                            {
+                                "event": "status_change",
+                                "task_id": task_id,
+                                "new_status": task_status,
+                                "instance_id": instance_id,
+                                "background_active": False,
+                            },
                         )
-
-                        await broadcast_status_change(
-                            task_id, task_status, instance_id
+                    elif cleared_background:
+                        background_payload = {
+                            "event": "background_activity",
+                            "event_type": "background_activity",
+                            "task_id": task_id,
+                            "background_active": False,
+                        }
+                        await self.broadcaster.broadcast(
+                            "tasks", background_payload
+                        )
+                        await self.broadcaster.broadcast(
+                            f"task:{task_id}", background_payload
                         )
                     await self.broadcaster.broadcast(
                         f"task:{task_id}",
@@ -7700,7 +10032,11 @@ class InstanceManager:
                                 if process is not None
                                 else None
                             ),
-                            "stderr": None,
+                            "stderr": (
+                                task_error_message
+                                if task_status == "failed"
+                                else None
+                            ),
                         },
                     )
                 await db.commit()

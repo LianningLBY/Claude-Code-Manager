@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from datetime import datetime
 
 from sqlalchemy import select, update
@@ -8,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.pr_monitor import MonitoredRepo, PRReview
 from backend.models.task import Task
+from backend.services.task_queue import (
+    task_retry_not_superseded_predicate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +211,13 @@ async def create_pr_review_task(
 
 
 async def check_and_update_review(
-    db: AsyncSession, pr_review_id: int, repo_full_name: str
+    db: AsyncSession,
+    pr_review_id: int,
+    repo_full_name: str,
+    *,
+    terminal_task_id: int | None = None,
+    terminal_task_retry_count: int | None = None,
+    background_handoff_pending: Callable[[], bool] | None = None,
 ):
     review = await db.get(PRReview, pr_review_id)
     if not review:
@@ -222,6 +232,42 @@ async def check_and_update_review(
 
     async def commit_exact_result(**values) -> bool:
         """Commit only while synchronize has not replaced this review."""
+
+        if terminal_task_id is not None:
+            if (
+                background_handoff_pending is not None
+                and background_handoff_pending()
+            ):
+                await db.rollback()
+                return False
+            task_guard = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == terminal_task_id,
+                    Task.status == "completed",
+                    Task.pty_background_generation.is_(None),
+                    (
+                        Task.id == terminal_task_id
+                        if terminal_task_retry_count is None
+                        else Task.retry_count
+                        == terminal_task_retry_count
+                    ),
+                    task_retry_not_superseded_predicate(),
+                )
+                .values(status=Task.status)
+            )
+            if not task_guard.rowcount or (
+                background_handoff_pending is not None
+                and background_handoff_pending()
+            ):
+                await db.rollback()
+                logger.info(
+                    "Deferring PR review %s while task %s still has "
+                    "background activity",
+                    pr_review_id,
+                    terminal_task_id,
+                )
+                return False
 
         predicates = [
             PRReview.id == pr_review_id,

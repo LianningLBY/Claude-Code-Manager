@@ -1,15 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
 import { LoopChatView } from './LoopChatView';
 import type { Task, ChatMessage } from '../../api/client';
 
 // Capture the onMessage callback so tests can inject WebSocket messages
 let capturedOnMessage: ((msg: Record<string, unknown>) => void) | undefined;
+let capturedChannels: string[] = [];
 vi.mock('../../hooks/useWebSocket', () => ({
   useWebSocket: vi.fn((
-    _channels: string[],
+    channels: string[],
     onMessage?: (msg: Record<string, unknown>) => void,
   ) => {
+    capturedChannels = channels;
     capturedOnMessage = onMessage;
     return { lastMessage: null, isConnected: true };
   }),
@@ -90,6 +92,11 @@ describe('LoopChatView', () => {
     vi.clearAllMocks();
     vi.mocked(api.getTaskChatHistory).mockReset().mockResolvedValue([]);
     capturedOnMessage = undefined;
+    capturedChannels = [];
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   describe('History loading', () => {
@@ -100,6 +107,38 @@ describe('LoopChatView', () => {
         // limit=0 表示不限量拉全量历史（compact=true, beforeId=0, touch=true）
         expect(api.getTaskChatHistory).toHaveBeenCalledWith(task.id, true, 0, 0, true);
       });
+    });
+
+    it('hides only raw-classified legacy Codex collab completions', async () => {
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({
+          id: 901,
+          role: 'system',
+          event_type: 'system_event',
+          content: 'completed',
+          native_item_type: 'collab_agent_tool_call',
+          native_item_status: 'completed',
+        }),
+        makeMsg({
+          id: 902,
+          role: 'system',
+          event_type: 'system_event',
+          content: 'completed',
+          native_item_type: null,
+          native_item_status: null,
+        }),
+        makeMsg({
+          id: 903,
+          content: 'Loop reply after agent wait',
+        }),
+      ]);
+
+      render(<LoopChatView task={makeTask()} onBack={onBack} />);
+
+      expect(
+        await screen.findByText('Loop reply after agent wait'),
+      ).toBeInTheDocument();
+      expect(screen.getAllByText('— completed —')).toHaveLength(1);
     });
   });
 
@@ -364,6 +403,164 @@ describe('LoopChatView', () => {
         expect(screen.getByText('Iteration 3')).toBeInTheDocument();
         expect(screen.getByText('Iter 2 msg')).toBeInTheDocument();
       });
+    });
+  });
+
+  describe('Detached background activity', () => {
+    it('keeps a terminal task active and cancellable from its initial marker', async () => {
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({ id: 1, content: 'Native child is still working' }),
+      ]);
+
+      render(
+        <LoopChatView
+          task={makeTask({ status: 'completed', background_active: true })}
+          onBack={onBack}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
+      });
+      expect(capturedChannels).toEqual(['task:42', 'tasks']);
+
+      fireEvent.click(screen.getByRole('button', { name: /Cancel Loop/i }));
+      await waitFor(() => {
+        expect(api.cancelTask).toHaveBeenCalledWith(42);
+      });
+    });
+
+    it.each([
+      {
+        label: 'global tasks channel',
+        channel: 'tasks',
+        data: {
+          event: 'background_activity',
+          task_id: 42,
+          background_active: true,
+        },
+      },
+      {
+        label: 'task channel',
+        channel: 'task:42',
+        data: {
+          event_type: 'background_activity',
+          background_active: true,
+        },
+      },
+    ])('consumes background activity from the $label', async ({ channel, data }) => {
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({ id: 2, content: 'Foreground answer' }),
+      ]);
+      render(
+        <LoopChatView
+          task={makeTask({ status: 'completed', background_active: false })}
+          onBack={onBack}
+        />,
+      );
+      await waitFor(() => {
+        expect(screen.getByText('Foreground answer')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
+
+      act(() => {
+        sendWs(data, channel);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
+      });
+    });
+
+    it('does not reset on terminal status until the exact background marker settles', async () => {
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({ id: 3, content: 'Foreground and child output' }),
+      ]);
+      render(<LoopChatView task={makeTask()} onBack={onBack} />);
+      await waitFor(() => {
+        expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+      });
+
+      act(() => {
+        sendWs({
+          event: 'status_change',
+          task_id: 42,
+          new_status: 'completed',
+          background_active: true,
+        }, 'tasks');
+      });
+      expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
+
+      act(() => {
+        sendWs({
+          event: 'background_activity',
+          task_id: 42,
+          background_active: false,
+        }, 'tasks');
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /Cancel Loop/i })).not.toBeInTheDocument();
+      });
+    });
+
+    it('expires a WS terminal override after seven seconds without another prop change', () => {
+      vi.useFakeTimers();
+      const task = makeTask({
+        status: 'in_progress',
+        background_active: false,
+      });
+      const { rerender } = render(
+        <LoopChatView task={task} onBack={onBack} />,
+      );
+      expect(
+        screen.getByRole('button', { name: /Cancel Loop/i }),
+      ).toBeInTheDocument();
+
+      act(() => {
+        sendWs({
+          event: 'status_change',
+          task_id: 42,
+          new_status: 'completed',
+          background_active: false,
+        }, 'tasks');
+      });
+      expect(
+        screen.queryByRole('button', { name: /Cancel Loop/i }),
+      ).not.toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+      rerender(
+        <LoopChatView
+          task={{ ...task, status: 'executing' }}
+          onBack={onBack}
+        />,
+      );
+      // The stale poll must not override a fresher WS terminal event early.
+      expect(
+        screen.queryByRole('button', { name: /Cancel Loop/i }),
+      ).not.toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(1999);
+      });
+      expect(
+        screen.queryByRole('button', { name: /Cancel Loop/i }),
+      ).not.toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      // No further prop transition is needed: the local status expires on its
+      // own and the still-executing durable snapshot becomes authoritative.
+      expect(
+        screen.getByRole('button', { name: /Cancel Loop/i }),
+      ).toBeInTheDocument();
     });
   });
 });

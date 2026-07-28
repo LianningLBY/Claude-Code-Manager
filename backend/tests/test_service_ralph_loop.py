@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.services.ralph_loop import RalphLoop
+from backend.services.task_queue import TaskQueue, task_generation_fence
 
 
 def _make_ralph_loop():
@@ -16,6 +17,41 @@ def _make_ralph_loop():
         instance_manager=MagicMock(),
         broadcaster=MagicMock(),
     )
+
+
+def _install_settling_failed_stop(instance_manager, db_factory):
+    async def settle(
+        instance_id,
+        *,
+        expected_task_id,
+        expected_pid,
+        expected_started_at,
+        task_status,
+        task_error_message,
+        terminal_consumer_timeout,
+        consumer_cancel_timeout,
+    ):
+        assert task_status == "failed"
+        assert task_error_message
+        assert terminal_consumer_timeout == 30.0
+        assert consumer_cancel_timeout == 10.0
+        async with db_factory() as db:
+            task = await db.get(Task, expected_task_id)
+            instance = await db.get(Instance, instance_id)
+            assert task.status == "failed"
+            assert instance.current_task_id == expected_task_id
+            assert instance.pid == expected_pid
+            assert instance.started_at == expected_started_at
+            task.pty_background_generation = None
+            instance.status = "error"
+            instance.pid = None
+            instance.current_task_id = None
+            await db.commit()
+        instance_manager.processes.pop(instance_id, None)
+        return True
+
+    instance_manager.stop = AsyncMock(side_effect=settle)
+    return instance_manager.stop
 
 
 def test_effective_exit_code_uses_provider_semantic_result():
@@ -195,6 +231,82 @@ async def test_stop_returns_claimed_task_to_pending_before_it_returns(db_factory
         assert released.instance_id is None
         assert "Ralph loop stopped" in released.error_message
     instance_manager.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_adopts_marker_only_handoff_and_awaits_exact_stop(
+    db_factory,
+):
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    stop_entered = asyncio.Event()
+    allow_stop = asyncio.Event()
+
+    async def exact_stop(*_args, **_kwargs):
+        stop_entered.set()
+        await allow_stop.wait()
+        return True
+
+    instance_manager = MagicMock()
+    instance_manager.is_running.return_value = True
+    instance_manager.stop = AsyncMock(side_effect=exact_stop)
+    rl = RalphLoop(db_factory, instance_manager, broadcaster)
+    started_at = datetime(2026, 4, 5, 6, 7, 8)
+
+    async with db_factory() as db:
+        instance = Instance(
+            name="ralph-cancel-marker-handoff",
+            status="running",
+            pid=6060,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        stale_task = Task(
+            title="cancel after PTY callback",
+            description="work",
+            status="in_progress",
+            instance_id=instance.id,
+        )
+        db.add(stale_task)
+        await db.flush()
+        instance.current_task_id = stale_task.id
+        await db.commit()
+        await db.refresh(stale_task)
+        task_id = stale_task.id
+        instance_id = instance.id
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.pty_background_generation = "cancel-native-epoch"
+        await db.commit()
+
+    cleanup = asyncio.create_task(
+        rl._release_cancelled_claim(instance_id, stale_task)
+    )
+    await asyncio.wait_for(stop_entered.wait(), timeout=1)
+    assert cleanup.done() is False
+    allow_stop.set()
+    await asyncio.wait_for(cleanup, timeout=1)
+
+    instance_manager.stop.assert_awaited_once_with(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=6060,
+        expected_started_at=started_at,
+        terminal_consumer_timeout=30.0,
+        consumer_cancel_timeout=10.0,
+    )
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        # The stop mock intentionally performs no persistence; reaching it and
+        # awaiting it must not make Ralph drop the durable exact owner.
+        assert current.status == "in_progress"
+        assert current.instance_id == instance_id
+        assert current.pty_background_generation == "cancel-native-epoch"
+        assert instance.current_task_id == task_id
+    broadcaster.broadcast.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -503,14 +615,187 @@ async def test_permanent_routing_failure_does_not_overwrite_cancellation(db_fact
 
 
 @pytest.mark.asyncio
+async def test_terminal_publication_rejects_new_background_generation(
+    db_factory,
+):
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    rl = RalphLoop(db_factory, MagicMock(), broadcaster)
+    async with db_factory() as db:
+        task = Task(
+            title="late native tail",
+            description="work",
+            status="in_progress",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        foreground_generation = task_generation_fence(task)
+
+        task.status = "completed"
+        task.completed_at = datetime.utcnow()
+        task.pty_background_generation = "new-background-epoch"
+        await db.commit()
+
+    published = await rl._broadcast_generation_event(
+        task_id,
+        foreground_generation,
+        "completed",
+        {
+            "event": "status_change",
+            "task_id": task_id,
+            "new_status": "completed",
+        },
+        terminal=True,
+    )
+
+    assert published is False
+    broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ralph_completion_adopts_marker_only_pty_handoff(db_factory):
+    rl = RalphLoop(db_factory, MagicMock(), MagicMock())
+    async with db_factory() as db:
+        instance = Instance(name="ralph-background-handoff")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="foreground completed before native child",
+            description="work",
+            status="in_progress",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        instance_id = instance.id
+        foreground_generation = task_generation_fence(task)
+
+        task.pty_background_generation = "native-tail-epoch"
+        await db.commit()
+
+    resulting = await rl._mark_completed_with_background_handoff(
+        task_id,
+        instance_id,
+        foreground_generation,
+    )
+
+    assert resulting is not None
+    assert resulting[-1] == "native-tail-epoch"
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "completed"
+        assert current.completed_at is not None
+        assert current.pty_background_generation == "native-tail-epoch"
+
+
+@pytest.mark.asyncio
+async def test_ralph_completion_retries_when_marker_clears_quickly(db_factory):
+    rl = RalphLoop(db_factory, MagicMock(), MagicMock())
+    async with db_factory() as db:
+        instance = Instance(name="ralph-fast-background-tail")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="native tail settles during completion",
+            description="work",
+            status="in_progress",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        instance_id = instance.id
+        foreground_generation = task_generation_fence(task)
+        task.pty_background_generation = "short-lived-native-tail"
+        await db.commit()
+
+    original_mark_completed = TaskQueue.mark_completed
+    attempts = 0
+
+    async def mark_then_settle(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        changed = await original_mark_completed(self, *args, **kwargs)
+        if attempts == 1:
+            assert changed is False
+            async with db_factory() as db:
+                current = await db.get(Task, task_id)
+                current.pty_background_generation = None
+                await db.commit()
+        return changed
+
+    with patch.object(
+        TaskQueue,
+        "mark_completed",
+        new=mark_then_settle,
+    ):
+        resulting = await rl._mark_completed_with_background_handoff(
+            task_id,
+            instance_id,
+            foreground_generation,
+        )
+
+    assert attempts == 2
+    assert resulting is not None
+    assert resulting[-1] is None
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "completed"
+        assert current.completed_at is not None
+        assert current.pty_background_generation is None
+
+
+@pytest.mark.asyncio
+async def test_status_publication_uses_exact_background_snapshot(db_factory):
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    rl = RalphLoop(db_factory, MagicMock(), broadcaster)
+    async with db_factory() as db:
+        task = Task(
+            title="durable background snapshot",
+            description="work",
+            status="completed",
+            completed_at=datetime.utcnow(),
+            pty_background_generation="exact-background-epoch",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        generation = task_generation_fence(task)
+
+    published = await rl._broadcast_generation_event(
+        task_id,
+        generation,
+        "completed",
+        {
+            "event": "status_change",
+            "task_id": task_id,
+            "new_status": "completed",
+            # A caller hint must not override the durable snapshot.
+            "background_active": False,
+        },
+        terminal=True,
+    )
+
+    assert published is True
+    event = broadcaster.broadcast.await_args.args[1]
+    assert event["background_active"] is True
+
+
+@pytest.mark.asyncio
 async def test_unexpected_error_fails_claim_before_reaping_exact_process(
     db_factory,
 ):
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     instance_manager = MagicMock()
-    instance_manager.kill_process_generation = AsyncMock(return_value=True)
-    instance_manager.wait_for_output_consumer = AsyncMock()
+    _install_settling_failed_stop(instance_manager, db_factory)
     rl = RalphLoop(
         db_factory=db_factory,
         instance_manager=instance_manager,
@@ -552,23 +837,103 @@ async def test_unexpected_error_fails_claim_before_reaping_exact_process(
 
     async with db_factory() as db:
         failed = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
         assert failed.status == "failed"
         assert failed.instance_id == instance_id
+        assert failed.pty_background_generation is None
         assert "consumer bookkeeping exploded" in failed.error_message
-    instance_manager.kill_process_generation.assert_awaited_once_with(
+        assert instance.status == "error"
+        assert instance.pid is None
+        assert instance.current_task_id is None
+        assert instance.started_at == datetime(2026, 2, 3, 4, 5, 6)
+    instance_manager.stop.assert_awaited_once_with(
         instance_id,
-        process,
-    )
-    instance_manager.wait_for_output_consumer.assert_awaited_once_with(
-        instance_id,
-        provider="claude",
-        timeout=30,
-        expected_process=process,
-        preserve_error=True,
+        expected_task_id=task_id,
+        expected_pid=process.pid,
+        expected_started_at=datetime(2026, 2, 3, 4, 5, 6),
+        task_status="failed",
+        task_error_message="Ralph loop failed: consumer bookkeeping exploded",
+        terminal_consumer_timeout=30.0,
+        consumer_cancel_timeout=10.0,
     )
     event = broadcaster.broadcast.await_args.args[1]
     assert event["new_status"] == "failed"
     assert event["reason"] == "ralph_internal_error"
+    assert event["background_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failure_clears_settled_marker_and_owner(
+    db_factory,
+):
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    process = MagicMock(pid=6161, returncode=None)
+    instance_manager = MagicMock()
+    instance_manager.processes = {}
+    _install_settling_failed_stop(instance_manager, db_factory)
+    rl = RalphLoop(db_factory, instance_manager, broadcaster)
+
+    async with db_factory() as db:
+        instance = Instance(
+            name="ralph-error-marker-handoff",
+            status="running",
+            pid=process.pid,
+            started_at=datetime(2026, 4, 5, 7, 8, 9),
+        )
+        db.add(instance)
+        await db.flush()
+        stale_task = Task(
+            title="error after PTY callback",
+            description="work",
+            provider="claude",
+            status="executing",
+            instance_id=instance.id,
+        )
+        db.add(stale_task)
+        await db.flush()
+        instance.current_task_id = stale_task.id
+        await db.commit()
+        await db.refresh(stale_task)
+        task_id = stale_task.id
+        instance_id = instance.id
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.pty_background_generation = "error-native-epoch"
+        await db.commit()
+    instance_manager.processes = {instance_id: process}
+
+    await rl._fail_unexpected_claim(
+        instance_id,
+        stale_task,
+        RuntimeError("late consumer failure"),
+    )
+
+    instance_manager.stop.assert_awaited_once_with(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=process.pid,
+        expected_started_at=datetime(2026, 4, 5, 7, 8, 9),
+        task_status="failed",
+        task_error_message="Ralph loop failed: late consumer failure",
+        terminal_consumer_timeout=30.0,
+        consumer_cancel_timeout=10.0,
+    )
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert current.status == "failed"
+        assert current.instance_id == instance_id
+        assert current.pty_background_generation is None
+        assert "late consumer failure" in current.error_message
+        assert instance.status == "error"
+        assert instance.current_task_id is None
+        assert instance.pid is None
+        assert instance.started_at == datetime(2026, 4, 5, 7, 8, 9)
+    event = broadcaster.broadcast.await_args.args[1]
+    assert event["new_status"] == "failed"
+    assert event["background_active"] is False
 
 
 @pytest.mark.asyncio
@@ -610,6 +975,11 @@ async def test_unexpected_error_with_unknown_persisted_process_fails_closed(
         instance_id = instance.id
         task_id = task.id
 
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.pty_background_generation = "unreaped-native-epoch"
+        await db.commit()
+
     await rl._fail_unexpected_claim(
         instance_id,
         task,
@@ -621,9 +991,14 @@ async def test_unexpected_error_with_unknown_persisted_process_fails_closed(
         instance = await db.get(Instance, instance_id)
         assert failed.status == "failed"
         assert failed.instance_id == instance_id
+        assert (
+            failed.pty_background_generation
+            == "unreaped-native-epoch"
+        )
         assert instance.status == "error"
         assert instance.pid == 97531
         assert instance.current_task_id == task_id
+        assert instance.started_at == datetime(2026, 2, 3, 4, 5, 6)
 
 
 @pytest.mark.asyncio
@@ -760,7 +1135,6 @@ async def test_unexpected_error_suppresses_failed_event_after_rapid_retry(
     process = MagicMock(pid=3333, returncode=None)
     instance_manager = MagicMock()
     instance_manager.processes = {}
-    instance_manager.wait_for_output_consumer = AsyncMock()
     rl = RalphLoop(
         db_factory=db_factory,
         instance_manager=instance_manager,
@@ -793,9 +1167,25 @@ async def test_unexpected_error_suppresses_failed_event_after_rapid_retry(
 
     instance_manager.processes = {instance_id: process}
 
-    async def retry_before_cleanup_returns(stopped_instance_id, exact_process):
+    async def retry_before_cleanup_returns(
+        stopped_instance_id,
+        *,
+        expected_task_id,
+        expected_pid,
+        expected_started_at,
+        task_status,
+        task_error_message,
+        terminal_consumer_timeout,
+        consumer_cancel_timeout,
+    ):
         assert stopped_instance_id == instance_id
-        assert exact_process is process
+        assert expected_task_id == task_id
+        assert expected_pid == process.pid
+        assert expected_started_at == datetime(2026, 3, 4, 5, 6, 7)
+        assert task_status == "failed"
+        assert task_error_message == "Ralph loop failed: old generation failed"
+        assert terminal_consumer_timeout == 30.0
+        assert consumer_cancel_timeout == 10.0
         async with db_factory() as db:
             queue = TaskQueue(db)
             assert await queue.retry(task_id) is not None
@@ -807,9 +1197,11 @@ async def test_unexpected_error_suppresses_failed_event_after_rapid_retry(
             instance.started_at = replacement.started_at
             instance.current_task_id = task_id
             await db.commit()
-        return True
+        # The exact stop lost its Task/Instance CAS to the replacement
+        # generation and must report that it did not settle the old owner.
+        return False
 
-    instance_manager.kill_process_generation = AsyncMock(
+    instance_manager.stop = AsyncMock(
         side_effect=retry_before_cleanup_returns
     )
 
@@ -824,6 +1216,11 @@ async def test_unexpected_error_suppresses_failed_event_after_rapid_retry(
         assert current.status == "in_progress"
         assert current.retry_count == 1
         assert current.instance_id == instance_id
+        instance = await db.get(Instance, instance_id)
+        assert instance.status == "running"
+        assert instance.pid == 4444
+        assert instance.current_task_id == task_id
+    instance_manager.stop.assert_awaited_once()
     broadcaster.broadcast.assert_not_awaited()
 
 

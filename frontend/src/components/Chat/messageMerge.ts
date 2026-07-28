@@ -1,5 +1,27 @@
 import type { ChatMessage } from '../../api/client';
 
+/**
+ * Older backends persisted a collab tool's local completed status as a
+ * system separator.  Require the native type and status extracted from
+ * raw_json so an unrelated system message containing "completed" survives.
+ */
+export function isLegacyCodexCollabCompleted(
+  message: Pick<
+    ChatMessage,
+    'event_type' | 'content' | 'native_item_type' | 'native_item_status'
+  >,
+): boolean {
+  return (
+    message.event_type === 'system_event'
+    && message.content === 'completed'
+    && (
+      message.native_item_type === 'collabAgentToolCall'
+      || message.native_item_type === 'collab_agent_tool_call'
+    )
+    && message.native_item_status === 'completed'
+  );
+}
+
 function attachmentKey(message: ChatMessage): string {
   return JSON.stringify(
     (message.attachments || []).map((attachment) => [

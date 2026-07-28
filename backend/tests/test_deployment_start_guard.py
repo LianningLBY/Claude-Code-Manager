@@ -16,6 +16,7 @@ from backend.services.deployment_start_guard import (
 def _write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload))
+    path.chmod(0o600)
 
 
 def test_no_deployment_record_allows_normal_start(tmp_path):
@@ -153,6 +154,7 @@ def test_corrupt_lease_fails_closed(tmp_path):
     lease = tmp_path / "backups" / "deployment-lease.json"
     lease.parent.mkdir(parents=True)
     lease.write_text("{not-json")
+    lease.chmod(0o600)
 
     result = assess_deployment_start(
         tmp_path, port=8000, running_commit="a" * 40

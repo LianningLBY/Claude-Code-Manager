@@ -1054,7 +1054,10 @@ class UpdateService:
             rows = (await db.execute(
                 select(Task.id, Task.title, Task.description, Task.status)
                 .where(
-                    Task.status.in_(ACTIVE_TASK_STATUSES),
+                    or_(
+                        Task.status.in_(ACTIVE_TASK_STATUSES),
+                        Task.pty_background_generation.isnot(None),
+                    ),
                     # Received shared tasks execute on their source CCM and
                     # are only remote-authoritative mirror rows here.
                     Task.shared_from_id.is_(None),

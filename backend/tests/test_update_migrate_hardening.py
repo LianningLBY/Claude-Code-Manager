@@ -23,6 +23,12 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "update_migrate.sh"
 
 
+def _write_secure(path: Path, body: str) -> None:
+    path.parent.chmod(0o700)
+    path.write_text(body)
+    path.chmod(0o600)
+
+
 def _write_sqlite(path: Path, value: str) -> None:
     connection = sqlite3.connect(path)
     try:
@@ -648,7 +654,8 @@ def test_matching_lease_records_active_handoff_then_terminal(
     lease = tmp_path / "backups" / "deployment-lease.json"
     lease.parent.mkdir()
     token = "owner-token"
-    lease.write_text(
+    _write_secure(
+        lease,
         json.dumps(
             {
                 "owner_token": token,
@@ -706,8 +713,8 @@ def test_writable_lease_or_lock_is_rejected_before_service_stop(
         "operation": "restart",
         "port": update_port,
     }
-    lease.write_text(json.dumps(original))
-    lock.write_text("")
+    _write_secure(lease, json.dumps(original))
+    _write_secure(lock, "")
     (lease if unsafe_target == "lease" else lock).chmod(0o666)
     env, service_log, _, python_wrapper = _fake_tools(tmp_path)
     env["FAKE_RUNNING_COMMIT"] = new_commit
@@ -750,7 +757,7 @@ def test_mirror_rejects_replaced_status_token_before_stop(
         "operation": "restart",
         "port": update_port,
     }
-    lease.write_text(json.dumps(original))
+    _write_secure(lease, json.dumps(original))
     env, service_log, _, python_wrapper = _fake_tools(tmp_path)
     env["FAKE_RUNNING_COMMIT"] = new_commit
     status_path = Path(f"/tmp/ccm-update-status-{update_port}.json")
@@ -808,7 +815,7 @@ def test_lease_token_mismatch_refuses_to_stop_or_overwrite(
         "handoff": True,
         "operation": "restart",
     }
-    lease.write_text(json.dumps(original))
+    _write_secure(lease, json.dumps(original))
     env, service_log, _, python_wrapper = _fake_tools(tmp_path)
     env["FAKE_RUNNING_COMMIT"] = new_commit
 
@@ -851,7 +858,7 @@ def test_late_worker_with_same_token_cannot_cross_terminal_lease(
         "deployment_incomplete": True,
         "operation": "restart",
     }
-    lease.write_text(json.dumps(terminal))
+    _write_secure(lease, json.dumps(terminal))
     env, service_log, _, python_wrapper = _fake_tools(tmp_path)
     env["FAKE_RUNNING_COMMIT"] = new_commit
 
@@ -886,7 +893,8 @@ def test_legacy_ten_arg_worker_self_claims_clean_terminal_repo_lease(
     _write_sqlite(backup, "unused")
     lease = project / "backups" / "deployment-lease.json"
     lease.parent.mkdir()
-    lease.write_text(
+    _write_secure(
+        lease,
         json.dumps(
             {
                 "owner_token": "previous-owner",
@@ -938,7 +946,7 @@ def test_legacy_worker_refuses_active_repo_lease_before_stop(
         "handoff": True,
         "deployment_incomplete": True,
     }
-    lease.write_text(json.dumps(active))
+    _write_secure(lease, json.dumps(active))
     env, service_log, _, python_wrapper = _fake_tools(tmp_path)
     env["FAKE_RUNNING_COMMIT"] = new_commit
 

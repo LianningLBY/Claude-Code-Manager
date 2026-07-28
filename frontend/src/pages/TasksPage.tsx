@@ -78,21 +78,53 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     // current page/filter fresh while the chat-open freeze preserves them
     // in the sidebar with last-known data (they'd otherwise show a stale
     // status until the chat is closed).
-    if (msg.channel === 'tasks' && msg.data?.event === 'status_change') {
-      const taskId = Number(msg.data.task_id);
-      const newStatus = typeof msg.data.new_status === 'string' ? msg.data.new_status : '';
-      if (!taskId || !newStatus) return;
-      const patch = (list: Task[]) =>
-        list.some((t) => t.id === taskId && t.status !== newStatus)
-          ? list.map((t) => (t.id === taskId ? { ...t, status: newStatus } : t))
-          : list;
-      setTasks(patch);
-      setAllTasks(patch);
-      setSearchResults((prev) => (prev ? patch(prev) : prev));
-      setChatTask((prev) => (prev && prev.id === taskId && prev.status !== newStatus ? { ...prev, status: newStatus } : prev));
-    }
-    if (msg.channel === 'tasks' && msg.data?.event === 'status_change') {
-      refreshRef.current();
+    const data = msg.data;
+    const event = msg.channel === 'tasks' ? data?.event : undefined;
+    if (data && (event === 'status_change' || event === 'background_activity')) {
+      const taskId = Number(data.task_id);
+      if (!Number.isSafeInteger(taskId) || taskId <= 0) return;
+
+      const newStatus = (
+        event === 'status_change'
+        && typeof data.new_status === 'string'
+        && data.new_status
+      ) ? data.new_status : undefined;
+      const backgroundActive = typeof data.background_active === 'boolean'
+        ? data.background_active
+        : undefined;
+      if (newStatus === undefined && backgroundActive === undefined) return;
+
+      const patchTask = (task: Task): Task => {
+        if (task.id !== taskId) return task;
+        const statusChanged = newStatus !== undefined && task.status !== newStatus;
+        const backgroundChanged = (
+          backgroundActive !== undefined
+          && task.background_active !== backgroundActive
+        );
+        if (!statusChanged && !backgroundChanged) return task;
+        return {
+          ...task,
+          ...(newStatus !== undefined ? { status: newStatus } : {}),
+          ...(backgroundActive !== undefined ? { background_active: backgroundActive } : {}),
+        };
+      };
+      const patchList = (list: Task[]) => {
+        const index = list.findIndex((task) => task.id === taskId);
+        if (index < 0) return list;
+        const patched = patchTask(list[index]);
+        if (patched === list[index]) return list;
+        const next = [...list];
+        next[index] = patched;
+        return next;
+      };
+
+      setTasks(patchList);
+      setAllTasks(patchList);
+      setSearchResults((prev) => (prev ? patchList(prev) : prev));
+      setChatTask((prev) => (prev ? patchTask(prev) : prev));
+      if (event === 'status_change') {
+        refreshRef.current();
+      }
     }
   }, [setSearchResults]);
   useWebSocket(['system', 'tasks'], handleGlobalWs);
@@ -546,6 +578,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       pending: 'bg-yellow-500',
       in_progress: 'bg-blue-500',
       executing: 'bg-blue-400 animate-pulse',
+      background: 'bg-teal-400 animate-pulse',
       plan_review: 'bg-purple-500',
       completed: 'bg-green-500',
       failed: 'bg-red-500',
@@ -588,7 +621,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                 >
                   <div className="flex items-center gap-2">
                     {/* 状态只靠圆点颜色表达（绿=完成 红=失败 蓝=运行 黄=等待） */}
-                    <span className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[t.status] || 'bg-gray-500'}`} title={t.status} />
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`}
+                      title={t.background_active ? 'background' : t.status}
+                    />
                     <span className={`text-xs truncate flex-1 ${chatTask?.id === t.id ? 'text-foreground font-medium' : 'text-gray-300'}`}>
                       {t.title || t.description?.slice(0, 50) || `Task #${t.id}`}
                     </span>

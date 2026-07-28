@@ -16,7 +16,10 @@ import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
-import { mergeChatHistory } from './messageMerge';
+import {
+  isLegacyCodexCollabCompleted,
+  mergeChatHistory,
+} from './messageMerge';
 
 interface ChatViewProps {
   task: Task;
@@ -207,10 +210,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // WS 驱动的实时状态覆盖。task.status prop（5s 轮询）才是最终一致的事实源：
   // prop 变化时清掉覆盖（见下方 effect），否则错过一次 WS 事件就永久陈旧。
   const [localStatus, setLocalStatus] = useState<string | null>(null);
+  const [localBackgroundActive, setLocalBackgroundActive] = useState<boolean | null>(null);
   // 最近一次 WS status_change 时刻：在途旧轮询快照返回（prop 回退旧值）时
   // 不能击穿刚到的 WS 状态——否则终态 effect 会误触发 autoDequeue，把排队
   // 消息在 turn 进行中提前发出。超过一个轮询周期没有 WS 事件才允许清除。
   const lastWsStatusAt = useRef(0);
+  // Background markers need the same stale-poll protection in both directions:
+  // an older request can return `true` just after the authoritative WS `false`.
+  const lastWsBackgroundAt = useRef(0);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [interrupting, setInterrupting] = useState(false);
   const [stillRunning, setStillRunning] = useState(false);
@@ -383,7 +390,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [distillError, setDistillError] = useState<string | null>(null);
   const [distillInstruction, setDistillInstruction] = useState('');
   const effectiveStatus = localStatus || task.status;
-  const isProcessing = sending || ['in_progress', 'executing'].includes(effectiveStatus);
+  const backgroundActive = localBackgroundActive ?? task.background_active === true;
+  // A native agent/monitor tail can remain active while the owning foreground
+  // turn is still `executing`; keep the marker independently visible.
+  const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const HISTORY_PAGE_SIZE = 200;
@@ -482,6 +492,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [autoDequeueFlag, setAutoDequeueFlag] = useState(0);
   const sendingRef = useRef(false);
   sendingRef.current = sending;
+  const backgroundActiveRef = useRef(false);
+  backgroundActiveRef.current = backgroundActive;
   const handleSendRef = useRef<(text: string, uploadResults?: UploadResult[]) => void>(() => {});
 
   useEffect(() => {
@@ -491,7 +503,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     // triggers autoDequeue in the same cycle as setSending(false) and the
     // ref still reads true → skips the queued message.
     const timer = setTimeout(() => {
-      if (sendingRef.current) return;
+      if (sendingRef.current || backgroundActiveRef.current) return;
       const queue = messageQueueRef.current;
       if (queue.length > 0) {
         const next = queue[0];
@@ -537,6 +549,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     );
     if (isStatusChange) {
       const newStatus = (msg.data!.new_status as string) || '';
+      if (typeof msg.data!.background_active === 'boolean') {
+        lastWsBackgroundAt.current = Date.now();
+        setLocalBackgroundActive(msg.data!.background_active);
+      }
       if (newStatus) {
         lastWsStatusAt.current = Date.now();
         setLocalStatus(newStatus);
@@ -544,10 +560,34 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       return;
     }
 
+    const isBackgroundActivity = (
+      msg.data
+      && (
+        (
+          msg.channel === 'tasks'
+          && msg.data.event === 'background_activity'
+          && Number(msg.data.task_id) === task.id
+        )
+        || (
+          msg.channel === `task:${task.id}`
+          && (
+            msg.data.event === 'background_activity'
+            || msg.data.event_type === 'background_activity'
+          )
+        )
+      )
+    );
+    if (isBackgroundActivity) {
+      if (typeof msg.data!.background_active === 'boolean') {
+        lastWsBackgroundAt.current = Date.now();
+        setLocalBackgroundActive(msg.data!.background_active);
+      }
+      return;
+    }
+
     if (msg.channel !== `task:${task.id}` || !msg.data) return;
 
     const eventType = msg.data.event_type as string || (msg.data.event as string);
-
     if (eventType === 'monitor_session_created' || eventType === 'monitor_session_status'
         || eventType === 'sub_agent_session_created' || eventType === 'sub_agent_session_status') {
       api.listMonitorSessions(task.id).then(setMonitorSessions).catch(() => {});
@@ -729,6 +769,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       // Small delay so any final output messages queued just before
       // process_exit are rendered before the "thinking" indicator hides.
       setTimeout(() => {
+        // A foreground process_exit is not terminal while an exact native
+        // background epoch is still active. Its false marker will drive the
+        // normal terminal effect after the final autonomous output arrives.
+        if (backgroundActiveRef.current) {
+          refreshHistoryRef.current();
+          return;
+        }
         setSending(false);
         setLocalStatus(null);  // Reset — status_change WS may have been missed
         setAutoDequeueFlag(f => f + 1);
@@ -814,6 +861,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     const showTypes = ['message', 'result', 'tool_use', 'tool_result', 'system_init', 'system_event', 'thinking'];
     if (!showTypes.includes(eventType)) return;
+    if (isLegacyCodexCollabCompleted({
+      event_type: eventType,
+      content: (msg.data.content as string) || null,
+      native_item_type: (msg.data.native_item_type as string) || null,
+      native_item_status: (msg.data.native_item_status as string) || null,
+    })) return;
 
     // Skip noisy system events (heartbeats, telemetry subtypes)
     const skipSystemContent = ['task_progress', 'thinking_tokens', 'token_usage', 'api_request', 'api_response'];
@@ -844,6 +897,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       source: (msg.data.source as string) || null,
       item_id: itemId,
       stream_item_id: itemId,
+      native_item_type: (msg.data.native_item_type as string) || null,
+      native_item_status: (msg.data.native_item_status as string) || null,
       persisted: isPersisted,
     };
     setMessages((prev) => {
@@ -867,6 +922,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     ]).then(([msgs, askPending]) => {
       const filtered = msgs
         .filter((m) =>
+          !isLegacyCodexCollabCompleted(m) &&
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((m) => ({ ...m, persisted: true }));
@@ -916,6 +972,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, oldestId).then((msgs) => {
       const filtered = msgs
         .filter((m) =>
+          !isLegacyCodexCollabCompleted(m) &&
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((m) => ({ ...m, persisted: true }));
@@ -953,25 +1010,67 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     handleSubscribed,
   );
 
-  // Fresh server data arrived via polling — drop the WS override so a missed
-  // status_change/process_exit can't pin the header/spinner on a stale status.
-  // Guard: skip if a WS status arrived within the last poll cycle — the prop
-  // change may be a stale in-flight snapshot fetched before that event.
+  // Keep a WS status for one full polling cycle, then independently expire it.
+  // Depending only on a prop change leaves the override pinned forever when a
+  // poll returns the same scalar status (or when no later poll changes it).
   useEffect(() => {
-    if (Date.now() - lastWsStatusAt.current > 7000) {
+    if (localStatus === null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const clearWhenStale = () => {
+      const remaining = 7000 - (Date.now() - lastWsStatusAt.current);
+      if (remaining <= 0) {
+        setLocalStatus(null);
+      } else {
+        timer = setTimeout(clearWhenStale, remaining);
+      }
+    };
+    const remaining = 7000 - (Date.now() - lastWsStatusAt.current);
+    if (remaining <= 0) {
       setLocalStatus(null);
+      return;
     }
-  }, [task.status]);
+    timer = setTimeout(clearWhenStale, remaining);
+    return () => clearTimeout(timer);
+  }, [localStatus, task.status]);
+
+  // Keep either WS marker value for one full polling cycle. Even when it
+  // currently equals the prop, clearing it immediately would let an older
+  // in-flight poll response in the opposite direction overwrite the event.
+  useEffect(() => {
+    if (localBackgroundActive === null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const clearWhenStale = () => {
+      const remaining = 7000 - (Date.now() - lastWsBackgroundAt.current);
+      if (remaining <= 0) {
+        setLocalBackgroundActive(null);
+      } else {
+        // A same-value WS event updates the ref without causing a render.
+        // Re-check at the old deadline so that fresh event still gets its
+        // complete protection window.
+        timer = setTimeout(clearWhenStale, remaining);
+      }
+    };
+    const remaining = 7000 - (Date.now() - lastWsBackgroundAt.current);
+    if (remaining <= 0) {
+      setLocalBackgroundActive(null);
+      return;
+    }
+    timer = setTimeout(clearWhenStale, remaining);
+    return () => clearTimeout(timer);
+  }, [localBackgroundActive, task.background_active]);
 
   // Reset sending state when task reaches a terminal status
   // (catches cases where process_exit WebSocket event is missed — e.g. WS disconnect)
   // Also trigger auto-dequeue so pending box messages get sent.
   useEffect(() => {
-    if (['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)) {
+    if (
+      !backgroundActive
+      && ['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)
+    ) {
       setSending(false);
       setAutoDequeueFlag(f => f + 1);
     }
-  }, [effectiveStatus]);
+  }, [backgroundActive, effectiveStatus]);
 
   // Load chat history
   useEffect(() => {
@@ -1301,6 +1400,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               {providerLabel}
             </span>
             <FastModeBadge task={task} />
+            {backgroundActive && (
+              <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
+                后台运行中
+              </span>
+            )}
             {task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
@@ -1350,7 +1454,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Star size={18} fill={starred ? 'currentColor' : 'none'} />
             </button>
-            {(sending || stillRunning || ['in_progress', 'executing'].includes(effectiveStatus)) && (
+            {(isProcessing || stillRunning) && (
               <button
                 onClick={async () => {
                   setInterrupting(true);

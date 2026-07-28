@@ -106,6 +106,9 @@ class TaskTerminationRequest(BaseModel):
     expected_instance_id: int | None = None
     expected_started_at: datetime | None = None
     expected_completed_at: datetime | None = None
+    # Required even when NULL: omission would let an old Manager snapshot
+    # silently adopt the Worker's arrival-time PTY epoch.
+    expected_pty_background_generation: str | None
 
 
 class WorkerRoutingConfigRequest(BaseModel):
@@ -257,6 +260,7 @@ class TaskResponse(BaseModel):
     metadata_: dict | None = None
     shared_from_id: int | None = None
     active_sub_agents: int = 0
+    background_active: bool = False
     context_window_usage: dict | None
     created_at: datetime
     started_at: datetime | None
@@ -278,3 +282,9 @@ class TaskResponse(BaseModel):
         from backend.services.command_registry import ensure_default_skills
         self.enabled_skills = ensure_default_skills(self.enabled_skills)
         return self
+
+
+class TaskTerminationSnapshot(TaskResponse):
+    """Internal-only Worker snapshot with the opaque PTY generation fence."""
+
+    pty_background_generation: str | None

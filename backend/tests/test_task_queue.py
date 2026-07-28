@@ -15,6 +15,7 @@ from backend.models.task import Task
 from backend.services.task_queue import (
     TaskQueue,
     _effective_key_expr,
+    task_delete_fence,
     task_generation_fence,
 )
 
@@ -166,6 +167,21 @@ async def test_retry_increments_count(queue):
 
 
 @pytest.mark.asyncio
+async def test_retry_rejects_completed_task_with_live_pty_background(queue):
+    task = await queue.create(title="background", description="tail")
+    task.status = "completed"
+    task.pty_background_generation = "exact-tail"
+    await queue.db.commit()
+    task_id = task.id
+
+    assert await queue.retry(task_id) is None
+    queue.db.expire_all()
+    current = await queue.get(task_id)
+    assert current.status == "completed"
+    assert current.pty_background_generation == "exact-tail"
+
+
+@pytest.mark.asyncio
 async def test_owned_completion_cannot_overwrite_cancelled_task(queue):
     task = await queue.create(title="owned", description="d", target_repo="/tmp")
     task_id = task.id
@@ -276,6 +292,35 @@ async def test_lifecycle_transitions_reject_same_slot_retry_aba(queue):
 
 
 @pytest.mark.asyncio
+async def test_completion_rejects_background_marker_armed_after_fence(queue):
+    instance = Instance(name="background-fence-worker")
+    queue.db.add(instance)
+    await queue.db.commit()
+    task = await queue.create(
+        title="foreground generation",
+        description="native child tail",
+        status="pending",
+    )
+    claimed = await queue.dequeue(instance_id=instance.id)
+    assert claimed is not None
+    task_id = claimed.id
+    generation = task_generation_fence(claimed)
+
+    claimed.pty_background_generation = "late-native-tail"
+    await queue.db.commit()
+
+    assert not await queue.mark_completed(
+        task_id,
+        instance_id=instance.id,
+        generation_fence=generation,
+    )
+    queue.db.expire_all()
+    current = await queue.get(task_id)
+    assert current.status == "in_progress"
+    assert current.pty_background_generation == "late-native-tail"
+
+
+@pytest.mark.asyncio
 async def test_defer_returns_active_task_without_consuming_retry_budget(queue):
     task = await queue.create(title="t", description="d", target_repo="/tmp")
     task_id = task.id
@@ -335,6 +380,17 @@ async def test_delete_conflict_task(queue):
 
 
 @pytest.mark.asyncio
+async def test_delete_rejects_completed_task_with_live_pty_background(queue):
+    task = await queue.create(title="background", description="tail")
+    task.status = "completed"
+    task.pty_background_generation = "exact-tail"
+    await queue.db.commit()
+
+    assert await queue.delete(task.id) is False
+    assert await queue.get(task.id) is not None
+
+
+@pytest.mark.asyncio
 async def test_delete_worker_mirror_requires_remote_confirmation(queue):
     task = await queue.create(
         title="remote",
@@ -347,6 +403,54 @@ async def test_delete_worker_mirror_requires_remote_confirmation(queue):
     assert await queue.delete(task_id) is False
     queue.db.expire_all()
     assert await queue.db.get(Task, task_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_remote_worker_delete_accepts_exact_background_mirror(queue):
+    task = await queue.create(
+        title="remote background",
+        description="d",
+        target_repo="/tmp",
+        worker_id=91,
+    )
+    task.status = "completed"
+    task.pty_background_generation = (
+        "worker-relay-background-mirror"
+    )
+    await queue.db.commit()
+    fence = task_delete_fence(task)
+
+    assert await queue.delete(
+        task.id,
+        expected_fence=fence,
+        remote_worker_deleted=True,
+    )
+    assert await queue.get(task.id) is None
+
+
+@pytest.mark.asyncio
+async def test_remote_worker_delete_rejects_changed_background_mirror(queue):
+    task = await queue.create(
+        title="remote background changed",
+        description="d",
+        target_repo="/tmp",
+        worker_id=91,
+    )
+    task.status = "completed"
+    task.pty_background_generation = "worker-relay-generation-1"
+    await queue.db.commit()
+    task_id = task.id
+    fence = task_delete_fence(task)
+
+    task.pty_background_generation = "worker-relay-generation-2"
+    await queue.db.commit()
+
+    assert not await queue.delete(
+        task_id,
+        expected_fence=fence,
+        remote_worker_deleted=True,
+    )
+    assert await queue.get(task_id) is not None
 
 
 @pytest.mark.asyncio

@@ -2084,6 +2084,644 @@ async def test_notifications_stream_delta_and_finish_process():
 
 
 @pytest.mark.asyncio
+async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-1"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=1,
+    )
+    await process.stdout.readline()
+
+    common_item = {
+        "type": "collabAgentToolCall",
+        "id": "collab-1",
+        "tool": "wait",
+        "senderThreadId": "thread-1",
+        "receiverThreadIds": ["child-1"],
+        "model": None,
+        "reasoningEffort": None,
+        "agentsStates": {},
+    }
+    server._handle_notification("item/started", {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "item": {**common_item, "status": "inProgress"},
+    })
+    server._handle_notification("item/completed", {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "item": {**common_item, "status": "completed"},
+    })
+    for metadata_item in (
+        {
+            "type": "subAgentActivity",
+            "id": "activity-1",
+            "agentThreadId": "child-1",
+            "agentPath": "child",
+            "kind": "interacted",
+        },
+        {"type": "contextCompaction", "id": "compact-1"},
+    ):
+        server._handle_notification("item/started", {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": metadata_item,
+        })
+        server._handle_notification("item/completed", {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": metadata_item,
+        })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-1",
+        "turn": {"id": "turn-1", "status": "completed", "error": None},
+    })
+
+    # Parent completion is not EOF while the interacted child has no
+    # authoritative terminal proof.
+    await asyncio.sleep(0)
+    assert process.returncode is None
+    assert "child-1" in server._contexts_by_descendant
+
+    server._handle_notification("thread/status/changed", {
+        "threadId": "child-1",
+        "status": {"type": "idle"},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+    lines = []
+    while line := await process.stdout.readline():
+        lines.append(json.loads(line))
+
+    assert [line["type"] for line in lines] == [
+        "item.started",
+        "item.completed",
+        "turn.completed",
+    ]
+    assert lines[0]["item"] == {
+        "type": "collab_agent_tool_call",
+        "id": "collab-1",
+        "tool": "wait",
+        "status": "inProgress",
+        "sender_thread_id": "thread-1",
+        "receiver_thread_ids": ["child-1"],
+        "model": None,
+        "reasoning_effort": None,
+        "agents_states": {},
+    }
+    assert lines[1]["item"]["type"] == "collab_agent_tool_call"
+    assert lines[1]["item"]["status"] == "completed"
+    assert lines[2]["type"] == "turn.completed"
+    assert "child-1" not in server._contexts_by_descendant
+
+
+@pytest.mark.asyncio
+async def test_parent_completed_waits_for_active_child_and_preserves_late_output():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-parent", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-parent"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=11,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("item/completed", {
+        "threadId": "thread-parent",
+        "turnId": "turn-parent",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "active", "activeFlags": []},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-parent",
+        "turn": {
+            "id": "turn-parent",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    await asyncio.sleep(0)
+    assert process.returncode is None
+    assert server.has_active_thread("thread-parent") is True
+
+    # The context remains attached after native parent completion, so a
+    # notification already in the transport queue is delivered before EOF.
+    server._handle_notification("item/agentMessage/delta", {
+        "threadId": "thread-parent",
+        "turnId": "turn-parent",
+        "itemId": "late-message",
+        "delta": "late but valid",
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "idle"},
+    })
+
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    lines = []
+    while line := await process.stdout.readline():
+        lines.append(json.loads(line))
+    assert [line["type"] for line in lines] == [
+        "item.agent_message.delta",
+        "turn.completed",
+    ]
+    assert lines[0]["delta"] == "late but valid"
+    assert server._contexts_by_descendant == {}
+
+
+@pytest.mark.asyncio
+async def test_started_activity_overrides_stale_idle_child_runtime():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-root", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=111,
+    )
+    await process.stdout.readline()
+
+    # An idle observation from an earlier child turn must not override the
+    # newer spawn/start activity while its turn notification is in flight.
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "idle"},
+    })
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert process.returncode is None
+    server._handle_notification("turn/started", {
+        "threadId": "thread-child",
+        "turn": {"id": "turn-child", "status": "inProgress"},
+    })
+    assert process.returncode is None
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "idle"},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_parent_completed_waits_for_nested_descendant_lineage():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-root", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate nested agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=12,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-child",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    # The child can spawn a grandchild before CCM has any child turn mapping.
+    # Its thread lineage must still extend the exact root generation.
+    server._handle_notification("item/completed", {
+        "threadId": "thread-child",
+        "turnId": "turn-child",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-grandchild",
+            "agentThreadId": "thread-grandchild",
+            "agentPath": "/root/child/grandchild",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "active", "activeFlags": []},
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-grandchild",
+        "status": {"type": "active", "activeFlags": []},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "idle"},
+    })
+
+    await asyncio.sleep(0)
+    assert process.returncode is None
+    assert server._contexts_by_descendant["thread-grandchild"] is (
+        server._contexts_by_thread["thread-root"]
+    )
+
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-grandchild",
+        "status": {"type": "idle"},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_interacted_child_uses_thread_read_to_resolve_queue_only_race(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "backend.services.codex_app_server._DESCENDANT_RECONCILE_INTERVAL",
+        0.01,
+    )
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-root",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-root"}}
+        if method == "thread/read":
+            assert params["threadId"] == "thread-child"
+            return {
+                "thread": {
+                    "id": "thread-child",
+                    "status": {"type": "idle"},
+                },
+            }
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="send a queue-only message",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=13,
+    )
+    await process.stdout.readline()
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "send-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "interacted",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    assert any(
+        call.args[0] == "thread/read"
+        for call in server._request.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_returncode"),
+    [("failed", 1), ("interrupted", 130)],
+)
+async def test_unsuccessful_parent_terminal_is_bounded_with_active_child(
+    status,
+    expected_returncode,
+):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-root",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-root"}}
+        if method == "turn/interrupt":
+            assert params == {
+                "threadId": "thread-child",
+                "turnId": "turn-child",
+            }
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "thread/status/changed",
+                {
+                    "threadId": "thread-child",
+                    "status": {"type": "idle"},
+                },
+            )
+            return {}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="work",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=14,
+    )
+    await process.stdout.readline()
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("turn/started", {
+        "threadId": "thread-child",
+        "turn": {"id": "turn-child", "status": "inProgress"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {
+            "id": "turn-root",
+            "status": status,
+            "error": (
+                {"message": "root failed"}
+                if status == "failed"
+                else None
+            ),
+        },
+    })
+
+    await asyncio.sleep(0)
+    assert process.returncode is None
+    assert await asyncio.wait_for(process.wait(), timeout=1) == (
+        expected_returncode
+    )
+    assert server._contexts_by_descendant == {}
+    assert any(
+        call.args[0] == "turn/interrupt"
+        for call in server._request.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_descendant_terminal_deadline_holds_adapter_until_proven(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "backend.services.codex_app_server._DESCENDANT_RECONCILE_INTERVAL",
+        0.001,
+    )
+    monkeypatch.setattr(
+        "backend.services.codex_app_server._DESCENDANT_TERMINAL_TIMEOUT",
+        0.02,
+    )
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-root",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-root"}}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": params["threadId"],
+                    "status": {"type": "active", "activeFlags": []},
+                },
+            }
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="work",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=15,
+    )
+    await process.stdout.readline()
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+
+    await asyncio.sleep(0.08)
+    context = server._contexts_by_thread["thread-root"]
+    assert process.returncode is None
+    assert (
+        context.deferred_terminal_notification["turn"]["status"]
+        == "failed"
+    )
+    assert server._contexts_by_descendant["thread-child"] is context
+
+    # Only an authoritative terminal notification releases EOF.
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "idle"},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 1
+    lines = []
+    while line := await process.stdout.readline():
+        lines.append(json.loads(line))
+    assert [line["type"] for line in lines] == ["turn.failed"]
+    assert "could not prove all native sub-agents terminal" in (
+        lines[0]["error"]["message"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_descendant_abandon_escalates_transport_shutdown(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "descendant-abandon")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-root",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-root"}}
+        if method == "thread/read":
+            assert params == {
+                "threadId": "thread-child",
+                "includeTurns": True,
+            }
+            return {
+                "thread": {
+                    "id": "thread-child",
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": [],
+                },
+            }
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    server.shutdown = AsyncMock()
+    process, _ = await server.start_turn(
+        prompt="work",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=16,
+    )
+    await process.stdout.readline()
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    await asyncio.sleep(0)
+
+    interrupt_confirmed = await server.abandon_turn(
+        process,
+        "consumer cancelled",
+    )
+    assert interrupt_confirmed is False
+    assert process.returncode is None
+    assert server._contexts_by_thread["thread-root"].process is process
+    assert server._contexts_by_turn["turn-root"].process is process
+    assert server._contexts_by_descendant["thread-child"].process is process
+
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    transport_stopped = await registry.abort_unclaimed_turn(
+        home,
+        process,
+        reason="consumer cancelled",
+    )
+
+    assert transport_stopped is True
+    server.shutdown.assert_awaited_once()
+    assert process.returncode == 130
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert home not in registry._servers
+    assert home not in registry._draining
+
+
+@pytest.mark.asyncio
 async def test_read_and_fork_thread_use_native_app_server_protocol():
     server = CodexAppServer("codex")
     server.ensure_started = AsyncMock()
@@ -2323,6 +2961,25 @@ async def test_reader_exit_fails_pending_requests_and_active_turns():
         resume_session_id=None, git_env=None, task_id=1,
     )
     await turn_process.stdout.readline()
+    context = server._contexts_by_thread["thread-1"]
+    server._handle_notification("item/completed", {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-1",
+        "turn": {"id": "turn-1", "status": "completed", "error": None},
+    })
+    await asyncio.sleep(0)
+    assert context.descendant_guard_task is not None
+    assert turn_process.returncode is None
     pending = asyncio.get_running_loop().create_future()
     server._pending[99] = pending
 
@@ -2337,6 +2994,8 @@ async def test_reader_exit_fails_pending_requests_and_active_turns():
     assert await turn_process.wait() == 1
     assert not server._contexts_by_thread
     assert not server._contexts_by_turn
+    assert not server._contexts_by_descendant
+    assert context.descendant_guard_task is None
     assert not server._pending
     with pytest.raises(CodexAppServerError, match="exited unexpectedly"):
         await pending
@@ -2354,6 +3013,34 @@ def test_normalize_app_server_command_item():
     assert normalized["type"] == "command_execution"
     assert normalized["aggregated_output"] == "/tmp\n"
     assert normalized["exit_code"] == 0
+
+
+def test_normalize_app_server_collab_agent_item():
+    normalized = CodexAppServer._normalize_item({
+        "type": "collabAgentToolCall",
+        "id": "collab-1",
+        "tool": "spawnAgent",
+        "status": "completed",
+        "senderThreadId": "thread-parent",
+        "receiverThreadIds": ["thread-child"],
+        "reasoningEffort": "high",
+        "agentsStates": {
+            "thread-child": {"status": "completed", "message": None},
+        },
+    })
+
+    assert normalized == {
+        "type": "collab_agent_tool_call",
+        "id": "collab-1",
+        "tool": "spawnAgent",
+        "status": "completed",
+        "sender_thread_id": "thread-parent",
+        "receiver_thread_ids": ["thread-child"],
+        "reasoning_effort": "high",
+        "agents_states": {
+            "thread-child": {"status": "completed", "message": None},
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -3033,8 +3720,16 @@ async def test_cancelled_turn_with_unconfirmed_interrupt_escalates_transport(
     server.shutdown.assert_awaited_once()
     assert home not in registry._starting
     assert thread_id not in registry._thread_owners
-    assert server._contexts_by_thread == {}
-    assert server._contexts_by_turn == {}
+    if shutdown_fails:
+        # No terminal proof exists: retain the exact adapter generation while
+        # the account remains fail-closed/draining.
+        assert server._contexts_by_thread[thread_id].process.returncode is None
+        assert server._contexts_by_turn["turn-interrupt-failure"].process is (
+            server._contexts_by_thread[thread_id].process
+        )
+    else:
+        assert server._contexts_by_thread == {}
+        assert server._contexts_by_turn == {}
 
 
 @pytest.mark.asyncio

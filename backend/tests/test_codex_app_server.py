@@ -1502,6 +1502,74 @@ async def test_steer_turn_targets_the_active_turn():
 
 
 @pytest.mark.asyncio
+async def test_steer_turn_sends_native_text_image_and_file_inputs():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-1"}},
+        {"turnId": "turn-1"},
+    ])
+    await server.start_turn(
+        prompt="work", cwd="/tmp", model="gpt-5.5", effort="low",
+        resume_session_id=None, git_env=None, task_id=1,
+    )
+    native_input = [
+        {"type": "text", "text": "inspect both attachments"},
+        {"type": "localImage", "path": "/tmp/screenshot.png"},
+        {
+            "type": "mention",
+            "name": "report.txt",
+            "path": "/tmp/report.txt",
+        },
+    ]
+
+    assert await server.steer_turn(
+        "thread-1",
+        "inspect both attachments",
+        input_items=native_input,
+    ) is True
+    steer_call = server._request.await_args_list[2]
+    assert steer_call.args == (
+        "turn/steer",
+        {
+            "threadId": "thread-1",
+            "expectedTurnId": "turn-1",
+            "input": native_input,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_input",
+    [
+        [{"type": "localImage", "path": "relative/image.png"}],
+        [{
+            "type": "mention",
+            "name": "report.txt",
+            "path": "relative/report.txt",
+        }],
+    ],
+)
+async def test_steer_turn_rejects_relative_attachment_paths(invalid_input):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock()
+
+    with pytest.raises(ValueError, match="Invalid Codex steer input item"):
+        await server.steer_turn(
+            "thread-1",
+            "inspect attachment",
+            input_items=invalid_input,
+        )
+
+    server._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_existing_goal_turn_notification_rebinds_submission_id():
     """A turn/start submission can be steered into an older native goal turn."""
 
@@ -1760,7 +1828,7 @@ async def test_steer_retries_authoritative_active_turn_id():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    steer_ids: list[str] = []
+    steer_requests: list[dict] = []
 
     async def request(method, params):
         if method == "thread/resume":
@@ -1773,7 +1841,7 @@ async def test_steer_retries_authoritative_active_turn_id():
         if method == "turn/start":
             return {"turn": {"id": "turn-submission"}}
         if method == "turn/steer":
-            steer_ids.append(params["expectedTurnId"])
+            steer_requests.append(params)
             if params["expectedTurnId"] == "turn-submission":
                 raise CodexAppServerError(
                     "turn/steer failed: expected active turn id "
@@ -1793,8 +1861,27 @@ async def test_steer_retries_authoritative_active_turn_id():
         task_id=208,
     )
 
-    assert await server.steer_turn("thread-goal", "new evidence") is True
-    assert steer_ids == ["turn-submission", "turn-active-goal"]
+    native_input = [
+        {"type": "text", "text": "new evidence"},
+        {"type": "localImage", "path": "/tmp/evidence.png"},
+        {
+            "type": "mention",
+            "name": "evidence.txt",
+            "path": "/tmp/evidence.txt",
+        },
+    ]
+    assert await server.steer_turn(
+        "thread-goal",
+        "new evidence",
+        input_items=native_input,
+    ) is True
+    assert [
+        request["expectedTurnId"] for request in steer_requests
+    ] == ["turn-submission", "turn-active-goal"]
+    assert [request["input"] for request in steer_requests] == [
+        native_input,
+        native_input,
+    ]
     assert (
         server._contexts_by_thread["thread-goal"].turn_id
         == "turn-active-goal"

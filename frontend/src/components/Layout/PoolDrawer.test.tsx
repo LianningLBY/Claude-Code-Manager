@@ -857,6 +857,146 @@ describe('PoolDrawer', () => {
       });
     });
 
+    it('renders unrestricted CloudRouter usage without presenting informational zeroes as the Key balance', async () => {
+      vi.mocked(api.getCloudRouterAccounts).mockResolvedValue([{
+        ...apiAccount,
+        id: 'cloudrouter-5',
+        name: 'CloudRouter Unlimited',
+        key_hint: 'cr-…9abc',
+      }]);
+      vi.mocked(api.getPoolUsage).mockResolvedValue({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'cloudrouter-5',
+          config_dir: '/tmp/cloudrouter-5/claude',
+          email: '',
+          role: 'api',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          api_provider: 'cloudrouter',
+          display_name: 'CloudRouter Unlimited',
+          api_account_id: 'cloudrouter-5',
+          supported_models: ['claude-sonnet-4-6'],
+          api_quota: {
+            state: 'active',
+            mode: 'unrestricted',
+            known: true,
+            stale: true,
+            currency: 'USD',
+            balance: 0,
+            remaining: 0,
+            fetched_at: '2026-07-28T08:30:00Z',
+            refresh_failed_at: '2026-07-28T09:00:00Z',
+            usage: {
+              today: {
+                actual_cost: 0.4662,
+                requests: 2,
+                total_tokens: 5967,
+              },
+              total: {
+                actual_cost: 1.25,
+                requests: 7,
+                total_tokens: 12345,
+              },
+              daily_usage: [{
+                date: '2026-07-28',
+                actual_cost: 0.4662,
+                requests: 2,
+                total_tokens: 5967,
+              }],
+              model_stats: [{
+                model: 'claude-sonnet-4-6',
+                actual_cost: 0.4662,
+                requests: 2,
+                total_tokens: 5967,
+              }],
+            },
+          },
+        }],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+
+      const card = (await screen.findByText('CloudRouter Unlimited')).closest('.rounded-lg') as HTMLElement;
+      expect(await within(card).findByText('Key 指纹：cr-…9abc')).toBeInTheDocument();
+      await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
+
+      expect(card).toHaveTextContent('Key 无独立消费额度上限');
+      expect(card).toHaveTextContent('Key 总额度：不限（共享组织池）');
+      expect(card).toHaveTextContent('组织总额度：接口未提供');
+      expect(card).toHaveTextContent('组织剩余额度：接口未提供');
+      expect(card).toHaveTextContent('Key 共享组织账户池，不代表组织池本身无限');
+      expect(card).toHaveTextContent('组织余额、充值和结算状态请前往 CloudRouter 控制台核对');
+      expect(card).toHaveTextContent('到期时间：接口未提供');
+      expect(card).toHaveTextContent('剩余天数：接口未提供');
+      expect(card).toHaveTextContent('CloudRouter 未返回有效期，CCM 不推断为永久有效');
+      expect(card).not.toHaveTextContent('到期时间：无法确认');
+      expect(card).not.toHaveTextContent('剩余天数：无法确认');
+      expect(card).toHaveTextContent('当前 Key 今日用量');
+      expect(card).toHaveTextContent('费用 $0.4662');
+      expect(card).toHaveTextContent('请求 2');
+      expect(card).toHaveTextContent('Tokens 5,967');
+      expect(card).toHaveTextContent('当前 Key 累计用量');
+      expect(card).toHaveTextContent('费用 $1.25');
+      expect(card).toHaveTextContent('缓存数据');
+      expect(card).not.toHaveTextContent('剩余 $0');
+      expect(card).not.toHaveTextContent('余额 $0');
+      expect(card).not.toHaveTextContent('总额度：无法确认');
+      expect(card).not.toHaveTextContent('数据时间：无法确认');
+      expect(card).toHaveTextContent('刷新失败时间：');
+
+      await user.click(within(card).getByText('逐日用量（最多显示 20 条）'));
+      await user.click(within(card).getByText('逐模型用量（最多显示 20 条）'));
+      expect(card).toHaveTextContent('2026-07-28');
+      expect(card).toHaveTextContent('claude-sonnet-4-6');
+    });
+
+    it('does not trust a Key hint carried only by an ordinary Pool projection', async () => {
+      vi.mocked(api.getCloudRouterAccounts).mockRejectedValue(new Error('admin access required'));
+      vi.mocked(api.getPoolUsage).mockResolvedValue({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'cloudrouter-6',
+          config_dir: '/tmp/cloudrouter-6/claude',
+          email: '',
+          role: 'api',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'Member Projection',
+          api_account_id: 'cloudrouter-6',
+          key_hint: 'must-not-render',
+          supported_models: ['claude-sonnet-4-6'],
+          api_quota: null,
+        }],
+      } as never);
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+
+      const card = screen.getByText('Member Projection').closest('.rounded-lg') as HTMLElement;
+      expect(card).not.toHaveTextContent('Key 指纹');
+      expect(card).not.toHaveTextContent('must-not-render');
+    });
+
     it('marks missing quota and expiry fields as unconfirmed instead of displaying zero', async () => {
       vi.mocked(api.getPoolUsage).mockResolvedValue({
         enabled: true,
@@ -901,7 +1041,7 @@ describe('PoolDrawer', () => {
       expect(card).not.toHaveTextContent('$0');
     });
 
-    it('renders a confirmed active wallet without expiry fields as unlimited duration', async () => {
+    it('does not infer unlimited duration from an active wallet with no expiry fields', async () => {
       vi.mocked(api.getPoolUsage).mockResolvedValue({
         enabled: true,
         total: 1,
@@ -944,9 +1084,10 @@ describe('PoolDrawer', () => {
       await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
       expect(card).toHaveTextContent('剩余 $3,000');
       expect(card).toHaveTextContent('余额 $3,000');
-      expect(card).toHaveTextContent('到期时间：无期限');
-      expect(card).toHaveTextContent('剩余天数：无期限');
-      expect(card).not.toHaveTextContent('到期时间：无法确认');
+      expect(card).toHaveTextContent('到期时间：无法确认');
+      expect(card).toHaveTextContent('剩余天数：无法确认');
+      expect(card).not.toHaveTextContent('到期时间：无期限');
+      expect(card).not.toHaveTextContent('剩余天数：无期限');
     });
 
     it('renders CloudRouter remaining=-1 as unlimited instead of a negative balance', async () => {

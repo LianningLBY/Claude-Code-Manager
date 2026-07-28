@@ -22,6 +22,7 @@ from backend.services.instance_manager import (
     InstanceNotFoundError,
     InstanceManager,
     LaunchSupersededError,
+    LiveAttachmentInjectionUnsupportedError,
 )
 from backend.services.claude_pool import ClaudePool
 from backend.services.codex_pool import CodexPool
@@ -213,6 +214,63 @@ def test_parse_codex_agent_message():
     assert event["role"] == "assistant"
     assert event["content"] == "Done"
     assert event["is_error"] is False
+
+
+@pytest.mark.asyncio
+async def test_inject_codex_message_forwards_native_attachment_inputs():
+    registry = MagicMock()
+    registry.steer_turn = AsyncMock(return_value=True)
+    manager = InstanceManager(MagicMock(), MagicMock())
+    manager._codex_app_server = registry
+    input_items = [
+        {"type": "text", "text": "inspect both attachments"},
+        {"type": "localImage", "path": "/tmp/screenshot.png"},
+        {
+            "type": "mention",
+            "name": "report.txt",
+            "path": "/tmp/report.txt",
+        },
+    ]
+
+    assert await manager.inject_codex_message(
+        "thread-1",
+        "inspect both attachments",
+        input_items=input_items,
+    ) is True
+    registry.steer_turn.assert_awaited_once_with(
+        "thread-1",
+        "inspect both attachments",
+        input_items=input_items,
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_pty_attachment_rejects_container_before_inject():
+    session = types.SimpleNamespace(
+        session_id="claude-session-1",
+        is_alive=True,
+        inject=AsyncMock(return_value=True),
+    )
+    consumer = MagicMock()
+    consumer.done.return_value = False
+    manager = InstanceManager(MagicMock(), MagicMock())
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={7: session},
+        _consumers={7: consumer},
+    )
+    manager._container_tasks[7] = 99
+
+    with pytest.raises(
+        LiveAttachmentInjectionUnsupportedError,
+        match="cannot access uploaded files",
+    ):
+        await manager.inject_pty_message(
+            "claude-session-1",
+            "Read /tmp/upload.txt",
+            require_host_file_access=True,
+        )
+
+    session.inject.assert_not_awaited()
 
 
 @pytest.mark.asyncio

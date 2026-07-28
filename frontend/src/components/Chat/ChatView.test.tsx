@@ -29,6 +29,10 @@ vi.mock('../../api/client', () => ({
       codex_main_mcp_enabled: true,
     }),
     config: vi.fn().mockResolvedValue({ model_options: ['claude-opus-4-6'], codex_model_options: [] }),
+    getInjectCapabilities: vi.fn().mockResolvedValue({
+      attachment_protocol: 1,
+      codex_native_inputs: true,
+    }),
     injectTaskMessage: vi.fn().mockResolvedValue({ ok: true, injected: true }),
     listQuickPhrases: vi.fn().mockResolvedValue([]),
     createQuickPhrase: vi.fn().mockResolvedValue({}),
@@ -129,6 +133,15 @@ describe('ChatView', () => {
       pty_available: false,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+    });
+    (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getInjectCapabilities as ReturnType<typeof vi.fn>).mockResolvedValue({
+      attachment_protocol: 1,
+      codex_native_inputs: true,
+    });
+    (api.injectTaskMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      injected: true,
     });
   });
 
@@ -329,9 +342,254 @@ describe('ChatView', () => {
             model: null,
             codex_service_tier: 'default',
           },
+          undefined,
         );
       });
       expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('uploads images and files and injects their exact server metadata into the active turn', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockImplementation(async ([file]) => [{
+        id: `upload-${file.name}`,
+        filename: file.name,
+        path: `/srv/uploads/${file.name}`,
+        url: `/api/uploads/${file.name}`,
+        is_image: file.type.startsWith('image/'),
+      }]);
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: true,
+        attachment_count: 2,
+      });
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      const picker = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+      await userEvent.upload(picker, [
+        new File(['png'], 'diagram.png', { type: 'image/png' }),
+        new File(['notes'], 'notes.txt', { type: 'text/plain' }),
+      ]);
+      await waitFor(() => expect(api.uploadImages).toHaveBeenCalledTimes(2));
+      await screen.findByText('notes.txt');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      await waitFor(() => {
+        expect(api.getInjectCapabilities).toHaveBeenCalledWith(task.id);
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          '(files attached)',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          {
+            file_paths: [
+              '/srv/uploads/diagram.png',
+              '/srv/uploads/notes.txt',
+            ],
+            image_paths: ['/srv/uploads/diagram.png'],
+            attachments: [
+              {
+                url: '/api/uploads/diagram.png',
+                name: 'diagram.png',
+                is_image: true,
+              },
+              {
+                url: '/api/uploads/notes.txt',
+                name: 'notes.txt',
+                is_image: false,
+              },
+            ],
+          },
+        );
+      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.queryByText('notes.txt')).not.toBeInTheDocument();
+      });
+    });
+
+    it('does not contact an old inject endpoint before attachment capability is confirmed', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockResolvedValue([{
+        id: 'upload-evidence',
+        filename: 'evidence.txt',
+        path: '/srv/uploads/evidence.txt',
+        url: '/api/uploads/evidence.txt',
+        is_image: false,
+      }]);
+      vi.mocked(api.getInjectCapabilities).mockRejectedValue(
+        new Error('HTTP 404'),
+      );
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
+      );
+      await screen.findByText('evidence.txt');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      expect(await screen.findByText(/HTTP 404/)).toHaveTextContent(
+        '消息和附件已保留',
+      );
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+    });
+
+    it('keeps attachments unless the server confirms the exact attachment count', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockResolvedValue([{
+        id: 'upload-evidence',
+        filename: 'evidence.txt',
+        path: '/srv/uploads/evidence.txt',
+        url: '/api/uploads/evidence.txt',
+        is_image: false,
+      }]);
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: true,
+      });
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
+      );
+      await screen.findByText('evidence.txt');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      expect(await screen.findByText(/没有确认全部附件均已注入/)).toHaveTextContent(
+        '消息和附件已保留',
+      );
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+    });
+
+    it('freezes composer edits while an injection request is in flight', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      let resolveInjection!: (value: {
+        ok: boolean;
+        injected: boolean;
+      }) => void;
+      vi.mocked(api.injectTaskMessage).mockImplementation(
+        () => new Promise((resolve) => {
+          resolveInjection = resolve;
+        }),
+      );
+      render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      const textbox = screen.getByRole('textbox');
+      await userEvent.type(textbox, 'snapshot');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalled());
+
+      expect(textbox).toBeDisabled();
+      expect(screen.getByTitle('Attach files')).toBeDisabled();
+      expect(screen.getByTitle(/注入模式已开启/)).toBeDisabled();
+
+      await act(async () => {
+        resolveInjection({ ok: true, injected: true });
+      });
+      await waitFor(() => expect(textbox).not.toBeDisabled());
+      expect(textbox).toHaveValue('');
+    });
+
+    it('keeps the text and uploaded attachment when the server does not confirm injection', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockResolvedValue([{
+        id: 'upload-evidence',
+        filename: 'evidence.txt',
+        path: '/srv/uploads/evidence.txt',
+        url: '/api/uploads/evidence.txt',
+        is_image: false,
+      }]);
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: false,
+      });
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
+      );
+      await screen.findByText('evidence.txt');
+      await userEvent.type(screen.getByRole('textbox'), '请结合附件继续');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      expect(await screen.findByText(/服务器没有确认消息已注入/)).toHaveTextContent(
+        '消息和附件已保留',
+      );
+      expect(screen.getByRole('textbox')).toHaveValue('请结合附件继续');
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('does not silently drop a failed upload when injecting text', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockRejectedValue(new Error('upload rejected'));
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['bad'], 'broken.txt', { type: 'text/plain' }),
+      );
+      await screen.findByTitle('Click to retry');
+      await userEvent.type(screen.getByRole('textbox'), '不要漏掉附件');
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', ctrlKey: true });
+
+      expect(await screen.findByText('Retry or remove failed attachments before sending.')).toBeInTheDocument();
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(screen.getByText('broken.txt')).toBeInTheDocument();
     });
 
     it('does not offer local injection for worker tasks', async () => {

@@ -1766,15 +1766,68 @@ class CodexAppServer:
             )
         return interrupt_confirmed
 
-    async def steer_turn(self, thread_id: str, content: str) -> bool:
+    async def steer_turn(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Append user input to the currently active regular turn.
 
         ``expectedTurnId`` makes the request race-safe: if the turn finishes
         between the local context lookup and the RPC, app-server rejects the
         stale steer instead of attaching it to a later turn.
         """
-        if not self.is_alive or not thread_id or not content:
+        if not self.is_alive or not thread_id or (not content and not input_items):
             return False
+        if input_items is None:
+            steer_input: list[dict[str, Any]] = [
+                {"type": "text", "text": content},
+            ]
+        else:
+            steer_input = []
+            for item in input_items:
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid Codex steer input item")
+                item_type = item.get("type")
+                if (
+                    item_type == "text"
+                    and set(item) == {"type", "text"}
+                    and isinstance(item.get("text"), str)
+                    and item["text"]
+                ):
+                    steer_input.append({
+                        "type": "text",
+                        "text": item["text"],
+                    })
+                elif (
+                    item_type == "localImage"
+                    and set(item) == {"type", "path"}
+                    and isinstance(item.get("path"), str)
+                    and os.path.isabs(item["path"])
+                ):
+                    steer_input.append({
+                        "type": "localImage",
+                        "path": item["path"],
+                    })
+                elif (
+                    item_type == "mention"
+                    and set(item) == {"type", "name", "path"}
+                    and isinstance(item.get("name"), str)
+                    and item["name"]
+                    and isinstance(item.get("path"), str)
+                    and os.path.isabs(item["path"])
+                ):
+                    steer_input.append({
+                        "type": "mention",
+                        "name": item["name"],
+                        "path": item["path"],
+                    })
+                else:
+                    raise ValueError("Invalid Codex steer input item")
+            if not steer_input:
+                raise ValueError("Codex steer input cannot be empty")
         context = self._contexts_by_thread.get(thread_id)
         if (
             context is None
@@ -1790,7 +1843,7 @@ class CodexAppServer:
                 {
                     "threadId": thread_id,
                     "expectedTurnId": expected_turn_id,
-                    "input": [{"type": "text", "text": content}],
+                    "input": steer_input,
                 },
             )
         except Exception as exc:
@@ -1810,7 +1863,7 @@ class CodexAppServer:
                         {
                             "threadId": thread_id,
                             "expectedTurnId": actual_turn_id,
-                            "input": [{"type": "text", "text": content}],
+                            "input": steer_input,
                         },
                     )
                 except Exception as retry_exc:
@@ -3068,13 +3121,25 @@ class CodexAppServerRegistry:
                 await _settle_registry_cleanup(_detach_shutdown_home())
         return True
 
-    async def steer_turn(self, thread_id: str, content: str) -> bool:
+    async def steer_turn(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> bool:
         async with self._lock:
             home = self._thread_owners.get(thread_id)
             server = self._servers.get(home) if home else None
         if server is None:
             return False
-        return await server.steer_turn(thread_id, content)
+        if input_items is None:
+            return await server.steer_turn(thread_id, content)
+        return await server.steer_turn(
+            thread_id,
+            content,
+            input_items=input_items,
+        )
 
     async def read_rate_limits(
         self, codex_home: str | os.PathLike[str] | None,

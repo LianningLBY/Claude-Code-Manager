@@ -111,6 +111,10 @@ class ConsumerRecoveryUnsettledError(RuntimeError):
     """A crashed consumer could not durably settle its exact generation."""
 
 
+class LiveAttachmentInjectionUnsupportedError(RuntimeError):
+    """The active transport cannot safely access Manager upload paths."""
+
+
 @dataclass(frozen=True)
 class _OutputConsumerRecord:
     """Identity of one output-bookkeeping generation for a reusable slot."""
@@ -341,7 +345,13 @@ class InstanceManager:
             for session in getattr(self._pty_backend, "_sessions", {}).values()
         )
 
-    async def inject_pty_message(self, session_id: str, content: str) -> bool:
+    async def inject_pty_message(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        require_host_file_access: bool = False,
+    ) -> bool:
         """Inject text into a live PTY session (PTY-only).
 
         Looked up by Claude session_id — the chat path picks a different
@@ -370,22 +380,49 @@ class InstanceManager:
                 "PTY inject rejected for session %s: no running turn", session_id
             )
             return False
+        if require_host_file_access and key in self._container_tasks:
+            # Shared-project PTY sessions run inside a container whose mount
+            # set does not include Manager's upload directory.  Sending only a
+            # host path would look successful while silently dropping every
+            # attachment from the model's reachable filesystem.
+            raise LiveAttachmentInjectionUnsupportedError(
+                "The active Claude PTY container cannot access uploaded files"
+            )
         try:
             return await session.inject(content)
         except Exception:
             logger.exception("PTY inject failed for session %s", session_id)
             return False
 
-    async def inject_codex_message(self, thread_id: str, content: str) -> bool:
+    async def inject_codex_message(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict] | None = None,
+    ) -> bool:
         """Steer a live Codex app-server turn without starting a new turn.
 
         Codex ``exec`` subprocesses do not expose same-turn steering, so a
         missing app-server/context deliberately returns False.
         """
-        if self._codex_app_server is None or not thread_id or not content:
+        if (
+            self._codex_app_server is None
+            or not thread_id
+            or (not content and not input_items)
+        ):
             return False
         try:
-            return await self._codex_app_server.steer_turn(thread_id, content)
+            if input_items is None:
+                return await self._codex_app_server.steer_turn(
+                    thread_id,
+                    content,
+                )
+            return await self._codex_app_server.steer_turn(
+                thread_id,
+                content,
+                input_items=input_items,
+            )
         except Exception:
             logger.exception("Codex inject failed for thread %s", thread_id)
             return False

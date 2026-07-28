@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api } from '../../api/client';
-import type { ChatMessage, CodexForkAnchor, FileAttachment, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
 import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
@@ -132,6 +132,20 @@ function ContextUsageIndicator({ usage }: { usage: ContextUsage }) {
   );
 }
 
+function injectAttachments(uploadResults: UploadResult[]): InjectTaskAttachments {
+  return {
+    file_paths: uploadResults.map((result) => result.path),
+    image_paths: uploadResults
+      .filter((result) => result.is_image)
+      .map((result) => result.path),
+    attachments: uploadResults.map((result) => ({
+      url: result.url,
+      name: result.filename || result.url.split('/').pop() || 'file',
+      is_image: result.is_image,
+    })),
+  };
+}
+
 export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, inline }: ChatViewProps) {
   const projectName = useMemo(() => {
     if (!task.project_id) return null;
@@ -225,6 +239,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [codexAppServerEnabled, setCodexAppServerEnabled] = useState(false);
   const [codexMainMcpEnabled, setCodexMainMcpEnabled] = useState<boolean | null>(null);
   const [injecting, setInjecting] = useState(false);
+  const injectingRef = useRef(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
   const [injectMode, setInjectMode] = useState(false);
   const canInject = task.worker_id == null && task.shared_from_id == null && (
@@ -276,23 +291,65 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return () => document.removeEventListener('mousedown', handle);
   }, [showModelMenu, modelOptions.length, task.provider]);
 
-  const handleInject = async () => {
-    const text = input.trim();
-    if (!text || injecting) return;
+  const handleInject = async (text: string, uploadResults: UploadResult[]) => {
+    if ((!text && uploadResults.length === 0) || injectingRef.current) return;
+    injectingRef.current = true;
     setInjecting(true);
     setError(null);
     try {
-      await api.injectTaskMessage(task.id, text, {
-        provider: task.provider,
-        model: task.model,
-        codex_service_tier: task.codex_service_tier,
-      });
-      setInput('');
+      if (uploadResults.length > 0) {
+        const capabilities = await api.getInjectCapabilities(task.id);
+        if (capabilities.attachment_protocol !== 1) {
+          throw new Error(
+            '当前服务器未确认附件注入协议，已在发送前停止；消息和附件未发送',
+          );
+        }
+      }
+      const result = await api.injectTaskMessage(
+        task.id,
+        text || '(files attached)',
+        {
+          provider: task.provider,
+          model: task.model,
+          codex_service_tier: task.codex_service_tier,
+        },
+        uploadResults.length > 0 ? injectAttachments(uploadResults) : undefined,
+      );
+      if (!result.ok || !result.injected) {
+        throw new Error('服务器没有确认消息已注入，输入和附件已保留');
+      }
+      if (
+        uploadResults.length > 0
+        && (
+          !Number.isInteger(result.attachment_count)
+          || result.attachment_count !== uploadResults.length
+        )
+      ) {
+        throw new Error(
+          '服务器没有确认全部附件均已注入，输入和附件已保留',
+        );
+      }
+      setInput((current) => (
+        current.trim() === text ? '' : current
+      ));
+      fileUpload.clear();
+      if (forkSeedUploads.length > 0) {
+        try {
+          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
+          localStorage.removeItem(forkSeedUploadsKey);
+        } catch { /* storage may be unavailable */ }
+        setForkSeedUploads([]);
+      }
     } catch (e) {
-      setError(`注入失败: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `未收到注入成功确认，消息和附件已保留；请先查看聊天记录或运行日志，再决定是否重试：${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
       onTaskUpdated?.();
       refreshHistoryRef.current();
     } finally {
+      injectingRef.current = false;
       setInjecting(false);
     }
   };
@@ -985,13 +1042,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [input]);
 
   useFileDrop({
-    onDrop: (files) => fileUpload.addFiles(files, (msg) => setDropError(msg)),
-    disabled: !task.session_id && !task.shared_from_id,
+    onDrop: (files) => {
+      if (!injectingRef.current) {
+        fileUpload.addFiles(files, (msg) => setDropError(msg));
+      }
+    },
+    disabled: injecting || (!task.session_id && !task.shared_from_id),
   });
 
   useEffect(() => {
-    if (!task.session_id && !task.shared_from_id) return;
+    if (injecting || (!task.session_id && !task.shared_from_id)) return;
     const handlePaste = (e: ClipboardEvent) => {
+      if (injectingRef.current) return;
       const items = e.clipboardData?.items;
       if (!items) return;
       const files: File[] = [];
@@ -1008,7 +1070,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     };
     document.addEventListener('paste', handlePaste);
     return () => document.removeEventListener('paste', handlePaste);
-  }, [task.session_id, task.shared_from_id, fileUpload.addFiles]);
+  }, [
+    task.session_id,
+    task.shared_from_id,
+    fileUpload.addFiles,
+    injecting,
+  ]);
 
   useEffect(() => {
     if (dropError) {
@@ -1018,6 +1085,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [dropError]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (injectingRef.current) {
+      e.target.value = '';
+      return;
+    }
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
     fileUpload.addFiles(files, (msg) => setDropError(msg));
@@ -1091,13 +1162,24 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       : fileUpload.uploadedResults.length + forkSeedUploads.length;
     if (!text && sendableAttachmentCount === 0) return;
 
-    // 注入模式：发送动作直达当前 turn（仅文本；不开新 turn、不排队）
-    if (injectMode && canInject && !fromQueue) {
-      if (text) await handleInject();
+    if (!fromQueue && fileUpload.isUploading) {
+      setError('附件仍在上传，请等待上传完成后再发送。');
       return;
     }
     if (!fromQueue && fileUpload.hasFailed) {
       setError('Retry or remove failed attachments before sending.');
+      return;
+    }
+    // 注入模式：文本和已上传附件直达当前 turn，不新开 turn、不排队。
+    if (injectMode && canInject && !fromQueue) {
+      if (!isProcessing) {
+        setError('注入仅在 turn 正在运行时可用；空闲时请关闭注入模式发送普通消息。');
+        return;
+      }
+      await handleInject(
+        text,
+        [...forkSeedUploads, ...fileUpload.uploadedResults],
+      );
       return;
     }
 
@@ -1828,6 +1910,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     type="button"
                     aria-label={`Remove ${upload.filename || 'fork attachment'}`}
                     onClick={() => setForkSeedUploads((prev) => prev.filter((item) => item.id !== upload.id))}
+                    disabled={injecting}
                     className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
                   >
                     <X size={10} />
@@ -1852,13 +1935,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     </div>
                   )}
                   {upload.status === 'failed' && (
-                    <div className="absolute inset-0 bg-red-900/50 flex items-center justify-center cursor-pointer" onClick={() => fileUpload.retryFile(upload.id)} title="Click to retry">
+                    <div
+                      className={`absolute inset-0 bg-red-900/50 flex items-center justify-center ${injecting ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+                      onClick={() => {
+                        if (!injecting) fileUpload.retryFile(upload.id);
+                      }}
+                      title={injecting ? 'Injection in progress' : 'Click to retry'}
+                    >
                       <AlertCircle size={16} className="text-red-400" />
                     </div>
                   )}
                   <button
                     type="button"
                     onClick={() => fileUpload.removeFile(upload.id)}
+                    disabled={injecting}
                     className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
                   >
                     <X size={10} />
@@ -1874,26 +1964,27 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               ref={fileInputRef}
               type="file"
               multiple
+              disabled={injecting}
               className="hidden"
               onChange={handleFileSelect}
             />
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={(!task.session_id && !task.shared_from_id) || fileUpload.uploads.length >= 10}
+              disabled={injecting || (!task.session_id && !task.shared_from_id) || fileUpload.uploads.length >= 10}
               className="p-2 text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed"
               title="Attach files"
             >
               <Paperclip size={18} />
             </button>
-            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={!task.session_id && !task.shared_from_id} />
-            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={!task.session_id && !task.shared_from_id} />
+            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInject)} />
+            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || (!task.session_id && !task.shared_from_id)} />
             {/* Temp model override (one-shot) */}
             <div className="relative" data-temp-model>
               <button
                 type="button"
                 onClick={() => setShowModelMenu((v) => !v)}
-                disabled={!task.session_id && !task.shared_from_id}
+                disabled={injecting || (!task.session_id && !task.shared_from_id)}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   modelOverride ? 'text-indigo-300 bg-indigo-600/20' : 'text-gray-500 hover:text-gray-300'
                 }`}
@@ -1942,7 +2033,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <button
                 type="button"
                 onClick={() => setInjectMode((v) => !v)}
-                disabled={!task.session_id}
+                disabled={injecting || !task.session_id}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   injectMode ? 'text-teal-300 bg-teal-600/20' : 'text-gray-500 hover:text-teal-300'
                 }`}
@@ -1982,6 +2073,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             </div>
           </div>
           {/* Row 2: full-width input */}
+          {injectMode && canInject && (
+            <div className="text-[10px] leading-relaxed text-teal-300/80">
+              文本、图片和文件会注入当前 turn；只有服务器明确确认成功后才会清空输入和附件。
+            </div>
+          )}
           <div className="flex gap-2 items-end">
             <textarea
               ref={textareaRef}
@@ -1997,7 +2093,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
               }
-              disabled={!task.session_id && !task.shared_from_id}
+              disabled={injecting || (!task.session_id && !task.shared_from_id)}
               rows={1}
               className="flex-1 bg-gray-800 text-foreground rounded-xl px-4 py-2.5 text-sm border border-gray-700/70 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 resize-none disabled:opacity-50 max-h-48 overflow-y-auto transition-colors"
               style={{ minHeight: '40px' }}

@@ -442,7 +442,7 @@ class SSHExecutor:
         if code != 0:
             raise RuntimeError(f"mkdir failed: {out[-500:]}")
         ssh_opt = self._rsync_ssh_command()
-        cmd = ["rsync", "-az", "-e", ssh_opt, local_path,
+        cmd = ["rsync", "-az", "--secluded-args", "-e", ssh_opt, local_path,
                f"{self.user}@{self.host}:{remote_path}"]
 
         def _sync() -> None:
@@ -463,7 +463,7 @@ class SSHExecutor:
         import os as _os
         _os.makedirs(_os.path.dirname(local_path.rstrip("/")) or "/", exist_ok=True)
         ssh_opt = self._rsync_ssh_command()
-        cmd = ["rsync", "-az"] + (["--delete"] if delete else []) + [
+        cmd = ["rsync", "-az", "--secluded-args"] + (["--delete"] if delete else []) + [
             "-e", ssh_opt, f"{self.user}@{self.host}:{remote_path}", local_path]
 
         def _sync() -> None:
@@ -484,7 +484,14 @@ class SSHExecutor:
         # .gitignore 的忽略规则自动生效（.venv/node_modules/*.db 等），
         # 与仓库保持同步，避免手工 exclude 列表漂移；excludes 只补充
         # git 跟踪之外必须排除的内容
-        cmd = ["rsync", "-az", "--delete", "--filter", ":- .gitignore"]
+        cmd = [
+            "rsync",
+            "-az",
+            "--secluded-args",
+            "--delete",
+            "--filter",
+            ":- .gitignore",
+        ]
         for ex in excludes or []:
             cmd += ["--exclude", ex]
         ssh_opt = self._rsync_ssh_command()

@@ -859,13 +859,49 @@ def _usage_metrics(value: Any) -> dict[str, Any] | None:
         return None
     keys = (
         "requests", "input_tokens", "output_tokens", "total_tokens",
-        "cache_creation_tokens", "cache_read_tokens", "actual_cost",
+        "cache_creation_tokens", "cache_write_tokens", "cache_read_tokens",
+        "cost", "actual_cost", "account_cost",
         "rpm", "tpm", "average_duration_ms",
     )
     result = {key: parsed for key in keys if (parsed := _number(value.get(key))) is not None}
-    for key in ("model_stats", "daily_usage"):
-        if isinstance(value.get(key), (dict, list)):
-            result[key] = value[key]
+    return result or None
+
+
+def _usage_detail_record(value: Any) -> dict[str, Any] | None:
+    """Return one bounded, JSON-safe usage breakdown row."""
+
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key in ("date", "model"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            result[key] = raw.strip()
+    if metrics := _usage_metrics(value):
+        result.update(metrics)
+    return result or None
+
+
+def _usage_details(value: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
+    """Normalise the list or keyed-map shapes used by CloudRouter details."""
+
+    if isinstance(value, list):
+        result = [
+            record
+            for item in value
+            if (record := _usage_detail_record(item)) is not None
+        ]
+        return result or None
+    if not isinstance(value, dict):
+        return None
+    if record := _usage_detail_record(value):
+        return record
+    result = {
+        key: record
+        for key, item in value.items()
+        if isinstance(key, str)
+        and (record := _usage_detail_record(item)) is not None
+    }
     return result or None
 
 
@@ -976,19 +1012,24 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
             exhausted = exhausted or window_exhausted
 
     usage_value = payload.get("usage")
-    usage: dict[str, Any] | None = None
+    usage: dict[str, Any] = {}
     if isinstance(usage_value, dict):
-        usage = {}
         for key in ("today", "total"):
             if metrics := _usage_metrics(usage_value.get(key)):
                 usage[key] = metrics
         for key in ("rpm", "tpm", "average_duration_ms"):
             if (parsed := _number(usage_value.get(key))) is not None:
                 usage[key] = parsed
-        for key in ("model_stats", "daily_usage"):
-            if isinstance(usage_value.get(key), (dict, list)):
-                usage[key] = usage_value[key]
-        usage = usage or None
+    # The live CloudRouter response places these breakdowns at the top level,
+    # while older/alternate responses may nest them under ``usage``. Keep the
+    # public shape stable without forwarding arbitrary or non-finite JSON data.
+    for key in ("model_stats", "daily_usage"):
+        raw = payload.get(key)
+        if raw is None and isinstance(usage_value, dict):
+            raw = usage_value.get(key)
+        if details := _usage_details(raw):
+            usage[key] = details
+    normalised_usage = usage or None
 
     balance_decimal = _decimal(payload.get("balance"))
     remaining_decimal = _decimal(payload.get("remaining"))
@@ -1025,11 +1066,17 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
         "unit": currency,
         "quota": quota,
         "windows": windows,
-        "usage": usage,
+        "usage": normalised_usage,
         "available": not unavailable,
         "known": True,
         "reason": reason,
     }
+    if mode == "unrestricted":
+        # This is a property of the credential's spend cap, not proof of an
+        # organisation wallet balance or an expiry policy. CloudRouter returns
+        # informational zero balance/remaining values for this mode; exposing
+        # them as real money would contradict the unlimited Key semantics.
+        snapshot["unlimited"] = True
     aliases = {
         "balance": ("balance",),
         "remaining": ("remaining",),
@@ -1037,6 +1084,8 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
         "days_until_expiry": ("days_until_expiry", "daysUntilExpiry"),
     }
     for key, source_keys in aliases.items():
+        if mode == "unrestricted" and key in {"balance", "remaining"}:
+            continue
         raw = next(
             (payload.get(source) for source in source_keys if payload.get(source) is not None),
             None,
@@ -1170,6 +1219,7 @@ def _unknown_snapshot(
     previous: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = dict(previous or {})
+    checked_at = _now()
     if previous:
         result["last_known_available"] = previous.get(
             "last_known_available", previous.get("available"),
@@ -1177,9 +1227,13 @@ def _unknown_snapshot(
         result["last_known_reason"] = previous.get(
             "last_known_reason", previous.get("reason"),
         )
+        # Keep the timestamp attached to the retained quota/usage payload.
+        # A failed refresh must not make old data look freshly fetched.
+        result["refresh_failed_at"] = checked_at
+    else:
+        result["fetched_at"] = checked_at
     result.update({
         "account_id": account_id,
-        "fetched_at": _now(),
         "stale": bool(previous),
         "state": "unknown",
         "status": "unknown",

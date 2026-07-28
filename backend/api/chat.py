@@ -4,7 +4,7 @@ from datetime import datetime
 import logging
 import os
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from backend.api.deps import (
@@ -20,6 +20,11 @@ from backend.database import get_db
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
 from backend.models.user_skill import UserSkill
+from backend.api.uploads import (
+    UploadAttachmentValidationError,
+    ValidatedUploadAttachment,
+    validate_upload_attachments,
+)
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.task_queue import task_is_pr_review_superseded
 from backend.services.worker_proxy import get_task_operation_lock
@@ -1289,8 +1294,162 @@ async def get_message_detail(
 
 
 class InjectMessage(BaseModel):
-    message: str
+    message: str = ""
+    image_paths: list[str] | None = None
+    file_paths: list[str] | None = None
+    attachments: list[dict[str, Any]] | None = None
     expected_routing: TaskRoutingExpectation | None = None
+
+    @model_validator(mode="after")
+    def require_text_or_attachment(self):
+        if not self.message.strip() and not (
+            self.file_paths or self.image_paths
+        ):
+            raise ValueError("message or attachment is required")
+        return self
+
+
+def _validated_inject_attachments(
+    body: InjectMessage,
+) -> list[ValidatedUploadAttachment]:
+    try:
+        return validate_upload_attachments(
+            file_paths=body.file_paths,
+            image_paths=body.image_paths,
+            attachments=body.attachments,
+        )
+    except UploadAttachmentValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _inject_transport_content(
+    message: str,
+    uploads: list[ValidatedUploadAttachment],
+) -> str:
+    """Build the text seen by PTY and the text item seen by Codex."""
+
+    if not uploads:
+        return message
+    lines = [
+        "用户在当前执行中补充了以下附件。请先实际读取附件，再结合本次补充继续工作："
+    ]
+    for upload in uploads:
+        tool = "Read/View Image" if upload.is_image else "Read"
+        lines.append(f"- {upload.path}（使用 {tool}）")
+    attachment_instruction = "\n".join(lines)
+    return (
+        f"{message}\n\n{attachment_instruction}"
+        if message
+        else attachment_instruction
+    )
+
+
+def _codex_inject_input_items(
+    content: str,
+    uploads: list[ValidatedUploadAttachment],
+) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = [{"type": "text", "text": content}]
+    for upload in uploads:
+        if upload.is_image:
+            items.append({"type": "localImage", "path": upload.path})
+        else:
+            items.append({
+                "type": "mention",
+                "name": upload.name,
+                "path": upload.path,
+            })
+    return items
+
+
+async def _inject_display_content(
+    request: Request,
+    db: AsyncSession,
+    raw_content: str,
+) -> tuple[str, str | None]:
+    display_content = raw_content
+    sender_display_name = None
+    user_id = getattr(request.state, "user_id", None)
+    if user_id:
+        from backend.models.user import User
+
+        sender = await db.get(User, user_id)
+        if sender:
+            sender_display_name = sender.name
+            display_content = f"[{sender.name}] {raw_content}"
+    return display_content, sender_display_name
+
+
+async def _store_injected_message(
+    *,
+    db: AsyncSession,
+    broadcaster,
+    task: Task,
+    raw_content: str,
+    display_content: str,
+    sender_display_name: str | None,
+    uploads: list[ValidatedUploadAttachment],
+    instance_id: int | None,
+) -> None:
+    attachments = [upload.public_dict() for upload in uploads]
+    file_paths = [upload.path for upload in uploads]
+    image_paths = [
+        upload.path for upload in uploads if upload.is_image
+    ]
+    raw_metadata: dict[str, Any] = {
+        "source": "inject",
+        "raw_content": raw_content,
+    }
+    if attachments:
+        raw_metadata.update({
+            "attachments": attachments,
+            "file_paths": file_paths,
+            "image_paths": image_paths,
+        })
+    if sender_display_name:
+        raw_metadata["sender_name"] = sender_display_name
+    db.add(LogEntry(
+        instance_id=instance_id,
+        task_id=task.id,
+        event_type="user_message",
+        role="user",
+        content=display_content,
+        raw_json=json.dumps(raw_metadata, ensure_ascii=False),
+        is_error=False,
+    ))
+    await db.commit()
+
+    event: dict[str, Any] = {
+        "event_type": "user_message",
+        "role": "user",
+        "content": display_content,
+        "source": "inject",
+        "raw_content": raw_content,
+        "attachments": attachments,
+        "image_urls": [
+            attachment["url"]
+            for attachment in attachments
+            if attachment["is_image"]
+        ],
+    }
+    if sender_display_name:
+        event["sender_name"] = sender_display_name
+    await broadcaster.broadcast(f"task:{task.id}", event)
+
+
+@router.get("/{task_id}/inject-capabilities")
+async def inject_capabilities(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
+    return {
+        "attachment_protocol": 1,
+        "codex_native_inputs": True,
+    }
 
 
 @router.post("/{task_id}/inject")
@@ -1302,83 +1461,157 @@ async def inject_message(
 ):
     """Inject a message into the task's currently running turn."""
     task = await db.get(Task, task_id)
-    if task:
-        await require_task_access(request, task, db)
-    if not task:
+    if task is None:
         raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
 
-    from backend.api.tasks import _require_expected_task_routing
-
-    _require_expected_task_routing(
-        task,
-        body.expected_routing,
-        effective_model=task.model,
-    )
-
-    from backend.main import instance_manager, broadcaster
-    if not task.session_id:
-        raise HTTPException(400, "Task has no session yet")
-    if task.worker_id is not None or task.shared_from_id is not None:
-        raise HTTPException(400, "远程 Worker / shared task 暂不支持执行中注入")
-
-    provider = (task.provider or "claude").lower()
-    if provider == "codex":
-        from backend.config import settings
-        if not settings.codex_app_server_enabled:
+    # Serialize with routing edits and migration.  Re-read after acquiring the
+    # lock so the expected route and transport are one admission decision.
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        task = await db.get(Task, task_id)
+        if task is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_access(request, task, db)
+        if task_is_pr_review_superseded(task):
             raise HTTPException(
-                400,
-                "Codex app-server 未开启，当前 exec 链路不支持执行中注入",
+                409,
+                "This PR review task was superseded by a newer push",
             )
-        ok = await instance_manager.inject_codex_message(
-            task.session_id, body.message
+
+        from backend.api.tasks import (
+            _require_expected_task_routing,
+            _require_no_pending_worker_routing,
         )
-        unavailable_detail = (
-            "注入失败：当前 Codex turn 已结束、暂不可 steer，或正在使用 "
-            "exec fallback；空闲时请关闭注入模式直接发普通消息"
-        )
-    elif provider == "claude":
-        if not instance_manager.has_pty_session(task.session_id):
+
+        if task.worker_id is not None:
             raise HTTPException(
                 400,
-                (
-                    "当前 Claude turn 使用直连进程，不支持执行中注入；"
-                    "请关闭注入模式后发送普通消息"
+                "Worker task 暂不支持执行中注入",
+            )
+        _require_no_pending_worker_routing(task)
+
+        _require_expected_task_routing(
+            task,
+            body.expected_routing,
+            effective_model=task.model,
+        )
+        if task.shared_from_id is not None:
+            raise HTTPException(
+                400,
+                "Shared task 暂不支持执行中注入",
+            )
+        if not task.session_id:
+            raise HTTPException(400, "Task has no session yet")
+
+        uploads = _validated_inject_attachments(body)
+
+        from backend.main import instance_manager, broadcaster
+
+        provider = (task.provider or "claude").lower()
+        transport_content = _inject_transport_content(
+            body.message,
+            uploads,
+        )
+        if provider == "codex":
+            from backend.config import settings
+
+            if not settings.codex_app_server_enabled:
+                raise HTTPException(
+                    400,
+                    "Codex app-server 未开启，当前 exec 链路不支持执行中注入",
                 )
-                if instance_manager.pty_mode_enabled
-                else "当前 Claude turn 不由 PTY 管理，无法执行中注入",
+            if uploads:
+                ok = await instance_manager.inject_codex_message(
+                    task.session_id,
+                    transport_content,
+                    input_items=_codex_inject_input_items(
+                        transport_content,
+                        uploads,
+                    ),
+                )
+            else:
+                ok = await instance_manager.inject_codex_message(
+                    task.session_id,
+                    transport_content,
+                )
+            unavailable_detail = (
+                "注入失败：当前 Codex turn 已结束、暂不可 steer、附件输入被 "
+                "transport 拒绝，或正在使用 exec fallback；空闲时请关闭注入"
+                "模式直接发普通消息"
             )
-        ok = await instance_manager.inject_pty_message(
-            task.session_id, body.message
-        )
-        unavailable_detail = (
-            "注入失败：没有正在运行的 turn。注入仅在任务执行中可用"
-            "（用于中途补充指令）；空闲时请关闭注入模式直接发普通消息"
-        )
-    else:
-        raise HTTPException(400, f"Provider {provider} 不支持执行中注入")
+        elif provider == "claude":
+            if not instance_manager.has_pty_session(task.session_id):
+                raise HTTPException(
+                    400,
+                    (
+                        "当前 Claude turn 使用直连进程，不支持执行中注入；"
+                        "请关闭注入模式后发送普通消息"
+                    )
+                    if instance_manager.pty_mode_enabled
+                    else "当前 Claude turn 不由 PTY 管理，无法执行中注入",
+                )
+            try:
+                if uploads:
+                    ok = await instance_manager.inject_pty_message(
+                        task.session_id,
+                        transport_content,
+                        require_host_file_access=True,
+                    )
+                else:
+                    ok = await instance_manager.inject_pty_message(
+                        task.session_id,
+                        transport_content,
+                    )
+            except Exception as exc:
+                from backend.services.instance_manager import (
+                    LiveAttachmentInjectionUnsupportedError,
+                )
 
-    if not ok:
-        raise HTTPException(409, unavailable_detail)
+                if isinstance(
+                    exc,
+                    LiveAttachmentInjectionUnsupportedError,
+                ):
+                    raise HTTPException(
+                        409,
+                        "当前 Claude PTY 运行在隔离容器中，无法安全访问上传"
+                        "附件；附件未注入。请在非隔离任务中使用执行中附件注入",
+                    ) from exc
+                raise
+            unavailable_detail = (
+                "注入失败：没有正在运行的 turn。注入仅在任务执行中可用"
+                "（用于中途补充指令）；空闲时请关闭注入模式直接发普通消息"
+            )
+        else:
+            raise HTTPException(
+                400,
+                f"Provider {provider} 不支持执行中注入",
+            )
 
-    # Record + broadcast so the injected text shows up in the chat thread
-    db.add(LogEntry(
-        instance_id=task.instance_id or 1,
-        task_id=task_id,
-        event_type="user_message",
-        role="user",
-        content=body.message,
-        raw_json=json.dumps({"source": "inject", "raw_content": body.message}),
-        is_error=False,
-    ))
-    await db.commit()
-    await broadcaster.broadcast(f"task:{task_id}", {
-        "event_type": "user_message",
-        "role": "user",
-        "content": body.message,
-        "source": "inject",
-        "raw_content": body.message,
-    })
-    return {"ok": True, "injected": True}
+        if not ok:
+            raise HTTPException(409, unavailable_detail)
+
+        display_content, sender_display_name = await _inject_display_content(
+            request,
+            db,
+            body.message,
+        )
+        await _store_injected_message(
+            db=db,
+            broadcaster=broadcaster,
+            task=task,
+            raw_content=body.message,
+            display_content=display_content,
+            sender_display_name=sender_display_name,
+            uploads=uploads,
+            instance_id=task.instance_id,
+        )
+        return {
+            "ok": True,
+            "injected": True,
+            "attachment_count": len(uploads),
+        }
 
 
 class PermissionDecision(BaseModel):

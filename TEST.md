@@ -593,8 +593,11 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_service_instance_manager.py` 的 canonical Skill adapter 用例 | Claude、PTY、Codex exec 与 app-server 消费同一 context，且只注入一次 |
 | `test_service_instance_manager.py::test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | safe fallback 同时保留 required MCP 与完全相同的 Skill context |
 | `test_mcp_config.py::test_codex_main_server_does_not_advertise_monitor_tools` | Codex 主 MCP 不声明三个 Monitor 工具，Claude 保持不变 |
+| `test_mcp_server.py::test_read_skill_rejects_skill_not_enabled_for_task` | `ccm_read_skill` 拒绝读取当前 Task 未启用的普通 Skill |
+| `test_mcp_server.py::test_codex_kill_switch_allows_only_selected_sub_agent_skill` | 主 MCP kill switch 关闭时，即使遗留配置启用了普通 Skill 也拒绝读取，同时保留已选 Sub-Agent controller |
 | `test_mcp_server.py::test_user_skill_read_is_scoped_to_selected_worker_snapshot` | `ccm_read_user_skill` 只读当前 Task 选中 ID，并优先使用 Worker snapshot |
 | `test_api_tasks.py` / `test_api_chat_plan.py` 的 Codex Skill capability 用例 | Monitor 拒绝、`$monitor` 在创建/description 更新/follow-up 三个入口持久化前拒绝、kill switch、User Skill ID 校验/去重、provider 切换与 legacy 配置更新边界 |
+| `test_api_tasks.py::test_invalid_skill_update_is_rejected_before_worker_migration` | 组合更新的 provider/Skill 配置在迁移前校验；400 不调用 migrator，也不改变持久状态 |
 | `test_worker_relay_proxy.py` / `test_task_migrator.py` 的 Skill snapshot 用例 | Worker 初次转发、续聊同步和迁移 payload 保留选择与正文 snapshot |
 | `test_api_chat_plan.py::test_codex_fork_starts_before_selected_user_message` | Fork 继承普通/User Skill 选择，附件 seed 保持只消费一次 |
 | 前端 `skillCapabilities.test.ts` | Claude 不变；Codex 始终禁 Monitor，kill switch 关闭时只保留 Sub-Agent |

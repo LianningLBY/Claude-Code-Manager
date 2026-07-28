@@ -586,6 +586,47 @@ async def update_task(
     elif "project_id" in updates and "worker_id" not in updates:
         await require_worker_target_access(request, task.worker_id, queue.db)
 
+    # Validate the effective Skill configuration before a worker migration can
+    # create or mutate externally visible state.  A rejected combined update
+    # must not migrate first and fail only while saving the remaining fields.
+    effective_provider = updates.get("provider", task.provider)
+    effective_description = updates.get("description", task.description)
+    command_skills = _explicit_command_skills(effective_description)
+    skill_configuration_changed = bool(
+        {"provider", "enabled_skills", "selected_user_skills"} & updates.keys()
+    ) or user_skill_snapshots is not None or bool(
+        command_skills and "description" in updates
+    )
+    if skill_configuration_changed:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        effective_skills = dict(updates.get(
+            "enabled_skills",
+            task.enabled_skills,
+        ) or {})
+        effective_skills.update(command_skills)
+        effective_user_skills = updates.get(
+            "selected_user_skills",
+            task.selected_user_skills,
+        )
+        normalized_user_skills = await _validate_skill_configuration(
+            queue.db,
+            provider=effective_provider,
+            enabled_skills=effective_skills,
+            selected_user_skills=effective_user_skills,
+            user_skill_snapshots=(
+                user_skill_snapshots
+                if user_skill_snapshots is not None
+                else (task.metadata_ or {}).get(
+                    USER_SKILL_SNAPSHOTS_METADATA_KEY
+                )
+            ),
+        )
+        if "selected_user_skills" in updates:
+            updates["selected_user_skills"] = normalized_user_skills
+
     # 执行位置切换走 TaskMigrator（同 mode/model 一样在 task 详情改，
     # 但语义是迁移而非改字段）。-1 = 切回本机
     if "worker_id" in updates:
@@ -622,43 +663,6 @@ async def update_task(
     current = await queue.get(task_id)
     if not current:
         raise HTTPException(404, "Task not found")
-    effective_provider = updates.get("provider", current.provider)
-    effective_description = updates.get("description", current.description)
-    command_skills = _explicit_command_skills(effective_description)
-    skill_configuration_changed = bool(
-        {"provider", "enabled_skills", "selected_user_skills"} & updates.keys()
-    ) or user_skill_snapshots is not None or bool(
-        command_skills and "description" in updates
-    )
-    if skill_configuration_changed:
-        from backend.services.skill_context import (
-            USER_SKILL_SNAPSHOTS_METADATA_KEY,
-        )
-
-        effective_skills = dict(updates.get(
-            "enabled_skills",
-            current.enabled_skills,
-        ) or {})
-        effective_skills.update(command_skills)
-        effective_user_skills = updates.get(
-            "selected_user_skills",
-            current.selected_user_skills,
-        )
-        normalized_user_skills = await _validate_skill_configuration(
-            queue.db,
-            provider=effective_provider,
-            enabled_skills=effective_skills,
-            selected_user_skills=effective_user_skills,
-            user_skill_snapshots=(
-                user_skill_snapshots
-                if user_skill_snapshots is not None
-                else (current.metadata_ or {}).get(
-                    USER_SKILL_SNAPSHOTS_METADATA_KEY
-                )
-            ),
-        )
-        if "selected_user_skills" in updates:
-            updates["selected_user_skills"] = normalized_user_skills
 
     if not updates:
         return current

@@ -311,6 +311,45 @@ async def test_provider_switch_rejects_inherited_monitor(client):
 
 
 @pytest.mark.asyncio
+async def test_invalid_skill_update_is_rejected_before_worker_migration(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="Do not migrate invalid configuration",
+            description="d",
+            provider="claude",
+            worker_id=41,
+            enabled_skills={},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    migrator = MagicMock()
+    migrator.migrate = AsyncMock()
+    with patch("backend.main.task_migrator", migrator):
+        response = await client.put(f"/api/tasks/{task_id}", json={
+            "worker_id": -1,
+            "provider": "codex",
+            "enabled_skills": {"monitor": True},
+        })
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+    migrator.migrate.assert_not_awaited()
+    async with session_factory() as db:
+        persisted = await db.get(Task, task_id)
+    assert persisted.worker_id == 41
+    assert persisted.provider == "claude"
+    assert persisted.enabled_skills == {}
+
+
+@pytest.mark.asyncio
 async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
     client, session_factory,
 ):

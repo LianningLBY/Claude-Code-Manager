@@ -107,7 +107,7 @@ async def ccm_read_skill(skill_name: str) -> str:
     try:
         from backend.services.skill_context import skill_supported
         task_data = await _get_task_data()
-        provider = task_data.get("provider") or "claude"
+        provider = (task_data.get("provider") or "claude").lower()
         if not skill_supported(provider, skill_name):
             return json.dumps({
                 "success": False,
@@ -124,6 +124,28 @@ async def ccm_read_skill(skill_name: str) -> str:
             return json.dumps({
                 "success": False,
                 "error": f"技能 '{skill_name}' 不存在。可用技能: {available}",
+            }, ensure_ascii=False)
+        enabled_skills = task_data.get("enabled_skills") or {}
+        from backend.config import settings
+        if (
+            provider == "codex"
+            and not settings.codex_main_mcp_enabled
+            and skill_name != "sub-agent"
+        ):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Skill '{skill_name}' is unavailable while Codex "
+                    "main-task MCP is disabled"
+                ),
+            }, ensure_ascii=False)
+        if (
+            not enabled_skills.get(skill_name, False)
+            and not skill.ccm.always
+        ):
+            return json.dumps({
+                "success": False,
+                "error": f"Skill '{skill_name}' is not enabled for this task",
             }, ensure_ascii=False)
         # Log usage
         try:

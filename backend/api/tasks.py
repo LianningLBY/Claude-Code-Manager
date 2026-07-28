@@ -1818,7 +1818,68 @@ async def update_task(
         if "selected_user_skills" in updates:
             updates["selected_user_skills"] = normalized_user_skills
 
-    # An already-forwarded Worker owns the executable Task row.  Synchronize
+    worker_id_supplied = "worker_id" in updates
+    target_project = None
+    target_project_id = updates.get("project_id", task.project_id)
+    if target_project_id is not None:
+        from backend.models.project import Project
+
+        target_project = await queue.db.get(Project, target_project_id)
+        if target_project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, target_project_id, queue.db)
+        if (
+            "project_id" in updates
+            and not worker_id_supplied
+            and task.worker_id != target_project.worker_id
+        ):
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+    elif "project_id" in updates and not worker_id_supplied:
+        await require_worker_target_access(request, task.worker_id, queue.db)
+
+    # 执行位置切换走 TaskMigrator（同 mode/model 一样在 task 详情改，
+    # 但语义是迁移而非改字段）。-1 = 切回本机
+    if "worker_id" in updates:
+        target = updates.pop("worker_id")
+        if target == -1:
+            target = None
+        if target_project is not None and target != target_project.worker_id:
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+        if target_project is None:
+            await require_worker_target_access(request, target, queue.db)
+        if task.worker_id != target:
+            from backend.main import task_migrator
+            if task_migrator is None:
+                raise HTTPException(503, "Worker 功能未启用")
+            from backend.services.task_migrator import MigrationError
+            try:
+                # 同步执行：迁移结束后才返回，前端拿到的就是最终状态。
+                # 大工作目录会久——前端按钮置灰 + migrating 状态广播兜底
+                if updates:
+                    await task_migrator.migrate(
+                        task_id,
+                        target,
+                        task_updates=updates,
+                    )
+                else:
+                    await task_migrator.migrate(task_id, target)
+            except MigrationError as e:
+                raise HTTPException(409, str(e))
+            # migrate 在独立 session 写库；当前 DI session 的 identity map
+            # 还缓存着旧 worker_id，必须 expire 否则响应返回迁移前的值
+            queue.db.expire_all()
+            migrated = await queue.get(task_id)
+            if not migrated:
+                raise HTTPException(404, "Task not found")
+            return migrated
+
+    # An already-forwarded Worker owns the executable Task row. Synchronize
     # its complete routing tuple before making the Manager mirror visible.
     if (
         task.worker_id is not None
@@ -1845,55 +1906,6 @@ async def update_task(
                 queue,
             )
         )
-
-    target_project = None
-    target_project_id = updates.get("project_id", task.project_id)
-    if target_project_id is not None:
-        from backend.models.project import Project
-
-        target_project = await queue.db.get(Project, target_project_id)
-        if target_project is None:
-            raise HTTPException(404, "Project not found")
-        await require_project_access(request, target_project_id, queue.db)
-        if (
-            "project_id" in updates
-            and "worker_id" not in updates
-            and task.worker_id != target_project.worker_id
-        ):
-            raise HTTPException(
-                400,
-                "Task Worker must match the selected Project location",
-            )
-    elif "project_id" in updates and "worker_id" not in updates:
-        await require_worker_target_access(request, task.worker_id, queue.db)
-
-    # 执行位置切换走 TaskMigrator（同 mode/model 一样在 task 详情改，
-    # 但语义是迁移而非改字段）。-1 = 切回本机
-    if "worker_id" in updates:
-        target = updates.pop("worker_id")
-        if target == -1:
-            target = None
-        if target_project is not None and target != target_project.worker_id:
-            raise HTTPException(
-                400,
-                "Task Worker must match the selected Project location",
-            )
-        if target_project is None:
-            await require_worker_target_access(request, target, queue.db)
-        if task.worker_id != target:
-            from backend.main import task_migrator
-            if task_migrator is None:
-                raise HTTPException(503, "Worker 功能未启用")
-            from backend.services.task_migrator import MigrationError
-            try:
-                # 同步执行：迁移结束后才返回，前端拿到的就是最终状态。
-                # 大工作目录会久——前端按钮置灰 + migrating 状态广播兜底
-                await task_migrator.migrate(task_id, target)
-            except MigrationError as e:
-                raise HTTPException(409, str(e))
-            # migrate 在独立 session 写库；当前 DI session 的 identity map
-            # 还缓存着旧 worker_id，必须 expire 否则响应返回迁移前的值
-            queue.db.expire_all()
 
     if not updates:
         task = await queue.get(task_id)

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import glob
 import logging
 import os
@@ -26,7 +27,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import JSON, select, update
 
 from backend.config import settings
 from backend.models.project import Project
@@ -42,6 +43,36 @@ from backend.services.worker_proxy import get_task_operation_lock
 logger = logging.getLogger(__name__)
 _CODEX_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _COPY_BUFFER_SIZE = 1024 * 1024
+_COORDINATED_TASK_UPDATE_FIELDS = frozenset({
+    "title",
+    "model",
+    "codex_service_tier",
+    "effort_level",
+    "thinking_budget",
+    "system_prompt_mode",
+    "timeout_hours",
+    "sort_order",
+    "description",
+    "priority",
+    "project_id",
+    "target_repo",
+    "target_branch",
+    "max_retries",
+    "max_iterations",
+    "must_complete",
+    "mode",
+    "goal_condition",
+    "goal_max_turns",
+    "goal_evaluator_model",
+    "enable_workflows",
+    "enabled_skills",
+    "selected_user_skills",
+    "provider",
+    "starred",
+    "tags",
+    # Internal transport for validated User Skill snapshots.
+    "metadata_",
+})
 
 
 class MigrationError(Exception):
@@ -94,6 +125,32 @@ def migration_generation_predicates(
         _nullable_eq(Task.started_at, generation.started_at),
         _nullable_eq(Task.completed_at, generation.completed_at),
     )
+
+
+def _task_value_predicates(values: dict) -> tuple:
+    """Match Task fields observed before a coordinated migration."""
+
+    predicates = []
+    for field, value in values.items():
+        column = getattr(Task, field)
+        if value is None and isinstance(column.type, JSON):
+            predicates.append(column == JSON.NULL)
+        else:
+            predicates.append(
+                column.is_(None) if value is None else column == value
+            )
+    return tuple(predicates)
+
+
+def _coordinated_task_updates(task_updates: dict | None) -> dict:
+    updates = copy.deepcopy(task_updates or {})
+    invalid = set(updates).difference(_COORDINATED_TASK_UPDATE_FIELDS)
+    if invalid:
+        raise MigrationError(
+            "Unsupported coordinated migration fields: "
+            + ", ".join(sorted(invalid))
+        )
+    return updates
 
 
 async def _settle_despite_cancellation(awaitable):
@@ -179,8 +236,15 @@ class TaskMigrator:
     # 入口
     # ------------------------------------------------------------------
 
-    async def migrate(self, task_id: int, target_worker_id: int | None):
+    async def migrate(
+        self,
+        task_id: int,
+        target_worker_id: int | None,
+        *,
+        task_updates: dict | None = None,
+    ):
         """把 task 迁到 target（worker_id 或 None=本机）。"""
+        coordinated_updates = _coordinated_task_updates(task_updates)
         lock = self._locks.setdefault(task_id, asyncio.Lock())
         if lock.locked():
             raise MigrationError("该 task 正在迁移中")
@@ -191,14 +255,28 @@ class TaskMigrator:
                 # Chat, retry and plan operations therefore cannot mutate the
                 # source Worker while files/session state are being copied.
                 async with get_task_operation_lock(task_id):
-                    await self._migrate_locked(task_id, target_worker_id)
+                    await self._migrate_locked(
+                        task_id,
+                        target_worker_id,
+                        coordinated_updates=coordinated_updates,
+                    )
 
-    async def _migrate_locked(self, task_id: int, target: int | None):
+    async def _migrate_locked(
+        self,
+        task_id: int,
+        target: int | None,
+        *,
+        coordinated_updates: dict,
+    ):
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
             if not task:
                 raise MigrationError("task 不存在")
             if task.worker_id == target:
+                if coordinated_updates:
+                    raise MigrationError(
+                        "Coordinated updates require a Worker location change"
+                    )
                 return  # 已在目标位置
             if (
                 (task.metadata_ or {}).get(
@@ -212,6 +290,17 @@ class TaskMigrator:
             observed = migration_task_generation(task)
             prev_status = observed.status
             src_worker_id = observed.worker_id
+            original_provider = (task.provider or "claude").lower()
+            observed_update_values = {
+                field: copy.deepcopy(getattr(task, field))
+                for field in coordinated_updates
+            }
+
+        # Check the destination against the same validated final tuple that
+        # will be imported and committed. Keep these values detached/in-memory
+        # until the final pointer CAS so failure leaves Manager config intact.
+        for field, value in coordinated_updates.items():
+            setattr(task, field, copy.deepcopy(value))
 
         src = await self._get_worker(src_worker_id) if src_worker_id else None
         dst = await self._get_worker(target) if target else None
@@ -242,8 +331,16 @@ class TaskMigrator:
         # A request cancellation can arrive after COMMIT but before the
         # coroutine returns.  Settle the claim so we always know whether there
         # is an exact ``migrating`` generation that must be restored.
+        claim_awaitable = (
+            self._claim_migration(
+                observed,
+                expected_values=observed_update_values,
+            )
+            if observed_update_values
+            else self._claim_migration(observed)
+        )
         claim_operation, claim_cancellation = await _settle_despite_cancellation(
-            self._claim_migration(observed)
+            claim_awaitable
         )
         try:
             claimed = claim_operation.result()
@@ -267,12 +364,24 @@ class TaskMigrator:
                     src,
                     claimed,
                     expected_remote_status=prev_status,
+                    protected_fields=frozenset(coordinated_updates),
+                    expected_values=observed_update_values,
                 )
 
-            task = await self._read_claimed_task(claimed)
+            task = await self._read_claimed_task(
+                claimed,
+                expected_values=observed_update_values,
+            )
+            for field, value in coordinated_updates.items():
+                setattr(task, field, copy.deepcopy(value))
             session_id = task.session_id
             project_id = task.project_id
             provider = (task.provider or "claude").lower()
+            if provider != original_provider and session_id is not None:
+                raise MigrationError(
+                    "Task provider cannot change while an existing native "
+                    "session may still emit output; start a new Task instead"
+                )
 
             # 2. 工作目录搬运（含 .git + 未提交改动，无过滤全量 rsync）
             local_path = None
@@ -297,7 +406,6 @@ class TaskMigrator:
             # 4. 目标是 worker：确保项目记录 + 用同 ID 重建 task
             if dst is not None:
                 from backend.main import worker_proxy
-                task = await self._read_claimed_task(claimed)
                 worker_project_id = await worker_proxy.ensure_worker_project(dst, task)
                 await self._ensure_worker_task(dst, task, worker_project_id)
 
@@ -326,6 +434,8 @@ class TaskMigrator:
                         restored_status=prev_status,
                         provider=provider,
                         local_codex_target_home=local_codex_target_home,
+                        task_updates=coordinated_updates,
+                        expected_values=observed_update_values,
                     )
                 )
             )
@@ -378,12 +488,15 @@ class TaskMigrator:
     async def _read_claimed_task(
         self,
         claimed: MigrationTaskGeneration,
+        *,
+        expected_values: dict | None = None,
     ) -> Task:
         async with self.db_factory() as db:
             task = (
                 await db.execute(
                     select(Task).where(
-                        *migration_generation_predicates(claimed)
+                        *migration_generation_predicates(claimed),
+                        *_task_value_predicates(expected_values or {}),
                     )
                 )
             ).scalar_one_or_none()
@@ -396,12 +509,15 @@ class TaskMigrator:
     async def _claim_migration(
         self,
         observed: MigrationTaskGeneration,
+        *,
+        expected_values: dict | None = None,
     ) -> MigrationTaskGeneration:
         async with self.db_factory() as db:
             result = await db.execute(
                 update(Task)
                 .where(
                     *migration_generation_predicates(observed),
+                    *_task_value_predicates(expected_values or {}),
                     task_retry_not_superseded_predicate(),
                 )
                 .values(status="migrating")
@@ -496,12 +612,17 @@ class TaskMigrator:
         restored_status: str,
         provider: str,
         local_codex_target_home: str | None,
+        task_updates: dict | None = None,
+        expected_values: dict | None = None,
     ) -> None:
         async with self.db_factory() as db:
             task = (
                 await db.execute(
                     select(Task)
-                    .where(*migration_generation_predicates(claimed))
+                    .where(
+                        *migration_generation_predicates(claimed),
+                        *_task_value_predicates(expected_values or {}),
+                    )
                     .with_for_update()
                 )
             ).scalar_one_or_none()
@@ -510,29 +631,38 @@ class TaskMigrator:
                     "task 迁移状态或 generation 已被并发修改，拒绝覆盖"
                 )
 
-            values: dict = {
+            values: dict = copy.deepcopy(task_updates or {})
+            values.update({
                 "worker_id": target_worker_id,
                 "status": restored_status,
-            }
+            })
             if provider == "codex" and target_worker_id is None and local_codex_target_home:
                 values["metadata_"] = self._local_codex_account_metadata(
-                    task.metadata_, local_codex_target_home
+                    values.get("metadata_", task.metadata_),
+                    local_codex_target_home,
                 )
 
             # last_cwd 防护：失败启动会把 os.getcwd() 写进 last_cwd（污染），
             # 且它优先于 target_repo——切回本机时不存在/不在项目内的一律清掉，
             # 让 cwd 解析回落到 target_repo。
             if target_worker_id is None and task.last_cwd:
+                effective_target_repo = values.get(
+                    "target_repo",
+                    task.target_repo,
+                )
                 valid = os.path.isdir(task.last_cwd) and (
-                    not task.target_repo
-                    or task.last_cwd.startswith(task.target_repo)
+                    not effective_target_repo
+                    or task.last_cwd.startswith(effective_target_repo)
                 )
                 if not valid:
                     values["last_cwd"] = None
 
             result = await db.execute(
                 update(Task)
-                .where(*migration_generation_predicates(claimed))
+                .where(
+                    *migration_generation_predicates(claimed),
+                    *_task_value_predicates(expected_values or {}),
+                )
                 .values(**values)
             )
             if result.rowcount != 1:
@@ -567,6 +697,8 @@ class TaskMigrator:
         claimed: MigrationTaskGeneration,
         *,
         expected_remote_status: str,
+        protected_fields: frozenset[str] = frozenset(),
+        expected_values: dict | None = None,
     ):
         """worker 广播会 pop session_id、last_cwd 只写 worker DB——迁移前必须拉全。"""
         task_id = claimed.task_id
@@ -598,7 +730,10 @@ class TaskMigrator:
             task = (
                 await db.execute(
                     select(Task)
-                    .where(*migration_generation_predicates(claimed))
+                    .where(
+                        *migration_generation_predicates(claimed),
+                        *_task_value_predicates(expected_values or {}),
+                    )
                     .with_for_update()
                 )
             ).scalar_one_or_none()
@@ -624,7 +759,10 @@ class TaskMigrator:
                 metadata[PR_REVIEW_SUPERSEDED_METADATA_KEY] = True
                 changed = await db.execute(
                     update(Task)
-                    .where(*migration_generation_predicates(claimed))
+                    .where(
+                        *migration_generation_predicates(claimed),
+                        *_task_value_predicates(expected_values or {}),
+                    )
                     .values(metadata_=metadata)
                 )
                 if changed.rowcount != 1:
@@ -644,7 +782,7 @@ class TaskMigrator:
                     "target_repo",
                     "error_message",
                 )
-                if field in wt
+                if field in wt and field not in protected_fields
             }
             # Even an empty response must prove that the claimed generation is
             # still current after the network await.
@@ -652,7 +790,10 @@ class TaskMigrator:
                 values["status"] = claimed.status
             changed = await db.execute(
                 update(Task)
-                .where(*migration_generation_predicates(claimed))
+                .where(
+                    *migration_generation_predicates(claimed),
+                    *_task_value_predicates(expected_values or {}),
+                )
                 .values(**values)
             )
             if changed.rowcount != 1:
@@ -1008,6 +1149,7 @@ class TaskMigrator:
                     await build_user_skill_snapshot_payload(
                         db,
                         task.selected_user_skills,
+                        metadata=task.metadata_,
                     )
                 )
         payload = {

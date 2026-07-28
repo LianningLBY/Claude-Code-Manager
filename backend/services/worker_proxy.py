@@ -316,6 +316,7 @@ class WorkerProxy:
             return await build_user_skill_snapshot_payload(
                 db,
                 task.selected_user_skills,
+                metadata=task.metadata_,
             )
 
     async def sync_task_skill_selection(

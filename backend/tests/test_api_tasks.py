@@ -351,6 +351,72 @@ async def test_invalid_skill_update_is_rejected_before_worker_migration(
 
 
 @pytest.mark.asyncio
+async def test_valid_skill_update_is_coordinated_with_worker_migration(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.worker import Worker
+
+    async with session_factory() as db:
+        worker = Worker(
+            id=42,
+            name="skill-destination",
+            status="ready",
+            private_ip="10.0.0.42",
+            auth_token="token",
+        )
+        task = Task(
+            title="Migrate final configuration",
+            description="d",
+            provider="claude",
+            enabled_skills={},
+        )
+        db.add_all([worker, task])
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    captured = {}
+
+    async def migrate(task_id, target, *, task_updates):
+        captured.update(
+            task_id=task_id,
+            target=target,
+            task_updates=task_updates,
+        )
+        async with session_factory() as db:
+            persisted = await db.get(Task, task_id)
+            for field, value in task_updates.items():
+                setattr(persisted, field, value)
+            persisted.worker_id = target
+            await db.commit()
+
+    migrator = MagicMock()
+    migrator.migrate = AsyncMock(side_effect=migrate)
+    with patch("backend.main.task_migrator", migrator):
+        response = await client.put(f"/api/tasks/{task_id}", json={
+            "worker_id": 42,
+            "provider": "codex",
+            "enabled_skills": {"sub-agent": True},
+        })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["worker_id"] == 42
+    assert response.json()["provider"] == "codex"
+    assert response.json()["enabled_skills"]["sub-agent"] is True
+    assert captured == {
+        "task_id": task_id,
+        "target": 42,
+        "task_updates": {
+            "provider": "codex",
+            "enabled_skills": {"sub-agent": True},
+            "metadata_": {},
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
     client, session_factory,
 ):

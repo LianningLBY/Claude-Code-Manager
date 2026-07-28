@@ -105,12 +105,20 @@ async def test_migrate_local_to_worker(db_factory, session_factory, monkeypatch)
     [False, True],
     ids=["local-to-worker", "worker-to-worker"],
 )
+@pytest.mark.parametrize(
+    "local_collision",
+    [False, True],
+    ids=["missing-local-row", "colliding-local-row"],
+)
 async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
     db_factory,
     session_factory,
     monkeypatch,
     source_is_worker,
+    local_collision,
 ):
+    from backend.models.user_skill import UserSkill
+
     source = (
         await _mk_worker(session_factory, name="source")
         if source_is_worker
@@ -139,6 +147,15 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
         "existing": "value",
         "ccm_user_skill_snapshots": snapshots,
     }
+    if local_collision:
+        async with session_factory() as db:
+            db.add(UserSkill(
+                id=81,
+                name="Wrong local collision",
+                description="must not replace Manager snapshot",
+                content="wrong local body",
+            ))
+            await db.commit()
     task_updates = {
         "provider": "codex",
         "enabled_skills": {"sub-agent": True},

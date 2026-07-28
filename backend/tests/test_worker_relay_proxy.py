@@ -409,6 +409,44 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
     }
 
 
+@pytest.mark.parametrize(
+    "local_collision",
+    [False, True],
+    ids=["missing-local-row", "colliding-local-row"],
+)
+async def test_worker_proxy_uses_authoritative_user_skill_snapshots(
+    session_factory,
+    local_collision,
+):
+    from backend.models.user_skill import UserSkill
+
+    if local_collision:
+        async with session_factory() as db:
+            db.add(UserSkill(
+                id=86,
+                name="Wrong Worker-local skill",
+                description="must not replace Manager snapshot",
+                content="wrong local body",
+            ))
+            await db.commit()
+
+    authoritative = [{
+        "id": 86,
+        "name": "Manager snapshot",
+        "description": "authoritative",
+        "content": "correct Manager body",
+    }]
+    task = Task(
+        id=986,
+        title="snapshot forwarding",
+        selected_user_skills=[86],
+        metadata_={"ccm_user_skill_snapshots": authoritative},
+    )
+    proxy = WorkerProxy(session_factory, relay=AsyncMock())
+
+    assert await proxy._user_skill_snapshots(task) == authoritative
+
+
 async def test_worker_fast_fails_before_forward_when_capability_is_unproven(
     monkeypatch,
 ):

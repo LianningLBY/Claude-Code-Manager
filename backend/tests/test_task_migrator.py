@@ -65,6 +65,21 @@ def _migrator(db_factory, relay=None) -> TaskMigrator:
     return m
 
 
+@pytest.mark.asyncio
+async def test_api_account_retirement_and_task_migration_are_mutually_exclusive():
+    migrator = TaskMigrator(db_factory=None, relay=FakeRelay())
+
+    async with migrator._migration_account_guard():
+        with pytest.raises(MigrationError, match="migration"):
+            async with migrator.api_account_retirement_guard():
+                pass
+
+    async with migrator.api_account_retirement_guard():
+        with pytest.raises(MigrationError, match="deletion"):
+            async with migrator._migration_account_guard():
+                pass
+
+
 async def test_migrate_local_to_worker(db_factory, session_factory, monkeypatch):
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, session_id="sess-1")
@@ -253,6 +268,60 @@ async def test_migrate_failure_restores_status(db_factory, session_factory, monk
         task = await db.get(Task, t.id)
     assert task.status == "failed"      # 复原
     assert task.worker_id is None       # 指针没切
+
+
+async def test_migration_cancellation_after_claim_settles_exact_rollback(
+    db_factory,
+    session_factory,
+):
+    """Cancellation after claim COMMIT cannot strand the task in migrating."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="failed")
+    migrator = _migrator(db_factory)
+    claim_committed = asyncio.Event()
+    release_claim = asyncio.Event()
+    rollback_started = asyncio.Event()
+    release_rollback = asyncio.Event()
+    real_claim = migrator._claim_migration
+    real_restore = migrator._restore_migration_claim
+
+    async def claim_then_pause(observed):
+        claimed = await real_claim(observed)
+        claim_committed.set()
+        await release_claim.wait()
+        return claimed
+
+    async def restore_then_pause(claimed, restored_status):
+        rollback_started.set()
+        await release_rollback.wait()
+        return await real_restore(claimed, restored_status)
+
+    migrator._claim_migration = claim_then_pause
+    migrator._restore_migration_claim = restore_then_pause
+
+    migration = asyncio.create_task(migrator.migrate(task.id, worker.id))
+    await asyncio.wait_for(claim_committed.wait(), timeout=1)
+    async with session_factory() as db:
+        claimed_task = await db.get(Task, task.id)
+    assert claimed_task.status == "migrating"
+
+    migration.cancel()
+    release_claim.set()
+    await asyncio.wait_for(rollback_started.wait(), timeout=1)
+    # A second cancellation while rollback is blocked must not interrupt the
+    # exact-generation restore.
+    migration.cancel()
+    release_rollback.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(migration, timeout=1)
+
+    async with session_factory() as db:
+        restored = await db.get(Task, task.id)
+    assert restored.status == "failed"
+    assert restored.worker_id is None
+    assert not migrator._locks[task.id].locked()
 
 
 async def test_migration_failure_does_not_overwrite_concurrent_status(
@@ -473,6 +542,8 @@ async def test_worker_task_import_is_one_inert_request(
         session_id="s",
         status="completed",
         retry_count=2,
+        provider="codex",
+        codex_service_tier="priority",
     )
     requests = []
 
@@ -482,7 +553,10 @@ async def test_worker_task_import_is_one_inert_request(
 
         @staticmethod
         def json():
-            return {"status": "cancelled"}
+            return {
+                "status": "cancelled",
+                "codex_service_tier": "priority",
+            }
 
         @staticmethod
         def raise_for_status():
@@ -516,6 +590,7 @@ async def test_worker_task_import_is_one_inert_request(
     assert payload["retry_count"] == 2
     assert payload["selected_user_skills"] is None
     assert payload["user_skill_snapshots"] == []
+    assert payload["codex_service_tier"] == "priority"
 
 
 async def test_put_worker_id_triggers_migration(client, session_factory, monkeypatch):

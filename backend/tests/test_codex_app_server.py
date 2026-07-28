@@ -20,7 +20,9 @@ from backend.services.codex_app_server import (
     CodexAppServerRegistry,
     CodexRequiredMcpError,
     CodexRequiredMcpPreTurnError,
+    CodexServiceTierUnavailableError,
     CodexThreadHomeMismatchError,
+    CodexThreadNotIdleError,
     CodexTurnProcess,
     codex_project_trust_target,
     codex_untrusted_project_config,
@@ -28,6 +30,11 @@ from backend.services.codex_app_server import (
     normalize_codex_home,
 )
 from backend.services.mcp_config import McpServerSpec
+from backend.services.codex_tier_proxy import (
+    CodexActualTierProof,
+    CodexTierProofError,
+    CodexTierProxyRoute,
+)
 
 
 def _task_mcp_spec(task_id: int) -> McpServerSpec:
@@ -109,7 +116,13 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-123"}},
+        {
+            "thread": {
+                "id": "thread-123",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+        },
         {"turn": {"id": "turn-456"}},
     ])
 
@@ -131,6 +144,7 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     assert resume_call.args[1]["threadId"] == "thread-123"
     assert resume_call.args[1]["approvalPolicy"] == "never"
     assert resume_call.args[1]["sandbox"] == "danger-full-access"
+    assert resume_call.args[1]["serviceTier"] is None
     assert resume_call.args[1]["config"]["shell_environment_policy"]["set"] == {
         "GIT_AUTHOR_NAME": "CCM"
     }
@@ -154,9 +168,973 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     assert turn_call.args[0] == "turn/start"
     assert turn_call.args[1]["effort"] == "max"
     assert turn_call.args[1]["model"] == "gpt-5.6-luna"
+    assert turn_call.args[1]["serviceTier"] is None
 
     first = json.loads((await process.stdout.readline()).decode())
     assert first == {"type": "thread.started", "thread_id": "thread-123"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_type", ["active", "notLoaded", None])
+async def test_start_turn_requires_explicit_idle_before_model_turn(status_type):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    thread = {"id": "thread-not-idle"}
+    if status_type is not None:
+        thread["status"] = {"type": status_type}
+    server._request = AsyncMock(return_value={"thread": thread})
+
+    with pytest.raises(CodexThreadNotIdleError):
+        await server.start_turn(
+            prompt="must not execute",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-not-idle",
+            git_env=None,
+            task_id=90,
+        )
+
+    server._request.assert_awaited_once()
+    assert server._request.await_args.args[0] == "thread/resume"
+    assert "thread-not-idle" not in server._contexts_by_thread
+
+
+@pytest.mark.asyncio
+async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "model/list":
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "model": "gpt-5.6-sol",
+                    "isDefault": True,
+                    "serviceTiers": [{"id": "priority", "name": "Fast"}],
+                }],
+                "nextCursor": None,
+            }
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-fast",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": "priority",
+            }
+        if method == "turn/start":
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/started",
+                {
+                    "threadId": "thread-fast",
+                    "turn": {
+                        "id": "turn-fast",
+                        "status": "inProgress",
+                    },
+                },
+            )
+            return {"turn": {"id": "turn-fast"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    process, thread_id = await server.start_turn(
+        prompt="fast",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=91,
+        codex_service_tier="priority",
+    )
+
+    assert thread_id == "thread-fast"
+    model_call, thread_call, turn_call = server._request.await_args_list
+    assert model_call.args == (
+        "model/list",
+        {"includeHidden": True, "limit": 100},
+    )
+    assert thread_call.args[0] == "thread/start"
+    assert thread_call.args[1]["serviceTier"] == "priority"
+    assert turn_call.args[0] == "turn/start"
+    assert turn_call.args[1]["serviceTier"] == "priority"
+
+    started = json.loads((await process.stdout.readline()).decode())
+    proof = json.loads((await process.stdout.readline()).decode())
+    assert started == {"type": "thread.started", "thread_id": "thread-fast"}
+    assert proof == {
+        "type": "system_event",
+        "content": "Codex Fast priority 请求准入已确认 · 模型 gpt-5.6-sol",
+        "requested_service_tier": "priority",
+        "admitted_service_tier": "priority",
+        "model": "gpt-5.6-sol",
+        "thread_id": "thread-fast",
+        "turn_id": "turn-fast",
+    }
+    assert "key" not in json.dumps(proof).lower()
+
+
+@pytest.mark.asyncio
+async def test_required_actual_tier_route_fails_before_app_server_start():
+    server = CodexAppServer(
+        "codex",
+        require_actual_tier_proof=True,
+    )
+    server.ensure_started = AsyncMock()
+
+    with pytest.raises(
+        CodexServiceTierUnavailableError,
+        match="upstream route could not be proven",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=901,
+            codex_service_tier="priority",
+        )
+
+    server.ensure_started.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_standard_turn_remains_available_without_actual_tier_route():
+    server = CodexAppServer(
+        "codex",
+        require_actual_tier_proof=True,
+    )
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-standard-custom-route",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+        },
+        {"turn": {"id": "turn-standard-custom-route"}},
+    ])
+
+    process, thread_id = await server.start_turn(
+        prompt="standard custom provider",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=902,
+        codex_service_tier="default",
+    )
+
+    assert thread_id == "thread-standard-custom-route"
+    thread_call, turn_call = server._request.await_args_list
+    assert thread_call.args[1]["serviceTier"] is None
+    assert turn_call.args[1]["serviceTier"] is None
+    assert json.loads((await process.stdout.readline()).decode()) == {
+        "type": "thread.started",
+        "thread_id": "thread-standard-custom-route",
+    }
+
+
+@pytest.mark.asyncio
+async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
+    server = CodexAppServer(
+        "codex",
+        actual_tier_proxy_route=CodexTierProxyRoute(
+            "https://upstream.example/v1",
+        ),
+        require_actual_tier_proof=True,
+    )
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    proof = CodexActualTierProof(
+        thread_id="thread-fast-proof",
+        turn_id="turn-fast-proof",
+        parent_thread_id=None,
+        requested_tier="priority",
+        actual_tier="priority",
+        response_id="resp-fast-proof",
+        observed_at=1.0,
+    )
+    proxy = SimpleNamespace(
+        is_alive=True,
+        set_thread_tier=MagicMock(),
+        wait_for_actual_tier=AsyncMock(return_value=proof),
+        register_thread_parent=MagicMock(),
+    )
+    server._actual_tier_proxy = proxy
+
+    async def request(method, _params):
+        if method == "model/list":
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "serviceTiers": [{"id": "priority"}],
+                }],
+            }
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-fast-proof",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": "priority",
+            }
+        if method == "turn/start":
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/started",
+                {
+                    "threadId": "thread-fast-proof",
+                    "turn": {
+                        "id": "turn-fast-proof",
+                        "status": "inProgress",
+                    },
+                },
+            )
+            return {"turn": {"id": "turn-fast-proof"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    process, _thread_id = await server.start_turn(
+        prompt="fast with proof",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=902,
+        codex_service_tier="priority",
+    )
+
+    thread_call = server._request.await_args_list[1]
+    fast_config = thread_call.args[1]["config"]
+    assert fast_config["features"] == {
+        "multi_agent": False,
+        "multi_agent_v2": {
+            "enabled": False,
+            "max_concurrent_threads_per_session": 1,
+            "hide_spawn_agent_metadata": True,
+        },
+        "enable_fanout": False,
+        "memories": False,
+        "realtime_conversation": False,
+        "remote_compaction_v2": True,
+    }
+    assert fast_config["agents"] == {
+        "max_threads": 1,
+        "max_depth": 1,
+    }
+    assert fast_config["memories"] == {
+        "generate_memories": False,
+        "use_memories": False,
+        "dedicated_tools": False,
+    }
+    assert thread_call.args[1]["approvalsReviewer"] == "user"
+    assert server._request.await_args_list[2].args[1]["approvalsReviewer"] == (
+        "user"
+    )
+    proxy.set_thread_tier.assert_called_once_with(
+        "thread-fast-proof",
+        "priority",
+    )
+    proxy.wait_for_actual_tier.assert_awaited_once_with(
+        "thread-fast-proof",
+        "turn-fast-proof",
+        "priority",
+        timeout=60.0,
+    )
+    assert json.loads((await process.stdout.readline()).decode())["type"] == (
+        "thread.started"
+    )
+    event = json.loads((await process.stdout.readline()).decode())
+    assert event["actual_service_tier_verified"] is True
+    assert event["admitted_service_tier"] == "priority"
+    assert event["upstream_response_id"] == "resp-fast-proof"
+
+
+@pytest.mark.asyncio
+async def test_standard_turn_fences_request_without_requiring_actual_field():
+    server = CodexAppServer(
+        "codex",
+        actual_tier_proxy_route=CodexTierProxyRoute(
+            "https://upstream.example/v1",
+        ),
+        require_actual_tier_proof=True,
+    )
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    proof = CodexActualTierProof(
+        thread_id="thread-standard-proof",
+        turn_id="turn-standard-proof",
+        parent_thread_id=None,
+        requested_tier="default",
+        actual_tier="default",
+        response_id="resp-standard-proof",
+        observed_at=1.0,
+    )
+    proxy = SimpleNamespace(
+        is_alive=True,
+        set_thread_tier=MagicMock(),
+        wait_for_actual_tier=AsyncMock(return_value=proof),
+        register_thread_parent=MagicMock(),
+    )
+    server._actual_tier_proxy = proxy
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-standard-proof",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+        },
+        {"turn": {"id": "turn-standard-proof"}},
+    ])
+
+    await server.start_turn(
+        prompt="standard with proof",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=903,
+        codex_service_tier="default",
+    )
+
+    proxy.set_thread_tier.assert_called_once_with(
+        "thread-standard-proof",
+        "default",
+    )
+    proxy.wait_for_actual_tier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
+    server = CodexAppServer(
+        "codex",
+        actual_tier_proxy_route=CodexTierProxyRoute(
+            "https://upstream.example/v1",
+        ),
+        require_actual_tier_proof=True,
+    )
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    proxy = SimpleNamespace(
+        is_alive=True,
+        set_thread_tier=MagicMock(),
+        wait_for_actual_tier=AsyncMock(side_effect=CodexTierProofError(
+            "actual priority mismatch",
+        )),
+        register_thread_parent=MagicMock(),
+    )
+    server._actual_tier_proxy = proxy
+    server.abandon_turn = AsyncMock(return_value=True)
+
+    async def request(method, _params):
+        if method == "model/list":
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "serviceTiers": [{"id": "priority"}],
+                }],
+            }
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-proof-failure",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": "priority",
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-proof-failure"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexServiceTierUnavailableError,
+        match="actual priority mismatch",
+    ):
+        await server.start_turn(
+            prompt="must be interrupted",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=904,
+            codex_service_tier="priority",
+        )
+
+    server.abandon_turn.assert_awaited_once()
+    abandoned_process = server.abandon_turn.await_args.args[0]
+    assert abandoned_process.thread_id == "thread-proof-failure"
+
+
+@pytest.mark.asyncio
+async def test_fast_proof_precedes_terminal_notification_that_wins_response_race():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "model/list":
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "serviceTiers": [{"id": "priority"}],
+                }],
+            }
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-fast-race",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": "priority",
+            }
+        if method == "turn/start":
+            server._handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread-fast-race",
+                    "turn": {
+                        "id": "turn-fast-race",
+                        "status": "completed",
+                    },
+                },
+            )
+            return {"turn": {"id": "turn-fast-race"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="fast",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=96,
+        codex_service_tier="priority",
+    )
+
+    events = []
+    while True:
+        raw = await process.stdout.readline()
+        if not raw:
+            break
+        events.append(json.loads(raw))
+
+    assert thread_id == "thread-fast-race"
+    assert process.returncode == 0
+    assert [event["type"] for event in events] == [
+        "thread.started",
+        "system_event",
+        "turn.completed",
+    ]
+    assert events[1]["admitted_service_tier"] == "priority"
+    assert events[1]["turn_id"] == "turn-fast-race"
+
+
+@pytest.mark.asyncio
+async def test_fast_turn_rejects_unadvertised_model_before_thread_start():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "data": [{
+            "id": "gpt-5.4-mini",
+            "model": "gpt-5.4-mini",
+            "serviceTiers": [],
+        }],
+        "nextCursor": None,
+    })
+
+    with pytest.raises(
+        CodexServiceTierUnavailableError,
+        match="does not advertise",
+    ):
+        await server.start_turn(
+            prompt="fast",
+            cwd="/tmp",
+            model="gpt-5.4-mini",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=92,
+            codex_service_tier="priority",
+        )
+
+    server._request.assert_awaited_once()
+    assert server._request.await_args.args[0] == "model/list"
+
+
+@pytest.mark.asyncio
+async def test_fast_turn_rejects_fresh_thread_tier_mismatch_before_turn_start():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "data": [{
+                "id": "gpt-5.6-sol",
+                "serviceTiers": [{"id": "priority"}],
+            }],
+        },
+        {
+            "thread": {
+                "id": "thread-downgraded",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": None,
+        },
+    ])
+
+    with pytest.raises(
+        CodexServiceTierUnavailableError,
+        match="did not admit",
+    ):
+        await server.start_turn(
+            prompt="fast",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=93,
+            codex_service_tier="priority",
+        )
+
+    assert [
+        call.args[0] for call in server._request.await_args_list
+    ] == ["model/list", "thread/start"]
+
+
+@pytest.mark.asyncio
+async def test_fast_turn_does_not_publish_proof_when_turn_start_is_rejected():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "data": [{
+                "id": "gpt-5.6-sol",
+                "serviceTiers": [{"id": "priority"}],
+            }],
+        },
+        {
+            "thread": {
+                "id": "thread-fast-rejected",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "priority",
+        },
+        CodexAppServerError("turn rejected"),
+    ])
+    emitted = []
+    original_feed = CodexTurnProcess.feed
+
+    def capture_feed(process, event):
+        emitted.append(event)
+        original_feed(process, event)
+
+    with patch.object(CodexTurnProcess, "feed", autospec=True, side_effect=capture_feed):
+        with pytest.raises(CodexAppServerError, match="turn rejected"):
+            await server.start_turn(
+                prompt="fast",
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=95,
+                codex_service_tier="priority",
+            )
+
+    assert emitted == [{
+        "type": "thread.started",
+        "thread_id": "thread-fast-rejected",
+    }]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_tier", "loaded_tier"),
+    [("priority", None), ("default", "priority")],
+)
+async def test_loaded_thread_switches_service_tier_before_turn_start(
+    requested_tier,
+    loaded_tier,
+):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+
+    async def request(method, params):
+        calls.append((method, params))
+        if method == "model/list":
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "serviceTiers": [{"id": "priority"}],
+                }],
+            }
+        if method == "thread/resume":
+            return {
+                "thread": {"id": "thread-hot", "status": {"type": "idle"}},
+                "serviceTier": loaded_tier,
+            }
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/settings/update":
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "thread/settings/updated",
+                {
+                    "threadId": "thread-hot",
+                    "threadSettings": {
+                        "serviceTier": (
+                            "priority"
+                            if requested_tier == "priority"
+                            else "default"
+                        ),
+                    },
+                },
+            )
+            return {}
+        if method == "turn/start":
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "turn/started",
+                {
+                    "threadId": "thread-hot",
+                    "turn": {
+                        "id": "turn-switched",
+                        "status": "inProgress",
+                    },
+                },
+            )
+            return {"turn": {"id": "turn-switched"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    process, _thread_id = await server.start_turn(
+        prompt="switch",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-hot",
+        git_env=None,
+        task_id=94,
+        codex_service_tier=requested_tier,
+    )
+
+    expected_rpc_tier = (
+        "priority" if requested_tier == "priority" else None
+    )
+    methods = [method for method, _params in calls]
+    assert methods == (
+        [
+            "model/list",
+            "thread/resume",
+            "thread/goal/get",
+            "thread/settings/update",
+            "turn/start",
+        ]
+        if requested_tier == "priority"
+        else ["thread/resume", "thread/settings/update", "turn/start"]
+    )
+    update_params = next(
+        params for method, params in calls
+        if method == "thread/settings/update"
+    )
+    turn_params = next(
+        params for method, params in calls if method == "turn/start"
+    )
+    assert update_params["serviceTier"] == expected_rpc_tier
+    assert turn_params["serviceTier"] == expected_rpc_tier
+    expected_event_count = 2 if requested_tier == "priority" else 1
+    emitted = [
+        json.loads((await process.stdout.readline()).decode())
+        for _index in range(expected_event_count)
+    ]
+    assert emitted[0] == {"type": "thread.started", "thread_id": "thread-hot"}
+    if requested_tier == "priority":
+        assert emitted[1]["type"] == "system_event"
+        assert emitted[1]["admitted_service_tier"] == "priority"
+        assert emitted[1]["turn_id"] == "turn-switched"
+    else:
+        assert emitted == [{
+            "type": "thread.started",
+            "thread_id": "thread-hot",
+        }]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "goal_status",
+    ["active", "paused", "blocked", "usageLimited", "budgetLimited"],
+)
+async def test_fast_resume_rejects_resumable_native_goal_before_tier_update(
+    goal_status,
+):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "data": [{
+                "id": "gpt-5.6-sol",
+                "serviceTiers": [{"id": "priority"}],
+            }],
+        },
+        {
+            "thread": {
+                "id": "thread-native-goal",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": None,
+        },
+        {"goal": {"status": goal_status}},
+    ])
+
+    with pytest.raises(
+        CodexThreadNotIdleError,
+        match=f"goal:{goal_status}",
+    ):
+        await server.start_turn(
+            prompt="fast follow-up",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-native-goal",
+            git_env=None,
+            task_id=97,
+            codex_service_tier="priority",
+        )
+
+    assert [
+        call.args[0] for call in server._request.await_args_list
+    ] == ["model/list", "thread/resume", "thread/goal/get"]
+    assert "thread-native-goal" not in server._contexts_by_thread
+
+
+@pytest.mark.asyncio
+async def test_fast_resume_rejects_goal_response_without_explicit_goal_key():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "data": [{
+                "id": "gpt-5.6-sol",
+                "serviceTiers": [{"id": "priority"}],
+            }],
+        },
+        {
+            "thread": {
+                "id": "thread-missing-goal-proof",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "priority",
+        },
+        {},
+    ])
+
+    with pytest.raises(
+        CodexAppServerError,
+        match="thread/goal/get returned invalid data",
+    ):
+        await server.start_turn(
+            prompt="fast follow-up",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-missing-goal-proof",
+            git_env=None,
+            task_id=99,
+            codex_service_tier="priority",
+        )
+
+    assert [
+        call.args[0] for call in server._request.await_args_list
+    ] == ["model/list", "thread/resume", "thread/goal/get"]
+    assert "thread-missing-goal-proof" not in server._contexts_by_thread
+
+
+@pytest.mark.asyncio
+async def test_fast_admission_ignores_settings_notification_without_turn_id():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    settings_seen = asyncio.Event()
+    release_turn_identity = asyncio.Event()
+
+    async def request(method, _params):
+        if method == "model/list":
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "serviceTiers": [{"id": "priority"}],
+                }],
+            }
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-settings-only",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": "priority",
+            }
+        if method == "turn/start":
+            server._handle_notification(
+                "thread/settings/updated",
+                {
+                    "threadId": "thread-settings-only",
+                    "threadSettings": {"serviceTier": "priority"},
+                },
+            )
+            settings_seen.set()
+
+            async def emit_authoritative_turn_identity():
+                await release_turn_identity.wait()
+                server._handle_notification(
+                    "turn/started",
+                    {
+                        "threadId": "thread-settings-only",
+                        "turn": {
+                            "id": "turn-with-identity",
+                            "status": "inProgress",
+                        },
+                    },
+                )
+
+            asyncio.create_task(emit_authoritative_turn_identity())
+            return {"turn": {"id": "turn-with-identity"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    admission = asyncio.create_task(server.start_turn(
+        prompt="fast",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=100,
+        codex_service_tier="priority",
+    ))
+    await settings_seen.wait()
+    await asyncio.sleep(0)
+    assert not admission.done()
+
+    release_turn_identity.set()
+    process, thread_id = await admission
+    assert thread_id == "thread-settings-only"
+    process.finish(0)
+
+
+@pytest.mark.asyncio
+async def test_fast_adoption_by_older_turn_is_interrupted_without_success_proof():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+    emitted = []
+    original_feed = CodexTurnProcess.feed
+
+    def capture_feed(process, event):
+        emitted.append(event)
+        original_feed(process, event)
+
+    async def request(method, params):
+        calls.append((method, params))
+        if method == "model/list":
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "serviceTiers": [{"id": "priority"}],
+                }],
+            }
+        if method == "thread/resume":
+            return {
+                "thread": {
+                    "id": "thread-fast-adopted",
+                    "status": {"type": "idle"},
+                },
+                "serviceTier": "priority",
+            }
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "turn/start":
+            # The adoption notification arrives only after the RPC response,
+            # which is the narrow window that must not publish a Fast proof.
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "item/agentMessage/delta",
+                {
+                    "threadId": "thread-fast-adopted",
+                    "turnId": "turn-older-goal",
+                    "itemId": "old-output",
+                    "delta": "older turn output",
+                },
+            )
+            return {"turn": {"id": "turn-new-submission"}}
+        if method in {"thread/goal/set", "turn/interrupt"}:
+            return {}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with (
+        patch.object(
+            CodexTurnProcess,
+            "feed",
+            autospec=True,
+            side_effect=capture_feed,
+        ),
+        pytest.raises(
+            CodexThreadNotIdleError,
+            match="adopted-active-turn:turn-older-goal",
+        ),
+    ):
+        await server.start_turn(
+            prompt="must be a new Fast turn",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-fast-adopted",
+            git_env=None,
+            task_id=98,
+            codex_service_tier="priority",
+        )
+
+    assert [method for method, _params in calls] == [
+        "model/list",
+        "thread/resume",
+        "thread/goal/get",
+        "turn/start",
+        "thread/goal/set",
+        "turn/interrupt",
+    ]
+    assert not any(
+        event.get("type") == "system_event"
+        and event.get("requested_service_tier") == "priority"
+        for event in emitted
+    )
+    assert "thread-fast-adopted" not in server._contexts_by_thread
 
 
 @pytest.mark.asyncio
@@ -165,7 +1143,7 @@ async def test_start_turn_injects_mcp_config_into_new_thread():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-new"}},
+        {"thread": {"id": "thread-new", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-new"}},
     ])
 
@@ -199,7 +1177,12 @@ async def test_start_turn_keeps_native_project_trust_behavior_by_default():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-default-trust"}},
+        {
+            "thread": {
+                "id": "thread-default-trust",
+                "status": {"type": "idle"},
+            },
+        },
         {"turn": {"id": "turn-default-trust"}},
     ])
 
@@ -285,7 +1268,12 @@ async def test_concurrent_task_threads_keep_mcp_context_isolated():
             task_id = args[args.index("--task-id") + 1]
             thread_configs[task_id] = params["config"]
             await asyncio.sleep(0)
-            return {"thread": {"id": f"thread-{task_id}"}}
+            return {
+                "thread": {
+                    "id": f"thread-{task_id}",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             await asyncio.sleep(0)
             return {"turn": {"id": f"turn-{params['threadId']}"}}
@@ -352,7 +1340,12 @@ async def test_turn_start_receives_task_skill_additional_context():
 
     async def request(method, params):
         if method == "thread/start":
-            return {"thread": {"id": "thread-skills"}}
+            return {
+                "thread": {
+                    "id": "thread-skills",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             turn_params.update(params)
             return {"turn": {"id": "turn-skills"}}
@@ -390,7 +1383,12 @@ async def test_explicit_skill_context_rejection_is_replay_safe():
 
     async def request(method, _params):
         if method == "thread/start":
-            return {"thread": {"id": "thread-context-rejected"}}
+            return {
+                "thread": {
+                    "id": "thread-context-rejected",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             raise CodexAppServerRequestError(
                 "unknown field additionalContext"
@@ -422,7 +1420,12 @@ async def test_unknown_skill_context_turn_failure_is_not_replay_safe():
 
     async def request(method, _params):
         if method == "thread/start":
-            return {"thread": {"id": "thread-context-unknown"}}
+            return {
+                "thread": {
+                    "id": "thread-context-unknown",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             raise CodexAppServerError("reader exited after write")
         raise AssertionError(f"unexpected request: {method}")
@@ -563,7 +1566,12 @@ async def test_required_mcp_missing_turn_id_is_explicit_and_detaches_context():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-missing-turn"}},
+        {
+            "thread": {
+                "id": "thread-missing-turn",
+                "status": {"type": "idle"},
+            },
+        },
         {"turn": {}},
     ])
 
@@ -591,7 +1599,7 @@ async def test_steer_turn_targets_the_active_turn():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-1"}},
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-1"}},
         {"turnId": "turn-1"},
     ])
@@ -622,7 +1630,12 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
 
     async def request(method, _params):
         if method == "thread/resume":
-            return {"thread": {"id": "thread-goal"}}
+            return {
+                "thread": {
+                    "id": "thread-goal",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             # Task 208's active goal emitted output before the turn/start RPC
             # returned its distinct submission id.
@@ -699,7 +1712,12 @@ async def test_terminal_first_notification_settles_provisional_context():
 
     async def request(method, _params):
         if method == "thread/resume":
-            return {"thread": {"id": "thread-hook"}}
+            return {
+                "thread": {
+                    "id": "thread-hook",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             server._handle_notification("turn/completed", {
                 "threadId": "thread-hook",
@@ -740,7 +1758,12 @@ async def test_signal_interrupt_reconciles_and_pauses_existing_goal_turn():
 
     async def request(method, params):
         if method == "thread/resume":
-            return {"thread": {"id": "thread-goal"}}
+            return {
+                "thread": {
+                    "id": "thread-goal",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             return {"turn": {"id": "turn-submission"}}
         if method == "turn/interrupt":
@@ -799,7 +1822,12 @@ async def test_interrupt_continues_when_goals_feature_is_disabled():
 
     async def request(method, params):
         if method == "thread/resume":
-            return {"thread": {"id": "thread-regular"}}
+            return {
+                "thread": {
+                    "id": "thread-regular",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             return {"turn": {"id": "turn-submission"}}
         if method == "turn/interrupt":
@@ -855,7 +1883,12 @@ async def test_steer_retries_authoritative_active_turn_id():
 
     async def request(method, params):
         if method == "thread/resume":
-            return {"thread": {"id": "thread-goal"}}
+            return {
+                "thread": {
+                    "id": "thread-goal",
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             return {"turn": {"id": "turn-submission"}}
         if method == "turn/steer":
@@ -895,9 +1928,9 @@ async def test_second_turn_on_same_active_thread_is_typed_busy_error():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-1"}},
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-1"}},
-        {"thread": {"id": "thread-1"}},
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
     ])
     await server.start_turn(
         prompt="first", cwd="/tmp", model="gpt-5.5", effort="low",
@@ -991,7 +2024,7 @@ async def test_steer_turn_protocol_rejection_is_a_normal_false_result():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-1"}},
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-1"}},
         CodexAppServerError("active turn changed"),
     ])
@@ -1009,7 +2042,7 @@ async def test_notifications_stream_delta_and_finish_process():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-1"}},
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-1"}},
     ])
     process, _ = await server.start_turn(
@@ -1220,7 +2253,7 @@ async def test_context_window_error_keeps_structured_codex_error_info():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-1"}},
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-1"}},
     ])
     process, _ = await server.start_turn(
@@ -1260,9 +2293,9 @@ async def test_interleaved_notifications_are_isolated_by_turn():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-a"}},
+        {"thread": {"id": "thread-a", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-a"}},
-        {"thread": {"id": "thread-b"}},
+        {"thread": {"id": "thread-b", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-b"}},
     ])
     process_a, _ = await server.start_turn(
@@ -1314,7 +2347,7 @@ async def test_reader_exit_fails_pending_requests_and_active_turns():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-1"}},
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-1"}},
     ])
     turn_process, _ = await server.start_turn(
@@ -1407,6 +2440,13 @@ async def test_app_server_spawn_uses_independent_session(tmp_path):
             await server._start()
 
     assert spawn.await_args.kwargs["start_new_session"] is True
+    assert spawn.await_args.args == (
+        "codex",
+        "app-server",
+        "--enable",
+        "fast_mode",
+        "--stdio",
+    )
 
 
 @pytest.mark.asyncio
@@ -1832,6 +2872,131 @@ def reset_registry_fake_servers():
 
 
 @pytest.mark.asyncio
+async def test_thread_routing_quiescence_requires_terminal_goal_and_idle_status():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"goal": {"status": "complete"}},
+        {
+            "thread": {
+                "id": "thread-routing-idle",
+                "status": {"type": "idle"},
+            },
+        },
+    ])
+
+    snapshot = await server.require_thread_routing_quiescence(
+        "thread-routing-idle",
+    )
+
+    assert snapshot["goal"] == {"status": "complete"}
+    assert snapshot["thread"]["status"] == {"type": "idle"}
+    assert server._request.await_args_list[1].args == (
+        "thread/read",
+        {
+            "threadId": "thread-routing-idle",
+            "includeTurns": False,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_thread_routing_quiescence_rejects_active_thread_after_goal_check():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"goal": None},
+        {
+            "thread": {
+                "id": "thread-routing-active",
+                "status": {
+                    "type": "active",
+                    "activeFlags": ["waitingOnTool"],
+                },
+            },
+        },
+    ])
+
+    with pytest.raises(CodexThreadNotIdleError, match="active"):
+        await server.require_thread_routing_quiescence(
+            "thread-routing-active",
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_routing_guard_blocks_resume_through_caller_commit(
+    tmp_path,
+):
+    class RoutingGuardServer(_RegistryFakeServer):
+        async def require_thread_routing_quiescence(self, thread_id):
+            return {
+                "goal": None,
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
+
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "routing-guard")
+    thread_id = "thread-routing-guard"
+    server = RoutingGuardServer("codex", codex_home=home)
+    registry._servers[home] = server
+    guard_entered = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def commit_under_guard():
+        async with registry.thread_routing_guard(home, thread_id):
+            guard_entered.set()
+            await release_commit.wait()
+
+    guarded = asyncio.create_task(commit_under_guard())
+    await guard_entered.wait()
+    try:
+        assert thread_id in registry._starting_threads
+        assert registry._starting[home] == 1
+        with pytest.raises(CodexAppServerBusyError, match="in flight"):
+            await registry.start_turn(
+                codex_home=home,
+                resume_session_id=thread_id,
+                task_id=99,
+            )
+    finally:
+        release_commit.set()
+        await guarded
+
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
+    assert registry._thread_owners[thread_id] == home
+
+
+@pytest.mark.asyncio
+async def test_registry_routing_guard_failure_releases_new_owner(tmp_path):
+    class NonIdleGuardServer(_RegistryFakeServer):
+        async def require_thread_routing_quiescence(self, thread_id):
+            raise CodexThreadNotIdleError(
+                thread_id,
+                "goal:paused",
+                operation="routing configuration change",
+            )
+
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "routing-guard-failure")
+    thread_id = "thread-routing-guard-failure"
+    registry._servers[home] = NonIdleGuardServer("codex", codex_home=home)
+
+    with pytest.raises(CodexThreadNotIdleError, match="goal:paused"):
+        async with registry.thread_routing_guard(home, thread_id):
+            pytest.fail("non-idle routing guard must not enter its context")
+
+    assert thread_id not in registry._thread_owners
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("shutdown_fails", [False, True])
 async def test_cancelled_turn_with_unconfirmed_interrupt_escalates_transport(
     tmp_path,
@@ -1849,7 +3014,12 @@ async def test_cancelled_turn_with_unconfirmed_interrupt_escalates_transport(
 
     async def request(method, _params):
         if method == "thread/resume":
-            return {"thread": {"id": thread_id}}
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
         if method == "turn/start":
             turn_start_entered.set()
             await release_turn_start.wait()
@@ -1909,7 +3079,7 @@ async def test_turn_start_timeout_shuts_transport_to_avoid_untracked_work(
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
-        {"thread": {"id": thread_id}},
+        {"thread": {"id": thread_id, "status": {"type": "idle"}}},
         asyncio.TimeoutError(),
     ])
     server.shutdown = AsyncMock()

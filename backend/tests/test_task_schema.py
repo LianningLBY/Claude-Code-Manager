@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from backend.schemas.task import TaskResponse
+from backend.config import settings
+from backend.schemas.task import TaskCreate, TaskResponse, TaskUpdate
 
 
 def _make_task_response(**overrides) -> TaskResponse:
@@ -16,7 +17,8 @@ def _make_task_response(**overrides) -> TaskResponse:
         goal_condition=None, goal_evaluator_model=None, goal_max_turns=30,
         goal_turns_used=0, goal_last_reason=None, plan_content=None,
         plan_approved=None, session_id=None, provider="claude", model=None,
-        effort_level=None, thinking_budget=None, enable_workflows=False,
+        codex_service_tier="default", effort_level=None, thinking_budget=None,
+        enable_workflows=False,
         enabled_skills=None, starred=False, archived=False, has_unread=False,
         error_message=None, tags=None, metadata_=None, active_sub_agents=0,
         context_window_usage=None,
@@ -63,3 +65,29 @@ class TestTaskResponseDatetimeSerialization:
         data = resp.model_dump(mode="json")
         for field in ("created_at", "started_at", "completed_at"):
             assert "+00:00" in data[field], f"{field} missing UTC offset"
+
+
+def test_explicit_empty_provider_is_rejected_even_when_default_is_codex(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "default_provider", "codex")
+
+    with pytest.raises(ValueError, match="provider must be"):
+        TaskCreate(
+            description="d",
+            provider="",
+            model="gpt-5.6-sol",
+            codex_service_tier="priority",
+        )
+    with pytest.raises(ValueError, match="provider must be"):
+        TaskUpdate(provider="")
+    with pytest.raises(ValueError, match="provider must be"):
+        TaskUpdate(provider=None)
+
+
+def test_task_provider_is_canonicalized():
+    created = TaskCreate(description="d", provider=" CODEX ")
+    updated = TaskUpdate(provider=" Claude ")
+
+    assert created.provider == "codex"
+    assert updated.provider == "claude"

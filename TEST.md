@@ -128,6 +128,9 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_delete_task` | DELETE 删除任务 |
 | `test_cancel_task` | 取消任务 |
 | `test_retry_task` | 重试任务 |
+| `test_create_task_defaults_to_standard_service_tier` / `test_create_fast_codex_task_persists_priority` | Task 默认持久化 Standard，Codex Fast 持久化 `priority` |
+| `test_create_fast_task_rejects_incompatible_configuration` / `test_update_validates_merged_provider_model_and_service_tier` | Claude、mini/Spark 与合并更新不能绕过 Fast 能力校验 |
+| `test_migration_import_*_fast_service_tier` | Worker migration-import 保留兼容 Fast，拒绝不支持模型 |
 
 #### `test_api_chat_plan.py` — Chat 和 Plan API
 
@@ -148,6 +151,7 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_plan_reject_success` | plan_review 状态 reject → status=cancelled, plan_approved=False |
 | `test_plan_approve_not_found` | 不存在的 task approve 返回 404 |
 | `test_plan_reject_not_found` | 不存在的 task reject 返回 404 |
+| `test_codex_fast_rejects_unsupported_chat_model_before_logging` | Fast Task 的一次性模型覆盖若不支持 `priority`，在消息落库和执行前拒绝 |
 
 #### `test_api_system.py` — 系统 API
 
@@ -425,6 +429,10 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_launch_codex_app_server_routes_turn_to_canonical_home` | capability 关闭时 app-server 行为保持原样且不注入空配置 |
 | `test_codex_main_mcp_capability_does_not_change_claude_launch` | capability 开启不改变 Claude provider 的启动路径 |
 
+Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；Standard 清除 sticky tier；已加载 thread 的 Standard↔Fast 切换等待 `thread/settings/updated`，root lineage 有活跃请求时拒绝切换；`model/list` 不支持、admission 不一致或无法确认时不得发送 `turn/start`；Fast 在 app-server 关闭/失败时禁止 `codex exec` fallback；选号、限额轮换、Worker 迁移和 ApexRouter capability 均保留 tier。loopback Responses 代理必须覆盖 secret path/loopback/endpoint/WS 门禁、请求 thread/turn/parent lineage、request priority 校验、上游非 2xx，以及在释放任何成功 SSE 前要求首个 `response.created.response.service_tier=priority`；缺字段、Standard、非法值或后续同 turn 失败都不能留下可用 Fast proof。Standard 请求不得携带 priority，但兼容上游不返回 informational tier。Fast Goal evaluator 必须继承任务模型并走 priority app-server 与实际 tier 证明，且在主回合前拒绝不同/不兼容 evaluator；Standard Goal evaluator 显式固定 Standard。Fast Task 的 Distill 必须在启动其 Standard auxiliary 前返回 409。
+
+路由配置一致性回归还必须覆盖：本机 active/运行中子 Agent 更新明确 409；Worker stage 只落 durable candidate，Manager exact CAS 后才 ack；stage/ack 响应丢失、orphan reconcile、Instance/pre-owner launch、queued recovery/final barrier、重启恢复及 Codex 子 Agent commit/cancel 均不得让旧 Standard turn 越过 Fast 配置。Manager 已 commit 后即使 ACK/readback 暂不可用，API 也返回 Manager 权威 Task，Worker marker 在后续 readback 收敛前持续阻断执行。
+
 前端 capability 展示回归：
 
 | 测试 | 验证内容 |
@@ -443,6 +451,8 @@ Codex 版本兼容基线（2026-07-24）：
 7. 同一账号有活跃 app-server turn 时尝试启动 exec，应返回 busy；turn 结束后 exec 可关闭空闲 app-server 再启动。反向在 exec generation 未收尾时启动 app-server 也应返回 busy；此时在 Codex 账号池强制刷新额度应显示该账号暂不可实时读取，且日志中不得出现同 home 的新 app-server 启动。
 8. 关闭 app-server 后启用 Codex Sub-Agent task，应明确报告其需要 app-server，且不得启动 exec。
 9. 设置 `CODEX_MAIN_MCP_ENABLED=false` 重启并确认普通 Codex exec 无 `ccm_skills`；测试完移除该覆盖并恢复原来的 `CODEX_APP_SERVER_ENABLED` 设置。
+
+Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模型、相同 effort 和 prompt 分别运行 Standard/Fast，确认 Fast 日志和聊天事件记录 requested/admitted=`priority`、`actual_service_tier_verified=true` 及上游 response id；再用 mini/Spark、未广告 priority 的 API 账号、关闭 app-server，以及代理模拟返回 `service_tier=default`/缺字段四种场景验证都明确失败且没有成功 Fast 输出。随后把同一已加载 Task 从 Fast 切 Standard、再切回 Fast，确认下一轮请求配置分别为 default/priority，且 Standard 没有继承旧 Fast。ApexRouter 需单独实测其实际速度与计费，不能套用 OpenAI 官方倍率。
 
 真实验收记录（2026-07-24）：
 
@@ -532,8 +542,10 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_codex_model_options_have_no_bare_gpt56` | **关键**：裸 `gpt-5.6` 不是有效模型 ID（服务端列表实证） |
 | `test_gpt56_*_support_*` / `test_older_models_fall_back_*` | 按模型区分档位：sol/terra 到 ultra、luna 到 max、旧模型到 xhigh |
 | `test_clamp_*` | `clamp_codex_effort` 透传受支持档位 / 向下夹不支持档位 / None 与未知输入安全 |
+| `test_fast_service_tier_capabilities_match_catalog` | Fast 能力只开放给 GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；mini/Spark/未知模型只有 Standard |
+| `test_validate_fast_service_tier_requires_codex_and_supported_model` | `priority` 仅允许 Codex + 支持模型，且与 model/effort 语义独立 |
 
-（前端配套：`TaskForm.test.tsx` 的 "Codex GPT-5.6 per-model effort options" 套件——模型下拉列三模型、effort 选项按模型过滤、切模型后失效档位自动回落默认）
+（前端配套：`TaskForm.test.tsx` 覆盖 Fast 选择、能力禁用、模型切换原子回落及 localStorage 默认；`TaskBadges.test.tsx` / `TaskList.test.tsx` / `ChatView.test.tsx` 覆盖下一轮配置、Fast 徽标和不支持的一次性模型禁用。）
 
 ##### Codex provider 对等逻辑（AGENTS.md，2026-07-19）
 

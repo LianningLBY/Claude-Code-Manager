@@ -20,7 +20,7 @@ from backend.database import get_db
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
 from backend.models.user_skill import UserSkill
-from backend.schemas.task import TaskResponse
+from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.task_queue import task_is_pr_review_superseded
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import (
@@ -40,6 +40,9 @@ class ChatMessage(BaseModel):
     secret_ids: list[int] | None = None
     # One-shot model override for this message (does not change task.model)
     model: str | None = None
+    # The route rendered by the caller. A mismatch is rejected before the
+    # user row is persisted, so a stale Fast tab cannot launch Standard.
+    expected_routing: TaskRoutingExpectation | None = None
 
 
 class ForkAnchor(BaseModel):
@@ -58,6 +61,21 @@ class ForkAnchor(BaseModel):
 class CodexForkRequest(BaseModel):
     anchor: ForkAnchor
     title: str | None = None
+
+
+def _validate_chat_service_tier(task: Task, model_override: str | None) -> None:
+    """Reject an unsupported one-turn model before persisting the message."""
+
+    from backend.services.codex_models import validate_codex_service_tier
+
+    try:
+        validate_codex_service_tier(
+            task.provider,
+            model_override or task.model,
+            task.codex_service_tier,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _native_ids(raw_json: str | None) -> tuple[str | None, str | None]:
@@ -338,6 +356,14 @@ async def send_chat_message(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
+    from backend.api.tasks import _require_expected_task_routing
+
+    _require_expected_task_routing(
+        task,
+        body.expected_routing,
+        effective_model=body.model or task.model,
+    )
+    _validate_chat_service_tier(task, body.model)
     if task_is_pr_review_superseded(task):
         raise HTTPException(
             409,
@@ -347,6 +373,36 @@ async def send_chat_message(
         return await _send_shared_chat(task, body, db)
     if task.worker_id is not None:
         return await _send_worker_chat(task, body, db, request)
+
+    # Worker-local stage/ack/reconcile and direct chat admission share this
+    # process-wide lock.  A stage that wins first returns 409 here; a stage
+    # that wins after this check is still caught by the queued turn's final DB
+    # launch barrier.
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        task = await db.get(Task, task_id)
+        if task is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_access(request, task, db)
+        if task.worker_id is not None or task.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Task routing changed while chat admission was in progress",
+            )
+        from backend.api.tasks import (
+            _require_expected_task_routing,
+            _require_no_pending_worker_routing,
+        )
+
+        _require_no_pending_worker_routing(task)
+        admitted_routing = _require_expected_task_routing(
+            task,
+            body.expected_routing,
+            effective_model=body.model or task.model,
+        )
+        _validate_chat_service_tier(task, body.model)
+
     if body.secret_ids:
         from backend.api.deps import require_admin
 
@@ -469,6 +525,7 @@ async def send_chat_message(
             source="user",
             command_skills=command_skills,
             model_override=body.model,
+            expected_task_routing=admitted_routing,
             source_log_id=user_log.id,
         )
     except TaskStartPausedError as exc:
@@ -693,6 +750,7 @@ async def fork_codex_task(
             last_cwd=source.last_cwd,
             provider="codex",
             model=source.model,
+            codex_service_tier=source.codex_service_tier,
             effort_level=source.effort_level,
             thinking_budget=source.thinking_budget,
             system_prompt_mode=source.system_prompt_mode,
@@ -875,6 +933,18 @@ async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, req
                 409,
                 "This PR review task was superseded by a newer push",
             )
+        from backend.api.tasks import _ensure_worker_routing_ready
+        from backend.api.tasks import _require_expected_task_routing
+
+        await _ensure_worker_routing_ready(
+            current,
+            operation_lock_held=True,
+        )
+        _require_expected_task_routing(
+            current,
+            body.expected_routing,
+            effective_model=body.model or current.model,
+        )
 
         # Preserve the sender prefix for the Manager UI, but forward only the
         # raw user text so it never becomes part of the model prompt.
@@ -968,6 +1038,11 @@ async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, req
                 "image_paths": body.image_paths,
                 "file_paths": body.file_paths,
                 "model": body.model,
+                "expected_routing": (
+                    body.expected_routing.model_dump(mode="json")
+                    if body.expected_routing is not None
+                    else None
+                ),
             },
             operation_lock_held=True,
         )
@@ -1226,6 +1301,7 @@ async def get_message_detail(
 
 class InjectMessage(BaseModel):
     message: str
+    expected_routing: TaskRoutingExpectation | None = None
 
 
 @router.post("/{task_id}/inject")
@@ -1241,6 +1317,14 @@ async def inject_message(
         await require_task_access(request, task, db)
     if not task:
         raise HTTPException(404, "Task not found")
+
+    from backend.api.tasks import _require_expected_task_routing
+
+    _require_expected_task_routing(
+        task,
+        body.expected_routing,
+        effective_model=task.model,
+    )
 
     from backend.main import instance_manager, broadcaster
     if not task.session_id:
@@ -1399,6 +1483,7 @@ async def _collect_conversation_for_distill(task_id: int, db: AsyncSession) -> s
 
 class DistillRequest(BaseModel):
     custom_instruction: str | None = None
+    expected_routing: TaskRoutingExpectation | None = None
 
 
 class DistillSaveRequest(BaseModel):
@@ -1418,70 +1503,98 @@ async def distill_task(
 
     Uses the task's provider and returns a card for user preview/editing.
     """
-    task = await db.get(Task, task_id)
-    if not task:
-        raise HTTPException(404, "Task not found")
-    await require_task_control(request, task, db)
+    # A distill request starts a separate provider call.  Keep the same
+    # operation barrier used by Task routing updates for the entire call:
+    # otherwise a Standard preflight can race with a Standard→Fast update and
+    # silently issue a non-priority request after the UI already shows Fast.
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        task = await db.get(Task, task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, task, db)
+        from backend.api.tasks import _require_expected_task_routing
 
-    conversation = await _collect_conversation_for_distill(task_id, db)
-    if not conversation.strip():
-        raise HTTPException(400, "No conversation history to distill")
-
-    from backend.main import (
-        cloudrouter_store,
-        codex_pool,
-        dispatcher,
-        instance_manager,
-    )
-    from backend.services.skill_distill import (
-        CodexDistillAccountUnavailableError,
-        TaskDistillError,
-        TaskDistillTimeoutError,
-        distill_task_conversation,
-    )
-    title = (
-        task.title
-        or (task.description[:100] if task.description else "")
-        or "Untitled"
-    )
-    try:
-        result = await distill_task_conversation(
-            title=title,
-            conversation=conversation,
-            provider=task.provider or "claude",
-            custom_instruction=body.custom_instruction,
-            claude_pool=dispatcher.pool,
-            codex_pool=codex_pool,
-            codex_account_id=(task.metadata_ or {}).get("codex_account_id"),
-            instance_manager=instance_manager,
-            cloudrouter_store=cloudrouter_store,
+        _require_expected_task_routing(
+            task,
+            body.expected_routing,
+            effective_model=task.model,
         )
-    except TaskDistillTimeoutError as exc:
-        raise HTTPException(504, str(exc)) from exc
-    except CodexDistillAccountUnavailableError as exc:
-        raise HTTPException(503, str(exc)) from exc
-    except TaskDistillError as exc:
-        detail = (exc.stderr or exc.stdout).strip()[:500]
-        logger.error(
-            "distill: %s failed. stdout=%s stderr=%s",
-            exc.provider,
-            exc.stdout[:500],
-            exc.stderr[:500],
+        if (
+            (task.provider or "claude").lower() == "codex"
+            and (task.codex_service_tier or "default") == "priority"
+        ):
+            raise HTTPException(
+                409,
+                "Codex Fast distillation is not available because the distill "
+                "transport cannot confirm priority admission; switch this Task "
+                "to Standard before distilling",
+            )
+
+        conversation = await _collect_conversation_for_distill(task_id, db)
+        if not conversation.strip():
+            raise HTTPException(400, "No conversation history to distill")
+
+        from backend.main import (
+            cloudrouter_store,
+            codex_pool,
+            dispatcher,
+            instance_manager,
         )
-        message = str(exc)
-        if detail:
-            message = f"{message}: {detail}"
-        raise HTTPException(502, message) from exc
+        from backend.services.skill_distill import (
+            CodexDistillAccountUnavailableError,
+            TaskDistillError,
+            TaskDistillTimeoutError,
+            distill_task_conversation,
+        )
+        title = (
+            task.title
+            or (task.description[:100] if task.description else "")
+            or "Untitled"
+        )
+        try:
+            result = await distill_task_conversation(
+                title=title,
+                conversation=conversation,
+                provider=task.provider or "claude",
+                custom_instruction=body.custom_instruction,
+                claude_pool=dispatcher.pool,
+                codex_pool=codex_pool,
+                codex_account_id=(task.metadata_ or {}).get(
+                    "codex_account_id"
+                ),
+                instance_manager=instance_manager,
+                cloudrouter_store=cloudrouter_store,
+            )
+        except TaskDistillTimeoutError as exc:
+            raise HTTPException(504, str(exc)) from exc
+        except CodexDistillAccountUnavailableError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except TaskDistillError as exc:
+            detail = (exc.stderr or exc.stdout).strip()[:500]
+            logger.error(
+                "distill: %s failed. stdout=%s stderr=%s",
+                exc.provider,
+                exc.stdout[:500],
+                exc.stderr[:500],
+            )
+            message = str(exc)
+            if detail:
+                message = f"{message}: {detail}"
+            raise HTTPException(502, message) from exc
 
-    suggested_name = (task.title or task.description or "untitled")[:50].strip()
+        suggested_name = (
+            task.title or task.description or "untitled"
+        )[:50].strip()
 
-    return {
-        "task_id": task_id,
-        "suggested_name": suggested_name,
-        "content": result["content"],
-        "provider": result["provider"],
-        "model": result["model"],
-    }
+        return {
+            "task_id": task_id,
+            "suggested_name": suggested_name,
+            "content": result["content"],
+            "provider": result["provider"],
+            "model": result["model"],
+        }
 
 
 @router.post("/{task_id}/distill/save")

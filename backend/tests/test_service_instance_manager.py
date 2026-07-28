@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import tomllib
+import types
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,8 +30,10 @@ from backend.services.codex_app_server import (
     CodexAppServerError,
     CodexRequiredMcpError,
     CodexRequiredMcpPreTurnError,
+    CodexServiceTierUnavailableError,
     CodexThreadHomeMismatchError,
 )
+from backend.services.codex_tier_proxy import CodexTierProxyRoute
 from backend.services.mcp_config import (
     McpServerSpec,
     build_mcp_server_specs,
@@ -59,6 +62,143 @@ def _no_pty_no_skills(monkeypatch):
 
 def test_codex_main_mcp_capability_defaults_on():
     assert Settings.model_fields["codex_main_mcp_enabled"].default is True
+
+
+def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
+    root = tmp_path / "api-account"
+    return types.SimpleNamespace(
+        id=f"{api_provider}-1",
+        api_provider=api_provider,
+        root=root,
+        claude_config_dir=str(root / "claude"),
+        codex_home=str(root / "codex"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_blocks_db_only_unknown_live_binding(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="unknown API owner",
+            status="in_progress",
+            provider="claude",
+            metadata_={},
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="recovered",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="claude",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+    blockers = await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path)
+    )
+
+    assert any("unverifiable" in blocker for blocker in blockers)
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_accepts_explicit_other_account_binding(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="known other owner",
+            status="in_progress",
+            provider="claude",
+            metadata_={"claude_account_id": "cloudrouter-2"},
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="recovered",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="claude",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+    assert await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path)
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_blocks_missing_task_claim(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        db.add(Instance(
+            name="orphan claim",
+            status="error",
+            pid=None,
+            current_task_id=999999,
+            provider="codex",
+        ))
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+    blockers = await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path)
+    )
+
+    assert any("unverifiable task claim" in blocker for blocker in blockers)
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_blocks_pool_only_hot_pty_session(
+    db_factory, tmp_path,
+):
+    account = _api_account_stub(tmp_path)
+    session = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            config_dir=account.claude_config_dir,
+        ),
+        is_alive=True,
+    )
+    manager = InstanceManager(db_factory, MagicMock())
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={},
+        _pool=types.SimpleNamespace(_sessions={"hot": session}),
+    )
+
+    blockers = await manager.api_account_runtime_users(account)
+
+    assert "hot PTY session hot" in blockers
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_fails_closed_on_db_query_error(tmp_path):
+    @asynccontextmanager
+    async def failing_db_factory():
+        db = MagicMock()
+        db.execute = AsyncMock(side_effect=RuntimeError("database offline"))
+        yield db
+
+    manager = InstanceManager(failing_db_factory, MagicMock())
+    with pytest.raises(
+        RuntimeError,
+        match="Could not verify durable task account ownership",
+    ):
+        await manager.api_account_runtime_users(
+            _api_account_stub(tmp_path)
+        )
 
 
 def test_codex_main_mcp_capability_allows_explicit_env_opt_out(monkeypatch):
@@ -149,6 +289,40 @@ async def test_failed_spawn_reap_retains_task_launch_reservation():
     process.returncode = -9
     im.processes.pop(instance_id, None)
     im._launch_reservations.pop(instance_id, None)
+
+
+@pytest.mark.asyncio
+async def test_fast_launch_resolves_null_model_before_runtime_admission(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "default_codex_model",
+        "gpt-5.6-sol",
+    )
+    im = InstanceManager(MagicMock(), MagicMock())
+    admitted = []
+
+    @asynccontextmanager
+    async def runtime_admission(provider, config_dir, model, *, service_tier):
+        admitted.append((provider, config_dir, model, service_tier))
+        yield None
+
+    im._cloudrouter_runtime_admission = runtime_admission
+    im._launch_locked = AsyncMock(return_value=4321)
+
+    assert await im.launch(
+        910,
+        "Fast with historical NULL model",
+        provider="codex",
+        model=None,
+        codex_service_tier="priority",
+    ) == 4321
+
+    assert admitted == [
+        ("codex", None, "gpt-5.6-sol", "priority"),
+    ]
+    assert im._launch_locked.await_args.kwargs["model"] == "gpt-5.6-sol"
 
 
 @pytest.mark.asyncio
@@ -384,6 +558,37 @@ def test_build_command_codex_default_model_not_passed():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(provider="codex", prompt="hi", model="default", resume_session_id=None, effort_level=None)
     assert "--model" not in cmd
+
+
+def test_build_command_codex_standard_explicitly_clears_fast_mode():
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="codex",
+        prompt="standard",
+        model="gpt-5.6-sol",
+        resume_session_id=None,
+        effort_level="high",
+        codex_service_tier="default",
+    )
+
+    assert 'service_tier="default"' in cmd
+    assert "fast_mode" not in cmd
+
+
+def test_build_command_codex_fast_uses_explicit_feature_and_tier():
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="codex",
+        prompt="fast",
+        model="gpt-5.6-sol",
+        resume_session_id=None,
+        effort_level="high",
+        codex_service_tier="priority",
+    )
+
+    assert cmd[cmd.index("--enable") + 1] == "fast_mode"
+    assert 'service_tier="fast"' in cmd
+    assert 'service_tier="default"' not in cmd
 
 
 def test_build_command_codex_api_forces_git_root_untrusted(tmp_path):
@@ -1870,6 +2075,9 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     broadcaster = MagicMock(broadcast=AsyncMock())
     im = InstanceManager(db_factory, broadcaster)
     im.task_message_enqueuer = AsyncMock()
+    im._codex_actual_tier_route_for_home = MagicMock(return_value=(
+        CodexTierProxyRoute("https://upstream.example/v1")
+    ))
     mock_proc = _make_mock_process()
     startup_error = (
         CodexAppServerError("initialize failed")
@@ -1877,6 +2085,15 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
         else None
     )
     thread_response = {"thread": {}} if failure_mode == "missing-thread" else None
+
+    async def ensure_with_test_proxy(server):
+        if startup_error is not None:
+            raise startup_error
+        proxy = MagicMock()
+        proxy.is_alive = True
+        proxy.close = AsyncMock()
+        server._actual_tier_proxy = proxy
+
     with (
         caplog.at_level("INFO", logger="backend.services.instance_manager"),
         patch(
@@ -1890,8 +2107,8 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
         ),
         patch(
             "backend.services.codex_app_server.CodexAppServer.ensure_started",
-            new_callable=AsyncMock,
-            side_effect=startup_error,
+            autospec=True,
+            side_effect=ensure_with_test_proxy,
         ) as ensure_started,
         patch(
             "backend.services.codex_app_server.CodexAppServer._request",
@@ -2143,6 +2360,75 @@ async def test_launch_codex_does_not_fallback_when_replay_is_unsafe(
 
 
 @pytest.mark.asyncio
+async def test_fast_launch_refuses_unconfirmed_direct_exec(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-fast-no-app-server")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    im = InstanceManager(db_factory, MagicMock())
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexServiceTierUnavailableError,
+            match="requires app-server",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must be verified",
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+                codex_service_tier="priority",
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fast_launch_does_not_use_exec_after_app_server_failure(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-fast-app-server-failure")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    im = InstanceManager(db_factory, MagicMock())
+    im._launch_codex_app_server = AsyncMock(
+        side_effect=RuntimeError("protocol unavailable"),
+    )
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexServiceTierUnavailableError,
+            match="refusing unverified exec fallback",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must be verified",
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+                codex_service_tier="priority",
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_codex_started_turn_wraps_generic_persistence_failure(
     db_factory,
 ):
@@ -2224,6 +2510,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
             source_log_id=4321,
             current_message="raw work",
             queue_timestamp=12.5,
+            codex_service_tier="priority",
         )
 
     assert pid == 7654
@@ -2232,11 +2519,16 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
         codex_home.resolve()
     )
     assert registry.start_turn.await_args.kwargs["mcp_specs"] == ()
+    assert (
+        registry.start_turn.await_args.kwargs["codex_service_tier"]
+        == "priority"
+    )
     assert im.get_config_dir(inst.id) == str(codex_home.resolve())
     assert im._launch_params[inst.id]["config_dir"] == str(codex_home.resolve())
     assert im._launch_params[inst.id]["source_log_id"] == 4321
     assert im._launch_params[inst.id]["current_message"] == "raw work"
     assert im._launch_params[inst.id]["queue_timestamp"] == 12.5
+    assert im._launch_params[inst.id]["codex_service_tier"] == "priority"
     await asyncio.sleep(0.1)
     im.task_message_enqueuer.assert_awaited_once()
     assert (
@@ -3061,6 +3353,7 @@ async def test_codex_soft_quota_switch_migrates_rebinds_and_updates_binding(
         task = Task(
             title="codex quota", provider="codex", status="executing",
             session_id=session_id, metadata_={"codex_account_id": "codex-a"},
+            codex_service_tier="priority",
         )
         db.add(task)
         await db.commit()
@@ -3077,6 +3370,11 @@ async def test_codex_soft_quota_switch_migrates_rebinds_and_updates_binding(
         switched = await im._try_proactive_pool_switch(7, task.id)
 
     assert switched is True
+    pool.select_quota_alternative.assert_awaited_once_with(
+        str(source.resolve()),
+        model=None,
+        service_tier="priority",
+    )
     migrated = (
         target / "sessions" / "2026" / "07" / "21"
         / f"rollout-2026-07-21T00-00-00-{session_id}.jsonl"
@@ -8559,6 +8857,56 @@ async def test_process_event_no_reactivate_on_stale_events(db_factory, flag):
         async with db_factory() as db:
             t = await db.get(Task, task_id)
             assert t.status == "completed"
+        assert _status_change_payloads(broadcaster) == []
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_process_event_cannot_reactivate_across_routing_marker(
+    db_factory,
+):
+    """Late old-route output cannot cross a durable routing stage fence."""
+
+    inst_id, task_id, retry_count, started_at, pid = (
+        await _make_completed_task(db_factory, "react-routing-fence")
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.metadata_ = {
+            "worker_routing_config_pending": {
+                "op_id": "standard-to-fast",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "codex_service_tier": "priority",
+            }
+        }
+        await db.commit()
+
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    im = InstanceManager(db_factory, broadcaster)
+    _process, consumer, _record = _arm_reactivation_generation(
+        im,
+        instance_id=inst_id,
+        task_id=task_id,
+        retry_count=retry_count,
+        started_at=started_at,
+        pid=pid,
+    )
+
+    try:
+        await im._process_event(inst_id, task_id, {
+            "event_type": "message",
+            "role": "assistant",
+            "content": "late Standard output after Fast was staged",
+        })
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert "worker_routing_config_pending" in task.metadata_
         assert _status_change_payloads(broadcaster) == []
     finally:
         consumer.cancel()

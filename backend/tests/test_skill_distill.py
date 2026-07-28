@@ -8,11 +8,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import backend.services.skill_distill as skill_distill_module
 from backend.config import settings
 from backend.services.skill_distill import (
+    TaskDistillCleanupError,
     TaskDistillTimeoutError,
     build_task_distill_prompt,
     distill_task_conversation,
+    reap_unreaped_task_distills,
+    task_distill_runtime_users,
 )
 
 
@@ -194,6 +198,7 @@ async def test_claude_api_distill_selects_model_and_scrubs_inherited_auth(
             conversation="[User]: fix it",
             provider="claude",
             claude_pool=pool,
+            instance_manager=_guard_manager(),
             cloudrouter_store=store,
         )
 
@@ -260,15 +265,20 @@ async def test_codex_api_distill_loads_provider_config_and_scrubs_auth(
     )
     cmd = create_process.await_args.args
     assert "--ignore-user-config" not in cmd
-    override_index = cmd.index("-c")
-    assert tomllib.loads(cmd[override_index + 1]) == {
+    configs = [
+        tomllib.loads(cmd[index + 1])
+        for index, value in enumerate(cmd[:-1])
+        if value == "-c"
+    ]
+    assert {"service_tier": "default"} in configs
+    assert {
         "projects": {
             str(Path(tempfile.gettempdir()).resolve()): {
                 "trust_level": "untrusted",
             },
         },
-    }
-    assert override_index < len(cmd) - 2
+    } in configs
+    assert cmd.index("-c") < len(cmd) - 2
     child_env = create_process.await_args.kwargs["env"]
     assert child_env["CODEX_HOME"] == str(codex_home)
     assert not {
@@ -341,6 +351,141 @@ async def test_task_distill_cancellation_kills_and_reaps_process():
 
     process.kill.assert_called_once_with()
     process.wait.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_task_distill_cancel_during_cleanup_never_signals_twice(
+    monkeypatch,
+):
+    process = _process(stdout=json.dumps({
+        "type": "result",
+        "result": "done",
+    }).encode())
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_calls = 0
+
+    async def delayed_cleanup(_retained, _communicate_task):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    monkeypatch.setattr(
+        skill_distill_module,
+        "_terminate_task_distill_process",
+        delayed_cleanup,
+    )
+    with patch(
+        "backend.services.skill_distill.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        request_task = asyncio.create_task(distill_task_conversation(
+            title="Claude task",
+            conversation="[User]: fix it",
+            provider="claude",
+        ))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        request_task.cancel()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+    assert cleanup_calls == 1
+    assert skill_distill_module._TASK_DISTILL_PROCESSES == {}
+
+
+@pytest.mark.asyncio
+async def test_task_distill_shutdown_reaper_coalesces_exact_cleanup(
+    monkeypatch,
+):
+    process = _process(stdout=json.dumps({
+        "type": "result",
+        "result": "done",
+    }).encode())
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_calls = 0
+
+    async def delayed_cleanup(_retained, _communicate_task):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    monkeypatch.setattr(
+        skill_distill_module,
+        "_terminate_task_distill_process",
+        delayed_cleanup,
+    )
+    with patch(
+        "backend.services.skill_distill.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        request_task = asyncio.create_task(distill_task_conversation(
+            title="Claude task",
+            conversation="[User]: fix it",
+            provider="claude",
+        ))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        shutdown_reaper = asyncio.create_task(
+            reap_unreaped_task_distills()
+        )
+        await asyncio.sleep(0)
+        release_cleanup.set()
+        result, _ = await asyncio.gather(request_task, shutdown_reaper)
+
+    assert result["content"] == "done"
+    assert cleanup_calls == 1
+    assert skill_distill_module._TASK_DISTILL_PROCESSES == {}
+
+
+@pytest.mark.asyncio
+async def test_task_distill_cleanup_failure_retains_exact_home_blocker(
+    tmp_path,
+    monkeypatch,
+):
+    provider_home = tmp_path / "claude-api"
+    pool = MagicMock()
+    pool.select.return_value = str(provider_home)
+    process = _process(stdout=b"")
+    process.returncode = None
+    communicating = asyncio.Event()
+
+    async def communicate(*, input):
+        communicating.set()
+        await asyncio.Event().wait()
+
+    async def failed_cleanup(_retained, _communicate_task):
+        raise RuntimeError("cannot prove child tree terminal")
+
+    process.communicate = AsyncMock(side_effect=communicate)
+    monkeypatch.setattr(
+        skill_distill_module,
+        "_terminate_task_distill_process",
+        failed_cleanup,
+    )
+    try:
+        with patch(
+            "backend.services.skill_distill.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ):
+            request_task = asyncio.create_task(distill_task_conversation(
+                title="Claude task",
+                conversation="[User]: fix it",
+                provider="claude",
+                claude_pool=pool,
+            ))
+            await asyncio.wait_for(communicating.wait(), timeout=1)
+            request_task.cancel()
+            with pytest.raises(TaskDistillCleanupError):
+                await request_task
+
+        blockers = task_distill_runtime_users(provider_home)
+        assert len(blockers) == 1
+        assert "skill distill process" in blockers[0]
+    finally:
+        skill_distill_module._TASK_DISTILL_PROCESSES.clear()
 
 
 @pytest.mark.asyncio

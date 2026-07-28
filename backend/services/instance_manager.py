@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -27,6 +27,9 @@ from backend.services.codex_models import clamp_codex_effort
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
 from backend.services.task_queue import task_retry_not_superseded_predicate
+from backend.services.worker_routing_config import (
+    has_pending_worker_routing,
+)
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 if TYPE_CHECKING:
@@ -551,10 +554,22 @@ class InstanceManager:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        codex_service_tier: str = "default",
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
         provider = (provider or "claude").lower()
+        if (
+            provider == "codex"
+            and str(codex_service_tier or "default").strip().lower()
+            == "priority"
+            and (not model or str(model).strip().lower() == "default")
+        ):
+            # Task.model may be NULL on historical rows.  Fast validation and
+            # pool selection use CCM's configured default, so the actual turn
+            # must name that same model instead of asking an account-specific
+            # app-server default which could advertise a different tier.
+            model = settings.default_codex_model
         lifecycle_lock = self._instance_lifecycle_lock(instance_id)
         current = asyncio.current_task()
         observed_generation: int | None = None
@@ -600,7 +615,10 @@ class InstanceManager:
                     self._launch_reservations[instance_id] = reservation
                     try:
                         async with self._cloudrouter_runtime_admission(
-                            provider, config_dir, model,
+                            provider,
+                            config_dir,
+                            model,
+                            service_tier=codex_service_tier,
                         ):
                             result = await self._launch_locked(
                                 instance_id=instance_id,
@@ -622,6 +640,7 @@ class InstanceManager:
                                 source_log_id=source_log_id,
                                 current_message=current_message,
                                 queue_timestamp=queue_timestamp,
+                                codex_service_tier=codex_service_tier,
                             )
                     except BaseException:
                         current_process = (
@@ -698,6 +717,7 @@ class InstanceManager:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        codex_service_tier: str = "default",
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -773,10 +793,15 @@ class InstanceManager:
                 CodexAppServerBusyError,
                 CodexRequiredMcpError,
                 CodexRequiredMcpPreTurnError,
+                CodexServiceTierUnavailableError,
                 CodexThreadHomeMismatchError,
+                normalize_codex_service_tier,
                 normalize_codex_home,
             )
 
+            codex_service_tier = normalize_codex_service_tier(
+                codex_service_tier
+            )
             config_dir = normalize_codex_home(config_dir)
             codex_home_path = Path(config_dir)
             codex_home_path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -904,6 +929,16 @@ class InstanceManager:
                 "exec fallback does not provide live thread control"
             )
 
+        if (
+            provider == "codex"
+            and codex_service_tier == "priority"
+            and not settings.codex_app_server_enabled
+        ):
+            raise CodexServiceTierUnavailableError(
+                "Codex Fast requires app-server admission confirmation; "
+                "the app-server transport is disabled"
+            )
+
         if provider == "codex" and settings.codex_app_server_enabled:
             async with self.codex_home_app_server_guard(config_dir):
                 try:
@@ -928,6 +963,7 @@ class InstanceManager:
                         current_message=current_message,
                         queue_timestamp=queue_timestamp,
                         disable_project_config=cloudrouter_account is not None,
+                        codex_service_tier=codex_service_tier,
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -938,7 +974,12 @@ class InstanceManager:
                         codex_mcp_required,
                     )
                     return pid
-                except CodexRequiredMcpPreTurnError:
+                except CodexRequiredMcpPreTurnError as exc:
+                    if codex_service_tier == "priority":
+                        raise CodexServiceTierUnavailableError(
+                            "Codex Fast could not be confirmed before "
+                            "turn/start; exec fallback is disabled for Fast"
+                        ) from exc
                     if (
                         codex_main_mcp_required
                         and not codex_sub_agent_mcp_required
@@ -967,6 +1008,7 @@ class InstanceManager:
                     asyncio.TimeoutError,
                     CodexAppServerBusyError,
                     CodexRequiredMcpError,
+                    CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
                     CodexLaunchCommitError,
                     InstanceNotFoundError,
@@ -985,6 +1027,16 @@ class InstanceManager:
                     )
                     raise
                 except Exception as exc:
+                    if codex_service_tier == "priority":
+                        # exec --json does not expose an accepted/effective
+                        # service tier before it executes the prompt.  A
+                        # catalog plus argv can prove only that Fast was
+                        # requested, so fail closed instead of showing a
+                        # misleading Fast badge or silently using Standard.
+                        raise CodexServiceTierUnavailableError(
+                            "Codex Fast could not be confirmed before "
+                            "turn/start; refusing unverified exec fallback"
+                        ) from exc
                     if codex_mcp_required:
                         # Once required ccm_skills was selected, every unknown
                         # app-server failure must fail closed instead of
@@ -1058,6 +1110,7 @@ class InstanceManager:
                 codex_mcp_specs if codex_main_mcp_required else ()
             ),
             codex_api_account=cloudrouter_account is not None,
+            codex_service_tier=codex_service_tier,
         )
         if provider == "codex":
             logger.info(
@@ -1276,6 +1329,7 @@ class InstanceManager:
                 "source_log_id": source_log_id,
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
+                "codex_service_tier": codex_service_tier,
             }
 
         return await self._persist_and_track_launch(
@@ -1299,8 +1353,58 @@ class InstanceManager:
                 self._resolve_codex_binary(),
                 request_timeout=settings.codex_app_server_request_timeout,
                 env_remove_resolver=self._codex_env_remove_for_home,
+                actual_tier_route_resolver=(
+                    self._codex_actual_tier_route_for_home
+                ),
+                require_actual_tier_proof=True,
             )
         return self._codex_app_server
+
+    def _codex_actual_tier_route_for_home(self, codex_home: str):
+        """Resolve a non-secret upstream route for the per-home proof proxy."""
+
+        from backend.services.cloudrouter_accounts import (
+            API_PROVIDER_APEX,
+            API_PROVIDER_SPECS,
+            LEGACY_APEX_CODEX_PROVIDER,
+        )
+        from backend.services.codex_tier_proxy import (
+            CodexTierProxyError,
+            CodexTierProxyRoute,
+            resolve_native_codex_tier_route,
+        )
+
+        account = self._cloudrouter_account_for_runtime_home(
+            "codex",
+            codex_home,
+        )
+        try:
+            if account is not None:
+                spec = API_PROVIDER_SPECS[account.api_provider]
+                return CodexTierProxyRoute(
+                    upstream_base_url=spec.codex_base_url,
+                    provider_id=spec.codex_provider,
+                    provider_aliases=(
+                        (LEGACY_APEX_CODEX_PROVIDER,)
+                        if account.api_provider == API_PROVIDER_APEX
+                        else ()
+                    ),
+                    built_in_openai=False,
+                    label=spec.label,
+                )
+            return resolve_native_codex_tier_route(codex_home)
+        except (CodexTierProxyError, OSError):
+            # Quota/configuration RPCs may still use an unproxied app-server,
+            # but a Fast start_turn requires a route and fails before prompt
+            # work. Standard remains compatible with an explicitly configured
+            # custom provider and still clears sticky Fast state through RPC.
+            # Never log auth content or the configured upstream URL.
+            logger.warning(
+                "Codex actual-tier route is unavailable home=%s reason=%s",
+                codex_home,
+                "unsupported-or-unverifiable-account",
+            )
+            return None
 
     def _cloudrouter_account_for_runtime_home(
         self,
@@ -1347,6 +1451,8 @@ class InstanceManager:
         provider: str,
         config_dir: str | None,
         model: str | None,
+        *,
+        service_tier: str = "default",
     ):
         """Revalidate an API route atomically with process admission."""
 
@@ -1361,7 +1467,17 @@ class InstanceManager:
             raise RuntimeError(
                 "CloudRouter account store cannot fence runtime admission"
             )
-        async with guard(provider, config_dir, model) as current:
+        async with guard(
+            provider,
+            config_dir,
+            model,
+            **(
+                {"service_tier": service_tier}
+                if provider == "codex"
+                and str(service_tier or "default").lower() != "default"
+                else {}
+            ),
+        ) as current:
             yield current
 
     @asynccontextmanager
@@ -1478,6 +1594,25 @@ class InstanceManager:
             async with self.codex_home_app_server_guard(codex_home) as home:
                 registry = self._ensure_codex_app_server_registry()
                 return await registry.read_thread(home, thread_id)
+
+    @asynccontextmanager
+    async def codex_thread_routing_guard(
+        self,
+        codex_home: str,
+        thread_id: str,
+    ):
+        """Hold native-thread quiescence across a Task routing DB commit."""
+
+        async with self._cloudrouter_configuration_admission(
+            "codex", codex_home,
+        ):
+            async with self.codex_home_app_server_guard(codex_home) as home:
+                registry = self._ensure_codex_app_server_registry()
+                async with registry.thread_routing_guard(
+                    home,
+                    thread_id,
+                ) as snapshot:
+                    yield snapshot
 
     async def create_codex_thread(
         self,
@@ -1608,6 +1743,7 @@ class InstanceManager:
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         disable_project_config: bool = False,
+        codex_service_tier: str = "default",
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -1626,6 +1762,7 @@ class InstanceManager:
             mcp_specs=mcp_specs,
             disable_project_config=disable_project_config,
             skill_context=skill_context,
+            codex_service_tier=codex_service_tier,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -1655,6 +1792,7 @@ class InstanceManager:
                 "source_log_id": source_log_id,
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
+                "codex_service_tier": codex_service_tier,
             }
 
         try:
@@ -2027,6 +2165,206 @@ class InstanceManager:
         finally:
             if started:
                 await self.end_codex_home_maintenance(codex_home)
+
+    async def api_account_runtime_users(self, account) -> list[str]:
+        """Return proven local runtime/DB users of one managed API account.
+
+        Retirement has already durably disabled Store admission before this
+        method runs. Therefore a launch which entered earlier has finished
+        registering its process, while a later launch cannot spawn.
+        """
+
+        target_claude = os.path.realpath(os.path.abspath(
+            account.claude_config_dir
+        ))
+        blockers: list[str] = []
+        for instance_id, config_dir in list(self._config_dirs.items()):
+            if os.path.realpath(os.path.abspath(config_dir)) != target_claude:
+                continue
+            if self.is_running(instance_id):
+                blockers.append(f"instance {instance_id}")
+
+        # An idle PTY process intentionally survives between visible turns and
+        # can start an autonomous monitor turn without a new dispatcher spawn.
+        # Do not remove credentials beneath it. The operator can disable PTY
+        # mode (which drains idle sessions) or stop the owning task, then retry.
+        backend = self._pty_backend
+        if backend is not None:
+            for instance_id, session in list(
+                getattr(backend, "_sessions", {}).items()
+            ):
+                session_config = getattr(session, "config", None)
+                config_dir = (
+                    getattr(session_config, "config_dir", None)
+                    or self._config_dirs.get(instance_id)
+                )
+                if (
+                    config_dir
+                    and os.path.realpath(os.path.abspath(config_dir))
+                    == target_claude
+                    and bool(getattr(session, "is_alive", False))
+                ):
+                    label = f"PTY session on instance {instance_id}"
+                    if label not in blockers:
+                        blockers.append(label)
+            # FullMirror removes its per-turn backend._sessions entry on exit,
+            # while the hot native Session remains in SessionPool and can wake
+            # autonomously. Its own immutable config_dir is authoritative.
+            pool = getattr(backend, "_pool", None)
+            for session_id, session in list(
+                getattr(pool, "_sessions", {}).items()
+            ):
+                session_config = getattr(session, "config", None)
+                config_dir = getattr(session_config, "config_dir", None)
+                if (
+                    config_dir
+                    and os.path.realpath(os.path.abspath(config_dir))
+                    == target_claude
+                    and bool(getattr(session, "is_alive", False))
+                ):
+                    blockers.append(f"hot PTY session {session_id}")
+
+        # These subprocesses are not Instance generations, but they can retain
+        # the same credential home after a cancelled/failed cleanup. Their
+        # module registries keep exact handles until terminal proof.
+        from backend.services.goal_evaluator import (
+            goal_evaluator_runtime_users,
+        )
+        from backend.services.skill_distill import task_distill_runtime_users
+
+        blockers.extend(goal_evaluator_runtime_users(
+            "claude", account.claude_config_dir,
+        ))
+        blockers.extend(goal_evaluator_runtime_users(
+            "codex", account.codex_home,
+        ))
+        blockers.extend(task_distill_runtime_users(
+            account.claude_config_dir,
+        ))
+        blockers.extend(task_distill_runtime_users(account.codex_home))
+
+        # After restart, an unknown/live generation may exist only as durable
+        # Task/Instance recovery evidence. Missing/mismatched ownership cannot
+        # prove that the surviving process uses another credential home.
+        try:
+            async with self.db_factory() as db:
+                tasks = (
+                    await db.execute(
+                        select(Task).where(
+                            Task.worker_id.is_(None),
+                            Task.status.in_(
+                                ("in_progress", "executing", "migrating")
+                            ),
+                        )
+                    )
+                ).scalars().all()
+                by_id = {task.id: task for task in tasks}
+                instances = (
+                    await db.execute(
+                        select(Instance).where(
+                            or_(
+                                Instance.status == "running",
+                                Instance.pid.is_not(None),
+                                Instance.current_task_id.is_not(None),
+                            )
+                        )
+                    )
+                ).scalars().all()
+                relevant_providers = (
+                    {"codex"}
+                    if getattr(account, "api_provider", None) == "apex"
+                    else {"claude", "codex"}
+                )
+
+                # An active task explicitly bound to this id blocks even in
+                # the pre-spawn preparation window.
+                for task in tasks:
+                    metadata = task.metadata_ or {}
+                    if account.id in {
+                        metadata.get("claude_account_id"),
+                        metadata.get("codex_account_id"),
+                    }:
+                        blockers.append(f"task {task.id} ({task.status})")
+
+                for instance in instances:
+                    task_id = instance.current_task_id
+                    if task_id not in by_id and task_id is not None:
+                        task = await db.get(Task, task_id)
+                        if task is not None:
+                            by_id[task_id] = task
+                    else:
+                        task = by_id.get(task_id)
+                    task_provider = str(
+                        getattr(task, "provider", None) or ""
+                    ).lower()
+                    instance_provider = str(
+                        instance.provider or task_provider or ""
+                    ).lower()
+                    observed_providers = {
+                        provider
+                        for provider in (task_provider, instance_provider)
+                        if provider
+                    }
+                    if (
+                        not observed_providers
+                        or not observed_providers.issubset(
+                            {"claude", "codex"}
+                        )
+                    ):
+                        blockers.append(
+                            f"instance {instance.id} has unverifiable "
+                            "provider ownership"
+                        )
+                        continue
+                    providers_to_check = {
+                        provider
+                        for provider in observed_providers
+                        if provider in relevant_providers
+                    }
+                    if not providers_to_check:
+                        continue
+                    if task is None:
+                        blockers.append(
+                            f"instance {instance.id} has unverifiable "
+                            f"task claim {task_id}"
+                        )
+                        continue
+                    metadata = task.metadata_ or {}
+                    bindings = {
+                        provider: metadata.get(f"{provider}_account_id")
+                        for provider in providers_to_check
+                    }
+                    if account.id in bindings.values():
+                        blockers.append(
+                            f"instance {instance.id} task {task.id}"
+                        )
+                        continue
+                    if all(
+                        isinstance(binding, str) and binding.strip()
+                        for binding in bindings.values()
+                    ):
+                        # A durable exact binding to another account is the
+                        # only safe negative proof for a persisted generation.
+                        continue
+                    blockers.append(
+                        f"instance {instance.id} has unverifiable "
+                        "provider account ownership"
+                    )
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not verify durable task account ownership",
+            ) from exc
+        return sorted(set(blockers))
+
+    async def detach_api_account_containers(self, account) -> int:
+        """Remove idle CCM containers retaining a read-only key bind mount."""
+
+        from backend.services.container_manager import ContainerManager
+
+        manager = getattr(self, "_container_mgr", None)
+        if manager is None:
+            manager = ContainerManager()
+        return await manager.retire_api_account_mounts(account.root)
 
     async def begin_codex_home_maintenance(
         self, codex_home: str, *, require_idle: bool = True,
@@ -2769,6 +3107,7 @@ class InstanceManager:
         skill_context: str = "",
         codex_mcp_specs: Sequence["McpServerSpec"] = (),
         codex_api_account: bool = False,
+        codex_service_tier: str = "default",
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -2824,6 +3163,12 @@ class InstanceManager:
             from backend.services.skill_context import wrap_skill_context
 
             prompt = wrap_skill_context(prompt, skill_context)
+            from backend.services.codex_app_server import (
+                CODEX_SERVICE_TIER_PRIORITY,
+                normalize_codex_service_tier,
+            )
+
+            service_tier = normalize_codex_service_tier(codex_service_tier)
             codex_binary = self._resolve_codex_binary()
             if resume_session_id:
                 cmd = [codex_binary, "exec", "resume"]
@@ -2834,6 +3179,11 @@ class InstanceManager:
                 "--skip-git-repo-check",
                 "--dangerously-bypass-approvals-and-sandbox",
             ])
+            if service_tier == CODEX_SERVICE_TIER_PRIORITY:
+                cmd.extend([
+                    "--enable",
+                    "fast_mode",
+                ])
             if model and model != "default":
                 cmd.extend(["--model", model])
             codex_effort = clamp_codex_effort(model, effort_level)
@@ -2872,6 +3222,12 @@ class InstanceManager:
                             f"{exc}"
                         ) from exc
                     raise
+            if service_tier == CODEX_SERVICE_TIER_PRIORITY:
+                cmd.extend(["-c", 'service_tier="fast"'])
+            else:
+                # Explicitly override a user-level Fast preference.  Omission
+                # would make a CCM Standard task inherit hidden priority usage.
+                cmd.extend(["-c", 'service_tier="default"'])
             if resume_session_id:
                 cmd.append(resume_session_id)
             cmd.append(prompt)
@@ -4196,6 +4552,9 @@ class InstanceManager:
                 source_log_id=params.get("source_log_id"),
                 current_message=params.get("current_message"),
                 queue_timestamp=params.get("queue_timestamp"),
+                codex_service_tier=params.get(
+                    "codex_service_tier", "default"
+                ),
             )
             return True
 
@@ -4379,6 +4738,9 @@ class InstanceManager:
                     source_log_id=params.get("source_log_id"),
                     current_message=params.get("current_message"),
                     queue_timestamp=params.get("queue_timestamp"),
+                    codex_service_tier=params.get(
+                        "codex_service_tier", "default"
+                    ),
                 )
                 return True
 
@@ -4513,6 +4875,9 @@ class InstanceManager:
                 source_log_id=params.get("source_log_id"),
                 current_message=params.get("current_message"),
                 queue_timestamp=params.get("queue_timestamp"),
+                codex_service_tier=params.get(
+                    "codex_service_tier", "default"
+                ),
             )
             return True
 
@@ -4663,6 +5028,14 @@ class InstanceManager:
                 session_id = task.session_id
                 bound_codex_id = (task.metadata_ or {}).get("codex_account_id")
                 task_model = task.model
+                task_service_tier = (
+                    task.codex_service_tier
+                    if (
+                        isinstance(task.codex_service_tier, str)
+                        and task.codex_service_tier in {"default", "priority"}
+                    )
+                    else "default"
+                )
 
             if not await generation_is_current(generation):
                 return False
@@ -4682,6 +5055,7 @@ class InstanceManager:
                 new_home = await pool.select_quota_alternative(
                     old_home,
                     model=task_model,
+                    service_tier=task_service_tier,
                 )
                 if not await generation_is_current(generation):
                     return False
@@ -5550,6 +5924,9 @@ class InstanceManager:
         ):
             reactivated_completed_at: datetime | None = None
             async with self.db_factory() as db:
+                # First acquire the exact Task write barrier without changing
+                # status.  A routing stage that wins before this point leaves
+                # a durable marker which late output must never cross.
                 task_reactivated = await db.execute(
                     update(Task)
                     .where(
@@ -5559,30 +5936,53 @@ class InstanceManager:
                         Task.retry_count == event_record.task_retry_count,
                         task_retry_not_superseded_predicate(),
                     )
-                    .values(status="executing")
+                    .values(status=Task.status)
                 )
                 if task_reactivated.rowcount:
-                    instance_guard = await db.execute(
-                        update(Instance)
-                        .where(
-                            Instance.id == instance_id,
-                            Instance.status == "running",
-                            Instance.pid
-                            == (getattr(event_record.process, "pid", 0) or 0),
-                            Instance.current_task_id == task_id,
-                            Instance.started_at
-                            == event_record.instance_started_at,
-                        )
-                        .values(status="running")
+                    current_task = await db.get(
+                        Task,
+                        task_id,
+                        populate_existing=True,
                     )
-                    if not instance_guard.rowcount or not owns_event_generation():
+                    if (
+                        current_task is None
+                        or has_pending_worker_routing(current_task)
+                    ):
                         await db.rollback()
                         task_reactivated = None
                     else:
-                        reactivated_completed_at = await db.scalar(
-                            select(Task.completed_at).where(Task.id == task_id)
+                        instance_guard = await db.execute(
+                            update(Instance)
+                            .where(
+                                Instance.id == instance_id,
+                                Instance.status == "running",
+                                Instance.pid
+                                == (
+                                    getattr(
+                                        event_record.process,
+                                        "pid",
+                                        0,
+                                    )
+                                    or 0
+                                ),
+                                Instance.current_task_id == task_id,
+                                Instance.started_at
+                                == event_record.instance_started_at,
+                            )
+                            .values(status="running")
                         )
-                        await db.commit()
+                        if (
+                            not instance_guard.rowcount
+                            or not owns_event_generation()
+                        ):
+                            await db.rollback()
+                            task_reactivated = None
+                        else:
+                            reactivated_completed_at = (
+                                current_task.completed_at
+                            )
+                            current_task.status = "executing"
+                            await db.commit()
                 else:
                     await db.rollback()
 

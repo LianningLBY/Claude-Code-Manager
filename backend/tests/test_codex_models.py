@@ -4,11 +4,16 @@
 sol/terra 支持 effort low..ultra，luna 支持 low..max，gpt-5.5 及更早只到 xhigh。
 """
 
+import pytest
+
 from backend.config import settings
 from backend.services.codex_models import (
+    CODEX_MODEL_SERVICE_TIERS,
     CODEX_MODEL_EFFORTS,
     clamp_codex_effort,
+    supported_codex_service_tiers,
     supported_codex_efforts,
+    validate_codex_service_tier,
 )
 
 GPT56_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
@@ -76,6 +81,49 @@ def test_effort_map_keys_are_valid_model_options():
     options = _option_list()
     for model in CODEX_MODEL_EFFORTS:
         assert model in options
+
+
+def test_fast_service_tier_capabilities_match_catalog():
+    for model in (
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+    ):
+        assert supported_codex_service_tiers(model) == ["default", "priority"]
+
+    assert supported_codex_service_tiers("gpt-5.4-mini") == ["default"]
+    assert supported_codex_service_tiers("gpt-5.3-codex-spark") == ["default"]
+    assert supported_codex_service_tiers("future-model") == ["default"]
+
+
+def test_default_model_service_tier_uses_configured_model():
+    assert supported_codex_service_tiers(None) == CODEX_MODEL_SERVICE_TIERS[
+        settings.default_codex_model
+    ]
+    assert supported_codex_service_tiers("default") == CODEX_MODEL_SERVICE_TIERS[
+        settings.default_codex_model
+    ]
+
+
+def test_validate_fast_service_tier_requires_codex_and_supported_model():
+    assert (
+        validate_codex_service_tier("codex", "gpt-5.6-sol", "priority")
+        == "priority"
+    )
+    assert validate_codex_service_tier("claude", "opus", "default") == "default"
+
+    with pytest.raises(ValueError, match="only available for Codex"):
+        validate_codex_service_tier("claude", "gpt-5.6-sol", "priority")
+    with pytest.raises(ValueError, match="not supported by model"):
+        validate_codex_service_tier("codex", "gpt-5.4-mini", "priority")
+    with pytest.raises(ValueError, match="must be 'default' or 'priority'"):
+        validate_codex_service_tier("codex", "gpt-5.6-sol", "turbo")
+    with pytest.raises(ValueError, match="provider must be"):
+        validate_codex_service_tier("", "gpt-5.6-sol", "priority")
+    with pytest.raises(ValueError, match="provider must be"):
+        validate_codex_service_tier("unknown", None, "default")
 
 
 # ---------------------------------------------------------------------------

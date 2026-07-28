@@ -11,6 +11,7 @@ Each shared Project gets its own Docker container with:
 import asyncio
 import logging
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -1199,6 +1200,115 @@ class ContainerManager:
         if git_dir and os.path.isdir(git_dir):
             shutil.rmtree(git_dir, ignore_errors=True)
         logger.info("Container %s stopped", name)
+
+    async def retire_api_account_mounts(
+        self, api_account_root: str | os.PathLike[str],
+    ) -> int:
+        """Stop CCM-owned containers bind-mounting one exact API account.
+
+        Account retirement calls this only after task/process admission has
+        been durably disabled and all known active turns were rejected. The
+        scan includes containers surviving a CCM restart, not just this
+        object's in-memory cache. Exact canonical source matching prevents an
+        arbitrary path from becoming a Docker removal selector.
+        """
+
+        source = str(Path(api_account_root).resolve(strict=True))
+        if not self.is_docker_available():
+            # A CCM container created before a CLI/package failure can retain
+            # an open read-only bind mount (and therefore the key inode).
+            # Absence of the client is not proof that no such container exists.
+            raise RuntimeError(
+                "Docker is unavailable; API account mounts cannot be verified",
+            )
+        code, output = await self._run([
+            "docker",
+            "ps",
+            "-a",
+            "--format",
+            "{{.Names}}",
+            "--filter",
+            f"name=^{CONTAINER_PREFIX}",
+        ])
+        if code != 0:
+            raise RuntimeError(
+                "Could not verify API account container mounts",
+            )
+        names: dict[int, str] = dict(self._containers)
+        for raw_name in output.splitlines():
+            name = raw_name.strip()
+            match = re.fullmatch(rf"{re.escape(CONTAINER_PREFIX)}([0-9]+)", name)
+            if match:
+                names.setdefault(int(match.group(1)), name)
+
+        stopped = 0
+        mount_template = (
+            "{{range .Mounts}}{{if eq .Destination "
+            f"\"{_API_ACCOUNT_CONTAINER_ROOT}\""
+            "}}{{.Source}}{{end}}{{end}}"
+        )
+        for project_id, name in sorted(names.items()):
+            async with self._lock(project_id):
+                expected_name = f"{CONTAINER_PREFIX}{project_id}"
+                if name != expected_name:
+                    raise RuntimeError(
+                        "Could not verify CCM container identity",
+                    )
+                mount_code, mounted_root = await self._run([
+                    "docker", "inspect", "-f", mount_template, name,
+                ])
+                if mount_code != 0:
+                    # Distinguish an ordinary list/inspect disappearance race
+                    # from daemon, permission, or malformed-state failures.
+                    # The project lock prevents CCM from recreating this exact
+                    # name between the proof and cleanup.
+                    proof_code, proof_output = await self._run([
+                        "docker",
+                        "ps",
+                        "-a",
+                        "--format",
+                        "{{.Names}}",
+                        "--filter",
+                        f"name=^{re.escape(name)}$",
+                    ])
+                    if proof_code != 0:
+                        raise RuntimeError(
+                            "Could not verify an API account container",
+                        )
+                    exact_names = {
+                        value.strip()
+                        for value in proof_output.splitlines()
+                        if value.strip()
+                    }
+                    if name in exact_names:
+                        raise RuntimeError(
+                            "Could not inspect an API account container",
+                        )
+                    self._containers.pop(project_id, None)
+                    continue
+                mounted = (
+                    str(Path(mounted_root.strip()).resolve(strict=False))
+                    if mounted_root.strip()
+                    else ""
+                )
+                if mounted != source:
+                    continue
+                stop_code, _ = await self._run([
+                    "docker", "stop", "-t", "10", name,
+                ])
+                remove_code, _ = await self._run([
+                    "docker", "rm", "-f", name,
+                ])
+                if stop_code != 0 or remove_code != 0:
+                    raise RuntimeError(
+                        "Could not detach an API account container mount",
+                    )
+                self._containers.pop(project_id, None)
+                git_dir = self._git_dirs.pop(project_id, None)
+                if git_dir and os.path.isdir(git_dir):
+                    shutil.rmtree(git_dir, ignore_errors=True)
+                stopped += 1
+        return stopped
 
     async def cleanup_all(self):
         for pid in list(self._containers.keys()):

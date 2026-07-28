@@ -27,6 +27,102 @@ from backend.models.project import Project
 from backend.models.task import Task
 
 
+@pytest.mark.asyncio
+async def test_api_account_mount_retirement_fails_when_docker_unavailable(
+    tmp_path,
+):
+    account_root = tmp_path / "cloudrouter-1"
+    account_root.mkdir()
+    manager = ContainerManager()
+    manager.is_docker_available = MagicMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="Docker is unavailable"):
+        await manager.retire_api_account_mounts(account_root)
+
+
+@pytest.mark.asyncio
+async def test_api_account_mount_retirement_fails_when_daemon_unverifiable(
+    tmp_path,
+):
+    account_root = tmp_path / "cloudrouter-1"
+    account_root.mkdir()
+    manager = ContainerManager()
+    manager.is_docker_available = MagicMock(return_value=True)
+    manager._run = AsyncMock(return_value=(1, "daemon unavailable"))
+
+    with pytest.raises(RuntimeError, match="Could not verify"):
+        await manager.retire_api_account_mounts(account_root)
+
+
+@pytest.mark.asyncio
+async def test_api_account_mount_inspect_failure_requires_absence_proof(
+    tmp_path,
+):
+    account_root = tmp_path / "cloudrouter-1"
+    account_root.mkdir()
+    manager = ContainerManager()
+    manager._containers[7] = "ccm-project-7"
+    manager.is_docker_available = MagicMock(return_value=True)
+    manager._run = AsyncMock(side_effect=[
+        (0, "ccm-project-7\n"),
+        (1, "inspect denied"),
+        (0, "ccm-project-7\n"),
+    ])
+
+    with pytest.raises(RuntimeError, match="Could not inspect"):
+        await manager.retire_api_account_mounts(account_root)
+
+    assert manager._containers == {7: "ccm-project-7"}
+
+
+@pytest.mark.asyncio
+async def test_api_account_mount_disappearance_is_proven_before_forget(
+    tmp_path,
+):
+    account_root = tmp_path / "cloudrouter-1"
+    account_root.mkdir()
+    manager = ContainerManager()
+    manager._containers[7] = "ccm-project-7"
+    manager.is_docker_available = MagicMock(return_value=True)
+    manager._run = AsyncMock(side_effect=[
+        (0, ""),
+        (1, "no such container"),
+        (0, ""),
+    ])
+
+    assert await manager.retire_api_account_mounts(account_root) == 0
+    assert manager._containers == {}
+
+
+@pytest.mark.asyncio
+async def test_api_account_mount_retirement_removes_only_exact_source(
+    tmp_path,
+):
+    account_root = tmp_path / "cloudrouter-1"
+    account_root.mkdir()
+    other_root = tmp_path / "cloudrouter-2"
+    other_root.mkdir()
+    manager = ContainerManager()
+    manager.is_docker_available = MagicMock(return_value=True)
+    manager._run = AsyncMock(side_effect=[
+        (0, "ccm-project-7\nccm-project-8\n"),
+        (0, f"{account_root}\n"),
+        (0, ""),
+        (0, ""),
+        (0, f"{other_root}\n"),
+    ])
+
+    assert await manager.retire_api_account_mounts(account_root) == 1
+    commands = [item.args[0] for item in manager._run.await_args_list]
+    assert ["docker", "stop", "-t", "10", "ccm-project-7"] in commands
+    assert ["docker", "rm", "-f", "ccm-project-7"] in commands
+    assert not any(
+        command[-1] == "ccm-project-8"
+        for command in commands
+        if command[:2] in (["docker", "stop"], ["docker", "rm"])
+    )
+
+
 def _tmp_pressure_namespace() -> dict:
     namespace: dict = {}
     exec(_TMP_PRESSURE_LIB, namespace)

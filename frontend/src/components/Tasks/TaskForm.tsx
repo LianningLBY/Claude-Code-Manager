@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../../api/client';
-import type { Project, TagItem, Task } from '../../api/client';
+import type { CodexServiceTier, Project, TagItem, Task } from '../../api/client';
 import { Plus, Paperclip, X, Star, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
 import { ProjectSelect } from '../ProjectSelect';
 import { VoiceButton } from '../Voice/VoiceButton';
@@ -22,6 +22,7 @@ interface StoredTaskDefaults {
   provider?: string;
   model?: string;
   effort?: string;
+  codexServiceTier?: CodexServiceTier;
   thinkingBudget?: string;
   timeoutHours?: string;
   systemPromptMode?: string;
@@ -66,6 +67,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [codexEffortOptions, setCodexEffortOptions] = useState<string[]>([]);
   // GPT-5.6 系列按模型区分档位（sol/terra 到 ultra，luna 到 max），未列出的模型用 codexEffortOptions
   const [codexModelEfforts, setCodexModelEfforts] = useState<Record<string, string[]>>({});
+  const [codexModelServiceTiers, setCodexModelServiceTiers] = useState<Record<string, CodexServiceTier[]>>({});
+  const [codexCapabilitiesLoaded, setCodexCapabilitiesLoaded] = useState(false);
+  const [codexServiceTier, setCodexServiceTier] = useState<CodexServiceTier>('default');
   const [defaultEffort, setDefaultEffort] = useState('medium');
   const [todoFilePath, setTodoFilePath] = useState('');
   const [maxIterations, setMaxIterations] = useState('50');
@@ -104,6 +108,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     setProvider(stored?.provider || fallbackProvider);
     setModel(stored?.model || '');
     setEffort(stored?.effort || '');
+    setCodexServiceTier(stored?.codexServiceTier === 'priority' ? 'priority' : 'default');
     setThinkingBudget(stored?.thinkingBudget || '');
     setTimeoutHours(stored?.timeoutHours || '');
     setSystemPromptMode(stored?.systemPromptMode || '');
@@ -132,10 +137,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setEffortOptions(c.effort_options);
       setCodexEffortOptions(c.codex_effort_options || ['low', 'medium', 'high', 'xhigh']);
       setCodexModelEfforts(c.codex_model_efforts || {});
+      setCodexModelServiceTiers(c.codex_model_service_tiers || {});
+      setCodexCapabilitiesLoaded(true);
       // Re-read after the async request so a default saved while it was in
       // flight still wins over the server defaults.
       applyStoredDefaults(readStoredTaskDefaults(), configuredProvider);
     }).catch(() => {
+      setCodexModelServiceTiers({});
+      setCodexCapabilitiesLoaded(true);
       applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     });
     api.getRuntimeSettings()
@@ -246,7 +255,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   }, [showPluginsDropdown, showConfigPanel, showSkillsDropdown]);
 
   const saveAsDefault = () => {
-    const cfg = { priority, mode, provider, model, effort, thinkingBudget, timeoutHours, systemPromptMode };
+    const cfg = { priority, mode, provider, model, effort, codexServiceTier, thinkingBudget, timeoutHours, systemPromptMode };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
     setDefaultSaved(true);
     setTimeout(() => setDefaultSaved(false), 2000);
@@ -260,13 +269,17 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [defaultSaved, setDefaultSaved] = useState(false);
   const hasStoredDefault = !!localStorage.getItem(STORAGE_KEY);
 
-  const hasNonDefaultConfig = priority !== 0 || mode !== 'auto' || provider !== defaultProvider || model !== '' || effort !== '' || thinkingBudget !== '' || timeoutHours !== '';
+  const hasNonDefaultConfig = priority !== 0 || mode !== 'auto' || provider !== defaultProvider || model !== '' || effort !== '' || codexServiceTier !== 'default' || thinkingBudget !== '' || timeoutHours !== '';
 
   const activeDefaultModel = provider === 'codex' ? defaultCodexModel : defaultModel;
   const activeModelOptions = provider === 'codex' ? codexModelOptions : modelOptions;
   const activeEffortOptions = provider === 'codex'
     ? (codexModelEfforts[model || defaultCodexModel] ?? codexEffortOptions)
     : effortOptions;
+  const activeCodexModel = model || defaultCodexModel;
+  const codexModelSupportsFast = (candidate: string) =>
+    (codexModelServiceTiers[candidate] || []).includes('priority');
+  const activeCodexModelSupportsFast = codexModelSupportsFast(activeCodexModel);
 
   // 切换 codex 模型后，已选档位可能不再受支持（如 max 换到 gpt-5.5）——回落默认
   useEffect(() => {
@@ -274,6 +287,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     const supported = codexModelEfforts[model || defaultCodexModel] ?? codexEffortOptions;
     if (supported.length && !supported.includes(effort)) setEffort('');
   }, [provider, model, effort, codexModelEfforts, codexEffortOptions, defaultCodexModel]);
+
+  // Fast is Codex-only and model-gated. Wait for the capability response before
+  // normalizing persisted defaults so a slow config request cannot erase them.
+  useEffect(() => {
+    if (provider !== 'codex') {
+      if (codexServiceTier !== 'default') setCodexServiceTier('default');
+      return;
+    }
+    if (codexCapabilitiesLoaded && codexServiceTier === 'priority' && !activeCodexModelSupportsFast) {
+      setCodexServiceTier('default');
+    }
+  }, [provider, codexServiceTier, codexCapabilitiesLoaded, activeCodexModelSupportsFast]);
 
   const handleProjectChange = (val: string) => {
     if (val === NEW_PROJECT_VALUE) {
@@ -386,6 +411,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         provider,
         model: model || activeDefaultModel,
         ...(effort ? { effort_level: effort } : {}),
+        ...(provider === 'codex' ? { codex_service_tier: codexServiceTier } : {}),
         ...(thinkingBudget ? { thinking_budget: parseInt(thinkingBudget) || null } : {}),
         ...(systemPromptMode ? { system_prompt_mode: systemPromptMode } : {}),
         ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
@@ -667,9 +693,11 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={provider}
                   onChange={(e) => {
-                    setProvider(e.target.value);
+                    const nextProvider = e.target.value;
+                    setProvider(nextProvider);
                     setModel('');
                     setEffort('');
+                    if (nextProvider !== 'codex') setCodexServiceTier('default');
                   }}
                 >
                   {providerOptions.map((p) => (
@@ -681,7 +709,19 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                 <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
+                  onChange={(e) => {
+                    const nextModel = e.target.value;
+                    setModel(nextModel);
+                    const resolvedModel = nextModel || defaultCodexModel;
+                    if (
+                      provider === 'codex'
+                      && codexCapabilitiesLoaded
+                      && codexServiceTier === 'priority'
+                      && !codexModelSupportsFast(resolvedModel)
+                    ) {
+                      setCodexServiceTier('default');
+                    }
+                  }}
                 >
                   <option value="">{activeDefaultModel} (default)</option>
                   {activeModelOptions.map((m) => (
@@ -700,6 +740,30 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                     <option key={e} value={e}>{e}</option>
                   ))}
                 </select>
+
+                {provider === 'codex' && (
+                  <>
+                    <span className="text-gray-400">Speed</span>
+                    <select
+                      aria-label="Codex speed"
+                      className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
+                      value={codexServiceTier}
+                      onChange={(e) => setCodexServiceTier(e.target.value as CodexServiceTier)}
+                    >
+                      <option value="default">Standard</option>
+                      <option value="priority" disabled={!activeCodexModelSupportsFast}>Fast</option>
+                    </select>
+                    <span
+                      className={`col-span-2 text-[10px] ${
+                        activeCodexModelSupportsFast ? 'text-amber-400/80' : 'text-gray-500'
+                      }`}
+                    >
+                      {activeCodexModelSupportsFast
+                        ? 'Fast 约 1.5×，会消耗更多额度；实际计价取决于账号来源'
+                        : `${activeCodexModel} 不支持 Fast`}
+                    </span>
+                  </>
+                )}
 
                 {/* Thinking 预算走 MAX_THINKING_TOKENS，claude 专属
                     （codex 的推理强度就是上面的 Effort）——codex 下隐藏幽灵选项 */}

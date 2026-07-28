@@ -692,6 +692,40 @@ async def test_cleanup_resets_stuck_executing_task(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_cleanup_fail_closes_active_task_with_routing_marker(
+    db_factory,
+):
+    """A crash-left routing fence must recover to an ack-safe terminal status."""
+
+    d = _make_dispatcher(db_factory)
+    marker = {
+        "op_id": "staged-before-restart",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    }
+    async with db_factory() as db:
+        task = Task(
+            title="stuck-fenced-task",
+            description="test",
+            status="executing",
+            metadata_={"worker_routing_config_pending": marker},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert task.instance_id is None
+        assert task.metadata_["worker_routing_config_pending"] == marker
+
+
+@pytest.mark.asyncio
 async def test_cleanup_fails_multi_owner_corruption_without_replay(db_factory):
     """Multiple dead reverse owners are corruption, not retry permission."""
     d = _make_dispatcher(db_factory)

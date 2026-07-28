@@ -135,6 +135,7 @@ class RalphLoop:
             task.provider,
             task_id=task.id,
             model=task.model,
+            codex_service_tier=task.codex_service_tier,
         )
         resume_session_id = (
             task.session_id
@@ -147,6 +148,7 @@ class RalphLoop:
             task_id=task.id,
             cwd=cwd,
             model=task.model,
+            codex_service_tier=task.codex_service_tier,
             resume_session_id=resume_session_id,
             thinking_budget=task.thinking_budget,
             provider=task.provider,

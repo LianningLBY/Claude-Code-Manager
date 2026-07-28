@@ -1,6 +1,14 @@
 from datetime import datetime, timezone
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    field_serializer,
+    model_validator,
+)
 
 from backend.config import settings
 
@@ -12,6 +20,17 @@ class UserSkillSnapshotPayload(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     description: str = ""
     content: str = ""
+
+
+def _normalize_task_provider(value: object) -> str:
+    """Canonicalize an explicit task provider without accepting empty input."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("provider must be 'claude' or 'codex'")
+    provider = value.strip().lower()
+    if provider not in {"claude", "codex"}:
+        raise ValueError("provider must be 'claude' or 'codex'")
+    return provider
 
 
 class TaskCreate(BaseModel):
@@ -37,8 +56,12 @@ class TaskCreate(BaseModel):
     goal_max_turns: int = 30  # goal only: max turns before auto-fail
     goal_evaluator_model: str | None = None  # goal only: evaluator model (default haiku)
     # API callers that omit provider follow the deployment-wide default.
-    provider: str = Field(default_factory=lambda: settings.default_provider)
+    provider: str = Field(
+        default_factory=lambda: settings.default_provider,
+        validate_default=True,
+    )
     model: str | None = None
+    codex_service_tier: Literal["default", "priority"] = "default"
     effort_level: str | None = None
     thinking_budget: int | None = None
     system_prompt_mode: str | None = None
@@ -55,6 +78,11 @@ class TaskCreate(BaseModel):
     secret_ids: list[int] | None = None
     clone_from_task_id: int | None = None
     starred: bool = False
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def normalize_provider(cls, value: object) -> str:
+        return _normalize_task_provider(value)
 
     @model_validator(mode='after')
     def validate_mode_fields(self):
@@ -90,12 +118,73 @@ class TaskTerminationRequest(BaseModel):
     expected_completed_at: datetime | None = None
 
 
+class WorkerRoutingConfigRequest(BaseModel):
+    """Internal Manager→Worker routing synchronization payload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op_id: str = Field(min_length=1, max_length=128)
+    provider: str = Field(min_length=1)
+    model: str | None = None
+    codex_service_tier: Literal["default", "priority"]
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def normalize_provider(cls, value: object) -> str:
+        return _normalize_task_provider(value)
+
+
+class WorkerRoutingConfigPending(WorkerRoutingConfigRequest):
+    """Durable staged candidate returned by Worker readback."""
+
+
+class WorkerRoutingConfigSnapshot(BaseModel):
+    """Strict Worker-local live tuple plus its optional staged candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    status: str
+    worker_id: None = None
+    shared_from_id: None = None
+    provider: str
+    model: str | None = None
+    codex_service_tier: Literal["default", "priority"]
+    pending: WorkerRoutingConfigPending | None = None
+
+
+class TaskRoutingExpectation(BaseModel):
+    """Client-visible routing tuple used to reject stale UI actions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(min_length=1)
+    model: str | None = None
+    codex_service_tier: Literal["default", "priority"]
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def normalize_provider(cls, value: object) -> str:
+        return _normalize_task_provider(value)
+
+
+class TaskActionRequest(BaseModel):
+    """Optional stale-view fence for actions that can start a model turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_routing: TaskRoutingExpectation | None = None
+
+
 class TaskUpdate(BaseModel):
     # 执行位置切换：传 worker_id 触发 TaskMigrator（-1 表示切回本机，
     # 因为 None 在 exclude_unset 语义下无法与「未传」区分）
     worker_id: int | None = None
     title: str | None = None
     model: str | None = None
+    # A concrete default keeps PATCH-style exclude_unset semantics while
+    # rejecting an explicit JSON null for this non-null Task setting.
+    codex_service_tier: Literal["default", "priority"] = "default"
     effort_level: str | None = None
     thinking_budget: int | None = None
     system_prompt_mode: str | None = None
@@ -120,6 +209,14 @@ class TaskUpdate(BaseModel):
     provider: str | None = None
     starred: bool | None = None
     tags: list[str] | None = None
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def normalize_provider(cls, value: object) -> str:
+        # The field's None default represents "not supplied" under
+        # exclude_unset. An explicit JSON null does run this validator and must
+        # not become a database NULL or inherit a deployment default.
+        return _normalize_task_provider(value)
 
 
 class TaskResponse(BaseModel):
@@ -153,6 +250,7 @@ class TaskResponse(BaseModel):
     session_id: str | None
     provider: str
     model: str | None
+    codex_service_tier: Literal["default", "priority"]
     effort_level: str | None
     thinking_budget: int | None
     system_prompt_mode: str | None = None

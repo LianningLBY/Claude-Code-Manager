@@ -9,7 +9,7 @@ import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, C
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
-import { TaskConfigBadge } from '../Tasks/TaskBadges';
+import { FastModeBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { ExpandableText } from '../ExpandableText';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
@@ -220,6 +220,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [modelContextWindows, setModelContextWindows] = useState<Record<string, number>>({});
+  const [codexModelServiceTiers, setCodexModelServiceTiers] = useState<Record<string, string[]>>({});
   const [ptyMode, setPtyMode] = useState(false);
   const [codexAppServerEnabled, setCodexAppServerEnabled] = useState(false);
   const [codexMainMcpEnabled, setCodexMainMcpEnabled] = useState<boolean | null>(null);
@@ -263,6 +264,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         setModelContextWindows(
           task.provider === 'codex' ? {} : (c.claude_model_context_windows || {}),
         );
+        setCodexModelServiceTiers(
+          task.provider === 'codex' ? (c.codex_model_service_tiers || {}) : {},
+        );
       }).catch(() => {});
     }
     const handle = (e: MouseEvent) => {
@@ -278,10 +282,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setInjecting(true);
     setError(null);
     try {
-      await api.injectTaskMessage(task.id, text);
+      await api.injectTaskMessage(task.id, text, {
+        provider: task.provider,
+        model: task.model,
+        codex_service_tier: task.codex_service_tier,
+      });
       setInput('');
     } catch (e) {
       setError(`注入失败: ${e instanceof Error ? e.message : String(e)}`);
+      onTaskUpdated?.();
+      refreshHistoryRef.current();
     } finally {
       setInjecting(false);
     }
@@ -1108,6 +1118,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setSending(true);
     setError(null);
 
+    let optimisticMessageId: number | null = null;
     try {
       let uploadedPaths: string[] | undefined;
       let uploadedResults: UploadResult[] = [];
@@ -1125,13 +1136,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       // Optimistic message — show immediately, always with user prefix.
       // 附件也要立刻带上：WS 回包按内容去重时若整条丢弃，图片就再也不显示了
       if (text) {
+        optimisticMessageId = Date.now() + Math.random();
         const optimisticAttachments: FileAttachment[] | null = uploadedResults.length > 0
           ? uploadedResults.map((r) => ({ url: r.url, name: r.filename || r.url.split('/').pop() || 'file', is_image: r.is_image }))
           : null;
         const ccU = JSON.parse(localStorage.getItem('cc_user') || '{}');
         const displayText = ccU.name ? `[${ccU.name}] ${text}` : text;
         setMessages(prev => [...prev, {
-          id: Date.now() + Math.random(), role: 'user', event_type: 'user_message',
+          id: optimisticMessageId!, role: 'user', event_type: 'user_message',
           content: displayText, tool_name: null, tool_input: null, tool_output: null,
           is_error: false, loop_iteration: null, timestamp: new Date().toISOString(),
           image_urls: optimisticAttachments?.filter((a) => a.is_image).map((a) => a.url) || null,
@@ -1141,7 +1153,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         setSending(true);
       }
 
-      await api.sendTaskChat(task.id, text || '(files attached)', uploadedPaths, selectedSecretIds.length > 0 ? selectedSecretIds : undefined, modelOverride);
+      await api.sendTaskChat(
+        task.id,
+        text || '(files attached)',
+        uploadedPaths,
+        selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+        modelOverride,
+        {
+          provider: task.provider,
+          model: modelOverride || task.model,
+          codex_service_tier: task.codex_service_tier,
+        },
+      );
       if (!fromQueue) {
         try {
           localStorage.setItem(forkSeedUploadsConsumedKey, '1');
@@ -1152,6 +1175,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       setModelOverride(null);
     } catch (e) {
       setSending(false);
+      if (optimisticMessageId !== null) {
+        setMessages((current) =>
+          current.filter((message) => message.id !== optimisticMessageId)
+        );
+      }
+      onTaskUpdated?.();
+      fetchHistory();
       const errMsg = String(e);
       if (errMsg.includes('409') || errMsg.toLowerCase().includes('currently being processed')) {
         setStillRunning(true);
@@ -1188,6 +1218,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
               {providerLabel}
             </span>
+            <FastModeBadge task={task} />
             {task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
@@ -1472,12 +1503,21 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       setDistilling(true);
                       setDistillError(null);
                       try {
-                        const result = await api.distillTask(task.id, distillInstruction.trim() || undefined);
+                        const result = await api.distillTask(
+                          task.id,
+                          distillInstruction.trim() || undefined,
+                          {
+                            provider: task.provider,
+                            model: task.model,
+                            codex_service_tier: task.codex_service_tier,
+                          },
+                        );
                         setDistillResult(result);
                         setDistillName(result.suggested_name);
                         setDistillContent(result.content);
                       } catch (e) {
                         setDistillError(e instanceof Error ? e.message : 'Distill failed');
+                        onTaskUpdated?.();
                       } finally {
                         setDistilling(false);
                       }
@@ -1875,15 +1915,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     const win = modelContextWindows[m]
                       ?? ((m.includes('[1m]') || m.includes('fable')) ? 1_000_000 : 200_000);
                     const over = !!contextUsage && contextUsage.total_input_tokens > win;
+                    const fastUnsupported = task.provider === 'codex'
+                      && task.codex_service_tier === 'priority'
+                      && !(codexModelServiceTiers[m] || []).includes('priority');
                     return (
                     <button
                       key={m}
+                      disabled={fastUnsupported}
                       onClick={() => { setModelOverride(m === task.model ? null : m); setShowModelMenu(false); }}
-                      className={`w-full px-3 py-1.5 text-xs text-left hover:bg-gray-700 flex items-center justify-between gap-2 ${modelOverride === m ? 'text-indigo-300 bg-indigo-600/20' : over ? 'text-amber-400/80' : 'text-gray-300'}`}
-                      title={over ? `当前上下文（${Math.round(contextUsage!.total_input_tokens/1000)}K tokens）可能超出该模型 ${win/1000}K 窗口，会报 Prompt is too long` : undefined}
+                      className={`w-full px-3 py-1.5 text-xs text-left hover:bg-gray-700 flex items-center justify-between gap-2 disabled:cursor-not-allowed disabled:text-gray-600 disabled:hover:bg-transparent ${modelOverride === m ? 'text-indigo-300 bg-indigo-600/20' : over ? 'text-amber-400/80' : 'text-gray-300'}`}
+                      title={fastUnsupported
+                        ? `${m} 不支持 Fast；先在 Task Config 中切换为 Standard`
+                        : over
+                          ? `当前上下文（${Math.round(contextUsage!.total_input_tokens/1000)}K tokens）可能超出该模型 ${win/1000}K 窗口，会报 Prompt is too long`
+                          : undefined}
                     >
                       <span>{m}</span>
-                      {over && <span className="shrink-0">⚠</span>}
+                      {fastUnsupported ? <span className="shrink-0">需 Standard</span> : over && <span className="shrink-0">⚠</span>}
                     </button>
                   );})}
                 </div>

@@ -314,6 +314,7 @@ async def test_codex_task_launch_resolves_home_and_resumes_native_thread():
         model="gpt-5.6-sol",
         session_id="thread-ralph-1",
         thinking_budget=1234,
+        codex_service_tier="priority",
     )
 
     with patch("backend.main.dispatcher", dispatcher):
@@ -330,12 +331,14 @@ async def test_codex_task_launch_resolves_home_and_resumes_native_thread():
         "codex",
         task_id=77,
         model="gpt-5.6-sol",
+        codex_service_tier="priority",
     )
     launch_kwargs = rl.instance_manager.launch.await_args.kwargs
     assert launch_kwargs["config_dir"] == "/pool/codex-2"
     assert launch_kwargs["resume_session_id"] == "thread-ralph-1"
     assert launch_kwargs["provider"] == "codex"
     assert launch_kwargs["model"] == "gpt-5.6-sol"
+    assert launch_kwargs["codex_service_tier"] == "priority"
 
 
 @pytest.mark.asyncio
@@ -352,6 +355,7 @@ async def test_claude_task_launch_uses_resolved_home_without_forcing_resume():
         model="claude-opus-4-8",
         session_id="claude-session",
         thinking_budget=None,
+        codex_service_tier="default",
     )
 
     with patch("backend.main.dispatcher", dispatcher):
@@ -362,6 +366,7 @@ async def test_claude_task_launch_uses_resolved_home_without_forcing_resume():
         "claude",
         task_id=78,
         model="claude-opus-4-8",
+        codex_service_tier="default",
     )
     launch_kwargs = rl.instance_manager.launch.await_args.kwargs
     assert launch_kwargs["config_dir"] == "/pool/claude-2"

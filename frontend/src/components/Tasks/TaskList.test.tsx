@@ -45,7 +45,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     has_unread: false,
     session_id: null,
     error_message: null,
+    provider: 'claude',
     model: null,
+    codex_service_tier: 'default',
     tags: null,
     context_window_usage: null,
     created_at: '2024-01-01T00:00:00Z',
@@ -80,6 +82,28 @@ describe('TaskList', () => {
   it('shows empty state when no tasks', () => {
     render(<TaskList tasks={[]} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('No tasks yet')).toBeInTheDocument();
+  });
+
+  it('shows Fast only for Codex priority tasks', () => {
+    const { rerender } = render(
+      <TaskList
+        tasks={[makeTask({ provider: 'codex', codex_service_tier: 'priority' })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+    expect(screen.getByTestId('codex-fast-badge')).toHaveTextContent('Fast');
+
+    rerender(
+      <TaskList
+        tasks={[makeTask({ provider: 'codex', codex_service_tier: 'default' })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+    expect(screen.queryByTestId('codex-fast-badge')).not.toBeInTheDocument();
   });
 
   describe('Copy prompt', () => {
@@ -141,11 +165,23 @@ describe('TaskList', () => {
     });
 
     it('shows Retry in overflow menu for failed tasks', async () => {
-      const tasks = [makeTask({ status: 'failed' })];
+      const tasks = [makeTask({
+        status: 'failed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        codex_service_tier: 'priority',
+      })];
       render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
 
       await userEvent.click(screen.getByTitle('More actions'));
-      expect(screen.getByText('Retry')).toBeInTheDocument();
+      await userEvent.click(screen.getByText('Retry'));
+
+      expect(api.retryTask).toHaveBeenCalledWith(1, {
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        codex_service_tier: 'priority',
+      });
+      await waitFor(() => expect(onRefresh).toHaveBeenCalled());
     });
 
     it('closes overflow menu on outside click', async () => {

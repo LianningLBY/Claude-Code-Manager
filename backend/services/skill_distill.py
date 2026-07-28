@@ -12,7 +12,9 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import text
@@ -20,12 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
 from backend.services.codex_app_server import codex_untrusted_project_override
+from backend.services.process_safety import require_safe_process_group_id
 
 logger = logging.getLogger(__name__)
 
 TASK_DISTILL_MAX_CHARS = 30_000
 TASK_DISTILL_CLAUDE_MODEL = "claude-opus-4-6"
 TASK_DISTILL_TIMEOUT_SECONDS = 300
+_TASK_DISTILL_CLEANUP_TIMEOUT_SECONDS = 5.0
 _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -65,8 +69,54 @@ class TaskDistillTimeoutError(TaskDistillError):
     """The provider exceeded the task-distill deadline."""
 
 
+class TaskDistillCleanupError(TaskDistillError):
+    """A distill process tree could not be proven terminal."""
+
+
 class CodexDistillAccountUnavailableError(TaskDistillError):
     """No healthy Codex account is available for an ephemeral distill."""
+
+
+@dataclass
+class _TaskDistillProcess:
+    """Exact process/home evidence retained until its tree is proven dead."""
+
+    process: object
+    provider: str
+    provider_home: str | None
+    process_group_id: int | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+
+
+_TASK_DISTILL_PROCESSES: dict[int, _TaskDistillProcess] = {}
+
+
+def _canonical_provider_home(
+    provider_home: str | os.PathLike[str] | None,
+) -> str | None:
+    if not provider_home:
+        return None
+    return os.path.realpath(os.path.abspath(os.path.expandvars(
+        os.path.expanduser(os.fspath(provider_home))
+    )))
+
+
+def task_distill_runtime_users(
+    provider_home: str | os.PathLike[str],
+) -> list[str]:
+    """Return exact active/unreaped distill users for one provider home."""
+
+    target = _canonical_provider_home(provider_home)
+    if target is None:
+        return []
+    blockers: list[str] = []
+    for token, retained in list(_TASK_DISTILL_PROCESSES.items()):
+        if retained.provider_home != target:
+            continue
+        pid = getattr(retained.process, "pid", None)
+        identity = pid if type(pid) is int and pid > 0 else token
+        blockers.append(f"skill distill process {identity}")
+    return blockers
 
 
 def build_task_distill_prompt(
@@ -149,6 +199,8 @@ def _build_task_distill_command(
             "read-only",
             "--ignore-rules",
             "--ephemeral",
+            "-c",
+            'service_tier="default"',
         ]
         if not load_user_config:
             cmd.append("--ignore-user-config")
@@ -206,30 +258,226 @@ def _extract_task_distill_content(provider: str, raw: str) -> str:
     return raw.strip()
 
 
-async def _terminate_task_distill_process(process) -> None:
-    if process is None or process.returncode is not None:
-        return
+async def _settle_task_distill_spawn(
+    *cmd: str,
+    **spawn_kwargs,
+) -> tuple[object, asyncio.CancelledError | None]:
+    """Recover the exact child even when cancellation races process spawn."""
+
+    spawn_task = asyncio.create_task(
+        asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
+    )
+    delayed_cancellation: asyncio.CancelledError | None = None
+    while not spawn_task.done():
+        try:
+            await asyncio.shield(spawn_task)
+        except asyncio.CancelledError as exc:
+            if spawn_task.done():
+                break
+            delayed_cancellation = exc
+        except Exception:
+            break
     try:
-        process.kill()
+        process = spawn_task.result()
+    except BaseException:
+        if delayed_cancellation is not None:
+            raise delayed_cancellation
+        raise
+    return process, delayed_cancellation
+
+
+def _register_task_distill_process(
+    process,
+    provider: str,
+    provider_home: str | os.PathLike[str] | None,
+) -> tuple[int, _TaskDistillProcess]:
+    token = id(process)
+    retained = _TaskDistillProcess(
+        process=process,
+        provider=provider,
+        provider_home=_canonical_provider_home(provider_home),
+    )
+    # Publish before any caller cancellation can be delivered.
+    _TASK_DISTILL_PROCESSES[token] = retained
+    pid = getattr(process, "pid", None)
+    if os.name == "posix" and type(pid) is int and pid > 1:
+        retained.process_group_id = require_safe_process_group_id(
+            pid,
+            context="task distill",
+        )
+    return token, retained
+
+
+def _task_distill_process_group_alive(process_group_id: int | None) -> bool:
+    if process_group_id is None:
+        return False
+    process_group_id = require_safe_process_group_id(
+        process_group_id,
+        context="task distill liveness check",
+    )
+    try:
+        os.killpg(process_group_id, 0)
+        return True
     except ProcessLookupError:
-        pass
-    except Exception:
-        logger.exception("Failed to stop task distill process")
+        return False
+    except PermissionError:
+        return True
+
+
+async def _terminate_task_distill_process(
+    retained: _TaskDistillProcess | None,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]] | None,
+) -> None:
+    """Kill, drain and prove one exact distill process group terminal."""
+
+    if retained is None:
+        if communicate_task is not None and not communicate_task.done():
+            communicate_task.cancel()
+            await asyncio.gather(communicate_task, return_exceptions=True)
+        return
+
+    process = retained.process
+    process_group_id = retained.process_group_id
+    pid = getattr(process, "pid", None)
+    unsafe_posix_group = (
+        os.name == "posix" and type(pid) is int and pid <= 1
+    )
     try:
-        await process.wait()
-    except Exception:
-        logger.exception("Failed to reap task distill process")
+        if process_group_id is not None:
+            os.killpg(process_group_id, signal.SIGKILL)
+        elif getattr(process, "returncode", None) is None:
+            process.kill()
+    except ProcessLookupError:
+        if getattr(process, "returncode", None) is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TASK_DISTILL_CLEANUP_TIMEOUT_SECONDS
+    parent_reaped = getattr(process, "returncode", None) is not None
+    if communicate_task is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(communicate_task),
+                timeout=max(0.01, deadline - loop.time()),
+            )
+            parent_reaped = True
+        except asyncio.TimeoutError:
+            communicate_task.cancel()
+            await asyncio.gather(communicate_task, return_exceptions=True)
+        except Exception:
+            # The original communicate failure is classified by the caller.
+            pass
+    if not parent_reaped:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(process.wait()),
+                timeout=max(0.01, deadline - loop.time()),
+            )
+            parent_reaped = True
+        except asyncio.TimeoutError:
+            logger.error("Timed out reaping task distill process")
+
+    while _task_distill_process_group_alive(process_group_id):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Task distill process group {process_group_id} survived SIGKILL"
+            )
+        await asyncio.sleep(min(0.05, remaining))
+    if not parent_reaped:
+        raise RuntimeError(
+            "Task distill parent could not be proven reaped"
+        )
+    if unsafe_posix_group:
+        raise RuntimeError(
+            f"Task distill process had unsafe group identity {pid!r}"
+        )
 
 
-async def _shielded_terminate_task_distill_process(process) -> None:
-    """Kill and reap even if the request task receives another cancellation."""
-    cleanup = asyncio.create_task(_terminate_task_distill_process(process))
+async def _shielded_terminate_task_distill_process(
+    token: int | None,
+    retained: _TaskDistillProcess | None,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]] | None,
+    *,
+    delayed_cancellation: asyncio.CancelledError | None = None,
+) -> None:
+    """Finish exact cleanup before forgetting evidence or delivering cancel."""
+
+    if (
+        token is not None
+        and retained is not None
+        and _TASK_DISTILL_PROCESSES.get(token) is not retained
+    ):
+        if delayed_cancellation is not None:
+            raise delayed_cancellation
+        return
+    if retained is not None:
+        cleanup = retained.cleanup_task
+        if cleanup is None:
+            cleanup = asyncio.create_task(
+                _terminate_task_distill_process(
+                    retained,
+                    communicate_task,
+                )
+            )
+            retained.cleanup_task = cleanup
+    else:
+        cleanup = asyncio.create_task(
+            _terminate_task_distill_process(None, communicate_task)
+        )
+    cancellation = delayed_cancellation
     while not cleanup.done():
         try:
             await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            continue
-    await cleanup
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            break
+    try:
+        cleanup.result()
+    except Exception as exc:
+        if retained is not None and retained.cleanup_task is cleanup:
+            # Preserve exact process/home evidence, but allow a later admin or
+            # shutdown retry to make a fresh cleanup attempt.
+            retained.cleanup_task = None
+        raise TaskDistillCleanupError(
+            "Distillation process tree could not be proven terminal",
+            provider=retained.provider if retained is not None else "unknown",
+            stderr=str(exc),
+        ) from exc
+    else:
+        if (
+            token is not None
+            and retained is not None
+            and _TASK_DISTILL_PROCESSES.get(token) is retained
+        ):
+            _TASK_DISTILL_PROCESSES.pop(token, None)
+    if cancellation is not None:
+        raise cancellation
+
+
+async def reap_unreaped_task_distills() -> None:
+    """Retry exact distill process trees retained after cleanup failure."""
+
+    failures: list[str] = []
+    for token, retained in list(_TASK_DISTILL_PROCESSES.items()):
+        try:
+            await _shielded_terminate_task_distill_process(
+                token,
+                retained,
+                None,
+            )
+        except Exception as exc:
+            failures.append(str(exc))
+    if failures:
+        raise TaskDistillCleanupError(
+            "Could not reap retained distill process trees",
+            provider="unknown",
+            stderr="; ".join(failures),
+        )
 
 
 def _is_cloudrouter_projection(
@@ -361,17 +609,32 @@ async def distill_task_conversation(
 
     async def run_process() -> tuple[object, bytes, bytes]:
         process = None
+        process_token: int | None = None
+        retained: _TaskDistillProcess | None = None
+        communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
+            spawn_kwargs: dict[str, object] = {
+                "stdin": asyncio.subprocess.PIPE,
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "env": env,
                 # Avoid loading the source task's CLAUDE.md/AGENTS.md. Distill
                 # only needs the transcript supplied on stdin.
-                cwd=distill_cwd,
+                "cwd": distill_cwd,
+            }
+            if os.name == "posix":
+                spawn_kwargs["start_new_session"] = True
+            process, spawn_cancellation = await _settle_task_distill_spawn(
+                *cmd,
+                **spawn_kwargs,
             )
+            process_token, retained = _register_task_distill_process(
+                process,
+                provider,
+                provider_home,
+            )
+            if spawn_cancellation is not None:
+                raise spawn_cancellation
             # ``select()`` only proposes an account. Publish "recently used"
             # once the provider process really exists, including runs that
             # later return a model/auth error.
@@ -383,16 +646,45 @@ async def distill_task_conversation(
                 and env.get("CLAUDE_CONFIG_DIR")
             ):
                 claude_pool.record_routed_account(env["CLAUDE_CONFIG_DIR"])
+            communicate_task = asyncio.create_task(
+                process.communicate(input=prompt.encode("utf-8"))
+            )
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=prompt.encode("utf-8")),
+                asyncio.shield(communicate_task),
                 timeout=TASK_DISTILL_TIMEOUT_SECONDS,
             )
+            # Parent completion does not prove that a tool child did not
+            # detach after inheriting this dedicated process group.
+            await _shielded_terminate_task_distill_process(
+                process_token,
+                retained,
+                communicate_task,
+            )
             return process, stdout, stderr
-        except asyncio.CancelledError:
-            await _shielded_terminate_task_distill_process(process)
-            raise
+        except asyncio.CancelledError as exc:
+            # Cancellation can arrive while the normal-path shielded cleanup
+            # is already running. If that exact cleanup removed the registry
+            # entry, terminal state was proven; never signal its old PGID a
+            # second time because the numeric identity may already be reused.
+            if (
+                process_token is not None
+                and retained is not None
+                and _TASK_DISTILL_PROCESSES.get(process_token) is not retained
+            ):
+                raise exc
+            await _shielded_terminate_task_distill_process(
+                process_token,
+                retained,
+                communicate_task,
+                delayed_cancellation=exc,
+            )
+            raise exc
         except asyncio.TimeoutError as exc:
-            await _terminate_task_distill_process(process)
+            await _shielded_terminate_task_distill_process(
+                process_token,
+                retained,
+                communicate_task,
+            )
             raise TaskDistillTimeoutError(
                 "Distillation timed out (5min)",
                 provider=provider,
@@ -400,7 +692,11 @@ async def distill_task_conversation(
         except TaskDistillError:
             raise
         except Exception as exc:
-            await _terminate_task_distill_process(process)
+            await _shielded_terminate_task_distill_process(
+                process_token,
+                retained,
+                communicate_task,
+            )
             raise TaskDistillError(
                 f"Distillation process failed: {exc}",
                 provider=provider,
@@ -441,7 +737,23 @@ async def distill_task_conversation(
                 stderr=str(exc),
             ) from exc
     else:
-        process, stdout, stderr = await run_process()
+        if cloudrouter_api:
+            if instance_manager is None:
+                raise TaskDistillError(
+                    "Claude API account admission is unavailable for distillation",
+                    provider="claude",
+                )
+            # Hold Store admission for the complete subprocess lifetime. A
+            # staged account retirement then either waits for this credential
+            # user to finish or disables the account before spawn.
+            async with instance_manager._cloudrouter_runtime_admission(
+                "claude",
+                provider_home,
+                model,
+            ):
+                process, stdout, stderr = await run_process()
+        else:
+            process, stdout, stderr = await run_process()
 
     raw = stdout.decode("utf-8", errors="replace")
     stderr_text = stderr.decode("utf-8", errors="replace")

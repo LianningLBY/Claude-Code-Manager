@@ -12,9 +12,16 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
 
   if (planTasks.length === 0) return null;
 
-  const handleApprove = async (id: number) => {
-    await api.approvePlan(id);
-    onRefresh();
+  const handleApprove = async (task: Task) => {
+    try {
+      await api.approvePlan(task.id, {
+        provider: task.provider,
+        model: task.model,
+        codex_service_tier: task.codex_service_tier,
+      });
+    } finally {
+      onRefresh();
+    }
   };
 
   const handleReject = async (id: number) => {
@@ -37,7 +44,7 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
             </div>
             <div className="flex gap-2">
               <button
-                onClick={() => handleApprove(task.id)}
+                onClick={() => handleApprove(task)}
                 className="flex items-center gap-1 bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-xs font-medium"
               >
                 <Check size={14} /> Approve

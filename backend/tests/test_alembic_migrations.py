@@ -361,6 +361,43 @@ class TestLegacyDefaultAdminMigration:
         assert bool(row.is_active) is True
 
 
+class TestCodexServiceTierMigration:
+    def test_existing_tasks_are_backfilled_as_standard(self, tmp_path):
+        db_path = str(tmp_path / "codex-service-tier.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "e4c9f2a71b03")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES "
+                "('existing task', 'd', 'pending', 0, 'main', 'pending', "
+                "0, 2, 'auto', '2026-07-28 00:00:00')"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            tier = conn.execute(text(
+                "SELECT codex_service_tier FROM tasks "
+                "WHERE title = 'existing task'"
+            )).scalar_one()
+            assert tier == "default"
+
+            column = inspect(conn).get_columns("tasks")
+            column = next(
+                item for item in column
+                if item["name"] == "codex_service_tier"
+            )
+            assert column["nullable"] is False
+        engine.dispose()
+
+
 class TestFreshMigration:
     """A fresh database (no tables) can be fully created via Alembic upgrade."""
 

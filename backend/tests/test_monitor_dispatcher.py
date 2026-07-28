@@ -17,6 +17,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.task import Task
 from backend.models.monitor_session import MonitorSession, MonitorCheck
@@ -49,11 +50,66 @@ def dispatcher(db_factory, mock_broadcaster):
     d.codex_pool = None
 
     @asynccontextmanager
-    async def runtime_admission(_provider, _home, _model):
+    async def runtime_admission(
+        _provider,
+        _home,
+        _model,
+        *,
+        service_tier="default",
+    ):
+        assert service_tier == "default"
         yield None
 
     d.instance_manager._cloudrouter_runtime_admission = runtime_admission
     return d
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor", "sub-agent"])
+async def test_api_account_aux_home_survives_cancelled_unreaped_spawn(
+    dispatcher, tmp_path, kind,
+):
+    home = str(tmp_path / "api-account" / "claude")
+    dispatcher.pool = MagicMock()
+    dispatcher._pool_select = AsyncMock(return_value=home)
+    dispatcher._sanitize_cloudrouter_claude_env = MagicMock()
+    process = _fake_proc(returncode=None)
+    session_id = 91 if kind == "monitor" else 92
+
+    async def cancelled_spawn(**kwargs):
+        kwargs["process_map"][session_id] = process
+        raise asyncio.CancelledError()
+
+    dispatcher._launch_registered_aux_process = cancelled_spawn
+    with pytest.raises(asyncio.CancelledError):
+        if kind == "monitor":
+            await dispatcher._launch_monitor_agent(
+                prompt="monitor",
+                cwd=str(tmp_path),
+                model="claude-opus-4-8",
+                monitor_session_id=session_id,
+                mcp_config_path=tmp_path / "monitor.json",
+            )
+        else:
+            await dispatcher._launch_sub_agent(
+                prompt="child",
+                cwd=str(tmp_path),
+                model="claude-opus-4-8",
+                session_id=session_id,
+                mcp_config_path=tmp_path / "child.json",
+            )
+
+    home_map = (
+        dispatcher._monitor_config_dirs
+        if kind == "monitor"
+        else dispatcher._sub_agent_config_dirs
+    )
+    assert home_map[session_id] == home
+
+    dispatcher._aux_process_reaped = MagicMock(return_value=False)
+    account = MagicMock(claude_config_dir=home)
+    blockers = dispatcher.api_account_aux_runtime_users(account)
+    assert blockers == [f"{kind} {session_id}"]
 
 
 async def _seed_task_and_monitor(
@@ -75,6 +131,34 @@ async def _seed_task_and_monitor(
         await db.commit()
         await db.refresh(ms)
         return task.id, ms.id
+
+
+async def _seed_codex_sub_agent(
+    dispatcher,
+    *,
+    task_id: int,
+    session_id: int,
+) -> None:
+    async with dispatcher.db_factory() as db:
+        task = Task(
+            id=task_id,
+            title="codex parent",
+            description="d",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+        )
+        session = MonitorSession(
+            id=session_id,
+            task_id=task_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="child",
+            status="running",
+        )
+        db.add_all([task, session])
+        await db.commit()
 
 
 def _fake_proc(returncode=0):
@@ -144,6 +228,11 @@ def test_build_monitor_agent_prompt_no_context(dispatcher):
 
 @pytest.mark.asyncio
 async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=41,
+    )
     process = _fake_proc(returncode=None)
     registry = MagicMock()
     registry.start_turn = AsyncMock(return_value=(process, "thread-child"))
@@ -187,6 +276,11 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
 
 @pytest.mark.asyncio
 async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=61,
+    )
     process = _fake_proc(returncode=None)
     registry = MagicMock()
     registry.start_turn = AsyncMock(return_value=(process, "thread-api-child"))
@@ -204,8 +298,15 @@ async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
     admission_calls = []
 
     @asynccontextmanager
-    async def runtime_admission(provider, home, model):
+    async def runtime_admission(
+        provider,
+        home,
+        model,
+        *,
+        service_tier="default",
+    ):
         admission_calls.append((provider, home, model))
+        assert service_tier == "default"
         yield account
 
     @asynccontextmanager
@@ -233,6 +334,247 @@ async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
         registry.start_turn.await_args.kwargs["disable_project_config"]
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_final_gate_rejects_pending_task_routing(
+    dispatcher,
+):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=71,
+    )
+    async with dispatcher.db_factory() as db:
+        task = await db.get(Task, 7)
+        task.metadata_ = {
+            "worker_routing_config_pending": {
+                "op_id": "sub-agent-stage",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "codex_service_tier": "priority",
+            }
+        }
+        await db.commit()
+
+    registry = MagicMock()
+    registry.start_turn = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+
+    @asynccontextmanager
+    async def admit(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = admit
+
+    with pytest.raises(RuntimeError, match="routing synchronization"):
+        await dispatcher._launch_codex_sub_agent(
+            prompt="must not start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=71,
+            task_id=7,
+            task_metadata={},
+            mcp_specs=(),
+            expected_task_routing=(
+                "codex",
+                "gpt-5.6-sol",
+                "default",
+            ),
+        )
+    registry.start_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_final_gate_rejects_stopped_generation(
+    dispatcher,
+):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=72,
+    )
+    async with dispatcher.db_factory() as db:
+        session = await db.get(MonitorSession, 72)
+        session.status = "stopped"
+        await db.commit()
+
+    registry = MagicMock()
+    registry.start_turn = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+
+    @asynccontextmanager
+    async def admit(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = admit
+
+    with pytest.raises(RuntimeError, match="launch admission changed"):
+        await dispatcher._launch_codex_sub_agent(
+            prompt="must not start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=72,
+            task_id=7,
+            task_metadata={},
+            mcp_specs=(),
+            expected_task_routing=(
+                "codex",
+                "gpt-5.6-sol",
+                "default",
+            ),
+        )
+    registry.start_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_commit_failure_aborts_exact_started_turn(
+    dispatcher,
+    monkeypatch,
+):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=73,
+    )
+    process = _fake_proc(returncode=None)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(
+        return_value=(process, "thread-uncommitted")
+    )
+
+    async def abort(_home, candidate, *, reason):
+        assert candidate is process
+        assert "did not commit" in reason
+        candidate.returncode = 130
+        return False
+
+    registry.abort_unclaimed_turn = AsyncMock(side_effect=abort)
+    registry.delete_thread = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+
+    @asynccontextmanager
+    async def admit(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = admit
+
+    async def fail_commit(_session):
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_commit)
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await dispatcher._launch_codex_sub_agent(
+            prompt="must be cleaned",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=73,
+            task_id=7,
+            task_metadata={},
+            mcp_specs=(),
+        )
+
+    registry.abort_unclaimed_turn.assert_awaited_once_with(
+        "/tmp/default-codex-home",
+        process,
+        reason="Codex sub-agent launch admission did not commit",
+    )
+    registry.delete_thread.assert_awaited_once_with(
+        "/tmp/default-codex-home",
+        "thread-uncommitted",
+    )
+    assert 73 not in dispatcher._sub_agent_codex_processes
+    assert 73 not in dispatcher._sub_agent_codex_homes
+    assert 73 not in dispatcher._sub_agent_codex_threads
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_commit_cancellation_waits_for_exact_abort(
+    dispatcher,
+    monkeypatch,
+):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=74,
+    )
+    process = _fake_proc(returncode=None)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(
+        return_value=(process, "thread-cancelled-commit")
+    )
+    commit_started = asyncio.Event()
+    abort_started = asyncio.Event()
+    release_abort = asyncio.Event()
+
+    async def blocked_commit(_session):
+        commit_started.set()
+        await asyncio.Future()
+
+    async def abort(_home, candidate, *, reason):
+        assert candidate is process
+        assert "did not commit" in reason
+        abort_started.set()
+        await release_abort.wait()
+        candidate.returncode = 130
+        return False
+
+    registry.abort_unclaimed_turn = AsyncMock(side_effect=abort)
+    registry.delete_thread = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+
+    @asynccontextmanager
+    async def admit(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = admit
+    monkeypatch.setattr(AsyncSession, "commit", blocked_commit)
+
+    launch = asyncio.create_task(
+        dispatcher._launch_codex_sub_agent(
+            prompt="must be cleaned after cancellation",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=74,
+            task_id=7,
+            task_metadata={},
+            mcp_specs=(),
+        )
+    )
+    await asyncio.wait_for(commit_started.wait(), timeout=1)
+    launch.cancel()
+    await asyncio.wait_for(abort_started.wait(), timeout=1)
+    assert not launch.done()
+
+    release_abort.set()
+    with pytest.raises(asyncio.CancelledError):
+        await launch
+
+    registry.abort_unclaimed_turn.assert_awaited_once_with(
+        "/tmp/default-codex-home",
+        process,
+        reason="Codex sub-agent launch admission did not commit",
+    )
+    registry.delete_thread.assert_awaited_once_with(
+        "/tmp/default-codex-home",
+        "thread-cancelled-commit",
+    )
+    assert 74 not in dispatcher._sub_agent_codex_processes
+    assert 74 not in dispatcher._sub_agent_codex_homes
+    assert 74 not in dispatcher._sub_agent_codex_threads
 
 
 @pytest.mark.asyncio

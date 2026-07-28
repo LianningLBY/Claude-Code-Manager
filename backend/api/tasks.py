@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import shutil
 import uuid
@@ -10,20 +11,26 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.config import settings
 from backend.database import get_db
 from backend.models.task import Task
 from backend.models.instance import Instance
 from backend.schemas.task import (
+    TaskActionRequest,
     TaskCreate,
     TaskMigrationImport,
     TaskResponse,
+    TaskRoutingExpectation,
     TaskTerminationRequest,
     TaskUpdate,
+    WorkerRoutingConfigRequest,
+    WorkerRoutingConfigSnapshot,
 )
 from backend.services.task_queue import TaskQueue, task_delete_fence
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
+from backend.services.codex_models import validate_codex_service_tier
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
     _finish_despite_cancellation as _finish_task_operation,
@@ -39,7 +46,21 @@ from backend.services.worker_relay import (
     worker_task_generation,
     worker_task_generation_predicates,
 )
-from backend.services.worker_proxy import get_task_operation_lock
+from backend.services.worker_proxy import (
+    WorkerEndpointNotFoundError,
+    get_task_operation_lock,
+)
+from backend.services.worker_routing_config import (
+    InvalidWorkerRoutingMarker,
+    WORKER_ROUTING_SAFE_STATUSES,
+    WorkerRoutingPending,
+    WorkerRoutingTuple,
+    has_pending_worker_routing,
+    read_pending_worker_routing,
+    task_routing_tuple,
+    with_pending_worker_routing,
+    without_pending_worker_routing,
+)
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
@@ -52,9 +73,97 @@ from backend.api.deps import (
 )
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+logger = logging.getLogger(__name__)
 _MANUAL_RETRYABLE_STATUSES = frozenset(
     {"failed", "cancelled", "conflict", "completed"}
 )
+_WORKER_ROUTING_CONFIG_FIELDS = frozenset(
+    {"provider", "model", "codex_service_tier"}
+)
+_WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
+    {"worker_id", "project_id", "target_repo"}
+)
+_LOCAL_ROUTING_EDITABLE_STATUSES = (
+    WORKER_ROUTING_SAFE_STATUSES | {"pending"}
+)
+
+
+class _WorkerRoutingConfirmationUnavailable(HTTPException):
+    """Worker ack/reconcile outcome could not be read after Manager commit."""
+
+    def __init__(self):
+        super().__init__(
+            503,
+            "Worker routing synchronization outcome could not be confirmed",
+        )
+
+
+def _require_expected_task_routing(
+    task: Task,
+    expected: TaskRoutingExpectation | None,
+    *,
+    effective_model: str | None,
+) -> tuple[str, str | None, str]:
+    """Reject a user action issued from a stale routing view."""
+
+    actual = (
+        (task.provider or "claude").lower(),
+        effective_model,
+        task.codex_service_tier or "default",
+    )
+    if expected is None:
+        return actual
+    requested = (
+        expected.provider.lower(),
+        expected.model,
+        expected.codex_service_tier,
+    )
+    if requested != actual:
+        raise HTTPException(
+            409,
+            "Task execution configuration changed since this page was "
+            "loaded; refresh before starting another turn",
+        )
+    return actual
+
+
+def _validate_task_service_tier_configuration(
+    *,
+    provider: str | None,
+    model: str | None,
+    codex_service_tier: str | None,
+    mode: str | None,
+    goal_evaluator_model: str | None,
+) -> None:
+    """Validate every model request hidden behind one Task configuration."""
+
+    validate_codex_service_tier(provider, model, codex_service_tier)
+    if not (
+        (provider or "claude").lower() == "codex"
+        and (codex_service_tier or "default") == "priority"
+        and mode == "goal"
+    ):
+        return
+
+    # A separate evaluator model may be statically Fast-capable yet absent
+    # from the account admitted for the main turn. Requiring the same model
+    # lets admission prove both requests before any Goal work starts.
+    task_model = model
+    if not task_model or task_model == "default":
+        task_model = settings.default_codex_model
+    evaluator_model = goal_evaluator_model
+    if not evaluator_model or evaluator_model == "default":
+        evaluator_model = task_model
+    if evaluator_model != task_model:
+        raise ValueError(
+            "Codex Fast Goal tasks must use the Task model for goal "
+            "evaluation; clear goal_evaluator_model or select the same model"
+        )
+    validate_codex_service_tier(
+        "codex",
+        evaluator_model,
+        "priority",
+    )
 
 
 def _explicit_command_skills(message: str | None) -> dict[str, bool]:
@@ -416,6 +525,16 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         selected_user_skills=data.get("selected_user_skills"),
         user_skill_snapshots=user_skill_snapshots,
     )
+    try:
+        _validate_task_service_tier_configuration(
+            provider=data.get("provider"),
+            model=data.get("model"),
+            codex_service_tier=data.get("codex_service_tier"),
+            mode=data.get("mode"),
+            goal_evaluator_model=data.get("goal_evaluator_model"),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
     task = await queue.create(**data)
     # Eliminate the dispatcher's historical 0-2s polling delay.  Importing
@@ -493,6 +612,16 @@ async def import_migrated_task(
         )
     if not data.get("effort_level"):
         data["effort_level"] = app_settings.default_effort
+    try:
+        _validate_task_service_tier_configuration(
+            provider=data.get("provider"),
+            model=data.get("model"),
+            codex_service_tier=data.get("codex_service_tier"),
+            mode=data.get("mode"),
+            goal_evaluator_model=data.get("goal_evaluator_model"),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
     existing = await db.get(Task, body.id)
     if existing is None:
@@ -536,6 +665,1069 @@ async def get_task(task_id: int, request: Request, queue: TaskQueue = Depends(_g
     return task
 
 
+def _normalized_task_update_values(updates: dict) -> dict:
+    """Mirror TaskQueue's explicit-NULL handling for one fenced UPDATE."""
+
+    normalized = {}
+    for key, value in updates.items():
+        if value is None:
+            mapped_attr = getattr(Task, key, None)
+            columns = getattr(
+                getattr(mapped_attr, "property", None),
+                "columns",
+                (),
+            )
+            if not columns or not columns[0].nullable:
+                continue
+        normalized[key] = value
+    return normalized
+
+
+def _routing_request_tuple(
+    body: WorkerRoutingConfigRequest,
+) -> WorkerRoutingTuple:
+    return WorkerRoutingTuple(
+        provider=body.provider,
+        model=body.model,
+        codex_service_tier=body.codex_service_tier,
+    )
+
+
+def _codex_account_binding(task: Task) -> object | None:
+    metadata = task.metadata_
+    if not isinstance(metadata, dict):
+        return None
+    return metadata.get("codex_account_id")
+
+
+def _resolve_codex_thread_routing_home(task: Task) -> str:
+    """Resolve one thread home without guessing between rollout copies."""
+
+    from backend.main import codex_pool
+    from backend.services.codex_app_server import normalize_codex_home
+
+    binding = _codex_account_binding(task)
+    if codex_pool is not None and binding is not None:
+        bound_home = codex_pool.home_for_account(str(binding))
+        if not bound_home:
+            raise HTTPException(
+                409,
+                "Codex routing change was blocked because the Task's bound "
+                "account home no longer exists",
+            )
+        return codex_pool.canonical_home(bound_home)
+
+    if codex_pool is not None and task.session_id:
+        try:
+            matches = codex_pool.locate_session_homes(task.session_id)
+        except Exception as exc:
+            raise HTTPException(
+                409,
+                "Codex routing change was blocked because the native thread "
+                "home could not be resolved",
+            ) from exc
+        if len(matches) > 1:
+            raise HTTPException(
+                409,
+                "Codex routing change was blocked because the native thread "
+                "exists in multiple account homes without an authoritative "
+                "Task binding",
+            )
+        if len(matches) == 1:
+            return codex_pool.canonical_home(matches[0])
+        if getattr(codex_pool, "enabled", False):
+            raise HTTPException(
+                409,
+                "Codex routing change was blocked because the native thread "
+                "has no authoritative account home",
+            )
+
+    return normalize_codex_home(None)
+
+
+async def _hold_codex_thread_routing_quiescence(
+    stack: AsyncExitStack,
+    task: Task,
+    candidate: WorkerRoutingTuple,
+) -> None:
+    """Reserve one idle native thread through the caller's routing commit."""
+
+    if (
+        not task.session_id
+        or (task.provider or "").lower() != "codex"
+        or task_routing_tuple(task) == candidate
+    ):
+        return
+    codex_home = _resolve_codex_thread_routing_home(task)
+    from backend.main import instance_manager
+
+    try:
+        await stack.enter_async_context(
+            instance_manager.codex_thread_routing_guard(
+                codex_home,
+                task.session_id,
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Codex routing change could not prove thread quiescence: "
+            "task=%s session=%s home=%s error=%s",
+            task.id,
+            task.session_id,
+            codex_home,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            409,
+            "Codex routing change was blocked because its native thread or "
+            "Goal could not be proven idle",
+        ) from exc
+
+
+def _routing_guard_generation_changed(current: Task, observed: Task) -> bool:
+    return (
+        current.session_id != observed.session_id
+        or task_routing_tuple(current) != task_routing_tuple(observed)
+        or _codex_account_binding(current) != _codex_account_binding(observed)
+    )
+
+
+def _worker_routing_snapshot(task: Task) -> dict:
+    try:
+        pending = read_pending_worker_routing(task)
+    except InvalidWorkerRoutingMarker as exc:
+        raise HTTPException(
+            409,
+            "Worker Task has an invalid routing synchronization marker",
+        ) from exc
+    return {
+        "id": task.id,
+        "status": task.status,
+        "worker_id": task.worker_id,
+        "shared_from_id": task.shared_from_id,
+        **task_routing_tuple(task).as_dict(),
+        "pending": pending.as_dict() if pending is not None else None,
+    }
+
+
+async def _lock_worker_local_routing_task(
+    task_id: int,
+    request: Request,
+    db: AsyncSession,
+    *,
+    safe_status_required: bool,
+    allowed_statuses: frozenset[str] | None = None,
+) -> Task:
+    """Acquire the portable Task write barrier and return its strict snapshot."""
+
+    predicates = [
+        Task.id == task_id,
+        Task.worker_id.is_(None),
+        Task.shared_from_id.is_(None),
+    ]
+    if allowed_statuses is not None:
+        predicates.append(Task.status.in_(allowed_statuses))
+    elif safe_status_required:
+        predicates.append(Task.status.in_(WORKER_ROUTING_SAFE_STATUSES))
+    guarded = await db.execute(
+        sa_update(Task)
+        .where(*predicates)
+        .values(status=Task.status)
+    )
+    if guarded.rowcount != 1:
+        await db.rollback()
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, db)
+        if current.worker_id is not None or current.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Routing synchronization endpoints only accept Worker-local Tasks",
+            )
+        if allowed_statuses is not None:
+            detail = (
+                "Task routing config cannot change after an execution claim "
+                "became active"
+            )
+        else:
+            detail = (
+                "Worker Task routing config cannot change while it is pending "
+                "or active"
+            )
+        raise HTTPException(409, detail)
+    current = await db.get(Task, task_id, populate_existing=True)
+    if current is None:
+        await db.rollback()
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, current, db)
+    reverse_owner = (
+        await db.execute(
+            select(Instance.id)
+            .where(Instance.current_task_id == task_id)
+            .with_for_update()
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if reverse_owner is not None:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task still has an active or unconfirmed Instance generation; "
+            "routing configuration cannot change until process cleanup is "
+            "complete",
+        )
+    return current
+
+
+async def _running_routing_sub_agent_id(
+    db: AsyncSession,
+    task_id: int,
+) -> int | None:
+    """Return a child generation that can still emit with the old route."""
+
+    from backend.models.sub_agent import SubAgentSession
+
+    return (
+        await db.execute(
+            select(SubAgentSession.id)
+            .where(
+                SubAgentSession.task_id == task_id,
+                SubAgentSession.status == "running",
+                (
+                    (
+                        SubAgentSession.agent_type == "sub_agent"
+                    )
+                    & (SubAgentSession.source == "ccm")
+                )
+                | (SubAgentSession.source == "native"),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+@router.post(
+    "/{task_id}/routing-config/stage",
+    response_model=WorkerRoutingConfigSnapshot,
+    include_in_schema=False,
+)
+async def stage_worker_routing_config(
+    task_id: int,
+    body: WorkerRoutingConfigRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Durably block launches and record a candidate without changing live config."""
+
+    require_admin(request)
+    task = await db.get(Task, task_id)
+    if task is not None:
+        await require_task_control(request, task, db)
+    await db.rollback()
+    candidate = _routing_request_tuple(body)
+
+    async with get_task_operation_lock(task_id):
+        # A terminal status may be published before a pre-owner launch or an
+        # existing process generation is fully reaped.  Settle that hidden
+        # reservation before taking the durable Task→Instance barrier below.
+        db.expire_all()
+        observed = await db.get(Task, task_id)
+        if observed is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, observed, db)
+        try:
+            _validate_task_service_tier_configuration(
+                provider=candidate.provider,
+                model=candidate.model,
+                codex_service_tier=candidate.codex_service_tier,
+                mode=observed.mode,
+                goal_evaluator_model=observed.goal_evaluator_model,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if (
+            observed.worker_id is not None
+            or observed.shared_from_id is not None
+        ):
+            raise HTTPException(
+                409,
+                "Routing synchronization endpoints only accept Worker-local "
+                "Tasks",
+            )
+        if observed.status not in WORKER_ROUTING_SAFE_STATUSES:
+            raise HTTPException(
+                409,
+                "Worker Task routing config cannot change while it is pending "
+                "or active",
+            )
+        if (
+            candidate.provider != observed.provider
+            and observed.session_id is not None
+        ):
+            raise HTTPException(
+                409,
+                "Task provider cannot change while an existing native session "
+                "may still emit output; start a new Task instead",
+            )
+        observed_instance_id = observed.instance_id
+        db.expunge(observed)
+        await db.rollback()
+        await _settle_task_launch_barrier(task_id, observed_instance_id)
+
+        async with AsyncExitStack() as routing_stack:
+            await _hold_codex_thread_routing_quiescence(
+                routing_stack,
+                observed,
+                candidate,
+            )
+            db.expire_all()
+            current = await _lock_worker_local_routing_task(
+                task_id,
+                request,
+                db,
+                safe_status_required=True,
+            )
+            if _routing_guard_generation_changed(current, observed):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Worker Task native session or routing generation changed "
+                    "while quiescence was being verified",
+                )
+            try:
+                pending = read_pending_worker_routing(current)
+            except InvalidWorkerRoutingMarker as exc:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Worker Task has an invalid routing synchronization marker",
+                ) from exc
+
+            # A Codex CCM sub-agent can still be between account resolution and
+            # start_turn after its parent task became terminal.  Keep stage
+            # behind that exact running child generation; its final launch gate
+            # provides the opposite ordering when stage wins first.
+            running_sub_agent = await _running_routing_sub_agent_id(
+                db,
+                task_id,
+            )
+            if running_sub_agent is not None:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Worker Task routing config cannot be staged while a CCM "
+                    "sub-agent is running",
+                )
+
+            if (
+                candidate.provider != current.provider
+                and current.session_id is not None
+            ):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task provider cannot change while an existing native "
+                    "session may still emit output; start a new Task instead",
+                )
+
+            requested = WorkerRoutingPending(body.op_id, candidate)
+            if pending is not None:
+                if pending != requested:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "Worker Task already has a different routing "
+                        "synchronization operation pending",
+                    )
+                snapshot = _worker_routing_snapshot(current)
+                await db.rollback()
+                return snapshot
+
+            current.metadata_ = with_pending_worker_routing(
+                current.metadata_,
+                requested,
+            )
+            await db.commit()
+            snapshot = _worker_routing_snapshot(current)
+            await db.rollback()
+            return snapshot
+
+
+@router.get(
+    "/{task_id}/routing-config/status",
+    response_model=WorkerRoutingConfigSnapshot,
+    include_in_schema=False,
+)
+async def read_worker_routing_config(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the live tuple and durable pending candidate for convergence."""
+
+    require_admin(request)
+    async with get_task_operation_lock(task_id):
+        task = await db.get(Task, task_id)
+        if task is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, task, db)
+        if task.worker_id is not None or task.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Routing synchronization endpoints only accept Worker-local Tasks",
+            )
+        return _worker_routing_snapshot(task)
+
+
+@router.post(
+    "/{task_id}/routing-config/ack",
+    response_model=WorkerRoutingConfigSnapshot,
+    include_in_schema=False,
+)
+async def ack_worker_routing_config(
+    task_id: int,
+    body: WorkerRoutingConfigRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Atomically promote the staged candidate and clear its launch fence."""
+
+    require_admin(request)
+    task = await db.get(Task, task_id)
+    if task is not None:
+        await require_task_control(request, task, db)
+    await db.rollback()
+    candidate = _routing_request_tuple(body)
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        current = await _lock_worker_local_routing_task(
+            task_id,
+            request,
+            db,
+            safe_status_required=True,
+        )
+        try:
+            pending = read_pending_worker_routing(current)
+        except InvalidWorkerRoutingMarker as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Worker Task has an invalid routing synchronization marker",
+            ) from exc
+        requested = WorkerRoutingPending(body.op_id, candidate)
+        if pending is None:
+            if task_routing_tuple(current) != candidate:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Worker routing ack has no matching pending or applied tuple",
+                )
+            snapshot = _worker_routing_snapshot(current)
+            await db.rollback()
+            return snapshot
+        if pending != requested:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Worker routing ack does not match the pending operation",
+            )
+
+        current.provider = candidate.provider
+        current.model = candidate.model
+        current.codex_service_tier = candidate.codex_service_tier
+        current.metadata_ = without_pending_worker_routing(current.metadata_)
+        await db.commit()
+        return _worker_routing_snapshot(current)
+
+
+@router.post(
+    "/{task_id}/routing-config/reconcile",
+    response_model=WorkerRoutingConfigSnapshot,
+    include_in_schema=False,
+)
+async def reconcile_worker_routing_config(
+    task_id: int,
+    body: WorkerRoutingConfigRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Abort an orphan stage by restoring the Manager-authoritative live tuple."""
+
+    require_admin(request)
+    task = await db.get(Task, task_id)
+    if task is not None:
+        await require_task_control(request, task, db)
+    await db.rollback()
+    authoritative = _routing_request_tuple(body)
+
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        current = await _lock_worker_local_routing_task(
+            task_id,
+            request,
+            db,
+            safe_status_required=True,
+        )
+        try:
+            _validate_task_service_tier_configuration(
+                provider=authoritative.provider,
+                model=authoritative.model,
+                codex_service_tier=authoritative.codex_service_tier,
+                mode=current.mode,
+                goal_evaluator_model=current.goal_evaluator_model,
+            )
+        except ValueError as exc:
+            await db.rollback()
+            raise HTTPException(422, str(exc)) from exc
+        try:
+            pending = read_pending_worker_routing(current)
+        except InvalidWorkerRoutingMarker as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Worker Task has an invalid routing synchronization marker",
+            ) from exc
+        if pending is None:
+            if task_routing_tuple(current) != authoritative:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Worker routing differs from Manager without a pending "
+                    "operation",
+                )
+            snapshot = _worker_routing_snapshot(current)
+            await db.rollback()
+            return snapshot
+        if pending.op_id != body.op_id:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Worker routing reconcile does not match the pending operation",
+            )
+
+        current.provider = authoritative.provider
+        current.model = authoritative.model
+        current.codex_service_tier = authoritative.codex_service_tier
+        current.metadata_ = without_pending_worker_routing(current.metadata_)
+        await db.commit()
+        return _worker_routing_snapshot(current)
+
+
+def _validate_remote_worker_routing_snapshot(
+    value,
+    *,
+    task_id: int,
+) -> WorkerRoutingConfigSnapshot:
+    try:
+        snapshot = WorkerRoutingConfigSnapshot.model_validate(value)
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            "Worker returned an invalid routing synchronization snapshot",
+        ) from exc
+    if snapshot.id != task_id:
+        raise HTTPException(
+            502,
+            "Worker returned a routing snapshot for a different Task",
+        )
+    return snapshot
+
+
+def _snapshot_routing_tuple(
+    snapshot: WorkerRoutingConfigSnapshot,
+) -> WorkerRoutingTuple:
+    return WorkerRoutingTuple(
+        provider=snapshot.provider,
+        model=snapshot.model,
+        codex_service_tier=snapshot.codex_service_tier,
+    )
+
+
+async def _read_remote_worker_routing(
+    task: Task,
+    *,
+    operation_lock_held: bool,
+    surface_endpoint_not_found: bool = False,
+) -> WorkerRoutingConfigSnapshot:
+    result = await _proxy(
+        task,
+        "GET",
+        f"/api/tasks/{task.id}/routing-config/status",
+        require_json=True,
+        surface_endpoint_not_found=surface_endpoint_not_found,
+        operation_lock_held=operation_lock_held,
+    )
+    return _validate_remote_worker_routing_snapshot(result, task_id=task.id)
+
+
+def _validate_legacy_worker_routing_snapshot(
+    value,
+    *,
+    task: Task,
+) -> WorkerRoutingConfigSnapshot:
+    """Validate the ordinary Task response used by a pre-routing-protocol Worker."""
+
+    if not isinstance(value, dict):
+        raise HTTPException(
+            502,
+            "Legacy Worker returned an invalid Task routing confirmation",
+        )
+    required = {"id", "status", "provider", "model"}
+    if not required.issubset(value):
+        raise HTTPException(
+            502,
+            "Legacy Worker Task response omitted required routing fields",
+        )
+    if value["id"] != task.id:
+        raise HTTPException(
+            502,
+            "Legacy Worker returned routing for a different Task",
+        )
+    if not isinstance(value["status"], str) or not value["status"]:
+        raise HTTPException(
+            502,
+            "Legacy Worker returned an invalid Task status",
+        )
+
+    authoritative = task_routing_tuple(task)
+    if authoritative.codex_service_tier != "default":
+        raise HTTPException(
+            409,
+            "Legacy Worker cannot confirm Codex Fast routing; execution was blocked",
+        )
+    remote = WorkerRoutingTuple(
+        provider=value["provider"],
+        model=value["model"],
+        # Workers predating the routing protocol also predate service tiers.
+        codex_service_tier=value.get("codex_service_tier", "default"),
+    )
+    if remote != authoritative:
+        raise HTTPException(
+            409,
+            "Legacy Worker Task routing does not exactly match the Manager; "
+            "execution was blocked",
+        )
+    return WorkerRoutingConfigSnapshot(
+        id=task.id,
+        status=value["status"],
+        worker_id=None,
+        shared_from_id=None,
+        provider=remote.provider,
+        model=remote.model,
+        codex_service_tier=remote.codex_service_tier,
+        pending=None,
+    )
+
+
+async def _read_legacy_worker_routing(
+    task: Task,
+    *,
+    operation_lock_held: bool,
+) -> WorkerRoutingConfigSnapshot:
+    result = await _proxy(
+        task,
+        "GET",
+        f"/api/tasks/{task.id}",
+        require_json=True,
+        operation_lock_held=operation_lock_held,
+    )
+    return _validate_legacy_worker_routing_snapshot(result, task=task)
+
+
+async def _confirm_worker_routing_mutation(
+    task: Task,
+    *,
+    path: str,
+    payload: dict,
+    expected: WorkerRoutingTuple,
+    operation_lock_held: bool,
+) -> WorkerRoutingConfigSnapshot:
+    """Confirm ack/reconcile, recovering only a lost success response."""
+
+    try:
+        result = await _proxy(
+            task,
+            "POST",
+            path,
+            payload,
+            require_json=True,
+            operation_lock_held=operation_lock_held,
+        )
+        snapshot = _validate_remote_worker_routing_snapshot(
+            result,
+            task_id=task.id,
+        )
+    except Exception as mutation_error:
+        try:
+            snapshot = await _read_remote_worker_routing(
+                task,
+                operation_lock_held=operation_lock_held,
+            )
+        except Exception:
+            raise _WorkerRoutingConfirmationUnavailable() from mutation_error
+    if snapshot.pending is not None or _snapshot_routing_tuple(snapshot) != expected:
+        raise HTTPException(
+            502,
+            "Worker routing synchronization remains pending or divergent",
+        )
+    return snapshot
+
+
+async def _ensure_worker_routing_ready(
+    task: Task,
+    *,
+    operation_lock_held: bool,
+    allow_legacy_standard: bool = True,
+) -> WorkerRoutingConfigSnapshot:
+    """Converge an orphan stage, then prove Worker live config equals Manager."""
+
+    authoritative = task_routing_tuple(task)
+    try:
+        snapshot = await _read_remote_worker_routing(
+            task,
+            operation_lock_held=operation_lock_held,
+            surface_endpoint_not_found=allow_legacy_standard,
+        )
+    except WorkerEndpointNotFoundError:
+        snapshot = await _read_legacy_worker_routing(
+            task,
+            operation_lock_held=operation_lock_held,
+        )
+    pending = snapshot.pending
+    if pending is not None:
+        pending_tuple = WorkerRoutingTuple(
+            provider=pending.provider,
+            model=pending.model,
+            codex_service_tier=pending.codex_service_tier,
+        )
+        payload = {
+            "op_id": pending.op_id,
+            **authoritative.as_dict(),
+        }
+        action = "ack" if pending_tuple == authoritative else "reconcile"
+        snapshot = await _confirm_worker_routing_mutation(
+            task,
+            path=f"/api/tasks/{task.id}/routing-config/{action}",
+            payload=payload,
+            expected=authoritative,
+            operation_lock_held=operation_lock_held,
+        )
+    if snapshot.pending is not None or _snapshot_routing_tuple(snapshot) != authoritative:
+        raise HTTPException(
+            409,
+            "Worker routing config does not exactly match the Manager; execution "
+            "was blocked",
+        )
+    return snapshot
+
+
+def _require_no_pending_worker_routing(task: Task) -> None:
+    if has_pending_worker_routing(task):
+        raise HTTPException(
+            409,
+            "Task routing configuration synchronization is pending; execution "
+            "is blocked until Manager and Worker converge",
+        )
+
+
+async def _update_local_task_with_routing_config(
+    task_id: int,
+    updates: dict,
+    request: Request,
+    queue: TaskQueue,
+) -> Task:
+    """Atomically save a local route only while no generation can use the old one."""
+
+    mixed = set(updates).difference(_WORKER_ROUTING_CONFIG_FIELDS)
+    if mixed:
+        raise HTTPException(
+            409,
+            "Task routing changes may only contain provider, model, and Codex "
+            "service tier; save other fields separately",
+        )
+
+    await queue.db.rollback()
+    async with get_task_operation_lock(task_id):
+        queue.db.expire_all()
+        observed = await queue.db.get(Task, task_id)
+        if observed is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, observed, queue.db)
+        if observed.worker_id is not None or observed.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Task execution authority changed before routing update",
+            )
+        if observed.status not in _LOCAL_ROUTING_EDITABLE_STATUSES:
+            raise HTTPException(
+                409,
+                "Task routing config cannot change after an execution claim "
+                "became active; wait for the current turn to finish",
+            )
+        normalized = _normalized_task_update_values(updates)
+        candidate = WorkerRoutingTuple(
+            provider=normalized.get("provider", observed.provider),
+            model=(
+                normalized["model"]
+                if "model" in normalized
+                else observed.model
+            ),
+            codex_service_tier=normalized.get(
+                "codex_service_tier",
+                observed.codex_service_tier,
+            ),
+        )
+        try:
+            _validate_task_service_tier_configuration(
+                provider=candidate.provider,
+                model=candidate.model,
+                codex_service_tier=candidate.codex_service_tier,
+                mode=observed.mode,
+                goal_evaluator_model=observed.goal_evaluator_model,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if (
+            candidate.provider != observed.provider
+            and observed.session_id is not None
+        ):
+            raise HTTPException(
+                409,
+                "Task provider cannot change while an existing native session "
+                "may still emit output; start a new Task instead",
+            )
+        observed_instance_id = observed.instance_id
+        queue.db.expunge(observed)
+        await queue.db.rollback()
+        await _settle_task_launch_barrier(task_id, observed_instance_id)
+
+        async with AsyncExitStack() as routing_stack:
+            await _hold_codex_thread_routing_quiescence(
+                routing_stack,
+                observed,
+                candidate,
+            )
+            queue.db.expire_all()
+            current = await _lock_worker_local_routing_task(
+                task_id,
+                request,
+                queue.db,
+                safe_status_required=False,
+                allowed_statuses=_LOCAL_ROUTING_EDITABLE_STATUSES,
+            )
+            if _routing_guard_generation_changed(current, observed):
+                await queue.db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task native session or routing generation changed while "
+                    "quiescence was being verified",
+                )
+            _require_no_pending_worker_routing(current)
+            if (
+                await _running_routing_sub_agent_id(queue.db, task_id)
+                is not None
+            ):
+                await queue.db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task routing config cannot change while a sub-agent is "
+                    "running",
+                )
+
+            current.provider = candidate.provider
+            current.model = candidate.model
+            current.codex_service_tier = candidate.codex_service_tier
+            await queue.db.commit()
+            await queue.db.refresh(current)
+            return current
+
+
+async def _update_worker_task_with_routing_config(
+    task_id: int,
+    updates: dict,
+    request: Request,
+    queue: TaskQueue,
+    *,
+    expected_worker_id: int,
+) -> Task:
+    """Run stage → exact Manager CAS → Worker ack under cancellation shielding."""
+
+    unsafe = _WORKER_CONFIG_SYNC_UNSAFE_FIELDS.intersection(updates)
+    if unsafe:
+        raise HTTPException(
+            409,
+            "Worker location/project changes must be saved separately from "
+            "provider, model, or Codex Fast changes",
+        )
+    mixed = set(updates).difference(_WORKER_ROUTING_CONFIG_FIELDS)
+    if mixed:
+        raise HTTPException(
+            409,
+            "Worker routing changes may only contain provider, model, and "
+            "Codex service tier; save other fields separately",
+        )
+
+    await queue.db.rollback()
+    async with get_task_operation_lock(task_id):
+        queue.db.expire_all()
+        current = await queue.db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, queue.db)
+        if current.worker_id != expected_worker_id:
+            raise HTTPException(
+                409,
+                "Task Worker assignment changed before config synchronization",
+            )
+        if current.status not in WORKER_ROUTING_SAFE_STATUSES:
+            raise HTTPException(
+                409,
+                "Worker Task config cannot change while it is pending or active; "
+                "wait for the current Worker turn to finish",
+            )
+
+        normalized = _normalized_task_update_values(updates)
+        candidate = WorkerRoutingTuple(
+            provider=normalized.get("provider", current.provider),
+            model=(
+                normalized["model"]
+                if "model" in normalized
+                else current.model
+            ),
+            codex_service_tier=normalized.get(
+                "codex_service_tier",
+                current.codex_service_tier,
+            ),
+        )
+        try:
+            _validate_task_service_tier_configuration(
+                provider=candidate.provider,
+                model=candidate.model,
+                codex_service_tier=candidate.codex_service_tier,
+                mode=current.mode,
+                goal_evaluator_model=current.goal_evaluator_model,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        normalized.update(candidate.as_dict())
+
+        observed = worker_task_generation(
+            current,
+            expected_worker_id=expected_worker_id,
+        )
+        if observed is None:
+            raise HTTPException(409, "Task Worker assignment changed")
+        previous = task_routing_tuple(current)
+        op_id = uuid.uuid4().hex
+        payload = {"op_id": op_id, **candidate.as_dict()}
+        # Never retain the Manager DB read transaction over Worker network
+        # calls.  Relay is then free to advance status, and the one exact CAS
+        # below will detect that generation change instead of re-fencing it.
+        queue.db.expunge(current)
+        await queue.db.rollback()
+
+        # Resolve any durable stage left by a prior crashed request before
+        # starting a different operation.  A marker with our current tuple is
+        # a lost ack; a different candidate is safely aborted to our tuple.
+        await _ensure_worker_routing_ready(
+            current,
+            operation_lock_held=True,
+            allow_legacy_standard=False,
+        )
+
+        # A timeout here is intentionally not read back into success.  The
+        # Worker may have staged the marker, but Manager has not committed, so
+        # it must remain blocked for the next explicit convergence attempt.
+        staged_result = await _proxy(
+            current,
+            "POST",
+            f"/api/tasks/{task_id}/routing-config/stage",
+            payload,
+            require_json=True,
+            operation_lock_held=True,
+        )
+        staged = _validate_remote_worker_routing_snapshot(
+            staged_result,
+            task_id=task_id,
+        )
+        if (
+            staged.status not in WORKER_ROUTING_SAFE_STATUSES
+            or _snapshot_routing_tuple(staged) != previous
+            or staged.pending is None
+            or staged.pending.op_id != op_id
+            or WorkerRoutingTuple(
+                provider=staged.pending.provider,
+                model=staged.pending.model,
+                codex_service_tier=staged.pending.codex_service_tier,
+            )
+            != candidate
+        ):
+            raise HTTPException(
+                502,
+                "Worker did not strictly confirm the staged routing candidate",
+            )
+
+        predicates = [
+            *worker_task_generation_predicates(observed),
+            Task.provider == previous.provider,
+            (
+                Task.model.is_(None)
+                if previous.model is None
+                else Task.model == previous.model
+            ),
+            Task.codex_service_tier == previous.codex_service_tier,
+        ]
+        changed = await queue.db.execute(
+            sa_update(Task)
+            .where(*predicates)
+            .values(**normalized)
+        )
+        if changed.rowcount != 1:
+            await queue.db.rollback()
+            raise HTTPException(
+                409,
+                "Task Worker generation changed while routing config was "
+                "staged; Worker remains safely blocked",
+            )
+        await queue.db.commit()
+        queue.db.expire_all()
+        updated = await queue.db.get(Task, task_id)
+        if updated is None:
+            raise HTTPException(
+                409,
+                "Task disappeared after routing config commit; Worker remains "
+                "safely blocked",
+            )
+
+        try:
+            await _confirm_worker_routing_mutation(
+                updated,
+                path=f"/api/tasks/{task_id}/routing-config/ack",
+                payload=payload,
+                expected=candidate,
+                operation_lock_held=True,
+            )
+        except _WorkerRoutingConfirmationUnavailable:
+            # Manager commit is the configuration commit point.  Returning an
+            # error here would leave the UI displaying its old Fast/Standard
+            # badge even though every subsequent execution is governed by the
+            # new authoritative tuple.  The Worker either applied it already
+            # or still has the durable stage marker, which blocks execution
+            # until the next retry/chat preflight converges it.
+            logger.warning(
+                "Worker routing ack could not be confirmed after Manager "
+                "commit; task=%s worker=%s op=%s remains execution-fenced",
+                task_id,
+                expected_worker_id,
+                op_id,
+            )
+        return updated
+
+
 @router.put("/{task_id}", response_model=TaskResponse)
 async def update_task(
     task_id: int, body: TaskUpdate, request: Request, queue: TaskQueue = Depends(_get_queue)
@@ -548,6 +1740,22 @@ async def update_task(
     user_skill_snapshots = updates.pop("user_skill_snapshots", None)
     if user_skill_snapshots is not None:
         require_admin(request)
+    try:
+        _validate_task_service_tier_configuration(
+            provider=updates.get("provider", task.provider),
+            model=updates.get("model", task.model),
+            codex_service_tier=updates.get(
+                "codex_service_tier",
+                task.codex_service_tier,
+            ),
+            mode=updates.get("mode", task.mode),
+            goal_evaluator_model=updates.get(
+                "goal_evaluator_model",
+                task.goal_evaluator_model,
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if "enabled_skills" in updates:
         # An explicit save is authoritative even when its JSON happens to equal
         # a currently active one-turn override. Clearing the generation marker
@@ -565,30 +1773,13 @@ async def update_task(
         )
         updates["metadata_"] = metadata
 
-    target_project = None
-    target_project_id = updates.get("project_id", task.project_id)
-    if target_project_id is not None:
-        from backend.models.project import Project
+    # "off" sentinel → explicit NULL. Do this before the Worker branch so both
+    # mirrors receive the same normalized value in a combined config update.
+    if updates.get("system_prompt_mode") == "off":
+        updates["system_prompt_mode"] = None
 
-        target_project = await queue.db.get(Project, target_project_id)
-        if target_project is None:
-            raise HTTPException(404, "Project not found")
-        await require_project_access(request, target_project_id, queue.db)
-        if (
-            "project_id" in updates
-            and "worker_id" not in updates
-            and task.worker_id != target_project.worker_id
-        ):
-            raise HTTPException(
-                400,
-                "Task Worker must match the selected Project location",
-            )
-    elif "project_id" in updates and "worker_id" not in updates:
-        await require_worker_target_access(request, task.worker_id, queue.db)
-
-    # Validate the effective Skill configuration before a worker migration can
-    # create or mutate externally visible state.  A rejected combined update
-    # must not migrate first and fail only while saving the remaining fields.
+    # Validate the effective Skill configuration before routing
+    # synchronization or Worker migration can create externally visible state.
     effective_provider = updates.get("provider", task.provider)
     effective_description = updates.get("description", task.description)
     command_skills = _explicit_command_skills(effective_description)
@@ -627,6 +1818,55 @@ async def update_task(
         if "selected_user_skills" in updates:
             updates["selected_user_skills"] = normalized_user_skills
 
+    # An already-forwarded Worker owns the executable Task row.  Synchronize
+    # its complete routing tuple before making the Manager mirror visible.
+    if (
+        task.worker_id is not None
+        and _WORKER_ROUTING_CONFIG_FIELDS.intersection(updates)
+    ):
+        return await _finish_task_operation(
+            _update_worker_task_with_routing_config(
+                task_id,
+                updates,
+                request,
+                queue,
+                expected_worker_id=task.worker_id,
+            )
+        )
+    if (
+        task.worker_id is None
+        and _WORKER_ROUTING_CONFIG_FIELDS.intersection(updates)
+    ):
+        return await _finish_task_operation(
+            _update_local_task_with_routing_config(
+                task_id,
+                updates,
+                request,
+                queue,
+            )
+        )
+
+    target_project = None
+    target_project_id = updates.get("project_id", task.project_id)
+    if target_project_id is not None:
+        from backend.models.project import Project
+
+        target_project = await queue.db.get(Project, target_project_id)
+        if target_project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, target_project_id, queue.db)
+        if (
+            "project_id" in updates
+            and "worker_id" not in updates
+            and task.worker_id != target_project.worker_id
+        ):
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+    elif "project_id" in updates and "worker_id" not in updates:
+        await require_worker_target_access(request, task.worker_id, queue.db)
+
     # 执行位置切换走 TaskMigrator（同 mode/model 一样在 task 详情改，
     # 但语义是迁移而非改字段）。-1 = 切回本机
     if "worker_id" in updates:
@@ -655,17 +1895,11 @@ async def update_task(
             # 还缓存着旧 worker_id，必须 expire 否则响应返回迁移前的值
             queue.db.expire_all()
 
-    # "off" sentinel → explicit NULL. model_dump(exclude_unset=True) has
-    # already removed fields that were not part of this PATCH-like request.
-    if updates.get("system_prompt_mode") == "off":
-        updates["system_prompt_mode"] = None
-
-    current = await queue.get(task_id)
-    if not current:
-        raise HTTPException(404, "Task not found")
-
     if not updates:
-        return current
+        task = await queue.get(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        return task
     task = await queue.update_task(task_id, **updates)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -1102,20 +2336,31 @@ async def _proxy(
     *,
     require_json: bool = False,
     allow_task_absent: bool = False,
+    surface_endpoint_not_found: bool = False,
     operation_lock_held: bool = False,
 ):
     from backend.main import worker_proxy
     if worker_proxy is None:
         raise HTTPException(503, "Worker 功能未启用")
-    if require_json or allow_task_absent or operation_lock_held:
+    if (
+        require_json
+        or allow_task_absent
+        or surface_endpoint_not_found
+        or operation_lock_held
+    ):
+        proxy_options = {
+            "require_json": require_json,
+            "allow_task_absent": allow_task_absent,
+            "operation_lock_held": operation_lock_held,
+        }
+        if surface_endpoint_not_found:
+            proxy_options["surface_endpoint_not_found"] = True
         return await worker_proxy.proxy_to_worker(
             task,
             method,
             path,
             body,
-            require_json=require_json,
-            allow_task_absent=allow_task_absent,
-            operation_lock_held=operation_lock_held,
+            **proxy_options,
         )
     return await worker_proxy.proxy_to_worker(task, method, path, body)
 
@@ -1657,7 +2902,13 @@ async def cancel_task(
 
 
 @router.post("/{task_id}/retry", response_model=TaskResponse)
-async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def retry_task(
+    task_id: int,
+    request: Request,
+    body: TaskActionRequest | None = None,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
@@ -1671,6 +2922,11 @@ async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
+        _require_expected_task_routing(
+            current,
+            body.expected_routing if body is not None else None,
+            effective_model=current.model,
+        )
         if current.status not in _MANUAL_RETRYABLE_STATUSES:
             raise HTTPException(
                 409,
@@ -1678,6 +2934,10 @@ async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(
             )
 
         if current.worker_id is not None:
+            await _ensure_worker_routing_ready(
+                current,
+                operation_lock_held=True,
+            )
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
@@ -1685,6 +2945,7 @@ async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(
                 current,
                 "POST",
                 f"/api/tasks/{task_id}/retry",
+                body=body.model_dump(mode="json") if body is not None else None,
                 operation_lock_held=True,
             )
             return await _sync_task_from_worker_response(
@@ -1694,6 +2955,7 @@ async def retry_task(task_id: int, request: Request, queue: TaskQueue = Depends(
                 observed=observed,
             )
 
+        _require_no_pending_worker_routing(current)
         retried = await _retry_local_task_safely(task_id, queue, db)
         if not retried:
             raise HTTPException(404, "Task not found")
@@ -1774,7 +3036,13 @@ async def get_queue(
 
 
 @router.post("/{task_id}/plan/approve", response_model=TaskResponse)
-async def approve_plan(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def approve_plan(
+    task_id: int,
+    request: Request,
+    body: TaskActionRequest | None = None,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     """Approve a plan-mode task's plan and queue it for execution."""
     task = await queue.get(task_id)
     if not task:
@@ -1787,10 +3055,19 @@ async def approve_plan(task_id: int, request: Request, queue: TaskQueue = Depend
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
+        _require_expected_task_routing(
+            current,
+            body.expected_routing if body is not None else None,
+            effective_model=current.model,
+        )
         if current.mode != "plan" or current.status != "plan_review":
             raise HTTPException(400, "Task is not in plan review state")
 
         if current.worker_id is not None:
+            await _ensure_worker_routing_ready(
+                current,
+                operation_lock_held=True,
+            )
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
@@ -1798,6 +3075,7 @@ async def approve_plan(task_id: int, request: Request, queue: TaskQueue = Depend
                 current,
                 "POST",
                 f"/api/tasks/{task_id}/plan/approve",
+                body=body.model_dump(mode="json") if body is not None else None,
                 operation_lock_held=True,
             )
             # worker 上回到 pending 由 worker 自己的 Dispatcher 接力执行
@@ -1808,6 +3086,7 @@ async def approve_plan(task_id: int, request: Request, queue: TaskQueue = Depend
                 observed=observed,
             )
 
+        _require_no_pending_worker_routing(current)
         changed = await db.execute(
             sa_update(Task)
             .where(*_task_generation_fence(task_id, current))

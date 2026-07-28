@@ -20,6 +20,7 @@ import re
 import shlex
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -95,12 +96,84 @@ def migration_generation_predicates(
     )
 
 
+async def _settle_despite_cancellation(awaitable):
+    """Finish a finite migration barrier before delivering cancellation."""
+
+    operation = asyncio.ensure_future(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException:
+            break
+    return operation, cancellation
+
+
 class TaskMigrator:
     def __init__(self, db_factory, relay, broadcaster=None):
         self.db_factory = db_factory
         self.relay = relay
         self.broadcaster = broadcaster
         self._locks: dict[int, asyncio.Lock] = {}
+        # API-account retirement must not remove a credential/config while a
+        # cross-Worker migration is reading or rebinding task execution state.
+        # This short bookkeeping lock preserves parallel migrations; the
+        # active counter, rather than the lock itself, spans each workflow.
+        self._api_account_fence_lock = asyncio.Lock()
+        self._active_migrations = 0
+        self._api_account_retirement_reserved = False
+
+    async def _release_migration_admission(self) -> None:
+        async with self._api_account_fence_lock:
+            self._active_migrations = max(0, self._active_migrations - 1)
+
+    @asynccontextmanager
+    async def _migration_account_guard(self):
+        async with self._api_account_fence_lock:
+            if self._api_account_retirement_reserved:
+                raise MigrationError(
+                    "API account deletion is in progress; retry task migration",
+                )
+            self._active_migrations += 1
+        try:
+            yield
+        finally:
+            release, cancellation = await _settle_despite_cancellation(
+                self._release_migration_admission()
+            )
+            release.result()
+            if cancellation is not None:
+                raise cancellation
+
+    async def _release_api_account_retirement(self) -> None:
+        async with self._api_account_fence_lock:
+            self._api_account_retirement_reserved = False
+
+    @asynccontextmanager
+    async def api_account_retirement_guard(self):
+        """Reject retirement during migration and new migration during cleanup."""
+
+        async with self._api_account_fence_lock:
+            if (
+                self._api_account_retirement_reserved
+                or self._active_migrations > 0
+            ):
+                raise MigrationError(
+                    "A task migration is using account runtime state",
+                )
+            self._api_account_retirement_reserved = True
+        try:
+            yield
+        finally:
+            release, cancellation = await _settle_despite_cancellation(
+                self._release_api_account_retirement()
+            )
+            release.result()
+            if cancellation is not None:
+                raise cancellation
 
     # ------------------------------------------------------------------
     # 入口
@@ -112,12 +185,13 @@ class TaskMigrator:
         if lock.locked():
             raise MigrationError("该 task 正在迁移中")
         async with lock:
-            # Migration keeps its fast duplicate-request guard above, but the
-            # full workflow also shares WorkerProxy's mutation lock.  Chat,
-            # retry and plan operations therefore cannot mutate the source
-            # Worker while files/session state are being copied.
-            async with get_task_operation_lock(task_id):
-                await self._migrate_locked(task_id, target_worker_id)
+            async with self._migration_account_guard():
+                # Migration keeps its fast duplicate-request guard above, but
+                # the full workflow also shares WorkerProxy's mutation lock.
+                # Chat, retry and plan operations therefore cannot mutate the
+                # source Worker while files/session state are being copied.
+                async with get_task_operation_lock(task_id):
+                    await self._migrate_locked(task_id, target_worker_id)
 
     async def _migrate_locked(self, task_id: int, target: int | None):
         async with self.db_factory() as db:
@@ -143,6 +217,19 @@ class TaskMigrator:
         dst = await self._get_worker(target) if target else None
         if target and (not dst or dst.status != "ready"):
             raise MigrationError(f"目标 Worker {dst.name if dst else target} 不可用")
+        if (
+            dst is not None
+            and (task.provider or "claude").lower() == "codex"
+            and (task.codex_service_tier or "default") == "priority"
+        ):
+            from backend.main import worker_proxy
+
+            if worker_proxy is None:
+                raise MigrationError("Worker 代理未初始化")
+            try:
+                await worker_proxy.require_worker_fast_support(dst, task)
+            except Exception as exc:
+                raise MigrationError(str(exc)) from exc
         if src_worker_id and (not src or src.status not in ("ready", "destroying")):
             raise MigrationError(
                 f"源 Worker {src.name if src else src_worker_id} 不可用（{src.status if src else '不存在'}）——"
@@ -152,14 +239,28 @@ class TaskMigrator:
         # Worker validation contains awaits, so the snapshot above is not a
         # claim.  Atomically transition the exact original state to migrating;
         # a dispatcher/user update which wins the race makes this CAS fail.
-        claimed = await self._claim_migration(observed)
-        await self._broadcast_status(task_id, prev_status, "migrating")
+        # A request cancellation can arrive after COMMIT but before the
+        # coroutine returns.  Settle the claim so we always know whether there
+        # is an exact ``migrating`` generation that must be restored.
+        claim_operation, claim_cancellation = await _settle_despite_cancellation(
+            self._claim_migration(observed)
+        )
+        try:
+            claimed = claim_operation.result()
+        except BaseException as claim_error:
+            if claim_cancellation is not None:
+                raise claim_cancellation from claim_error
+            raise
 
         local_codex_target_home: str | None = None
         src_unsubscribed = False
         dst_subscribed = False
         claim_active = True
         try:
+            if claim_cancellation is not None:
+                raise claim_cancellation
+            await self._broadcast_status(task_id, prev_status, "migrating")
+
             # 1. 源是 worker：先把 relay 收不到的字段同步回来（session_id/last_cwd）
             if src is not None:
                 await self._sync_task_fields_from_worker(
@@ -205,46 +306,66 @@ class TaskMigrator:
                 self.relay.unsubscribe_task(src.id, task_id)
                 src_unsubscribed = True
             if dst is not None:
-                await self.relay.subscribe_task(dst, task_id)
+                subscribe_operation, subscribe_cancellation = (
+                    await _settle_despite_cancellation(
+                        self.relay.subscribe_task(dst, task_id)
+                    )
+                )
+                subscribe_operation.result()
                 dst_subscribed = True
+                if subscribe_cancellation is not None:
+                    raise subscribe_cancellation
 
             # 6. 切指针 + 状态复原。仍以 migrating + 原 worker_id 为 CAS
             # 条件；并发取消/认领不能被迁移完成阶段覆盖。
-            await self._finish_migration(
-                claimed=claimed,
-                target_worker_id=target,
-                restored_status=prev_status,
-                provider=provider,
-                local_codex_target_home=local_codex_target_home,
+            finish_operation, finish_cancellation = (
+                await _settle_despite_cancellation(
+                    self._finish_migration(
+                        claimed=claimed,
+                        target_worker_id=target,
+                        restored_status=prev_status,
+                        provider=provider,
+                        local_codex_target_home=local_codex_target_home,
+                    )
+                )
             )
+            finish_operation.result()
             claim_active = False
             await self._broadcast_status(task_id, "migrating", prev_status)
+            if finish_cancellation is not None:
+                raise finish_cancellation
             logger.info("task %s migrated: %s -> %s", task_id, src_worker_id, target)
-        except Exception:
-            # 复制式搬运：源机文件未动，失败无害，状态复原可重试
-            if claim_active:
-                restored = await self._restore_migration_claim(
-                    claimed,
-                    prev_status,
-                )
-                if restored:
-                    await self._broadcast_status(task_id, "migrating", prev_status)
-                else:
-                    logger.warning(
-                        "task %s migration rollback skipped: claim no longer owned",
-                        task_id,
+        except BaseException as migration_error:
+            # ``CancelledError`` is a BaseException on supported Python
+            # versions.  Rollback must finish despite repeated cancellation;
+            # otherwise the durable claim can remain ``migrating`` forever.
+            rollback_operation, rollback_cancellation = (
+                await _settle_despite_cancellation(
+                    self._rollback_failed_migration(
+                        task_id=task_id,
+                        claimed=claimed,
+                        restored_status=prev_status,
+                        src=src,
+                        dst=dst,
+                        src_unsubscribed=src_unsubscribed,
+                        dst_subscribed=dst_subscribed,
+                        claim_active=claim_active,
                     )
-
-            # Keep relay routing aligned with the unchanged source pointer when
-            # a failure happens after subscription switching.
+                )
+            )
             try:
-                if dst_subscribed and dst is not None:
-                    self.relay.unsubscribe_task(dst.id, task_id)
-                if src_unsubscribed and src is not None:
-                    await self.relay.subscribe_task(src, task_id)
-            except Exception:
-                logger.exception("task %s relay rollback failed", task_id)
-            raise
+                rollback_operation.result()
+            except BaseException as rollback_error:
+                if isinstance(migration_error, asyncio.CancelledError):
+                    raise migration_error from rollback_error
+                if rollback_cancellation is not None:
+                    raise rollback_cancellation from rollback_error
+                raise rollback_error from migration_error
+            if isinstance(migration_error, asyncio.CancelledError):
+                raise migration_error
+            if rollback_cancellation is not None:
+                raise rollback_cancellation from migration_error
+            raise migration_error
 
     # ------------------------------------------------------------------
     # 子操作
@@ -311,6 +432,61 @@ class TaskMigrator:
             )
             await db.commit()
             return result.rowcount == 1
+
+    async def _rollback_failed_migration(
+        self,
+        *,
+        task_id: int,
+        claimed: MigrationTaskGeneration,
+        restored_status: str,
+        src: Worker | None,
+        dst: Worker | None,
+        src_unsubscribed: bool,
+        dst_subscribed: bool,
+        claim_active: bool,
+    ) -> None:
+        """Restore an owned claim and relay route as one settled barrier."""
+
+        if not claim_active:
+            # The destination pointer was already committed.  A late
+            # cancellation (for example during the final broadcast) must not
+            # route the relay back to the old Worker.
+            return
+
+        errors: list[BaseException] = []
+        try:
+            restored = await self._restore_migration_claim(
+                claimed,
+                restored_status,
+            )
+            if restored:
+                await self._broadcast_status(
+                    task_id,
+                    "migrating",
+                    restored_status,
+                )
+            else:
+                logger.warning(
+                    "task %s migration rollback skipped: claim no longer owned",
+                    task_id,
+                )
+        except BaseException as exc:
+            errors.append(exc)
+            logger.exception("task %s migration claim rollback failed", task_id)
+
+        # Keep relay routing aligned with the unchanged source pointer when a
+        # failure happens after subscription switching.
+        try:
+            if dst_subscribed and dst is not None:
+                self.relay.unsubscribe_task(dst.id, task_id)
+            if src_unsubscribed and src is not None:
+                await self.relay.subscribe_task(src, task_id)
+        except BaseException as exc:
+            errors.append(exc)
+            logger.exception("task %s relay rollback failed", task_id)
+
+        if errors:
+            raise errors[0]
 
     async def _finish_migration(
         self,
@@ -854,6 +1030,7 @@ class TaskMigrator:
             "goal_evaluator_model": task.goal_evaluator_model,
             "provider": task.provider,
             "model": task.model,
+            "codex_service_tier": task.codex_service_tier,
             "effort_level": task.effort_level,
             "thinking_budget": task.thinking_budget,
             "system_prompt_mode": task.system_prompt_mode,
@@ -881,5 +1058,11 @@ class TaskMigrator:
                     detail = r.text
                 raise MigrationError(f"目标 Worker 导入 task 冲突: {detail}")
             r.raise_for_status()
-            if r.json().get("status") != "cancelled":
+            created = r.json()
+            if created.get("status") != "cancelled":
                 raise MigrationError("目标 Worker 导入 task 未保持不可调度状态")
+            if (
+                (task.codex_service_tier or "default") == "priority"
+                and created.get("codex_service_tier") != "priority"
+            ):
+                raise MigrationError("目标 Worker 未确认 Codex Fast 任务配置")

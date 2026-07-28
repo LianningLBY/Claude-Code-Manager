@@ -7,6 +7,7 @@ work; the request's ``api_provider`` selects CloudRouter or ApexRouter.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -14,6 +15,7 @@ from pydantic import BaseModel, SecretStr
 
 from backend.api.deps import require_admin
 from backend.services.cloudrouter_accounts import (
+    CloudRouterAccountBusyError,
     CloudRouterAccountNotFound,
     CloudRouterAccountStore,
     CloudRouterUnsafePathError,
@@ -42,17 +44,23 @@ def _runtime_pools():
     import backend.main as runtime
     from backend.config import settings
 
-    accounts = runtime.cloudrouter_store.all_accounts()
+    accounts = runtime.cloudrouter_store.all_accounts(include_retired=True)
     has_claude = any(
-        account.enabled
-        and not account.retired
-        and account.supports_model("claude", None)
+        account.cleanup_pending
+        or (
+            account.enabled
+            and not account.retired
+            and account.supports_model("claude", None)
+        )
         for account in accounts
     )
     has_codex = any(
-        account.enabled
-        and not account.retired
-        and account.supports_model("codex", None)
+        account.cleanup_pending
+        or (
+            account.enabled
+            and not account.retired
+            and account.supports_model("codex", None)
+        )
         for account in accounts
     )
 
@@ -97,8 +105,13 @@ def _reload_runtime_pools() -> None:
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, CloudRouterAccountNotFound):
         return HTTPException(404, "API account not found")
+    if isinstance(exc, CloudRouterAccountBusyError):
+        return HTTPException(409, str(exc))
     if isinstance(exc, CloudRouterUnsafePathError):
-        return HTTPException(409, "API account storage is unsafe")
+        # A storage-integrity failure can occur before the durable retirement
+        # tombstone is written. Keep 409 exclusively for staged/busy cleanup
+        # so the client never falsely claims this account was disabled.
+        return HTTPException(500, "API account storage is unsafe")
     if isinstance(exc, CloudRouterUpstreamError):
         if exc.status_code in {401, 403}:
             return HTTPException(400, "API key is invalid or unauthorized")
@@ -116,10 +129,13 @@ def _http_error(exc: Exception) -> HTTPException:
 async def list_accounts(request: Request, force: bool = False):
     require_admin(request)
     store = _get_store()
-    accounts = store.all_accounts()
-    usage = await asyncio.gather(
-        *(store.fetch_usage(account.id, force=force) for account in accounts),
-    )
+    accounts = store.visible_accounts()
+    usage = await asyncio.gather(*(
+        store.fetch_usage(account.id, force=force)
+        if not account.retired
+        else asyncio.sleep(0, result=None)
+        for account in accounts
+    ))
     return [
         {**account.public_dict(), "api_quota": snapshot}
         for account, snapshot in zip(accounts, usage, strict=True)
@@ -156,30 +172,131 @@ async def refresh_account(request: Request, account_id: str):
     return {**account.public_dict(), "api_quota": quota}
 
 
+@asynccontextmanager
+async def _runtime_retirement_fence(account, store):
+    """Prove quiescence after durable disable, without reversing lock order."""
+
+    import backend.main as runtime
+
+    migrator = runtime.task_migrator
+
+    @asynccontextmanager
+    async def no_migration_guard():
+        yield
+
+    migration_guard = (
+        migrator.api_account_retirement_guard()
+        if migrator is not None
+        else no_migration_guard()
+    )
+    try:
+        async with migration_guard:
+            if store.active_credential_users(account.id):
+                raise CloudRouterAccountBusyError(
+                    "API account still has an active quota/credential request; "
+                    "retry deletion after it finishes",
+                )
+            blockers = await runtime.instance_manager.api_account_runtime_users(
+                account
+            )
+            blockers.extend(
+                runtime.dispatcher.api_account_aux_runtime_users(account)
+            )
+            if blockers:
+                summary = ", ".join(blockers[:5])
+                raise CloudRouterAccountBusyError(
+                    "API account is still in use by "
+                    f"{summary}; stop it and retry deletion"
+                )
+
+            maintenance_started = False
+            try:
+                await (
+                    runtime.instance_manager
+                    .begin_codex_app_server_home_maintenance(
+                        account.codex_home,
+                        require_idle=True,
+                    )
+                )
+                maintenance_started = True
+                # No later task/aux process can spawn after Store staging. Check
+                # again after the Codex transport has stopped, then detach idle
+                # Docker containers retaining a read-only bind mount.
+                if store.active_credential_users(account.id):
+                    raise CloudRouterAccountBusyError(
+                        "API account still has an active quota/credential request; "
+                        "retry deletion after it finishes",
+                    )
+                blockers = (
+                    await runtime.instance_manager.api_account_runtime_users(
+                        account
+                    )
+                )
+                blockers.extend(
+                    runtime.dispatcher.api_account_aux_runtime_users(account)
+                )
+                if blockers:
+                    raise CloudRouterAccountBusyError(
+                        "API account acquired a runtime user before disable "
+                        "completed; retry deletion",
+                    )
+                # Shared-project containers are a Claude-only execution path.
+                # ApexRouter has never exposed a Claude route, so no CCM
+                # container can mount its account root. CloudRouter must scan
+                # even if a later model refresh removed all Claude models,
+                # because an older idle container may retain the mount.
+                if account.api_provider != "apex":
+                    await (
+                        runtime.instance_manager
+                        .detach_api_account_containers(account)
+                    )
+            finally:
+                if maintenance_started:
+                    await (
+                        runtime.instance_manager
+                        .end_codex_app_server_home_maintenance(
+                            account.codex_home
+                        )
+                    )
+            # Codex maintenance is deliberately released before final Store
+            # cleanup. The account is already disabled, so new Store admission
+            # fails before reaching the home lock; this preserves the global
+            # lifecycle -> Store -> home ordering.
+            yield
+    except CloudRouterAccountBusyError:
+        raise
+    except Exception as exc:
+        from backend.services.task_migrator import MigrationError
+
+        if isinstance(exc, MigrationError):
+            raise CloudRouterAccountBusyError(str(exc)) from exc
+        raise CloudRouterAccountBusyError(
+            "API account runtime state could not be verified safely; "
+            "retry deletion after active work finishes",
+        ) from exc
+
+
 @router.delete("/{account_id}")
 async def retire_account(request: Request, account_id: str):
-    """Refuse retirement until every API credential consumer shares one fence.
-
-    Main turns, PTY/container launches, goal evaluators, distillation, monitors,
-    and sub-agents do not yet have a single cross-lifecycle admission barrier.
-    A best-effort process snapshot leaves a select→spawn race where retirement
-    can remove the key/config beneath a newly admitted process.  Keep the store
-    retirement primitive for offline maintenance/tests, but do not expose an
-    unsafe runtime delete operation.
-    """
+    """Durably disable, prove quiescence, then remove managed credentials."""
 
     require_admin(request)
     store = _get_store()
     try:
-        account = store.account(account_id)
+        async with store.account_retirement_guard(account_id):
+            account = await store.stage_retirement(account_id)
+            _reload_runtime_pools()
+            if account.retired and not account.cleanup_pending:
+                return {"ok": True, **account.public_dict()}
+            async with _runtime_retirement_fence(account, store):
+                account = await store.finalize_retirement(account_id)
+            _reload_runtime_pools()
     except Exception as exc:
+        # Stage may have succeeded before a busy/failure response. Project the
+        # pending tombstone immediately so either pool tab exposes retry.
+        try:
+            _reload_runtime_pools()
+        except Exception:
+            pass
         raise _http_error(exc) from exc
-    if account is None:
-        raise HTTPException(404, "API account not found")
-    if account.retired and not account.cleanup_pending:
-        return {"ok": True, **account.public_dict()}
-    raise HTTPException(
-        409,
-        "API account deletion is temporarily disabled while "
-        "runtime credential-use fencing is unavailable",
-    )
+    return {"ok": True, **account.public_dict()}

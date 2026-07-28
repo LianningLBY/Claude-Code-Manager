@@ -5,11 +5,12 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.task import Task
 from backend.models.instance import Instance
+from backend.models.log_entry import LogEntry
 from backend.models.task_share import TaskShare
 
 
@@ -45,6 +46,7 @@ async def test_codex_fork_starts_before_selected_user_message(
         "target_repo": "/tmp/project",
         "provider": "codex",
         "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
     })
     task_id = created.json()["id"]
     async with session_factory() as db:
@@ -155,6 +157,7 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert payload["session_id"] == "thread-fork"
     assert payload["enabled_skills"] == {"code-review": True}
     assert payload["selected_user_skills"] == [41]
+    assert payload["codex_service_tier"] == "priority"
     assert payload["metadata_"]["codex_account_id"] == "codex-a"
     assert payload["metadata_"]["forked_from_task_id"] == task_id
     assert payload["metadata_"]["forked_from_log_id"] == anchor_id
@@ -488,6 +491,130 @@ async def test_codex_task_distill_routes_to_codex_provider(
     assert "fix the bug" in kwargs["conversation"]
 
 
+@pytest.mark.asyncio
+async def test_codex_fast_distill_fails_before_spawning_provider(
+    client,
+    session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Fast distill",
+        "description": "d",
+        "target_repo": "/tmp",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        db.add(LogEntry(
+            instance_id=1,
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="evidence",
+            is_error=False,
+        ))
+        await db.commit()
+
+    with patch(
+        "backend.services.skill_distill.distill_task_conversation",
+        new=AsyncMock(),
+    ) as distill:
+        response = await client.post(
+            f"/api/tasks/{task_id}/distill",
+            json={
+                "expected_routing": {
+                    "provider": "codex",
+                    "model": "gpt-5.6-sol",
+                    "codex_service_tier": "priority",
+                },
+            },
+        )
+
+    assert response.status_code == 409
+    assert "priority admission" in response.json()["detail"]
+    distill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_distill_route_change_cannot_commit_before_standard_spawn_finishes(
+    client,
+    session_factory,
+):
+    created = await client.post("/api/tasks", json={
+        "title": "Distill routing barrier",
+        "description": "d",
+        "target_repo": "/tmp",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "default",
+    })
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="completed")
+        )
+        db.add(LogEntry(
+            instance_id=1,
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="evidence",
+            is_error=False,
+        ))
+        await db.commit()
+
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def controlled_distill(**kwargs):
+        assert kwargs["provider"] == "codex"
+        provider_started.set()
+        await release_provider.wait()
+        return {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "content": "# Skill",
+        }
+
+    with patch(
+        "backend.services.skill_distill.distill_task_conversation",
+        new=AsyncMock(side_effect=controlled_distill),
+    ):
+        distill_request = asyncio.create_task(
+            client.post(
+                f"/api/tasks/{task_id}/distill",
+                json={
+                    "expected_routing": {
+                        "provider": "codex",
+                        "model": "gpt-5.6-sol",
+                        "codex_service_tier": "default",
+                    },
+                },
+            )
+        )
+        await asyncio.wait_for(provider_started.wait(), timeout=1)
+
+        route_update = asyncio.create_task(
+            client.put(
+                f"/api/tasks/{task_id}",
+                json={"codex_service_tier": "priority"},
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not route_update.done()
+
+        release_provider.set()
+        distilled = await asyncio.wait_for(distill_request, timeout=2)
+        updated = await asyncio.wait_for(route_update, timeout=2)
+
+    assert distilled.status_code == 200, distilled.text
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["codex_service_tier"] == "priority"
+
+
 async def _create_task_with_tools(client, session_factory):
     """Helper: create task + insert tool_use/tool_result log entries."""
     from backend.models.log_entry import LogEntry
@@ -651,6 +778,47 @@ async def test_plan_approve_success(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_plan_approve_rejects_stale_fast_view_before_queueing(
+    client,
+    session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Plan Task",
+        "description": "d",
+        "target_repo": "/tmp",
+        "mode": "plan",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "default",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="plan_review", plan_content="plan")
+        )
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/plan/approve",
+        json={
+            "expected_routing": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "codex_service_tier": "priority",
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "plan_review"
+    assert task.plan_approved is None
+
+
+@pytest.mark.asyncio
 async def test_plan_reject_success(client, session_factory):
     """Rejecting a plan-mode task in plan_review state should cancel it."""
     create_resp = await client.post("/api/tasks", json={
@@ -780,7 +948,12 @@ async def test_chat_send_enqueues_message(client, session_factory):
     """Chat send returns 200 queued=True and enqueues via the dispatcher."""
     from backend.services.dispatcher import PRIORITY_USER
 
-    task_id = await _create_task_with_session(client, session_factory)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+        model="claude-sonnet-4-6",
+    )
 
     mock_d = _mock_dispatcher()
     mock_broadcaster = MagicMock()
@@ -1175,7 +1348,12 @@ async def test_chat_send_with_image_paths_stores_original_message(client, sessio
 # === Dispatcher: queued message → launch resolution (model/effort/cwd) ===
 
 
-from backend.services.dispatcher import GlobalDispatcher, QueuedMessage, PRIORITY_USER
+from backend.services.dispatcher import (
+    GlobalDispatcher,
+    PRIORITY_USER,
+    QueuedMessage,
+    QueuedMessageRoutingMismatchError,
+)
 
 
 def _make_dispatcher(db_factory):
@@ -1212,6 +1390,33 @@ def _queued(prompt="hi"):
         priority=PRIORITY_USER, timestamp=time.monotonic(),
         prompt=prompt, source="user",
     )
+
+
+@pytest.mark.asyncio
+async def test_queued_message_rejects_route_changed_after_api_admission(
+    db_factory,
+):
+    dispatcher = _make_dispatcher(db_factory)
+    task_id = await _seed_task_for_queue(
+        db_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    message = _queued()
+    message.expected_task_routing = (
+        "codex",
+        "gpt-5.6-sol",
+        "priority",
+    )
+
+    with pytest.raises(
+        QueuedMessageRoutingMismatchError,
+        match="changed after message admission",
+    ):
+        await dispatcher._process_queued_message(task_id, message)
+
+    dispatcher.instance_manager.launch.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1600,7 +1805,12 @@ async def test_chat_send_with_model_override(client, session_factory):
     """临时模型：body.model 透传为 enqueue 的 model_override，不落库。"""
     from backend.models.task import Task
 
-    task_id = await _create_task_with_session(client, session_factory)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+        model="claude-sonnet-4-6",
+    )
 
     mock_d = _mock_dispatcher()
     mock_broadcaster = MagicMock()
@@ -1610,12 +1820,25 @@ async def test_chat_send_with_model_override(client, session_factory):
          patch("backend.main.broadcaster", mock_broadcaster):
         resp = await client.post(
             f"/api/tasks/{task_id}/chat",
-            json={"message": "hard problem", "model": "claude-opus-4-8"},
+            json={
+                "message": "hard problem",
+                "model": "claude-opus-4-8",
+                "expected_routing": {
+                    "provider": "claude",
+                    "model": "claude-opus-4-8",
+                    "codex_service_tier": "default",
+                },
+            },
         )
 
     assert resp.status_code == 200
     kwargs = mock_d.enqueue_message.call_args.kwargs
     assert kwargs["model_override"] == "claude-opus-4-8"
+    assert kwargs["expected_task_routing"] == (
+        "claude",
+        "claude-opus-4-8",
+        "default",
+    )
 
     # task.model 不被修改
     async with session_factory() as db:
@@ -1624,11 +1847,91 @@ async def test_chat_send_with_model_override(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_chat_stale_fast_view_rejected_before_logging(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    dispatcher = _mock_dispatcher()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={
+                "message": "must not run Standard",
+                "expected_routing": {
+                    "provider": "codex",
+                    "model": "gpt-5.6-sol",
+                    "codex_service_tier": "priority",
+                },
+            },
+        )
+
+    assert response.status_code == 409
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with session_factory() as db:
+        count = await db.scalar(
+            select(func.count())
+            .select_from(LogEntry)
+            .where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_codex_fast_rejects_unsupported_chat_model_before_logging(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="priority",
+    )
+    mock_d = _mock_dispatcher()
+
+    with patch("backend.main.dispatcher", mock_d):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "do not persist", "model": "gpt-5.4-mini"},
+        )
+
+    assert resp.status_code == 422
+    assert "not supported" in resp.json()["detail"]
+    mock_d.enqueue_message.assert_not_awaited()
+    async with session_factory() as db:
+        count = await db.scalar(
+            select(func.count())
+            .select_from(LogEntry)
+            .where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    assert count == 0
+
+
+@pytest.mark.asyncio
 async def test_update_task_model_persists(client, session_factory):
     """持久模型切换：PATCH/PUT task.model 生效。"""
     from backend.models.task import Task
 
-    task_id = await _create_task_with_session(client, session_factory)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+    )
     resp = await client.put(
         f"/api/tasks/{task_id}", json={"model": "claude-sonnet-4-6"}
     )
@@ -1767,6 +2070,47 @@ async def test_codex_inject_steers_without_pty_mode(
         if call.args[1].get("source") == "inject"
     ]
     assert len(injected) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_inject_rejects_stale_fast_view_before_steer(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A stale Fast tab must not steer a turn whose Task is now Standard."""
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    mock_im = MagicMock()
+    mock_im.inject_codex_message = AsyncMock(return_value=True)
+
+    with patch("backend.main.instance_manager", mock_im), \
+         patch(
+             "backend.main.broadcaster",
+             MagicMock(broadcast=AsyncMock()),
+         ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={
+                "message": "must remain Fast",
+                "expected_routing": {
+                    "provider": "codex",
+                    "model": "gpt-5.6-sol",
+                    "codex_service_tier": "priority",
+                },
+            },
+        )
+
+    assert response.status_code == 409
+    mock_im.inject_codex_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

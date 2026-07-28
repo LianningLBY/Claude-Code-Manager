@@ -1,5 +1,6 @@
 """Tests for Task API endpoints."""
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 import pytest
@@ -559,6 +560,44 @@ async def test_retry_task(client):
     assert cancelled.status_code == 200
     resp = await client.post(f"/api/tasks/{task_id}/retry")
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_stale_fast_view_before_mutating_generation(
+    client,
+    session_factory,
+):
+    """A stale Fast retry must not enqueue the Task as Standard."""
+    from backend.models.task import Task
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Stale retry",
+        "description": "d",
+        "target_repo": "/tmp",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "default",
+    })
+    task_id = create_resp.json()["id"]
+    cancelled = await client.post(f"/api/tasks/{task_id}/cancel")
+    assert cancelled.status_code == 200
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/retry",
+        json={
+            "expected_routing": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "codex_service_tier": "priority",
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "cancelled"
+    assert task.retry_count == 0
 
 
 @pytest.mark.parametrize("status", ["pending", "in_progress", "executing", "migrating"])
@@ -1193,6 +1232,440 @@ async def test_create_task_model_in_list(client):
     assert resp.status_code == 200
     tasks = resp.json()
     assert tasks[0]["model"] == "haiku"
+
+
+# === Codex service tier tests ===
+
+
+@pytest.mark.asyncio
+async def test_create_task_defaults_to_standard_service_tier(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Standard task",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+
+    assert resp.status_code == 201, resp.text
+    task_id = resp.json()["id"]
+    assert resp.json()["codex_service_tier"] == "default"
+
+    get_resp = await client.get(f"/api/tasks/{task_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["codex_service_tier"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_create_fast_codex_task_persists_priority(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Fast task",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    })
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["codex_service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_create_fast_goal_inherits_task_model_for_evaluator(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Fast Goal",
+        "description": "d",
+        "mode": "goal",
+        "goal_condition": "tests pass",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    })
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["goal_evaluator_model"] is None
+    assert resp.json()["codex_service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "goal_evaluator_model"),
+    [
+        (None, "configured-default"),
+        ("default", "configured-default"),
+        ("configured-default", "default"),
+    ],
+)
+async def test_create_fast_goal_normalizes_default_model_aliases(
+    client,
+    model,
+    goal_evaluator_model,
+):
+    from backend.config import settings
+
+    default_model = settings.default_codex_model
+    payload = {
+        "title": "Fast Goal default aliases",
+        "description": "d",
+        "mode": "goal",
+        "goal_condition": "tests pass",
+        "provider": "codex",
+        "model": default_model if model == "configured-default" else model,
+        "goal_evaluator_model": (
+            default_model
+            if goal_evaluator_model == "configured-default"
+            else goal_evaluator_model
+        ),
+        "codex_service_tier": "priority",
+    }
+
+    resp = await client.post("/api/tasks", json=payload)
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["codex_service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_create_fast_goal_rejects_distinct_evaluator_model(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Split Fast Goal",
+        "description": "d",
+        "mode": "goal",
+        "goal_condition": "tests pass",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "goal_evaluator_model": "gpt-5.6-terra",
+        "codex_service_tier": "priority",
+    })
+
+    assert resp.status_code == 422
+    assert "must use the Task model" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_fast_goal_rejects_distinct_evaluator_model(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": "Fast Goal update",
+        "description": "d",
+        "mode": "goal",
+        "goal_condition": "tests pass",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    })
+    task_id = created.json()["id"]
+    cancelled = await client.post(f"/api/tasks/{task_id}/cancel")
+    assert cancelled.status_code == 200
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"goal_evaluator_model": "gpt-5.6-terra"},
+    )
+
+    assert response.status_code == 422
+    assert "must use the Task model" in response.json()["detail"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.goal_evaluator_model is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "model", "detail"),
+    [
+        ("claude", "claude-opus-4-6", "only available for Codex"),
+        ("codex", "gpt-5.4-mini", "not supported by model"),
+        ("codex", "gpt-5.3-codex-spark", "not supported by model"),
+    ],
+)
+async def test_create_fast_task_rejects_incompatible_configuration(
+    client,
+    provider,
+    model,
+    detail,
+):
+    resp = await client.post("/api/tasks", json={
+        "title": "Invalid Fast task",
+        "description": "d",
+        "provider": provider,
+        "model": model,
+        "codex_service_tier": "priority",
+    })
+
+    assert resp.status_code == 422
+    assert detail in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_validates_merged_provider_model_and_service_tier(client):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Fast task",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    })
+    assert create_resp.status_code == 201
+    task_id = create_resp.json()["id"]
+
+    claude_resp = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"provider": "claude"},
+    )
+    assert claude_resp.status_code == 422
+    assert "only available for Codex" in claude_resp.json()["detail"]
+
+    mini_resp = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"model": "gpt-5.4-mini"},
+    )
+    assert mini_resp.status_code == 422
+    assert "not supported by model" in mini_resp.json()["detail"]
+
+    disable_resp = await client.put(
+        f"/api/tasks/{task_id}",
+        json={
+            "provider": "claude",
+            "model": "claude-opus-4-6",
+            "codex_service_tier": "default",
+        },
+    )
+    assert disable_resp.status_code == 200, disable_resp.text
+    assert disable_resp.json()["provider"] == "claude"
+    assert disable_resp.json()["codex_service_tier"] == "default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "mode"),
+    (("in_progress", "loop"), ("executing", "goal")),
+)
+async def test_local_fast_update_rejects_active_mode_generation(
+    client,
+    session_factory,
+    status,
+    mode,
+):
+    from backend.models.task import Task
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Active Standard task",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status=status, mode=mode)
+        )
+        await db.commit()
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 409
+    assert "execution claim became active" in response.json()["detail"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.codex_service_tier == "default"
+
+
+@pytest.mark.asyncio
+async def test_local_fast_update_rejects_running_ccm_sub_agent(
+    client,
+    session_factory,
+):
+    from backend.models.monitor_session import MonitorSession
+    from backend.models.task import Task
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Parent with old Standard child",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        db.add(
+            MonitorSession(
+                task_id=task_id,
+                agent_type="sub_agent",
+                source="ccm",
+                description="still running",
+                status="running",
+            )
+        )
+        await db.commit()
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 409
+    assert "sub-agent is running" in response.json()["detail"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.codex_service_tier == "default"
+
+
+@pytest.mark.asyncio
+async def test_local_fast_update_holds_codex_thread_guard_through_commit(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    import backend.main as main_module
+    from backend.models.task import Task
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Idle native thread",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        task.session_id = "idle-native-thread"
+        await db.commit()
+
+    guard_exited = False
+
+    @asynccontextmanager
+    async def routing_guard(_home, thread_id):
+        nonlocal guard_exited
+        assert thread_id == "idle-native-thread"
+        async with session_factory() as db:
+            before = await db.get(Task, task_id)
+            assert before.codex_service_tier == "default"
+        yield {"thread": {"status": {"type": "idle"}}, "goal": None}
+        async with session_factory() as db:
+            committed = await db.get(Task, task_id)
+            assert committed.codex_service_tier == "priority"
+        guard_exited = True
+
+    monkeypatch.setattr(
+        main_module.instance_manager,
+        "codex_thread_routing_guard",
+        routing_guard,
+    )
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["codex_service_tier"] == "priority"
+    assert guard_exited
+
+
+@pytest.mark.asyncio
+async def test_local_fast_update_fails_before_commit_when_thread_not_idle(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    import backend.main as main_module
+    from backend.models.task import Task
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Active native Goal",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        task.session_id = "active-goal-thread"
+        await db.commit()
+
+    @asynccontextmanager
+    async def routing_guard(_home, _thread_id):
+        raise RuntimeError("goal:active")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        main_module.instance_manager,
+        "codex_thread_routing_guard",
+        routing_guard,
+    )
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 409
+    assert "could not be proven idle" in response.json()["detail"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.codex_service_tier == "default"
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_null_or_unknown_service_tier(client):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Tier validation",
+        "description": "d",
+    })
+    task_id = create_resp.json()["id"]
+
+    null_resp = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"codex_service_tier": None},
+    )
+    assert null_resp.status_code == 422
+
+    unknown_resp = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"codex_service_tier": "turbo"},
+    )
+    assert unknown_resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_migration_import_preserves_fast_service_tier(client):
+    resp = await client.post("/api/tasks/migration-import", json={
+        "id": 7091,
+        "title": "Migrated Fast task",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "codex_service_tier": "priority",
+    })
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["status"] == "cancelled"
+    assert resp.json()["codex_service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_migration_import_rejects_incompatible_fast_service_tier(client):
+    resp = await client.post("/api/tasks/migration-import", json={
+        "id": 7092,
+        "title": "Invalid migrated Fast task",
+        "description": "d",
+        "provider": "codex",
+        "model": "gpt-5.4-mini",
+        "codex_service_tier": "priority",
+    })
+
+    assert resp.status_code == 422
+    assert "not supported by model" in resp.json()["detail"]
 
 
 # === Title update tests ===

@@ -16,11 +16,13 @@ import logging
 import math
 import os
 import re
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
 
+from backend.config import settings
 from backend.services.claude_pool import (
     is_codex_auth_failure,
     is_codex_transient,
@@ -65,6 +67,83 @@ QUOTA_CACHE_TTL = 120  # seconds
 QUOTA_SWITCH_THRESHOLD_PERCENT = 90.0
 PROACTIVE_QUOTA_MAX_COOLDOWN_SECONDS = 8 * 24 * 60 * 60
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_MODELS_CACHE_MAX_BYTES = 4 * 1024 * 1024
+_MODELS_CACHE_MAX_MODELS = 2048
+_CODEX_SERVICE_TIERS = frozenset({"default", "priority"})
+
+
+def _normalize_service_tier(service_tier: str | None) -> str:
+    value = str(service_tier or "default").strip().lower()
+    if value not in _CODEX_SERVICE_TIERS:
+        raise ValueError(f"Unsupported Codex service tier: {service_tier!r}")
+    return value
+
+
+def _service_tier_model(model: str | None) -> str:
+    """Resolve Task.model NULL/default exactly like request validation."""
+
+    value = str(model or "").strip()
+    if not value or value.lower() == "default":
+        return settings.default_codex_model
+    return value
+
+
+def _models_cache_supports_service_tier(
+    codex_home: str,
+    model: str | None,
+    service_tier: str,
+) -> bool:
+    """Read one native account's bounded catalog without guessing support."""
+
+    if service_tier == "default":
+        return True
+    requested_model = _service_tier_model(model)
+    path = Path(codex_home) / "models_cache.json"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > _MODELS_CACHE_MAX_BYTES
+        ):
+            return False
+        chunks: list[bytes] = []
+        remaining = _MODELS_CACHE_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > _MODELS_CACHE_MAX_BYTES:
+            return False
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list) or len(models) > _MODELS_CACHE_MAX_MODELS:
+        return False
+    for item in models:
+        if not isinstance(item, dict) or item.get("slug") != requested_model:
+            continue
+        tiers = item.get("service_tiers")
+        if not isinstance(tiers, list):
+            return False
+        return any(
+            isinstance(tier, dict) and tier.get("id") == service_tier
+            for tier in tiers
+        )
+    return False
 
 
 def quota_at_or_above(
@@ -199,7 +278,7 @@ class CodexPoolAccount:
         "id", "codex_home", "email", "enabled", "retired", "cleanup_pending",
         "login_recovery_failed", "quota_valid_after", "quota_cutoff_invalid",
         "auth_kind", "api_provider", "display_name", "api_account_id",
-        "supported_models",
+        "supported_models", "service_tiers",
         "_api_account",
     )
 
@@ -241,11 +320,22 @@ class CodexPoolAccount:
         )
         self.api_account_id: str | None = data.get("api_account_id")
         self.supported_models: list[str] | None = data.get("supported_models")
+        self.service_tiers: dict[str, list[str]] = {
+            str(model): [
+                str(tier) for tier in tiers if isinstance(tier, str)
+            ]
+            for model, tiers in (data.get("service_tiers") or {}).items()
+            if isinstance(model, str) and isinstance(tiers, list)
+        }
         self._api_account = data.get("_api_account")
 
     @classmethod
     def from_cloudrouter(cls, account) -> "CodexPoolAccount":
         auth_kind = str(getattr(account, "auth_kind", "") or "cloudrouter_api")
+        retired = bool(getattr(account, "retired", False))
+        cleanup_pending = bool(
+            getattr(account, "cleanup_pending", False)
+        )
         return cls({
             "id": account.id,
             "codex_home": str(account.codex_home),
@@ -253,11 +343,12 @@ class CodexPoolAccount:
             # Keep the home as a disabled projection when refreshed models no
             # longer include Codex. Old rollouts remain migration evidence.
             "enabled": (
-                bool(account.enabled)
-                and not bool(account.retired)
+                bool(getattr(account, "enabled", True))
+                and not retired
                 and bool((account.models or {}).get("codex"))
             ),
-            "retired": bool(account.retired),
+            "retired": retired,
+            "cleanup_pending": cleanup_pending,
             "auth_kind": auth_kind,
             "api_provider": (
                 getattr(account, "api_provider", None)
@@ -266,6 +357,7 @@ class CodexPoolAccount:
             "display_name": account.name,
             "api_account_id": account.id,
             "supported_models": list((account.models or {}).get("codex", [])),
+            "service_tiers": dict(getattr(account, "service_tiers", {}) or {}),
             "_api_account": account,
         })
 
@@ -279,6 +371,42 @@ class CodexPoolAccount:
                 "Could not evaluate API account model support for %s", self.id
             )
             return False
+
+    def supports_service_tier(
+        self,
+        model: str | None,
+        service_tier: str | None,
+    ) -> bool:
+        requested_tier = _normalize_service_tier(service_tier)
+        requested_model = (
+            _service_tier_model(model)
+            if requested_tier == "priority"
+            else model
+        )
+        if not self.supports_model(requested_model):
+            return False
+        if requested_tier == "default":
+            return True
+        if _is_api_auth_kind(self.auth_kind):
+            try:
+                return bool(
+                    self._api_account.supports_service_tier(
+                        "codex",
+                        requested_model,
+                        requested_tier,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Could not evaluate API account service-tier support for %s",
+                    self.id,
+                )
+                return False
+        return _models_cache_supports_service_tier(
+            self.codex_home,
+            requested_model,
+            requested_tier,
+        )
 
 
 class CodexPool:
@@ -493,6 +621,7 @@ class CodexPool:
             "display_name": account.display_name,
             "api_account_id": account.api_account_id,
             "supported_models": account.supported_models,
+            "service_tiers": account.service_tiers,
             "api_quota": self._cached_api_quota(account.id),
         }
 
@@ -541,29 +670,57 @@ class CodexPool:
         return bool(state and state["available"])
 
     def supports_model_for_home(
-        self, codex_home: str | os.PathLike[str], model: str | None
+        self,
+        codex_home: str | os.PathLike[str],
+        model: str | None,
+        *,
+        service_tier: str = "default",
     ) -> bool:
         account = self.account_for_home(codex_home)
-        return True if account is None else account.supports_model(model)
+        requested_tier = _normalize_service_tier(service_tier)
+        if account is None:
+            if requested_tier == "default":
+                return True
+            return _models_cache_supports_service_tier(
+                canonical_codex_home(codex_home),
+                model,
+                requested_tier,
+            )
+        return account.supports_service_tier(model, requested_tier)
 
-    def has_compatible_enabled_account(self, model: str | None) -> bool:
+    def has_compatible_enabled_account(
+        self,
+        model: str | None,
+        *,
+        service_tier: str = "default",
+    ) -> bool:
         """Whether model routing is possible independent of cooldown/quota."""
 
+        requested_tier = _normalize_service_tier(service_tier)
         return any(
             account.enabled
             and not account.retired
-            and account.supports_model(model)
+            and account.supports_service_tier(model, requested_tier)
             for account in self._accounts
         )
 
-    def has_retryable_compatible_account(self, model: str | None) -> bool:
+    def has_retryable_compatible_account(
+        self,
+        model: str | None,
+        *,
+        service_tier: str = "default",
+    ) -> bool:
         """Whether unavailable compatible accounts can recover automatically."""
 
+        requested_tier = _normalize_service_tier(service_tier)
         for account in self._accounts:
             if (
                 not account.enabled
                 or account.retired
-                or not account.supports_model(model)
+                or not account.supports_service_tier(
+                    model,
+                    requested_tier,
+                )
             ):
                 continue
             if account.id in self._terminal_failures:
@@ -601,9 +758,17 @@ class CodexPool:
         result: list[dict] = []
         for account in self._accounts:
             # Retired tombstones remain internally addressable so historical
-            # task bindings can migrate their rollout, but they are deleted
-            # from the user-facing pool and are never selectable.
-            if account.retired or (
+            # task bindings can migrate their rollout. A pending API cleanup
+            # remains visible so an administrator can retry DELETE after the
+            # active runtime user exits; finalized tombstones stay hidden.
+            pending_api_cleanup = bool(
+                account.retired
+                and account.cleanup_pending
+                and _is_api_auth_kind(account.auth_kind)
+            )
+            if (account.retired and not pending_api_cleanup) or (
+                not pending_api_cleanup
+                and
                 _is_api_auth_kind(account.auth_kind)
                 and not account.supported_models
             ):
@@ -647,10 +812,12 @@ class CodexPool:
         exclude: set[str] | None = None,
         *,
         model: str | None = None,
+        service_tier: str = "default",
     ) -> str | None:
         """Pick an available CODEX_HOME. Returns None if all exhausted."""
         now = time.time()
         excluded = exclude or set()
+        requested_tier = _normalize_service_tier(service_tier)
         candidates = []
         for account in self._accounts:
             decision = self._api_quota_decision(account)
@@ -658,7 +825,7 @@ class CodexPool:
                 account.enabled
                 and account.id not in excluded
                 and now >= self._cooldowns.get(account.id, 0)
-                and account.supports_model(model)
+                and account.supports_service_tier(model, requested_tier)
                 and not (
                     bool(decision.get("known"))
                     and decision.get("available") is False
@@ -1088,6 +1255,7 @@ class CodexPool:
         *,
         threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
         model: str | None = None,
+        service_tier: str = "default",
     ) -> str | None:
         """Return a below-threshold alternative when the current home is high.
 
@@ -1145,7 +1313,11 @@ class CodexPool:
                 )
             ):
                 excluded.add(account.id)
-        return self.select(exclude=excluded, model=model)
+        return self.select(
+            exclude=excluded,
+            model=model,
+            service_tier=service_tier,
+        )
 
     def cached_quota_for_home(self, codex_home: str) -> dict | None:
         """Return the latest selection snapshot for one account home."""

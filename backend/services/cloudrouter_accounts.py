@@ -21,7 +21,7 @@ import stat
 import tempfile
 import time
 import tomllib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -107,6 +107,10 @@ MAX_API_RESPONSE_BYTES = 1024 * 1024
 MAX_API_KEY_BYTES = 16 * 1024
 MAX_DISCOVERED_MODELS = 1024
 MAX_MODEL_ID_BYTES = 512
+MAX_SERVICE_TIERS_PER_MODEL = 16
+MAX_SERVICE_TIER_ID_BYTES = 64
+MAX_CODEX_MODELS_CACHE_BYTES = 4 * 1024 * 1024
+MAX_CODEX_MODELS_CACHE_MODELS = 2048
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 DEFAULT_QUOTA_CACHE_TTL = 60.0
 CLAUDE_SKIP_DANGEROUS_PROMPT = "skipDangerousModePermissionPrompt"
@@ -118,6 +122,10 @@ class CloudRouterAccountError(RuntimeError):
 
 class CloudRouterAccountNotFound(CloudRouterAccountError):
     """The requested local API account does not exist."""
+
+
+class CloudRouterAccountBusyError(CloudRouterAccountError):
+    """The account still has a credential/runtime consumer."""
 
 
 class CloudRouterUnsafePathError(CloudRouterAccountError):
@@ -234,6 +242,82 @@ def _open_regular_nofollow(path: Path, *, maximum: int) -> bytes:
         os.close(descriptor)
 
 
+def codex_models_cache_service_tiers(
+    codex_home: str | os.PathLike[str],
+    allowed_models: list[str] | set[str],
+) -> dict[str, list[str]]:
+    """Read exact tier evidence from one bounded, non-symlink Codex catalog.
+
+    This is candidate-routing evidence only. Fast turns still require the
+    app-server's live ``model/list`` response before any thread is created.
+    """
+
+    allowed = {
+        model
+        for model in allowed_models
+        if isinstance(model, str) and model
+    }
+    if not allowed:
+        return {}
+    try:
+        payload = json.loads(
+            _open_regular_nofollow(
+                Path(codex_home) / "models_cache.json",
+                maximum=MAX_CODEX_MODELS_CACHE_BYTES,
+            ).decode("utf-8"),
+        )
+    except (
+        CloudRouterUnsafePathError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return {}
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if (
+        not isinstance(models, list)
+        or len(models) > MAX_CODEX_MODELS_CACHE_MODELS
+    ):
+        return {}
+
+    result: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for item in models:
+        if not isinstance(item, dict):
+            return {}
+        model = item.get("slug")
+        if not isinstance(model, str):
+            return {}
+        if model in seen:
+            return {}
+        seen.add(model)
+        if model not in allowed:
+            continue
+        raw_tiers = item.get("service_tiers")
+        if (
+            not isinstance(raw_tiers, list)
+            or len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL
+        ):
+            return {}
+        tier_ids: set[str] = set()
+        for tier in raw_tiers:
+            tier_id = tier.get("id") if isinstance(tier, dict) else None
+            if not isinstance(tier_id, str):
+                return {}
+            tier_id = tier_id.strip()
+            if (
+                not tier_id
+                or len(tier_id.encode("utf-8"))
+                > MAX_SERVICE_TIER_ID_BYTES
+                or any(character.isspace() for character in tier_id)
+            ):
+                return {}
+            tier_ids.add(tier_id)
+        if tier_ids:
+            result[model] = sorted(tier_ids)
+    return result
+
+
 def _require_owned_regular(path: Path, expected_mode: int) -> None:
     try:
         metadata = path.lstat()
@@ -288,6 +372,129 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _directory_open_flags() -> int:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise CloudRouterUnsafePathError(
+            "Safe directory-descriptor traversal is unavailable",
+        )
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_NOFOLLOW
+        | os.O_DIRECTORY
+    )
+
+
+def _open_directory_chain_nofollow(path: Path) -> int:
+    """Open an absolute directory one component at a time without symlinks."""
+
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if not absolute.is_absolute() or not absolute.anchor:
+        raise CloudRouterUnsafePathError("Managed directory must be absolute")
+    flags = _directory_open_flags()
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for component in absolute.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_regular_at(
+    parent_fd: int,
+    name: str,
+    *,
+    maximum: int,
+) -> bytes:
+    """Read one owned regular child without following a replacement symlink."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > maximum
+        ):
+            raise CloudRouterUnsafePathError(
+                f"Unsafe managed file: {name}",
+            )
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > maximum:
+            raise CloudRouterUnsafePathError(
+                f"Managed file is too large: {name}",
+            )
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_private_json_at(
+    parent_fd: int,
+    name: str,
+    value: dict[str, Any],
+    *,
+    maximum: int | None = None,
+) -> None:
+    """Atomically replace JSON relative to one already-verified directory."""
+
+    payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
+    if maximum is not None and len(payload) > maximum:
+        raise CloudRouterUpstreamError("metadata_too_large")
+    temporary = f".{name}.{os.urandom(12).hex()}.tmp"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("Could not write account metadata")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _atomic_private_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
@@ -434,7 +641,7 @@ def _normalise_models(payload: Any) -> dict[str, list[str]]:
     return result
 
 
-def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
+def _normalise_apex_models(payload: Any) -> dict[str, Any]:
     """Normalise Apex's native Codex model catalog response.
 
     Unlike an OpenAI-compatible ``/models`` response (``data[].id``), the
@@ -449,6 +656,7 @@ def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
     if len(items) > MAX_DISCOVERED_MODELS:
         raise CloudRouterUpstreamError("too_many_models")
     models: list[str] = []
+    service_tiers: dict[str, list[str]] = {}
     seen: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
@@ -467,12 +675,109 @@ def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
             raise CloudRouterUpstreamError("invalid_models_response")
         if _provider_for_model(model_id) != "codex" or model_id in seen:
             continue
+        raw_tiers = item.get("service_tiers", [])
+        if not isinstance(raw_tiers, list):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        if len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL:
+            raise CloudRouterUpstreamError("invalid_models_response")
+        tier_ids: set[str] = set()
+        for tier in raw_tiers:
+            tier_id = tier.get("id") if isinstance(tier, dict) else None
+            if not isinstance(tier_id, str):
+                raise CloudRouterUpstreamError("invalid_models_response")
+            tier_id = tier_id.strip()
+            if (
+                not tier_id
+                or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
+                or any(character.isspace() for character in tier_id)
+            ):
+                raise CloudRouterUpstreamError("invalid_models_response")
+            tier_ids.add(tier_id)
         seen.add(model_id)
         models.append(model_id)
+        if tier_ids:
+            service_tiers[model_id] = sorted(tier_ids)
     models.sort()
     if not models:
         raise CloudRouterUpstreamError("no_supported_models")
-    return {"claude": [], "codex": models}
+    return {
+        "claude": [],
+        "codex": models,
+        # This internal probe field is split into a top-level metadata field
+        # before persistence; it never changes the public ``models`` shape.
+        "service_tiers": service_tiers,
+    }
+
+
+def _normalise_service_tiers(
+    value: Any,
+    codex_models: list[str],
+    *,
+    unsafe_metadata: bool,
+) -> dict[str, list[str]]:
+    """Validate a bounded model-to-tier capability map."""
+
+    def invalid() -> Exception:
+        if unsafe_metadata:
+            return CloudRouterUnsafePathError(
+                "Invalid API account service tier metadata"
+            )
+        return CloudRouterUpstreamError("invalid_models_response")
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise invalid()
+    available = set(codex_models)
+    result: dict[str, list[str]] = {}
+    for model, tiers in value.items():
+        if (
+            not isinstance(model, str)
+            or model not in available
+            or not isinstance(tiers, list)
+            or len(tiers) > MAX_SERVICE_TIERS_PER_MODEL
+        ):
+            raise invalid()
+        tier_ids: set[str] = set()
+        for tier_id in tiers:
+            if not isinstance(tier_id, str):
+                raise invalid()
+            tier_id = tier_id.strip()
+            if (
+                not tier_id
+                or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
+                or any(character.isspace() for character in tier_id)
+            ):
+                raise invalid()
+            tier_ids.add(tier_id)
+        if tier_ids:
+            result[model] = sorted(tier_ids)
+    return result
+
+
+def _split_model_probe(
+    value: dict[str, Any],
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Separate the stable provider model map from optional tier metadata."""
+
+    if not isinstance(value, dict):
+        raise CloudRouterUpstreamError("invalid_models_response")
+    models: dict[str, list[str]] = {}
+    for provider in ("claude", "codex"):
+        raw_models = value.get(provider)
+        if not isinstance(raw_models, list) or any(
+            not isinstance(model, str)
+            or _provider_for_model(model) != provider
+            for model in raw_models
+        ):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        models[provider] = sorted(set(raw_models))
+    service_tiers = _normalise_service_tiers(
+        value.get("service_tiers"),
+        models["codex"],
+        unsafe_metadata=False,
+    )
+    return models, service_tiers
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -570,7 +875,10 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
 
     upstream_status = str(payload.get("status") or "active").lower()
     mode = str(payload.get("mode") or "").lower()
-    if mode not in {"quota_limited", "subscription", "wallet"}:
+    # CloudRouter reports accounts without a spend cap as ``unrestricted``.
+    # Their balance/remaining fields may both be zero, but those values are
+    # informational rather than an exhaustion signal.
+    if mode not in {"quota_limited", "subscription", "wallet", "unrestricted"}:
         mode = "subscription" if isinstance(payload.get("subscription"), dict) else "wallet"
     expired = upstream_status == "expired"
     exhausted = upstream_status in {"quota_exhausted", "exhausted"}
@@ -585,7 +893,7 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
     )
     currency = (
         "USD"
-        if mode in {"quota_limited", "wallet"} or subscription_uses_usd
+        if mode in {"quota_limited", "wallet", "unrestricted"} or subscription_uses_usd
         else "credits"
     )
     quota_value = payload.get("quota")
@@ -910,6 +1218,8 @@ class CloudRouterAccount:
     retired: bool
     cleanup_pending: bool
     models: dict[str, list[str]]
+    service_tiers: dict[str, list[str]]
+    service_tiers_explicit: bool
     key_hint: str
     root: Path
 
@@ -954,6 +1264,27 @@ class CloudRouterAccount:
             return any(dated.fullmatch(candidate) for candidate in available)
         return False
 
+    def supports_service_tier(
+        self,
+        provider: str,
+        model: str | None,
+        service_tier: str | None,
+    ) -> bool:
+        """Return exact advertised support; unknown Fast capability is false."""
+
+        requested_tier = str(service_tier or "default").strip().lower()
+        if requested_tier == "default":
+            return self.supports_model(provider, model)
+        if requested_tier != "priority" or str(provider or "").lower() != "codex":
+            return False
+        requested_model = _normalise_model(model)
+        if not requested_model or requested_model == "default":
+            # Apex's catalog currently does not mark its default model.  Do
+            # not guess and accidentally route a Fast task to an unsupported
+            # default such as a mini/Spark model.
+            return False
+        return requested_tier in self.service_tiers.get(requested_model, [])
+
     def public_dict(self) -> dict[str, Any]:
         supported_models = sorted({
             model for values in self.models.values() for model in values
@@ -967,6 +1298,7 @@ class CloudRouterAccount:
             "retired": self.retired,
             "cleanup_pending": self.cleanup_pending,
             "models": self.models,
+            "service_tiers": self.service_tiers,
             "providers": self.providers,
             "key_hint": self.key_hint,
             "account_dir": str(self.root),
@@ -1019,13 +1351,113 @@ class CloudRouterAccountStore:
         raw_root = Path(os.path.expandvars(os.path.expanduser(os.fspath(root))))
         self.root = raw_root.absolute()
         _ensure_private_directory(self.root)
+        root_fd = _open_directory_chain_nofollow(self.root)
+        try:
+            root_metadata = os.fstat(root_fd)
+            self._root_identity = (
+                root_metadata.st_dev,
+                root_metadata.st_ino,
+            )
+        finally:
+            os.close(root_fd)
         self._quota_cache_ttl = max(0.0, float(quota_cache_ttl))
         self._http_timeout = http_timeout
         self._accounts: dict[str, CloudRouterAccount] = {}
         self._quota_cache: dict[str, dict[str, Any]] = {}
         self._quota_cached_at: dict[str, float] = {}
         self._mutation_lock = asyncio.Lock()
+        # DELETE is intentionally split into durable disable, runtime
+        # quiescence, and cleanup phases. Keep those phases serialized per
+        # account without holding the store mutation lock across lifecycle
+        # locks (normal launch uses lifecycle -> store ordering).
+        self._retirement_locks: dict[str, asyncio.Lock] = {}
+        # Upstream usage reads retain the API key in memory after the local
+        # file has been opened. Track that full request lifetime so retirement
+        # never removes a credential while it is still being used.
+        self._credential_users: dict[str, int] = {}
         self.reload()
+
+    def _open_store_root_fd(self) -> int:
+        try:
+            descriptor = _open_directory_chain_nofollow(self.root)
+        except (CloudRouterAccountError, OSError) as exc:
+            raise CloudRouterUnsafePathError(
+                "API account store root is unsafe",
+            ) from exc
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or (metadata.st_dev, metadata.st_ino) != self._root_identity
+        ):
+            os.close(descriptor)
+            raise CloudRouterUnsafePathError(
+                "API account store root changed identity",
+            )
+        return descriptor
+
+    @contextmanager
+    def _open_account_fd(self, account_id: str):
+        """Anchor one account below the exact store-root inode."""
+
+        valid_id = _validate_account_id(account_id)
+        root_fd = self._open_store_root_fd()
+        account_fd = -1
+        try:
+            try:
+                account_fd = os.open(
+                    valid_id,
+                    _directory_open_flags(),
+                    dir_fd=root_fd,
+                )
+            except OSError as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Unsafe API account directory: {valid_id}",
+                ) from exc
+            metadata = os.fstat(account_fd)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise CloudRouterUnsafePathError(
+                    f"Unsafe API account directory: {valid_id}",
+                )
+            yield root_fd, account_fd
+        finally:
+            if account_fd >= 0:
+                os.close(account_fd)
+            os.close(root_fd)
+
+    @staticmethod
+    def _assert_account_fd_current(
+        root_fd: int,
+        account_fd: int,
+        account_id: str,
+    ) -> None:
+        """Require the account name to still reference this exact directory."""
+
+        try:
+            current = os.stat(
+                account_id,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise CloudRouterUnsafePathError(
+                f"API account directory changed: {account_id}",
+            ) from exc
+        opened = os.fstat(account_fd)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+        ):
+            raise CloudRouterUnsafePathError(
+                f"API account directory changed: {account_id}",
+            )
 
     def _account_root(self, account_id: str) -> Path:
         valid = _validate_account_id(account_id)
@@ -1081,6 +1513,27 @@ class CloudRouterAccountStore:
             # project a coincidentally named Claude model into an unconfigured
             # CLAUDE_CONFIG_DIR.
             normalised_models["claude"] = []
+        elif data.get("service_tiers") not in (None, {}):
+            raise CloudRouterUnsafePathError(
+                f"Unexpected service tier metadata: {account_id}"
+            )
+        service_tiers = _normalise_service_tiers(
+            data.get("service_tiers"),
+            normalised_models["codex"],
+            unsafe_metadata=True,
+        )
+        service_tiers_explicit = "service_tiers" in data
+        if (
+            api_provider == API_PROVIDER_APEX
+            and not service_tiers_explicit
+        ):
+            # Older ApexRouter metadata predates capability persistence. Use
+            # only its own exact, bounded local catalog as candidate evidence;
+            # an explicit (even empty) metadata field remains authoritative.
+            service_tiers = codex_models_cache_service_tiers(
+                path / "codex",
+                normalised_models["codex"],
+            )
         account = CloudRouterAccount(
             id=account_id,
             name=name,
@@ -1089,6 +1542,8 @@ class CloudRouterAccountStore:
             retired=bool(data.get("retired", False)),
             cleanup_pending=bool(data.get("cleanup_pending", False)),
             models=normalised_models,
+            service_tiers=service_tiers,
+            service_tiers_explicit=service_tiers_explicit,
             key_hint=str(data.get("key_hint") or ""),
             root=path,
         )
@@ -1303,7 +1758,8 @@ class CloudRouterAccountStore:
                 ) from exc
 
     def reload(self) -> list[CloudRouterAccount]:
-        _ensure_private_directory(self.root)
+        root_fd = self._open_store_root_fd()
+        os.close(root_fd)
         loaded: dict[str, CloudRouterAccount] = {}
         for child in self.root.iterdir():
             if not ACCOUNT_ID_RE.fullmatch(child.name):
@@ -1333,9 +1789,72 @@ class CloudRouterAccountStore:
             accounts = [account for account in accounts if not account.retired]
         return accounts
 
+    def visible_accounts(self) -> list[CloudRouterAccount]:
+        """Return active accounts plus resumable cleanup tombstones."""
+
+        return [
+            account
+            for account in self.all_accounts(include_retired=True)
+            if not account.retired or account.cleanup_pending
+        ]
+
     def account(self, account_id: str) -> CloudRouterAccount | None:
         _validate_account_id(account_id)
         return self._accounts.get(account_id)
+
+    @asynccontextmanager
+    async def account_retirement_guard(self, account_id: str):
+        """Serialize the complete staged retirement workflow for one id."""
+
+        valid_id = _validate_account_id(account_id)
+        lock = self._retirement_locks.setdefault(valid_id, asyncio.Lock())
+        async with lock:
+            yield
+
+    def active_credential_users(self, account_id: str) -> int:
+        """Number of admitted upstream requests still using this key."""
+
+        return max(0, int(self._credential_users.get(
+            _validate_account_id(account_id), 0,
+        )))
+
+    async def _release_credential_user(self, account_id: str) -> None:
+        async with self._mutation_lock:
+            remaining = self._credential_users.get(account_id, 0) - 1
+            if remaining > 0:
+                self._credential_users[account_id] = remaining
+            else:
+                self._credential_users.pop(account_id, None)
+
+    @asynccontextmanager
+    async def credential_admission(self, account_id: str):
+        """Lease one enabled key for the full lifetime of an upstream call."""
+
+        valid_id = _validate_account_id(account_id)
+        async with self._mutation_lock:
+            self.reload()
+            account = self._require_account(valid_id)
+            self._credential_users[valid_id] = (
+                self._credential_users.get(valid_id, 0) + 1
+            )
+        try:
+            yield account
+        finally:
+            cleanup = asyncio.create_task(
+                self._release_credential_user(valid_id)
+            )
+            delayed_cancellation: asyncio.CancelledError | None = None
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError as exc:
+                    if delayed_cancellation is None:
+                        delayed_cancellation = exc
+                except BaseException:
+                    break
+            cleanup.result()
+            if delayed_cancellation is not None:
+                raise delayed_cancellation
 
     @staticmethod
     def _canonical_runtime_path(path: str | os.PathLike[str]) -> str:
@@ -1424,6 +1943,8 @@ class CloudRouterAccountStore:
         provider: str,
         runtime_home: str | os.PathLike[str],
         model: str | None,
+        *,
+        service_tier: str = "default",
     ):
         """Serialize model/quota revalidation with metadata mutation.
 
@@ -1440,6 +1961,25 @@ class CloudRouterAccountStore:
             if not account.supports_model(provider, model):
                 raise CloudRouterAccountError(
                     f"API account does not support model {model!r}"
+                )
+            requested_tier = str(
+                service_tier or "default"
+            ).strip().lower()
+            if requested_tier not in {"default", "priority"}:
+                raise CloudRouterAccountError(
+                    f"Unsupported Codex service tier {service_tier!r}"
+                )
+            if (
+                provider == "codex"
+                and not account.supports_service_tier(
+                    provider,
+                    model,
+                    requested_tier,
+                )
+            ):
+                raise CloudRouterAccountError(
+                    "API account does not advertise service tier "
+                    f"{requested_tier!r} for model {model!r}"
                 )
             decision = self.cached_quota_decision(account.id)
             if (
@@ -1523,7 +2063,7 @@ class CloudRouterAccountStore:
         api_key: str,
         *,
         api_provider: str = API_PROVIDER_CLOUDROUTER,
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, Any]:
         provider = normalize_api_provider(api_provider)
         spec = API_PROVIDER_SPECS[provider]
         if provider == API_PROVIDER_APEX:
@@ -1560,7 +2100,7 @@ class CloudRouterAccountStore:
     def _metadata(
         account_id: str,
         name: str,
-        models: dict[str, list[str]],
+        models: dict[str, Any],
         key_hint: str,
         *,
         api_provider: str = API_PROVIDER_CLOUDROUTER,
@@ -1570,6 +2110,7 @@ class CloudRouterAccountStore:
     ) -> dict[str, Any]:
         current = _now()
         provider = normalize_api_provider(api_provider)
+        provider_models, service_tiers = _split_model_probe(models)
         return {
             "version": 2,
             "id": account_id,
@@ -1578,7 +2119,8 @@ class CloudRouterAccountStore:
             "enabled": enabled,
             "retired": retired,
             "cleanup_pending": False,
-            "models": models,
+            "models": provider_models,
+            "service_tiers": service_tiers,
             "key_hint": key_hint,
             "endpoints": dict(API_PROVIDER_SPECS[provider].endpoints),
             "created_at": created_at or current,
@@ -1593,7 +2135,7 @@ class CloudRouterAccountStore:
         account_id: str,
         name: str,
         api_key: str,
-        models: dict[str, list[str]],
+        models: dict[str, Any],
         api_provider: str = API_PROVIDER_CLOUDROUTER,
     ) -> None:
         provider = normalize_api_provider(api_provider)
@@ -1707,7 +2249,9 @@ class CloudRouterAccountStore:
                     metadata_path, maximum=MAX_METADATA_BYTES,
                 ).decode("utf-8"),
             )
-            data["models"] = models
+            provider_models, service_tiers = _split_model_probe(models)
+            data["models"] = provider_models
+            data["service_tiers"] = service_tiers
             data["updated_at"] = _now()
             _atomic_private_json(
                 metadata_path,
@@ -1720,7 +2264,7 @@ class CloudRouterAccountStore:
     async def fetch_usage(
         self, account_id: str, force: bool = False,
     ) -> dict[str, Any]:
-        account = self._require_account(account_id)
+        self._require_account(account_id)
         current = _now()
         cached = self._quota_cache.get(account_id)
         if (
@@ -1730,36 +2274,48 @@ class CloudRouterAccountStore:
             < self._quota_cache_ttl
         ):
             return dict(cached)
-        spec = API_PROVIDER_SPECS[account.api_provider]
-        if spec.usage_url is None:
-            snapshot = _unknown_snapshot(
-                account_id,
-                "usage_not_supported",
-                previous=cached,
-            )
-            self._quota_cache[account_id] = snapshot
-            self._quota_cached_at[account_id] = current
-            return dict(snapshot)
-        try:
-            payload = await self._request_json(
-                spec.usage_url, self._read_api_key(account),
-            )
-            snapshot = (
-                _normalise_apex_usage(account_id, payload)
-                if account.api_provider == API_PROVIDER_APEX
-                else _normalise_usage(account_id, payload)
-            )
-        except CloudRouterUpstreamError as exc:
-            if exc.status_code in {401, 403}:
-                snapshot = _unavailable_snapshot(account_id, exc.code)
-            else:
+        async with self.credential_admission(account_id) as account:
+            spec = API_PROVIDER_SPECS[account.api_provider]
+            if spec.usage_url is None:
                 snapshot = _unknown_snapshot(
-                    account_id, exc.code, previous=cached,
+                    account_id,
+                    "usage_not_supported",
+                    previous=cached,
                 )
-        except CloudRouterUnsafePathError:
-            snapshot = _unavailable_snapshot(account_id, "invalid_local_credentials")
-        self._quota_cache[account_id] = snapshot
-        self._quota_cached_at[account_id] = current
+            else:
+                try:
+                    payload = await self._request_json(
+                        spec.usage_url, self._read_api_key(account),
+                    )
+                    snapshot = (
+                        _normalise_apex_usage(account_id, payload)
+                        if account.api_provider == API_PROVIDER_APEX
+                        else _normalise_usage(account_id, payload)
+                    )
+                except CloudRouterUpstreamError as exc:
+                    if exc.status_code in {401, 403}:
+                        snapshot = _unavailable_snapshot(account_id, exc.code)
+                    else:
+                        snapshot = _unknown_snapshot(
+                            account_id, exc.code, previous=cached,
+                        )
+                except CloudRouterUnsafePathError:
+                    snapshot = _unavailable_snapshot(
+                        account_id, "invalid_local_credentials",
+                    )
+            # Retirement may have staged while the HTTP request was in flight.
+            # Publish only while this exact id is still active; stage clears
+            # any snapshot that won an earlier publication race.
+            async with self._mutation_lock:
+                self.reload()
+                current_account = self.account(account_id)
+                if (
+                    current_account is not None
+                    and current_account.enabled
+                    and not current_account.retired
+                ):
+                    self._quota_cache[account_id] = snapshot
+                    self._quota_cached_at[account_id] = current
         return dict(snapshot)
 
     def cached_quota_decision(self, account_id: str) -> dict[str, Any]:
@@ -1797,78 +2353,290 @@ class CloudRouterAccountStore:
             "reason": str(snapshot.get("reason") or "unknown"),
         }
 
-    @staticmethod
-    def _remove_except(directory: Path, preserved_name: str) -> None:
-        if directory.is_symlink() or not directory.is_dir():
-            raise CloudRouterUnsafePathError(f"Unsafe account directory: {directory}")
-        for child in directory.iterdir():
-            if child.name == preserved_name:
-                if child.is_symlink() or not child.is_dir():
-                    raise CloudRouterUnsafePathError(
-                        f"Unsafe preserved account directory: {child}",
-                    )
-                continue
-            if child.is_symlink() or child.is_file():
-                child.unlink()
-            elif child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+    def _remove_except(
+        self,
+        account_fd: int,
+        runtime_name: str,
+        preserved_name: str,
+    ) -> None:
+        """Remove only direct children of one proven managed runtime dir.
 
-    async def retire_account(self, account_id: str) -> CloudRouterAccount:
-        async with self._mutation_lock:
-            self.reload()
-            account = self._require_account(account_id, allow_retired=True)
-            if account.retired and not account.cleanup_pending:
-                return account
+        ``shutil.rmtree``'s fd-based implementation refuses symlink swaps. The
+        account/runtime descriptor chain and relative child names ensure
+        cleanup cannot be redirected if a same-uid process replaces an
+        ancestor or descendant between inspection and removal.
+        """
 
-            metadata_path = account.root / "account.json"
-            data = json.loads(
-                _open_regular_nofollow(
-                    metadata_path, maximum=MAX_METADATA_BYTES,
-                ).decode("utf-8"),
+        if (
+            runtime_name not in {"claude", "codex"}
+            or (runtime_name, preserved_name)
+            not in {("claude", "projects"), ("codex", "sessions")}
+            or not shutil.rmtree.avoids_symlink_attacks
+        ):
+            raise CloudRouterUnsafePathError(
+                f"Refusing unmanaged account cleanup: {runtime_name}",
             )
-            if not account.retired:
-                # Disable first.  Existing pool projections consult the Store's
-                # quota decision on every selection, so no new turn can enter
-                # while credentials and runtime configuration are removed.
+        try:
+            descriptor = os.open(
+                runtime_name,
+                _directory_open_flags(),
+                dir_fd=account_fd,
+            )
+        except OSError as exc:
+            raise CloudRouterUnsafePathError(
+                f"Unsafe managed runtime directory: {runtime_name}",
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            current = os.stat(
+                runtime_name,
+                dir_fd=account_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or current.st_dev != opened.st_dev
+                or current.st_ino != opened.st_ino
+            ):
+                raise CloudRouterUnsafePathError(
+                    f"Unsafe managed runtime directory: {runtime_name}",
+                )
+            for name in os.listdir(descriptor):
+                metadata = os.stat(
+                    name, dir_fd=descriptor, follow_symlinks=False,
+                )
+                if name == preserved_name:
+                    if (
+                        not stat.S_ISDIR(metadata.st_mode)
+                        or stat.S_ISLNK(metadata.st_mode)
+                        or metadata.st_uid != os.getuid()
+                    ):
+                        raise CloudRouterUnsafePathError(
+                            "Unsafe preserved account directory",
+                        )
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    shutil.rmtree(name, dir_fd=descriptor)
+                else:
+                    os.unlink(name, dir_fd=descriptor)
+            os.fsync(descriptor)
+            current = os.stat(
+                runtime_name,
+                dir_fd=account_fd,
+                follow_symlinks=False,
+            )
+            if (
+                current.st_dev != opened.st_dev
+                or current.st_ino != opened.st_ino
+            ):
+                raise CloudRouterUnsafePathError(
+                    f"Managed runtime directory changed: {runtime_name}",
+                )
+        finally:
+            os.close(descriptor)
+
+    def _unlink_account_credentials(
+        self, account_fd: int,
+    ) -> None:
+        """Unlink only verified regular credential files via account dirfd."""
+
+        for name in ("api.key", "key-helper"):
+            try:
+                initial = os.stat(
+                    name, dir_fd=account_fd, follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(initial.st_mode)
+                or initial.st_uid != os.getuid()
+            ):
+                raise CloudRouterUnsafePathError(
+                    f"Unsafe account credential entry: {name}",
+                )
+            file_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                child_fd = os.open(name, file_flags, dir_fd=account_fd)
+            except OSError as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Unsafe account credential entry: {name}",
+                ) from exc
+            try:
+                opened = os.fstat(child_fd)
+                current = os.stat(
+                    name, dir_fd=account_fd, follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.getuid()
+                    or current.st_dev != opened.st_dev
+                    or current.st_ino != opened.st_ino
+                    or initial.st_dev != opened.st_dev
+                    or initial.st_ino != opened.st_ino
+                ):
+                    raise CloudRouterUnsafePathError(
+                        f"Account credential changed during cleanup: {name}",
+                    )
+            finally:
+                os.close(child_fd)
+            os.unlink(name, dir_fd=account_fd)
+        os.fsync(account_fd)
+
+    async def stage_retirement(self, account_id: str) -> CloudRouterAccount:
+        """Durably disable an account before any runtime lifecycle fencing."""
+
+        async with self._mutation_lock:
+            account = self._require_account(account_id, allow_retired=True)
+            with self._open_account_fd(account.id) as (
+                root_fd,
+                account_fd,
+            ):
+                self._assert_account_fd_current(
+                    root_fd, account_fd, account.id,
+                )
+                try:
+                    data = json.loads(_read_regular_at(
+                        account_fd,
+                        "account.json",
+                        maximum=MAX_METADATA_BYTES,
+                    ).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise CloudRouterUnsafePathError(
+                        f"Invalid account metadata: {account.id}",
+                    ) from exc
+                if not isinstance(data, dict) or data.get("id") != account.id:
+                    raise CloudRouterUnsafePathError(
+                        f"Mismatched account metadata: {account.id}",
+                    )
+                retired = bool(data.get("retired", False))
+                cleanup_pending = bool(
+                    data.get("cleanup_pending", False)
+                )
+                if retired and not cleanup_pending:
+                    self.reload()
+                    return self._require_account(
+                        account_id,
+                        allow_retired=True,
+                    )
+                if not retired:
+                    data.update({
+                        "enabled": False,
+                        "retired": True,
+                        "cleanup_pending": True,
+                        "updated_at": _now(),
+                    })
+                    _atomic_private_json_at(
+                        account_fd,
+                        "account.json",
+                        data,
+                        maximum=MAX_METADATA_BYTES,
+                    )
+                    self._assert_account_fd_current(
+                        root_fd, account_fd, account.id,
+                    )
+                self._quota_cache.pop(account_id, None)
+                self._quota_cached_at.pop(account_id, None)
+            self.reload()
+            return self._require_account(account_id, allow_retired=True)
+
+    async def finalize_retirement(
+        self, account_id: str,
+    ) -> CloudRouterAccount:
+        """Remove credentials/config from an already-disabled tombstone."""
+
+        async with self._mutation_lock:
+            account = self._require_account(account_id, allow_retired=True)
+            if self._credential_users.get(account.id, 0) > 0:
+                raise CloudRouterAccountBusyError(
+                    "API account still has an active credential request",
+                )
+            with self._open_account_fd(account.id) as (
+                root_fd,
+                account_fd,
+            ):
+                self._assert_account_fd_current(
+                    root_fd, account_fd, account.id,
+                )
+                try:
+                    data = json.loads(_read_regular_at(
+                        account_fd,
+                        "account.json",
+                        maximum=MAX_METADATA_BYTES,
+                    ).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise CloudRouterUnsafePathError(
+                        f"Invalid account metadata: {account.id}",
+                    ) from exc
+                if not isinstance(data, dict) or data.get("id") != account.id:
+                    raise CloudRouterUnsafePathError(
+                        f"Mismatched account metadata: {account.id}",
+                    )
+                retired = bool(data.get("retired", False))
+                cleanup_pending = bool(
+                    data.get("cleanup_pending", False)
+                )
+                if retired and not cleanup_pending:
+                    self.reload()
+                    return self._require_account(
+                        account_id,
+                        allow_retired=True,
+                    )
+                if not retired or not cleanup_pending:
+                    raise CloudRouterAccountError(
+                        "API account retirement was not durably staged",
+                    )
+                self._remove_except(
+                    account_fd,
+                    "claude",
+                    "projects",
+                )
+                self._assert_account_fd_current(
+                    root_fd, account_fd, account.id,
+                )
+                self._remove_except(
+                    account_fd,
+                    "codex",
+                    "sessions",
+                )
+                self._assert_account_fd_current(
+                    root_fd, account_fd, account.id,
+                )
+                self._unlink_account_credentials(account_fd)
+                self._assert_account_fd_current(
+                    root_fd, account_fd, account.id,
+                )
                 data.update({
                     "enabled": False,
                     "retired": True,
-                    "cleanup_pending": True,
+                    "cleanup_pending": False,
+                    "key_hint": "",
                     "updated_at": _now(),
                 })
-                _atomic_private_json(metadata_path, data)
-                _fsync_directory(account.root)
-                self.reload()
-                account = self._require_account(account_id, allow_retired=True)
-
-            self._remove_except(account.root / "claude", "projects")
-            self._remove_except(account.root / "codex", "sessions")
-            for name in ("api.key", "key-helper"):
-                target = account.root / name
-                if target.is_symlink():
-                    target.unlink()
-                elif target.exists():
-                    if not target.is_file():
-                        raise CloudRouterUnsafePathError(
-                            f"Unsafe account credential path: {target}",
-                        )
-                    target.unlink()
-            data = json.loads(
-                _open_regular_nofollow(
-                    metadata_path, maximum=MAX_METADATA_BYTES,
-                ).decode("utf-8"),
-            )
-            data.update({
-                "enabled": False,
-                "retired": True,
-                "cleanup_pending": False,
-                "updated_at": _now(),
-            })
-            _atomic_private_json(metadata_path, data)
-            _fsync_directory(account.root)
+                _atomic_private_json_at(
+                    account_fd,
+                    "account.json",
+                    data,
+                    maximum=MAX_METADATA_BYTES,
+                )
+                self._assert_account_fd_current(
+                    root_fd, account_fd, account.id,
+                )
             self._quota_cache.pop(account_id, None)
             self._quota_cached_at.pop(account_id, None)
             self.reload()
             return self._require_account(account_id, allow_retired=True)
+
+    async def retire_account(self, account_id: str) -> CloudRouterAccount:
+        """Offline/test convenience wrapper for staged, resumable cleanup."""
+
+        async with self.account_retirement_guard(account_id):
+            staged = await self.stage_retirement(account_id)
+            if staged.retired and not staged.cleanup_pending:
+                return staged
+            return await self.finalize_retirement(account_id)

@@ -610,6 +610,8 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_mcp_server.py::test_user_skill_read_is_scoped_to_selected_worker_snapshot` | `ccm_read_user_skill` 只读当前 Task 选中 ID，并优先使用 Worker snapshot |
 | `test_api_tasks.py` / `test_api_chat_plan.py` 的 Codex Skill capability 用例 | Monitor 拒绝、`$monitor` 在创建/description 更新/follow-up 三个入口持久化前拒绝、kill switch、User Skill ID 校验/去重、provider 切换与 legacy 配置更新边界 |
 | `test_api_tasks.py::test_invalid_skill_update_is_rejected_before_worker_migration` | 组合更新的 provider/Skill 配置在迁移前校验；400 不调用 migrator，也不改变持久状态 |
+| `test_api_tasks.py::test_valid_skill_update_is_coordinated_with_worker_migration` | 有效的 Worker+provider/Skill 组合更新作为最终配置快照交给 migrator，不再迁移旧配置后单独更新 Manager |
+| `test_task_migrator.py::test_coordinated_migration_*` | 本地→Worker、Worker→Worker 的 destination import payload 与 Manager 最终 provider/Skills/User Skill snapshots 完全一致；导入失败保留原配置，认领 CAS 不覆盖并发配置 |
 | `test_worker_relay_proxy.py` / `test_task_migrator.py` 的 Skill snapshot 用例 | Worker 初次转发、续聊同步和迁移 payload 保留选择与正文 snapshot |
 | `test_api_chat_plan.py::test_codex_fork_starts_before_selected_user_message` | Fork 继承普通/User Skill 选择，附件 seed 保持只消费一次 |
 | 前端 `skillCapabilities.test.ts` | Claude 不变；Codex 始终禁 Monitor，kill switch 关闭时只保留 Sub-Agent |

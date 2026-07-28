@@ -381,4 +381,5 @@ uv run alembic history         # 查看历史
 - **搬运内容**：session JSONL（跨账号 glob 定位 → 目标机 ~/.claude 同编码路径）+ 项目目录全量 rsync（含未提交改动）；worker→worker 经 Manager 两跳
 - **cwd 链条两个教训**（task 58 实测）：① worker 转发路径必须像本地一样把 project.local_path 写进 target_repo；② 失败启动会把 os.getcwd() 写进 last_cwd 且其优先级高于 target_repo——迁回本机时无效 last_cwd 必须清掉
 - 目标 worker 重建必须走 admin-only `POST /api/tasks/migration-import`，首个可见状态就在同一事务内是 `cancelled` 且不 wake Dispatcher；禁止恢复旧的 `pending create → 第二请求 cancel` 窗口。迁移认领/完成/回滚都以原 status + 原 worker_id 做 CAS，`in_progress`/`executing` 一律先停止再迁移
+- `worker_id` 与 provider/Skills/User Skill snapshot 的组合更新必须作为同一次协调迁移处理：目标 Worker 的 inert import 先接收已校验的最终配置，Manager 只在导入成功后把最终配置与 Worker 指针放进同一次 CAS；导入/搬运失败时 Manager 保留原配置。迁移认领与完成 CAS 还必须比较所有待更新字段的原值，不能覆盖并发配置写入
 - Worker 销毁 = 批量迁回 + terminate；纯本地项目 = rsync 播种（_init_local_repo 见 .git 跳过）

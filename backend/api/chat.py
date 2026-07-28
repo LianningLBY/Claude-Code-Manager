@@ -365,6 +365,16 @@ async def send_chat_message(
         unknown_cmd = stripped.split(None, 1)[0]
         raise HTTPException(400, f"未知命令 {unknown_cmd}，输入 $help 查看可用命令")
 
+    if command and command.required_skills:
+        from backend.api.tasks import _validate_skill_configuration
+
+        await _validate_skill_configuration(
+            db,
+            provider=task.provider,
+            enabled_skills=command.required_skills,
+            selected_user_skills=None,
+        )
+
     # Keep sender identity presentation-only.  The raw text is what the model
     # receives; the prefixed form is only stored/broadcast for the chat UI.
     user_id = getattr(request.state, "user_id", None)
@@ -945,6 +955,7 @@ async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, req
 
         # 4. Ensure relay subscription before the remote turn can emit events.
         await worker_proxy.relay.subscribe_task(worker, current.id)
+        await worker_proxy.sync_task_skill_selection(worker, current)
 
         # 5. The common operation lock is already held; asking WorkerProxy to
         # acquire it again would deadlock.

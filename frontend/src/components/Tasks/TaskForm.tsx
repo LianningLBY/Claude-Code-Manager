@@ -7,6 +7,7 @@ import { VoiceButton } from '../Voice/VoiceButton';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
+import { skillSupportedByProvider } from '../../config/skillCapabilities';
 
 interface TaskFormProps {
   onCreated: () => void;
@@ -83,6 +84,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
   const [dropError, setDropError] = useState('');
   const [enabledPlugins, setEnabledPlugins] = useState<Record<string, boolean>>({});
+  const [codexTaskSkillsEnabled, setCodexTaskSkillsEnabled] = useState(false);
   const [showPluginsDropdown, setShowPluginsDropdown] = useState(false);
   const [showConfigPanel, setShowConfigPanel] = useState(false);
   const [starOnCreate, setStarOnCreate] = useState(false);
@@ -136,6 +138,13 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     }).catch(() => {
       applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     });
+    api.getRuntimeSettings()
+      .then((runtime) => {
+        setCodexTaskSkillsEnabled(
+          runtime.codex_main_mcp_enabled !== false,
+        );
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -154,7 +163,11 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     api.listSkillsCached()
       .then((skills) => setAvailableSkills(
         skills
-          .filter((skill) => provider === 'claude' || skill.key === 'sub-agent')
+          .filter((skill) => skillSupportedByProvider(
+            provider,
+            skill.key,
+            codexTaskSkillsEnabled,
+          ))
           .map((s) => ({ key: s.key, label: s.label, description: s.description })),
       ))
       .catch(() => setAvailableSkills(
@@ -162,9 +175,11 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           ? [{ key: 'sub-agent', label: 'Sub-Agent', description: 'Parallel one-shot sub-agents' }]
           : [{ key: 'monitor', label: 'Monitor', description: 'Background monitoring sub-agents' }],
       ));
-  }, [provider]);
+  }, [provider, codexTaskSkillsEnabled]);
   const AVAILABLE_PLUGINS = availableSkills;
-  const enabledPluginCount = Object.values(enabledPlugins).filter(Boolean).length;
+  const enabledPluginCount = AVAILABLE_PLUGINS.filter(
+    (skill) => enabledPlugins[skill.key],
+  ).length;
 
   const [userSkills, setUserSkills] = useState<{ id: number; name: string; description: string }[]>([]);
   const [enabledUserSkills, setEnabledUserSkills] = useState<Record<number, boolean>>({});
@@ -192,10 +207,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
 
   const saveSkillsAsDefault = () => {
     const pluginSelection = Object.entries(enabledPlugins)
-      .filter(([, v]) => v)
+      .filter(([key, enabled]) => (
+        enabled && skillSupportedByProvider(
+          provider,
+          key,
+          codexTaskSkillsEnabled,
+        )
+      ))
       .reduce((acc, [k]) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
     const userSkillIds = Object.entries(enabledUserSkills)
-      .filter(([, v]) => v)
+      .filter(([, v]) => (
+        v && (provider !== 'codex' || codexTaskSkillsEnabled)
+      ))
       .map(([k]) => Number(k));
     api.setDefaultSkills(
       Object.keys(pluginSelection).length > 0 ? pluginSelection : null,
@@ -368,11 +391,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
         enabled_skills: (() => {
           const skills = Object.entries(enabledPlugins)
-            .filter(([, v]) => v)
+            .filter(([key, enabled]) => (
+              enabled && skillSupportedByProvider(
+                provider,
+                key,
+                codexTaskSkillsEnabled,
+              )
+            ))
             .reduce((acc, [k]) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
           return Object.keys(skills).length > 0 ? skills : undefined;
         })(),
-        ...(enabledUserSkillCount > 0 ? {
+        ...(enabledUserSkillCount > 0
+          && (provider !== 'codex' || codexTaskSkillsEnabled) ? {
           selected_user_skills: Object.entries(enabledUserSkills)
             .filter(([, v]) => v)
             .map(([k]) => Number(k)),
@@ -753,10 +783,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         >
           <Star size={13} fill={starOnCreate ? 'currentColor' : 'none'} />
         </button>
-        {/* User Skills dropdown — skill 模板/注入是 claude 专属
-            （dispatcher 对 codex 跳过），codex 下隐藏幽灵选项 */}
-        {provider === 'claude' && (
-        <div ref={skillsRef} className="relative">
+        {(provider !== 'codex' || codexTaskSkillsEnabled) && (
+          <div ref={skillsRef} className="relative">
             <button
               type="button"
               onClick={() => setShowSkillsDropdown(!showSkillsDropdown)}
@@ -804,14 +832,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             )}
           </div>
         )}
-        {/* Codex user-skill templates and Monitor remain unavailable; the
-            provider-neutral Sub-Agent plugin is exposed below. */}
+        {/* Codex supports ordinary Skills/User Skills through task context;
+            persistent Monitor lifecycle remains a separate PR. */}
         {provider === 'codex' && (
           <span
             className="text-xs text-gray-500 px-1 py-1.5 whitespace-nowrap"
-            title="用户 Skills 与 Monitor 仍仅支持 Claude；Sub-Agent 已支持 Codex"
+            title={codexTaskSkillsEnabled
+              ? '普通 Skills、User Skills 与 Sub-Agent 已支持 Codex；Monitor 尚未支持'
+              : 'Codex 主任务 MCP 已关闭；仅 Sub-Agent 可用'}
           >
-            Skills / Monitor 仅支持 Claude · Sub-Agent 可用
+            {codexTaskSkillsEnabled
+              ? 'Monitor 暂不支持 Codex'
+              : '主任务 MCP 已关闭 · 仅 Sub-Agent 可用'}
           </span>
         )}
         {/* Plugins dropdown */}

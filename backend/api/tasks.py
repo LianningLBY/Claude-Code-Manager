@@ -57,6 +57,89 @@ _MANUAL_RETRYABLE_STATUSES = frozenset(
 )
 
 
+def _explicit_command_skills(message: str | None) -> dict[str, bool]:
+    """Return the temporary Skills requested by one leading $command."""
+
+    from backend.services.command_registry import parse_command
+
+    command, _command_args = parse_command(message or "")
+    return dict(command.required_skills or {}) if command else {}
+
+
+async def _validate_skill_configuration(
+    db: AsyncSession,
+    *,
+    provider: str | None,
+    enabled_skills: dict | None,
+    selected_user_skills: list[int] | None,
+    user_skill_snapshots: list[dict] | None = None,
+) -> list[int] | None:
+    """Validate and normalize task-scoped Skill selections."""
+
+    from backend.config import settings as app_settings
+    from backend.models.user_skill import UserSkill
+    from backend.services.skill_context import (
+        normalize_user_skill_ids,
+        skill_supported,
+        user_skill_snapshot_from_mapping,
+    )
+
+    provider = (provider or "claude").lower()
+    unsupported = sorted(
+        name
+        for name, enabled in (enabled_skills or {}).items()
+        if enabled and not skill_supported(provider, name)
+    )
+    if unsupported:
+        raise HTTPException(
+            400,
+            "Provider "
+            f"{(provider or 'claude').lower()} does not support Skills: "
+            + ", ".join(unsupported),
+        )
+
+    normalized = normalize_user_skill_ids(selected_user_skills)
+    unavailable_without_main_mcp = sorted(
+        name
+        for name, enabled in (enabled_skills or {}).items()
+        if enabled and name != "sub-agent"
+    )
+    if (
+        provider == "codex"
+        and not app_settings.codex_main_mcp_enabled
+        and (unavailable_without_main_mcp or normalized)
+    ):
+        raise HTTPException(
+            400,
+            "Codex main-task MCP is disabled; only Sub-Agent can be enabled",
+        )
+    if not normalized:
+        return [] if selected_user_skills is not None else None
+    found = set()
+    for value in user_skill_snapshots or []:
+        if not isinstance(value, dict):
+            continue
+        snapshot = user_skill_snapshot_from_mapping(value)
+        if snapshot is not None:
+            found.add(snapshot.id)
+    if user_skill_snapshots is None:
+        found.update(
+            (
+                await db.execute(
+                    select(UserSkill.id).where(UserSkill.id.in_(normalized))
+                )
+            ).scalars().all()
+        )
+    missing = [skill_id for skill_id in normalized if skill_id not in found]
+    if missing:
+        raise HTTPException(
+            400,
+            "Selected User Skills do not exist: "
+            + ", ".join(str(skill_id) for skill_id in missing),
+        )
+    return normalized
+
+
 def _find_session_jsonl(session_id: str, provider: str = "claude") -> Path | None:
     """Locate a provider session JSONL on disk.
 
@@ -282,6 +365,9 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     attachments = data.pop("attachments", None)
     secret_ids = data.pop("secret_ids", None)
     clone_from_task_id = data.pop("clone_from_task_id", None)
+    user_skill_snapshots = data.pop("user_skill_snapshots", None)
+    if user_skill_snapshots is not None:
+        require_admin(request)
     meta = data.get("metadata_") or {}
     all_paths = file_paths or image_paths
     if all_paths:
@@ -290,6 +376,12 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         meta["attachments"] = attachments
     if secret_ids:
         meta["secret_ids"] = secret_ids
+    if user_skill_snapshots is not None:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        meta[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
     if meta:
         data["metadata_"] = meta
 
@@ -313,6 +405,17 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         )
     if not data.get("effort_level"):
         data["effort_level"] = app_settings.default_effort
+    validation_skills = dict(data.get("enabled_skills") or {})
+    validation_skills.update(
+        _explicit_command_skills(data.get("description"))
+    )
+    data["selected_user_skills"] = await _validate_skill_configuration(
+        db,
+        provider=data.get("provider"),
+        enabled_skills=validation_skills,
+        selected_user_skills=data.get("selected_user_skills"),
+        user_skill_snapshots=user_skill_snapshots,
+    )
 
     task = await queue.create(**data)
     # Eliminate the dispatcher's historical 0-2s polling delay.  Importing
@@ -358,6 +461,7 @@ async def import_migrated_task(
     require_admin(request)
 
     data = body.model_dump()
+    user_skill_snapshots = data.pop("user_skill_snapshots", None)
     for transient_field in (
         "image_paths",
         "file_paths",
@@ -366,6 +470,14 @@ async def import_migrated_task(
         "clone_from_task_id",
     ):
         data.pop(transient_field, None)
+    if user_skill_snapshots is not None:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        data["metadata_"] = {
+            USER_SKILL_SNAPSHOTS_METADATA_KEY: user_skill_snapshots,
+        }
     data.update(
         worker_id=None,
         status="cancelled",
@@ -433,12 +545,25 @@ async def update_task(
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, queue.db)
     updates = body.model_dump(exclude_unset=True)
+    user_skill_snapshots = updates.pop("user_skill_snapshots", None)
+    if user_skill_snapshots is not None:
+        require_admin(request)
     if "enabled_skills" in updates:
         # An explicit save is authoritative even when its JSON happens to equal
         # a currently active one-turn override. Clearing the generation marker
         # lets lifecycle cleanup distinguish that user write from its own
         # temporary value.
         updates["metadata_"] = clear_temporary_skills_marker(task.metadata_)
+    if user_skill_snapshots is not None:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        metadata = dict(updates.get("metadata_") or task.metadata_ or {})
+        metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = (
+            user_skill_snapshots
+        )
+        updates["metadata_"] = metadata
 
     target_project = None
     target_project_id = updates.get("project_id", task.project_id)
@@ -494,11 +619,49 @@ async def update_task(
     if updates.get("system_prompt_mode") == "off":
         updates["system_prompt_mode"] = None
 
+    current = await queue.get(task_id)
+    if not current:
+        raise HTTPException(404, "Task not found")
+    effective_provider = updates.get("provider", current.provider)
+    effective_description = updates.get("description", current.description)
+    command_skills = _explicit_command_skills(effective_description)
+    skill_configuration_changed = bool(
+        {"provider", "enabled_skills", "selected_user_skills"} & updates.keys()
+    ) or user_skill_snapshots is not None or bool(
+        command_skills and "description" in updates
+    )
+    if skill_configuration_changed:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        effective_skills = dict(updates.get(
+            "enabled_skills",
+            current.enabled_skills,
+        ) or {})
+        effective_skills.update(command_skills)
+        effective_user_skills = updates.get(
+            "selected_user_skills",
+            current.selected_user_skills,
+        )
+        normalized_user_skills = await _validate_skill_configuration(
+            queue.db,
+            provider=effective_provider,
+            enabled_skills=effective_skills,
+            selected_user_skills=effective_user_skills,
+            user_skill_snapshots=(
+                user_skill_snapshots
+                if user_skill_snapshots is not None
+                else (current.metadata_ or {}).get(
+                    USER_SKILL_SNAPSHOTS_METADATA_KEY
+                )
+            ),
+        )
+        if "selected_user_skills" in updates:
+            updates["selected_user_skills"] = normalized_user_skills
+
     if not updates:
-        task = await queue.get(task_id)
-        if not task:
-            raise HTTPException(404, "Task not found")
-        return task
+        return current
     task = await queue.update_task(task_id, **updates)
     if not task:
         raise HTTPException(404, "Task not found")

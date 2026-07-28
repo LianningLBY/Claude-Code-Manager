@@ -16,6 +16,7 @@ from backend.services.codex_app_server import (
     CodexAppServer,
     CodexAppServerBusyError,
     CodexAppServerError,
+    CodexAppServerRequestError,
     CodexAppServerRegistry,
     CodexRequiredMcpError,
     CodexRequiredMcpPreTurnError,
@@ -340,6 +341,109 @@ async def test_required_mcp_thread_rejection_is_explicit():
             task_id=51,
             mcp_specs=(_task_mcp_spec(51),),
         )
+
+
+@pytest.mark.asyncio
+async def test_turn_start_receives_task_skill_additional_context():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    turn_params = {}
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {"thread": {"id": "thread-skills"}}
+        if method == "turn/start":
+            turn_params.update(params)
+            return {"turn": {"id": "turn-skills"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    await server.start_turn(
+        prompt="review this",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=55,
+        skill_context="## Available Skills\n- **review**: Review changes",
+    )
+
+    assert turn_params["input"] == [{
+        "type": "text",
+        "text": "review this",
+    }]
+    assert turn_params["additionalContext"] == {
+        "ccm.taskSkills": {
+            "kind": "application",
+            "value": "## Available Skills\n- **review**: Review changes",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_skill_context_rejection_is_replay_safe():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "thread/start":
+            return {"thread": {"id": "thread-context-rejected"}}
+        if method == "turn/start":
+            raise CodexAppServerRequestError(
+                "unknown field additionalContext"
+            )
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="before admission",
+    ):
+        await server.start_turn(
+            prompt="review this",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=55,
+            skill_context="## Available Skills\n- **review**",
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_skill_context_turn_failure_is_not_replay_safe():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "thread/start":
+            return {"thread": {"id": "thread-context-unknown"}}
+        if method == "turn/start":
+            raise CodexAppServerError("reader exited after write")
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="unknown admission state",
+    ) as exc_info:
+        await server.start_turn(
+            prompt="review this",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=55,
+            skill_context="## Available Skills\n- **review**",
+        )
+
+    assert not isinstance(exc_info.value, CodexRequiredMcpPreTurnError)
 
 
 @pytest.mark.asyncio

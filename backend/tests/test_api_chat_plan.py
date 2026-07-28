@@ -52,6 +52,8 @@ async def test_codex_fork_starts_before_selected_user_message(
         task.status = "completed"
         task.session_id = "thread-source"
         task.last_cwd = "/tmp/project"
+        task.enabled_skills = {"code-review": True}
+        task.selected_user_skills = [41]
         task.metadata_ = {
             "codex_account_id": "codex-a",
             "attachments": [{
@@ -151,6 +153,8 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert payload["status"] == "completed"
     assert payload["mode"] == "auto"
     assert payload["session_id"] == "thread-fork"
+    assert payload["enabled_skills"] == {"code-review": True}
+    assert payload["selected_user_skills"] == [41]
     assert payload["metadata_"]["codex_account_id"] == "codex-a"
     assert payload["metadata_"]["forked_from_task_id"] == task_id
     assert payload["metadata_"]["forked_from_log_id"] == anchor_id
@@ -1033,20 +1037,21 @@ async def test_enabled_skills_do_not_impersonate_command_invocations(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("message", "skill_name"),
+    ("message", "skill_name", "provider"),
     [
-        ("$monitor watch the build", "monitor"),
-        ("$sub-agent review the change", "sub-agent"),
+        ("$monitor watch the build", "monitor", "claude"),
+        ("$sub-agent review the change", "sub-agent", "codex"),
     ],
 )
 async def test_explicit_skill_command_injects_only_selected_invocation(
-    client, session_factory, message, skill_name,
+    client, session_factory, message, skill_name, provider,
 ):
     """A real leading $command activates exactly that command for the turn."""
     task_id = await _create_task_with_session(
         client,
         session_factory,
         enabled_skills={"monitor": True, "sub-agent": True},
+        provider=provider,
     )
     mock_d = _mock_dispatcher()
     mock_broadcaster = MagicMock()
@@ -1066,6 +1071,47 @@ async def test_explicit_skill_command_injects_only_selected_invocation(
     assert kwargs["command_skills"] == {skill_name: True}
     other = "sub-agent" if skill_name == "monitor" else "monitor"
     assert f"用户通过 ${other} 命令触发" not in kwargs["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_codex_chat_rejects_monitor_command_before_persist_or_enqueue(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.log_entry import LogEntry
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        enabled_skills={},
+        provider="codex",
+    )
+    mock_d = _mock_dispatcher()
+    mock_broadcaster = MagicMock()
+    mock_broadcaster.broadcast = AsyncMock()
+
+    with patch("backend.main.dispatcher", mock_d), \
+         patch("backend.main.broadcaster", mock_broadcaster):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "$monitor watch the build"},
+        )
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+    mock_d.enqueue_message.assert_not_awaited()
+    mock_broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert stored == []
 
 
 @pytest.mark.asyncio

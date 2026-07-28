@@ -5,6 +5,15 @@ from pydantic import BaseModel, Field, field_serializer, model_validator
 from backend.config import settings
 
 
+class UserSkillSnapshotPayload(BaseModel):
+    """Internal Manager→Worker copy of one selected User Skill."""
+
+    id: int = Field(gt=0)
+    name: str = Field(min_length=1, max_length=100)
+    description: str = ""
+    content: str = ""
+
+
 class TaskCreate(BaseModel):
     # Manager→Worker 转发时指定 ID（task ID 全局由 Manager 分配，见设计文档 §2）
     id: int | None = None
@@ -38,6 +47,7 @@ class TaskCreate(BaseModel):
     enable_workflows: bool = False
     enabled_skills: dict | None = None
     selected_user_skills: list[int] | None = None
+    user_skill_snapshots: list[UserSkillSnapshotPayload] | None = None
     tags: list[str] | None = None
     image_paths: list[str] | None = None  # kept for backwards compat
     file_paths: list[str] | None = None
@@ -106,6 +116,7 @@ class TaskUpdate(BaseModel):
     enable_workflows: bool | None = None
     enabled_skills: dict | None = None
     selected_user_skills: list[int] | None = None
+    user_skill_snapshots: list[UserSkillSnapshotPayload] | None = None
     provider: str | None = None
     starred: bool | None = None
     tags: list[str] | None = None

@@ -120,6 +120,8 @@ def build_mcp_server_specs(
     task_id: int,
     enabled_skills: dict | None = None,
     api_base: str | None = None,
+    *,
+    provider: str = "claude",
 ) -> tuple[McpServerSpec, ...]:
     """Build the main task's CCM MCP server specs.
 
@@ -128,12 +130,24 @@ def build_mcp_server_specs(
     from task state at call time.
     """
 
+    enabled_tools = CCM_SKILLS_TOOLS
+    if (provider or "claude").lower() == "codex":
+        from backend.services.skill_context import (
+            CODEX_UNSUPPORTED_MAIN_TOOLS,
+        )
+
+        enabled_tools = tuple(
+            tool
+            for tool in CCM_SKILLS_TOOLS
+            if tool not in CODEX_UNSUPPORTED_MAIN_TOOLS
+        )
+
     return (
         _ccm_server_spec(
             name="ccm_skills",
             module="backend.mcp.ccm_skills_server",
             context_args=("--task-id", str(task_id)),
-            enabled_tools=CCM_SKILLS_TOOLS,
+            enabled_tools=enabled_tools,
             api_base=api_base,
         ),
     )

@@ -197,6 +197,7 @@ class WorkerProxy:
 
         # 先订阅 relay 再创建：worker Dispatcher 可能创建后立即执行，后订阅丢初始事件
         await self.relay.subscribe_task(worker, task.id)
+        user_skill_snapshots = await self._user_skill_snapshots(task)
 
         payload = {
             "id": task.id,  # 关键：Manager 分配的全局 ID
@@ -220,6 +221,8 @@ class WorkerProxy:
             "timeout_hours": task.timeout_hours,
             "enable_workflows": task.enable_workflows,
             "enabled_skills": task.enabled_skills,
+            "selected_user_skills": task.selected_user_skills,
+            "user_skill_snapshots": user_skill_snapshots,
             "tags": list(task.tags) if task.tags else None,
         }
         async with httpx.AsyncClient(timeout=30) as c:
@@ -231,6 +234,40 @@ class WorkerProxy:
             # 不检查会卡死在 in_progress：422 字段校验失败 / 500 都要立刻暴露
             r.raise_for_status()
         logger.info("task %s forwarded to worker %s", task.id, worker.id)
+
+    async def _user_skill_snapshots(self, task: Task) -> list[dict]:
+        from backend.services.skill_context import (
+            build_user_skill_snapshot_payload,
+            normalize_user_skill_ids,
+        )
+
+        if not normalize_user_skill_ids(task.selected_user_skills):
+            return []
+        async with self.db_factory() as db:
+            return await build_user_skill_snapshot_payload(
+                db,
+                task.selected_user_skills,
+            )
+
+    async def sync_task_skill_selection(
+        self,
+        worker: Worker,
+        task: Task,
+    ) -> None:
+        """Refresh a remote task's live Skill selection before a new turn."""
+
+        payload = {
+            "enabled_skills": task.enabled_skills,
+            "selected_user_skills": task.selected_user_skills,
+            "user_skill_snapshots": await self._user_skill_snapshots(task),
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.put(
+                self._api(worker, f"/api/tasks/{task.id}"),
+                headers=self._headers(worker),
+                json=payload,
+            )
+            response.raise_for_status()
 
     async def push_files(self, worker: Worker, paths: list[str]):
         """chat 附件推到 worker 同一绝对路径（worker 上 Claude 用 Read 读）。"""

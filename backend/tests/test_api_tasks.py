@@ -88,6 +88,7 @@ async def test_explicit_skill_save_clears_temporary_generation_marker(
     response = await client.post("/api/tasks", json={
         "title": "Save temporary-looking skills",
         "description": "d",
+        "provider": "claude",
         "enabled_skills": {"monitor": True},
     })
     task_id = response.json()["id"]
@@ -112,6 +113,204 @@ async def test_explicit_skill_save_clears_temporary_generation_marker(
 
 
 @pytest.mark.asyncio
+async def test_codex_rejects_monitor_even_when_main_mcp_is_enabled(
+    client,
+    monkeypatch,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    response = await client.post("/api/tasks", json={
+        "title": "No Codex Monitor",
+        "description": "d",
+        "provider": "codex",
+        "enabled_skills": {"monitor": True},
+    })
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+
+
+@pytest.mark.asyncio
+async def test_codex_rejects_monitor_command_even_when_skill_is_not_enabled(
+    client,
+    monkeypatch,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    response = await client.post("/api/tasks", json={
+        "title": "No Codex Monitor command bypass",
+        "description": "$monitor watch the build",
+        "provider": "codex",
+        "enabled_skills": {},
+    })
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+
+
+@pytest.mark.asyncio
+async def test_codex_rejects_monitor_command_added_by_task_update(
+    client,
+    monkeypatch,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    created = await client.post("/api/tasks", json={
+        "title": "No updated Codex Monitor command bypass",
+        "description": "ordinary task",
+        "provider": "codex",
+    })
+
+    response = await client.put(
+        f"/api/tasks/{created.json()['id']}",
+        json={"description": "$monitor watch the build"},
+    )
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+
+
+@pytest.mark.asyncio
+async def test_codex_main_mcp_kill_switch_keeps_only_sub_agent(client):
+    rejected = await client.post("/api/tasks", json={
+        "title": "No ordinary skills",
+        "description": "d",
+        "provider": "codex",
+        "enabled_skills": {"code-review": True},
+    })
+    allowed = await client.post("/api/tasks", json={
+        "title": "Sub-Agent remains independent",
+        "description": "d",
+        "provider": "codex",
+        "enabled_skills": {"sub-agent": True},
+    })
+
+    assert rejected.status_code == 400
+    assert "main-task MCP is disabled" in rejected.text
+    assert allowed.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_selected_user_skills_are_validated_and_deduplicated(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.user_skill import UserSkill
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with session_factory() as db:
+        skill = UserSkill(
+            name="API selected skill",
+            description="selected",
+            content="body",
+        )
+        db.add(skill)
+        await db.commit()
+        await db.refresh(skill)
+
+    created = await client.post("/api/tasks", json={
+        "title": "Selected User Skill",
+        "description": "d",
+        "provider": "codex",
+        "selected_user_skills": [skill.id, skill.id],
+    })
+    missing = await client.post("/api/tasks", json={
+        "title": "Missing User Skill",
+        "description": "d",
+        "provider": "codex",
+        "selected_user_skills": [skill.id + 1000],
+    })
+
+    assert created.status_code == 201, created.text
+    assert created.json()["selected_user_skills"] == [skill.id]
+    assert missing.status_code == 400
+    assert "do not exist" in missing.text
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_ids_never_fall_back_to_local_user_skills(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.user_skill import UserSkill
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with session_factory() as db:
+        local_skill = UserSkill(
+            name="Worker-local collision",
+            description="must not authorize a Manager selection",
+            content="local body",
+        )
+        db.add(local_skill)
+        await db.commit()
+        await db.refresh(local_skill)
+
+    response = await client.post("/api/tasks", json={
+        "title": "Authoritative empty snapshot",
+        "description": "d",
+        "provider": "codex",
+        "selected_user_skills": [local_skill.id],
+        "user_skill_snapshots": [],
+    })
+
+    assert response.status_code == 400
+    assert "do not exist" in response.text
+
+
+@pytest.mark.asyncio
+async def test_unrelated_update_allows_legacy_codex_monitor_configuration(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="Legacy Codex Monitor",
+            description="d",
+            provider="codex",
+            model="gpt-5.6-sol",
+            enabled_skills={"monitor": True},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"model": "gpt-5.6-terra"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == "gpt-5.6-terra"
+
+
+@pytest.mark.asyncio
+async def test_provider_switch_rejects_inherited_monitor(client):
+    created = await client.post("/api/tasks", json={
+        "title": "Claude Monitor",
+        "description": "d",
+        "provider": "claude",
+        "enabled_skills": {"monitor": True},
+    })
+
+    response = await client.put(
+        f"/api/tasks/{created.json()['id']}",
+        json={"provider": "codex"},
+    )
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+
+
+@pytest.mark.asyncio
 async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
     client, session_factory,
 ):
@@ -127,6 +326,13 @@ async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
             "session_id": "session-1",
             "last_cwd": "/workspace/repo",
             "retry_count": 2,
+            "selected_user_skills": [81],
+            "user_skill_snapshots": [{
+                "id": 81,
+                "name": "Migrated skill",
+                "description": "Manager copy",
+                "content": "full body",
+            }],
         })
 
     assert resp.status_code == 201, resp.text
@@ -137,6 +343,13 @@ async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
     assert task.status == "cancelled"
     assert task.session_id == "session-1"
     assert task.retry_count == 2
+    assert task.selected_user_skills == [81]
+    assert task.metadata_["ccm_user_skill_snapshots"] == [{
+        "id": 81,
+        "name": "Migrated skill",
+        "description": "Manager copy",
+        "content": "full body",
+    }]
 
 
 @pytest.mark.asyncio

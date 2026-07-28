@@ -30,6 +30,14 @@ def _headers() -> dict[str, str]:
     return {}
 
 
+async def _get_task_data() -> dict:
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(_api_url(""), headers=_headers())
+        resp.raise_for_status()
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
 @mcp.tool()
 async def ccm_command_help() -> str:
     """列出所有可用的 CCM 命令和技能。
@@ -42,15 +50,20 @@ async def ccm_command_help() -> str:
     try:
         from backend.services.command_registry import COMMAND_REGISTRY
         from backend.services.skill_loader import discover_skills
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(_api_url(""), headers=_headers())
-            resp.raise_for_status()
-            task_data = resp.json()
-            enabled_skills = task_data.get("enabled_skills") or {}
+        from backend.services.skill_context import skill_supported
+
+        task_data = await _get_task_data()
+        enabled_skills = task_data.get("enabled_skills") or {}
+        provider = task_data.get("provider") or "claude"
 
         # Built-in commands
         commands = []
         for cmd in COMMAND_REGISTRY.values():
+            if any(
+                not skill_supported(provider, skill_name)
+                for skill_name in cmd.required_skills
+            ):
+                continue
             commands.append({
                 "command": f"${cmd.name}",
                 "description": cmd.description,
@@ -58,7 +71,9 @@ async def ccm_command_help() -> str:
             })
 
         # Skills from SKILL.md files
-        skills = discover_skills()
+        skills = discover_skills(
+            exclude={"monitor"} if provider == "codex" else None
+        )
         skill_list = []
         for name, skill in skills.items():
             skill_list.append({
@@ -90,6 +105,17 @@ async def ccm_read_skill(skill_name: str) -> str:
         skill_name: 技能名称（如 monitor, code-review）
     """
     try:
+        from backend.services.skill_context import skill_supported
+        task_data = await _get_task_data()
+        provider = task_data.get("provider") or "claude"
+        if not skill_supported(provider, skill_name):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Skill '{skill_name}' is not supported by provider "
+                    f"{provider}"
+                ),
+            }, ensure_ascii=False)
         from backend.services.skill_loader import discover_skills
         skills = discover_skills()
         skill = skills.get(skill_name)
@@ -144,6 +170,48 @@ async def ccm_read_user_skill(skill_id: int) -> str:
         skill_id: Skill ID（在目录中显示为 id=N）
     """
     try:
+        from backend.services.skill_context import (
+            normalize_user_skill_ids,
+            user_skill_snapshots_from_metadata,
+        )
+
+        task_data = await _get_task_data()
+        selected = normalize_user_skill_ids(
+            task_data.get("selected_user_skills")
+        )
+        if skill_id not in selected:
+            return json.dumps({
+                "success": False,
+                "error": f"User skill {skill_id} is not selected for this task",
+            }, ensure_ascii=False)
+        metadata = task_data.get("metadata_")
+        snapshots = {
+            snapshot.id: snapshot
+            for snapshot in user_skill_snapshots_from_metadata(
+                metadata
+            )
+        }
+        snapshot = snapshots.get(skill_id)
+        if snapshot is not None:
+            return json.dumps({
+                "success": True,
+                "id": snapshot.id,
+                "name": snapshot.name,
+                "description": snapshot.description,
+                "content": snapshot.content,
+            }, ensure_ascii=False)
+        if (
+            isinstance(metadata, dict)
+            and "ccm_user_skill_snapshots" in metadata
+        ):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"User skill {skill_id} is unavailable in the "
+                    "authoritative task snapshot"
+                ),
+            }, ensure_ascii=False)
+
         from backend.database import async_session
         from backend.models.user_skill import UserSkill
         async with async_session() as db:

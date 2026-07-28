@@ -49,7 +49,11 @@ def _no_pty_no_skills(monkeypatch):
     monkeypatch.setattr("backend.config.settings.use_pty_mode", False)
     with patch("backend.services.skill_loader.discover_skills", return_value={}), \
          patch("backend.services.skill_loader.build_skill_prompt_file", return_value=""), \
-         patch("backend.services.skill_loader.get_skill_disallowed_tools", return_value=[]):
+         patch("backend.services.skill_loader.get_skill_disallowed_tools", return_value=[]), \
+         patch(
+             "backend.services.skill_context.build_task_skill_context",
+             new=AsyncMock(return_value=""),
+         ):
         yield
 
 
@@ -461,6 +465,58 @@ def test_build_command_codex_renders_required_mcp_as_exact_argv_tokens(
     assert expected_mcp_args[1] in cmd
     assert "--task-id" in expected_mcp_args[1]
     assert '"73"' in expected_mcp_args[1]
+
+
+def test_build_command_codex_exec_uses_canonical_skill_context():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    cmd = im._build_command(
+        provider="codex",
+        prompt="review this",
+        model="gpt-5.6-sol",
+        resume_session_id=None,
+        effort_level="high",
+        skill_context="## Available Skills\n- **review**: Review changes",
+    )
+
+    assert cmd[-1] == (
+        "<ccm-task-skill-context>\n"
+        "## Available Skills\n- **review**: Review changes\n"
+        "</ccm-task-skill-context>\n\n"
+        "review this"
+    )
+
+
+def test_build_command_claude_uses_one_canonical_skill_file():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    cmd = im._build_command(
+        provider="claude",
+        prompt="review this",
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        task_id=73,
+        skill_context=(
+            "## Available Skills\n- **review**: Review changes\n\n"
+            "## User Skills\n- **Personal** (id=8): Checklist"
+        ),
+    )
+
+    indexes = [
+        index
+        for index, token in enumerate(cmd)
+        if token == "--append-system-prompt-file"
+    ]
+    assert len(indexes) == 1
+    prompt_path = Path(cmd[indexes[0] + 1])
+    try:
+        assert prompt_path.read_text(encoding="utf-8") == (
+            "## Available Skills\n- **review**: Review changes\n\n"
+            "## User Skills\n- **Personal** (id=8): Checklist\n"
+        )
+    finally:
+        prompt_path.unlink(missing_ok=True)
 
 
 def test_build_command_codex_rejects_invalid_required_exec_mcp():
@@ -1197,7 +1253,7 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
 
     argv = list(exec_mock.await_args.args)
     expected_mcp_args = render_codex_exec_config_args(
-        build_mcp_server_specs(task.id, {})
+        build_mcp_server_specs(task.id, {}, provider="codex")
     )
     flag_index = argv.index("-c")
     assert argv[flag_index : flag_index + 2] == expected_mcp_args
@@ -1824,6 +1880,15 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     with (
         caplog.at_level("INFO", logger="backend.services.instance_manager"),
         patch(
+            "backend.services.skill_context.build_task_skill_context",
+            new=AsyncMock(
+                return_value=(
+                    "## Available Skills\n"
+                    "- **review**: Review changes"
+                ),
+            ),
+        ),
+        patch(
             "backend.services.codex_app_server.CodexAppServer.ensure_started",
             new_callable=AsyncMock,
             side_effect=startup_error,
@@ -1857,11 +1922,16 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     exec_mock.assert_awaited_once()
     argv = list(exec_mock.await_args.args)
     expected_mcp_args = render_codex_exec_config_args(
-        build_mcp_server_specs(task.id, {})
+        build_mcp_server_specs(task.id, {}, provider="codex")
     )
     flag_index = argv.index("-c")
     assert argv[flag_index : flag_index + 2] == expected_mcp_args
-    assert argv[-1] == "must keep required MCP"
+    assert argv[-1] == (
+        "<ccm-task-skill-context>\n"
+        "## Available Skills\n- **review**: Review changes\n"
+        "</ccm-task-skill-context>\n\n"
+        "must keep required MCP"
+    )
     assert "route=safe-fallback" in caplog.text
     assert "reason=required-mcp-pre-turn" in caplog.text
     await asyncio.sleep(0.1)
@@ -7586,11 +7656,9 @@ async def test_launch_delegates_to_pty_backend_for_claude():
 
 
 @pytest.mark.asyncio
-async def test_pty_launch_injects_async_user_skill_directory(tmp_path):
+async def test_pty_launch_injects_canonical_task_skill_context():
     im = InstanceManager(_FakeDBFactory(), MagicMock())
     calls = {}
-    prompt_file = tmp_path / "user-skills.md"
-    prompt_file.write_text("## User Skills\n- **Review** (id=2): edge cases")
 
     class FakeBackend:
         async def launch_for_ccm(self, **kwargs):
@@ -7601,8 +7669,12 @@ async def test_pty_launch_injects_async_user_skill_directory(tmp_path):
     im._pty_backend = FakeBackend()
     im._pty_enabled = True
     with patch(
-        "backend.services.user_skill_injector.build_user_skill_prompt",
-        new=AsyncMock(return_value=str(prompt_file)),
+        "backend.services.skill_context.build_task_skill_context",
+        new=AsyncMock(
+            return_value="## User Skills\n- **Review** (id=2): edge cases",
+        ),
+    ), patch(
+        "backend.services.ask_user_settings.ensure_ask_user_hook",
     ):
         await im.launch(
             instance_id=8,
@@ -7614,8 +7686,10 @@ async def test_pty_launch_injects_async_user_skill_directory(tmp_path):
 
     assert "## User Skills" in calls["prompt"]
     assert "**Review** (id=2)" in calls["prompt"]
-    assert calls["prompt"].endswith("## Current user request\n\nreview this")
-    assert not prompt_file.exists()
+    assert calls["prompt"].startswith("<ccm-task-skill-context>")
+    assert calls["prompt"].endswith(
+        "</ccm-task-skill-context>\n\nreview this"
+    )
 
 
 @pytest.mark.asyncio

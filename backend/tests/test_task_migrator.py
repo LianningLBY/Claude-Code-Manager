@@ -514,6 +514,8 @@ async def test_worker_task_import_is_one_inert_request(
     assert payload["id"] == t.id
     assert payload["project_id"] == 17
     assert payload["retry_count"] == 2
+    assert payload["selected_user_skills"] is None
+    assert payload["user_skill_snapshots"] == []
 
 
 async def test_put_worker_id_triggers_migration(client, session_factory, monkeypatch):

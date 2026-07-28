@@ -714,6 +714,7 @@ class InstanceManager:
         # files, containers, or a real agent process; a post-spawn rowcount
         # check remains below as defense against cross-process DB mutation.
         task_retry_count: int | None = None
+        task_skill_context = ""
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -734,6 +735,21 @@ class InstanceManager:
                         f"Task {task_id} no longer owns instance {instance_id}"
                     )
                 task_retry_count = generation_row[0]
+                if (
+                    provider == "claude"
+                    or settings.codex_main_mcp_enabled
+                ):
+                    from backend.services.skill_context import (
+                        build_task_skill_context,
+                    )
+
+                    task_skill_context = await build_task_skill_context(
+                        db,
+                        task_id=task_id,
+                        provider=provider,
+                        project_dir=cwd,
+                        enabled_skills=enabled_skills,
+                    )
         if provider == "codex":
             # A Codex turn is not reusable when its process adapter reaches a
             # terminal returncode: the output consumer may still be migrating
@@ -861,6 +877,7 @@ class InstanceManager:
             codex_mcp_specs = build_mcp_server_specs(
                 task_id,
                 enabled_skills or {},
+                provider=provider,
             )
         elif codex_sub_agent_mcp_required:
             from backend.services.mcp_config import (
@@ -906,6 +923,7 @@ class InstanceManager:
                         enabled_skills=enabled_skills,
                         task_retry_count=task_retry_count,
                         mcp_specs=codex_mcp_specs,
+                        skill_context=task_skill_context,
                         source_log_id=source_log_id,
                         current_message=current_message,
                         queue_timestamp=queue_timestamp,
@@ -996,40 +1014,7 @@ class InstanceManager:
                         config_dir,
                     )
 
-        user_skill_prompt_path = None
-        if provider == "claude" and task_id:
-            from backend.services.user_skill_injector import (
-                build_user_skill_prompt,
-            )
-
-            user_skill_prompt_path = await build_user_skill_prompt(
-                task_id,
-                self.db_factory,
-            )
-
         if provider == "claude" and self.pty_mode_enabled:
-            if user_skill_prompt_path:
-                try:
-                    user_skill_directory = Path(
-                        user_skill_prompt_path
-                    ).read_text(encoding="utf-8")
-                except OSError:
-                    user_skill_directory = ""
-                finally:
-                    try:
-                        os.unlink(user_skill_prompt_path)
-                    except OSError:
-                        pass
-                if user_skill_directory:
-                    # claude-pty's pinned PTYConfig has no equivalent of
-                    # --append-system-prompt-file.  Put the small L0 skill
-                    # directory in the turn prompt so the default PTY path has
-                    # the same user-skill discovery capability as direct -p.
-                    prompt = (
-                        f"{user_skill_directory}\n\n"
-                        "## Current user request\n\n"
-                        f"{prompt}"
-                    )
             return await self._launch_pty(
                 instance_id=instance_id,
                 prompt=prompt,
@@ -1049,6 +1034,7 @@ class InstanceManager:
                 claude_binary_override=_container_wrapper,
                 container_exec_spec=_container_exec_spec,
                 task_retry_count=task_retry_count,
+                skill_context=task_skill_context,
                 cloudrouter_api=cloudrouter_account is not None,
                 source_log_id=source_log_id,
                 current_message=current_message,
@@ -1067,12 +1053,11 @@ class InstanceManager:
             system_prompt_mode=system_prompt_mode,
             cwd=cwd,
             task_id=task_id,
+            skill_context=task_skill_context,
             codex_mcp_specs=(
                 codex_mcp_specs if codex_main_mcp_required else ()
             ),
             codex_api_account=cloudrouter_account is not None,
-            user_skill_prompt_path=user_skill_prompt_path,
-            resolve_user_skill_prompt=False,
         )
         if provider == "codex":
             logger.info(
@@ -1618,6 +1603,7 @@ class InstanceManager:
         enabled_skills: dict | None,
         task_retry_count: int | None = None,
         mcp_specs: Sequence["McpServerSpec"] = (),
+        skill_context: str = "",
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
@@ -1639,6 +1625,7 @@ class InstanceManager:
             task_id=task_id,
             mcp_specs=mcp_specs,
             disable_project_config=disable_project_config,
+            skill_context=skill_context,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -2189,6 +2176,7 @@ class InstanceManager:
         claude_binary_override: str | None = None,
         container_exec_spec=None,
         task_retry_count: int | None = None,
+        skill_context: str = "",
         cloudrouter_api: bool = False,
         source_log_id: int | None = None,
         current_message: str | None = None,
@@ -2281,9 +2269,13 @@ class InstanceManager:
 
                     self._pty_backend.build_config = _patched_build_config
                 try:
+                    from backend.services.skill_context import (
+                        wrap_skill_context,
+                    )
+
                     session_id = await self._pty_backend.launch_for_ccm(
                         instance_id=instance_id,
-                        prompt=prompt,
+                        prompt=wrap_skill_context(prompt, skill_context),
                         task_id=task_id,
                         cwd=cwd,
                         model=model if model and model != "default" else None,
@@ -2774,10 +2766,9 @@ class InstanceManager:
         system_prompt_mode: str | None = None,
         cwd: str | None = None,
         task_id: int | None = None,
+        skill_context: str = "",
         codex_mcp_specs: Sequence["McpServerSpec"] = (),
         codex_api_account: bool = False,
-        user_skill_prompt_path: str | None = None,
-        resolve_user_skill_prompt: bool = True,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -2794,7 +2785,10 @@ class InstanceManager:
                 cmd.extend(["--model", model])
             if effort_level:
                 cmd.extend(["--effort", effort_level])
-            from backend.services.skill_loader import discover_skills, build_skill_prompt_file, get_skill_disallowed_tools
+            from backend.services.skill_loader import (
+                discover_skills,
+                get_skill_disallowed_tools,
+            )
             skills = discover_skills(project_dir=cwd)
             disallowed = []
             if not enable_workflows:
@@ -2807,21 +2801,16 @@ class InstanceManager:
                 cmd.extend(["--disallowedTools", ",".join(sorted(set(disallowed)))])
             if mcp_config_path and Path(mcp_config_path).exists():
                 cmd.extend(["--mcp-config", mcp_config_path])
-            # Skill prompt injection (plugins + user skills)
-            skill_prompt_path = build_skill_prompt_file(skills, enabled_skills, task_id)
+            # Skill prompt injection (plugins + user skills) is built once by
+            # the provider-neutral task context builder.
+            from backend.services.skill_context import write_skill_context_file
+
+            skill_prompt_path = write_skill_context_file(
+                skill_context,
+                task_id,
+            )
             if skill_prompt_path:
                 cmd.extend(["--append-system-prompt-file", skill_prompt_path])
-            # User skill injection (L0 directory in prompt)
-            if user_skill_prompt_path:
-                cmd.extend([
-                    "--append-system-prompt-file",
-                    user_skill_prompt_path,
-                ])
-            elif task_id and resolve_user_skill_prompt:
-                from backend.services.user_skill_injector import build_user_skill_prompt_sync
-                user_skill_path = build_user_skill_prompt_sync(task_id)
-                if user_skill_path:
-                    cmd.extend(["--append-system-prompt-file", user_skill_path])
             if system_prompt_mode and settings.append_system_prompt_file:
                 sp_path = Path(settings.append_system_prompt_file)
                 if not sp_path.is_absolute():
@@ -2832,6 +2821,9 @@ class InstanceManager:
             return cmd
 
         if provider == "codex":
+            from backend.services.skill_context import wrap_skill_context
+
+            prompt = wrap_skill_context(prompt, skill_context)
             codex_binary = self._resolve_codex_binary()
             if resume_session_id:
                 cmd = [codex_binary, "exec", "resume"]

@@ -273,20 +273,92 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         goal_max_turns=30,
         provider="codex",
         enable_workflows=False,
+        selected_user_skills=[5],
         tags=["pr-review"],
         metadata_={"pr_review_id": 123},
     )
     proxy.get_worker = AsyncMock(return_value=worker)
     proxy.ensure_worker_project = AsyncMock(return_value=34)
+    proxy._user_skill_snapshots = AsyncMock(return_value=[{
+        "id": 5,
+        "name": "Manager skill",
+        "description": "copied",
+        "content": "body",
+    }])
 
     await proxy._forward_task_to_worker_locked(task)
 
     parsed_on_worker = TaskCreate.model_validate(captured_payload)
     assert captured_payload["tags"] == ["pr-review"]
+    assert captured_payload["selected_user_skills"] == [5]
+    assert captured_payload["user_skill_snapshots"] == [{
+        "id": 5,
+        "name": "Manager skill",
+        "description": "copied",
+        "content": "body",
+    }]
     assert parsed_on_worker.tags == ["pr-review"]
     # metadata_ is intentionally not a public TaskCreate field; the hidden
     # termination endpoint accepts the forwarded tag only for Worker copies.
     assert not hasattr(parsed_on_worker, "metadata_")
+
+
+async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
+    captured_payload = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def put(self, _url, *, headers, json):
+            captured_payload.update(json)
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    proxy._user_skill_snapshots = AsyncMock(return_value=[{
+        "id": 6,
+        "name": "Updated skill",
+        "description": "latest selection",
+        "content": "body",
+    }])
+    worker = Worker(
+        id=78,
+        name="worker",
+        private_ip="10.0.0.78",
+        auth_token="token",
+    )
+    task = Task(
+        id=902,
+        title="remote",
+        description="continue",
+        worker_id=worker.id,
+        enabled_skills={"code-review": True},
+        selected_user_skills=[6],
+    )
+
+    await proxy.sync_task_skill_selection(worker, task)
+
+    assert captured_payload == {
+        "enabled_skills": {"code-review": True},
+        "selected_user_skills": [6],
+        "user_skill_snapshots": [{
+            "id": 6,
+            "name": "Updated skill",
+            "description": "latest selection",
+            "content": "body",
+        }],
+    }
 
 
 # === WorkerRelay._handle ===

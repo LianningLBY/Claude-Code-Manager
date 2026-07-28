@@ -820,6 +820,20 @@ class TaskMigrator:
         """Atomically import an inert same-ID task on the destination Worker."""
         headers = {"Authorization": f"Bearer {dst.auth_token}"}
         base = f"http://{dst.private_ip}:{dst.ccm_port}/api/tasks"
+        from backend.services.skill_context import (
+            build_user_skill_snapshot_payload,
+            normalize_user_skill_ids,
+        )
+
+        user_skill_snapshots = []
+        if normalize_user_skill_ids(task.selected_user_skills):
+            async with self.db_factory() as db:
+                user_skill_snapshots = (
+                    await build_user_skill_snapshot_payload(
+                        db,
+                        task.selected_user_skills,
+                    )
+                )
         payload = {
             "id": task.id,
             "worker_id": None,
@@ -848,6 +862,7 @@ class TaskMigrator:
             "enable_workflows": task.enable_workflows,
             "enabled_skills": task.enabled_skills,
             "selected_user_skills": task.selected_user_skills,
+            "user_skill_snapshots": user_skill_snapshots,
             "tags": task.tags,
             "starred": task.starred,
             "session_id": task.session_id,

@@ -875,7 +875,10 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
 
     upstream_status = str(payload.get("status") or "active").lower()
     mode = str(payload.get("mode") or "").lower()
-    if mode not in {"quota_limited", "subscription", "wallet"}:
+    # CloudRouter reports accounts without a spend cap as ``unrestricted``.
+    # Their balance/remaining fields may both be zero, but those values are
+    # informational rather than an exhaustion signal.
+    if mode not in {"quota_limited", "subscription", "wallet", "unrestricted"}:
         mode = "subscription" if isinstance(payload.get("subscription"), dict) else "wallet"
     expired = upstream_status == "expired"
     exhausted = upstream_status in {"quota_exhausted", "exhausted"}
@@ -890,7 +893,7 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
     )
     currency = (
         "USD"
-        if mode in {"quota_limited", "wallet"} or subscription_uses_usd
+        if mode in {"quota_limited", "wallet", "unrestricted"} or subscription_uses_usd
         else "credits"
     )
     quota_value = payload.get("quota")

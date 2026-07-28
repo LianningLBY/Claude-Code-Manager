@@ -695,6 +695,28 @@ async def test_wallet_negative_one_remaining_means_unlimited(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_unrestricted_zero_balance_remains_available(tmp_path, monkeypatch):
+    store, account = await _add(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "_request_json", AsyncMock(return_value={
+        "balance": 0,
+        "isValid": True,
+        "mode": "unrestricted",
+        "planName": "钱包余额",
+        "remaining": 0,
+        "unit": "USD",
+    }))
+
+    snapshot = await store.fetch_usage(account.id)
+
+    assert snapshot["mode"] == "unrestricted"
+    assert snapshot["state"] == "active"
+    assert snapshot["available"] is True
+    assert snapshot["currency"] == "USD"
+    assert snapshot["balance"] == 0
+    assert snapshot["remaining"] == 0
+
+
+@pytest.mark.asyncio
 async def test_wallet_negative_balance_other_than_unlimited_is_exhausted(
     tmp_path, monkeypatch,
 ):

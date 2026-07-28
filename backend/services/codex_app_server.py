@@ -1050,9 +1050,19 @@ class CodexAppServer:
         # Persist the native thread id through the same event path as exec.
         turn_process.feed({"type": "thread.started", "thread_id": thread_id})
 
+        model_prompt = prompt
+        if required_context:
+            from backend.services.skill_context import wrap_skill_context
+
+            # Codex 0.144.6 silently drops unknown TurnStartParams fields.
+            # Keep the canonical task context in the schema-backed text input
+            # so the primary app-server route and exec fallback expose the
+            # same bounded, model-visible prompt.
+            model_prompt = wrap_skill_context(prompt, skill_context)
+
         turn_params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": [{"type": "text", "text": model_prompt}],
             "cwd": os.path.abspath(cwd),
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
@@ -1063,13 +1073,6 @@ class CodexAppServer:
             # between thread admission and this turn.
             "serviceTier": rpc_service_tier,
         }
-        if required_context:
-            turn_params["additionalContext"] = {
-                "ccm.taskSkills": {
-                    "kind": "application",
-                    "value": skill_context.strip(),
-                }
-            }
         turn_request = asyncio.create_task(self._request("turn/start", turn_params))
         turn_cancelled = False
         while not turn_request.done():

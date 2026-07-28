@@ -600,8 +600,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | 测试 | 验证内容 |
 |------|---------|
 | `test_skill_context.py` | Claude/Codex 使用同一 task-scoped 普通/User Skill 目录；禁用项不声明、User Skill 去重且正文不预注入、Codex 排除 Monitor、Worker snapshot 可独立解析 |
-| `test_codex_app_server.py::test_turn_start_receives_task_skill_additional_context` | app-server 把 canonical context 放入 `turn/start.additionalContext`，不污染用户 prompt |
-| `test_codex_app_server.py::test_explicit_skill_context_rejection_is_replay_safe` | app-server 显式拒绝 context 时归类为 pre-turn safe fallback；未知 admission 状态仍禁止重放 |
+| `test_codex_app_server.py::test_turn_start_prefixes_task_skills_in_schema_backed_text_input` | app-server 的 fresh/resume 都把 canonical context 精确写入 Codex 0.144.6 支持的 `turn/start.input[].text`，且请求不含 schema 外字段 |
+| `test_codex_app_server.py::test_stdio_protocol_delivers_skill_catalog_in_model_visible_input` | 经真实 stdio JSON-RPC 边界和 0.144.6 `TurnStartParams` 字段过滤后，模型可见输入仍包含普通/User Skill catalog、bounded markers 与原始 prompt；未知字段会被测试 peer 丢弃并导致断言失败 |
+| `test_codex_app_server.py::test_explicit_context_turn_rejection_is_replay_safe` | app-server 显式拒绝 schema-backed context turn 时归类为 pre-turn safe fallback；未知 admission 状态仍禁止重放 |
 | `test_service_instance_manager.py` 的 canonical Skill adapter 用例 | Claude、PTY、Codex exec 与 app-server 消费同一 context，且只注入一次 |
 | `test_service_instance_manager.py::test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | safe fallback 同时保留 required MCP 与完全相同的 Skill context |
 | `test_mcp_config.py::test_codex_main_server_does_not_advertise_monitor_tools` | Codex 主 MCP 不声明三个 Monitor 工具，Claude 保持不变 |

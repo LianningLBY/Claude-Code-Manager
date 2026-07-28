@@ -141,14 +141,7 @@ async def test_standard_proxy_accepts_reported_default_and_omitted_request_tier(
                 json=_request_body(tier=None),
             )
         assert response.status_code == 200
-        proof = await proxy.wait_for_actual_tier(
-            "thread-1",
-            "turn-1",
-            "default",
-            timeout=0.2,
-        )
-        assert proof.requested_tier == "default"
-        assert proof.actual_tier == "default"
+        assert b'"service_tier": "default"' in response.content
     finally:
         await proxy.close()
 
@@ -172,14 +165,37 @@ async def test_standard_proxy_accepts_unreported_actual_tier():
                 json=_request_body(tier=None),
             )
         assert response.status_code == 200
-        proof = await proxy.wait_for_actual_tier(
-            "thread-1",
-            "turn-1",
-            "default",
-            timeout=0.2,
+        assert b"response.created" in response.content
+    finally:
+        await proxy.close()
+
+
+@pytest.mark.asyncio
+async def test_standard_proxy_does_not_depend_on_responses_sse_prelude():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b"event: response.in_progress\n"
+                b'data: {"type":"response.in_progress","response":{}}\n\n'
+                b"event: response.completed\n"
+                b'data: {"type":"response.completed","response":{}}\n\n'
+            ),
         )
-        assert proof.requested_tier == "default"
-        assert proof.actual_tier is None
+
+    proxy = await _running_proxy(handler)
+    proxy.set_thread_tier("thread-1", "default")
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await client.post(
+                f"{proxy.local_base_url}/responses",
+                headers={"x-client-request-id": "thread-1"},
+                json=_request_body(tier=None),
+            )
+        assert response.status_code == 200
+        assert b"response.in_progress" in response.content
+        assert b"response.completed" in response.content
     finally:
         await proxy.close()
 

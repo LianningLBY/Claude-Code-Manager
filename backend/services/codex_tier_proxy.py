@@ -9,8 +9,9 @@ proxy is therefore deliberately placed on the HTTP Responses path:
   ``x-codex-parent-thread-id``;
 * Fast releases no successful SSE bytes until ``response.created`` reports
   the exact actual tier ``priority``;
-* Standard still proves that the outgoing request did not ask for priority,
-  while tolerating upstreams that omit the informational response field.
+* Standard proves that the outgoing request did not ask for priority, then
+  transparently streams the upstream response without depending on optional
+  response-tier metadata or a particular SSE prelude.
 
 The listener is per app-server/CODEX_HOME, loopback-only, and protected by a
 high-entropy path.  Authentication headers are forwarded but never retained or
@@ -1252,6 +1253,22 @@ class CodexActualTierProxy:
                 if identity is None:
                     await self._forward_unverified_response(writer, upstream)
                     return
+                if identity.expected_tier == CODEX_TIER_DEFAULT:
+                    # Standard is proven entirely at request admission:
+                    # _extract_request_identity rejected priority or unknown
+                    # service_tier values before any upstream request. Do not
+                    # make ordinary turns depend on optional response metadata
+                    # or an upstream-specific SSE event order. Fast remains
+                    # fail-closed in _forward_verified_sse below.
+                    logger.info(
+                        "Codex Standard request tier fenced "
+                        "thread=%s turn=%s parent=%s",
+                        identity.thread_id,
+                        identity.turn_id,
+                        identity.parent_thread_id or "-",
+                    )
+                    await self._forward_stream_response(writer, upstream)
+                    return
                 await self._forward_verified_sse(writer, upstream, identity)
             finally:
                 await upstream.aclose()
@@ -1341,6 +1358,22 @@ class CodexActualTierProxy:
             list(_filter_response_headers(upstream.headers)),
             bytes(body),
         )
+
+    async def _forward_stream_response(
+        self,
+        writer: asyncio.StreamWriter,
+        upstream: httpx.Response,
+    ) -> None:
+        """Stream a response after all required request-side checks passed."""
+
+        await self._send_stream_headers(
+            writer,
+            upstream.status_code,
+            list(_filter_response_headers(upstream.headers)),
+        )
+        async for chunk in _iter_response_raw(upstream):
+            writer.write(chunk)
+            await writer.drain()
 
     async def _forward_verified_sse(
         self,

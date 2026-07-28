@@ -96,7 +96,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     has_unread: false,
     session_id: 'session-123',
     error_message: null,
+    provider: 'claude',
     model: null,
+    codex_service_tier: 'default',
     tags: null,
     context_window_usage: null,
     created_at: '2024-01-01T00:00:00Z',
@@ -142,6 +144,63 @@ describe('ChatView', () => {
       );
 
       expect(await screen.findByTitle('Codex 主任务 MCP 已启用')).toHaveTextContent('MCP 已启用');
+    });
+
+    it('shows the Fast badge for a Codex priority task', async () => {
+      render(
+        <ChatView
+          task={makeTask({
+            provider: 'codex',
+            codex_service_tier: 'priority',
+          })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByTestId('codex-fast-badge')).toHaveTextContent('Fast');
+    });
+
+    it('blocks an unsupported one-shot model while the task is Fast', async () => {
+      vi.mocked(api.config).mockResolvedValue({
+        default_provider: 'codex',
+        provider_options: ['claude', 'codex'],
+        default_model: 'claude-opus-4-6',
+        model_options: ['claude-opus-4-6'],
+        default_codex_model: 'gpt-5.5',
+        codex_model_options: ['gpt-5.5', 'gpt-5.4-mini'],
+        default_effort: 'medium',
+        effort_options: ['low', 'medium', 'high'],
+        claude_model_efforts: {},
+        claude_model_context_windows: {},
+        codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
+        codex_model_efforts: {},
+        codex_model_service_tiers: {
+          'gpt-5.5': ['default', 'priority'],
+          'gpt-5.4-mini': ['default'],
+        },
+      });
+      render(
+        <ChatView
+          task={makeTask({
+            provider: 'codex',
+            model: 'gpt-5.5',
+            codex_service_tier: 'priority',
+          })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('临时切换模型（仅下一条消息）'));
+      const unsupported = await screen.findByRole('button', { name: /gpt-5\.4-mini/ });
+      expect(unsupported).toBeDisabled();
+      expect(unsupported).toHaveAttribute(
+        'title',
+        'gpt-5.4-mini 不支持 Fast；先在 Task Config 中切换为 Standard',
+      );
     });
 
     it('shows the emergency opt-out state returned by the backend', async () => {
@@ -262,7 +321,15 @@ describe('ChatView', () => {
       await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
 
       await waitFor(() => {
-        expect(api.injectTaskMessage).toHaveBeenCalledWith(task.id, 'change direction');
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'change direction',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+        );
       });
       expect(api.sendTaskChat).not.toHaveBeenCalled();
     });
@@ -489,6 +556,11 @@ describe('ChatView', () => {
         ['/repo/uploads/evidence.txt'],
         undefined,
         null,
+        {
+          provider: 'codex',
+          model: null,
+          codex_service_tier: 'default',
+        },
       ));
     });
 
@@ -519,6 +591,11 @@ describe('ChatView', () => {
         undefined,
         undefined,
         null,
+        {
+          provider: 'codex',
+          model: null,
+          codex_service_tier: 'default',
+        },
       ));
     });
   });

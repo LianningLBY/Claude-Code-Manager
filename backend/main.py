@@ -115,10 +115,13 @@ if recovery["recovered"] or recovery["quarantined"]:
     )
 
 _has_cloudrouter_codex_accounts = any(
-    account.enabled
-    and not account.retired
-    and account.supports_model("codex", None)
-    for account in cloudrouter_store.all_accounts()
+    account.cleanup_pending
+    or (
+        account.enabled
+        and not account.retired
+        and account.supports_model("codex", None)
+    )
+    for account in cloudrouter_store.all_accounts(include_retired=True)
 )
 if settings.codex_pool_enabled or _has_cloudrouter_codex_accounts:
     try:

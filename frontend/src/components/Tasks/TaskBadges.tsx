@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Wrench, Users, Settings } from '../icons';
 import { api } from '../../api/client';
-import type { Task, SubAgentSummary } from '../../api/client';
+import type { CodexServiceTier, Task, SubAgentSummary } from '../../api/client';
 
 // Plugins (SKILL.md-based) loaded from API at page load, cached globally
 let _pluginsCache: { key: string; label: string }[] | null = null;
@@ -142,6 +142,8 @@ interface ConfigOptions {
   claude: string[]; codex: string[];
   effort: string[]; codexEffort: string[];
   codexModelEfforts: Record<string, string[]>;
+  defaultCodexModel: string;
+  codexModelServiceTiers: Record<string, CodexServiceTier[]>;
 }
 let _configOptionsCache: ConfigOptions | null = null;
 async function fetchConfigOptions(): Promise<ConfigOptions> {
@@ -153,19 +155,36 @@ async function fetchConfigOptions(): Promise<ConfigOptions> {
     effort: c.effort_options,
     codexEffort: c.codex_effort_options,
     codexModelEfforts: c.codex_model_efforts || {},
+    defaultCodexModel: c.default_codex_model,
+    codexModelServiceTiers: c.codex_model_service_tiers || {},
   };
   return _configOptionsCache;
 }
 const fetchModelOptions = fetchConfigOptions;
 
+/** Visible Fast request marker. The backend refuses to start a turn unless
+ * priority was confirmed, so it cannot silently execute this task as Standard. */
+export function FastModeBadge({ task }: { task: Task }) {
+  if (task.provider !== 'codex' || task.codex_service_tier !== 'priority') return null;
+  return (
+    <span
+      data-testid="codex-fast-badge"
+      className="text-xs bg-amber-500/20 text-amber-300 px-1.5 rounded font-medium whitespace-nowrap"
+      title="Codex Fast（priority service tier）"
+    >
+      Fast
+    </span>
+  );
+}
+
 /** Clickable model badge: dropdown to switch the task's model (persisted). */
 export function ModelBadge({ task, onRefresh, compact }: { task: Task; onRefresh: () => void; compact?: boolean }) {
   const [open, setOpen] = useState(false);
-  const [options, setOptions] = useState<string[]>([]);
+  const [config, setConfig] = useState<ConfigOptions | null>(null);
 
   useEffect(() => {
     if (!open) return;
-    fetchModelOptions().then((o) => setOptions(task.provider === 'codex' ? o.codex : o.claude)).catch(() => {});
+    fetchModelOptions().then(setConfig).catch(() => {});
     const handle = (e: MouseEvent) => {
       if (!(e.target as HTMLElement).closest('[data-model-dropdown]')) setOpen(false);
     };
@@ -174,6 +193,7 @@ export function ModelBadge({ task, onRefresh, compact }: { task: Task; onRefresh
   }, [open, task.provider]);
 
   const label = task.model || 'default';
+  const options = config ? (task.provider === 'codex' ? config.codex : config.claude) : [];
 
   return (
     <div className="relative" data-model-dropdown>
@@ -197,9 +217,19 @@ export function ModelBadge({ task, onRefresh, compact }: { task: Task; onRefresh
                 setOpen(false);
                 if (m === task.model) return;
                 try {
-                  await api.updateTask(task.id, { model: m });
+                  const shouldClearFast = task.provider === 'codex'
+                    && task.codex_service_tier === 'priority'
+                    && !(config?.codexModelServiceTiers[m] || []).includes('priority');
+                  await api.updateTask(task.id, {
+                    model: m,
+                    ...(shouldClearFast ? { codex_service_tier: 'default' as const } : {}),
+                  });
                   onRefresh();
-                } catch { /* keep current */ }
+                } catch {
+                  // A lost response does not prove the update was rolled back.
+                  // Reconcile the badge/model with the authoritative Task.
+                  onRefresh();
+                }
               }}
               className={`w-full px-3 py-1.5 text-xs text-left transition-colors hover:bg-gray-700 ${
                 m === task.model ? 'text-indigo-300 bg-indigo-600/20' : 'text-gray-300'
@@ -243,6 +273,7 @@ const THINKING_OPTIONS: { value: string; label: string }[] = [
 export function TaskConfigBadge({ task, onRefresh, openUp, align }: { task: Task; onRefresh: () => void; openUp?: boolean; align?: 'left' | 'right' }) {
   const [open, setOpen] = useState(false);
   const [opts, setOpts] = useState<ConfigOptions | null>(null);
+  const [updateError, setUpdateError] = useState('');
   // workers state removed — Run on moved to Project level
   // migrating state removed — Run on moved to Project level
 
@@ -266,8 +297,19 @@ export function TaskConfigBadge({ task, onRefresh, openUp, align }: { task: Task
     if (isShared) return;
     try {
       await api.updateTask(task.id, data);
+      setUpdateError('');
       onRefresh();
-    } catch { /* keep current */ }
+    } catch (error) {
+      setUpdateError(
+        error instanceof Error
+          ? error.message
+          : 'Task 配置保存失败，请稍后重试',
+      );
+      // The response can be lost after the server has already committed the
+      // authoritative routing tuple. Re-read it even on failure so a stale
+      // Fast badge can never be treated as proof that the next turn is Fast.
+      onRefresh();
+    }
   };
 
   const isCodex = task.provider === 'codex';
@@ -276,6 +318,13 @@ export function TaskConfigBadge({ task, onRefresh, openUp, align }: { task: Task
   const efforts = opts
     ? (isCodex ? (task.model && opts.codexModelEfforts[task.model]) || opts.codexEffort : opts.effort)
     : [];
+  const resolvedCodexModel = (
+    !task.model || task.model === 'default'
+      ? opts?.defaultCodexModel
+      : task.model
+  ) || '';
+  const codexModelSupportsFast = !!opts
+    && (opts.codexModelServiceTiers[resolvedCodexModel] || []).includes('priority');
 
   return (
     <div className="relative" data-task-config>
@@ -294,12 +343,29 @@ export function TaskConfigBadge({ task, onRefresh, openUp, align }: { task: Task
           onClick={(e) => e.stopPropagation()}
         >
           {isShared && <p className="text-xs text-orange-400 mb-2">Shared task — read only</p>}
+          {updateError && (
+            <p
+              role="alert"
+              className="text-xs text-red-300 bg-red-950/50 border border-red-800/60 rounded px-2 py-1.5 mb-2"
+            >
+              配置保存失败：{updateError}
+            </p>
+          )}
           <div className={`grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 items-center text-xs ${isShared ? 'pointer-events-none opacity-60' : ''}`}>
             <span className="text-gray-400">Model</span>
             <select
               className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
               value={task.model || ''}
-              onChange={(e) => update({ model: e.target.value })}
+              onChange={(e) => {
+                const nextModel = e.target.value;
+                const shouldClearFast = isCodex
+                  && task.codex_service_tier === 'priority'
+                  && !(opts?.codexModelServiceTiers[nextModel] || []).includes('priority');
+                update({
+                  model: nextModel,
+                  ...(shouldClearFast ? { codex_service_tier: 'default' as const } : {}),
+                });
+              }}
             >
               {task.model && !models.includes(task.model) && (
                 <option value={task.model}>{task.model}</option>
@@ -316,6 +382,21 @@ export function TaskConfigBadge({ task, onRefresh, openUp, align }: { task: Task
               {!task.effort_level && <option value="">default</option>}
               {efforts.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
+
+            {isCodex && (
+              <>
+                <span className="text-gray-400">Speed</span>
+                <select
+                  aria-label="Codex speed"
+                  className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
+                  value={task.codex_service_tier || 'default'}
+                  onChange={(e) => update({ codex_service_tier: e.target.value as CodexServiceTier })}
+                >
+                  <option value="default">Standard</option>
+                  <option value="priority" disabled={!codexModelSupportsFast}>Fast</option>
+                </select>
+              </>
+            )}
 
             <span className="text-gray-400">Timeout</span>
             <select
@@ -346,6 +427,13 @@ export function TaskConfigBadge({ task, onRefresh, openUp, align }: { task: Task
               <option value="replace">Fable 5 (Replace)</option>
             </select>
           </div>
+          {isCodex && (
+            <div className={`mt-2 text-[10px] ${codexModelSupportsFast ? 'text-amber-400/80' : 'text-gray-500'}`}>
+              {codexModelSupportsFast
+                ? 'Fast 约 1.5×，会消耗更多额度；实际计价取决于账号来源'
+                : `${resolvedCodexModel || '当前模型'} 不支持 Fast`}
+            </div>
+          )}
           <div className="mt-2 text-[10px] text-gray-500">修改在下一轮对话生效</div>
         </div>
       )}

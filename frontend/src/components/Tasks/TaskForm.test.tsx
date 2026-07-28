@@ -17,7 +17,7 @@ vi.mock('../../api/client', () => ({
       default_model: 'claude-opus-4-6',
       model_options: ['claude-opus-4-6', 'claude-sonnet-4-6'],
       default_codex_model: 'gpt-5.5',
-      codex_model_options: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+      codex_model_options: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini'],
       default_effort: 'medium',
       effort_options: ['low', 'medium', 'high'],
       codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
@@ -25,6 +25,13 @@ vi.mock('../../api/client', () => ({
         'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
         'gpt-5.6-terra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
         'gpt-5.6-luna': ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      codex_model_service_tiers: {
+        'gpt-5.6-sol': ['default', 'priority'],
+        'gpt-5.6-terra': ['default', 'priority'],
+        'gpt-5.6-luna': ['default', 'priority'],
+        'gpt-5.5': ['default', 'priority'],
+        'gpt-5.4-mini': ['default'],
       },
     }),
     createTask: vi.fn().mockResolvedValue({ id: 1 }),
@@ -456,6 +463,94 @@ describe('Codex provider UI gating', () => {
   });
 });
 
+describe('Codex Fast speed configuration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.config).mockResolvedValue({
+      default_provider: 'claude',
+      provider_options: ['claude', 'codex'],
+      default_model: 'claude-opus-4-6',
+      model_options: ['claude-opus-4-6'],
+      default_codex_model: 'gpt-5.5',
+      codex_model_options: ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4-mini'],
+      default_effort: 'medium',
+      effort_options: ['low', 'medium', 'high'],
+      claude_model_efforts: {},
+      claude_model_context_windows: {},
+      codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
+      codex_model_efforts: {},
+      codex_model_service_tiers: {
+        'gpt-5.6-sol': ['default', 'priority'],
+        'gpt-5.5': ['default', 'priority'],
+        'gpt-5.4-mini': ['default'],
+      },
+    });
+  });
+
+  async function switchToCodexFastForm() {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+    await userEvent.selectOptions(
+      await waitFor(() => screen.getByDisplayValue('Claude')),
+      'codex',
+    );
+    return waitFor(() => screen.getByLabelText('Codex speed'));
+  }
+
+  it('only shows Speed for Codex tasks', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+    expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByDisplayValue('Claude'), 'codex');
+    expect(await screen.findByLabelText('Codex speed')).toHaveValue('default');
+
+    await userEvent.selectOptions(screen.getByDisplayValue('Codex'), 'claude');
+    expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
+  });
+
+  it('persists priority in the task creation payload', async () => {
+    const speedSelect = await switchToCodexFastForm();
+    await userEvent.selectOptions(speedSelect, 'priority');
+    await selectProject();
+    await userEvent.type(
+      screen.getByPlaceholderText('Prompt / Description (this will be sent to Codex)'),
+      'fast task',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({ codex_service_tier: 'priority' }),
+    ));
+  });
+
+  it('atomically resets Fast when switching to an unsupported model', async () => {
+    const speedSelect = await switchToCodexFastForm();
+    await userEvent.selectOptions(speedSelect, 'priority');
+    expect(speedSelect).toHaveValue('priority');
+
+    await userEvent.selectOptions(
+      screen.getByDisplayValue('gpt-5.5 (default)'),
+      'gpt-5.4-mini',
+    );
+
+    await waitFor(() => expect(speedSelect).toHaveValue('default'));
+    expect(screen.getByRole('option', { name: 'Fast' })).toBeDisabled();
+    expect(screen.getByText('gpt-5.4-mini 不支持 Fast')).toBeInTheDocument();
+  });
+
+  it('stores and restores Fast in the new-task localStorage defaults', async () => {
+    const speedSelect = await switchToCodexFastForm();
+    await userEvent.selectOptions(speedSelect, 'priority');
+    await userEvent.click(screen.getByRole('button', { name: '设为默认配置' }));
+
+    expect(JSON.parse(localStorage.getItem('cc_default_task_config') || '{}')).toEqual(
+      expect.objectContaining({ codexServiceTier: 'priority' }),
+    );
+  });
+});
+
 describe('TaskForm persisted defaults', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -471,6 +566,7 @@ describe('TaskForm persisted defaults', () => {
       provider: 'codex',
       model: 'gpt-5.6-sol',
       effort: 'ultra',
+      codexServiceTier: 'priority',
     }));
 
     render(<TaskForm onCreated={vi.fn()} />);
@@ -490,12 +586,17 @@ describe('TaskForm persisted defaults', () => {
       codex_model_efforts: {
         'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
       },
+      codex_model_service_tiers: {
+        'gpt-5.6-sol': ['default', 'priority'],
+        'gpt-5.5': ['default', 'priority'],
+      },
     }));
 
     await waitFor(() => {
       expect(screen.getByDisplayValue('Codex')).toBeInTheDocument();
       expect(screen.getByDisplayValue('gpt-5.6-sol')).toBeInTheDocument();
       expect(screen.getByDisplayValue('ultra')).toBeInTheDocument();
+      expect(screen.getByLabelText('Codex speed')).toHaveValue('priority');
     });
   });
 

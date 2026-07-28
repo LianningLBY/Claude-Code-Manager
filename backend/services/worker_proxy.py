@@ -31,6 +31,10 @@ _task_operation_locks: WeakKeyDictionary[
 ] = WeakKeyDictionary()
 
 
+class WorkerEndpointNotFoundError(Exception):
+    """A caller-requested signal that the Worker returned an exact HTTP 404."""
+
+
 def get_task_operation_lock(task_id: int) -> asyncio.Lock:
     """Return the process-wide operation lock for one Task on this event loop.
 
@@ -181,6 +185,55 @@ class WorkerProxy:
     # 任务转发（设计 §5.3）
     # ------------------------------------------------------------------
 
+    async def require_worker_fast_support(
+        self,
+        worker: Worker,
+        task: Task,
+    ) -> None:
+        """Fail before remote task creation when a Worker cannot prove Fast.
+
+        Older Workers ignore unknown Task fields, which would otherwise let a
+        Manager display Fast while the remote turn runs as Standard.
+        """
+
+        if (
+            (task.provider or "claude").lower() != "codex"
+            or (task.codex_service_tier or "default") != "priority"
+        ):
+            return
+
+        async with httpx.AsyncClient(timeout=30) as c:
+            response = await c.get(
+                self._api(worker, "/api/system/config"),
+                headers=self._headers(worker),
+            )
+            response.raise_for_status()
+        try:
+            config = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} 无法确认 Codex Fast 能力，任务未转发"
+            ) from exc
+        if not isinstance(config, dict):
+            raise RuntimeError(
+                f"Worker {worker.name} 无法确认 Codex Fast 能力，任务未转发"
+            )
+
+        model = task.model
+        if not model or model == "default":
+            model = config.get("default_codex_model")
+        tiers_by_model = config.get("codex_model_service_tiers")
+        supported = (
+            tiers_by_model.get(model)
+            if isinstance(tiers_by_model, dict) and isinstance(model, str)
+            else None
+        )
+        if not isinstance(supported, list) or "priority" not in supported:
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明模型 {model or 'default'} "
+                "支持 Codex Fast，任务未转发"
+            )
+
     async def forward_task_to_worker(self, task: Task):
         async with self.task_operation_lock(task.id):
             return await self._forward_task_to_worker_locked(task)
@@ -193,6 +246,7 @@ class WorkerProxy:
                 f"（{worker.status if worker else 'not found'}）"
             )
 
+        await self.require_worker_fast_support(worker, task)
         worker_project_id = await self.ensure_worker_project(worker, task)
 
         # 先订阅 relay 再创建：worker Dispatcher 可能创建后立即执行，后订阅丢初始事件
@@ -215,6 +269,7 @@ class WorkerProxy:
             "goal_evaluator_model": task.goal_evaluator_model,
             "provider": task.provider,
             "model": task.model,
+            "codex_service_tier": task.codex_service_tier,
             "effort_level": task.effort_level,
             "thinking_budget": task.thinking_budget,
             "timeout_hours": task.timeout_hours,
@@ -230,6 +285,20 @@ class WorkerProxy:
             )
             # 不检查会卡死在 in_progress：422 字段校验失败 / 500 都要立刻暴露
             r.raise_for_status()
+            if (task.codex_service_tier or "default") == "priority":
+                try:
+                    created = r.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 Codex Fast 任务配置"
+                    ) from exc
+                if (
+                    not isinstance(created, dict)
+                    or created.get("codex_service_tier") != "priority"
+                ):
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 Codex Fast 任务配置"
+                    )
         logger.info("task %s forwarded to worker %s", task.id, worker.id)
 
     async def push_files(self, worker: Worker, paths: list[str]):
@@ -251,6 +320,7 @@ class WorkerProxy:
         *,
         require_json: bool = False,
         allow_task_absent: bool = False,
+        surface_endpoint_not_found: bool = False,
         operation_lock_held: bool = False,
     ):
         if operation_lock_held:
@@ -261,6 +331,7 @@ class WorkerProxy:
                 body,
                 require_json=require_json,
                 allow_task_absent=allow_task_absent,
+                surface_endpoint_not_found=surface_endpoint_not_found,
             )
         async with self.task_operation_lock(task.id):
             return await self._proxy_to_worker_locked(
@@ -270,6 +341,7 @@ class WorkerProxy:
                 body,
                 require_json=require_json,
                 allow_task_absent=allow_task_absent,
+                surface_endpoint_not_found=surface_endpoint_not_found,
             )
 
     async def _proxy_to_worker_locked(
@@ -281,6 +353,7 @@ class WorkerProxy:
         *,
         require_json: bool,
         allow_task_absent: bool,
+        surface_endpoint_not_found: bool,
     ):
         worker = await self.require_ready_worker(task.worker_id)
         await self.relay.subscribe_task(worker, task.id)
@@ -311,6 +384,8 @@ class WorkerProxy:
                 f"内部 Worker 认证失败（远端 HTTP {r.status_code}），"
                 "请重试 Worker 引导以同步认证凭据",
             )
+        if surface_endpoint_not_found and r.status_code == 404:
+            raise WorkerEndpointNotFoundError(path)
         if allow_task_absent and r.status_code == 404:
             try:
                 missing = r.json()

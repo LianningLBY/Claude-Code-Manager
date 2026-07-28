@@ -197,6 +197,21 @@ async def test_config_ships_codex_sol_as_default(client):
 
 
 @pytest.mark.asyncio
+async def test_config_returns_codex_service_tier_capabilities(client):
+    resp = await client.get("/api/system/config")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["default_codex_service_tier"] == "default"
+    assert data["codex_service_tier_options"] == ["default", "priority"]
+    tiers = data["codex_model_service_tiers"]
+    assert tiers["gpt-5.6-sol"] == ["default", "priority"]
+    assert tiers["gpt-5.4"] == ["default", "priority"]
+    assert tiers["gpt-5.4-mini"] == ["default"]
+    assert tiers["gpt-5.3-codex-spark"] == ["default"]
+
+
+@pytest.mark.asyncio
 async def test_config_returns_model_options_list(client):
     resp = await client.get("/api/system/config")
     assert resp.status_code == 200

@@ -72,15 +72,29 @@ def _make_dispatcher(db_factory):
     instance_manager._try_proactive_pool_switch = AsyncMock()
 
     @asynccontextmanager
-    async def runtime_admission(_provider, _home, _model):
+    async def runtime_admission(
+        _provider,
+        _home,
+        _model,
+        *,
+        service_tier="default",
+    ):
         yield None
 
     @asynccontextmanager
     async def codex_exec_admission(home):
         yield home
 
+    @asynccontextmanager
+    async def codex_app_server_admission(home):
+        yield home
+
     instance_manager._cloudrouter_runtime_admission = runtime_admission
     instance_manager.codex_home_exec_guard = codex_exec_admission
+    instance_manager.codex_home_app_server_guard = codex_app_server_admission
+    instance_manager._ensure_codex_app_server_registry = MagicMock(
+        return_value=MagicMock(name="codex-app-server-registry"),
+    )
     instance_manager._pty_rate_limit_seen = set()
 
     broadcaster = MagicMock()
@@ -2650,6 +2664,134 @@ async def test_goal_turn_passes_pool_config_dir(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
+    db_factory,
+):
+    """A hidden Fast evaluator must never enter the Standard exec path."""
+
+    d = _make_dispatcher(db_factory)
+    codex_home = "/codex/fast-account"
+    d._resolve_resume_config_dir = AsyncMock(return_value=codex_home)
+    registry = MagicMock(name="fast-goal-registry")
+    d.instance_manager._ensure_codex_app_server_registry = MagicMock(
+        return_value=registry,
+    )
+    app_server_homes: list[str | None] = []
+    runtime_admissions: list[tuple] = []
+
+    @asynccontextmanager
+    async def app_server_guard(home):
+        app_server_homes.append(home)
+        yield home
+
+    @asynccontextmanager
+    async def forbidden_exec_guard(_home):
+        raise AssertionError("Fast goal evaluator entered codex exec")
+        yield  # pragma: no cover
+
+    @asynccontextmanager
+    async def runtime_admission(
+        provider,
+        home,
+        model,
+        *,
+        service_tier="default",
+    ):
+        runtime_admissions.append((provider, home, model, service_tier))
+        yield None
+
+    d.instance_manager.codex_home_app_server_guard = app_server_guard
+    d.instance_manager.codex_home_exec_guard = forbidden_exec_guard
+    d.instance_manager._cloudrouter_runtime_admission = runtime_admission
+    pool = MagicMock()
+    pool.is_known_account.return_value = True
+    pool.is_home_available.return_value = True
+    pool.supports_model_for_home.return_value = True
+    d.codex_pool = pool
+
+    async with db_factory() as db:
+        inst = Instance(name="fast-goal-worker")
+        task = _make_goal_task(db)
+        task.provider = "codex"
+        task.model = "gpt-5.4"
+        task.codex_service_tier = "priority"
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_obj = task
+
+    process = MagicMock(returncode=0, wait=AsyncMock(return_value=0))
+    d.instance_manager.processes = {inst_id: process}
+
+    from backend.services.goal_evaluator import GoalEvalResult
+
+    with patch(
+        "backend.services.goal_evaluator.GoalEvaluator.evaluate",
+        new_callable=AsyncMock,
+        return_value=GoalEvalResult(achieved=True, reason="done"),
+    ) as evaluate:
+        await _claim_mode_lifecycle(db_factory, inst_id, task_obj)
+        await d._run_goal_lifecycle(
+            inst_id,
+            task_obj,
+            d._task_lifecycle_generation(task_obj),
+            "/repo",
+        )
+
+    eval_kwargs = evaluate.await_args.kwargs
+    assert eval_kwargs["model"] == "gpt-5.4"
+    assert eval_kwargs["codex_home"] == codex_home
+    assert eval_kwargs["codex_service_tier"] == "priority"
+    assert eval_kwargs["codex_app_server_registry"] is registry
+    assert app_server_homes == [codex_home]
+    assert runtime_admissions == [
+        ("codex", codex_home, "gpt-5.4", "priority"),
+    ]
+    pool.supports_model_for_home.assert_called_with(
+        codex_home,
+        "gpt-5.4",
+        service_tier="priority",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fast_goal_rejects_different_evaluator_before_main_turn(
+    db_factory,
+):
+    """Even two Fast-capable models cannot split preflight from execution."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        inst = Instance(name="invalid-fast-goal-worker")
+        task = _make_goal_task(db)
+        task.provider = "codex"
+        task.model = "gpt-5.6-sol"
+        task.codex_service_tier = "priority"
+        task.goal_evaluator_model = "gpt-5.4"
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_obj = task
+
+    from backend.services.goal_evaluator import GoalEvaluationError
+
+    await _claim_mode_lifecycle(db_factory, inst_id, task_obj)
+    with pytest.raises(GoalEvaluationError, match="same model"):
+        await d._run_goal_lifecycle(
+            inst_id,
+            task_obj,
+            d._task_lifecycle_generation(task_obj),
+            "/repo",
+        )
+
+    d.instance_manager.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_text",
     [
@@ -2765,6 +2907,7 @@ async def test_goal_lifecycle_retry_resumes_persisted_turn_and_session(db_factor
         "claude",
         task_id=task_obj.id,
         expected_generation=expected_generation,
+        codex_service_tier="default",
     )
     async with db_factory() as db:
         persisted = await db.get(Task, task_obj.id)
@@ -3966,6 +4109,42 @@ async def test_codex_routing_failure_requeues_exact_message(db_factory, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_codex_fast_admission_failure_is_visible_and_not_requeued(
+    db_factory,
+):
+    """An unconfirmed Fast turn is a permanent refusal for this exact send."""
+
+    from backend.services.codex_app_server import (
+        CodexServiceTierUnavailableError,
+    )
+
+    d = _make_dispatcher(db_factory)
+    published = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        raise CodexServiceTierUnavailableError("priority was not admitted")
+
+    async def publish(task_id, exc):
+        assert task_id == 1
+        assert isinstance(exc, CodexServiceTierUnavailableError)
+        published.set()
+
+    d._process_queued_message = fake_process
+    d._publish_permanent_account_routing_failure = AsyncMock(
+        side_effect=publish,
+    )
+    await d.enqueue_message(1, "must not run as Standard")
+    await asyncio.wait_for(published.wait(), 1)
+    await asyncio.wait_for(d._get_task_queue(1).join(), 1)
+
+    assert len(seen) == 1
+    assert seen[0].prompt == "must not run as Standard"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
 async def test_claude_routing_failure_requeues_exact_message(
     db_factory,
     monkeypatch,
@@ -5077,6 +5256,78 @@ async def test_initial_command_skill_claim_uses_save_before_write_barrier(
 
 
 @pytest.mark.asyncio
+async def test_initial_launch_uses_route_saved_before_write_barrier(
+    db_factory,
+):
+    """The post-barrier provider/model/tier snapshot owns the first turn."""
+    d = _make_dispatcher(db_factory)
+    d._resolve_resume_config_dir = AsyncMock(return_value=None)
+    before_claim = asyncio.Event()
+    allow_claim = asyncio.Event()
+    blocked_once = False
+
+    async def block_after_stale_snapshot(_channel, payload):
+        nonlocal blocked_once
+        if (
+            not blocked_once
+            and payload.get("old_status") == "pending"
+            and payload.get("new_status") == "in_progress"
+        ):
+            blocked_once = True
+            before_claim.set()
+            await allow_claim.wait()
+
+    d.broadcaster.broadcast.side_effect = block_after_stale_snapshot
+
+    async with db_factory() as db:
+        instance = Instance(name="initial-route-save-race")
+        task = Task(
+            title="initial route save race",
+            description="do work",
+            status="in_progress",
+            provider="claude",
+            model="claude-opus-4-6",
+            codex_service_tier="default",
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        await db.refresh(task)
+        instance_id, task_id, task_obj = instance.id, task.id, task
+
+    async def successful_launch(**kwargs):
+        process = MagicMock(returncode=0)
+        process.wait = AsyncMock(return_value=0)
+        d.instance_manager.processes[kwargs["instance_id"]] = process
+
+    d.instance_manager.launch = AsyncMock(side_effect=successful_launch)
+    lifecycle = asyncio.create_task(
+        d._run_task_lifecycle(instance_id, task_obj)
+    )
+    await asyncio.wait_for(before_claim.wait(), timeout=1)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.provider = "codex"
+        current.model = "gpt-5.6-terra"
+        current.codex_service_tier = "priority"
+        await db.commit()
+
+    allow_claim.set()
+    await asyncio.wait_for(lifecycle, timeout=2)
+
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["provider"] == "codex"
+    assert launch["model"] == "gpt-5.6-terra"
+    assert launch["codex_service_tier"] == "priority"
+    route = d._resolve_resume_config_dir.await_args
+    assert route.args[:2] == (None, "codex")
+    assert route.kwargs["model"] == "gpt-5.6-terra"
+    assert route.kwargs["codex_service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
 async def test_queued_command_skill_claim_uses_save_before_write_barrier(
     db_factory,
     monkeypatch,
@@ -5119,6 +5370,227 @@ async def test_queued_command_skill_claim_uses_save_before_write_barrier(
         current = await db.get(Task, task_id)
         assert current.enabled_skills == {"saved": True}
         assert current.metadata_ == {"keep": "saved"}
+
+
+@pytest.mark.asyncio
+async def test_queued_route_change_after_resolution_requeues_with_new_snapshot(
+    db_factory,
+    monkeypatch,
+):
+    """A queued turn never launches with an account route from stale config."""
+    import backend.services.dispatcher as dispatcher_module
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.provider = "claude"
+        task.model = "claude-opus-4-6"
+        task.codex_service_tier = "default"
+        await db.commit()
+
+    before_claim = asyncio.Event()
+    allow_claim = asyncio.Event()
+    first_claim = True
+
+    @asynccontextmanager
+    async def blocked_start_guard():
+        nonlocal first_claim
+        if first_claim:
+            first_claim = False
+            before_claim.set()
+            await allow_claim.wait()
+        yield
+
+    routes = []
+
+    async def resolve_route(_session_id, provider, **kwargs):
+        routes.append(
+            (
+                provider,
+                kwargs.get("model"),
+                kwargs["codex_service_tier"],
+            )
+        )
+        return None
+
+    launched = asyncio.Event()
+
+    async def successful_launch(**kwargs):
+        process = MagicMock(returncode=0)
+        process.wait = AsyncMock(return_value=0)
+        d.instance_manager.processes[kwargs["instance_id"]] = process
+        launched.set()
+
+    d.task_start_guard = blocked_start_guard
+    d._resolve_resume_config_dir = AsyncMock(side_effect=resolve_route)
+    d.instance_manager.launch = AsyncMock(side_effect=successful_launch)
+    queue = d._get_task_queue(task_id)
+    await queue.put(msg)
+    worker = asyncio.create_task(d._task_queue_consumer(task_id))
+    d._task_queue_workers[task_id] = worker
+    try:
+        await asyncio.wait_for(before_claim.wait(), timeout=1)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.provider = "codex"
+            task.model = "gpt-5.6-terra"
+            task.codex_service_tier = "priority"
+            await db.commit()
+
+        allow_claim.set()
+        with patch.object(
+            dispatcher_module,
+            "CODEX_ROUTING_RETRY_DELAY",
+            0,
+        ):
+            await asyncio.wait_for(launched.wait(), timeout=2)
+            await asyncio.wait_for(queue.join(), timeout=2)
+    finally:
+        allow_claim.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    assert routes == [
+        ("claude", "claude-opus-4-6", "default"),
+        ("codex", "gpt-5.6-terra", "priority"),
+    ]
+    assert d.instance_manager.launch.await_count == 1
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["provider"] == "codex"
+    assert launch["model"] == "gpt-5.6-terra"
+    assert launch["codex_service_tier"] == "priority"
+    assert msg.instance_claim is None
+
+
+@pytest.mark.asyncio
+async def test_queued_launch_barrier_requeues_when_routing_stage_arrives(
+    db_factory,
+    monkeypatch,
+):
+    """A chat accepted before stage cannot cross the final launch barrier."""
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+
+    before_claim = asyncio.Event()
+    allow_claim = asyncio.Event()
+
+    @asynccontextmanager
+    async def blocked_start_guard():
+        before_claim.set()
+        await allow_claim.wait()
+        yield
+
+    d.task_start_guard = blocked_start_guard
+    queued = asyncio.create_task(d._process_queued_message(task_id, msg))
+    await asyncio.wait_for(before_claim.wait(), timeout=1)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.metadata_ = {
+            "worker_routing_config_pending": {
+                "op_id": "queued-stage-race",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "codex_service_tier": "priority",
+            }
+        }
+        await db.commit()
+    allow_claim.set()
+
+    with pytest.raises(
+        QueuedMessagePrelaunchError,
+        match="synchronization is pending",
+    ):
+        await asyncio.wait_for(queued, timeout=2)
+    d.instance_manager.launch.assert_not_awaited()
+    assert msg.instance_claim is None
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_fresh_launch_barrier_fail_closes_pending_routing_marker(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="fresh-routing-marker")
+        task = Task(
+            title="blocked fresh task",
+            description="d",
+            status="in_progress",
+            metadata_={
+                "worker_routing_config_pending": {
+                    "op_id": "fresh-stage-race",
+                    "provider": "codex",
+                    "model": "gpt-5.6-sol",
+                    "codex_service_tier": "priority",
+                }
+            },
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        await db.refresh(task)
+        instance_id, task_id, task_obj = instance.id, task.id, task
+
+    await d._run_task_lifecycle(instance_id, task_obj)
+
+    d.instance_manager.launch.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert task.instance_id is None
+        assert "worker_routing_config_pending" in task.metadata_
+
+
+@pytest.mark.asyncio
+async def test_dequeue_skips_task_with_pending_routing_marker(db_factory):
+    from backend.services.task_queue import TaskQueue
+
+    async with db_factory() as db:
+        blocked = Task(
+            title="blocked",
+            description="d",
+            status="pending",
+            priority=-10,
+            metadata_={
+                "worker_routing_config_pending": {
+                    "op_id": "crash-leftover",
+                    "provider": "codex",
+                    "model": "gpt-5.6-sol",
+                    "codex_service_tier": "priority",
+                }
+            },
+        )
+        runnable = Task(
+            title="runnable",
+            description="d",
+            status="pending",
+            priority=0,
+        )
+        db.add_all([blocked, runnable])
+        await db.commit()
+        blocked_id, runnable_id = blocked.id, runnable.id
+
+    async with db_factory() as db:
+        claimed = await TaskQueue(db).dequeue()
+
+    assert claimed is not None
+    assert claimed.id == runnable_id
+    async with db_factory() as db:
+        blocked = await db.get(Task, blocked_id)
+        assert blocked.status == "pending"
 
 
 @pytest.mark.asyncio
@@ -5670,6 +6142,57 @@ async def test_queued_recovery_cas_cannot_revive_concurrent_cancel(
         assert task.status == "cancelled"
         assert task.retry_count == 1
         assert task.session_id == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_queued_recovery_preserves_safe_status_when_routing_stage_wins(
+    db_factory,
+    monkeypatch,
+):
+    import backend.api.tasks as tasks_mod
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "failed"
+        task.last_cwd = "/repo"
+        await db.commit()
+
+    marker = {
+        "op_id": "stage-during-recovery",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    }
+
+    async def stage_during_clone(source_task_id, db):
+        assert source_task_id == task_id
+        task = await db.get(Task, task_id, populate_existing=True)
+        task.metadata_ = {"worker_routing_config_pending": marker}
+        await db.commit()
+        return {"session_id": "cloned-but-fenced", "last_cwd": "/repo"}
+
+    monkeypatch.setattr(tasks_mod, "_clone_session", stage_during_clone)
+
+    with pytest.raises(
+        QueuedMessagePrelaunchError,
+        match="routing configuration synchronization is pending",
+    ):
+        await d._process_queued_message(task_id, msg)
+
+    d.instance_manager.launch.assert_not_awaited()
+    assert msg.prompt == "hi"
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert task.session_id == "sess-1"
+        assert (
+            task.metadata_["worker_routing_config_pending"]
+            == marker
+        )
 
 
 @pytest.mark.asyncio
@@ -6548,9 +7071,14 @@ async def test_dispatcher_shutdown_quiesces_before_reaping_generations(
 
     d.instance_manager.stop = AsyncMock(side_effect=stop_generation)
 
-    await d.shutdown()
+    with patch(
+        "backend.services.skill_distill.reap_unreaped_task_distills",
+        new=AsyncMock(),
+    ) as reap_distills:
+        await d.shutdown()
 
     assert lifecycle.cancelled()
+    reap_distills.assert_awaited_once_with()
     assert 22 not in d._task_queue_workers
     d.instance_manager.stop.assert_awaited_once_with(
         4,

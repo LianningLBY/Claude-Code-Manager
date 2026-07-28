@@ -17,10 +17,16 @@ import re
 import signal
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
+from backend.services.codex_tier_proxy import (
+    CodexActualTierProxy,
+    CodexTierProofError,
+    CodexTierProxyRoute,
+)
 from backend.services.mcp_config import McpServerSpec, render_codex_mcp_config
 from backend.services.process_safety import require_safe_process_group_id
 
@@ -43,6 +49,14 @@ _NO_ACTIVE_GOAL_RE = re.compile(
     r"\b(?:no active goal|goal is not active|goal not found)\b",
     re.IGNORECASE,
 )
+CODEX_SERVICE_TIER_DEFAULT = "default"
+CODEX_SERVICE_TIER_PRIORITY = "priority"
+_CODEX_SERVICE_TIERS = frozenset({
+    CODEX_SERVICE_TIER_DEFAULT,
+    CODEX_SERVICE_TIER_PRIORITY,
+})
+_MODEL_LIST_PAGE_LIMIT = 100
+_MODEL_LIST_MAX_PAGES = 20
 
 
 async def _settle_registry_cleanup(awaitable):
@@ -74,6 +88,25 @@ class CodexAppServerBusyError(CodexAppServerError):
     """The requested account home still has an active Codex turn."""
 
 
+class CodexThreadNotIdleError(CodexAppServerBusyError):
+    """A native thread can still execute outside CCM's current turn adapter."""
+
+    def __init__(
+        self,
+        thread_id: str,
+        state: str,
+        *,
+        operation: str,
+    ) -> None:
+        super().__init__(
+            f"Codex thread {thread_id} is not authoritatively idle before "
+            f"{operation}: {state}"
+        )
+        self.thread_id = thread_id
+        self.state = state
+        self.operation = operation
+
+
 class CodexRequiredMcpError(CodexAppServerError):
     """A thread could not be created with its required MCP configuration."""
 
@@ -84,6 +117,10 @@ class CodexRequiredMcpPreTurnError(CodexRequiredMcpError):
 
 class CodexThreadHomeMismatchError(CodexAppServerError):
     """A thread was routed to a different account without an explicit rebind."""
+
+
+class CodexServiceTierUnavailableError(CodexAppServerError):
+    """The requested Codex service tier was not admitted before turn/start."""
 
 
 class _UnconfirmedTurnCancellation(asyncio.CancelledError):
@@ -120,6 +157,45 @@ def normalize_codex_home(codex_home: str | os.PathLike[str] | None = None) -> st
 
     configured = codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex"
     return str(Path(configured).expanduser().resolve(strict=False))
+
+
+def normalize_codex_service_tier(service_tier: str | None) -> str:
+    """Return CCM's canonical Codex service tier or reject unsafe input."""
+
+    value = str(service_tier or CODEX_SERVICE_TIER_DEFAULT).strip().lower()
+    if value not in _CODEX_SERVICE_TIERS:
+        raise ValueError(f"Unsupported Codex service tier: {service_tier!r}")
+    return value
+
+
+def _require_idle_thread_status(
+    thread: Any,
+    *,
+    thread_id: str,
+    operation: str,
+) -> None:
+    """Require the v2 protocol's explicit idle proof for one native thread."""
+
+    status = thread.get("status") if isinstance(thread, dict) else None
+    status_type = status.get("type") if isinstance(status, dict) else None
+    if status_type != "idle":
+        raise CodexThreadNotIdleError(
+            thread_id,
+            str(status_type or "unknown"),
+            operation=operation,
+        )
+
+
+def _canonical_app_server_service_tier(value: Any) -> str | None:
+    """Map app-server's explicit Standard value to its RPC request shape."""
+
+    # Sending JSON null clears a sticky Fast setting, while Codex reports the
+    # resulting effective setting as the literal string ``default``.
+    if value is None or value == CODEX_SERVICE_TIER_DEFAULT:
+        return None
+    if value == CODEX_SERVICE_TIER_PRIORITY:
+        return CODEX_SERVICE_TIER_PRIORITY
+    return "__invalid__"
 
 
 def _canonical_path(path: str | os.PathLike[str]) -> Path:
@@ -301,6 +377,12 @@ class _TurnContext:
     usage: dict[str, int] | None = None
     first_input_seen: bool = False
     first_output_seen: bool = False
+    pending_terminal_notification: tuple[str, dict[str, Any]] | None = None
+    admission_observed_future: asyncio.Future | None = None
+    admission_confirmed: bool = False
+    pending_admission_notifications: (
+        list[tuple[str, dict[str, Any]]] | None
+    ) = None
 
 
 class CodexAppServer:
@@ -313,6 +395,8 @@ class CodexAppServer:
         *,
         codex_home: str | os.PathLike[str] | None = None,
         env_remove: set[str] | None = None,
+        actual_tier_proxy_route: CodexTierProxyRoute | None = None,
+        require_actual_tier_proof: bool = False,
     ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
@@ -320,6 +404,9 @@ class CodexAppServer:
         self._env_remove = {
             str(key).upper() for key in (env_remove or set())
         }
+        self._actual_tier_proxy_route = actual_tier_proxy_route
+        self._require_actual_tier_proof = bool(require_actual_tier_proof)
+        self._actual_tier_proxy: CodexActualTierProxy | None = None
         self._process: asyncio.subprocess.Process | None = None
         # On POSIX, app-server is launched as its own session leader.  Keep
         # the exact process identity—not just its numeric PID—so a stale
@@ -328,6 +415,7 @@ class CodexAppServer:
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future] = {}
+        self._thread_settings_waiters: dict[str, asyncio.Future] = {}
         self._contexts_by_thread: dict[str, _TurnContext] = {}
         self._contexts_by_turn: dict[str, _TurnContext] = {}
         self._stderr_lines: deque[str] = deque(maxlen=100)
@@ -369,6 +457,9 @@ class CodexAppServer:
     def _detach_turn_context(self, context: _TurnContext) -> None:
         """Remove every identity mapping for one exact adapter generation."""
 
+        admission_future = context.admission_observed_future
+        if admission_future is not None and not admission_future.done():
+            admission_future.cancel()
         if self._contexts_by_thread.get(context.thread_id) is context:
             self._contexts_by_thread.pop(context.thread_id, None)
         for turn_id, candidate in list(self._contexts_by_turn.items()):
@@ -607,12 +698,32 @@ class CodexAppServer:
         }
         if os.name == "posix":
             spawn_kwargs["start_new_session"] = True
-        self._process = await asyncio.create_subprocess_exec(
-            self.binary,
+        app_server_args = [
             "app-server",
-            "--stdio",
-            **spawn_kwargs,
-        )
+            "--enable",
+            "fast_mode",
+        ]
+        if self._actual_tier_proxy_route is not None:
+            proxy = CodexActualTierProxy(
+                self._actual_tier_proxy_route,
+                first_event_timeout=max(self.request_timeout, 60.0),
+            )
+            await proxy.start()
+            self._actual_tier_proxy = proxy
+            app_server_args.extend(proxy.codex_override_args())
+        app_server_args.append("--stdio")
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                self.binary,
+                *app_server_args,
+                **spawn_kwargs,
+            )
+        except BaseException:
+            proxy = self._actual_tier_proxy
+            self._actual_tier_proxy = None
+            if proxy is not None:
+                await proxy.close()
+            raise
         process = self._process
         self._process_group_process = process if os.name == "posix" else None
         self._reader_task = asyncio.create_task(self._read_loop(process))
@@ -661,7 +772,23 @@ class CodexAppServer:
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
         disable_project_config: bool = False,
+        codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
     ) -> tuple[CodexTurnProcess, str]:
+        service_tier = normalize_codex_service_tier(codex_service_tier)
+        if (
+            service_tier == CODEX_SERVICE_TIER_PRIORITY
+            and self._require_actual_tier_proof
+            and self._actual_tier_proxy_route is None
+        ):
+            raise CodexServiceTierUnavailableError(
+                "Codex execution cannot start because the account's actual "
+                "service-tier upstream route could not be proven"
+            )
+        rpc_service_tier = (
+            CODEX_SERVICE_TIER_PRIORITY
+            if service_tier == CODEX_SERVICE_TIER_PRIORITY
+            else None
+        )
         required_mcp = any(spec.required for spec in mcp_specs)
         try:
             thread_config: dict[str, Any] = (
@@ -677,6 +804,42 @@ class CodexAppServer:
             _deep_merge_config(
                 thread_config,
                 codex_untrusted_project_config(cwd),
+            )
+        if service_tier == CODEX_SERVICE_TIER_PRIORITY:
+            # Hidden model work must not escape the proof boundary. Native
+            # child requests are still lineage-checked by the proxy, but Fast
+            # disables autonomous fanout/memory as a second fail-closed layer.
+            _deep_merge_config(
+                thread_config,
+                {
+                    "features": {
+                        "multi_agent": False,
+                        # 5.6 model-catalog defaults can materialize v2 as a
+                        # feature config object.  Override that exact shape;
+                        # a legacy scalar toggle alone can be displaced when
+                        # the catalog layer is resolved.
+                        "multi_agent_v2": {
+                            "enabled": False,
+                            "max_concurrent_threads_per_session": 1,
+                            "hide_spawn_agent_metadata": True,
+                        },
+                        "enable_fanout": False,
+                        "memories": False,
+                        "realtime_conversation": False,
+                        # Remote compaction v2 uses the ordinary streaming
+                        # /responses path and inherits this thread's tier.
+                        "remote_compaction_v2": True,
+                    },
+                    "agents": {
+                        "max_threads": 1,
+                        "max_depth": 1,
+                    },
+                    "memories": {
+                        "generate_memories": False,
+                        "use_memories": False,
+                        "dedicated_tools": False,
+                    },
+                },
             )
         try:
             await self.ensure_started()
@@ -696,6 +859,24 @@ class CodexAppServer:
                     f"{exc}"
                 ) from exc
             raise
+        actual_tier_proxy = self._actual_tier_proxy
+        if (
+            service_tier == CODEX_SERVICE_TIER_PRIORITY
+            and self._require_actual_tier_proof
+            and (
+                actual_tier_proxy is None
+                or not actual_tier_proxy.is_alive
+            )
+        ):
+            raise CodexServiceTierUnavailableError(
+                "Codex actual service-tier proxy is unavailable before "
+                "thread admission"
+            )
+        if service_tier == CODEX_SERVICE_TIER_PRIORITY:
+            await self._require_service_tier_support(
+                model=model,
+                service_tier=service_tier,
+            )
         launch_started = time.perf_counter()
         if git_env:
             # Per-project git credentials must remain thread-scoped.  A global
@@ -709,7 +890,14 @@ class CodexAppServer:
         common: dict[str, Any] = {
             "cwd": os.path.abspath(cwd),
             "approvalPolicy": "never",
+            # Never allow a model-catalog/profile default to route approvals
+            # through the guardian subagent, which would create hidden model
+            # work outside the root turn.
+            "approvalsReviewer": "user",
             "sandbox": "danger-full-access",
+            # This field is intentionally present even for Standard.  JSON null
+            # clears a sticky service tier inherited from a resumed thread.
+            "serviceTier": rpc_service_tier,
         }
         if model and model != "default":
             common["model"] = model
@@ -741,6 +929,63 @@ class CodexAppServer:
                     f"Required MCP configuration was not admitted: {message}"
                 )
             raise CodexAppServerError(message)
+        # A native Goal can continue after CCM has finished and detached its
+        # process adapter.  Resuming such a thread may report ``active`` even
+        # though Task/Instance rows look terminal.  Never send turn/start into
+        # that older, unknown-tier generation: app-server can otherwise steer
+        # this submission into the already-running turn and a Fast badge/proof
+        # would describe work that actually began under the previous tier.
+        _require_idle_thread_status(
+            thread,
+            thread_id=str(thread_id),
+            operation=f"{thread_method} turn admission",
+        )
+        if (
+            resume_session_id
+            and service_tier == CODEX_SERVICE_TIER_PRIORITY
+        ):
+            # ``thread.status == idle`` only proves that no turn is executing
+            # at this instant.  A native Goal can be active between autonomous
+            # turns and start its next (old-tier) turn before our turn/start.
+            # Fast therefore requires the stronger proof that no resumable
+            # Goal exists before changing sticky thread settings.
+            await self._require_no_resumable_thread_goal(
+                str(thread_id),
+                operation=f"{thread_method} Fast turn admission",
+            )
+        effective_service_tier = _canonical_app_server_service_tier(
+            response.get("serviceTier")
+            if isinstance(response, dict)
+            else None
+        )
+        if effective_service_tier != rpc_service_tier:
+            if resume_session_id:
+                effective_service_tier = (
+                    await self._update_loaded_thread_service_tier(
+                        str(thread_id),
+                        rpc_service_tier,
+                    )
+                )
+            if effective_service_tier != rpc_service_tier:
+                raise CodexServiceTierUnavailableError(
+                    "Codex did not admit the requested service tier "
+                    f"{service_tier!r} for model {model or 'default'!r}; "
+                    f"effective tier was {effective_service_tier!r}"
+                )
+        if actual_tier_proxy is not None:
+            # Keep this mapping for the lifetime of the native thread, not
+            # merely the CCM adapter turn. Native Goals and hidden follow-up
+            # requests can outlive ``turn/completed`` and must remain fenced.
+            try:
+                actual_tier_proxy.set_thread_tier(
+                    str(thread_id),
+                    service_tier,
+                )
+            except CodexTierProofError as exc:
+                raise CodexServiceTierUnavailableError(
+                    "Codex service tier cannot change while an older request "
+                    f"in this native thread lineage is active: {exc}"
+                ) from exc
         self._known_threads.add(thread_id)
         existing = self._contexts_by_thread.get(thread_id)
         if existing and existing.process.returncode is None:
@@ -764,6 +1009,19 @@ class CodexAppServer:
             process=turn_process,
             launch_started=launch_started,
             task_id=task_id,
+            admission_observed_future=(
+                asyncio.get_running_loop().create_future()
+                if service_tier == CODEX_SERVICE_TIER_PRIORITY
+                else None
+            ),
+            pending_admission_notifications=(
+                []
+                if (
+                    service_tier == CODEX_SERVICE_TIER_PRIORITY
+                    or actual_tier_proxy is not None
+                )
+                else None
+            ),
         )
         self._contexts_by_thread[thread_id] = context
         # Persist the native thread id through the same event path as exec.
@@ -774,8 +1032,13 @@ class CodexAppServer:
             "input": [{"type": "text", "text": prompt}],
             "cwd": os.path.abspath(cwd),
             "approvalPolicy": "never",
+            "approvalsReviewer": "user",
             "model": model if model and model != "default" else None,
             "effort": effort,
+            # turn/start persists overrides for subsequent turns.  Repeat the
+            # exact value so another caller cannot reintroduce a sticky tier
+            # between thread admission and this turn.
+            "serviceTier": rpc_service_tier,
         }
         turn_request = asyncio.create_task(self._request("turn/start", turn_params))
         turn_cancelled = False
@@ -856,13 +1119,481 @@ class CodexAppServer:
                     "could not be confirmed",
                 )
             raise asyncio.CancelledError
+        actual_tier_proof = None
+        if (
+            actual_tier_proxy is not None
+            and service_tier == CODEX_SERVICE_TIER_PRIORITY
+        ):
+            proof_wait = asyncio.create_task(
+                actual_tier_proxy.wait_for_actual_tier(
+                    str(thread_id),
+                    str(turn_id),
+                    service_tier,
+                    timeout=max(self.request_timeout, 60.0),
+                )
+            )
+            while not proof_wait.done():
+                try:
+                    await asyncio.shield(proof_wait)
+                except asyncio.CancelledError:
+                    # The native turn exists and its upstream request may
+                    # already be in flight. Obtain or reject the exact proof,
+                    # then interrupt before propagating cancellation.
+                    turn_cancelled = True
+                except BaseException:
+                    break
+            try:
+                actual_tier_proof = proof_wait.result()
+            except CodexTierProofError as exc:
+                reason = (
+                    "Codex upstream did not prove the requested actual "
+                    f"service tier {service_tier!r}: {exc}"
+                )
+                interrupt_confirmed = await self.abandon_turn(
+                    turn_process,
+                    reason,
+                )
+                if not interrupt_confirmed:
+                    raise _UnconfirmedTurnStartFailure(
+                        turn_process,
+                        f"{reason}, and its interrupt could not be confirmed",
+                    ) from exc
+                raise CodexServiceTierUnavailableError(reason) from exc
+            if turn_cancelled:
+                cleanup = asyncio.create_task(self.abandon_turn(
+                    turn_process,
+                    "Codex actual service-tier proof wait was cancelled",
+                ))
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                interrupt_confirmed = cleanup.result()
+                if not interrupt_confirmed:
+                    raise _UnconfirmedTurnCancellation(
+                        turn_process,
+                        "Codex actual service-tier proof wait was cancelled "
+                        "and its interrupt could not be confirmed",
+                    )
+                raise asyncio.CancelledError
+        if service_tier == CODEX_SERVICE_TIER_PRIORITY:
+            observed_future = context.admission_observed_future
+            assert observed_future is not None
+            observation_wait = asyncio.create_task(asyncio.wait_for(
+                asyncio.shield(observed_future),
+                timeout=self.request_timeout,
+            ))
+            while not observation_wait.done():
+                try:
+                    await asyncio.shield(observation_wait)
+                except asyncio.CancelledError:
+                    # The turn is already live.  Finish identity
+                    # reconciliation, then interrupt the exact native
+                    # generation before propagating cancellation.
+                    turn_cancelled = True
+                except BaseException:
+                    break
+            try:
+                observation_wait.result()
+            except asyncio.TimeoutError as exc:
+                reason = (
+                    "Codex Fast turn did not emit an authoritative native "
+                    "turn identity before the admission deadline"
+                )
+                interrupt_confirmed = await self.abandon_turn(
+                    turn_process,
+                    reason,
+                )
+                if not interrupt_confirmed:
+                    raise _UnconfirmedTurnStartFailure(
+                        turn_process,
+                        f"{reason}, and its interrupt could not be confirmed",
+                    ) from exc
+                raise CodexServiceTierUnavailableError(reason) from exc
+
+            if turn_cancelled:
+                cleanup = asyncio.create_task(self.abandon_turn(
+                    turn_process,
+                    "Codex Fast turn admission was cancelled",
+                ))
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                interrupt_confirmed = cleanup.result()
+                if not interrupt_confirmed:
+                    raise _UnconfirmedTurnCancellation(
+                        turn_process,
+                        "Codex Fast turn admission was cancelled and its "
+                        "interrupt could not be confirmed",
+                    )
+                raise asyncio.CancelledError
+        if (
+            service_tier == CODEX_SERVICE_TIER_PRIORITY
+            and context.observed_turn_id is not None
+            and context.observed_turn_id != context.admitted_turn_id
+        ):
+            # Codex can adopt a turn/start submission into an older native
+            # Goal turn.  That older generation began before this request's
+            # priority admission, so its actual tier is unknowable here.  Stop
+            # it and fail instead of attaching a Fast proof to old work.
+            reason = (
+                "Codex Fast turn was adopted by an older active native turn; "
+                "priority execution cannot be proven"
+            )
+            interrupt_confirmed = await self.abandon_turn(
+                turn_process,
+                reason,
+            )
+            if not interrupt_confirmed:
+                raise _UnconfirmedTurnStartFailure(
+                    turn_process,
+                    f"{reason}, and its interrupt could not be confirmed",
+                )
+            raise CodexThreadNotIdleError(
+                str(thread_id),
+                (
+                    "adopted-active-turn:"
+                    f"{context.observed_turn_id}"
+                ),
+                operation="Fast turn admission",
+            )
+        if service_tier == CODEX_SERVICE_TIER_PRIORITY:
+            # Only publish the proof after turn/start itself returned a real
+            # turn id.  A thread-level confirmation followed by a rejected or
+            # indeterminate turn must never appear as a successful Fast turn.
+            admission_event = {
+                "type": "system_event",
+                "content": (
+                    (
+                        "Codex Fast 实际 priority 已由上游确认"
+                        if actual_tier_proof is not None
+                        else "Codex Fast priority 请求准入已确认"
+                    )
+                    + f" · 模型 {model or 'default'}"
+                ),
+                "requested_service_tier": CODEX_SERVICE_TIER_PRIORITY,
+                "admitted_service_tier": (
+                    actual_tier_proof.actual_tier
+                    if actual_tier_proof is not None
+                    else effective_service_tier
+                ),
+                "model": model or "default",
+                "thread_id": thread_id,
+                "turn_id": str(turn_id),
+            }
+            if actual_tier_proof is not None:
+                admission_event.update({
+                    "actual_service_tier_verified": True,
+                    "upstream_response_id": actual_tier_proof.response_id,
+                })
+            turn_process.feed(admission_event)
+            logger.info(
+                "Codex service-tier request admitted task=%s thread=%s turn=%s "
+                "requested=priority admitted=%s actual_verified=%s "
+                "response=%s model=%s",
+                task_id,
+                thread_id,
+                turn_id,
+                (
+                    actual_tier_proof.actual_tier
+                    if actual_tier_proof is not None
+                    else effective_service_tier
+                ),
+                actual_tier_proof is not None,
+                (
+                    actual_tier_proof.response_id
+                    if actual_tier_proof is not None
+                    else "-"
+                ),
+                model or "default",
+            )
+            context.admission_confirmed = True
+            self._replay_pending_admission_notifications(context)
+        else:
+            logger.info(
+                "Codex service-tier request admitted task=%s thread=%s turn=%s "
+                "requested=default admitted=%s actual_verified=%s "
+                "response=%s model=%s",
+                task_id,
+                thread_id,
+                turn_id,
+                effective_service_tier,
+                actual_tier_proof is not None,
+                (
+                    actual_tier_proof.response_id
+                    if actual_tier_proof is not None
+                    else "-"
+                ),
+                model or "default",
+            )
+            if actual_tier_proxy is not None:
+                context.admission_confirmed = True
+                self._replay_pending_admission_notifications(context)
         logger.info(
             "Codex latency task=%s thread=%s stage=turn_started elapsed_ms=%.1f",
             task_id,
             thread_id,
             (time.perf_counter() - launch_started) * 1000,
         )
+        self._replay_pending_terminal_notification(context)
         return turn_process, thread_id
+
+    def _replay_pending_admission_notifications(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Replay Fast events only after exact new-turn identity is proven."""
+
+        pending = context.pending_admission_notifications
+        context.pending_admission_notifications = None
+        for method, params in pending or ():
+            self._handle_notification(method, params)
+
+    def _replay_pending_terminal_notification(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Finish a turn only after its admission response has been handled."""
+
+        pending = context.pending_terminal_notification
+        if pending is None:
+            return
+        context.pending_terminal_notification = None
+        method, params = pending
+        self._handle_notification(method, params)
+
+    async def _require_service_tier_support(
+        self,
+        *,
+        model: str | None,
+        service_tier: str,
+    ) -> None:
+        """Confirm the selected model advertises a tier before creating a thread."""
+
+        requested_model = (
+            str(model).strip()
+            if model and str(model).strip().lower() != "default"
+            else None
+        )
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _page in range(_MODEL_LIST_MAX_PAGES):
+            params: dict[str, Any] = {
+                "includeHidden": True,
+                "limit": _MODEL_LIST_PAGE_LIMIT,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            try:
+                response = await self._request("model/list", params)
+            except Exception as exc:
+                raise CodexServiceTierUnavailableError(
+                    "Codex model capabilities could not be verified before "
+                    f"requesting service tier {service_tier!r}"
+                ) from exc
+            data = response.get("data") if isinstance(response, dict) else None
+            if not isinstance(data, list):
+                raise CodexServiceTierUnavailableError(
+                    "Codex model/list returned an invalid capability catalog"
+                )
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id")
+                item_model = item.get("model")
+                is_selected = (
+                    (
+                        requested_model is not None
+                        and requested_model in {item_id, item_model}
+                    )
+                    or (
+                        requested_model is None
+                        and item.get("isDefault") is True
+                    )
+                )
+                if not is_selected:
+                    continue
+                tiers = item.get("serviceTiers")
+                supported = {
+                    tier.get("id")
+                    for tier in tiers
+                    if isinstance(tier, dict) and isinstance(tier.get("id"), str)
+                } if isinstance(tiers, list) else set()
+                if service_tier in supported:
+                    return
+                raise CodexServiceTierUnavailableError(
+                    f"Codex model {requested_model or item_id or item_model or 'default'!r} "
+                    f"does not advertise service tier {service_tier!r}"
+                )
+
+            next_cursor = (
+                response.get("nextCursor")
+                if isinstance(response, dict)
+                else None
+            )
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                raise CodexServiceTierUnavailableError(
+                    "Codex model/list returned a repeated pagination cursor"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        raise CodexServiceTierUnavailableError(
+            f"Codex model {requested_model or 'default'!r} was not found in "
+            "the authenticated account's capability catalog"
+        )
+
+    async def _update_loaded_thread_service_tier(
+        self,
+        thread_id: str,
+        service_tier: str | None,
+    ) -> str | None:
+        """Update a hot thread and wait for its authoritative settings event."""
+
+        if thread_id in self._thread_settings_waiters:
+            raise CodexAppServerBusyError(
+                f"thread {thread_id} already has a settings update in flight"
+            )
+        future = asyncio.get_running_loop().create_future()
+        self._thread_settings_waiters[thread_id] = future
+        try:
+            await self._request(
+                "thread/settings/update",
+                {
+                    "threadId": thread_id,
+                    # null explicitly clears a prior Fast selection.
+                    "serviceTier": service_tier,
+                },
+            )
+            try:
+                notification = await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=self.request_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise CodexServiceTierUnavailableError(
+                    "Codex accepted a thread service-tier update but did not "
+                    "confirm its effective settings before turn/start"
+                ) from exc
+        except CodexServiceTierUnavailableError:
+            raise
+        except Exception as exc:
+            raise CodexServiceTierUnavailableError(
+                "Codex could not update the loaded thread's service tier "
+                "before turn/start"
+            ) from exc
+        finally:
+            if self._thread_settings_waiters.get(thread_id) is future:
+                self._thread_settings_waiters.pop(thread_id, None)
+            if not future.done():
+                future.cancel()
+
+        settings = (
+            notification.get("threadSettings")
+            if isinstance(notification, dict)
+            else None
+        )
+        if not isinstance(settings, dict) or "serviceTier" not in settings:
+            return "__invalid__"
+        return _canonical_app_server_service_tier(
+            settings.get("serviceTier"),
+        )
+
+    async def require_thread_routing_quiescence(
+        self,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        """Prove a persisted thread cannot autonomously use its old route.
+
+        Native Goals outlive CCM's per-turn adapter.  A completed Task and an
+        empty ``_contexts_by_thread`` map are therefore insufficient evidence:
+        app-server can continue an active/paused/blocked Goal later without a
+        new CCM launch.  Routing changes are admitted only when there is no
+        Goal that could be resumed and ``thread/read`` explicitly reports the
+        loaded thread as idle.
+        """
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        await self.ensure_started()
+
+        goal = await self._require_no_resumable_thread_goal(
+            thread_id,
+            operation="routing configuration change",
+        )
+
+        response = await self._request(
+            "thread/read",
+            {
+                "threadId": thread_id,
+                "includeTurns": False,
+            },
+        )
+        thread = response.get("thread") if isinstance(response, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise CodexAppServerError(
+                f"thread/read returned an invalid thread for {thread_id}"
+            )
+        _require_idle_thread_status(
+            thread,
+            thread_id=thread_id,
+            operation="routing configuration change",
+        )
+        return {
+            "thread": thread,
+            "goal": goal,
+        }
+
+    async def _require_no_resumable_thread_goal(
+        self,
+        thread_id: str,
+        *,
+        operation: str,
+    ) -> dict[str, Any] | None:
+        """Return a terminal Goal, or reject any Goal that can run again."""
+
+        try:
+            goal_response = await self._request(
+                "thread/goal/get",
+                {"threadId": thread_id},
+            )
+        except CodexAppServerError as exc:
+            if _GOALS_FEATURE_DISABLED_RE.search(str(exc)):
+                goal = None
+            else:
+                raise
+        else:
+            if (
+                not isinstance(goal_response, dict)
+                or "goal" not in goal_response
+            ):
+                raise CodexAppServerError(
+                    f"thread/goal/get returned invalid data for {thread_id}"
+                )
+            goal = goal_response.get("goal")
+            if goal is not None and not isinstance(goal, dict):
+                raise CodexAppServerError(
+                    f"thread/goal/get returned an invalid goal for {thread_id}"
+                )
+
+        if goal is not None:
+            goal_status = goal.get("status")
+            # Only a completed Goal is immutable enough for a routing change.
+            # Paused/blocked/limited Goals can be resumed by another surface,
+            # so accepting them would reopen an old-tier autonomous turn after
+            # the Task badge has changed.
+            if goal_status != "complete":
+                raise CodexThreadNotIdleError(
+                    thread_id,
+                    f"goal:{goal_status or 'unknown'}",
+                    operation=operation,
+                )
+        return goal
 
     async def read_thread(self, thread_id: str) -> dict[str, Any]:
         """Load one thread and its persisted turns from this account home."""
@@ -1173,7 +1904,14 @@ class CodexAppServer:
                 if not future.done():
                     future.set_exception(error)
             self._pending.clear()
+            for future in list(self._thread_settings_waiters.values()):
+                if not future.done():
+                    future.set_exception(error)
+            self._thread_settings_waiters.clear()
             for context in list(self._contexts_by_thread.values()):
+                future = context.admission_observed_future
+                if future is not None and not future.done():
+                    future.set_exception(error)
                 context.process.finish(1, str(error))
             self._contexts_by_thread.clear()
             self._contexts_by_turn.clear()
@@ -1236,7 +1974,41 @@ class CodexAppServer:
         )
 
     def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
+        if method == "thread/started":
+            thread = params.get("thread")
+            if isinstance(thread, dict):
+                child_id = thread.get("id")
+                parent_id = thread.get("parentThreadId")
+                proxy = self._actual_tier_proxy
+                if (
+                    proxy is not None
+                    and isinstance(child_id, str)
+                    and isinstance(parent_id, str)
+                ):
+                    try:
+                        proxy.register_thread_parent(child_id, parent_id)
+                    except CodexTierProofError:
+                        # The request path independently requires the same
+                        # lineage metadata and will reject it before upstream
+                        # work. Keep notification handling synchronous and
+                        # non-throwing so the shared app-server reader lives.
+                        logger.exception(
+                            "Rejected ambiguous Codex child-thread lineage "
+                            "child=%s parent=%s",
+                            child_id,
+                            parent_id,
+                        )
+            return
         thread_id = params.get("threadId")
+        if method == "thread/settings/updated":
+            waiter = (
+                self._thread_settings_waiters.get(str(thread_id))
+                if thread_id
+                else None
+            )
+            if waiter is not None and not waiter.done():
+                waiter.set_result(params)
+            return
         turn_id = self._notification_turn_id(method, params)
         context = self._contexts_by_turn.get(turn_id) if turn_id else None
         if (
@@ -1286,6 +2058,35 @@ class CodexAppServer:
         if turn_id and context.observed_turn_id is None:
             if not self._bind_turn_context(context, turn_id, observed=True):
                 return
+        if turn_id and context.observed_turn_id is not None:
+            observed_future = context.admission_observed_future
+            if observed_future is not None and not observed_future.done():
+                observed_future.set_result(context.observed_turn_id)
+        if (
+            context.pending_admission_notifications is not None
+            and not context.admission_confirmed
+        ):
+            context.pending_admission_notifications.append(
+                (method, dict(params)),
+            )
+            return
+        if method == "turn/completed" and context.admitted_turn_id is None:
+            # Notifications may race ahead of the turn/start RPC response.
+            # Keep the adapter open until the response supplies a real turn id
+            # and Fast can publish its admission proof before terminal EOF.
+            if context.pending_terminal_notification is None:
+                context.pending_terminal_notification = (
+                    method,
+                    dict(params),
+                )
+            else:
+                logger.warning(
+                    "Ignoring duplicate pre-admission terminal notification "
+                    "thread=%s turn=%s",
+                    context.thread_id,
+                    turn_id,
+                )
+            return
 
         if method == "turn/started":
             context.process.feed({"type": "turn.started"})
@@ -1558,6 +2359,10 @@ class CodexAppServer:
 
         process = self._process
         if not process:
+            proxy = self._actual_tier_proxy
+            self._actual_tier_proxy = None
+            if proxy is not None:
+                await proxy.close()
             return
         if process.stdin:
             try:
@@ -1608,6 +2413,10 @@ class CodexAppServer:
             self._process_group_process = None
         self._reader_task = None
         self._stderr_task = None
+        proxy = self._actual_tier_proxy
+        self._actual_tier_proxy = None
+        if proxy is not None:
+            await proxy.close()
 
     async def shutdown(self) -> None:
         """Permanently stop and verify this server object's process group."""
@@ -1635,10 +2444,16 @@ class CodexAppServerRegistry:
         request_timeout: float = 30.0,
         *,
         env_remove_resolver: Callable[[str], set[str]] | None = None,
+        actual_tier_route_resolver: (
+            Callable[[str], CodexTierProxyRoute | None] | None
+        ) = None,
+        require_actual_tier_proof: bool = False,
     ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
         self._env_remove_resolver = env_remove_resolver
+        self._actual_tier_route_resolver = actual_tier_route_resolver
+        self._require_actual_tier_proof = bool(require_actual_tier_proof)
         self._servers: dict[str, CodexAppServer] = {}
         self._thread_owners: dict[str, str] = {}
         self._draining: set[str] = set()
@@ -1658,6 +2473,23 @@ class CodexAppServerRegistry:
         self._starting_threads: dict[str, object] = {}
         self._shutdown_requested = False
         self._lock = asyncio.Lock()
+
+    def _new_server(self, home: str) -> CodexAppServer:
+        server_kwargs: dict[str, Any] = {}
+        if self._env_remove_resolver is not None:
+            server_kwargs["env_remove"] = self._env_remove_resolver(home)
+        if self._actual_tier_route_resolver is not None:
+            server_kwargs["actual_tier_proxy_route"] = (
+                self._actual_tier_route_resolver(home)
+            )
+        if self._require_actual_tier_proof:
+            server_kwargs["require_actual_tier_proof"] = True
+        return CodexAppServer(
+            self.binary,
+            request_timeout=self.request_timeout,
+            codex_home=home,
+            **server_kwargs,
+        )
 
     async def start_turn(
         self,
@@ -1703,15 +2535,7 @@ class CodexAppServerRegistry:
                 self._starting_threads[resume_session_id] = start_token
             server = self._servers.get(home)
             if server is None:
-                server_kwargs: dict[str, Any] = {}
-                if self._env_remove_resolver is not None:
-                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
-                server = CodexAppServer(
-                    self.binary,
-                    request_timeout=self.request_timeout,
-                    codex_home=home,
-                    **server_kwargs,
-                )
+                server = self._new_server(home)
                 self._servers[home] = server
             self._starting[home] = self._starting.get(home, 0) + 1
 
@@ -1743,7 +2567,24 @@ class CodexAppServerRegistry:
                 self._thread_owners[thread_id] = home
                 admitted = True
             return process, thread_id
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, CodexThreadNotIdleError):
+                # thread/resume has already rejoined this live native thread.
+                # Preserve its exact home route even though no new CCM process
+                # was admitted; dropping the reservation would let a later
+                # caller attempt the same active rollout from another account.
+                async with self._lock:
+                    owner = self._thread_owners.get(exc.thread_id)
+                    if owner is None:
+                        self._thread_owners[exc.thread_id] = home
+                    elif owner != home:
+                        self._draining.add(home)
+                        raise CodexThreadHomeMismatchError(
+                            f"Active Codex thread {exc.thread_id} is bound to "
+                            f"{owner}, not {home}"
+                        ) from exc
+                if resume_session_id == exc.thread_id:
+                    reserved_owner = False
             if getattr(server, "shutdown_requested", False):
                 async with self._lock:
                     if self._servers.get(home) is server:
@@ -1828,15 +2669,7 @@ class CodexAppServerRegistry:
                 )
             server = self._servers.get(home)
             if server is None:
-                server_kwargs: dict[str, Any] = {}
-                if self._env_remove_resolver is not None:
-                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
-                server = CodexAppServer(
-                    self.binary,
-                    request_timeout=self.request_timeout,
-                    codex_home=home,
-                    **server_kwargs,
-                )
+                server = self._new_server(home)
                 self._servers[home] = server
             if server.has_active_thread(thread_id):
                 raise CodexAppServerBusyError(
@@ -1868,6 +2701,73 @@ class CodexAppServerRegistry:
 
             await _settle_registry_cleanup(_release_read_thread())
 
+    @asynccontextmanager
+    async def thread_routing_guard(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ):
+        """Hold an exact native-thread idle proof across a caller DB commit.
+
+        The per-thread reservation uses the same registry fence as
+        ``start_turn``.  Once the quiescence RPCs succeed, no CCM turn can
+        resume this thread until the caller leaves the context (normally after
+        committing the Task routing tuple or Worker stage marker).
+        """
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        home = normalize_codex_home(codex_home)
+        token = object()
+        reserved_owner = False
+        async with self._lock:
+            if self._shutdown_requested or home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is unavailable: {home}"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if owner is not None and owner != home:
+                raise CodexThreadHomeMismatchError(
+                    f"Codex thread {thread_id} is bound to {owner}, not {home}"
+                )
+            if thread_id in self._starting_threads or thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has an operation in flight"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                server = self._new_server(home)
+                self._servers[home] = server
+            if server.has_active_thread(thread_id):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} still has an active CCM turn"
+                )
+            if owner is None:
+                self._thread_owners[thread_id] = home
+                reserved_owner = True
+            self._starting_threads[thread_id] = token
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        validated = False
+        try:
+            snapshot = await server.require_thread_routing_quiescence(thread_id)
+            validated = True
+            yield snapshot
+        finally:
+            async def _release_routing_guard() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+                    if (
+                        reserved_owner
+                        and not validated
+                        and self._thread_owners.get(thread_id) == home
+                    ):
+                        self._thread_owners.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_routing_guard())
+
     async def create_thread(
         self,
         codex_home: str | os.PathLike[str] | None,
@@ -1886,15 +2786,7 @@ class CodexAppServerRegistry:
                 )
             server = self._servers.get(home)
             if server is None:
-                server_kwargs: dict[str, Any] = {}
-                if self._env_remove_resolver is not None:
-                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
-                server = CodexAppServer(
-                    self.binary,
-                    request_timeout=self.request_timeout,
-                    codex_home=home,
-                    **server_kwargs,
-                )
+                server = self._new_server(home)
                 self._servers[home] = server
             self._starting[home] = self._starting.get(home, 0) + 1
 
@@ -1949,15 +2841,7 @@ class CodexAppServerRegistry:
                 )
             server = self._servers.get(home)
             if server is None:
-                server_kwargs: dict[str, Any] = {}
-                if self._env_remove_resolver is not None:
-                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
-                server = CodexAppServer(
-                    self.binary,
-                    request_timeout=self.request_timeout,
-                    codex_home=home,
-                    **server_kwargs,
-                )
+                server = self._new_server(home)
                 self._servers[home] = server
             if server.has_active_thread(thread_id):
                 raise CodexAppServerBusyError(
@@ -2209,15 +3093,7 @@ class CodexAppServerRegistry:
                 )
             server = self._servers.get(home)
             if server is None:
-                server_kwargs: dict[str, Any] = {}
-                if self._env_remove_resolver is not None:
-                    server_kwargs["env_remove"] = self._env_remove_resolver(home)
-                server = CodexAppServer(
-                    self.binary,
-                    request_timeout=self.request_timeout,
-                    codex_home=home,
-                    **server_kwargs,
-                )
+                server = self._new_server(home)
                 self._servers[home] = server
             self._starting[home] = self._starting.get(home, 0) + 1
 

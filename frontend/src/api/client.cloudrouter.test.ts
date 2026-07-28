@@ -73,4 +73,28 @@ describe('API account compatibility routing', () => {
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'POST' });
     expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'DELETE' });
   });
+
+  it('preserves the HTTP status and structured detail for a busy retirement', async () => {
+    fetchMock.mockResolvedValueOnce({
+      status: 409,
+      statusText: 'Conflict',
+      ok: false,
+      headers: { get: () => null },
+      json: async () => ({
+        detail: {
+          error: 'API account is still in use',
+          cleanup_pending: true,
+        },
+      }),
+    });
+
+    await expect(api.deleteCloudRouterAccount('cloudrouter-1')).rejects.toMatchObject({
+      message: 'API account is still in use',
+      status: 409,
+      detail: {
+        error: 'API account is still in use',
+        cleanup_pending: true,
+      },
+    });
+  });
 });

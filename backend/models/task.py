@@ -1,6 +1,17 @@
 from datetime import datetime
 
-from sqlalchemy import Float, Integer, String, Text, DateTime, JSON, select, func, case
+from sqlalchemy import (
+    CheckConstraint,
+    Float,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    JSON,
+    select,
+    func,
+    case,
+)
 from sqlalchemy.orm import Mapped, mapped_column, column_property
 
 from backend.database import Base
@@ -8,6 +19,12 @@ from backend.database import Base
 
 class Task(Base):
     __tablename__ = "tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "codex_service_tier IN ('default', 'priority')",
+            name="ck_tasks_codex_service_tier",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="")
@@ -45,6 +62,12 @@ class Task(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     provider: Mapped[str] = mapped_column(String(20), default="claude", server_default="claude")
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    codex_service_tier: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="default",
+        server_default="default",
+    )
     effort_level: Mapped[str | None] = mapped_column(String(20), nullable=True)
     thinking_budget: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # NULL = 不注入；"append" = 追加；"replace" = 替换

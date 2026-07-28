@@ -10,17 +10,25 @@ from fastapi import HTTPException
 from sqlalchemy import select, update
 
 import backend.main as main_module
+import backend.api.tasks as tasks_api_module
 import backend.services.task_events as task_events_module
 import backend.services.worker_proxy as worker_proxy_module
 import backend.services.worker_relay as worker_relay_module
 from backend.models.log_entry import LogEntry
+from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.schemas.task import TaskCreate
-from backend.services.worker_proxy import WorkerProxy
+from backend.services.worker_proxy import (
+    WorkerEndpointNotFoundError,
+    WorkerProxy,
+)
 from backend.services.worker_relay import WorkerRelay
+from backend.services.worker_routing_config import (
+    WORKER_ROUTING_PENDING_KEY,
+)
 
 
 class FakeBroadcaster:
@@ -135,6 +143,29 @@ def _remote_task(task: Task, **overrides) -> dict:
     return payload
 
 
+def _routing_snapshot(
+    task: Task,
+    *,
+    status: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    codex_service_tier: str | None = None,
+    pending: dict | None = None,
+) -> dict:
+    return {
+        "id": task.id,
+        "status": status or task.status,
+        "worker_id": None,
+        "shared_from_id": None,
+        "provider": provider or task.provider,
+        "model": task.model if model is None else model,
+        "codex_service_tier": (
+            codex_service_tier or task.codex_service_tier
+        ),
+        "pending": pending,
+    }
+
+
 async def test_authoritative_worker_apply_preserves_supersede_marker(
     session_factory,
 ):
@@ -232,8 +263,14 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
     captured_payload = {}
 
     class Response:
+        def __init__(self, payload):
+            self._payload = payload
+
         def raise_for_status(self):
             return None
+
+        def json(self):
+            return self._payload
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -245,9 +282,17 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         async def __aexit__(self, *args):
             return False
 
+        async def get(self, _url, *, headers):
+            return Response({
+                "default_codex_model": "gpt-5.6-sol",
+                "codex_model_service_tiers": {
+                    "gpt-5.6-sol": ["default", "priority"],
+                },
+            })
+
         async def post(self, _url, *, headers, json):
             captured_payload.update(json)
-            return Response()
+            return Response(json)
 
     monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
     relay = AsyncMock()
@@ -272,6 +317,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         must_complete=False,
         goal_max_turns=30,
         provider="codex",
+        codex_service_tier="priority",
         enable_workflows=False,
         tags=["pr-review"],
         metadata_={"pr_review_id": 123},
@@ -283,10 +329,124 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
 
     parsed_on_worker = TaskCreate.model_validate(captured_payload)
     assert captured_payload["tags"] == ["pr-review"]
+    assert captured_payload["codex_service_tier"] == "priority"
     assert parsed_on_worker.tags == ["pr-review"]
+    assert parsed_on_worker.codex_service_tier == "priority"
     # metadata_ is intentionally not a public TaskCreate field; the hidden
     # termination endpoint accepts the forwarded tag only for Worker copies.
     assert not hasattr(parsed_on_worker, "metadata_")
+
+
+async def test_worker_fast_fails_before_forward_when_capability_is_unproven(
+    monkeypatch,
+):
+    post = AsyncMock()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # Shape returned by an older Worker that predates service tiers.
+            return {
+                "default_codex_model": "gpt-5.6-sol",
+            }
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    relay = AsyncMock()
+    proxy = WorkerProxy(None, relay)
+    worker = Worker(
+        id=78,
+        name="old-worker",
+        status="ready",
+        private_ip="10.0.0.78",
+        auth_token="token",
+    )
+    task = Task(
+        id=902,
+        title="Fast remote task",
+        description="run fast",
+        worker_id=worker.id,
+        project_id=12,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="priority",
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=34)
+
+    with pytest.raises(RuntimeError, match="未声明.*支持 Codex Fast"):
+        await proxy._forward_task_to_worker_locked(task)
+
+    proxy.ensure_worker_project.assert_not_awaited()
+    relay.subscribe_task.assert_not_awaited()
+    post.assert_not_awaited()
+
+
+async def test_worker_fast_preflight_resolves_default_model_alias(
+    monkeypatch,
+):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "default_codex_model": "gpt-5.6-sol",
+                "codex_model_service_tiers": {
+                    "gpt-5.6-sol": ["default", "priority"],
+                },
+            }
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, AsyncMock())
+    worker = Worker(
+        id=79,
+        name="worker",
+        status="ready",
+        private_ip="10.0.0.79",
+        auth_token="token",
+    )
+    task = Task(
+        id=903,
+        title="Fast default-model task",
+        description="run fast",
+        worker_id=worker.id,
+        provider="codex",
+        model="default",
+        codex_service_tier="priority",
+    )
+
+    await proxy.require_worker_fast_support(worker, task)
 
 
 # === WorkerRelay._handle ===
@@ -1353,6 +1513,28 @@ async def test_generic_worker_proxy_can_confirm_task_already_absent(
     assert result == {"ok": True, "already_deleted": True}
 
 
+async def test_generic_worker_proxy_can_surface_exact_endpoint_404(
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    _install_proxy_transport(
+        monkeypatch,
+        _ProxyResponse(404, {"detail": "Not Found"}),
+    )
+    proxy = WorkerProxy(session_factory, AsyncMock())
+
+    with pytest.raises(WorkerEndpointNotFoundError):
+        await proxy.proxy_to_worker(
+            task,
+            "GET",
+            f"/api/tasks/{task.id}/routing-config/status",
+            require_json=True,
+            surface_endpoint_not_found=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("transport_error", "expected_status", "expected_detail"),
     [
@@ -1409,6 +1591,1201 @@ async def test_create_task_with_worker_id_and_explicit_id(client, session_factor
     data = resp.json()
     assert data["id"] == 4242
     assert data["worker_id"] == 3
+
+
+async def test_worker_routing_config_update_confirms_remote_before_manager(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    proxy = AsyncMock()
+
+    async def protocol(_task, method, path, body=None, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        if path.endswith("/stage"):
+            return _routing_snapshot(task, pending=dict(body))
+        assert path.endswith("/ack")
+        return _routing_snapshot(
+            task,
+            codex_service_tier="priority",
+        )
+
+    proxy.proxy_to_worker.side_effect = protocol
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["codex_service_tier"] == "priority"
+    assert proxy.proxy_to_worker.await_count == 3
+    stage = proxy.proxy_to_worker.await_args_list[1]
+    assert stage.args[1:3] == (
+        "POST",
+        f"/api/tasks/{task.id}/routing-config/stage",
+    )
+    assert stage.args[3] | {"op_id": "<ignored>"} == {
+        "op_id": "<ignored>",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    }
+    assert stage.kwargs["require_json"] is True
+    assert stage.kwargs["operation_lock_held"] is True
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.codex_service_tier == "priority"
+
+
+async def test_worker_routing_config_updates_model_and_disables_fast_atomically(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="priority",
+    )
+    proxy = AsyncMock()
+
+    async def protocol(_task, method, path, body=None, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        if path.endswith("/stage"):
+            return _routing_snapshot(task, pending=dict(body))
+        assert path.endswith("/ack")
+        return _routing_snapshot(
+            task,
+            model="gpt-5.4-mini",
+            codex_service_tier="default",
+        )
+
+    proxy.proxy_to_worker.side_effect = protocol
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={
+            "model": "gpt-5.4-mini",
+            "codex_service_tier": "default",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == "gpt-5.4-mini"
+    assert response.json()["codex_service_tier"] == "default"
+    assert proxy.proxy_to_worker.await_count == 3
+    stage_payload = proxy.proxy_to_worker.await_args_list[1].args[3]
+    assert {
+        key: value
+        for key, value in stage_payload.items()
+        if key != "op_id"
+    } == {
+        "model": "gpt-5.4-mini",
+        "codex_service_tier": "default",
+        "provider": "codex",
+    }
+
+
+async def test_worker_routing_config_rejects_mixed_routing_and_other_fields(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={
+            "title": "must-not-change",
+            "codex_service_tier": "priority",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "save other fields separately" in response.json()["detail"]
+    proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.title == "t"
+    assert current.codex_service_tier == "default"
+
+
+@pytest.mark.parametrize(
+    ("field", "remote_value"),
+    (
+        ("id", -1),
+        ("provider", "claude"),
+        ("model", "gpt-5.6-terra"),
+        ("codex_service_tier", "default"),
+    ),
+)
+async def test_worker_routing_config_rejects_unconfirmed_remote_snapshot(
+    client,
+    session_factory,
+    monkeypatch,
+    field,
+    remote_value,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    remote = {
+        "id": task.id,
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    }
+    remote[field] = remote_value
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.return_value = remote
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 502
+    assert "invalid routing synchronization snapshot" in response.json()["detail"]
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.model == "gpt-5.6-sol"
+    assert current.codex_service_tier == "default"
+
+
+async def test_worker_routing_config_remote_failure_keeps_manager_standard(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = HTTPException(
+        502,
+        "Worker rejected config",
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 502
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.codex_service_tier == "default"
+
+
+async def test_worker_routing_config_relay_active_change_keeps_worker_blocked(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+
+    remote_pending = None
+
+    async def stage_after_relay_event(
+        _task,
+        method,
+        path,
+        body=None,
+        **_kwargs,
+    ):
+        nonlocal remote_pending
+        if method == "GET":
+            return _routing_snapshot(task)
+        assert path.endswith("/stage")
+        remote_pending = dict(body)
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(status="executing")
+            )
+            await db.commit()
+        return _routing_snapshot(task, pending=remote_pending)
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = stage_after_relay_event
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "remains safely blocked" in response.json()["detail"]
+    assert remote_pending is not None
+    assert proxy.proxy_to_worker.await_count == 2
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "executing"
+    assert current.codex_service_tier == "default"
+
+
+@pytest.mark.parametrize("status", ("pending", "in_progress", "executing"))
+async def test_worker_routing_config_rejects_forwarding_or_active_generation(
+    client,
+    session_factory,
+    monkeypatch,
+    status,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status=status,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 409
+    assert "pending or active" in response.json()["detail"]
+    proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.codex_service_tier == "default"
+
+
+async def test_worker_routing_config_rereads_assignment_after_operation_barrier(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class MigrationGate:
+        async def __aenter__(self):
+            entered.set()
+            await release.wait()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        tasks_api_module,
+        "get_task_operation_lock",
+        lambda _task_id: MigrationGate(),
+    )
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    request = asyncio.create_task(
+        client.put(
+            f"/api/tasks/{task.id}",
+            json={"codex_service_tier": "priority"},
+        )
+    )
+    await entered.wait()
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(worker_id=None)
+        )
+        await db.commit()
+    release.set()
+    response = await request
+
+    assert response.status_code == 409
+    assert "assignment changed" in response.json()["detail"]
+    proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id is None
+    assert current.codex_service_tier == "default"
+
+
+async def test_worker_local_stage_readback_and_ack_are_atomic(
+    client,
+    session_factory,
+):
+    task = await _mk_task(
+        session_factory,
+        worker_id=None,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+        metadata_={"keep": "yes"},
+    )
+    payload = {
+        "op_id": "stage-standard-to-fast",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    }
+
+    staged = await client.post(
+        f"/api/tasks/{task.id}/routing-config/stage",
+        json=payload,
+    )
+
+    assert staged.status_code == 200, staged.text
+    assert staged.json()["codex_service_tier"] == "default"
+    assert staged.json()["pending"] == payload
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "default"
+        assert current.metadata_["keep"] == "yes"
+        assert (
+            current.metadata_[WORKER_ROUTING_PENDING_KEY]["op_id"]
+            == payload["op_id"]
+        )
+
+    readback = await client.get(
+        f"/api/tasks/{task.id}/routing-config/status"
+    )
+    assert readback.status_code == 200
+    assert readback.json() == staged.json()
+
+    acked = await client.post(
+        f"/api/tasks/{task.id}/routing-config/ack",
+        json=payload,
+    )
+    assert acked.status_code == 200, acked.text
+    assert acked.json()["codex_service_tier"] == "priority"
+    assert acked.json()["pending"] is None
+
+    # A lost ack response may be retried exactly.
+    duplicate = await client.post(
+        f"/api/tasks/{task.id}/routing-config/ack",
+        json=payload,
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json() == acked.json()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "priority"
+        assert current.metadata_ == {"keep": "yes"}
+
+
+async def test_worker_stage_holds_codex_thread_guard_through_marker_commit(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        worker_id=None,
+        status="completed",
+        session_id="native-thread-guarded",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    guard_exited = False
+
+    @asynccontextmanager
+    async def routing_guard(_home, thread_id):
+        nonlocal guard_exited
+        assert thread_id == "native-thread-guarded"
+        async with session_factory() as db:
+            before = await db.get(Task, task.id)
+            assert WORKER_ROUTING_PENDING_KEY not in (before.metadata_ or {})
+        yield {"thread": {"status": {"type": "idle"}}, "goal": None}
+        async with session_factory() as db:
+            staged = await db.get(Task, task.id)
+            assert staged.codex_service_tier == "default"
+            assert WORKER_ROUTING_PENDING_KEY in staged.metadata_
+        guard_exited = True
+
+    monkeypatch.setattr(
+        main_module.instance_manager,
+        "codex_thread_routing_guard",
+        routing_guard,
+    )
+    response = await client.post(
+        f"/api/tasks/{task.id}/routing-config/stage",
+        json={
+            "op_id": "guarded-standard-to-fast",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "priority",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["codex_service_tier"] == "default"
+    assert response.json()["pending"]["codex_service_tier"] == "priority"
+    assert guard_exited
+
+
+@pytest.mark.parametrize("status", ("pending", "in_progress", "executing"))
+async def test_worker_local_stage_atomically_rejects_active_status(
+    client,
+    session_factory,
+    status,
+):
+    task = await _mk_task(
+        session_factory,
+        status=status,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    response = await client.post(
+        f"/api/tasks/{task.id}/routing-config/stage",
+        json={
+            "op_id": f"active-{status}",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "priority",
+        },
+    )
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "default"
+        assert WORKER_ROUTING_PENDING_KEY not in (current.metadata_ or {})
+
+
+async def test_worker_pending_marker_blocks_direct_retry_chat_and_plan_approve(
+    client,
+    session_factory,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    payload = {
+        "op_id": "block-direct-turns",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    }
+    staged = await client.post(
+        f"/api/tasks/{task.id}/routing-config/stage",
+        json=payload,
+    )
+    assert staged.status_code == 200
+
+    retry = await client.post(f"/api/tasks/{task.id}/retry")
+    chat = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": "must remain queued nowhere"},
+    )
+    assert retry.status_code == 409
+    assert chat.status_code == 409
+    async with session_factory() as db:
+        logs = list(
+            (
+                await db.execute(
+                    select(LogEntry).where(LogEntry.task_id == task.id)
+                )
+            ).scalars()
+        )
+    assert logs == []
+
+    plan = await _mk_task(
+        session_factory,
+        status="plan_review",
+        mode="plan",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    staged_plan = await client.post(
+        f"/api/tasks/{plan.id}/routing-config/stage",
+        json={**payload, "op_id": "block-plan-approve"},
+    )
+    assert staged_plan.status_code == 200
+    approve = await client.post(f"/api/tasks/{plan.id}/plan/approve")
+    assert approve.status_code == 409
+    async with session_factory() as db:
+        current = await db.get(Task, plan.id)
+        assert current.status == "plan_review"
+        assert not current.plan_approved
+
+
+async def test_worker_stage_rejects_running_ccm_sub_agent(
+    client,
+    session_factory,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    async with session_factory() as db:
+        db.add(
+            MonitorSession(
+                task_id=task.id,
+                agent_type="sub_agent",
+                source="ccm",
+                description="delayed child",
+                status="running",
+            )
+        )
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/routing-config/stage",
+        json={
+            "op_id": "child-running",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "priority",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "sub-agent is running" in response.json()["detail"]
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert WORKER_ROUTING_PENDING_KEY not in (current.metadata_ or {})
+
+
+async def test_worker_stage_rejects_unsettled_main_instance_generation(
+    client,
+    session_factory,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    async with session_factory() as db:
+        instance = Instance(
+            name="still-running-old-standard",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        current = await db.get(Task, task.id)
+        current.instance_id = instance.id
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/routing-config/stage",
+        json={
+            "op_id": "must-wait-for-old-turn",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "priority",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "Instance generation" in response.json()["detail"]
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "default"
+        assert WORKER_ROUTING_PENDING_KEY not in (current.metadata_ or {})
+
+
+async def test_worker_stage_rejects_unsettled_preowner_launch_reservation(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    async with session_factory() as db:
+        instance = Instance(name="preowner-reservation", status="idle")
+        db.add(instance)
+        await db.flush()
+        current = await db.get(Task, task.id)
+        current.instance_id = instance.id
+        await db.commit()
+        instance_id = instance.id
+
+    barrier = AsyncMock(
+        side_effect=HTTPException(
+            409,
+            "pre-owner process launch could not be proven stopped",
+        )
+    )
+    monkeypatch.setattr(
+        tasks_api_module,
+        "_settle_task_launch_barrier",
+        barrier,
+    )
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/routing-config/stage",
+        json={
+            "op_id": "hidden-preowner",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "priority",
+        },
+    )
+
+    assert response.status_code == 409
+    barrier.assert_awaited_once_with(task.id, instance_id)
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "default"
+        assert WORKER_ROUTING_PENDING_KEY not in (current.metadata_ or {})
+
+
+async def test_worker_routing_stage_timeout_leaves_remote_blocked_and_manager_old(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    remote_pending = None
+
+    async def lose_stage_response(
+        _task,
+        method,
+        path,
+        body=None,
+        **_kwargs,
+    ):
+        nonlocal remote_pending
+        if method == "GET":
+            return _routing_snapshot(task)
+        assert path.endswith("/stage")
+        remote_pending = dict(body)
+        raise HTTPException(503, "stage response lost")
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = lose_stage_response
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 503
+    assert remote_pending is not None
+    assert proxy.proxy_to_worker.await_count == 2
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "default"
+
+
+async def test_worker_routing_lost_ack_response_converges_by_readback(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    state = {
+        "tier": "default",
+        "pending": None,
+        "ack_lost": False,
+    }
+
+    async def protocol(_task, method, path, body=None, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(
+                task,
+                codex_service_tier=state["tier"],
+                pending=state["pending"],
+            )
+        if path.endswith("/stage"):
+            state["pending"] = dict(body)
+            return _routing_snapshot(task, pending=state["pending"])
+        assert path.endswith("/ack")
+        state["tier"] = body["codex_service_tier"]
+        state["pending"] = None
+        state["ack_lost"] = True
+        raise HTTPException(503, "ack response lost")
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = protocol
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["codex_service_tier"] == "priority"
+    assert state == {
+        "tier": "priority",
+        "pending": None,
+        "ack_lost": True,
+    }
+    assert proxy.proxy_to_worker.await_count == 4
+
+
+async def test_worker_fast_to_standard_returns_authoritative_after_unreadable_ack(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """Post-commit uncertainty must not leave the UI showing stale Fast."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="priority",
+    )
+    remote_pending = None
+    get_count = 0
+
+    async def protocol(_task, method, path, body=None, **_kwargs):
+        nonlocal remote_pending, get_count
+        if method == "GET":
+            get_count += 1
+            if get_count == 1:
+                return _routing_snapshot(
+                    task,
+                    codex_service_tier="priority",
+                )
+            raise HTTPException(503, "ack readback unavailable")
+        if path.endswith("/stage"):
+            remote_pending = dict(body)
+            return _routing_snapshot(
+                task,
+                codex_service_tier="priority",
+                pending=remote_pending,
+            )
+        assert path.endswith("/ack")
+        raise HTTPException(503, "ack unavailable")
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = protocol
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "default"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["codex_service_tier"] == "default"
+    assert remote_pending is not None
+    assert remote_pending["codex_service_tier"] == "default"
+    assert proxy.proxy_to_worker.await_count == 4
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "default"
+
+
+async def test_worker_execution_reconciles_orphan_stage_to_manager_tuple(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="failed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    pending = {
+        "op_id": "orphan-fast-stage",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "priority",
+    }
+
+    async def protocol(_task, method, path, body=None, **_kwargs):
+        nonlocal pending
+        if method == "GET":
+            return _routing_snapshot(task, pending=pending)
+        if path.endswith("/reconcile"):
+            assert body["op_id"] == "orphan-fast-stage"
+            assert body["codex_service_tier"] == "default"
+            pending = None
+            return _routing_snapshot(task)
+        assert path.endswith("/retry")
+        return _remote_task(
+            task,
+            status="pending",
+            retry_count=task.retry_count + 1,
+            completed_at=None,
+        )
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = protocol
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.post(f"/api/tasks/{task.id}/retry")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "pending"
+    assert pending is None
+    assert proxy.proxy_to_worker.await_count == 3
+
+
+async def test_worker_standard_execution_accepts_matching_legacy_routing(
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    paths = []
+
+    async def legacy_protocol(_task, method, path, _body=None, **kwargs):
+        paths.append(path)
+        assert method == "GET"
+        if path.endswith("/routing-config/status"):
+            assert kwargs["surface_endpoint_not_found"] is True
+            raise WorkerEndpointNotFoundError(path)
+        assert path == f"/api/tasks/{task.id}"
+        return {
+            "id": task.id,
+            "status": task.status,
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            # A pre-Fast Worker has no codex_service_tier response field.
+        }
+
+    monkeypatch.setattr(tasks_api_module, "_proxy", legacy_protocol)
+
+    snapshot = await tasks_api_module._ensure_worker_routing_ready(
+        task,
+        operation_lock_held=True,
+    )
+
+    assert snapshot.provider == "codex"
+    assert snapshot.model == "gpt-5.6-sol"
+    assert snapshot.codex_service_tier == "default"
+    assert snapshot.pending is None
+    assert paths == [
+        f"/api/tasks/{task.id}/routing-config/status",
+        f"/api/tasks/{task.id}",
+    ]
+
+
+async def test_worker_fast_execution_rejects_legacy_routing(
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="priority",
+    )
+    paths = []
+
+    async def legacy_protocol(_task, _method, path, _body=None, **_kwargs):
+        paths.append(path)
+        if path.endswith("/routing-config/status"):
+            raise WorkerEndpointNotFoundError(path)
+        return {
+            "id": task.id,
+            "status": task.status,
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        }
+
+    monkeypatch.setattr(tasks_api_module, "_proxy", legacy_protocol)
+
+    with pytest.raises(HTTPException) as caught:
+        await tasks_api_module._ensure_worker_routing_ready(
+            task,
+            operation_lock_held=True,
+        )
+
+    assert caught.value.status_code == 409
+    assert "cannot confirm Codex Fast" in caught.value.detail
+    assert paths == [
+        f"/api/tasks/{task.id}/routing-config/status",
+        f"/api/tasks/{task.id}",
+    ]
+
+
+async def test_worker_standard_execution_rejects_mismatched_legacy_routing(
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+
+    async def legacy_protocol(_task, _method, path, _body=None, **_kwargs):
+        if path.endswith("/routing-config/status"):
+            raise WorkerEndpointNotFoundError(path)
+        return {
+            "id": task.id,
+            "status": task.status,
+            "provider": "codex",
+            "model": "gpt-5.6-terra",
+        }
+
+    monkeypatch.setattr(tasks_api_module, "_proxy", legacy_protocol)
+
+    with pytest.raises(HTTPException) as caught:
+        await tasks_api_module._ensure_worker_routing_ready(
+            task,
+            operation_lock_held=True,
+        )
+
+    assert caught.value.status_code == 409
+    assert "does not exactly match" in caught.value.detail
+
+
+async def test_worker_execution_does_not_downgrade_non_404_routing_failure(
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    proxy = AsyncMock(
+        side_effect=HTTPException(
+            502,
+            "Worker 上游请求失败（远端 HTTP 500）",
+        )
+    )
+    monkeypatch.setattr(tasks_api_module, "_proxy", proxy)
+
+    with pytest.raises(HTTPException) as caught:
+        await tasks_api_module._ensure_worker_routing_ready(
+            task,
+            operation_lock_held=True,
+        )
+
+    assert caught.value.status_code == 502
+    assert "远端 HTTP 500" in caught.value.detail
+    proxy.assert_awaited_once()
+
+
+async def test_worker_routing_update_does_not_use_legacy_protocol(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    paths = []
+
+    async def old_worker(_task, _method, path, _body=None, **kwargs):
+        paths.append(path)
+        assert kwargs.get("surface_endpoint_not_found", False) is False
+        raise HTTPException(
+            502,
+            "Worker 上游请求失败（远端 HTTP 404）",
+        )
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = old_worker
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"codex_service_tier": "priority"},
+    )
+
+    assert response.status_code == 502
+    assert paths == [f"/api/tasks/{task.id}/routing-config/status"]
+
+
+async def test_worker_routing_update_finishes_ack_before_propagating_cancel(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    ack_started = asyncio.Event()
+    release_ack = asyncio.Event()
+    state = {"tier": "default", "pending": None}
+
+    async def protocol(_task, method, path, body=None, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(
+                task,
+                codex_service_tier=state["tier"],
+                pending=state["pending"],
+            )
+        if path.endswith("/stage"):
+            state["pending"] = dict(body)
+            return _routing_snapshot(task, pending=state["pending"])
+        assert path.endswith("/ack")
+        ack_started.set()
+        await release_ack.wait()
+        state["tier"] = "priority"
+        state["pending"] = None
+        return _routing_snapshot(
+            task,
+            codex_service_tier="priority",
+        )
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = protocol
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    request = asyncio.create_task(
+        client.put(
+            f"/api/tasks/{task.id}",
+            json={"codex_service_tier": "priority"},
+        )
+    )
+    await asyncio.wait_for(ack_started.wait(), timeout=1)
+    request.cancel()
+    await asyncio.sleep(0)
+    assert state["pending"] is not None
+    release_ack.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert state == {"tier": "priority", "pending": None}
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.codex_service_tier == "priority"
+
+
+async def test_worker_execution_fails_closed_on_unmarked_tuple_divergence(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="failed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.return_value = _routing_snapshot(
+        task,
+        codex_service_tier="priority",
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.post(f"/api/tasks/{task.id}/retry")
+
+    assert response.status_code == 409
+    assert "execution was blocked" in response.json()["detail"]
+    proxy.proxy_to_worker.assert_awaited_once()
 
 
 async def test_proxy_terminal_response_commits_normalized_generation_then_publishes(
@@ -1524,7 +2901,15 @@ async def test_proxy_response_cannot_overwrite_same_worker_retry_aba(
         error_message="old failure",
     )
 
-    async def retry_completes_before_old_response(*_args, **_kwargs):
+    async def retry_completes_before_old_response(
+        _task,
+        method,
+        _path,
+        *_args,
+        **_kwargs,
+    ):
+        if method == "GET":
+            return _routing_snapshot(task)
         async with session_factory() as db:
             await db.execute(
                 update(Task)
@@ -1787,7 +3172,13 @@ async def test_chat_proxy_for_worker_task(client, session_factory, monkeypatch):
     proxy = AsyncMock()
     proxy.require_ready_worker.return_value = w
     proxy.relay = AsyncMock()
-    proxy.proxy_to_worker.return_value = {"ok": True, "queued": True, "session_id": "sess-1"}
+
+    async def route_then_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(t)
+        return {"ok": True, "queued": True, "session_id": "sess-1"}
+
+    proxy.proxy_to_worker.side_effect = route_then_chat
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
     monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
 
@@ -1805,7 +3196,7 @@ async def test_chat_proxy_for_worker_task(client, session_factory, monkeypatch):
         task = await db.get(Task, t.id)
     assert len(logs) == 1 and logs[0].instance_id is None
     assert task.session_id == "sess-1"
-    proxy.proxy_to_worker.assert_called_once()
+    assert proxy.proxy_to_worker.await_count == 2
     assert (
         proxy.proxy_to_worker.call_args.kwargs["operation_lock_held"]
         is True
@@ -1825,7 +3216,15 @@ async def test_worker_chat_response_cannot_overwrite_retry_aba(
         session_id="old-session",
     )
 
-    async def replace_generation_before_response(*_args, **_kwargs):
+    async def replace_generation_before_response(
+        _task,
+        method,
+        _path,
+        *_args,
+        **_kwargs,
+    ):
+        if method == "GET":
+            return _routing_snapshot(task)
         async with session_factory() as db:
             await db.execute(
                 update(Task)
@@ -1889,9 +3288,17 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
     proxy = AsyncMock()
     proxy.require_ready_worker.return_value = w
     proxy.relay = AsyncMock()
-    proxy.proxy_to_worker.return_value = {
-        "ok": True, "queued": True, "session_id": "worker-prefix-session",
-    }
+
+    async def route_then_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(t)
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": "worker-prefix-session",
+        }
+
+    proxy.proxy_to_worker.side_effect = route_then_chat
     broadcaster = FakeBroadcaster()
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
     monkeypatch.setattr(main_module, "broadcaster", broadcaster)

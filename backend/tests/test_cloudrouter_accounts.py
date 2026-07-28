@@ -5,6 +5,7 @@ import stat
 import sys
 import tomllib
 import types
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -23,6 +24,8 @@ from backend.services.cloudrouter_accounts import (
     CLAUDE_BASE_URL,
     CODEX_BASE_URL,
     MAX_API_RESPONSE_BYTES,
+    CloudRouterAccountBusyError,
+    CloudRouterAccountError,
     CloudRouterAccountNotFound,
     CloudRouterAccountStore,
     CloudRouterUnsafePathError,
@@ -499,6 +502,87 @@ async def test_failed_retirement_is_disabled_and_idempotently_resumable(
 
 
 @pytest.mark.asyncio
+async def test_finalize_retirement_refuses_active_credential_lease(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_credential():
+        async with store.credential_admission(account.id):
+            entered.set()
+            await release.wait()
+
+    lease_task = asyncio.create_task(hold_credential())
+    await entered.wait()
+    await store.stage_retirement(account.id)
+
+    with pytest.raises(CloudRouterAccountBusyError, match="credential"):
+        await store.finalize_retirement(account.id)
+
+    assert (account.root / "api.key").is_file()
+    assert store.account(account.id).cleanup_pending is True
+    release.set()
+    await lease_task
+    completed = await store.finalize_retirement(account.id)
+    assert completed.cleanup_pending is False
+    assert not (account.root / "api.key").exists()
+
+
+@pytest.mark.asyncio
+async def test_pending_tombstone_survives_restart_in_both_pool_tabs(
+    tmp_path, monkeypatch,
+):
+    from backend.services.claude_pool import ClaudePool
+    from backend.services.codex_pool import CodexPool
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": [],
+            "codex": ["gpt-5.5"],
+        }),
+    )
+    account = await store.add_account(
+        "Apex API",
+        "lck-secret",
+        api_provider="apex",
+    )
+    await store.stage_retirement(account.id)
+
+    # Reconstruct every in-memory projection as a process restart would.
+    restarted = CloudRouterAccountStore(store.root)
+    claude = ClaudePool(
+        tmp_path / "missing-claude.json",
+        cloudrouter_store=restarted,
+        bootstrap_default=False,
+        include_native=False,
+    )
+    codex = CodexPool(
+        tmp_path / "missing-codex.json",
+        cloudrouter_store=restarted,
+        bootstrap_default=False,
+        include_native=False,
+    )
+
+    for projected in (claude.list_accounts(), codex.list_accounts()):
+        assert len(projected) == 1
+        assert projected[0]["api_account_id"] == account.id
+        assert projected[0]["retired"] is True
+        assert projected[0]["cleanup_pending"] is True
+        assert projected[0]["enabled"] is False
+
+    await restarted.finalize_retirement(account.id)
+    claude.reload()
+    codex.reload()
+    assert claude.list_accounts() == []
+    assert codex.list_accounts() == []
+
+
+@pytest.mark.asyncio
 async def test_usage_quota_exhaustion_is_known_unavailable_and_cached(
     tmp_path, monkeypatch,
 ):
@@ -782,7 +866,14 @@ async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
     request = AsyncMock(return_value={
         "models": [
             {"slug": "claude-opus-4-8", "supported_in_api": True},
-            {"slug": "gpt-5.4", "supported_in_api": True, "visibility": "list"},
+            {
+                "slug": "gpt-5.4",
+                "supported_in_api": True,
+                "visibility": "list",
+                "service_tiers": [
+                    {"id": "priority", "name": "Fast"},
+                ],
+            },
             {"slug": "gpt-hidden", "supported_in_api": True, "visibility": "hide"},
             {"slug": "gpt-disabled", "supported_in_api": False},
         ],
@@ -794,7 +885,11 @@ async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
         api_provider="apex",
     )
 
-    assert models == {"claude": [], "codex": ["gpt-5.4"]}
+    assert models == {
+        "claude": [],
+        "codex": ["gpt-5.4"],
+        "service_tiers": {"gpt-5.4": ["priority"]},
+    }
     request.assert_awaited_once_with(
         (
             f"{APEX_MODELS_URL}?client_version="
@@ -802,6 +897,221 @@ async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
         ),
         "lck-test-secret",
     )
+
+
+@pytest.mark.asyncio
+async def test_apex_service_tiers_are_persisted_and_reloaded(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": [],
+            "codex": ["gpt-5.4", "gpt-5.4-mini"],
+            "service_tiers": {"gpt-5.4": ["priority"]},
+        }),
+    )
+
+    account = await store.add_account(
+        "Apex Fast",
+        "lck-test-secret",
+        api_provider="apex",
+    )
+
+    assert account.service_tiers == {"gpt-5.4": ["priority"]}
+    assert account.supports_service_tier(
+        "codex", "gpt-5.4", "priority"
+    )
+    assert not account.supports_service_tier(
+        "codex", "gpt-5.4-mini", "priority"
+    )
+    metadata = json.loads((account.root / "account.json").read_text())
+    assert metadata["models"] == {
+        "claude": [],
+        "codex": ["gpt-5.4", "gpt-5.4-mini"],
+    }
+    assert metadata["service_tiers"] == {
+        "gpt-5.4": ["priority"],
+    }
+    public = store.reload()[0].public_dict()
+    assert public["service_tiers"] == {"gpt-5.4": ["priority"]}
+
+
+@pytest.mark.asyncio
+async def test_legacy_apex_uses_exact_nofollow_models_cache_as_fast_candidate(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": [],
+            "codex": ["gpt-5.4", "gpt-5.5"],
+        }),
+    )
+    account = await store.add_account(
+        "Legacy Apex",
+        "lck-test-secret",
+        api_provider="apex",
+    )
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("service_tiers")
+    metadata_path.write_text(json.dumps(metadata))
+    (account.root / "codex" / "models_cache.json").write_text(json.dumps({
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "service_tiers": [{"id": "priority"}],
+            },
+            {
+                "slug": "gpt-5.5",
+                "service_tiers": [],
+            },
+            {
+                "slug": "gpt-not-advertised-by-account",
+                "service_tiers": [{"id": "priority"}],
+            },
+        ],
+    }))
+
+    legacy = store.reload()[0]
+
+    assert legacy.service_tiers_explicit is False
+    assert legacy.service_tiers == {"gpt-5.4": ["priority"]}
+    assert legacy.supports_service_tier(
+        "codex", "gpt-5.4", "priority"
+    )
+    assert not legacy.supports_service_tier(
+        "codex", "gpt-5.5", "priority"
+    )
+    async with store.runtime_admission(
+        "codex",
+        legacy.codex_home,
+        "gpt-5.4",
+        service_tier="priority",
+    ) as admitted:
+        assert admitted.id == legacy.id
+
+
+@pytest.mark.asyncio
+async def test_explicit_or_non_apex_capability_never_uses_models_cache_fallback(
+    tmp_path, monkeypatch,
+):
+    apex_store = CloudRouterAccountStore(tmp_path / "apex-accounts")
+    monkeypatch.setattr(
+        apex_store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": [],
+            "codex": ["gpt-5.4"],
+        }),
+    )
+    apex = await apex_store.add_account(
+        "Explicit Apex",
+        "lck-test-secret",
+        api_provider="apex",
+    )
+    (apex.root / "codex" / "models_cache.json").write_text(json.dumps({
+        "models": [{
+            "slug": "gpt-5.4",
+            "service_tiers": [{"id": "priority"}],
+        }],
+    }))
+    explicit = apex_store.reload()[0]
+    assert explicit.service_tiers_explicit is True
+    assert not explicit.supports_service_tier(
+        "codex", "gpt-5.4", "priority"
+    )
+
+    generic_store, generic = await _add(
+        tmp_path,
+        monkeypatch,
+        models={"claude": [], "codex": ["gpt-5.4"]},
+    )
+    generic_metadata_path = generic.root / "account.json"
+    generic_metadata = json.loads(generic_metadata_path.read_text())
+    generic_metadata.pop("service_tiers")
+    generic_metadata_path.write_text(json.dumps(generic_metadata))
+    (generic.root / "codex" / "models_cache.json").write_text(json.dumps({
+        "models": [{
+            "slug": "gpt-5.4",
+            "service_tiers": [{"id": "priority"}],
+        }],
+    }))
+    legacy_generic = generic_store.reload()[0]
+    assert legacy_generic.service_tiers_explicit is False
+    assert not legacy_generic.supports_service_tier(
+        "codex", "gpt-5.4", "priority"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_apex_models_cache_symlink_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": [],
+            "codex": ["gpt-5.4"],
+        }),
+    )
+    account = await store.add_account(
+        "Legacy Apex",
+        "lck-test-secret",
+        api_provider="apex",
+    )
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("service_tiers")
+    metadata_path.write_text(json.dumps(metadata))
+    outside = tmp_path / "outside-models-cache.json"
+    outside.write_text(json.dumps({
+        "models": [{
+            "slug": "gpt-5.4",
+            "service_tiers": [{"id": "priority"}],
+        }],
+    }))
+    (account.root / "codex" / "models_cache.json").symlink_to(outside)
+
+    legacy = store.reload()[0]
+
+    assert legacy.service_tiers == {}
+    assert not legacy.supports_service_tier(
+        "codex", "gpt-5.4", "priority"
+    )
+
+
+@pytest.mark.asyncio
+async def test_apex_probe_rejects_malformed_service_tiers(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "models": [{
+                "slug": "gpt-5.4",
+                "service_tiers": [{"id": "priority tier"}],
+            }],
+        }),
+    )
+
+    with pytest.raises(
+        CloudRouterUpstreamError,
+        match="invalid_models_response",
+    ):
+        await store.probe_models(
+            "lck-test-secret",
+            api_provider="apex",
+        )
 
 
 @pytest.mark.asyncio
@@ -1014,6 +1324,47 @@ async def test_configuration_admission_validates_route_without_quota_gate(
             "codex", account.codex_home,
         ):
             pass
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_requires_exact_fast_capability(
+    tmp_path, monkeypatch,
+):
+    cloudrouter_store, cloudrouter = await _add(tmp_path, monkeypatch)
+    with pytest.raises(
+        CloudRouterAccountError,
+        match="does not advertise service tier",
+    ):
+        async with cloudrouter_store.runtime_admission(
+            "codex",
+            cloudrouter.codex_home,
+            "gpt-5.5",
+            service_tier="priority",
+        ):
+            pass
+
+    apex_store = CloudRouterAccountStore(tmp_path / "apex-accounts")
+    monkeypatch.setattr(
+        apex_store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": [],
+            "codex": ["gpt-5.4"],
+            "service_tiers": {"gpt-5.4": ["priority"]},
+        }),
+    )
+    apex = await apex_store.add_account(
+        "Apex Fast",
+        "lck-test-secret",
+        api_provider="apex",
+    )
+    async with apex_store.runtime_admission(
+        "codex",
+        apex.codex_home,
+        "gpt-5.4",
+        service_tier="priority",
+    ) as admitted:
+        assert admitted.id == apex.id
 
 
 @pytest.mark.asyncio
@@ -1276,6 +1627,19 @@ def test_runtime_pool_reload_is_deduplicated(monkeypatch):
     assert claude.calls == 2
 
 
+def test_unsafe_storage_error_is_not_reported_as_staged_busy_cleanup():
+    busy = cloudrouter_api._http_error(
+        CloudRouterAccountBusyError("active turn")
+    )
+    unsafe = cloudrouter_api._http_error(
+        CloudRouterUnsafePathError("ancestor changed")
+    )
+
+    assert busy.status_code == 409
+    assert unsafe.status_code == 500
+    assert unsafe.detail == "API account storage is unsafe"
+
+
 @pytest.mark.asyncio
 async def test_first_api_account_lazily_creates_both_runtime_pools(
     tmp_path, monkeypatch,
@@ -1318,6 +1682,55 @@ async def test_first_api_account_lazily_creates_both_runtime_pools(
         model="gpt-5.5"
     ) == str(Path(account.codex_home).resolve())
     assert dispatcher.codex_pool is fake_main.codex_pool
+
+
+@pytest.mark.asyncio
+async def test_pending_apex_tombstone_initializes_both_pool_tabs_after_restart(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.5"]}),
+    )
+    account = await store.add_account(
+        "Apex API",
+        "lck-secret",
+        api_provider="apex",
+    )
+    await store.stage_retirement(account.id)
+    restarted = CloudRouterAccountStore(store.root)
+    dispatcher = types.SimpleNamespace(pool=None, codex_pool=None)
+    fake_main = types.SimpleNamespace(
+        cloudrouter_store=restarted,
+        dispatcher=dispatcher,
+        instance_manager=types.SimpleNamespace(
+            read_codex_rate_limits=AsyncMock(),
+        ),
+        codex_pool=None,
+    )
+    monkeypatch.setitem(sys.modules, "backend.main", fake_main)
+    import backend
+    monkeypatch.setattr(backend, "main", fake_main, raising=False)
+    monkeypatch.setattr(
+        "backend.config.settings.pool_config_path",
+        str(tmp_path / "missing-claude-pool.json"),
+    )
+    monkeypatch.setattr(
+        "backend.config.settings.codex_pool_config_path",
+        str(tmp_path / "missing-codex-pool.json"),
+    )
+    monkeypatch.setattr("backend.config.settings.pool_enabled", False)
+    monkeypatch.setattr("backend.config.settings.codex_pool_enabled", False)
+
+    claude, codex = cloudrouter_api._runtime_pools()
+
+    assert claude is not None
+    assert codex is not None
+    assert claude.list_accounts()[0]["api_account_id"] == account.id
+    assert codex.list_accounts()[0]["api_account_id"] == account.id
 
 
 @pytest.mark.asyncio
@@ -1412,7 +1825,7 @@ async def test_create_endpoint_accepts_apex_provider_without_exposing_key(
 
 
 @pytest.mark.asyncio
-async def test_delete_endpoint_is_fail_closed_until_all_runtime_users_are_fenced(
+async def test_delete_endpoint_stages_busy_account_and_retry_finishes_cleanup(
     tmp_path, monkeypatch,
 ):
     store, account = await _add(tmp_path, monkeypatch)
@@ -1420,9 +1833,381 @@ async def test_delete_endpoint_is_fail_closed_until_all_runtime_users_are_fenced
     reload_pools = Mock()
     monkeypatch.setattr(cloudrouter_api, "_reload_runtime_pools", reload_pools)
 
+    @asynccontextmanager
+    async def busy_fence(_account, _store):
+        raise CloudRouterAccountBusyError("active turn")
+        yield
+
+    monkeypatch.setattr(
+        cloudrouter_api, "_runtime_retirement_fence", busy_fence,
+    )
     with pytest.raises(HTTPException) as blocked:
         await cloudrouter_api.retire_account(_admin_request(), account.id)
     assert blocked.value.status_code == 409
-    assert "temporarily disabled" in blocked.value.detail
-    assert store.account(account.id).retired is False
-    reload_pools.assert_not_called()
+    assert blocked.value.detail == "active turn"
+    pending = store.account(account.id)
+    assert pending is not None
+    assert pending.retired is True
+    assert pending.cleanup_pending is True
+    assert (account.root / "api.key").is_file()
+    assert store.visible_accounts() == [pending]
+
+    listed = await cloudrouter_api.list_accounts(_admin_request())
+    assert listed[0]["id"] == account.id
+    assert listed[0]["cleanup_pending"] is True
+    assert listed[0]["api_quota"] is None
+
+    @asynccontextmanager
+    async def idle_fence(_account, _store):
+        yield
+
+    monkeypatch.setattr(
+        cloudrouter_api, "_runtime_retirement_fence", idle_fence,
+    )
+    result = await cloudrouter_api.retire_account(
+        _admin_request(), account.id,
+    )
+    assert result["ok"] is True
+    assert result["retired"] is True
+    assert result["cleanup_pending"] is False
+    assert result["key_hint"] == ""
+    assert not (account.root / "api.key").exists()
+    assert store.visible_accounts() == []
+    assert reload_pools.call_count >= 4
+
+
+def _install_retirement_runtime(
+    monkeypatch,
+    *,
+    store,
+    instance_manager,
+    dispatcher=None,
+):
+    runtime = types.SimpleNamespace(
+        cloudrouter_store=store,
+        instance_manager=instance_manager,
+        dispatcher=dispatcher or types.SimpleNamespace(
+            api_account_aux_runtime_users=Mock(return_value=[]),
+        ),
+        task_migrator=None,
+    )
+    monkeypatch.setitem(sys.modules, "backend.main", runtime)
+    import backend
+    monkeypatch.setattr(backend, "main", runtime, raising=False)
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_apex_retirement_skips_impossible_claude_container_scan(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.5"]}),
+    )
+    account = await store.add_account(
+        "Apex API",
+        "lck-secret",
+        api_provider="apex",
+    )
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(return_value=[]),
+        begin_codex_app_server_home_maintenance=AsyncMock(return_value=False),
+        end_codex_app_server_home_maintenance=AsyncMock(),
+        detach_api_account_containers=AsyncMock(
+            side_effect=AssertionError("Apex cannot have a Claude mount"),
+        ),
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+    monkeypatch.setattr(cloudrouter_api, "_get_store", lambda: store)
+    monkeypatch.setattr(cloudrouter_api, "_reload_runtime_pools", Mock())
+
+    result = await cloudrouter_api.retire_account(
+        _admin_request(), account.id,
+    )
+
+    assert result["ok"] is True
+    assert result["cleanup_pending"] is False
+    manager.detach_api_account_containers.assert_not_awaited()
+    manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
+        account.codex_home
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_retirement_container_failure_is_busy_and_releases_home(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(return_value=[]),
+        begin_codex_app_server_home_maintenance=AsyncMock(return_value=False),
+        end_codex_app_server_home_maintenance=AsyncMock(),
+        detach_api_account_containers=AsyncMock(
+            side_effect=RuntimeError("Docker unavailable"),
+        ),
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+
+    with pytest.raises(
+        CloudRouterAccountBusyError,
+        match="could not be verified",
+    ):
+        async with cloudrouter_api._runtime_retirement_fence(account, store):
+            pass
+
+    manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
+        account.codex_home
+    )
+
+
+@pytest.mark.asyncio
+async def test_retirement_home_release_failure_never_reaches_finalize(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(return_value=[]),
+        begin_codex_app_server_home_maintenance=AsyncMock(return_value=False),
+        end_codex_app_server_home_maintenance=AsyncMock(
+            side_effect=RuntimeError("release failed"),
+        ),
+        detach_api_account_containers=AsyncMock(return_value=0),
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+
+    with pytest.raises(
+        CloudRouterAccountBusyError,
+        match="could not be verified",
+    ):
+        async with cloudrouter_api._runtime_retirement_fence(account, store):
+            raise AssertionError("fence must not yield after release failure")
+
+    assert (account.root / "api.key").is_file()
+
+
+@pytest.mark.asyncio
+async def test_retirement_cancellation_releases_codex_home(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    detach_started = asyncio.Event()
+
+    async def wait_for_cancel(_account):
+        detach_started.set()
+        await asyncio.Event().wait()
+
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(return_value=[]),
+        begin_codex_app_server_home_maintenance=AsyncMock(return_value=False),
+        end_codex_app_server_home_maintenance=AsyncMock(),
+        detach_api_account_containers=AsyncMock(side_effect=wait_for_cancel),
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+
+    async def run_fence():
+        async with cloudrouter_api._runtime_retirement_fence(account, store):
+            pass
+
+    request_task = asyncio.create_task(run_fence())
+    await asyncio.wait_for(detach_started.wait(), timeout=1)
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
+        account.codex_home
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_usage_lease_blocks_cleanup_and_never_republishes_cache(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_request(_url, _api_key):
+        entered.set()
+        await release.wait()
+        return {"mode": "wallet", "status": "active", "balance": 7}
+
+    monkeypatch.setattr(store, "_request_json", delayed_request)
+    usage_task = asyncio.create_task(store.fetch_usage(account.id, force=True))
+    await entered.wait()
+    assert store.active_credential_users(account.id) == 1
+
+    staged = await store.stage_retirement(account.id)
+    assert staged.cleanup_pending is True
+    assert store._quota_cache.get(account.id) is None
+    release.set()
+    result = await usage_task
+
+    assert result["state"] == "active"
+    assert store.active_credential_users(account.id) == 0
+    assert store._quota_cache.get(account.id) is None
+
+
+@pytest.mark.asyncio
+async def test_retire_does_not_follow_nested_symlink(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    external = tmp_path / "external"
+    external.mkdir()
+    secret = external / "keep.txt"
+    secret.write_text("keep")
+    plugins = account.root / "claude" / "plugins"
+    plugins.mkdir()
+    (plugins / "outside").symlink_to(external, target_is_directory=True)
+
+    await store.retire_account(account.id)
+
+    assert secret.read_text() == "keep"
+    assert not plugins.exists()
+
+
+@pytest.mark.asyncio
+async def test_stage_account_ancestor_swap_never_writes_external_metadata(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    original_root = tmp_path / "original-account"
+    external_root = tmp_path / "external-account"
+    external_root.mkdir()
+    external_metadata = external_root / "account.json"
+    external_metadata.write_text('{"sentinel":"external"}\n')
+    original_atomic = cloudrouter_module._atomic_private_json_at
+    swapped = False
+
+    def swap_before_atomic(parent_fd, name, value, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            account.root.rename(original_root)
+            account.root.symlink_to(external_root, target_is_directory=True)
+        return original_atomic(parent_fd, name, value, **kwargs)
+
+    monkeypatch.setattr(
+        cloudrouter_module,
+        "_atomic_private_json_at",
+        swap_before_atomic,
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="directory changed",
+    ):
+        await store.stage_retirement(account.id)
+
+    original_metadata = json.loads(
+        (original_root / "account.json").read_text()
+    )
+    assert original_metadata["retired"] is True
+    assert original_metadata["cleanup_pending"] is True
+    assert external_metadata.read_text() == '{"sentinel":"external"}\n'
+
+
+@pytest.mark.asyncio
+async def test_finalize_account_ancestor_swap_never_deletes_external_tree(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    await store.stage_retirement(account.id)
+    original_root = tmp_path / "pending-account"
+    external_root = tmp_path / "external-account"
+    (external_root / "claude" / "plugins").mkdir(parents=True)
+    (external_root / "codex").mkdir()
+    claude_sentinel = external_root / "claude" / "plugins" / "keep.txt"
+    codex_sentinel = external_root / "codex" / "keep.txt"
+    claude_sentinel.write_text("keep")
+    codex_sentinel.write_text("keep")
+    original_remove = store._remove_except
+    swapped = False
+
+    def swap_before_runtime_open(*args):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            account.root.rename(original_root)
+            account.root.symlink_to(external_root, target_is_directory=True)
+        return original_remove(*args)
+
+    monkeypatch.setattr(store, "_remove_except", swap_before_runtime_open)
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="directory changed",
+    ):
+        await store.finalize_retirement(account.id)
+
+    assert claude_sentinel.read_text() == "keep"
+    assert codex_sentinel.read_text() == "keep"
+    original_metadata = json.loads(
+        (original_root / "account.json").read_text()
+    )
+    assert original_metadata["retired"] is True
+    assert original_metadata["cleanup_pending"] is True
+    assert store.account(account.id).cleanup_pending is True
+
+
+@pytest.mark.asyncio
+async def test_store_root_replacement_fails_identity_check_before_cleanup(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    await store.stage_retirement(account.id)
+    original_store = tmp_path / "original-store"
+    external_store = tmp_path / "external-store"
+    external_store.mkdir()
+    sentinel = external_store / "keep.txt"
+    sentinel.write_text("keep")
+    store.root.rename(original_store)
+    store.root.symlink_to(external_store, target_is_directory=True)
+
+    with pytest.raises(CloudRouterUnsafePathError, match="store root"):
+        await store.finalize_retirement(account.id)
+
+    assert sentinel.read_text() == "keep"
+    metadata = json.loads(
+        (original_store / account.id / "account.json").read_text()
+    )
+    assert metadata["cleanup_pending"] is True
+
+
+@pytest.mark.asyncio
+async def test_retire_rejects_symlink_credential_without_following_it(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    external = tmp_path / "external-key"
+    external.write_text("outside")
+    (account.root / "api.key").unlink()
+    (account.root / "api.key").symlink_to(external)
+
+    with pytest.raises(CloudRouterUnsafePathError):
+        await store.retire_account(account.id)
+
+    pending = store.account(account.id)
+    assert pending is not None
+    assert pending.retired is True
+    assert pending.cleanup_pending is True
+    assert external.read_text() == "outside"

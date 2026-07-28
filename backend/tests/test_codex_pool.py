@@ -235,6 +235,86 @@ class TestSelection:
         assert pool.select() == str((tmp_path / "codex-2").resolve())
         assert pool.status()["last_selected"] is None
 
+    def test_fast_selection_uses_exact_native_model_catalog(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "service_tiers": [{"id": "priority"}],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "service_tiers": [],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="priority",
+        ) == str((tmp_path / "codex-1").resolve())
+        assert pool.supports_model_for_home(
+            tmp_path / "codex-1",
+            "gpt-5.6-sol",
+            service_tier="priority",
+        )
+        assert not pool.supports_model_for_home(
+            tmp_path / "codex-2",
+            "gpt-5.6-sol",
+            service_tier="priority",
+        )
+        assert not pool.has_compatible_enabled_account(
+            "gpt-5.4-mini",
+            service_tier="priority",
+        )
+
+    def test_fast_selection_fails_closed_without_catalog(
+        self, pool: CodexPool,
+    ):
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="priority",
+        ) is None
+
+    def test_fast_selection_resolves_null_model_to_configured_default(
+        self,
+        pool: CodexPool,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            codex_pool_module.settings,
+            "default_codex_model",
+            "gpt-5.6-sol",
+        )
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "service_tiers": [{"id": "priority"}],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model=None,
+            service_tier="priority",
+        ) == str((tmp_path / "codex-1").resolve())
+        assert pool.supports_model_for_home(
+            tmp_path / "codex-1",
+            None,
+            service_tier="priority",
+        )
+
 
 class TestAccountHomeHelpers:
     def test_canonical_home_resolves_alias_and_drives_lookup(
@@ -1048,6 +1128,7 @@ class _FakeCloudRouterCodexAccount:
             "claude": [],
             "codex": ["gpt-5.5"],
         }
+        self.service_tiers = {}
         self.root = root
         self.claude_config_dir = str(root / "claude")
         self.codex_home = str(root / "codex")
@@ -1055,6 +1136,15 @@ class _FakeCloudRouterCodexAccount:
     def supports_model(self, provider, model):
         choices = self.models.get(provider, [])
         return bool(choices) if not model else model in choices
+
+    def supports_service_tier(self, provider, model, service_tier):
+        if service_tier == "default":
+            return self.supports_model(provider, model)
+        return (
+            provider == "codex"
+            and service_tier
+            in self.service_tiers.get(str(model or ""), [])
+        )
 
 
 class _FakeCloudRouterCodexStore:
@@ -1272,6 +1362,7 @@ class TestCloudRouterCodexProjection:
             "claude": [],
             "codex": ["gpt-5.4"],
         }
+        account.service_tiers = {"gpt-5.4": ["priority"]}
         snapshot = {
             "available": True,
             "known": True,
@@ -1288,6 +1379,10 @@ class TestCloudRouterCodexProjection:
         assert pool.select(model="gpt-5.4") == str(
             Path(account.codex_home).resolve()
         )
+        assert pool.select(
+            model="gpt-5.4",
+            service_tier="priority",
+        ) == str(Path(account.codex_home).resolve())
         assert pool.select(model="gpt-5.5") is None
         public = pool.list_accounts()[0]
         assert public["auth_kind"] == "apex_api"

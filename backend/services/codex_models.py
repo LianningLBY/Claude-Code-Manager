@@ -6,12 +6,37 @@ GPT-5.6 是一个家族、三个模型（无裸 "gpt-5.6" ID）：
   - gpt-5.6-terra (GPT-5.6 Terra, balanced)  efforts: low..max + ultra
   - gpt-5.6-luna  (GPT-5.6 Luna,  fast)      efforts: low..max
 旧模型（gpt-5.5 及更早）只支持 low..xhigh。
+
+Fast mode is a service tier, independent from the selected model and its
+reasoning effort.  CCM stores the upstream canonical values:
+  - default  -> Standard
+  - priority -> Fast
 """
 
 from backend.config import settings
 
 # 档位从低到高的全序，用于把不支持的高档位向下夹到该模型的最高档
 EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+DEFAULT_CODEX_SERVICE_TIER = "default"
+FAST_CODEX_SERVICE_TIER = "priority"
+CODEX_SERVICE_TIERS = (
+    DEFAULT_CODEX_SERVICE_TIER,
+    FAST_CODEX_SERVICE_TIER,
+)
+
+# Codex CLI 0.144.6 model catalog (`service_tiers[].id == "priority"`).
+# Runtime account/model discovery remains authoritative because API routers can
+# expose a different catalog; this map is the request-time/UI safety gate.
+CODEX_MODEL_SERVICE_TIERS: dict[str, list[str]] = {
+    "gpt-5.6-sol": ["default", "priority"],
+    "gpt-5.6-terra": ["default", "priority"],
+    "gpt-5.6-luna": ["default", "priority"],
+    "gpt-5.5": ["default", "priority"],
+    "gpt-5.4": ["default", "priority"],
+    "gpt-5.4-mini": ["default"],
+    "gpt-5.3-codex-spark": ["default"],
+}
 
 # 基线档位：codex_effort_options（gpt-5.5 及更早的模型）
 CODEX_MODEL_EFFORTS: dict[str, list[str]] = {
@@ -33,6 +58,62 @@ CODEX_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.3-codex-spark": 128_000,
 }
 DEFAULT_CODEX_CONTEXT_WINDOW = 272_000
+
+
+def supported_codex_service_tiers(model: str | None) -> list[str]:
+    """Return the statically advertised service tiers for a Codex model."""
+    if not model or model == "default":
+        model = settings.default_codex_model
+    return CODEX_MODEL_SERVICE_TIERS.get(
+        model,
+        [DEFAULT_CODEX_SERVICE_TIER],
+    )
+
+
+def validate_codex_service_tier(
+    provider: str | None,
+    model: str | None,
+    service_tier: str | None,
+) -> str:
+    """Validate the merged Task provider/model/service-tier configuration.
+
+    Standard is valid for every provider. Fast is Codex-only and is accepted
+    here only for models whose shipped catalog advertises the priority tier.
+    The transport performs a second live capability check before starting a
+    turn so a route cannot silently downgrade Fast to Standard.
+    """
+    raw_provider = (
+        settings.default_provider
+        if provider is None
+        else provider
+    )
+    if not isinstance(raw_provider, str) or not raw_provider.strip():
+        raise ValueError("provider must be 'claude' or 'codex'")
+    normalized_provider = raw_provider.strip().lower()
+    if normalized_provider not in {"claude", "codex"}:
+        raise ValueError("provider must be 'claude' or 'codex'")
+
+    tier = service_tier or DEFAULT_CODEX_SERVICE_TIER
+    if tier not in CODEX_SERVICE_TIERS:
+        raise ValueError(
+            "codex_service_tier must be 'default' or 'priority'"
+        )
+    if tier == DEFAULT_CODEX_SERVICE_TIER:
+        return tier
+
+    if normalized_provider != "codex":
+        raise ValueError("Codex Fast mode is only available for Codex tasks")
+
+    resolved_model = (
+        settings.default_codex_model
+        if not model or model == "default"
+        else model
+    )
+    if tier not in supported_codex_service_tiers(resolved_model):
+        raise ValueError(
+            f"Codex Fast mode is not supported by model '{resolved_model}'"
+        )
+    return tier
 
 
 def codex_context_window(model: str | None) -> int:

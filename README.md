@@ -23,6 +23,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **Plan Mode** — 敏感任务先生成只读计划，人工审批后再执行
 - **Effort Level** — 支持 `low` / `medium` / `high` / `xhigh` / `max` 五档，优先级链：Task → Instance → 全局默认
 - **Model 配置** — 支持全称模型 ID（包括 `claude-opus-5`）；Opus 5 固定为 1M context 并支持 `low/medium/high/xhigh/max` effort，其他兼容模型可用 `[1m]` 后缀开启 1M context
+- **Codex Fast** — Codex Task 可选择 Standard 或 Fast；Fast 使用同一模型的 `priority` service tier，不会换模型或降低 effort。当前支持 GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；账号或模型无法确认 `priority` 时会在执行前明确失败，不会挂着 Fast 徽标偷偷按 Standard 运行
 - **Thinking Budget** — Instance 级别设置 `thinking_budget`，通过 `MAX_THINKING_TOKENS` 传递给 CLI
 - **Workflows 开关** — Task 级别控制是否启用 Workflow 工具，关闭时节省 token
 
@@ -38,7 +39,8 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **语音输入** — 通过 OpenAI Whisper API 语音转文字创建任务
 
 ### 可靠性
-- **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter API Key 共用账号池、模型兼容性检查和 session 迁移。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
+- **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter API Key 共用账号池、模型/Service Tier 兼容性检查和 session 迁移。Codex Fast 只选择真实广告 `priority` 的账号；ApexRouter 的模型目录能力也会参与选择。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
+- **API 账号安全删除** — CloudRouter/ApexRouter 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
 - **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级
 - **瞬时 429/过载自动重试** — 基础设施侧的临时限流/过载（非账号额度用尽），指数退避+jitter 用同一账号自动 `--resume` 重试，最多 5 次；检测按 provider 分流（Claude / Codex 各自的 CLI 错误文案）
 - **`/tmp` 空间保护** — 服务启动时及后台每 3 小时检查容量和 inode；任一达到 80% 时，清理全部超过 6 小时的 CCM 白名单临时产物
@@ -744,6 +746,7 @@ cloudflared tunnel run <tunnel-name>
 - **Claude Code 集成**：默认 PTY 模式（常驻交互会话，多轮免冷启动）；可切换为 `claude -p` 一次性进程模式（`USE_PTY_MODE=false`）
 - **进程超时保护**：任务执行超过 `TASK_TIMEOUT_SECONDS`（默认 30 分钟）后自动 kill，防止进程挂死
 - **多轮对话**：session_id 绑定在 Task 上，follow-up 时使用 `--resume <session_id>` 续接会话
+- **Codex Fast**：`Task.codex_service_tier` 持久保存 `default|priority`。Standard 会显式清除会话残留的 Fast tier；Fast 必须同时通过当前账号 `model/list` 能力检查、app-server 显式 priority 准入，以及 CCM loopback Responses 代理对上游 `response.created.response.service_tier=priority` 的实际响应验证。成功 SSE 在验证前不会释放；缺字段、不一致、非 2xx、未知 lineage 或代理不可用都会明确失败，且 Fast 禁止回退 `codex exec`。日志与聊天事件会记录 `actual_service_tier_verified=true` 和上游 response id。Fast Goal evaluator 使用与任务相同的模型并走同一实际 tier 证明链路；当前 Distill 无法提供同等证明，因此 Fast Task 会在 Distill 执行前明确返回 409
 - **子 Agent 系统**：统一存 `sub_agent_sessions` 表，`agent_type` 区分类别（monitor / native-agent / native-monitor）。CCM 自有子 agent 拥有独立 MCP server，通过 HTTP API 与系统通信
 - **瞬时过载重试**：Anthropic 基础设施侧 429/overloaded 与账号额度用尽严格区分，前者退避重试同一账号，后者走号池轮换
 - **进程管理**：`asyncio.create_subprocess_exec` 启动，必须 unset `CLAUDECODE` 环境变量避免嵌套检测

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Eye, EyeOff, Plus, RefreshCw, X, Users, Settings } from '../icons';
-import { api } from '../../api/client';
+import { api, isApiRequestError } from '../../api/client';
 import type {
   ApiAccountProvider,
   CloudRouterApiQuota,
@@ -321,7 +321,7 @@ function formatWindowName(minutes: number | null): string {
   return `${hours}小时窗口`;
 }
 
-function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetPreferred, onRelogin, onRetryUsage, onDelete, reloginState }: {
+function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetPreferred, onRelogin, onRetryUsage, onDelete, deleting, reloginState }: {
   account: PoolAccountUsage;
   preferred: string | null;
   lastSelected: string | null;
@@ -329,21 +329,27 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
   onRetryUsage: () => void;
-  onDelete?: (id: string) => void;
+  onDelete?: () => void;
+  deleting?: boolean;
   reloginState?: { status: string; message?: string };
 }) {
   const isApi = isApiAuthKind(account.auth_kind);
+  const cleanupPending = isApi && account.cleanup_pending === true;
   const apiProvider = resolveApiProvider(account.auth_kind, account.api_provider);
-  const statusDot = !account.enabled
+  const statusDot = cleanupPending
+    ? { cls: 'bg-amber-500', label: '待清理' }
+    : !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
       ? { cls: 'bg-green-500', label: '可用' }
       : { cls: 'bg-yellow-500', label: '冷却中' };
-  const isPreferred = preferred === account.id;
-  const isLastSelected = lastSelected === account.id;
+  const isPreferred = !cleanupPending && preferred === account.id;
+  const isLastSelected = !cleanupPending && lastSelected === account.id;
 
   return (
-    <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${isPreferred ? 'border-indigo-500' : 'border-gray-700'}`}>
+    <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${
+      cleanupPending ? 'border-amber-500/60' : isPreferred ? 'border-indigo-500' : 'border-gray-700'
+    }`}>
       <div className="flex items-center gap-2">
         <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot.cls}`} title={statusDot.label} />
         <span className="text-sm font-medium text-foreground truncate" title={account.id}>
@@ -352,6 +358,11 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
             {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
+          </span>
+        )}
+        {cleanupPending && (
+          <span className="px-1.5 py-0.5 rounded bg-amber-600/25 text-amber-300 text-[10px] font-semibold">
+            待清理
           </span>
         )}
         {!isApi && account.subscription_type && (
@@ -400,11 +411,16 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
           )}
           {onDelete && (
             <button
-              onClick={() => onDelete(account.id)}
-              className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500"
-              title="从号池删除"
+              onClick={onDelete}
+              disabled={deleting}
+              className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500 disabled:opacity-50"
+              title={isApi
+                ? cleanupPending
+                  ? '账号已停用；继续安全清理 API Key 与配置'
+                  : '同时从 Claude 与 Codex 视图删除此 API 账号'
+                : '从号池删除'}
             >
-              删除
+              {deleting ? '处理中…' : cleanupPending ? '继续清理' : isApi ? '删除 API 账号' : '删除'}
             </button>
           )}
         </div>
@@ -416,7 +432,12 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
         </div>
       )}
       {isApi && <ApiAccountModels models={account.supported_models} />}
-      {isApi ? (
+      {cleanupPending ? (
+        <div className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-[10px] leading-relaxed text-amber-200">
+          账号已停用，新的 Claude/Codex 任务不会再使用它。API Key 与配置仍在等待安全清理；
+          活跃任务不会被强制终止，任务结束后可点击“继续清理”。Claude projects 与 Codex sessions 会保留。
+        </div>
+      ) : isApi ? (
         <ApiQuotaDisclosure quota={account.api_quota} onRefresh={onRetryUsage} />
       ) : account.usage ? (
         <div className="space-y-1.5">
@@ -514,7 +535,7 @@ function CodexOtpPrompt({ state, onSubmit }: {
   );
 }
 
-function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, onRetryUsage, reloginState }: {
+function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, deleting, onRetryUsage, reloginState }: {
   account: CodexPoolAccountUsage;
   preferred: string | null;
   lastSelected: string | null;
@@ -522,24 +543,30 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
   onSubmitOtp: (state: CodexLoginStatus, code: string) => Promise<void>;
-  onDelete?: (id: string) => void;
+  onDelete?: () => void;
+  deleting?: boolean;
   onRetryUsage: () => void;
   reloginState?: CodexLoginStatus;
 }) {
   const isApi = isApiAuthKind(account.auth_kind);
+  const cleanupPending = isApi && account.cleanup_pending === true;
   const apiProvider = resolveApiProvider(account.auth_kind, account.api_provider);
-  const statusDot = !account.enabled
+  const statusDot = cleanupPending
+    ? { cls: 'bg-amber-500', label: '待清理' }
+    : !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
       ? { cls: 'bg-green-500', label: '可用' }
       : { cls: 'bg-yellow-500', label: '冷却中' };
 
   const q = isApi ? null : account.quota;
-  const isPreferred = preferred === account.id;
-  const isLastSelected = lastSelected === account.id;
+  const isPreferred = !cleanupPending && preferred === account.id;
+  const isLastSelected = !cleanupPending && lastSelected === account.id;
 
   return (
-    <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${isPreferred ? 'border-emerald-500' : 'border-gray-700'}`}>
+    <div className={`rounded-lg border bg-gray-800 p-3 space-y-2 ${
+      cleanupPending ? 'border-amber-500/60' : isPreferred ? 'border-emerald-500' : 'border-gray-700'
+    }`}>
       <div className="flex items-center gap-2">
         <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot.cls}`} title={statusDot.label} />
         <span className="text-sm font-medium text-foreground truncate" title={account.id}>
@@ -548,6 +575,11 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
             {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
+          </span>
+        )}
+        {cleanupPending && (
+          <span className="px-1.5 py-0.5 rounded bg-amber-600/25 text-amber-300 text-[10px] font-semibold">
+            待清理
           </span>
         )}
         {!isApi && account.plan_type && (
@@ -606,10 +638,16 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
           )}
           {onDelete && (
             <button
-              onClick={() => onDelete(account.id)}
-              className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500"
+              onClick={onDelete}
+              disabled={deleting}
+              className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500 disabled:opacity-50"
+              title={isApi
+                ? cleanupPending
+                  ? '账号已停用；继续安全清理 API Key 与配置'
+                  : '同时从 Claude 与 Codex 视图删除此 API 账号'
+                : '从号池删除'}
             >
-              删除
+              {deleting ? '处理中…' : cleanupPending ? '继续清理' : isApi ? '删除 API 账号' : '删除'}
             </button>
           )}
         </div>
@@ -619,7 +657,12 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
         CODEX_HOME: {account.codex_home}
       </div>
       {isApi && <ApiAccountModels models={account.supported_models} />}
-      {isApi ? (
+      {cleanupPending ? (
+        <div className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-[10px] leading-relaxed text-amber-200">
+          账号已停用，新的 Claude/Codex 任务不会再使用它。API Key 与配置仍在等待安全清理；
+          活跃任务不会被强制终止，任务结束后可点击“继续清理”。Claude projects 与 Codex sessions 会保留。
+        </div>
+      ) : isApi ? (
         <ApiQuotaDisclosure quota={account.api_quota} onRefresh={onRetryUsage} />
       ) : q ? (
         <div className="space-y-2">
@@ -1226,6 +1269,7 @@ export function PoolDrawer() {
   const [showCodexAdd, setShowCodexAdd] = useState(false);
   const [showApiAdd, setShowApiAdd] = useState(false);
   const [showCcSettings, setShowCcSettings] = useState(false);
+  const [apiDeleting, setApiDeleting] = useState<Record<string, boolean>>({});
 
   const handleClaudeRelogin = useCallback(async (accountId: string) => {
     setRelogin((m) => ({ ...m, [accountId]: { status: 'running' } }));
@@ -1375,6 +1419,57 @@ export function PoolDrawer() {
       await refreshBothPools();
     } catch (e) {
       window.alert(e instanceof Error ? e.message : 'API 账号刷新失败');
+    }
+  }, [refreshBothPools]);
+
+  const handleApiDelete = useCallback(async (
+    accountId: string | null | undefined,
+    displayName: string,
+    cleanupPending: boolean,
+  ) => {
+    // Pool projections have their own provider-specific ids. Only the shared
+    // API account id is valid for deletion, otherwise one projection could be
+    // mistaken for the underlying credential account.
+    if (!accountId) {
+      window.alert('API 账号标识缺失，已拒绝删除；请刷新账号池后重试');
+      return;
+    }
+    const prompt = cleanupPending
+      ? `继续清理 API 账号“${displayName}”？\n\n`
+        + '账号已经同时从 Claude 与 Codex 新任务中停用。继续操作会永久删除 API Key 和账号配置，无法恢复；'
+        + 'Claude projects 与 Codex sessions 会保留。活跃任务不会被强制终止，若仍在使用该账号，本次会继续保留“待清理”状态供稍后重试。'
+      : `删除 API 账号“${displayName}”？\n\n`
+        + '此操作会同时从 Claude 与 Codex 账号视图停用该账号，并永久删除 API Key 和账号配置，无法恢复。\n\n'
+        + 'Claude projects 与 Codex sessions 会保留，供已有任务上下文迁移；活跃任务不会被强制终止。'
+        + '若账号正忙，本次会进入“待清理”状态，任务结束后可点击“继续清理”。';
+    if (!window.confirm(prompt)) return;
+
+    setApiDeleting((current) => ({ ...current, [accountId]: true }));
+    try {
+      const result = await api.deleteCloudRouterAccount(accountId);
+      await refreshBothPools();
+      if (result.cleanup_pending) {
+        window.alert('账号已安全停用，但仍在使用中；已保留为“待清理”，请在活跃任务结束后点击“继续清理”。');
+      }
+    } catch (e) {
+      // Retirement is staged before the backend checks every runtime fence.
+      // Refresh both projections even on 409 so the resumable tombstone is
+      // immediately visible from whichever tab initiated the request.
+      await refreshBothPools();
+      if (isApiRequestError(e) && e.status === 409) {
+        window.alert(
+          `账号已安全停用，但暂时无法完成清理：${e.message}\n\n`
+          + '活跃任务不会被强制终止；账号已保留为“待清理”，请在任务结束后点击“继续清理”。',
+        );
+      } else {
+        window.alert(e instanceof Error ? e.message : 'API 账号删除失败');
+      }
+    } finally {
+      setApiDeleting((current) => {
+        const next = { ...current };
+        delete next[accountId];
+        return next;
+      });
     }
   }, [refreshBothPools]);
 
@@ -1528,10 +1623,21 @@ export function PoolDrawer() {
                           void loadClaudeUsage(true);
                         }
                       }}
-                      onDelete={isApiAuthKind(a.auth_kind) ? undefined : async (id) => {
-                        if (!window.confirm(`从 Claude 号池中删除 ${id}？`)) return;
-                        try { await api.poolDeleteAccount(id); await loadClaudeUsage(); } catch (e) { window.alert(String(e)); }
-                      }}
+                      onDelete={isApiAuthKind(a.auth_kind)
+                        ? () => {
+                            void handleApiDelete(
+                              a.api_account_id,
+                              a.display_name || a.api_account_id || '未命名 API 账号',
+                              a.cleanup_pending === true,
+                            );
+                          }
+                        : async () => {
+                            if (!window.confirm(`从 Claude 号池中删除 ${a.id}？`)) return;
+                            try { await api.poolDeleteAccount(a.id); await loadClaudeUsage(); } catch (e) { window.alert(String(e)); }
+                          }}
+                      deleting={isApiAuthKind(a.auth_kind) && a.api_account_id
+                        ? apiDeleting[a.api_account_id] === true
+                        : false}
                       reloginState={relogin[a.id]}
                     />
                   ))}
@@ -1553,10 +1659,21 @@ export function PoolDrawer() {
                       onSetPreferred={handleCodexSetPreferred}
                       onRelogin={handleCodexRelogin}
                       onSubmitOtp={(state, code) => handleCodexSubmitOtp(a.id, state, code)}
-                      onDelete={isApiAuthKind(a.auth_kind) ? undefined : async (id) => {
-                        if (!window.confirm(`从 Codex 号池中删除 ${id}？将清除 OAuth、邮箱 Token、OpenAI 密码以及该账号的日志、历史和配置；仅保留原生会话文件用于任务上下文迁移。`)) return;
-                        try { await api.codexPoolDeleteAccount(id); await loadCodexUsage(); } catch (e) { window.alert(String(e)); }
-                      }}
+                      onDelete={isApiAuthKind(a.auth_kind)
+                        ? () => {
+                            void handleApiDelete(
+                              a.api_account_id,
+                              a.display_name || a.api_account_id || '未命名 API 账号',
+                              a.cleanup_pending === true,
+                            );
+                          }
+                        : async () => {
+                            if (!window.confirm(`从 Codex 号池中删除 ${a.id}？将清除 OAuth、邮箱 Token、OpenAI 密码以及该账号的日志、历史和配置；仅保留原生会话文件用于任务上下文迁移。`)) return;
+                            try { await api.codexPoolDeleteAccount(a.id); await loadCodexUsage(); } catch (e) { window.alert(String(e)); }
+                          }}
+                      deleting={isApiAuthKind(a.auth_kind) && a.api_account_id
+                        ? apiDeleting[a.api_account_id] === true
+                        : false}
                       onRetryUsage={() => {
                         if (isApiAuthKind(a.auth_kind)) {
                           void handleApiRefresh(a.api_account_id);

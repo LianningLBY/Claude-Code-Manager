@@ -11,13 +11,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.services.codex_app_server import CodexTurnProcess
 from backend.services.goal_evaluator import (
     GoalEvaluationError,
     GoalEvaluatorCleanupError,
     GoalEvaluator,
     GoalEvalResult,
+    _GOAL_EVALUATOR_PROCESS_CLEANUPS,
+    _GOAL_EVALUATOR_RUNTIME_ROUTES,
     _GOAL_EVALUATOR_TASK_IDS,
+    _UNREAPED_CODEX_GOAL_EVALUATOR_TURNS,
     _UNREAPED_GOAL_EVALUATOR_PROCESSES,
+    _register_goal_evaluator_process,
+    _terminate_process_shielded,
+    goal_evaluator_runtime_users,
     has_unreaped_goal_evaluator_for_task,
     reap_unreaped_goal_evaluators,
 )
@@ -146,7 +153,8 @@ class TestGoalEvalResult:
 @pytest.mark.asyncio
 async def test_retained_goal_evaluator_is_retried_by_shutdown_reaper():
     process = MagicMock(pid=54_901, returncode=None)
-    _UNREAPED_GOAL_EVALUATOR_PROCESSES[process.pid] = process
+    process_token = id(process)
+    _UNREAPED_GOAL_EVALUATOR_PROCESSES[process_token] = process
     try:
         with patch(
             "backend.services.goal_evaluator._terminate_process",
@@ -155,29 +163,189 @@ async def test_retained_goal_evaluator_is_retried_by_shutdown_reaper():
         ):
             with pytest.raises(GoalEvaluatorCleanupError, match="54901"):
                 await reap_unreaped_goal_evaluators()
-        assert _UNREAPED_GOAL_EVALUATOR_PROCESSES[process.pid] is process
+        assert _UNREAPED_GOAL_EVALUATOR_PROCESSES[process_token] is process
 
         with patch(
             "backend.services.goal_evaluator._terminate_process",
             new_callable=AsyncMock,
         ):
             await reap_unreaped_goal_evaluators()
-        assert process.pid not in _UNREAPED_GOAL_EVALUATOR_PROCESSES
+        assert process_token not in _UNREAPED_GOAL_EVALUATOR_PROCESSES
     finally:
-        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process.pid, None)
-        _GOAL_EVALUATOR_TASK_IDS.pop(process.pid, None)
+        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+        _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
 
 
 def test_retained_goal_evaluator_is_queryable_by_task():
     process = MagicMock(pid=54_902, returncode=None)
-    _UNREAPED_GOAL_EVALUATOR_PROCESSES[process.pid] = process
-    _GOAL_EVALUATOR_TASK_IDS[process.pid] = 812
+    process_token = id(process)
+    _UNREAPED_GOAL_EVALUATOR_PROCESSES[process_token] = process
+    _GOAL_EVALUATOR_TASK_IDS[process_token] = 812
     try:
         assert has_unreaped_goal_evaluator_for_task(812) is True
         assert has_unreaped_goal_evaluator_for_task(813) is False
     finally:
-        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process.pid, None)
-        _GOAL_EVALUATOR_TASK_IDS.pop(process.pid, None)
+        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+        _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+
+
+def test_runtime_registry_does_not_overwrite_reused_numeric_pid(tmp_path):
+    provider_home = tmp_path / "claude-home"
+    old_process = MagicMock(pid=54_903, returncode=None)
+    new_process = MagicMock(pid=54_903, returncode=None)
+    old_token = id(old_process)
+    new_token = id(new_process)
+    try:
+        _register_goal_evaluator_process(
+            old_process,
+            provider="claude",
+            provider_home=str(provider_home),
+            task_id=821,
+        )
+        _register_goal_evaluator_process(
+            new_process,
+            provider="claude",
+            provider_home=str(provider_home),
+            task_id=822,
+        )
+
+        assert old_token != new_token
+        assert _UNREAPED_GOAL_EVALUATOR_PROCESSES[old_token] is old_process
+        assert _UNREAPED_GOAL_EVALUATOR_PROCESSES[new_token] is new_process
+        assert goal_evaluator_runtime_users(
+            "claude", str(provider_home),
+        ) == [
+            "goal-evaluator:claude:task=821:pid=54903",
+            "goal-evaluator:claude:task=822:pid=54903",
+        ]
+    finally:
+        for process_token in (old_token, new_token):
+            _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+            _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+            _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+
+
+@pytest.mark.asyncio
+async def test_active_claude_runtime_user_matches_exact_canonical_home(
+    tmp_path,
+):
+    evaluator = GoalEvaluator()
+    real_home = tmp_path / "claude-home"
+    real_home.mkdir()
+    alias_home = tmp_path / "claude-home-alias"
+    alias_home.symlink_to(real_home, target_is_directory=True)
+    other_home = tmp_path / "other-claude-home"
+    communicate_started = asyncio.Event()
+    release_communicate = asyncio.Event()
+
+    mock_proc = MagicMock(pid=55_101, returncode=None)
+
+    async def communicate():
+        communicate_started.set()
+        await release_communicate.wait()
+        mock_proc.returncode = 0
+        return (
+            json.dumps({"achieved": True, "reason": "ok"}).encode(),
+            b"",
+        )
+
+    mock_proc.communicate = AsyncMock(side_effect=communicate)
+    evaluation = None
+    try:
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch(
+                "backend.services.goal_evaluator.os.killpg",
+                side_effect=ProcessLookupError,
+            ),
+        ):
+            evaluation = asyncio.create_task(evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                provider="claude",
+                config_dir=str(alias_home),
+                task_id=901,
+            ))
+            await communicate_started.wait()
+
+            expected = ["goal-evaluator:claude:task=901:pid=55101"]
+            assert goal_evaluator_runtime_users(
+                "claude", str(real_home),
+            ) == expected
+            assert goal_evaluator_runtime_users(
+                "CLAUDE", str(alias_home),
+            ) == expected
+            assert goal_evaluator_runtime_users(
+                "claude", str(other_home),
+            ) == []
+            assert goal_evaluator_runtime_users(
+                "codex", str(real_home),
+            ) == []
+
+            release_communicate.set()
+            result = await evaluation
+
+        assert result.achieved is True
+        assert goal_evaluator_runtime_users("claude", str(real_home)) == []
+    finally:
+        release_communicate.set()
+        if evaluation is not None and not evaluation.done():
+            evaluation.cancel()
+            await asyncio.gather(evaluation, return_exceptions=True)
+        process_token = id(mock_proc)
+        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+        _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+        _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_runtime_user_remains_until_reaper_proves_terminal(
+    tmp_path,
+):
+    evaluator = GoalEvaluator()
+    provider_home = tmp_path / "claude-retained"
+    mock_proc = MagicMock(pid=55_102, returncode=0)
+    mock_proc.communicate = AsyncMock(return_value=(
+        json.dumps({"achieved": True, "reason": "ok"}).encode(),
+        b"",
+    ))
+
+    try:
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch(
+                "backend.services.goal_evaluator._terminate_process",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("terminal proof unavailable"),
+            ),
+        ):
+            with pytest.raises(GoalEvaluatorCleanupError):
+                await evaluator.evaluate(
+                    condition="cond",
+                    conversation_summary="conv",
+                    provider="claude",
+                    config_dir=str(provider_home),
+                    task_id=902,
+                )
+
+        assert goal_evaluator_runtime_users(
+            "claude", str(provider_home),
+        ) == ["goal-evaluator:claude:task=902:pid=55102"]
+
+        with patch(
+            "backend.services.goal_evaluator._terminate_process",
+            new_callable=AsyncMock,
+        ):
+            await reap_unreaped_goal_evaluators()
+
+        assert goal_evaluator_runtime_users(
+            "claude", str(provider_home),
+        ) == []
+    finally:
+        process_token = id(mock_proc)
+        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+        _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+        _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
 
 
 class TestParseResponse:
@@ -484,6 +652,179 @@ class TestEvaluateIntegration:
         mock_proc.wait.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_cancellation_during_successful_cleanup_never_resignals_reused_pgid(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        provider_home = tmp_path / "claude-cleanup-cancel"
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        pgid_reused = False
+        cleanup_calls = 0
+
+        mock_proc = MagicMock(pid=55_105, returncode=0)
+        mock_proc.communicate = AsyncMock(return_value=(
+            json.dumps({"achieved": True, "reason": "ok"}).encode(),
+            b"",
+        ))
+
+        async def terminate_once(
+            process,
+            communicate_task,
+            *,
+            managed_process_group,
+        ):
+            nonlocal cleanup_calls, pgid_reused
+            cleanup_calls += 1
+            assert process is mock_proc
+            assert cleanup_calls == 1, (
+                "a second cleanup would signal a reused numeric PID/PGID"
+            )
+            assert pgid_reused is False
+            cleanup_started.set()
+            await release_cleanup.wait()
+            # Model the exact evaluator group becoming terminal and the
+            # numeric PGID immediately being assigned elsewhere.
+            pgid_reused = True
+
+        evaluation = None
+        process_token = id(mock_proc)
+        try:
+            with (
+                patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+                patch(
+                    "backend.services.goal_evaluator._terminate_process",
+                    side_effect=terminate_once,
+                ),
+            ):
+                evaluation = asyncio.create_task(evaluator.evaluate(
+                    condition="cond",
+                    conversation_summary="conv",
+                    provider="claude",
+                    config_dir=str(provider_home),
+                    task_id=905,
+                ))
+                await cleanup_started.wait()
+                assert goal_evaluator_runtime_users(
+                    "claude", str(provider_home),
+                ) == ["goal-evaluator:claude:task=905:pid=55105"]
+
+                evaluation.cancel()
+                await asyncio.sleep(0)
+                release_cleanup.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await evaluation
+
+            assert pgid_reused is True
+            assert cleanup_calls == 1
+            assert process_token not in _UNREAPED_GOAL_EVALUATOR_PROCESSES
+            assert goal_evaluator_runtime_users(
+                "claude", str(provider_home),
+            ) == []
+        finally:
+            release_cleanup.set()
+            if evaluation is not None and not evaluation.done():
+                evaluation.cancel()
+                await asyncio.gather(evaluation, return_exceptions=True)
+            _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+            _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+            _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+
+    @pytest.mark.asyncio
+    async def test_request_cleanup_and_shutdown_reaper_share_exact_termination(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        provider_home = tmp_path / "claude-concurrent-cleanup"
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_calls = 0
+
+        mock_proc = MagicMock(pid=55_106, returncode=0)
+        mock_proc.communicate = AsyncMock(return_value=(
+            json.dumps({"achieved": True, "reason": "ok"}).encode(),
+            b"",
+        ))
+
+        async def terminate_once(
+            process,
+            communicate_task,
+            *,
+            managed_process_group,
+        ):
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            assert process is mock_proc
+            assert cleanup_calls == 1, (
+                "request cleanup and shutdown reaper must not signal "
+                "the same exact process group twice"
+            )
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        evaluation = None
+        reaper = None
+        process_token = id(mock_proc)
+        try:
+            with (
+                patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+                patch(
+                    "backend.services.goal_evaluator._terminate_process",
+                    side_effect=terminate_once,
+                ),
+            ):
+                evaluation = asyncio.create_task(evaluator.evaluate(
+                    condition="cond",
+                    conversation_summary="conv",
+                    provider="claude",
+                    config_dir=str(provider_home),
+                    task_id=906,
+                ))
+                await cleanup_started.wait()
+                assert process_token in _GOAL_EVALUATOR_PROCESS_CLEANUPS
+
+                reaper = asyncio.create_task(
+                    reap_unreaped_goal_evaluators()
+                )
+                await asyncio.sleep(0)
+                assert cleanup_calls == 1
+
+                release_cleanup.set()
+                result, _ = await asyncio.gather(evaluation, reaper)
+                # A shutdown caller may already hold a stale registry
+                # snapshot and arrive after the shared cleanup entry was
+                # removed.  Weak exact-object terminal proof must still make
+                # that late call a no-op.
+                await _terminate_process_shielded(
+                    mock_proc,
+                    None,
+                    managed_process_group=(os.name == "posix"),
+                )
+
+            assert result.achieved is True
+            assert cleanup_calls == 1
+            assert process_token not in _GOAL_EVALUATOR_PROCESS_CLEANUPS
+            assert process_token not in _UNREAPED_GOAL_EVALUATOR_PROCESSES
+            assert goal_evaluator_runtime_users(
+                "claude", str(provider_home),
+            ) == []
+        finally:
+            release_cleanup.set()
+            pending = [
+                task
+                for task in (evaluation, reaper)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            _GOAL_EVALUATOR_PROCESS_CLEANUPS.pop(process_token, None)
+            _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+            _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+            _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+
+    @pytest.mark.asyncio
     async def test_evaluate_subprocess_error(self):
         evaluator = GoalEvaluator()
 
@@ -625,7 +966,363 @@ class TestEvaluateIntegration:
         assert mock_exec.call_args.kwargs["env"]["CODEX_HOME"] == str(codex_home)
         assert "cwd" not in mock_exec.call_args.kwargs
         assert mock_exec.call_args.args[1] == "exec"
-        assert "-c" not in mock_exec.call_args.args
+        command = list(mock_exec.call_args.args)
+        configs = [
+            tomllib.loads(command[index + 1])
+            for index, value in enumerate(command[:-1])
+            if value == "-c"
+        ]
+        assert configs == [{"service_tier": "default"}]
+
+    @pytest.mark.asyncio
+    async def test_active_codex_standard_runtime_user_matches_exact_home(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        codex_home = tmp_path / "codex-standard"
+        communicate_started = asyncio.Event()
+        release_communicate = asyncio.Event()
+        agent_text = json.dumps({"achieved": True, "reason": "ok"})
+        stdout = json.dumps({
+            "item": {"type": "agent_message", "text": agent_text},
+        }).encode()
+        mock_proc = MagicMock(pid=55_103, returncode=None)
+
+        async def communicate():
+            communicate_started.set()
+            await release_communicate.wait()
+            mock_proc.returncode = 0
+            return stdout, b""
+
+        mock_proc.communicate = AsyncMock(side_effect=communicate)
+        evaluation = None
+        try:
+            with (
+                patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+                patch(
+                    "backend.services.goal_evaluator.os.killpg",
+                    side_effect=ProcessLookupError,
+                ),
+            ):
+                evaluation = asyncio.create_task(evaluator.evaluate(
+                    condition="cond",
+                    conversation_summary="conv",
+                    provider="codex",
+                    codex_home=str(codex_home),
+                    task_id=903,
+                ))
+                await communicate_started.wait()
+
+                assert goal_evaluator_runtime_users(
+                    "codex", str(codex_home),
+                ) == ["goal-evaluator:codex:task=903:pid=55103"]
+                assert goal_evaluator_runtime_users(
+                    "claude", str(codex_home),
+                ) == []
+
+                release_communicate.set()
+                result = await evaluation
+
+            assert result.achieved is True
+            assert goal_evaluator_runtime_users(
+                "codex", str(codex_home),
+            ) == []
+        finally:
+            release_communicate.set()
+            if evaluation is not None and not evaluation.done():
+                evaluation.cancel()
+                await asyncio.gather(evaluation, return_exceptions=True)
+            process_token = id(mock_proc)
+            _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+            _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+            _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+
+    @pytest.mark.asyncio
+    async def test_codex_fast_requires_exact_app_server_route_before_execution(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as spawn:
+            with pytest.raises(
+                GoalEvaluationError,
+                match="exact app-server account route",
+            ):
+                await evaluator.evaluate(
+                    condition="cond",
+                    conversation_summary="conv",
+                    provider="codex",
+                    model="gpt-5.4",
+                    codex_home=str(tmp_path / "codex-fast"),
+                    codex_service_tier="priority",
+                )
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_fast_uses_priority_app_server_and_deletes_thread(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        process = CodexTurnProcess(
+            55_012,
+            AsyncMock(),
+            thread_id="fast-evaluator-thread",
+        )
+        process.feed({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": json.dumps({
+                    "achieved": True,
+                    "reason": "priority evaluation completed",
+                }),
+            },
+        })
+        process.finish(0)
+        registry = MagicMock()
+        registry.start_turn = AsyncMock(return_value=(
+            process,
+            "fast-evaluator-thread",
+        ))
+        registry.abort_unclaimed_turn = AsyncMock()
+        registry.delete_thread = AsyncMock()
+        codex_home = str(tmp_path / "codex-fast")
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as spawn:
+            result = await evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                provider="codex",
+                model="gpt-5.4",
+                codex_home=codex_home,
+                task_id=812,
+                codex_service_tier="priority",
+                codex_app_server_registry=registry,
+            )
+
+        assert result.achieved is True
+        assert result.reason == "priority evaluation completed"
+        spawn.assert_not_awaited()
+        start_kwargs = registry.start_turn.await_args.kwargs
+        assert start_kwargs["codex_home"] == codex_home
+        assert start_kwargs["model"] == "gpt-5.4"
+        assert start_kwargs["codex_service_tier"] == "priority"
+        assert start_kwargs["resume_session_id"] is None
+        registry.abort_unclaimed_turn.assert_not_awaited()
+        registry.delete_thread.assert_awaited_once_with(
+            codex_home,
+            "fast-evaluator-thread",
+        )
+        assert not _UNREAPED_CODEX_GOAL_EVALUATOR_TURNS
+
+    @pytest.mark.asyncio
+    async def test_active_codex_fast_runtime_user_matches_canonical_home(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        real_home = tmp_path / "codex-fast-home"
+        real_home.mkdir()
+        alias_home = tmp_path / "codex-fast-alias"
+        alias_home.symlink_to(real_home, target_is_directory=True)
+        process = CodexTurnProcess(
+            55_104,
+            AsyncMock(),
+            thread_id="active-fast-evaluator",
+        )
+        registry = MagicMock()
+        registry.start_turn = AsyncMock(return_value=(
+            process,
+            "active-fast-evaluator",
+        ))
+        registry.abort_unclaimed_turn = AsyncMock()
+        registry.delete_thread = AsyncMock()
+        evaluation = asyncio.create_task(evaluator.evaluate(
+            condition="cond",
+            conversation_summary="conv",
+            provider="codex",
+            model="gpt-5.4",
+            codex_home=str(alias_home),
+            task_id=904,
+            codex_service_tier="priority",
+            codex_app_server_registry=registry,
+        ))
+
+        try:
+            expected = [
+                "goal-evaluator:codex:"
+                "task=904:thread=active-fast-evaluator"
+            ]
+            for _ in range(100):
+                if goal_evaluator_runtime_users(
+                    "codex", str(real_home),
+                ) == expected:
+                    break
+                await asyncio.sleep(0)
+            assert goal_evaluator_runtime_users(
+                "codex", str(real_home),
+            ) == expected
+            assert goal_evaluator_runtime_users(
+                "codex", str(alias_home),
+            ) == expected
+            assert goal_evaluator_runtime_users(
+                "claude", str(real_home),
+            ) == []
+
+            process.feed({
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": json.dumps({
+                        "achieved": True,
+                        "reason": "priority evaluation completed",
+                    }),
+                },
+            })
+            process.finish(0)
+            result = await evaluation
+
+            assert result.achieved is True
+            assert goal_evaluator_runtime_users(
+                "codex", str(real_home),
+            ) == []
+            registry.delete_thread.assert_awaited_once_with(
+                str(alias_home),
+                "active-fast-evaluator",
+            )
+        finally:
+            if process.returncode is None:
+                process.finish(130, "test cleanup")
+            if not evaluation.done():
+                await asyncio.gather(evaluation, return_exceptions=True)
+            _UNREAPED_CODEX_GOAL_EVALUATOR_TURNS.pop(
+                id(process), None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_codex_fast_timeout_aborts_and_deletes_exact_thread(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        process = CodexTurnProcess(
+            55_013,
+            AsyncMock(),
+            thread_id="timed-out-fast-evaluator",
+        )
+        registry = MagicMock()
+        registry.start_turn = AsyncMock(return_value=(
+            process,
+            "timed-out-fast-evaluator",
+        ))
+
+        async def abort_turn(home, candidate, *, reason):
+            assert home == str(tmp_path / "codex-fast")
+            assert candidate is process
+            assert "timed out" in reason
+            candidate.finish(130, reason)
+            return False
+
+        registry.abort_unclaimed_turn = AsyncMock(side_effect=abort_turn)
+        registry.delete_thread = AsyncMock()
+
+        with (
+            patch(
+                "asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as spawn,
+            patch(
+                "backend.services.goal_evaluator.settings.goal_evaluation_timeout",
+                0.01,
+            ),
+        ):
+            with pytest.raises(GoalEvaluationError, match="timed out"):
+                await evaluator.evaluate(
+                    condition="cond",
+                    conversation_summary="conv",
+                    provider="codex",
+                    model="gpt-5.4",
+                    codex_home=str(tmp_path / "codex-fast"),
+                    task_id=813,
+                    codex_service_tier="priority",
+                    codex_app_server_registry=registry,
+                )
+
+        spawn.assert_not_awaited()
+        registry.abort_unclaimed_turn.assert_awaited_once()
+        registry.delete_thread.assert_awaited_once_with(
+            str(tmp_path / "codex-fast"),
+            "timed-out-fast-evaluator",
+        )
+        assert process.returncode == 130
+        assert not _UNREAPED_CODEX_GOAL_EVALUATOR_TURNS
+
+    @pytest.mark.asyncio
+    async def test_codex_fast_cancel_cleanup_failure_is_retained_for_reaper(
+        self, tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        process = CodexTurnProcess(
+            55_014,
+            AsyncMock(),
+            thread_id="retained-fast-evaluator",
+        )
+        registry = MagicMock()
+        registry.start_turn = AsyncMock(return_value=(
+            process,
+            "retained-fast-evaluator",
+        ))
+        abort_calls = 0
+
+        async def abort_turn(_home, candidate, *, reason):
+            nonlocal abort_calls
+            abort_calls += 1
+            if abort_calls == 1:
+                raise RuntimeError("interrupt and shutdown unconfirmed")
+            candidate.finish(130, reason)
+            return False
+
+        registry.abort_unclaimed_turn = AsyncMock(side_effect=abort_turn)
+        registry.delete_thread = AsyncMock()
+        codex_home = str(tmp_path / "codex-fast")
+        evaluation = asyncio.create_task(evaluator.evaluate(
+            condition="cond",
+            conversation_summary="conv",
+            provider="codex",
+            model="gpt-5.4",
+            codex_home=codex_home,
+            task_id=814,
+            codex_service_tier="priority",
+            codex_app_server_registry=registry,
+        ))
+        await asyncio.sleep(0)
+        evaluation.cancel()
+
+        with pytest.raises(
+            GoalEvaluatorCleanupError,
+            match="could not be proven terminal",
+        ):
+            await evaluation
+
+        assert process.returncode is None
+        assert has_unreaped_goal_evaluator_for_task(814) is True
+        assert goal_evaluator_runtime_users(
+            "codex", codex_home,
+        ) == [
+            "goal-evaluator:codex:"
+            "task=814:thread=retained-fast-evaluator"
+        ]
+        await reap_unreaped_goal_evaluators()
+        assert process.returncode == 130
+        assert has_unreaped_goal_evaluator_for_task(814) is False
+        assert goal_evaluator_runtime_users("codex", codex_home) == []
+        registry.delete_thread.assert_awaited_once_with(
+            codex_home,
+            "retained-fast-evaluator",
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider", ["claude", "codex"])
@@ -698,16 +1395,20 @@ class TestEvaluateIntegration:
         assert not set(auth_keys) & child_env.keys()
         if provider == "codex":
             assert mock_exec.call_args.kwargs["cwd"] == tempfile.gettempdir()
-            override_index = command.index("-c")
-            override = tomllib.loads(command[override_index + 1])
-            assert override == {
+            configs = [
+                tomllib.loads(command[index + 1])
+                for index, value in enumerate(command[:-1])
+                if value == "-c"
+            ]
+            assert {"service_tier": "default"} in configs
+            assert {
                 "projects": {
                     str(Path(tempfile.gettempdir()).resolve()): {
                         "trust_level": "untrusted",
                     },
                 },
-            }
-            assert override_index < len(command) - 2
+            } in configs
+            assert command.index("-c") < len(command) - 2
         else:
             assert "cwd" not in mock_exec.call_args.kwargs
             assert "-c" not in command

@@ -1,5 +1,15 @@
 import { getApiBase } from '../config/server';
 
+export interface ApiRequestError extends Error {
+  status: number;
+  detail: unknown;
+}
+
+export function isApiRequestError(error: unknown): error is ApiRequestError {
+  return error instanceof Error
+    && typeof (error as { status?: unknown }).status === 'number';
+}
+
 function getBase(): string {
   return getApiBase();
 }
@@ -39,10 +49,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       : detail && typeof detail === 'object' && typeof detail.error === 'string'
         ? detail.error
         : res.statusText;
-    const requestError = new Error(message) as Error & {
-      status?: number;
-      detail?: unknown;
-    };
+    const requestError = new Error(message) as ApiRequestError;
     requestError.status = res.status;
     requestError.detail = detail;
     throw requestError;
@@ -133,6 +140,14 @@ export interface ProjectTodo {
   updated_at: string;
 }
 
+export type CodexServiceTier = 'default' | 'priority';
+
+export interface TaskRoutingExpectation {
+  provider: string;
+  model: string | null;
+  codex_service_tier: CodexServiceTier;
+}
+
 export interface Task {
   id: number;
   worker_id: number | null;
@@ -169,6 +184,7 @@ export interface Task {
   provider: string;
   model: string | null;
   effort_level: string | null;
+  codex_service_tier: CodexServiceTier;
   thinking_budget?: number | null;
   system_prompt_mode?: string | null;
   timeout_hours?: number | null;
@@ -552,6 +568,9 @@ export interface CloudRouterAccountProjection {
   api_provider?: ApiAccountProvider | null;
   display_name?: string | null;
   api_account_id?: string | null;
+  /** A durable tombstone is kept while credential/config cleanup must be retried. */
+  retired?: boolean;
+  cleanup_pending?: boolean;
   supported_models?: string[];
   api_quota?: CloudRouterApiQuota | null;
 }
@@ -750,6 +769,7 @@ export interface SharedTaskReceived {
     model?: string;
     provider?: string;
     effort_level?: string;
+    codex_service_tier?: CodexServiceTier;
     project_id?: number;
     project_name?: string;
     session_id?: string;
@@ -1055,22 +1075,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ anchor, ...(title?.trim() ? { title: title.trim() } : {}) }),
     }),
-  distillTask: (id: number, customInstruction?: string) =>
-    request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null }) }),
+  distillTask: (id: number, customInstruction?: string, expectedRouting?: TaskRoutingExpectation) =>
+    request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; starred?: boolean; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; starred?: boolean; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
-  updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; model?: string; effort_level?: string; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null }) =>
+  updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteTask: (id: number) =>
     request<{ ok: boolean }>(`/api/tasks/${id}`, { method: 'DELETE' }),
   cancelTask: (id: number) =>
     request<Task>(`/api/tasks/${id}/cancel`, { method: 'POST' }),
-  retryTask: (id: number) =>
-    request<Task>(`/api/tasks/${id}/retry`, { method: 'POST' }),
-  approvePlan: (id: number) =>
-    request<Task>(`/api/tasks/${id}/plan/approve`, { method: 'POST' }),
+  retryTask: (id: number, expectedRouting?: TaskRoutingExpectation) =>
+    request<Task>(`/api/tasks/${id}/retry`, { method: 'POST', body: JSON.stringify({ expected_routing: expectedRouting }) }),
+  approvePlan: (id: number, expectedRouting?: TaskRoutingExpectation) =>
+    request<Task>(`/api/tasks/${id}/plan/approve`, { method: 'POST', body: JSON.stringify({ expected_routing: expectedRouting }) }),
   rejectPlan: (id: number) =>
     request<Task>(`/api/tasks/${id}/plan/reject`, { method: 'POST' }),
   // Instances
@@ -1110,10 +1130,10 @@ export const api = {
     request<{ ok: boolean }>('/api/dispatcher/stop', { method: 'POST' }),
 
   // Chat (task-based)
-  sendTaskChat: (taskId: number, message: string, filePaths?: string[], secretIds?: number[], model?: string | null) =>
-    request<{ ok: boolean; pid: number; instance_id: number; session_id: string }>(`/api/tasks/${taskId}/chat`, { method: 'POST', body: JSON.stringify({ message, file_paths: filePaths, secret_ids: secretIds, ...(model ? { model } : {}) }) }),
-  injectTaskMessage: (taskId: number, message: string) =>
-    request<{ ok: boolean; injected: boolean }>(`/api/tasks/${taskId}/inject`, { method: 'POST', body: JSON.stringify({ message }) }),
+  sendTaskChat: (taskId: number, message: string, filePaths?: string[], secretIds?: number[], model?: string | null, expectedRouting?: TaskRoutingExpectation) =>
+    request<{ ok: boolean; pid: number; instance_id: number; session_id: string }>(`/api/tasks/${taskId}/chat`, { method: 'POST', body: JSON.stringify({ message, file_paths: filePaths, secret_ids: secretIds, ...(model ? { model } : {}), expected_routing: expectedRouting }) }),
+  injectTaskMessage: (taskId: number, message: string, expectedRouting?: TaskRoutingExpectation) =>
+    request<{ ok: boolean; injected: boolean }>(`/api/tasks/${taskId}/inject`, { method: 'POST', body: JSON.stringify({ message, expected_routing: expectedRouting }) }),
   // touch=true 仅在用户真正打开聊天（首页加载）时传——后端以此更新访问排序；
   // 分页翻旧消息不传，避免后台轮询/旧版客户端把任务在列表里来回顶到最前
   getTaskChatHistory: (taskId: number, compact = true, limit = 0, beforeId = 0, touch = false) =>
@@ -1418,7 +1438,7 @@ export const api = {
   // System
   health: () => request<{ status: string; commit?: string }>('/api/system/health'),
   stats: () => request<{ tasks: Record<string, number>; running_instances: number }>('/api/system/stats'),
-  config: () => request<{ default_provider: string; provider_options: string[]; default_model: string; model_options: string[]; default_codex_model: string; codex_model_options: string[]; default_effort: string; effort_options: string[]; claude_model_efforts: Record<string, string[]>; claude_model_context_windows: Record<string, number>; codex_effort_options: string[]; codex_model_efforts: Record<string, string[]> }>('/api/system/config'),
+  config: () => request<{ default_provider: string; provider_options: string[]; default_model: string; model_options: string[]; default_codex_model: string; codex_model_options: string[]; default_effort: string; effort_options: string[]; claude_model_efforts: Record<string, string[]>; claude_model_context_windows: Record<string, number>; codex_effort_options: string[]; codex_model_efforts: Record<string, string[]>; default_codex_service_tier?: CodexServiceTier; codex_service_tier_options?: CodexServiceTier[]; codex_model_service_tiers: Record<string, CodexServiceTier[]> }>('/api/system/config'),
   listSkills: () => request<{ key: string; label: string; description: string; always: boolean; priority: number; tags: string[] }[]>('/api/system/skills'),
   listSkillsCached: () => listSkillsCached(),
   listUserSkillsCached: () => listUserSkillsCached(),

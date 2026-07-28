@@ -3,7 +3,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { api } from '../../api/client';
 import type { Task, Project } from '../../api/client';
 import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus } from '../icons';
-import { PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
+import { FastModeBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
 import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
@@ -69,9 +69,18 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
     await api.cancelTask(id);
     onRefresh();
   };
-  const handleRetry = async (id: number) => {
-    await api.retryTask(id);
-    onRefresh();
+  const handleRetry = async (task: Task) => {
+    try {
+      await api.retryTask(task.id, {
+        provider: task.provider,
+        model: task.model,
+        codex_service_tier: task.codex_service_tier,
+      });
+    } finally {
+      // A stale routing expectation returns 409; refresh the Fast/Standard
+      // badge even though the action itself was intentionally rejected.
+      onRefresh();
+    }
   };
   const handleStar = async (id: number) => {
     await api.starTask(id);
@@ -172,6 +181,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
               <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
                 {t.provider === 'codex' ? 'Codex' : 'Claude'}
               </span>
+              <FastModeBadge task={t} />
               <TaskConfigBadge task={t} onRefresh={onRefresh} />
               <PluginsBadge task={t} onRefresh={onRefresh} />
               <SubAgentsBadge task={t} />
@@ -248,7 +258,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
                     )}
                     {t.status === 'failed' && (
                       <button
-                        onClick={() => { handleRetry(t.id); setMenuOpenId(null); }}
+                        onClick={() => { handleRetry(t); setMenuOpenId(null); }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-blue-400 hover:bg-gray-800 text-left"
                       >
                         <RotateCcw size={14} /> Retry

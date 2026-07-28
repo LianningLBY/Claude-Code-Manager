@@ -354,6 +354,7 @@ class PoolAccount:
         "role",
         "enabled",
         "retired",
+        "cleanup_pending",
         "auth_kind",
         "api_provider",
         "display_name",
@@ -372,6 +373,7 @@ class PoolAccount:
         self.role: str = data.get("role", "automation")
         self.enabled: bool = data.get("enabled", True)
         self.retired: bool = bool(data.get("retired", False))
+        self.cleanup_pending: bool = bool(data.get("cleanup_pending", False))
         self.auth_kind: str = str(data.get("auth_kind") or "subscription")
         self.api_provider: str | None = data.get("api_provider")
         if self.api_provider is None and _is_api_auth_kind(self.auth_kind):
@@ -386,6 +388,10 @@ class PoolAccount:
     @classmethod
     def from_cloudrouter(cls, account) -> "PoolAccount":
         auth_kind = str(getattr(account, "auth_kind", "") or "cloudrouter_api")
+        retired = bool(getattr(account, "retired", False))
+        cleanup_pending = bool(
+            getattr(account, "cleanup_pending", False)
+        )
         return cls({
             "id": account.id,
             "config_dir": str(account.claude_config_dir),
@@ -395,11 +401,12 @@ class PoolAccount:
             # Claude family. Historical JSONL sessions in this directory must
             # remain discoverable for safe migration.
             "enabled": (
-                bool(account.enabled)
-                and not bool(account.retired)
+                bool(getattr(account, "enabled", True))
+                and not retired
                 and bool((account.models or {}).get("claude"))
             ),
-            "retired": bool(account.retired),
+            "retired": retired,
+            "cleanup_pending": cleanup_pending,
             "auth_kind": auth_kind,
             "api_provider": (
                 getattr(account, "api_provider", None)
@@ -599,7 +606,14 @@ class ClaudePool:
         now = time.time()
         result = []
         for a in self._accounts:
-            if a.retired or (
+            pending_api_cleanup = bool(
+                a.retired
+                and a.cleanup_pending
+                and _is_api_auth_kind(a.auth_kind)
+            )
+            if (a.retired and not pending_api_cleanup) or (
+                not pending_api_cleanup
+                and
                 _is_api_auth_kind(a.auth_kind)
                 and not a.supported_models
             ):
@@ -612,6 +626,8 @@ class ClaudePool:
                 "email": a.email,
                 "role": a.role,
                 "enabled": a.enabled,
+                "retired": a.retired,
+                "cleanup_pending": a.cleanup_pending,
                 "available": available,
                 "cooldown_until": cd_until if cd_until > now else None,
                 "cooldown_remaining": max(0, cd_until - now) if cd_until > now else 0,
@@ -753,15 +769,14 @@ class ClaudePool:
 
     def _probe_account(self, account: PoolAccount) -> bool:
         """Run a small Claude CLI probe before assigning work to an account."""
+        if _is_api_auth_kind(account.auth_kind):
+            # API credentials are validated by the Store at create/refresh and
+            # again under runtime_admission around the real process spawn.
+            # A synchronous probe cannot participate in that async retirement
+            # fence and would create an untracked key consumer.
+            return True
         # Same nested-session cleanup as InstanceManager.launch
         env = {k: v for k, v in os.environ.items() if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
-        if _is_api_auth_kind(account.auth_kind):
-            for key in (
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_API_KEY",
-                "CLAUDE_CODE_OAUTH_TOKEN",
-            ):
-                env.pop(key, None)
         env["CLAUDE_CONFIG_DIR"] = account.config_dir
         try:
             proc = subprocess.run(

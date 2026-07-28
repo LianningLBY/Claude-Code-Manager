@@ -11,6 +11,9 @@ from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.services.worker_routing_config import (
+    has_pending_worker_routing,
+)
 
 
 PR_REVIEW_SUPERSEDED_METADATA_KEY = "pr_review_superseded"
@@ -613,6 +616,7 @@ class TaskQueue:
         has no identifiable owner.
         """
 
+        blocked_ids = set(exclude_ids or ())
         while True:
             stmt = (
                 select(Task.id)
@@ -626,12 +630,28 @@ class TaskQueue:
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(1)
             )
-            if exclude_ids:
-                stmt = stmt.where(Task.id.notin_(exclude_ids))
+            if blocked_ids:
+                stmt = stmt.where(Task.id.notin_(blocked_ids))
 
             candidate_id = (await self.db.execute(stmt)).scalar_one_or_none()
             if candidate_id is None:
                 return None
+            candidate = await self.db.get(
+                Task,
+                candidate_id,
+                populate_existing=True,
+            )
+            if candidate is None:
+                self.db.expire_all()
+                continue
+            if has_pending_worker_routing(candidate):
+                # JSON marker predicates are not portable across every
+                # supported database.  A staged marker cannot legitimately be
+                # added while status=pending, so this refreshed pre-CAS check
+                # safely skips crash/corruption leftovers without claiming
+                # them; final launch barriers independently fail closed.
+                blocked_ids.add(candidate_id)
+                continue
 
             values = {
                 "status": "in_progress",

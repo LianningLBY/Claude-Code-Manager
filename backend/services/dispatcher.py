@@ -57,6 +57,9 @@ from backend.services.task_skill_overrides import (
     TEMP_SKILLS_GENERATION_KEY,
     clear_temporary_skills_marker,
 )
+from backend.services.worker_routing_config import (
+    has_pending_worker_routing,
+)
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,10 @@ logger = logging.getLogger(__name__)
 
 class QueuedMessagePrelaunchError(RuntimeError):
     """A queued message launch failed before any managed turn could start."""
+
+
+class QueuedMessageRoutingMismatchError(RuntimeError):
+    """A user message was admitted from a stale provider/model/tier view."""
 
 
 class TaskQueueAbortTimeoutError(RuntimeError):
@@ -252,6 +259,13 @@ class QueuedMessage:
     command_skills: dict | None = field(compare=False, default=None)
     # One-shot model override for this message only (not persisted to task)
     model_override: str | None = field(compare=False, default=None)
+    # Exact provider/effective-model/tier rendered by the initiating UI.
+    # A later mismatch is permanent for this message: never silently replay it
+    # on a different (especially Standard) route.
+    expected_task_routing: tuple[str, str | None, str] | None = field(
+        compare=False,
+        default=None,
+    )
     # Source monitor/sub-agent session ID for dedup (frontend uses this to
     # render [Monitor] / [Sub-Agent] badges on injected user_message bubbles)
     monitor_session_id: int | None = field(compare=False, default=None)
@@ -507,11 +521,13 @@ class GlobalDispatcher:
         self._shutting_down = False
         self._monitor_tasks: dict[int, asyncio.Task] = {}           # monitor_session_id -> asyncio task
         self._monitor_processes: dict[int, asyncio.subprocess.Process] = {}  # monitor_session_id -> subprocess
+        self._monitor_config_dirs: dict[int, str] = {}
         self._monitor_log_fhs: dict[int, object] = {}  # monitor_session_id -> log file handle
 
         # Sub-agent (one-shot tasks) lifecycle — parallel to monitor
         self._sub_agent_tasks: dict[int, asyncio.Task] = {}      # session_id -> asyncio task
         self._sub_agent_processes: dict[int, asyncio.subprocess.Process] = {}
+        self._sub_agent_config_dirs: dict[int, str] = {}
         self._sub_agent_log_fhs: dict[int, object] = {}
         # Codex turns share an account-level app-server process. Keep them
         # separate from OS subprocesses so auxiliary cleanup never sends a
@@ -568,9 +584,12 @@ class GlobalDispatcher:
             has_cloudrouter_claude = bool(
                 self.cloudrouter_store is not None
                 and any(
-                    account.enabled
-                    and not account.retired
-                    and account.supports_model("claude", None)
+                    account.cleanup_pending
+                    or (
+                        account.enabled
+                        and not account.retired
+                        and account.supports_model("claude", None)
+                    )
                     for account in self.cloudrouter_store.all_accounts(
                         include_retired=True
                     )
@@ -1089,6 +1108,26 @@ class GlobalDispatcher:
                         t.instance_id,
                         sorted(task_reverse_owners),
                     )
+                elif has_pending_worker_routing(t):
+                    # A historical/corrupt active row with a durable routing
+                    # fence must become safe for Manager convergence.  Returning
+                    # it to pending would make both ack and reconcile reject it
+                    # while TaskQueue also refuses to dequeue it.
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "Recovered unowned execution with pending Worker "
+                            "routing configuration synchronization"
+                        ),
+                    }
+                    logger.error(
+                        "Failing unowned task %s so its pending Worker routing "
+                        "configuration can be reconciled",
+                        t.id,
+                    )
                 else:
                     new_status = "pending"
                     values = {
@@ -1424,6 +1463,19 @@ class GlobalDispatcher:
             )
             logger.exception(
                 "Failed to reap retained goal evaluator during shutdown"
+            )
+        try:
+            from backend.services.skill_distill import (
+                reap_unreaped_task_distills,
+            )
+
+            await reap_unreaped_task_distills()
+        except Exception as exc:
+            shutdown_failures.append(
+                f"skill distill cleanup failed: {exc!r}"
+            )
+            logger.exception(
+                "Failed to reap retained skill distill during shutdown"
             )
 
         managed_instance_ids = {
@@ -2357,6 +2409,7 @@ class GlobalDispatcher:
         task_id: int | None = None,
         expected_generation: _TaskRoutingGeneration | None = None,
         model: str | None = None,
+        codex_service_tier: str = "default",
     ) -> str | None:
         """Resolve the provider account home for a (possibly resuming) launch.
 
@@ -2391,6 +2444,7 @@ class GlobalDispatcher:
                 task_id=task_id,
                 expected_generation=expected_generation,
                 model=model,
+                codex_service_tier=codex_service_tier,
             )
         if not (self.pool and self.pool.enabled):
             return None
@@ -3102,6 +3156,7 @@ class GlobalDispatcher:
         task_id: int | None,
         expected_generation: _TaskRoutingGeneration | None = None,
         model: str | None = None,
+        codex_service_tier: str = "default",
     ) -> str | None:
         """Select/reuse a Codex account without losing the native thread.
 
@@ -3134,6 +3189,7 @@ class GlobalDispatcher:
                 and pool.supports_model_for_home(
                     preferred_owner_home,
                     model,
+                    service_tier=codex_service_tier,
                 )
             ):
                 preferred_home = preferred_owner_home
@@ -3192,7 +3248,11 @@ class GlobalDispatcher:
         resident_available = bool(
             resident
             and pool.is_home_available(resident)
-            and pool.supports_model_for_home(resident, model)
+            and pool.supports_model_for_home(
+                resident,
+                model,
+                service_tier=codex_service_tier,
+            )
         )
 
         if resident_available and (
@@ -3210,19 +3270,31 @@ class GlobalDispatcher:
         resident_id = pool.account_id_for_home(resident) if resident else None
         if resident_id:
             excluded.add(resident_id)
-        target = preferred_home or pool.select(exclude=excluded, model=model)
+        target = preferred_home or pool.select(
+            exclude=excluded,
+            model=model,
+            service_tier=codex_service_tier,
+        )
 
         if not target:
-            if not pool.has_compatible_enabled_account(model):
+            if not pool.has_compatible_enabled_account(
+                model,
+                service_tier=codex_service_tier,
+            ):
                 raise CodexAccountRoutingError(
                     f"Codex pool has no enabled account supporting model "
-                    f"{model!r}; refusing to route or downgrade the task",
+                    f"{model!r} with service tier {codex_service_tier!r}; "
+                    "refusing to route or downgrade the task",
                     permanent=True,
                 )
-            if not pool.has_retryable_compatible_account(model):
+            if not pool.has_retryable_compatible_account(
+                model,
+                service_tier=codex_service_tier,
+            ):
                 raise CodexAccountRoutingError(
-                    f"All compatible Codex accounts for model {model!r} "
-                    "require quota or credential intervention before retrying",
+                    f"All compatible Codex accounts for model {model!r} and "
+                    f"service tier {codex_service_tier!r} require quota or "
+                    "credential intervention before retrying",
                     permanent=True,
                 )
             if resident and pool.is_known_account(resident) and pool.is_home_enabled(resident):
@@ -3514,6 +3586,15 @@ class GlobalDispatcher:
                 (task.metadata_ or {}).get("codex_account_id") if task else None
             )
             task_model = task.model if task else None
+            task_service_tier = (
+                task.codex_service_tier
+                if (
+                    task
+                    and isinstance(task.codex_service_tier, str)
+                    and task.codex_service_tier in {"default", "priority"}
+                )
+                else "default"
+            )
 
         old_home = self.instance_manager.get_config_dir(instance_id)
         if not old_home and isinstance(bound_id, str):
@@ -3536,7 +3617,11 @@ class GlobalDispatcher:
 
         old_account_id = pool.account_id_for_home(old_home)
         excluded = {old_account_id} if old_account_id else set()
-        new_home = pool.select(exclude=excluded, model=task_model)
+        new_home = pool.select(
+            exclude=excluded,
+            model=task_model,
+            service_tier=task_service_tier,
+        )
         if not new_home:
             logger.warning(
                 "Codex pool exhausted — no alternative account for task %d",
@@ -3696,6 +3781,7 @@ class GlobalDispatcher:
                 task_id=task.id,
                 cwd=cwd,
                 model=task.model,
+                codex_service_tier=task.codex_service_tier,
                 resume_session_id=session_id,
                 git_env=git_env or {},
                 thinking_budget=thinking_budget,
@@ -3713,6 +3799,7 @@ class GlobalDispatcher:
                 task_id=task.id,
                 cwd=cwd,
                 model=task.model,
+                codex_service_tier=task.codex_service_tier,
                 git_env=git_env or {},
                 thinking_budget=thinking_budget,
                 effort_level=effort_level,
@@ -3772,6 +3859,7 @@ class GlobalDispatcher:
                 task_id=task.id,
                 cwd=cwd,
                 model=task.model,
+                codex_service_tier=task.codex_service_tier,
                 resume_session_id=current_session,
                 loop_iteration=loop_iteration,
                 git_env=git_env or {},
@@ -4550,9 +4638,15 @@ class GlobalDispatcher:
         )
         original_task_skills: dict = {}
         launch_skills: dict = {}
+        launch_routing = (
+            task.provider,
+            task.model,
+            task.codex_service_tier,
+        )
         has_temporary_initial_skills = False
         initial_skill_overrides: dict = {}
         initial_skill_token: str | None = None
+        routing_sync_pending = False
         try:
             # === Step 1: Mark in_progress ===
             await self._broadcast_task_status_generation(
@@ -4574,9 +4668,9 @@ class GlobalDispatcher:
             effort_level = task.effort_level or settings.default_effort
             async with self.db_factory() as db:
                 # This no-op generation UPDATE is also the Task write barrier.
-                # Refresh skills only after it succeeds: a settings save may
-                # have committed after dequeue handed us ``task`` but before
-                # this lifecycle reached its final launch claim.
+                # Refresh mutable launch settings only after it succeeds: a
+                # settings save may have committed after dequeue handed us
+                # ``task`` but before this lifecycle reached its final claim.
                 claimed = await db.execute(
                     update(Task)
                     .where(
@@ -4608,56 +4702,92 @@ class GlobalDispatcher:
                         populate_existing=True,
                     )
                     if current is not None:
-                        original_task_skills = dict(
-                            current.enabled_skills or {}
-                        )
-                        # The command/prompt belongs to the dequeued lifecycle
-                        # generation; only its persistent skill baseline is
-                        # refreshed here.  Mixing a concurrently edited
-                        # description with the already-built lifecycle prompt
-                        # could advertise a command that this turn will not
-                        # execute (or vice versa).
-                        initial_command, _ = _initial_task_command(task)
-                        required_skills = (
-                            dict(initial_command.required_skills or {})
-                            if initial_command
-                            else {}
-                        )
-                        launch_skills = dict(original_task_skills)
-                        launch_skills.update(required_skills)
-                        has_temporary_initial_skills = (
-                            launch_skills != original_task_skills
-                        )
-                        missing_skill = object()
-                        initial_skill_overrides = {
-                            key: value
-                            for key, value in launch_skills.items()
-                            if original_task_skills.get(key, missing_skill)
-                            != value
-                        }
-                        initial_skill_token = (
-                            secrets.token_urlsafe(24)
-                            if has_temporary_initial_skills
-                            else None
-                        )
-                        current.status = "executing"
-                        current.instance_id = instance_id
-                        if has_temporary_initial_skills:
-                            # The API checks Task.enabled_skills when the model
-                            # calls create_sub_agent. Publish the temporary
-                            # command skill in the ownership transaction.
-                            current.enabled_skills = launch_skills
-                            temporary_metadata = dict(
-                                current.metadata_ or {}
+                        if has_pending_worker_routing(current):
+                            routing_sync_pending = True
+                            # This state can only come from a historical/manual
+                            # race: legal stage requests reject active Tasks.
+                            # Keep the durable marker but return the Task to a
+                            # safe terminal status so Manager ack/reconcile can
+                            # converge it.  Moving it back to pending would
+                            # leave the marker permanently unacknowledgeable.
+                            current.status = "failed"
+                            current.instance_id = None
+                            current.completed_at = datetime.utcnow()
+                            current.error_message = (
+                                "Execution blocked by pending Worker routing "
+                                "configuration synchronization"
                             )
-                            temporary_metadata[
-                                TEMP_SKILLS_GENERATION_KEY
-                            ] = initial_skill_token
-                            current.metadata_ = temporary_metadata
+                        else:
+                            # The Task write barrier orders a concurrent settings
+                            # save before this launch claim.  Route the turn from
+                            # that post-barrier snapshot, never from the detached
+                            # row handed to us by dequeue.
+                            launch_routing = (
+                                current.provider,
+                                current.model,
+                                current.codex_service_tier,
+                            )
+                            original_task_skills = dict(
+                                current.enabled_skills or {}
+                            )
+                            # The command/prompt belongs to the dequeued lifecycle
+                            # generation; only its persistent skill baseline is
+                            # refreshed here.  Mixing a concurrently edited
+                            # description with the already-built lifecycle prompt
+                            # could advertise a command that this turn will not
+                            # execute (or vice versa).
+                            initial_command, _ = _initial_task_command(task)
+                            required_skills = (
+                                dict(initial_command.required_skills or {})
+                                if initial_command
+                                else {}
+                            )
+                            launch_skills = dict(original_task_skills)
+                            launch_skills.update(required_skills)
+                            has_temporary_initial_skills = (
+                                launch_skills != original_task_skills
+                            )
+                            missing_skill = object()
+                            initial_skill_overrides = {
+                                key: value
+                                for key, value in launch_skills.items()
+                                if original_task_skills.get(key, missing_skill)
+                                != value
+                            }
+                            initial_skill_token = (
+                                secrets.token_urlsafe(24)
+                                if has_temporary_initial_skills
+                                else None
+                            )
+                            current.status = "executing"
+                            current.instance_id = instance_id
+                            if has_temporary_initial_skills:
+                                # The API checks Task.enabled_skills when the model
+                                # calls create_sub_agent. Publish the temporary
+                                # command skill in the ownership transaction.
+                                current.enabled_skills = launch_skills
+                                temporary_metadata = dict(
+                                    current.metadata_ or {}
+                                )
+                                temporary_metadata[
+                                    TEMP_SKILLS_GENERATION_KEY
+                                ] = initial_skill_token
+                                current.metadata_ = temporary_metadata
                     executing_generation = (
                         await self._read_task_status_generation(db, task.id)
                     )
                 await db.commit()
+            if routing_sync_pending:
+                from backend.services.task_events import (
+                    broadcast_status_change,
+                )
+
+                await broadcast_status_change(
+                    task.id,
+                    "failed",
+                    None,
+                )
+                return
             if not claimed.rowcount or executing_generation is None:
                 logger.info(
                     "Task %s launch claim on instance %s was superseded",
@@ -4667,9 +4797,14 @@ class GlobalDispatcher:
             lifecycle_generation = self._task_lifecycle_generation(
                 executing_generation
             )
-            # Launch and cleanup must use the same post-barrier skill snapshot,
+            # Launch and cleanup must use the same post-barrier snapshots,
             # including ordinary user saves that won the race before claim.
             task.enabled_skills = launch_skills
+            (
+                task.provider,
+                task.model,
+                task.codex_service_tier,
+            ) = launch_routing
             claim_validated = True
             await self._broadcast_task_status_generation(
                 executing_generation,
@@ -4725,6 +4860,7 @@ class GlobalDispatcher:
                 task_id=task.id,
                 expected_generation=lifecycle_generation,
                 **({"model": task.model} if task.model else {}),
+                codex_service_tier=task.codex_service_tier,
             )
 
             if not await self._task_claim_is_active(lifecycle_generation):
@@ -4740,6 +4876,7 @@ class GlobalDispatcher:
                 task_id=task.id,
                 cwd=cwd,
                 model=task.model,
+                codex_service_tier=task.codex_service_tier,
                 resume_session_id=task.session_id,
                 git_env=git_env or {},
                 thinking_budget=thinking_budget,
@@ -5519,6 +5656,7 @@ class GlobalDispatcher:
                 task_id=task.id,
                 expected_generation=generation,
                 **({"model": task.model} if task.model else {}),
+                codex_service_tier=task.codex_service_tier,
             )
 
             iteration_exit_code, config_dir = await self._launch_mode_turn_with_rotation(
@@ -5668,6 +5806,70 @@ class GlobalDispatcher:
     #                       Goal mode lifecycle                           #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _goal_evaluator_runtime_config(
+        task: Task,
+    ) -> tuple[str, str, str]:
+        """Resolve and validate the evaluator route for the current Task.
+
+        Fast cannot use the lightweight ``gpt-5.4-mini`` default because that
+        model does not advertise the priority tier.  Unless the user selected
+        an explicit evaluator, inherit the already-Fast-compatible task model.
+        """
+
+        from backend.services.codex_models import validate_codex_service_tier
+        from backend.services.goal_evaluator import GoalEvaluationError
+
+        provider = (task.provider or "claude").lower()
+        if provider != "codex":
+            return (
+                provider,
+                task.goal_evaluator_model
+                or settings.default_goal_evaluator_model,
+                "default",
+            )
+
+        service_tier = task.codex_service_tier or "default"
+        task_model = task.model
+        if not task_model or task_model == "default":
+            task_model = settings.default_codex_model
+        if service_tier == "priority":
+            evaluator_model = task.goal_evaluator_model
+            if not evaluator_model or evaluator_model == "default":
+                evaluator_model = task_model
+            if evaluator_model != task_model:
+                raise GoalEvaluationError(
+                    "Codex Fast goal evaluator must use the same model as "
+                    "the task so account capability can be proven before "
+                    "the visible goal turn starts",
+                    provider=provider,
+                    stderr=(
+                        f"task model is {task_model!r}, evaluator model is "
+                        f"{evaluator_model!r}"
+                    ),
+                )
+        else:
+            evaluator_model = (
+                task.goal_evaluator_model
+                or settings.default_codex_goal_evaluator_model
+            )
+            if evaluator_model == "default":
+                evaluator_model = settings.default_codex_model
+
+        try:
+            validate_codex_service_tier(
+                provider,
+                evaluator_model,
+                service_tier,
+            )
+        except ValueError as exc:
+            raise GoalEvaluationError(
+                "Codex goal evaluator cannot preserve the task service tier",
+                provider=provider,
+                stderr=str(exc),
+            ) from exc
+        return provider, evaluator_model, service_tier
+
     async def _evaluate_goal_with_rotation(
         self,
         evaluator,
@@ -5685,12 +5887,11 @@ class GlobalDispatcher:
         """
         from backend.services.goal_evaluator import GoalEvaluationError
 
-        provider = (task.provider or "claude").lower()
-        evaluator_model = task.goal_evaluator_model or (
-            settings.default_codex_goal_evaluator_model
-            if provider == "codex"
-            else settings.default_goal_evaluator_model
-        )
+        (
+            provider,
+            evaluator_model,
+            evaluator_service_tier,
+        ) = self._goal_evaluator_runtime_config(task)
         turn_home = codex_home
         evaluation_home = turn_home
 
@@ -5703,24 +5904,31 @@ class GlobalDispatcher:
                     or (
                         pool.is_home_available(turn_home)
                         and pool.supports_model_for_home(
-                            turn_home, evaluator_model
+                            turn_home,
+                            evaluator_model,
+                            service_tier=evaluator_service_tier,
                         )
                     )
                 )
             )
             if not current_usable:
-                evaluation_home = pool.select(model=evaluator_model)
+                evaluation_home = pool.select(
+                    model=evaluator_model,
+                    service_tier=evaluator_service_tier,
+                )
                 if evaluation_home is None:
                     detail = (
                         "no enabled account supports"
                         if not pool.has_compatible_enabled_account(
-                            evaluator_model
+                            evaluator_model,
+                            service_tier=evaluator_service_tier,
                         )
                         else "no compatible pool account is currently available for"
                     )
                     raise GoalEvaluationError(
                         f"Codex pool has {detail} goal evaluator model "
-                        f"{evaluator_model!r}",
+                        f"{evaluator_model!r} with service tier "
+                        f"{evaluator_service_tier!r}",
                         provider=provider,
                     )
         elif provider == "claude" and self.pool:
@@ -5771,27 +5979,51 @@ class GlobalDispatcher:
                     provider=provider,
                 )
             try:
-                async def evaluate_with_home(admitted_home):
+                async def evaluate_with_home(
+                    admitted_home,
+                    *,
+                    codex_app_server_registry=None,
+                ):
                     return await evaluator.evaluate(
                         condition=task.goal_condition,
                         conversation_summary=conversation_summary,
-                        model=task.goal_evaluator_model,
+                        model=evaluator_model,
                         provider=provider,
                         codex_home=admitted_home,
                         task_id=task.id,
                         config_dir=admitted_home,
                         cloudrouter_store=self.cloudrouter_store,
+                        codex_service_tier=evaluator_service_tier,
+                        codex_app_server_registry=codex_app_server_registry,
                     )
 
                 # Validate/sanitize an API home before any process can read it.
-                # For Codex, retain the same store → home/exec lock order used
-                # by normal launches and stop an idle app-server before exec.
+                # Preserve the normal store → home lock order. Fast stays on
+                # app-server; Standard uses the mutually exclusive exec guard.
                 async with self.instance_manager._cloudrouter_runtime_admission(
                     provider,
                     evaluation_home,
                     evaluator_model,
+                    service_tier=evaluator_service_tier,
                 ):
-                    if provider == "codex":
+                    if (
+                        provider == "codex"
+                        and evaluator_service_tier == "priority"
+                    ):
+                        async with (
+                            self.instance_manager.codex_home_app_server_guard(
+                                evaluation_home,
+                            )
+                        ) as admitted_home:
+                            registry = (
+                                self.instance_manager
+                                ._ensure_codex_app_server_registry()
+                            )
+                            result = await evaluate_with_home(
+                                admitted_home,
+                                codex_app_server_registry=registry,
+                            )
+                    elif provider == "codex":
                         async with self.instance_manager.codex_home_exec_guard(
                             evaluation_home,
                         ) as admitted_home:
@@ -5891,6 +6123,13 @@ class GlobalDispatcher:
             if turn >= max_turns:
                 break
 
+            # Validate the hidden evaluator before launching the visible goal
+            # turn.  API validation handles ordinary writes; this runtime
+            # barrier also protects legacy/corrupt rows and configuration
+            # changes without letting a Fast task do work before discovering
+            # that its evaluator would have to downgrade.
+            self._goal_evaluator_runtime_config(task)
+
             if turn == 0 and not session_id:
                 turn_prompt = self._build_goal_initial_prompt(task)
                 turn_resume_session = None
@@ -5905,6 +6144,7 @@ class GlobalDispatcher:
                     task_id=task.id,
                     expected_generation=generation,
                     **({"model": task.model} if task.model else {}),
+                    codex_service_tier=task.codex_service_tier,
                 )
             else:
                 resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
@@ -5918,6 +6158,7 @@ class GlobalDispatcher:
                     task_id=task.id,
                     expected_generation=generation,
                     **({"model": task.model} if task.model else {}),
+                    codex_service_tier=task.codex_service_tier,
                 )
 
             turn_exit_code, config_dir = await self._launch_mode_turn_with_rotation(
@@ -6293,6 +6534,7 @@ class GlobalDispatcher:
             task_id=task.id,
             expected_generation=generation,
             **({"model": task.model} if task.model else {}),
+            codex_service_tier=task.codex_service_tier,
         )
 
         logger.info(f"Loop task {task.id} iter {iteration}: resuming session {resume_sid} to fix missing signal")
@@ -6339,6 +6581,7 @@ class GlobalDispatcher:
             task_id=task.id,
             expected_generation=generation,
             **({"model": task.model} if task.model else {}),
+            codex_service_tier=task.codex_service_tier,
         )
         exit_code, config_dir = await self._launch_mode_turn_with_rotation(
             instance_id,
@@ -6654,6 +6897,31 @@ class GlobalDispatcher:
 
         return process
 
+    def api_account_aux_runtime_users(self, account) -> list[str]:
+        """Return exact live Claude auxiliary users of one API account."""
+
+        target = os.path.realpath(os.path.abspath(account.claude_config_dir))
+        blockers: list[str] = []
+        for label, process_map, home_map in (
+            (
+                "monitor",
+                self._monitor_processes,
+                getattr(self, "_monitor_config_dirs", {}),
+            ),
+            (
+                "sub-agent",
+                self._sub_agent_processes,
+                getattr(self, "_sub_agent_config_dirs", {}),
+            ),
+        ):
+            for session_id, config_dir in list(home_map.items()):
+                if os.path.realpath(os.path.abspath(config_dir)) != target:
+                    continue
+                process = process_map.get(session_id)
+                if process is not None and not self._aux_process_reaped(process):
+                    blockers.append(f"{label} {session_id}")
+        return blockers
+
     async def _finalize_aux_lifecycle_process(
         self,
         *,
@@ -6884,6 +7152,10 @@ class GlobalDispatcher:
                 process=proc,
                 process_map=self._monitor_processes,
             )
+            if monitor_session_id not in self._monitor_processes:
+                getattr(
+                    self, "_monitor_config_dirs", {}
+                ).pop(monitor_session_id, None)
             cleanup_monitor_agent_mcp_config(monitor_session_id)
             log_fh = self._monitor_log_fhs.pop(monitor_session_id, None)
             if log_fh:
@@ -6952,15 +7224,34 @@ class GlobalDispatcher:
                 self._sanitize_cloudrouter_claude_env(env, config_dir)
 
         log_path = Path(f"/tmp/ccm_monitor_{monitor_session_id}.log")
-        process = await self._launch_registered_aux_process(
-            cmd=cmd,
-            cwd=cwd,
-            env=env,
-            log_path=log_path,
-            session_id=monitor_session_id,
-            process_map=self._monitor_processes,
-            log_map=self._monitor_log_fhs,
-        )
+        async with self.instance_manager._cloudrouter_runtime_admission(
+            "claude",
+            config_dir,
+            model or settings.default_model,
+        ):
+            if config_dir:
+                if not hasattr(self, "_monitor_config_dirs"):
+                    self._monitor_config_dirs = {}
+                self._monitor_config_dirs[monitor_session_id] = config_dir
+            try:
+                process = await self._launch_registered_aux_process(
+                    cmd=cmd,
+                    cwd=cwd,
+                    env=env,
+                    log_path=log_path,
+                    session_id=monitor_session_id,
+                    process_map=self._monitor_processes,
+                    log_map=self._monitor_log_fhs,
+                )
+            except BaseException:
+                # Spawn cancellation can retain an unreaped exact Process in
+                # process_map. Keep its credential-home evidence until that
+                # generation is proven dead.
+                if monitor_session_id not in self._monitor_processes:
+                    getattr(
+                        self, "_monitor_config_dirs", {}
+                    ).pop(monitor_session_id, None)
+                raise
         if config_dir and self.pool:
             self.pool.record_routed_account(config_dir)
         logger.info(
@@ -7054,7 +7345,12 @@ class GlobalDispatcher:
         try:
             async with self.db_factory() as db:
                 sa = await db.get(SubAgentSession, session_id)
-                if not sa:
+                if (
+                    not sa
+                    or sa.agent_type != "sub_agent"
+                    or sa.source != "ccm"
+                    or sa.status != "running"
+                ):
                     return
                 task = await db.get(Task, sa.task_id)
                 if not task:
@@ -7068,6 +7364,12 @@ class GlobalDispatcher:
                 provider = (task.provider or "claude").lower()
                 task_model = task.model
                 task_effort = task.effort_level
+                task_service_tier = task.codex_service_tier
+                task_routing = (
+                    task.provider,
+                    task.model,
+                    task.codex_service_tier,
+                )
                 task_metadata = dict(task.metadata_ or {})
 
             prompt = self._build_sub_agent_prompt(
@@ -7081,6 +7383,8 @@ class GlobalDispatcher:
                     cwd=task_cwd,
                     model=model or task_model or settings.default_codex_model,
                     effort_level=task_effort or settings.default_effort,
+                    codex_service_tier=task_service_tier,
+                    expected_task_routing=task_routing,
                     session_id=session_id,
                     task_id=task_id,
                     task_metadata=task_metadata,
@@ -7180,6 +7484,10 @@ class GlobalDispatcher:
                     process=proc,
                     process_map=self._sub_agent_processes,
                 )
+                if session_id not in self._sub_agent_processes:
+                    getattr(
+                        self, "_sub_agent_config_dirs", {}
+                    ).pop(session_id, None)
             if mcp_config_path is not None:
                 cleanup_sub_agent_mcp_config(session_id)
             log_fh = self._sub_agent_log_fhs.pop(session_id, None)
@@ -7229,15 +7537,31 @@ class GlobalDispatcher:
                 self._sanitize_cloudrouter_claude_env(env, config_dir)
 
         log_path = Path(f"/tmp/ccm_sub_agent_{session_id}.log")
-        process = await self._launch_registered_aux_process(
-            cmd=cmd,
-            cwd=cwd,
-            env=env,
-            log_path=log_path,
-            session_id=session_id,
-            process_map=self._sub_agent_processes,
-            log_map=self._sub_agent_log_fhs,
-        )
+        async with self.instance_manager._cloudrouter_runtime_admission(
+            "claude",
+            config_dir,
+            model or settings.default_model,
+        ):
+            if config_dir:
+                if not hasattr(self, "_sub_agent_config_dirs"):
+                    self._sub_agent_config_dirs = {}
+                self._sub_agent_config_dirs[session_id] = config_dir
+            try:
+                process = await self._launch_registered_aux_process(
+                    cmd=cmd,
+                    cwd=cwd,
+                    env=env,
+                    log_path=log_path,
+                    session_id=session_id,
+                    process_map=self._sub_agent_processes,
+                    log_map=self._sub_agent_log_fhs,
+                )
+            except BaseException:
+                if session_id not in self._sub_agent_processes:
+                    getattr(
+                        self, "_sub_agent_config_dirs", {}
+                    ).pop(session_id, None)
+                raise
         if config_dir and self.pool:
             self.pool.record_routed_account(config_dir)
         logger.info(
@@ -7256,6 +7580,12 @@ class GlobalDispatcher:
         task_id: int,
         task_metadata: dict,
         mcp_specs: tuple,
+        codex_service_tier: str = "default",
+        expected_task_routing: tuple[
+            str,
+            str | None,
+            str,
+        ] | None = None,
     ):
         """Launch an independent Codex thread with required callback tools."""
 
@@ -7269,14 +7599,22 @@ class GlobalDispatcher:
             if (
                 bound_home
                 and pool.is_home_available(bound_home)
-                and pool.supports_model_for_home(bound_home, model)
+                and pool.supports_model_for_home(
+                    bound_home,
+                    model,
+                    service_tier=codex_service_tier,
+                )
             ):
                 codex_home = pool.canonical_home(bound_home)
             else:
-                codex_home = pool.select(model=model)
+                codex_home = pool.select(
+                    model=model,
+                    service_tier=codex_service_tier,
+                )
             if not codex_home:
                 raise RuntimeError(
-                    f"No available Codex account supports sub-agent model {model!r}"
+                    "No available Codex account supports sub-agent model "
+                    f"{model!r} with service tier {codex_service_tier!r}"
                 )
 
         async def launch_admitted_turn(disable_project_config: bool):
@@ -7286,34 +7624,135 @@ class GlobalDispatcher:
                 registry = (
                     self.instance_manager._ensure_codex_app_server_registry()
                 )
-                process, thread_id = await registry.start_turn(
-                    codex_home=admitted_home,
-                    prompt=prompt,
-                    cwd=cwd,
-                    model=model,
-                    effort=clamp_codex_effort(model, effort_level),
-                    resume_session_id=None,
-                    git_env=None,
-                    task_id=task_id,
-                    mcp_specs=mcp_specs,
-                    disable_project_config=disable_project_config,
+                from backend.models.sub_agent import SubAgentSession
+
+                expected_provider, expected_model, expected_tier = (
+                    expected_task_routing
+                    or ("codex", model, codex_service_tier)
                 )
+                process = None
+                thread_id = None
+                try:
+                    async with self.db_factory() as db:
+                        task_predicates = [
+                            Task.id == task_id,
+                            Task.worker_id.is_(None),
+                            Task.shared_from_id.is_(None),
+                            Task.provider == expected_provider,
+                            (
+                                Task.model.is_(None)
+                                if expected_model is None
+                                else Task.model == expected_model
+                            ),
+                            Task.codex_service_tier == expected_tier,
+                        ]
+                        task_guard = await db.execute(
+                            update(Task)
+                            .where(*task_predicates)
+                            .values(status=Task.status)
+                        )
+                        session_guard = await db.execute(
+                            update(SubAgentSession)
+                            .where(
+                                SubAgentSession.id == session_id,
+                                SubAgentSession.task_id == task_id,
+                                SubAgentSession.agent_type == "sub_agent",
+                                SubAgentSession.source == "ccm",
+                                SubAgentSession.status == "running",
+                            )
+                            .values(status=SubAgentSession.status)
+                        )
+                        current_task = await db.get(
+                            Task,
+                            task_id,
+                            populate_existing=True,
+                        )
+                        if (
+                            task_guard.rowcount != 1
+                            or session_guard.rowcount != 1
+                            or current_task is None
+                            or has_pending_worker_routing(current_task)
+                        ):
+                            await db.rollback()
+                            raise RuntimeError(
+                                "Codex sub-agent launch admission changed or "
+                                "Task routing synchronization is pending"
+                            )
+
+                        # Keep the Task→SubAgent DB barrier until start_turn has
+                        # registered the native turn.  A concurrent Worker stage
+                        # therefore either wins first and blocks us, or observes
+                        # this exact running child and rejects its own stage.
+                        process, thread_id = await registry.start_turn(
+                            codex_home=admitted_home,
+                            prompt=prompt,
+                            cwd=cwd,
+                            model=model,
+                            effort=clamp_codex_effort(
+                                model,
+                                effort_level,
+                            ),
+                            codex_service_tier=codex_service_tier,
+                            resume_session_id=None,
+                            git_env=None,
+                            task_id=task_id,
+                            mcp_specs=mcp_specs,
+                            disable_project_config=disable_project_config,
+                        )
+                        # Registration is synchronous and deliberately occurs
+                        # before the next await.  If DB commit is cancelled or
+                        # fails, cleanup below can still identify the exact
+                        # native turn instead of leaving an invisible child
+                        # running with the old routing tuple.
+                        self._sub_agent_codex_homes[session_id] = admitted_home
+                        self._sub_agent_codex_processes[session_id] = process
+                        self._sub_agent_codex_threads[session_id] = thread_id
+                        await db.commit()
+                except BaseException:
+                    if process is not None:
+                        cleanup, _cleanup_cancellation = (
+                            await _settle_despite_cancellation(
+                                self._finalize_codex_sub_agent_turn(
+                                    session_id,
+                                    process,
+                                    reason=(
+                                        "Codex sub-agent launch admission "
+                                        "did not commit"
+                                    ),
+                                )
+                            )
+                        )
+                        try:
+                            cleanup.result()
+                        except BaseException:
+                            # abort_unclaimed_turn leaves the home draining
+                            # when interrupt/shutdown cannot be confirmed.
+                            # Retain the maps as exact cleanup evidence and
+                            # propagate the original launch failure.
+                            logger.exception(
+                                "Failed to clean up uncommitted Codex "
+                                "sub-agent turn: session=%s home=%s",
+                                session_id,
+                                admitted_home,
+                            )
+                    raise
                 return process, thread_id, admitted_home
 
         # Preserve the global lock order used by ordinary task launches:
         # API-store mutation/admission first, then the per-home transport lock.
         # Native homes pass through and yield None.
-        async with self.instance_manager._cloudrouter_runtime_admission(
-            "codex",
-            codex_home,
-            model,
-        ) as api_account:
-            process, thread_id, admitted_home = await launch_admitted_turn(
-                api_account is not None,
-            )
-        self._sub_agent_codex_homes[session_id] = admitted_home
-        self._sub_agent_codex_processes[session_id] = process
-        self._sub_agent_codex_threads[session_id] = thread_id
+        from backend.services.worker_proxy import get_task_operation_lock
+
+        async with get_task_operation_lock(task_id):
+            async with self.instance_manager._cloudrouter_runtime_admission(
+                "codex",
+                codex_home,
+                model,
+                service_tier=codex_service_tier,
+            ) as api_account:
+                process, thread_id, admitted_home = await launch_admitted_turn(
+                    api_account is not None,
+                )
         if codex_home and pool:
             pool.record_routed_account(codex_home)
         logger.info(
@@ -7446,6 +7885,7 @@ class GlobalDispatcher:
         user_message_text: str | None = None,
         command_skills: dict | None = None,
         model_override: str | None = None,
+        expected_task_routing: tuple[str, str | None, str] | None = None,
         monitor_session_id: int | None = None,
         source_log_id: int | None = None,
         current_message: str | None = None,
@@ -7478,6 +7918,7 @@ class GlobalDispatcher:
             user_message_text=user_message_text,
             command_skills=command_skills,
             model_override=model_override,
+            expected_task_routing=expected_task_routing,
             monitor_session_id=monitor_session_id,
             source_log_id=source_log_id,
             current_message=prompt if current_message is None else current_message,
@@ -7624,16 +8065,32 @@ class GlobalDispatcher:
     ) -> None:
         """Make a non-retryable queued-message routing refusal visible."""
 
+        from backend.services.codex_app_server import (
+            CodexServiceTierUnavailableError,
+        )
+
         provider = (
             "Claude"
             if isinstance(exc, ClaudeAccountRoutingError)
             else "Codex"
         )
-        notice = (
-            f"{provider} 账号路由无法安全确定，本条消息未执行。"
-            "请检查账号启用状态与模型支持；若是旧会话多副本，"
-            "请先手动指定正确账号后重新发送。"
-        )
+        if isinstance(exc, QueuedMessageRoutingMismatchError):
+            notice = (
+                "任务的 Provider、模型或 Fast/Standard 配置已在消息发送后"
+                "发生变化，本条消息未执行。请刷新页面并重新发送。"
+            )
+        elif isinstance(exc, CodexServiceTierUnavailableError):
+            notice = (
+                "Codex Fast 未被当前模型或账号确认，本条消息未执行。"
+                "请切换到支持 Fast 的模型/账号，或将速度改为 Standard 后"
+                f"重新发送。详情：{exc}"
+            )
+        else:
+            notice = (
+                f"{provider} 账号路由无法安全确定，本条消息未执行。"
+                "请检查账号启用状态与模型支持；若是旧会话多副本，"
+                "请先手动指定正确账号后重新发送。"
+            )
         async with self.db_factory() as db:
             entry = LogEntry(
                 instance_id=None,
@@ -7702,6 +8159,7 @@ class GlobalDispatcher:
                 except Exception as exc:
                     from backend.services.codex_app_server import (
                         CodexAppServerBusyError,
+                        CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
                     )
                     from backend.services.instance_manager import (
@@ -7712,13 +8170,23 @@ class GlobalDispatcher:
                         exc,
                         (
                             QueuedMessagePrelaunchError,
+                            QueuedMessageRoutingMismatchError,
                             CodexAccountRoutingError,
                             CodexAppServerBusyError,
+                            CodexServiceTierUnavailableError,
                             CodexThreadHomeMismatchError,
                             InstanceAlreadyRunningError,
                         ),
                     ):
                         permanent_routing_error = (
+                            isinstance(
+                                exc,
+                                (
+                                    CodexServiceTierUnavailableError,
+                                    QueuedMessageRoutingMismatchError,
+                                ),
+                            )
+                            or
                             isinstance(
                                 exc,
                                 (
@@ -7989,6 +8457,19 @@ class GlobalDispatcher:
                     task_id,
                 )
                 return
+            current_expected_route = (
+                (task.provider or "claude").lower(),
+                msg.model_override or task.model,
+                task.codex_service_tier or "default",
+            )
+            if (
+                msg.expected_task_routing is not None
+                and current_expected_route != msg.expected_task_routing
+            ):
+                raise QueuedMessageRoutingMismatchError(
+                    "Task execution configuration changed after message "
+                    "admission"
+                )
             if task.worker_id is not None or task.shared_from_id is not None:
                 # A message can be dequeued just before Task migration commits.
                 # It cannot be safely replayed locally (that would create a
@@ -8119,43 +8600,43 @@ class GlobalDispatcher:
                 # 两个 Claude session（一个回应聊天、一个重跑任务）。设成 "in_progress"
                 # 表示"已被 queue consumer 认领、待 resume"，dispatch loop 不会重复分配。
                 # 详见 PROGRESS.md task #707 双 session 竞争条件。
+                recovery_predicates = (
+                    Task.id == task_id,
+                    Task.status == recovery_status,
+                    Task.retry_count == recovery_retry_count,
+                    (
+                        Task.instance_id.is_(None)
+                        if recovery_instance_id is None
+                        else Task.instance_id == recovery_instance_id
+                    ),
+                    (
+                        Task.session_id.is_(None)
+                        if recovery_session_id is None
+                        else Task.session_id == recovery_session_id
+                    ),
+                    (
+                        Task.started_at.is_(None)
+                        if recovery_started_at is None
+                        else Task.started_at == recovery_started_at
+                    ),
+                    (
+                        Task.completed_at.is_(None)
+                        if recovery_completed_at is None
+                        else Task.completed_at == recovery_completed_at
+                    ),
+                    Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
+                    task_retry_not_superseded_predicate(),
+                )
+                # Acquire the exact Task write barrier before inspecting the
+                # durable routing fence.  A Worker stage that wins during
+                # clone/compaction must leave this Task in its safe status;
+                # moving it to in_progress would make ack/reconcile reject it
+                # forever.
                 recovery_claim = await db.execute(
                     update(Task)
-                    .where(
-                        Task.id == task_id,
-                        Task.status == recovery_status,
-                        Task.retry_count == recovery_retry_count,
-                        (
-                            Task.instance_id.is_(None)
-                            if recovery_instance_id is None
-                            else Task.instance_id == recovery_instance_id
-                        ),
-                        (
-                            Task.session_id.is_(None)
-                            if recovery_session_id is None
-                            else Task.session_id == recovery_session_id
-                        ),
-                        (
-                            Task.started_at.is_(None)
-                            if recovery_started_at is None
-                            else Task.started_at == recovery_started_at
-                        ),
-                        (
-                            Task.completed_at.is_(None)
-                            if recovery_completed_at is None
-                            else Task.completed_at == recovery_completed_at
-                        ),
-                        Task.worker_id.is_(None),
-                        Task.shared_from_id.is_(None),
-                        task_retry_not_superseded_predicate(),
-                    )
-                    .values(
-                        status="in_progress",
-                        session_id=recovered_session_id,
-                        context_window_usage=recovered_context_usage,
-                        completed_at=None,
-                        error_message=None,
-                    )
+                    .where(*recovery_predicates)
+                    .values(status=Task.status)
                 )
                 if not recovery_claim.rowcount:
                     await db.rollback()
@@ -8180,6 +8661,27 @@ class GlobalDispatcher:
                         "Queued task recovery generation changed; preserving "
                         "the exact message for retry"
                     )
+                current = await db.get(
+                    Task,
+                    task_id,
+                    populate_existing=True,
+                )
+                if current is None:
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Queued task disappeared after recovery barrier"
+                    )
+                if has_pending_worker_routing(current):
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Task routing configuration synchronization is pending; "
+                        "preserving the exact message for retry"
+                    )
+                current.status = "in_progress"
+                current.session_id = recovered_session_id
+                current.context_window_usage = recovered_context_usage
+                current.completed_at = None
+                current.error_message = None
                 await db.commit()
                 msg.prompt = recovered_prompt
                 if recovered_session_id is None:
@@ -8279,12 +8781,34 @@ class GlobalDispatcher:
             # inherited CLAUDE_CONFIG_DIR that lacks the JSONL (prod #734/#740).
             queued_routing_generation = self._task_status_generation(task)
             effective_model = msg.model_override or task.model
+            resolved_routing = (
+                (task.provider or "claude").lower(),
+                effective_model,
+                task.codex_service_tier or "default",
+            )
+            if (task.provider or "claude").lower() == "codex":
+                from backend.services.codex_models import (
+                    validate_codex_service_tier,
+                )
+
+                try:
+                    validate_codex_service_tier(
+                        task.provider,
+                        effective_model,
+                        task.codex_service_tier,
+                    )
+                except ValueError as exc:
+                    raise CodexAccountRoutingError(
+                        str(exc),
+                        permanent=True,
+                    ) from exc
             config_dir = await self._resolve_resume_config_dir(
                 task.session_id,
                 task.provider,
                 task_id=task.id,
                 expected_generation=queued_routing_generation,
                 **({"model": effective_model} if effective_model else {}),
+                codex_service_tier=task.codex_service_tier,
             )
 
             logger.info(
@@ -8373,6 +8897,7 @@ class GlobalDispatcher:
                 task_id=task_id,
                 cwd=task.last_cwd or task.target_repo or os.getcwd(),
                 model=effective_model,
+                codex_service_tier=task.codex_service_tier,
                 resume_session_id=task.session_id,
                 git_env=git_env,
                 thinking_budget=task.thinking_budget,
@@ -8507,6 +9032,36 @@ class GlobalDispatcher:
                         "Queued task disappeared after launch barrier"
                     )
                 task = current
+                if has_pending_worker_routing(task):
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Task routing configuration synchronization is pending; "
+                        "preserving the exact message for retry"
+                    )
+                current_effective_model = msg.model_override or task.model
+                current_routing = (
+                    (task.provider or "claude").lower(),
+                    current_effective_model,
+                    task.codex_service_tier or "default",
+                )
+                if (
+                    msg.expected_task_routing is not None
+                    and current_routing != msg.expected_task_routing
+                ):
+                    await db.rollback()
+                    raise QueuedMessageRoutingMismatchError(
+                        "Task execution configuration changed before launch"
+                    )
+                if current_routing != resolved_routing:
+                    # Account/session routing may have side effects, so never
+                    # combine its old provider/model/tier result with a newer
+                    # Task configuration.  The queue consumer preserves this
+                    # exact message and resolves the route again on retry.
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Task execution configuration changed during account "
+                        "resolution; preserving the exact message for retry"
+                    )
                 original_skills = dict(task.enabled_skills or {})
                 cleanup_state["original_skills"] = original_skills
                 effective_skills = dict(original_skills)
@@ -8516,6 +9071,12 @@ class GlobalDispatcher:
                     cleanup_state["temporary_skill_token"] = (
                         temporary_skill_token
                     )
+                launch_kwargs.update(
+                    provider=task.provider,
+                    model=current_effective_model,
+                    codex_service_tier=task.codex_service_tier,
+                )
+                task_provider = (task.provider or "claude").lower()
                 launch_kwargs["enabled_skills"] = effective_skills
 
                 task.status = "executing"
@@ -8571,6 +9132,7 @@ class GlobalDispatcher:
             except Exception as exc:
                 from backend.services.codex_app_server import (
                     CodexAppServerBusyError,
+                    CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
                 )
                 from backend.services.cloudrouter_accounts import (
@@ -8588,6 +9150,7 @@ class GlobalDispatcher:
                     (
                         CodexAccountRoutingError,
                         CodexAppServerBusyError,
+                        CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
                         InstanceAlreadyRunningError,
                     ),

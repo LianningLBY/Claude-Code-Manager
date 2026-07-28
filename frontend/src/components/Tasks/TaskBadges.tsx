@@ -25,7 +25,12 @@ async function loadCodexTaskSkillsCapability(): Promise<boolean> {
   if (!_codexTaskSkillsCapability) {
     _codexTaskSkillsCapability = api.getRuntimeSettings()
       .then((runtime) => runtime.codex_main_mcp_enabled !== false)
-      .catch(() => false);
+      .catch((error) => {
+        // A transient settings failure is capability uncertainty, not a
+        // page-lifetime proof that ordinary Codex Skills are disabled.
+        _codexTaskSkillsCapability = null;
+        throw error;
+      });
   }
   return _codexTaskSkillsCapability;
 }
@@ -90,13 +95,11 @@ export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () =>
                     ...(task.enabled_skills || {}),
                     [tool.key]: !enabled,
                   };
-                  const newSkills = Object.fromEntries(
-                    Object.entries(nextSkills).filter(([key]) => (
-                      tools.some((candidate) => candidate.key === key)
-                    )),
-                  );
                   try {
-                    await api.updateTask(task.id, { enabled_skills: newSkills });
+                    // ``tools`` is only the currently visible capability
+                    // subset. Preserve persisted keys that are hidden because
+                    // capability discovery is unavailable or provider-filtered.
+                    await api.updateTask(task.id, { enabled_skills: nextSkills });
                     onRefresh();
                   } catch { /* keep current state */ }
                 }}

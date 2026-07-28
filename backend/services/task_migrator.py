@@ -407,7 +407,12 @@ class TaskMigrator:
             if dst is not None:
                 from backend.main import worker_proxy
                 worker_project_id = await worker_proxy.ensure_worker_project(dst, task)
-                await self._ensure_worker_task(dst, task, worker_project_id)
+                await self._ensure_worker_task(
+                    dst,
+                    task,
+                    worker_project_id,
+                    source_status=prev_status,
+                )
 
             # 5. relay 订阅切换
             if src is not None:
@@ -1133,13 +1138,23 @@ class TaskMigrator:
 
     # -- 目标 worker 上重建 task ----------------------------------------
 
-    async def _ensure_worker_task(self, dst: Worker, task: Task, worker_project_id: int):
+    async def _ensure_worker_task(
+        self,
+        dst: Worker,
+        task: Task,
+        worker_project_id: int,
+        *,
+        source_status: str | None = None,
+    ):
         """Atomically import an inert same-ID task on the destination Worker."""
         headers = {"Authorization": f"Bearer {dst.auth_token}"}
         base = f"http://{dst.private_ip}:{dst.ccm_port}/api/tasks"
         from backend.services.skill_context import (
             build_user_skill_snapshot_payload,
             normalize_user_skill_ids,
+        )
+        from backend.services.worker_routing_config import (
+            WORKER_ROUTING_SAFE_STATUSES,
         )
 
         user_skill_snapshots = []
@@ -1152,9 +1167,16 @@ class TaskMigrator:
                         metadata=task.metadata_,
                     )
                 )
+        requested_source_status = source_status or task.status
+        source_status = (
+            requested_source_status
+            if requested_source_status in WORKER_ROUTING_SAFE_STATUSES
+            else "cancelled"
+        )
         payload = {
             "id": task.id,
             "worker_id": None,
+            "source_status": source_status,
             "title": task.title,
             "description": task.description or task.title or "migrated task",
             "project_id": worker_project_id,
@@ -1201,7 +1223,7 @@ class TaskMigrator:
                 raise MigrationError(f"目标 Worker 导入 task 冲突: {detail}")
             r.raise_for_status()
             created = r.json()
-            if created.get("status") != "cancelled":
+            if created.get("status") != source_status:
                 raise MigrationError("目标 Worker 导入 task 未保持不可调度状态")
             if (
                 (task.codex_service_tier or "default") == "priority"

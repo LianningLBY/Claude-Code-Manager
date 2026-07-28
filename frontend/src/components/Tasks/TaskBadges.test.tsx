@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { Task } from '../../api/client';
-import { ModelBadge, TaskConfigBadge } from './TaskBadges';
+import { ModelBadge, PluginsBadge, TaskConfigBadge } from './TaskBadges';
 
 vi.mock('../../api/client', () => ({
   api: {
@@ -17,6 +17,13 @@ vi.mock('../../api/client', () => ({
         'gpt-5.5': ['default', 'priority'],
         'gpt-5.4-mini': ['default'],
       },
+    }),
+    listSkills: vi.fn().mockResolvedValue([
+      { key: 'code-review', label: 'Code Review' },
+      { key: 'sub-agent', label: 'Sub-Agent' },
+    ]),
+    getRuntimeSettings: vi.fn().mockResolvedValue({
+      codex_main_mcp_enabled: true,
     }),
     updateTask: vi.fn().mockResolvedValue({}),
   },
@@ -38,6 +45,54 @@ function makeCodexTask(overrides: Partial<Task> = {}): Task {
     ...overrides,
   } as Task;
 }
+
+describe('PluginsBadge capability failures', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('preserves hidden Skills when runtime capability discovery fails', async () => {
+    vi.mocked(api.getRuntimeSettings)
+      .mockRejectedValueOnce(new Error('temporary settings failure'));
+    const onRefresh = vi.fn();
+    const task = makeCodexTask({
+      enabled_skills: {
+        'code-review': true,
+        'sub-agent': false,
+      },
+    });
+
+    const first = render(
+      <PluginsBadge task={task} onRefresh={onRefresh} />,
+    );
+    await userEvent.click(screen.getByTitle('Plugins'));
+    const subAgent = await screen.findByRole(
+      'button',
+      { name: /Sub-Agent/ },
+    );
+    expect(screen.queryByText('Code Review')).not.toBeInTheDocument();
+
+    await userEvent.click(subAgent);
+
+    expect(api.updateTask).toHaveBeenCalledWith(7, {
+      enabled_skills: {
+        'code-review': true,
+        'sub-agent': true,
+      },
+    });
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+
+    first.unmount();
+    vi.mocked(api.getRuntimeSettings).mockResolvedValueOnce({
+      codex_main_mcp_enabled: true,
+    } as Awaited<ReturnType<typeof api.getRuntimeSettings>>);
+    render(<PluginsBadge task={task} onRefresh={vi.fn()} />);
+    await userEvent.click(screen.getByTitle('Plugins'));
+
+    expect(await screen.findByText('Code Review')).toBeInTheDocument();
+    expect(api.getRuntimeSettings).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe('TaskConfigBadge Codex Fast', () => {
   beforeEach(() => {

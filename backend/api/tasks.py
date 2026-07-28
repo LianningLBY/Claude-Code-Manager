@@ -573,8 +573,8 @@ async def import_migrated_task(
     dispatcher.  Task migration used to call that endpoint and cancel in a
     second request, leaving a real window where the destination Worker could
     claim and execute the imported task.  This admin-only endpoint persists
-    the task as ``cancelled`` in the same transaction and never wakes the
-    dispatcher.
+    only a non-dispatchable source status in the same transaction and never
+    wakes the dispatcher.
 
     Existing inactive copies are refreshed with a status CAS.  If a legacy
     copy has already become active, fail closed instead of cancelling work
@@ -583,6 +583,7 @@ async def import_migrated_task(
     require_admin(request)
 
     data = body.model_dump()
+    source_status = data.pop("source_status")
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
     for transient_field in (
         "image_paths",
@@ -602,7 +603,7 @@ async def import_migrated_task(
         }
     data.update(
         worker_id=None,
-        status="cancelled",
+        status=source_status,
         created_by=get_current_user_id(request),
     )
 
@@ -653,9 +654,9 @@ async def import_migrated_task(
     task = await db.get(Task, body.id)
     if task is None:  # defensive: a concurrent delete must not look successful
         raise HTTPException(409, "Destination task disappeared during migration import")
-    if old_status != "cancelled":
+    if old_status != source_status:
         from backend.services.task_events import broadcast_status_change
-        await broadcast_status_change(task.id, "cancelled")
+        await broadcast_status_change(task.id, source_status)
     return task
 
 

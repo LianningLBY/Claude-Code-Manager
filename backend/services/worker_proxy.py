@@ -366,12 +366,17 @@ class WorkerProxy:
             if isinstance(confirmed_metadata, dict)
             else None
         )
+        # ``instance_id`` is node-local execution ownership. A task migrated
+        # from Manager to Worker deliberately keeps the old Manager instance
+        # id while the imported Worker row has no corresponding local
+        # instance. The globally assigned task id plus the monotonic retry
+        # generation and coordinated inert status identify the remote copy;
+        # comparing unrelated database ids would reject every such migration.
         if (
             not isinstance(confirmed, dict)
             or confirmed.get("id") != task.id
             or confirmed.get("status") != task.status
             or confirmed.get("retry_count") != task.retry_count
-            or confirmed.get("instance_id") != task.instance_id
             or confirmed.get("enabled_skills") != payload["enabled_skills"]
             or confirmed.get("selected_user_skills")
             != payload["selected_user_skills"]

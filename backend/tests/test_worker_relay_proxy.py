@@ -364,7 +364,9 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
                 "id": task.id,
                 "status": task.status,
                 "retry_count": task.retry_count,
-                "instance_id": task.instance_id,
+                # Worker instance ids belong to a different database and are
+                # intentionally not comparable with the Manager mirror.
+                "instance_id": None,
                 "enabled_skills": captured_payload["enabled_skills"],
                 "selected_user_skills": captured_payload[
                     "selected_user_skills"
@@ -477,6 +479,7 @@ async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
         title="remote",
         description="continue",
         worker_id=worker.id,
+        instance_id=444,
         enabled_skills={"code-review": True},
         selected_user_skills=[9],
     )
@@ -2848,6 +2851,189 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
         "description": "Manager-authoritative description",
         "content": "Manager-authoritative content",
     }]
+
+
+@pytest.mark.parametrize(
+    ("source_status", "mode", "action_path"),
+    [
+        pytest.param("completed", "auto", "retry", id="retry"),
+        pytest.param("completed", "auto", "chat", id="chat"),
+        pytest.param(
+            "plan_review",
+            "plan",
+            "plan/approve",
+            id="plan-approve",
+        ),
+    ],
+)
+async def test_migrated_inert_task_can_start_its_next_worker_turn(
+    client,
+    db_factory,
+    session_factory,
+    monkeypatch,
+    source_status,
+    mode,
+    action_path,
+):
+    """Migration and the next admission agree on one remote generation."""
+
+    from backend.services.task_migrator import TaskMigrator
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        status=source_status,
+        mode=mode,
+        plan_content="ready plan" if mode == "plan" else None,
+        instance_id=444,
+        enabled_skills={"code-review": True},
+    )
+    relay = AsyncMock()
+    remote: dict = {}
+    imported_statuses = []
+    skill_payloads = []
+
+    class Response:
+        text = ""
+
+        def __init__(self, payload, status_code=200):
+            self.payload = payload
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return dict(self.payload)
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, *, headers, json):
+            assert url.endswith("/api/tasks/migration-import")
+            imported_statuses.append(json["source_status"])
+            remote.update({
+                "id": json["id"],
+                "status": json["source_status"],
+                "retry_count": json["retry_count"],
+                "instance_id": None,
+                "enabled_skills": json["enabled_skills"],
+                "selected_user_skills": json["selected_user_skills"],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": json[
+                        "user_skill_snapshots"
+                    ],
+                },
+                "provider": json["provider"],
+                "model": json["model"],
+                "codex_service_tier": json["codex_service_tier"],
+            })
+            return Response(remote, status_code=201)
+
+        async def put(self, url, *, headers, json):
+            assert url.endswith(f"/api/tasks/{task.id}")
+            skill_payloads.append(json)
+            remote["enabled_skills"] = json["enabled_skills"]
+            remote["selected_user_skills"] = json["selected_user_skills"]
+            remote["metadata_"]["ccm_user_skill_snapshots"] = json[
+                "user_skill_snapshots"
+            ]
+            return Response(remote)
+
+    async def worker_protocol(current, method, path, body=None, **_kwargs):
+        if method == "GET":
+            assert path.endswith("/routing-config/status")
+            return _routing_snapshot(
+                current,
+                status=remote["status"],
+            )
+        assert method == "POST"
+        if action_path == "retry":
+            assert path.endswith("/retry")
+            assert remote["status"] == "completed"
+            remote.update(
+                status="pending",
+                retry_count=remote["retry_count"] + 1,
+                instance_id=None,
+            )
+            return _remote_task(
+                current,
+                status="pending",
+                retry_count=remote["retry_count"],
+                completed_at=None,
+            )
+        if action_path == "plan/approve":
+            assert path.endswith("/plan/approve")
+            assert remote["status"] == "plan_review"
+            remote.update(status="pending", instance_id=None)
+            return _remote_task(
+                current,
+                status="pending",
+                retry_count=remote["retry_count"],
+                completed_at=None,
+                plan_approved=True,
+            )
+        assert path.endswith("/chat")
+        assert remote["status"] == "completed"
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": "migrated-session",
+        }
+
+    monkeypatch.setattr(
+        worker_proxy_module.httpx,
+        "AsyncClient",
+        Client,
+    )
+    proxy = WorkerProxy(db_factory, relay=relay)
+    proxy.ensure_worker_project = AsyncMock(return_value=17)
+    proxy.proxy_to_worker = AsyncMock(side_effect=worker_protocol)
+    migrator = TaskMigrator(
+        db_factory=db_factory,
+        relay=relay,
+        broadcaster=None,
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "task_migrator", migrator)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+
+    migrated = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"worker_id": worker.id},
+    )
+
+    assert migrated.status_code == 200, migrated.text
+    assert migrated.json()["status"] == source_status
+    assert migrated.json()["worker_id"] == worker.id
+    assert imported_statuses == [source_status]
+    assert remote["instance_id"] is None
+
+    if action_path == "chat":
+        response = await client.post(
+            f"/api/tasks/{task.id}/chat",
+            json={"message": "continue after migration"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["queued"] is True
+    else:
+        response = await client.post(
+            f"/api/tasks/{task.id}/{action_path}",
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "pending"
+
+    assert len(skill_payloads) == 1
+    assert skill_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
 
 
 async def test_worker_skill_update_shares_execution_admission_lock(

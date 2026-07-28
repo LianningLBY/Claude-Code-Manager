@@ -168,9 +168,11 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
         status_code = 201
         text = ""
 
-        @staticmethod
-        def json():
-            return {"status": "cancelled"}
+        def __init__(self, status):
+            self.status = status
+
+        def json(self):
+            return {"status": self.status}
 
         @staticmethod
         def raise_for_status():
@@ -185,7 +187,7 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
 
         async def post(self, url, *, headers, json):
             requests.append((url, headers, json))
-            return Response()
+            return Response(json["source_status"])
 
     monkeypatch.setattr(
         task_migrator_module.httpx,
@@ -209,6 +211,7 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
     assert len(requests) == 1
     _url, _headers, payload = requests[0]
     assert payload["provider"] == "codex"
+    assert payload["source_status"] == "completed"
     assert payload["enabled_skills"] == {"sub-agent": True}
     assert payload["selected_user_skills"] == [81]
     assert payload["user_skill_snapshots"] == snapshots
@@ -769,10 +772,12 @@ async def test_worker_task_import_is_one_inert_request(
         status_code = 201
         text = ""
 
-        @staticmethod
-        def json():
+        def __init__(self, status):
+            self.status = status
+
+        def json(self):
             return {
-                "status": "cancelled",
+                "status": self.status,
                 "codex_service_tier": "priority",
             }
 
@@ -789,7 +794,7 @@ async def test_worker_task_import_is_one_inert_request(
 
         async def post(self, url, *, headers, json):
             requests.append((url, headers, json))
-            return Response()
+            return Response(json["source_status"])
 
     monkeypatch.setattr(
         task_migrator_module.httpx,
@@ -804,6 +809,7 @@ async def test_worker_task_import_is_one_inert_request(
     url, _headers, payload = requests[0]
     assert url.endswith("/api/tasks/migration-import")
     assert payload["id"] == t.id
+    assert payload["source_status"] == "completed"
     assert payload["project_id"] == 17
     assert payload["retry_count"] == 2
     assert payload["selected_user_skills"] is None

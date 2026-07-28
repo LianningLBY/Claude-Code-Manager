@@ -131,6 +131,7 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_create_task_defaults_to_standard_service_tier` / `test_create_fast_codex_task_persists_priority` | Task 默认持久化 Standard，Codex Fast 持久化 `priority` |
 | `test_create_fast_task_rejects_incompatible_configuration` / `test_update_validates_merged_provider_model_and_service_tier` | Claude、mini/Spark 与合并更新不能绕过 Fast 能力校验 |
 | `test_migration_import_*_fast_service_tier` | Worker migration-import 保留兼容 Fast，拒绝不支持模型 |
+| `test_migration_import_preserves_inert_status_without_waking_dispatcher` | Worker migration-import 原子保留 `plan_review` 等不可调度源状态，且不产生 pending 窗口、不 wake Dispatcher |
 
 #### `test_api_chat_plan.py` — Chat 和 Plan API
 
@@ -617,9 +618,11 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_worker_relay_proxy.py` / `test_task_migrator.py` 的 Skill snapshot 用例 | Worker 初次转发、续聊同步和迁移 payload 保留选择与正文 snapshot |
 | `test_worker_relay_proxy.py::test_worker_skill_selection_sync_*` | Worker Skill 同步必须读回并确认完整普通/User Skill 元组与权威 snapshot；确认缺失或陈旧时 fail closed |
 | `test_worker_relay_proxy.py::test_worker_execution_admission_syncs_latest_manager_skills` | 已转发 Task 在 Manager 保存最新普通/User Skills 后，Retry 与 Plan Approve 都先同步并确认最终元组/snapshot，再允许 Worker 进入 pending |
+| `test_worker_relay_proxy.py::test_migrated_inert_task_can_start_its_next_worker_turn` | 本地 completed/plan-review Task 经真实迁移流程导入 Worker 后，即使 Manager/Worker `instance_id` 不同，Retry、chat 与 Plan Approve 仍使用同一 status/retry generation 完成 Skill 同步并启动下一轮 |
 | `test_worker_relay_proxy.py::test_worker_skill_update_shares_execution_admission_lock` | Worker Skill 保存与执行准入共用 task operation lock，不允许保存提交穿过正在进行的 Retry/Approve 准入窗口 |
 | `test_api_chat_plan.py::test_codex_fork_starts_before_selected_user_message` | Fork 继承普通/User Skill 选择，附件 seed 保持只消费一次 |
 | 前端 `skillCapabilities.test.ts` | Claude 不变；Codex 始终禁 Monitor，kill switch 关闭时只保留 Sub-Agent |
+| 前端 `TaskBadges.test.tsx::preserves hidden Skills when runtime capability discovery fails` | Runtime Settings 瞬时失败时切换 Sub-Agent 保留当前隐藏 ordinary Skills；失败 capability 不做页面生命周期缓存，后续加载可恢复 |
 
 ##### `test_service_worktree_manager.py` — Worktree 管理器
 

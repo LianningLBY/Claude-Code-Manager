@@ -417,10 +417,10 @@ async def test_valid_skill_update_is_coordinated_with_worker_migration(
 
 
 @pytest.mark.asyncio
-async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
+async def test_migration_import_preserves_inert_status_without_waking_dispatcher(
     client, session_factory,
 ):
-    """Worker imports have no observable pending state to dispatch."""
+    """Worker imports preserve plan review without a pending dispatch window."""
     from backend.main import dispatcher
     from backend.models.task import Task
 
@@ -432,6 +432,8 @@ async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
             "session_id": "session-1",
             "last_cwd": "/workspace/repo",
             "retry_count": 2,
+            "source_status": "plan_review",
+            "mode": "plan",
             "selected_user_skills": [81],
             "user_skill_snapshots": [{
                 "id": 81,
@@ -442,11 +444,11 @@ async def test_migration_import_is_created_cancelled_without_waking_dispatcher(
         })
 
     assert resp.status_code == 201, resp.text
-    assert resp.json()["status"] == "cancelled"
+    assert resp.json()["status"] == "plan_review"
     wake.assert_not_called()
     async with session_factory() as db:
         task = await db.get(Task, 7001)
-    assert task.status == "cancelled"
+    assert task.status == "plan_review"
     assert task.session_id == "session-1"
     assert task.retry_count == 2
     assert task.selected_user_skills == [81]

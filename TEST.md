@@ -611,6 +611,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_mcp_server.py::test_codex_kill_switch_allows_only_selected_sub_agent_skill` | 主 MCP kill switch 关闭时，即使遗留配置启用了普通 Skill 也拒绝读取，同时保留已选 Sub-Agent controller |
 | `test_mcp_server.py::test_user_skill_read_is_scoped_to_selected_worker_snapshot` | `ccm_read_user_skill` 只读当前 Task 选中 ID，并优先使用 Worker snapshot |
 | `test_api_tasks.py` / `test_api_chat_plan.py` 的 Codex Skill capability 用例 | Monitor 拒绝、`$monitor` 在创建/description 更新/follow-up 三个入口持久化前拒绝、kill switch、User Skill ID 校验/去重、provider 切换与 legacy 配置更新边界 |
+| `test_worker_relay_proxy.py::test_codex_worker_chat_rejects_invalid_command_before_manager_side_effects` | Worker-backed Codex chat 在 Manager operation lock 内按权威 provider 拒绝 `$monitor` 与未知的开头命令，且不写日志、不广播、不同步附件/Skills、不访问 Worker |
+| `test_api_chat_plan.py::test_codex_shared_chat_rejects_monitor_before_local_side_effects` | Shared Codex shadow 在本地日志、广播和 owner proxy 前拒绝 `$monitor`；瞬时远端拒绝不会留下幽灵消息 |
+| `test_worker_relay_proxy.py::test_codex_worker_chat_allows_sub_agent_command` | Worker-backed Codex 仍允许 `$sub-agent`，并把未改写的原始 `$command` 消息交给 Worker 端二次校验/执行 |
 | `test_api_tasks.py::test_invalid_skill_update_is_rejected_before_worker_migration` | 组合更新的 provider/Skill 配置在迁移前校验；400 不调用 migrator，也不改变持久状态 |
 | `test_api_tasks.py::test_valid_skill_update_is_coordinated_with_worker_migration` | 有效的 Worker+provider/Skill 组合更新作为最终配置快照交给 migrator，不再迁移旧配置后单独更新 Manager |
 | `test_task_migrator.py::test_coordinated_migration_*` | 本地→Worker、Worker→Worker 的 destination import payload 与 Manager 最终 provider/Skills/User Skill snapshots 完全一致；导入失败保留原配置，认领 CAS 不覆盖并发配置 |

@@ -28,7 +28,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **Workflows 开关** — Task 级别控制是否启用 Workflow 工具，关闭时节省 token
 
 ### 智能能力
-- **Skills 系统** — 创建 Task 时可为 Claude/Codex 勾选普通 Skills 与 User Skills；统一 task context 由 Claude system-prompt 文件、Codex app-server `additionalContext` 或等价 `codex exec` adapter 注入。Codex Monitor 仍明确禁用；`CODEX_MAIN_MCP_ENABLED=false` 会关闭 Codex 普通/User Skills，但不影响独立的 Sub-Agent
+- **Skills 系统** — 创建 Task 时可为 Claude/Codex 勾选普通 Skills 与 User Skills；统一 task context 由 Claude system-prompt 文件、Codex app-server `additionalContext` 或等价 `codex exec` adapter 注入。Codex Monitor 仍明确禁用；`CODEX_MAIN_MCP_ENABLED=false` 会关闭 Codex 普通/User Skills，但不影响独立的 Sub-Agent。开头的 `$command` 会在本地、Worker 和 Shared chat 写入消息前统一校验 provider 能力
 - **Monitor Sub-Agent** — Agent 可自主创建持久监控子 Agent，子 Agent 拥有独立 MCP 工具（report_status / mark_complete / get_context），自主决定检查频率并向系统汇报
 - **原生子 Agent 镜像（PTY 模式）** — 模型用内置 Agent/Task/Monitor 工具开的子 agent 会被 PTY 层观测并自动注册进子 agent 体系（类别 native-agent / native-monitor），统一展示和管理
 

@@ -3726,6 +3726,97 @@ async def test_local_dequeue_skips_worker_tasks(session_factory):
     assert got is not None and got.id == local.id
 
 
+@pytest.mark.parametrize(
+    ("message", "detail"),
+    [
+        ("$monitor watch the build", "does not support Skills: monitor"),
+        ("$not-a-command explain this", "$not-a-command"),
+    ],
+)
+async def test_codex_worker_chat_rejects_invalid_command_before_manager_side_effects(
+    client,
+    session_factory,
+    monkeypatch,
+    message,
+    detail,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        provider="codex",
+        status="completed",
+    )
+    proxy = AsyncMock()
+    proxy.relay = AsyncMock()
+    broadcaster = FakeBroadcaster()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": message},
+    )
+
+    assert response.status_code == 400
+    assert detail in response.text
+    async with session_factory() as db:
+        stored = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert stored == []
+    assert broadcaster.sent == []
+    proxy.require_ready_worker.assert_not_awaited()
+    proxy.push_files.assert_not_awaited()
+    proxy.sync_task_skill_selection.assert_not_awaited()
+    proxy.proxy_to_worker.assert_not_awaited()
+    proxy.relay.subscribe_task.assert_not_awaited()
+
+
+async def test_codex_worker_chat_allows_sub_agent_command(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        provider="codex",
+        status="completed",
+    )
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = AsyncMock()
+
+    async def route_then_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        return {"ok": True, "queued": True}
+
+    proxy.proxy_to_worker.side_effect = route_then_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+
+    message = "$sub-agent review the change"
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": message},
+    )
+
+    assert response.status_code == 200, response.text
+    chat_call = next(
+        call
+        for call in proxy.proxy_to_worker.await_args_list
+        if call.args[1] == "POST"
+    )
+    assert chat_call.kwargs["body"]["message"] == message
+    proxy.sync_task_skill_selection.assert_awaited_once()
+
+
 async def test_chat_proxy_for_worker_task(client, session_factory, monkeypatch):
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, worker_id=w.id)

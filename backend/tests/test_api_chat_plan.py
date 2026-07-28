@@ -1288,6 +1288,69 @@ async def test_codex_chat_rejects_monitor_command_before_persist_or_enqueue(
 
 
 @pytest.mark.asyncio
+async def test_codex_shared_chat_rejects_monitor_before_local_side_effects(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.models.feishu_binding import FeishuUserBinding
+    from backend.models.task_share import SharedTaskReceived
+    import backend.services.shared_proxy as shared_proxy_module
+
+    engine = session_factory.kw["bind"]
+    async with engine.begin() as conn:
+        await conn.run_sync(FeishuUserBinding.__table__.create, checkfirst=True)
+
+    async with session_factory() as db:
+        shared = SharedTaskReceived(
+            owner_ccm_url="https://owner.test",
+            remote_task_id=91,
+            share_token="shared-command-token",
+            task_title="Shared Codex task",
+            task_description="d",
+            status="active",
+        )
+        db.add(shared)
+        await db.flush()
+        shadow = Task(
+            title="Shared Codex task",
+            description="d",
+            status="completed",
+            provider="codex",
+            shared_from_id=shared.id,
+        )
+        db.add(shadow)
+        await db.flush()
+        shared.local_task_id = shadow.id
+        await db.commit()
+        task_id = shadow.id
+
+    proxy_chat = AsyncMock()
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    monkeypatch.setattr(shared_proxy_module, "proxy_chat", proxy_chat)
+    monkeypatch.setattr("backend.main.broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/chat",
+        json={"message": "$monitor watch the build"},
+    )
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+    proxy_chat.assert_not_awaited()
+    broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert stored == []
+
+
+@pytest.mark.asyncio
 async def test_mentioning_skill_command_mid_message_does_not_invoke_it(
     client, session_factory,
 ):

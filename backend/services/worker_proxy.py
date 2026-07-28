@@ -324,12 +324,21 @@ class WorkerProxy:
         worker: Worker,
         task: Task,
     ) -> None:
-        """Refresh a remote task's live Skill selection before a new turn."""
+        """Refresh and confirm a remote task's Skills before a new turn."""
 
+        from backend.services.command_registry import ensure_default_skills
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+            normalize_user_skill_ids,
+        )
+
+        user_skill_snapshots = await self._user_skill_snapshots(task)
         payload = {
-            "enabled_skills": task.enabled_skills,
-            "selected_user_skills": task.selected_user_skills,
-            "user_skill_snapshots": await self._user_skill_snapshots(task),
+            "enabled_skills": ensure_default_skills(task.enabled_skills),
+            "selected_user_skills": normalize_user_skill_ids(
+                task.selected_user_skills
+            ),
+            "user_skill_snapshots": user_skill_snapshots,
         }
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.put(
@@ -338,6 +347,41 @@ class WorkerProxy:
                 json=payload,
             )
             response.raise_for_status()
+            try:
+                confirmed = response.json()
+            except Exception as exc:
+                raise HTTPException(
+                    502,
+                    "Worker Skill selection synchronization returned an "
+                    "invalid confirmation",
+                ) from exc
+
+        confirmed_metadata = (
+            confirmed.get("metadata_")
+            if isinstance(confirmed, dict)
+            else None
+        )
+        confirmed_snapshots = (
+            confirmed_metadata.get(USER_SKILL_SNAPSHOTS_METADATA_KEY)
+            if isinstance(confirmed_metadata, dict)
+            else None
+        )
+        if (
+            not isinstance(confirmed, dict)
+            or confirmed.get("id") != task.id
+            or confirmed.get("status") != task.status
+            or confirmed.get("retry_count") != task.retry_count
+            or confirmed.get("instance_id") != task.instance_id
+            or confirmed.get("enabled_skills") != payload["enabled_skills"]
+            or confirmed.get("selected_user_skills")
+            != payload["selected_user_skills"]
+            or confirmed_snapshots != user_skill_snapshots
+        ):
+            raise HTTPException(
+                409,
+                "Worker Skill selection does not exactly match the Manager; "
+                "execution was blocked",
+            )
 
     async def push_files(self, worker: Worker, paths: list[str]):
         """chat 附件推到 worker 同一绝对路径（worker 上 Claude 用 Read 读）。"""

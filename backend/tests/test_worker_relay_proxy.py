@@ -19,6 +19,7 @@ from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
 from backend.schemas.task import TaskCreate
 from backend.services.worker_proxy import (
@@ -358,6 +359,23 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
         def raise_for_status(self):
             return None
 
+        def json(self):
+            return {
+                "id": task.id,
+                "status": task.status,
+                "retry_count": task.retry_count,
+                "instance_id": task.instance_id,
+                "enabled_skills": captured_payload["enabled_skills"],
+                "selected_user_skills": captured_payload[
+                    "selected_user_skills"
+                ],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": captured_payload[
+                        "user_skill_snapshots"
+                    ],
+                },
+            }
+
     class Client:
         def __init__(self, *_args, **_kwargs):
             pass
@@ -407,6 +425,67 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
             "content": "body",
         }],
     }
+
+
+async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
+    monkeypatch,
+):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": task.id,
+                "status": task.status,
+                "retry_count": task.retry_count,
+                "instance_id": task.instance_id,
+                "enabled_skills": {},
+                "selected_user_skills": [],
+                "metadata_": {"ccm_user_skill_snapshots": []},
+            }
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def put(self, _url, *, headers, json):
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    proxy._user_skill_snapshots = AsyncMock(return_value=[{
+        "id": 9,
+        "name": "Authoritative",
+        "description": "Manager copy",
+        "content": "body",
+    }])
+    worker = Worker(
+        id=79,
+        name="worker",
+        private_ip="10.0.0.79",
+        auth_token="token",
+    )
+    task = Task(
+        id=903,
+        title="remote",
+        description="continue",
+        worker_id=worker.id,
+        enabled_skills={"code-review": True},
+        selected_user_skills=[9],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await proxy.sync_task_skill_selection(worker, task)
+
+    assert exc.value.status_code == 409
+    assert "execution was blocked" in exc.value.detail
 
 
 @pytest.mark.parametrize(
@@ -2624,6 +2703,192 @@ async def test_worker_execution_reconciles_orphan_stage_to_manager_tuple(
     assert response.json()["status"] == "pending"
     assert pending is None
     assert proxy.proxy_to_worker.await_count == 3
+
+
+@pytest.mark.parametrize(
+    ("status", "mode", "action_path", "retry_delta"),
+    [
+        pytest.param(
+            "completed",
+            "auto",
+            "retry",
+            1,
+            id="retry",
+        ),
+        pytest.param(
+            "plan_review",
+            "plan",
+            "plan/approve",
+            0,
+            id="plan-approve",
+        ),
+    ],
+)
+async def test_worker_execution_admission_syncs_latest_manager_skills(
+    client,
+    session_factory,
+    monkeypatch,
+    status,
+    mode,
+    action_path,
+    retry_delta,
+):
+    worker = await _mk_worker(session_factory)
+    async with session_factory() as db:
+        user_skill = UserSkill(
+            name=f"Final {action_path} skill",
+            description="Manager-authoritative description",
+            content="Manager-authoritative content",
+        )
+        db.add(user_skill)
+        await db.commit()
+        await db.refresh(user_skill)
+        user_skill_id = user_skill.id
+
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status=status,
+        mode=mode,
+        plan_content="approved plan" if mode == "plan" else None,
+        enabled_skills={"code-review": False},
+        selected_user_skills=[],
+    )
+    admission_order = []
+    worker_skill_payloads = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": task.id,
+                "status": task.status,
+                "retry_count": task.retry_count,
+                "instance_id": task.instance_id,
+                "enabled_skills": self.payload["enabled_skills"],
+                "selected_user_skills": self.payload[
+                    "selected_user_skills"
+                ],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": self.payload[
+                        "user_skill_snapshots"
+                    ],
+                },
+            }
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def put(self, _url, *, headers, json):
+            admission_order.append("skills")
+            worker_skill_payloads.append(json)
+            return Response(json)
+
+    async def protocol(current, method, path, body=None, **_kwargs):
+        if method == "GET":
+            assert path.endswith("/routing-config/status")
+            return _routing_snapshot(current)
+        assert method == "POST"
+        assert path.endswith(f"/{action_path}")
+        assert admission_order[-1] == "skills"
+        admission_order.append(action_path)
+        return _remote_task(
+            current,
+            status="pending",
+            retry_count=current.retry_count + retry_delta,
+            completed_at=None,
+            plan_approved=True if mode == "plan" else current.plan_approved,
+        )
+
+    proxy = WorkerProxy(session_factory, relay=AsyncMock())
+    proxy.proxy_to_worker = AsyncMock(side_effect=protocol)
+    monkeypatch.setattr(
+        worker_proxy_module.httpx,
+        "AsyncClient",
+        Client,
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    updated = await client.put(
+        f"/api/tasks/{task.id}",
+        json={
+            "enabled_skills": {"code-review": True},
+            "selected_user_skills": [user_skill_id],
+        },
+    )
+    assert updated.status_code == 200, updated.text
+
+    response = await client.post(f"/api/tasks/{task.id}/{action_path}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "pending"
+    assert admission_order == ["skills", action_path]
+    assert len(worker_skill_payloads) == 1
+    assert worker_skill_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
+    assert worker_skill_payloads[0]["selected_user_skills"] == [
+        user_skill_id,
+    ]
+    assert worker_skill_payloads[0]["user_skill_snapshots"] == [{
+        "id": user_skill_id,
+        "name": f"Final {action_path} skill",
+        "description": "Manager-authoritative description",
+        "content": "Manager-authoritative content",
+    }]
+
+
+async def test_worker_skill_update_shares_execution_admission_lock(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        enabled_skills={"code-review": False},
+    )
+    update_entered = asyncio.Event()
+    original_update = tasks_api_module.TaskQueue.update_task
+
+    async def observed_update(self, task_id, **updates):
+        update_entered.set()
+        return await original_update(self, task_id, **updates)
+
+    monkeypatch.setattr(
+        tasks_api_module.TaskQueue,
+        "update_task",
+        observed_update,
+    )
+    lock = worker_proxy_module.get_task_operation_lock(task.id)
+    async with lock:
+        pending = asyncio.create_task(client.put(
+            f"/api/tasks/{task.id}",
+            json={"enabled_skills": {"code-review": True}},
+        ))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not update_entered.is_set()
+
+    response = await pending
+
+    assert response.status_code == 200, response.text
+    assert update_entered.is_set()
+    assert response.json()["enabled_skills"]["code-review"] is True
 
 
 async def test_worker_standard_execution_accepts_matching_legacy_routing(

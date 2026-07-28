@@ -614,6 +614,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_task_migrator.py::test_coordinated_migration_*` | 本地→Worker、Worker→Worker 的 destination import payload 与 Manager 最终 provider/Skills/User Skill snapshots 完全一致；导入失败保留原配置，认领 CAS 不覆盖并发配置 |
 | `test_worker_relay_proxy.py::test_worker_proxy_uses_authoritative_user_skill_snapshots` | Worker 转发在 Manager snapshot 对应的本地 User Skill 缺失或同 ID 内容碰撞时都坚持使用 metadata 权威正文 |
 | `test_worker_relay_proxy.py` / `test_task_migrator.py` 的 Skill snapshot 用例 | Worker 初次转发、续聊同步和迁移 payload 保留选择与正文 snapshot |
+| `test_worker_relay_proxy.py::test_worker_skill_selection_sync_*` | Worker Skill 同步必须读回并确认完整普通/User Skill 元组与权威 snapshot；确认缺失或陈旧时 fail closed |
+| `test_worker_relay_proxy.py::test_worker_execution_admission_syncs_latest_manager_skills` | 已转发 Task 在 Manager 保存最新普通/User Skills 后，Retry 与 Plan Approve 都先同步并确认最终元组/snapshot，再允许 Worker 进入 pending |
+| `test_worker_relay_proxy.py::test_worker_skill_update_shares_execution_admission_lock` | Worker Skill 保存与执行准入共用 task operation lock，不允许保存提交穿过正在进行的 Retry/Approve 准入窗口 |
 | `test_api_chat_plan.py::test_codex_fork_starts_before_selected_user_message` | Fork 继承普通/User Skill 选择，附件 seed 保持只消费一次 |
 | 前端 `skillCapabilities.test.ts` | Claude 不变；Codex 始终禁 Monitor，kill switch 关闭时只保留 Sub-Agent |
 

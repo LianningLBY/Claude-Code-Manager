@@ -80,6 +80,9 @@ _MANUAL_RETRYABLE_STATUSES = frozenset(
 _WORKER_ROUTING_CONFIG_FIELDS = frozenset(
     {"provider", "model", "codex_service_tier"}
 )
+_WORKER_SKILL_CONFIG_FIELDS = frozenset(
+    {"enabled_skills", "selected_user_skills", "metadata_"}
+)
 _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
     {"worker_id", "project_id", "target_repo"}
 )
@@ -1728,6 +1731,35 @@ async def _update_worker_task_with_routing_config(
         return updated
 
 
+async def _update_worker_task_with_skill_configuration(
+    task_id: int,
+    updates: dict,
+    request: Request,
+    queue: TaskQueue,
+    *,
+    expected_worker_id: int,
+) -> Task:
+    """Serialize Manager-authoritative Skill saves with Worker execution."""
+
+    await queue.db.rollback()
+    async with get_task_operation_lock(task_id):
+        queue.db.expire_all()
+        current = await queue.db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, queue.db)
+        if current.worker_id != expected_worker_id:
+            raise HTTPException(
+                409,
+                "Task Worker assignment changed before Skill configuration "
+                "could be saved",
+            )
+        updated = await queue.update_task(task_id, **updates)
+        if updated is None:
+            raise HTTPException(404, "Task not found")
+        return updated
+
+
 @router.put("/{task_id}", response_model=TaskResponse)
 async def update_task(
     task_id: int, body: TaskUpdate, request: Request, queue: TaskQueue = Depends(_get_queue)
@@ -1904,6 +1936,23 @@ async def update_task(
                 updates,
                 request,
                 queue,
+            )
+        )
+
+    # Skill-only edits remain Manager-authoritative until the next turn, but
+    # they must commit under the same lock as retry/chat/plan approval.  This
+    # gives every execution admission one unambiguous final tuple to sync.
+    if (
+        task.worker_id is not None
+        and _WORKER_SKILL_CONFIG_FIELDS.intersection(updates)
+    ):
+        return await _finish_task_operation(
+            _update_worker_task_with_skill_configuration(
+                task_id,
+                updates,
+                request,
+                queue,
+                expected_worker_id=task.worker_id,
             )
         )
 
@@ -2375,6 +2424,17 @@ async def _proxy(
             **proxy_options,
         )
     return await worker_proxy.proxy_to_worker(task, method, path, body)
+
+
+async def _sync_worker_skill_selection_before_execution(task: Task) -> None:
+    """Confirm Manager Skills on the Worker before an executable transition."""
+
+    from backend.main import worker_proxy
+
+    if worker_proxy is None:
+        raise HTTPException(503, "Worker 功能未启用")
+    worker = await worker_proxy.require_ready_worker(task.worker_id)
+    await worker_proxy.sync_task_skill_selection(worker, task)
 
 
 async def _sync_task_from_worker_response(
@@ -2953,6 +3013,23 @@ async def retry_task(
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
+            await _sync_worker_skill_selection_before_execution(current)
+            await db.rollback()
+            db.expire_all()
+            current = await db.get(Task, task_id)
+            if (
+                current is None
+                or worker_task_generation(
+                    current,
+                    expected_worker_id=observed.worker_id,
+                )
+                != observed
+            ):
+                raise HTTPException(
+                    409,
+                    "Task Worker generation changed while Skill selection was "
+                    "being synchronized",
+                )
             result = await _proxy(
                 current,
                 "POST",
@@ -3083,6 +3160,23 @@ async def approve_plan(
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
+            await _sync_worker_skill_selection_before_execution(current)
+            await db.rollback()
+            db.expire_all()
+            current = await db.get(Task, task_id)
+            if (
+                current is None
+                or worker_task_generation(
+                    current,
+                    expected_worker_id=observed.worker_id,
+                )
+                != observed
+            ):
+                raise HTTPException(
+                    409,
+                    "Task Worker generation changed while Skill selection was "
+                    "being synchronized",
+                )
             result = await _proxy(
                 current,
                 "POST",

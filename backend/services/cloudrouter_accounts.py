@@ -911,9 +911,10 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
 
     upstream_status = str(payload.get("status") or "active").lower()
     mode = str(payload.get("mode") or "").lower()
-    # CloudRouter reports accounts without a spend cap as ``unrestricted``.
-    # Their balance/remaining fields may both be zero, but those values are
-    # informational rather than an exhaustion signal.
+    # CloudRouter reports Keys without independent spend or time limits as
+    # ``unrestricted``. Their effective cap and remaining amount follow the
+    # owning account. The zero balance/remaining fields are informational,
+    # not an exhaustion signal or the owning account's numeric quota.
     if mode not in {"quota_limited", "subscription", "wallet", "unrestricted"}:
         mode = "subscription" if isinstance(payload.get("subscription"), dict) else "wallet"
     expired = upstream_status == "expired"
@@ -1072,10 +1073,9 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
         "reason": reason,
     }
     if mode == "unrestricted":
-        # This is a property of the credential's spend cap, not proof of an
-        # organisation wallet balance or an expiry policy. CloudRouter returns
-        # informational zero balance/remaining values for this mode; exposing
-        # them as real money would contradict the unlimited Key semantics.
+        # This Key has no independent spend cap or expiry; its effective limit
+        # follows the owning account. CloudRouter returns informational zero
+        # balance/remaining values here, so never expose them as real money.
         snapshot["unlimited"] = True
     aliases = {
         "balance": ("balance",),

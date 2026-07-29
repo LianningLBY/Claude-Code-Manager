@@ -315,15 +315,17 @@ function ApiQuotaPanel({ quota, onRefresh }: {
       )}
       {unlimited ? (
         <div className="rounded border border-emerald-600/30 bg-emerald-950/20 p-2 text-[10px] leading-relaxed">
-          <div className="font-medium text-emerald-300">Key 无独立消费额度上限</div>
+          <div className="font-medium text-emerald-300">Key 无独立额度上限</div>
           <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-gray-400">
-            <span>Key 总额度：<span className="font-medium text-emerald-300">不限（共享组织池）</span></span>
-            <span>组织总额度：<span className="text-gray-300">接口未提供</span></span>
-            <span>组织剩余额度：<span className="text-gray-300">接口未提供</span></span>
+            <span>Key 额度上限：<span className="font-medium text-emerald-300">等于所属账号额度上限</span></span>
+            <span>Key 剩余额度：<span className="text-gray-300">等于所属账号剩余额度</span></span>
+            {expiryNotSupplied && (
+              <span>Key 使用时间：<span className="font-medium text-emerald-300">不限制</span></span>
+            )}
           </div>
           <div className="mt-0.5 text-gray-400">
-            下方仅展示当前 Key 返回的调用用量。Key 共享组织账户池，不代表组织池本身无限；
-            组织余额、充值和结算状态请前往 CloudRouter 控制台核对。
+            此 Key 未设置独立额度，实际额度随所属账号；下方仅展示当前 Key 的调用用量。
+            账号额度具体数值、充值和结算状态请前往 CloudRouter 控制台查看。
           </div>
         </div>
       ) : total && (total.used != null || total.limit != null || total.remaining != null) ? (
@@ -359,21 +361,14 @@ function ApiQuotaPanel({ quota, onRefresh }: {
       <div className="grid grid-cols-1 gap-1 text-[10px] text-gray-500">
         <span>到期时间：<span className="text-gray-300">
           {expiryNotSupplied
-            ? '接口未提供'
+            ? '不限制'
             : formatApiTimestamp(quota.expires_at)}
         </span></span>
         <span>剩余天数：<span className="text-gray-300">
           {quota.days_until_expiry == null
-            ? expiryNotSupplied
-              ? '接口未提供'
-              : '无法确认'
+            ? expiryNotSupplied ? '不限制' : '无法确认'
             : `${quota.days_until_expiry.toLocaleString()} 天`}
         </span></span>
-        {expiryNotSupplied && (
-          <span className="text-gray-400">
-            “无限制”表示 Key 没有消费额度上限；CloudRouter 未返回有效期，CCM 不推断为永久有效。
-          </span>
-        )}
         <span>数据时间：<span className={quota.stale ? 'text-amber-300' : 'text-gray-300'}>
           {formatApiTimestamp(quota.fetched_at)}
         </span></span>

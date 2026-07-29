@@ -696,6 +696,95 @@ async def test_local_termination_reaps_db_terminal_auxiliary_with_runtime(
 
 
 @pytest.mark.asyncio
+async def test_local_termination_cleans_codex_monitor_after_terminal_commit(
+    db_factory,
+):
+    """Native thread deletion starts only after parent/child terminalization."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        task = Task(
+            title="codex monitor terminal cleanup",
+            description="test",
+            status="executing",
+            provider="codex",
+        )
+        db.add(task)
+        await db.flush()
+        monitor = MonitorSession(
+            task_id=task.id,
+            agent_type="monitor",
+            source="ccm",
+            description="live codex monitor",
+            provider="codex",
+            status="running",
+            codex_thread_id="monitor-thread-terminal-order",
+            codex_home="/tmp/codex-monitor-terminal-order",
+        )
+        db.add(monitor)
+        await db.commit()
+        task_id = task.id
+        monitor_id = monitor.id
+
+    runtime_map = backend.main.dispatcher._monitor_turn_handles
+    marker = object()
+    runtime_map[monitor_id] = marker
+
+    async def stop_exact(session_id):
+        assert session_id == monitor_id
+        runtime_map.pop(monitor_id, None)
+
+    async def cleanup_after_commit(session_id):
+        assert session_id == monitor_id
+        async with db_factory() as db:
+            persisted_task = await db.get(Task, task_id)
+            persisted_monitor = await db.get(MonitorSession, monitor_id)
+            assert persisted_task.status == "completed"
+            assert persisted_monitor.status == "cancelled"
+        return True
+
+    cleanup = AsyncMock(side_effect=cleanup_after_commit)
+    try:
+        async with db_factory() as db:
+            with (
+                patch.object(
+                    backend.main.dispatcher,
+                    "abort_task_queue",
+                    new_callable=AsyncMock,
+                    return_value=0,
+                ),
+                patch.object(
+                    backend.main.dispatcher,
+                    "stop_monitor_session_process",
+                    new_callable=AsyncMock,
+                    side_effect=stop_exact,
+                ),
+                patch.object(
+                    backend.main.dispatcher,
+                    "_cleanup_codex_monitor_thread",
+                    cleanup,
+                ),
+                patch(
+                    "backend.services.task_events.broadcast_status_change",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                result = await termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+    finally:
+        if runtime_map.get(monitor_id) is marker:
+            runtime_map.pop(monitor_id, None)
+
+    assert result.terminal_status == "completed"
+    cleanup.assert_awaited_once_with(monitor_id)
+
+
+@pytest.mark.asyncio
 async def test_local_termination_skips_historical_terminal_auxiliary_rows(
     db_factory,
 ):

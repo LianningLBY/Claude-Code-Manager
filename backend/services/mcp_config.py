@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +18,12 @@ from typing import Mapping, Sequence, cast
 
 
 _CCM_ROOT = str(Path(__file__).resolve().parent.parent.parent)
-_VENV_PYTHON = str(Path(_CCM_ROOT) / ".venv" / "bin" / "python3")
+# MCP servers are children of the running backend and need its exact dependency
+# environment. Reusing that interpreter is portable across Linux venvs,
+# container system Python, and Windows ``Scripts/python.exe``; constructing a
+# repository-relative ``.venv/bin/python3`` path breaks Windows-hosted bind
+# mounts even though the backend itself has all required packages.
+_VENV_PYTHON = sys.executable
 _MCP_STARTUP_TIMEOUT_SEC = 10.0
 _MCP_TOOL_TIMEOUT_SEC = 60.0
 _TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -67,6 +73,7 @@ class McpServerSpec:
     env: Mapping[str, str] = field(default_factory=dict)
     required: bool = False
     enabled_tools: tuple[str, ...] = ()
+    default_tools_approval_mode: str | None = None
     startup_timeout_sec: float | None = None
     tool_timeout_sec: float | None = None
 
@@ -111,6 +118,10 @@ def _ccm_server_spec(
         cwd=_CCM_ROOT,
         required=True,
         enabled_tools=enabled_tools,
+        # These are CCM-owned, task-scoped tools whose handlers enforce the
+        # exact Task/session/generation again. Codex app-server otherwise
+        # treats approvalPolicy="never" as a user rejection at call time.
+        default_tools_approval_mode="approve",
         startup_timeout_sec=_MCP_STARTUP_TIMEOUT_SEC,
         tool_timeout_sec=_MCP_TOOL_TIMEOUT_SEC,
     )
@@ -122,6 +133,7 @@ def build_mcp_server_specs(
     api_base: str | None = None,
     *,
     provider: str = "claude",
+    codex_monitor_enabled: bool = False,
 ) -> tuple[McpServerSpec, ...]:
     """Build the main task's CCM MCP server specs.
 
@@ -131,7 +143,10 @@ def build_mcp_server_specs(
     """
 
     enabled_tools = CCM_SKILLS_TOOLS
-    if (provider or "claude").lower() == "codex":
+    if (
+        (provider or "claude").lower() == "codex"
+        and not codex_monitor_enabled
+    ):
         from backend.services.skill_context import (
             CODEX_UNSUPPORTED_MAIN_TOOLS,
         )
@@ -157,19 +172,25 @@ def build_monitor_agent_mcp_server_specs(
     monitor_session_id: int,
     task_id: int,
     api_base: str | None = None,
+    turn_generation: int | None = None,
 ) -> tuple[McpServerSpec, ...]:
     """Build MCP callback specs for one monitor agent."""
 
+    context_args = [
+        "--monitor-session-id",
+        str(monitor_session_id),
+        "--task-id",
+        str(task_id),
+    ]
+    if turn_generation is not None:
+        context_args.extend(
+            ("--turn-generation", str(turn_generation))
+        )
     return (
         _ccm_server_spec(
             name="ccm_monitor_agent",
             module="backend.mcp.ccm_monitor_agent_server",
-            context_args=(
-                "--monitor-session-id",
-                str(monitor_session_id),
-                "--task-id",
-                str(task_id),
-            ),
+            context_args=tuple(context_args),
             enabled_tools=CCM_MONITOR_AGENT_TOOLS,
             api_base=api_base,
         ),
@@ -283,6 +304,20 @@ def render_codex_mcp_config(specs: Sequence[McpServerSpec]) -> dict[str, object]
             server["env"] = dict(spec.env)
         if spec.enabled_tools:
             server["enabled_tools"] = list(spec.enabled_tools)
+        if spec.default_tools_approval_mode is not None:
+            if spec.default_tools_approval_mode not in {
+                "auto",
+                "prompt",
+                "writes",
+                "approve",
+            }:
+                raise ValueError(
+                    "Invalid Codex default_tools_approval_mode for "
+                    f"{spec.name!r}"
+                )
+            server["default_tools_approval_mode"] = (
+                spec.default_tools_approval_mode
+            )
         if spec.startup_timeout_sec is not None:
             server["startup_timeout_sec"] = spec.startup_timeout_sec
         if spec.tool_timeout_sec is not None:
@@ -378,25 +413,44 @@ def cleanup_mcp_config(task_id: int):
 
 
 def generate_monitor_agent_mcp_config(
-    monitor_session_id: int, task_id: int, api_base: str | None = None
+    monitor_session_id: int,
+    task_id: int,
+    api_base: str | None = None,
+    turn_generation: int | None = None,
 ) -> Path:
     """为 monitor 子 agent 生成专用 MCP config。
 
     Returns:
         配置文件路径，调用方负责清理。
     """
-    config_path = Path(tempfile.gettempdir()) / f"ccm_monitor_agent_{monitor_session_id}.json"
+    generation_suffix = (
+        f"_{turn_generation}" if turn_generation is not None else ""
+    )
+    config_path = (
+        Path(tempfile.gettempdir())
+        / f"ccm_monitor_agent_{monitor_session_id}{generation_suffix}.json"
+    )
     specs = build_monitor_agent_mcp_server_specs(
         monitor_session_id,
         task_id,
         api_base,
+        turn_generation,
     )
     return _write_claude_mcp_config(specs, config_path)
 
 
-def cleanup_monitor_agent_mcp_config(monitor_session_id: int):
+def cleanup_monitor_agent_mcp_config(
+    monitor_session_id: int,
+    turn_generation: int | None = None,
+):
     """清理 monitor 子 agent 的 MCP config 文件。"""
-    config_path = Path(tempfile.gettempdir()) / f"ccm_monitor_agent_{monitor_session_id}.json"
+    generation_suffix = (
+        f"_{turn_generation}" if turn_generation is not None else ""
+    )
+    config_path = (
+        Path(tempfile.gettempdir())
+        / f"ccm_monitor_agent_{monitor_session_id}{generation_suffix}.json"
+    )
     config_path.unlink(missing_ok=True)
 
 

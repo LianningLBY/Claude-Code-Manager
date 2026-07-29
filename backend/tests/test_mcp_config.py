@@ -72,7 +72,7 @@ def _assert_ccm_skills_config(path, task_id: int, api_base: str):
     assert "ccm_skills" in config["mcpServers"]
 
     server = config["mcpServers"]["ccm_skills"]
-    assert server["command"].endswith("python3")
+    assert Path(server["command"]).is_file()
     assert "--task-id" in server["args"]
     assert str(task_id) in server["args"]
     assert "--api-base" in server["args"]
@@ -161,6 +161,7 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
             cwd="/srv/ccm",
             required=True,
             enabled_tools=EXPECTED_MAIN_TOOLS,
+            default_tools_approval_mode="approve",
             startup_timeout_sec=10.0,
             tool_timeout_sec=60.0,
         ),
@@ -194,11 +195,32 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
             cwd="/srv/ccm",
             required=True,
             enabled_tools=EXPECTED_MONITOR_TOOLS,
+            default_tools_approval_mode="approve",
             startup_timeout_sec=10.0,
             tool_timeout_sec=60.0,
         ),
     )
     assert CCM_MONITOR_AGENT_TOOLS == EXPECTED_MONITOR_TOOLS
+
+
+def test_monitor_agent_mcp_spec_carries_exact_turn_generation(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+
+    spec = build_monitor_agent_mcp_server_specs(
+        7,
+        42,
+        api_base="http://manager:8321",
+        turn_generation=9,
+    )[0]
+
+    assert spec.args[2:8] == (
+        "--monitor-session-id",
+        "7",
+        "--task-id",
+        "42",
+        "--turn-generation",
+        "9",
+    )
 
 
 def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
@@ -227,6 +249,7 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
             cwd="/srv/ccm",
             required=True,
             enabled_tools=EXPECTED_SUB_AGENT_TOOLS,
+            default_tools_approval_mode="approve",
             startup_timeout_sec=10.0,
             tool_timeout_sec=60.0,
         ),
@@ -357,15 +380,21 @@ def test_default_api_base_and_empty_auth_token(monkeypatch):
     assert "--auth-token" not in spec.args
 
 
-def test_codex_main_server_does_not_advertise_monitor_tools():
+def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():
     (claude_spec,) = build_mcp_server_specs(42, provider="claude")
-    (codex_spec,) = build_mcp_server_specs(42, provider="codex")
+    (closed_codex_spec,) = build_mcp_server_specs(42, provider="codex")
+    (local_codex_spec,) = build_mcp_server_specs(
+        42,
+        provider="codex",
+        codex_monitor_enabled=True,
+    )
 
     monitor_tools = {"create_monitor", "check_monitors", "stop_monitor"}
     assert monitor_tools.issubset(claude_spec.enabled_tools)
-    assert monitor_tools.isdisjoint(codex_spec.enabled_tools)
-    assert "ccm_read_skill" in codex_spec.enabled_tools
-    assert "ccm_read_user_skill" in codex_spec.enabled_tools
+    assert monitor_tools.isdisjoint(closed_codex_spec.enabled_tools)
+    assert monitor_tools.issubset(local_codex_spec.enabled_tools)
+    assert "ccm_read_skill" in closed_codex_spec.enabled_tools
+    assert "ccm_read_user_skill" in closed_codex_spec.enabled_tools
 
 
 @pytest.mark.parametrize(
@@ -562,6 +591,12 @@ def test_codex_renderers_share_each_role_spec(
     app_server_config = render_codex_mcp_config(specs)
 
     assert set(app_server_config["mcp_servers"]) == {expected_name}
+    assert (
+        app_server_config["mcp_servers"][expected_name][
+            "default_tools_approval_mode"
+        ]
+        == "approve"
+    )
     assert _parse_codex_exec_config_args(
         render_codex_exec_config_args(specs)
     ) == app_server_config
@@ -692,5 +727,23 @@ def test_codex_renderers_reject_invalid_timeouts(
     with pytest.raises(
         ValueError,
         match=rf"Invalid Codex {field_name}.*finite non-negative number",
+    ):
+        renderer((spec,))
+
+
+@pytest.mark.parametrize(
+    "renderer",
+    [render_codex_mcp_config, render_codex_exec_config_args],
+)
+def test_codex_renderers_reject_invalid_default_tools_approval_mode(renderer):
+    spec = McpServerSpec(
+        name="invalid",
+        command="python",
+        default_tools_approval_mode="always",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid Codex default_tools_approval_mode.*'invalid'",
     ):
         renderer((spec,))

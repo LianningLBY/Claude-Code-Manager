@@ -877,6 +877,7 @@ class InstanceManager:
         # check remains below as defense against cross-process DB mutation.
         task_retry_count: int | None = None
         task_skill_context = ""
+        codex_monitor_enabled = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -897,6 +898,22 @@ class InstanceManager:
                         f"Task {task_id} no longer owns instance {instance_id}"
                     )
                 task_retry_count = generation_row[0]
+                task = await db.get(Task, task_id)
+                if task is None:
+                    raise LaunchSupersededError(
+                        f"Task {task_id} disappeared before launch"
+                    )
+                from backend.services.skill_context import (
+                    codex_monitor_supported_for_scope,
+                )
+
+                codex_monitor_enabled = codex_monitor_supported_for_scope(
+                    provider=provider,
+                    worker_id=task.worker_id,
+                    shared_from_id=task.shared_from_id,
+                    metadata=task.metadata_,
+                    codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+                )
                 if (
                     provider == "claude"
                     or settings.codex_main_mcp_enabled
@@ -1045,6 +1062,7 @@ class InstanceManager:
                 task_id,
                 enabled_skills or {},
                 provider=provider,
+                codex_monitor_enabled=codex_monitor_enabled,
             )
         elif codex_sub_agent_mcp_required:
             from backend.services.mcp_config import (

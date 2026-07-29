@@ -1306,7 +1306,7 @@ async def test_explicit_skill_command_injects_only_selected_invocation(
 
 
 @pytest.mark.asyncio
-async def test_codex_chat_rejects_monitor_command_before_persist_or_enqueue(
+async def test_local_codex_chat_accepts_monitor_command(
     client,
     session_factory,
     monkeypatch,
@@ -1332,10 +1332,62 @@ async def test_codex_chat_rejects_monitor_command_before_persist_or_enqueue(
             json={"message": "$monitor watch the build"},
         )
 
+    assert response.status_code == 200, response.text
+    assert mock_d.enqueue_message.await_args.kwargs["command_skills"] == {
+        "monitor": True,
+    }
+    mock_broadcaster.broadcast.assert_awaited()
+    async with session_factory() as db:
+        stored = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert len(stored) == 1
+    assert stored[0].content == "$monitor watch the build"
+
+
+@pytest.mark.asyncio
+async def test_codex_worker_chat_rejects_monitor_before_proxy_or_log(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.log_entry import LogEntry
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with session_factory() as db:
+        task = Task(
+            title="Worker Codex monitor command",
+            description="d",
+            status="completed",
+            provider="codex",
+            worker_id=77,
+            session_id="worker-session",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    worker_proxy = MagicMock()
+    worker_proxy.require_ready_worker = AsyncMock()
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    monkeypatch.setattr("backend.main.worker_proxy", worker_proxy)
+    monkeypatch.setattr("backend.main.broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/chat",
+        json={"message": "$monitor watch the build"},
+    )
+
     assert response.status_code == 400
     assert "does not support Skills: monitor" in response.text
-    mock_d.enqueue_message.assert_not_awaited()
-    mock_broadcaster.broadcast.assert_not_awaited()
+    worker_proxy.require_ready_worker.assert_not_awaited()
+    broadcaster.broadcast.assert_not_awaited()
     async with session_factory() as db:
         stored = list((await db.execute(
             select(LogEntry).where(
@@ -1352,10 +1404,12 @@ async def test_codex_shared_chat_rejects_monitor_before_local_side_effects(
     session_factory,
     monkeypatch,
 ):
+    from backend.config import settings
     from backend.models.feishu_binding import FeishuUserBinding
     from backend.models.task_share import SharedTaskReceived
     import backend.services.shared_proxy as shared_proxy_module
 
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     engine = session_factory.kw["bind"]
     async with engine.begin() as conn:
         await conn.run_sync(FeishuUserBinding.__table__.create, checkfirst=True)

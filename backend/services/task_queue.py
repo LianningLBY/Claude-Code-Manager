@@ -550,6 +550,25 @@ class TaskQueue:
         ):
             await self.db.rollback()
             return False
+        if any(
+            session.agent_type == "monitor"
+            and session.source == "ccm"
+            and session.remote_id is None
+            and (session.provider or "claude").lower() == "codex"
+            and (
+                session.codex_thread_id is not None
+                or session.codex_home is not None
+                or session.codex_cleanup_pending
+                or session.codex_cleanup_error is not None
+            )
+            for session in monitor_rows
+        ):
+            # A terminal Codex Monitor row remains the durable owner of its
+            # rollout until exact thread deletion succeeds. Removing the Task
+            # (and therefore this child row) would turn a retryable cleanup
+            # failure into an unowned native thread after restart.
+            await self.db.rollback()
+            return False
 
         # Auxiliary lifecycle cleanup deliberately retains exact task/process
         # handles when descendants cannot be proven reaped. Do not erase their
@@ -561,6 +580,7 @@ class TaskQueue:
         aux_process_maps = (
             getattr(dispatcher, "_monitor_processes", {}),
             getattr(dispatcher, "_sub_agent_processes", {}),
+            getattr(dispatcher, "_monitor_turn_handles", {}),
         )
         for session_id in monitor_ids:
             if any(
@@ -933,7 +953,13 @@ class TaskQueue:
         await self.db.execute(
             update(MonitorSession)
             .where(MonitorSession.task_id == task_id, MonitorSession.status == "running")
-            .values(status="cancelled", completed_at=datetime.utcnow())
+            .values(
+                status="cancelled",
+                completed_at=datetime.utcnow(),
+                next_check_at=None,
+                active_turn_generation=None,
+                turn_started_at=None,
+            )
         )
 
         await self.db.commit()

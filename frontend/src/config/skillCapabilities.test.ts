@@ -7,8 +7,28 @@ describe('skillSupportedByProvider', () => {
     expect(skillSupportedByProvider('claude', 'monitor', false)).toBe(true);
   });
 
-  it('always excludes Monitor from Codex', () => {
-    expect(skillSupportedByProvider('codex', 'monitor', true)).toBe(false);
+  it('allows Monitor only for a confirmed local Codex scope', () => {
+    expect(skillSupportedByProvider(
+      'codex',
+      'monitor',
+      true,
+      true,
+      false,
+    )).toBe(true);
+    expect(skillSupportedByProvider(
+      'codex',
+      'monitor',
+      true,
+      true,
+      true,
+    )).toBe(false);
+    expect(skillSupportedByProvider(
+      'codex',
+      'monitor',
+      true,
+      false,
+      false,
+    )).toBe(false);
   });
 
   it('keeps only Sub-Agent when Codex main-task MCP is disabled', () => {

@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select, update, func, or_
@@ -173,6 +173,10 @@ TASK_QUEUE_ABORT_TIMEOUT = 15.0
 AUX_LIFECYCLE_CANCEL_TIMEOUT = 10.0
 DISPATCHER_BACKGROUND_STOP_TIMEOUT = 10.0
 SHUTDOWN_LIFECYCLE_CANCEL_TIMEOUT = 15.0
+MONITOR_TURN_TIMEOUT = 600.0
+MONITOR_MAX_CONSECUTIVE_FAILURES = 3
+MONITOR_FAILURE_BACKOFF_BASE = 5.0
+MONITOR_FAILURE_BACKOFF_MAX = 300.0
 
 
 @dataclass(frozen=True)
@@ -212,6 +216,27 @@ class _TaskLifecycleGeneration:
 _TaskRoutingGeneration = (
     _TaskLifecycleGeneration | _TaskStatusGeneration
 )
+
+
+@dataclass(slots=True)
+class _MonitorTurnHandle:
+    """Provider-aware ownership evidence for one scheduled Monitor turn.
+
+    Claude owns a private OS process group.  Codex owns only a turn adapter on
+    an account-scoped shared app-server transport, so it must never enter the
+    subprocess map or the process-group finalizer.
+    """
+
+    session_id: int
+    generation: int
+    provider: str
+    process: object | None
+    config_path: Path | None = None
+    codex_home: str | None = None
+    codex_thread_id: str | None = None
+    codex_account_id: str | None = None
+    codex_created_thread: bool = False
+    codex_identity_committed: bool = False
 
 
 class CodexAccountRoutingError(RuntimeError):
@@ -532,6 +557,11 @@ class GlobalDispatcher:
         self._monitor_processes: dict[int, asyncio.subprocess.Process] = {}  # monitor_session_id -> subprocess
         self._monitor_config_dirs: dict[int, str] = {}
         self._monitor_log_fhs: dict[int, object] = {}  # monitor_session_id -> log file handle
+        self._monitor_turn_handles: dict[int, _MonitorTurnHandle] = {}
+        self._monitor_cleanup_locks: dict[int, asyncio.Lock] = {}
+        # Scheduled lifecycles sleep without blocking maintenance. Only a
+        # claimed turn contributes to active auxiliary blockers.
+        self._monitor_active_turns: set[int] = set()
 
         # Sub-agent (one-shot tasks) lifecycle — parallel to monitor
         self._sub_agent_tasks: dict[int, asyncio.Task] = {}      # session_id -> asyncio task
@@ -672,6 +702,8 @@ class GlobalDispatcher:
             # manager-owned snapshot without being represented in that snapshot.
             async with self._chat_launch_admission_lock:
                 await self._cleanup_stale_state()
+            await self._recover_codex_monitor_cleanups()
+            await self._recover_monitor_sessions()
 
             # Ensure we have worker instances up to max_concurrent_instances
             await self._ensure_instances()
@@ -1406,7 +1438,20 @@ class GlobalDispatcher:
                         # ``monitor`` agent_type. Source is authoritative.
                         manager_owned = ms.task_id in live_task_ids
                     elif ms.agent_type == "monitor":
-                        manager_owned = ms.id in active_monitor_ids
+                        if ms.id in active_monitor_ids:
+                            manager_owned = True
+                        elif ms.active_turn_generation is None:
+                            # A scheduled Monitor owns no model process while
+                            # it waits. It is durable and will be rehydrated
+                            # immediately after startup reconciliation.
+                            manager_owned = (
+                                await db.get(Task, ms.task_id)
+                            ) is not None
+                        else:
+                            # An unclean restart with an active generation
+                            # cannot prove that the old child is gone. Fail
+                            # closed instead of starting a duplicate checker.
+                            manager_owned = False
                     elif ms.agent_type == "sub_agent":
                         manager_owned = ms.id in active_sub_agent_ids
                     elif ms.agent_type in {
@@ -1432,6 +1477,12 @@ class GlobalDispatcher:
                     )
                     ms.status = "failed"
                     ms.completed_at = datetime.utcnow()
+                    if ms.agent_type == "monitor":
+                        ms.next_check_at = None
+                        ms.last_error = (
+                            "Monitor turn ownership could not be recovered "
+                            "after service restart"
+                        )
 
             await db.commit()
 
@@ -1527,7 +1578,11 @@ class GlobalDispatcher:
         # the manager snapshot so shutdown cannot leave invisible children.
         aux_stops = [
             *(self.stop_monitor_session_process(session_id)
-              for session_id in set(self._monitor_tasks) | set(self._monitor_processes)),
+              for session_id in (
+                  set(self._monitor_tasks)
+                  | set(self._monitor_processes)
+                  | set(getattr(self, "_monitor_turn_handles", {}))
+              )),
             *(self.stop_sub_agent_session_process(session_id)
               for session_id in (
                   set(self._sub_agent_tasks)
@@ -2050,6 +2105,11 @@ class GlobalDispatcher:
             for session_id in self._monitor_processes
             if type(session_id) is int
         )
+        monitor_ids.update(
+            session_id
+            for session_id in getattr(self, "_monitor_turn_handles", {})
+            if type(session_id) is int
+        )
         sub_agent_ids = {
             session_id
             for session_id, task in self._sub_agent_tasks.items()
@@ -2080,7 +2140,22 @@ class GlobalDispatcher:
     def active_auxiliary_blockers(self) -> list[dict[str, object]]:
         """Return live CCM-owned auxiliary generations that a restart kills."""
 
-        monitor_ids, sub_agent_ids = self._active_auxiliary_session_ids()
+        from backend.services.plan_agent_runner import (
+            active_plan_agent_task_ids,
+        )
+
+        _scheduled_monitor_ids, sub_agent_ids = (
+            self._active_auxiliary_session_ids()
+        )
+        monitor_ids = {
+            session_id
+            for session_id in (
+                set(self._monitor_processes)
+                | set(getattr(self, "_monitor_turn_handles", {}))
+                | set(getattr(self, "_monitor_active_turns", set()))
+            )
+            if type(session_id) is int
+        }
         return [
             *(
                 {
@@ -2099,6 +2174,15 @@ class GlobalDispatcher:
                     "kind": "sub_agent",
                 }
                 for session_id in sorted(sub_agent_ids)
+            ),
+            *(
+                {
+                    "id": task_id,
+                    "title": f"Plan Agent Task #{task_id}",
+                    "status": "running_auxiliary",
+                    "kind": "plan_agent",
+                }
+                for task_id in sorted(active_plan_agent_task_ids())
             ),
         ]
 
@@ -7348,6 +7432,79 @@ class GlobalDispatcher:
                     blockers.append(f"{label} {session_id}")
         return blockers
 
+    async def codex_monitor_runtime_users(
+        self,
+        codex_home: str,
+        *,
+        account_id: str | None = None,
+    ) -> list[str]:
+        """Return durable or in-flight Monitor owners of one CODEX_HOME."""
+
+        from backend.models.monitor_session import MonitorSession
+        from backend.services.codex_app_server import normalize_codex_home
+
+        target = normalize_codex_home(codex_home)
+        blockers: set[str] = set()
+        for session_id, handle in list(
+            getattr(self, "_monitor_turn_handles", {}).items()
+        ):
+            if (
+                handle.provider == "codex"
+                and handle.codex_home is not None
+                and normalize_codex_home(handle.codex_home) == target
+            ):
+                blockers.add(f"monitor {session_id}")
+
+        ownership_filter = MonitorSession.codex_home.isnot(None)
+        if account_id is not None:
+            ownership_filter = or_(
+                ownership_filter,
+                MonitorSession.codex_account_id == account_id,
+            )
+        async with self.db_factory() as db:
+            result = await db.execute(
+                select(
+                    MonitorSession.id,
+                    MonitorSession.status,
+                    MonitorSession.codex_home,
+                    MonitorSession.codex_account_id,
+                    MonitorSession.codex_thread_id,
+                    MonitorSession.codex_cleanup_pending,
+                ).where(
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.remote_id.is_(None),
+                    MonitorSession.provider == "codex",
+                    ownership_filter,
+                )
+            )
+            rows = list(result.all())
+        for (
+            session_id,
+            status,
+            persisted_home,
+            persisted_account_id,
+            thread_id,
+            cleanup_pending,
+        ) in rows:
+            home_matches = bool(
+                persisted_home
+                and normalize_codex_home(persisted_home) == target
+            )
+            account_matches = bool(
+                account_id is not None
+                and persisted_account_id == account_id
+            )
+            if not home_matches and not account_matches:
+                continue
+            if (
+                status == "running"
+                or thread_id is not None
+                or cleanup_pending
+            ):
+                blockers.add(f"monitor {session_id}")
+        return sorted(blockers)
+
     async def _finalize_aux_lifecycle_process(
         self,
         *,
@@ -7392,10 +7549,125 @@ class GlobalDispatcher:
             )
         return delayed_cancellation
 
-    async def stop_monitor_session_process(self, session_id: int) -> None:
-        await self._stop_aux_session(
-            session_id, self._monitor_tasks, self._monitor_processes
+    async def stop_monitor_session_process(
+        self,
+        session_id: int,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        """Stop one local Monitor generation.
+
+        Runtime shutdown passes ``terminal=False``: the durable Codex thread is
+        retained and its claimed generation is released for resume after
+        restart.  User/task terminal transitions pass ``terminal=True`` and
+        additionally delete that exact thread.
+        """
+
+        stop_error: BaseException | None = None
+        try:
+            await self._stop_aux_session(
+                session_id, self._monitor_tasks, self._monitor_processes
+            )
+        except BaseException as exc:
+            stop_error = exc
+
+        handle = getattr(self, "_monitor_turn_handles", {}).get(session_id)
+        if handle is not None and handle.provider == "codex":
+            try:
+                reaped = await self._finalize_codex_monitor_turn(
+                    handle,
+                    reason="CCM Monitor session stopped",
+                )
+                if (
+                    not reaped
+                    and getattr(self, "_monitor_turn_handles", {}).get(
+                        session_id
+                    )
+                    is handle
+                ):
+                    raise RuntimeError(
+                        "Codex Monitor turn could not be proven terminal"
+                    )
+            except BaseException as exc:
+                if stop_error is None:
+                    stop_error = exc
+                else:
+                    logger.exception(
+                        "Additional Codex Monitor stop failure: session=%s",
+                        session_id,
+                    )
+
+        if (
+            session_id not in self._monitor_processes
+            and session_id
+            not in getattr(self, "_monitor_turn_handles", {})
+        ):
+            getattr(self, "_monitor_active_turns", set()).discard(session_id)
+
+        if terminal:
+            try:
+                cleaned = await self._cleanup_codex_monitor_thread(
+                    session_id
+                )
+                if not cleaned:
+                    raise RuntimeError(
+                        "Codex Monitor terminal thread cleanup remains "
+                        "pending"
+                    )
+            except BaseException as exc:
+                # Cleanup state and the exact identity remain durable for the
+                # next startup retry.  Surface the failure to explicit stop
+                # callers without losing an earlier reaping failure.
+                if stop_error is None:
+                    stop_error = exc
+                else:
+                    logger.exception(
+                        "Additional Codex Monitor thread cleanup failure: "
+                        "session=%s",
+                        session_id,
+                    )
+
+        if stop_error is not None:
+            raise stop_error
+
+    async def _finalize_codex_monitor_turn(
+        self,
+        handle: _MonitorTurnHandle,
+        *,
+        reason: str,
+    ) -> bool:
+        """Abort a Codex turn adapter without signaling its shared transport."""
+
+        process = handle.process
+        registry = self.instance_manager._ensure_codex_app_server_registry()
+        if process is not None and getattr(process, "returncode", None) is None:
+            await registry.abort_unclaimed_turn(
+                handle.codex_home,
+                process,
+                reason=reason,
+            )
+        terminal = (
+            process is None
+            or getattr(process, "returncode", None) is not None
         )
+        handles = getattr(self, "_monitor_turn_handles", {})
+        uncommitted_thread = (
+            handle.codex_created_thread
+            and not handle.codex_identity_committed
+        )
+        if (
+            terminal
+            and not uncommitted_thread
+            and handles.get(handle.session_id) is handle
+        ):
+            handles.pop(handle.session_id, None)
+        elif not terminal or uncommitted_thread:
+            # The exact handle is a maintenance blocker until an interrupt or
+            # transport shutdown proves the native turn terminal. A newly
+            # created thread also remains evidence until it is deleted or its
+            # cleanup identity becomes durable.
+            handles.setdefault(handle.session_id, handle)
+        return terminal and not uncommitted_thread
 
     async def stop_sub_agent_session_process(self, session_id: int) -> None:
         if (
@@ -7451,148 +7723,1777 @@ class GlobalDispatcher:
             self._sub_agent_codex_homes.pop(session_id, None)
             self._sub_agent_codex_threads.pop(session_id, None)
 
+    @staticmethod
+    def _codex_thread_already_absent(exc: BaseException) -> bool:
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "thread not found",
+                "unknown thread",
+                "no such thread",
+                "thread does not exist",
+                "thread already deleted",
+            )
+        )
+
+    async def _persist_uncommitted_codex_monitor_cleanup(
+        self,
+        handle: _MonitorTurnHandle,
+        error: BaseException,
+    ) -> bool:
+        """Turn an undeletable new thread into durable terminal evidence."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        message = (
+            "Codex Monitor identity commit failed and compensating thread "
+            f"deletion is pending: {error}"
+        )[:2000]
+        now = datetime.utcnow()
+        async with self.db_factory() as db:
+            persisted = await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == handle.session_id,
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation
+                    == handle.generation,
+                    MonitorSession.codex_thread_id.is_(None),
+                    MonitorSession.codex_home.is_(None),
+                )
+                .values(
+                    status="failed",
+                    completed_at=now,
+                    next_check_at=None,
+                    active_turn_generation=None,
+                    turn_started_at=None,
+                    last_error=message,
+                    codex_thread_id=handle.codex_thread_id,
+                    codex_home=handle.codex_home,
+                    codex_account_id=handle.codex_account_id,
+                    codex_cleanup_pending=True,
+                    codex_cleanup_error=message,
+                )
+            )
+            if not persisted.rowcount:
+                # A concurrent user/task terminal transition can legitimately
+                # win immediately after the failed identity transaction. The
+                # rollout still belongs to this row, so retain its exact
+                # cleanup identity without rewriting the terminal status.
+                persisted = await db.execute(
+                    update(MonitorSession)
+                    .where(
+                        MonitorSession.id == handle.session_id,
+                        MonitorSession.agent_type == "monitor",
+                        MonitorSession.source == "ccm",
+                        MonitorSession.remote_id.is_(None),
+                        MonitorSession.provider == "codex",
+                        MonitorSession.status != "running",
+                        MonitorSession.codex_thread_id.is_(None),
+                        MonitorSession.codex_home.is_(None),
+                    )
+                    .values(
+                        codex_thread_id=handle.codex_thread_id,
+                        codex_home=handle.codex_home,
+                        codex_account_id=handle.codex_account_id,
+                        codex_cleanup_pending=True,
+                        codex_cleanup_error=message,
+                    )
+                )
+            await db.commit()
+        if persisted.rowcount:
+            handle.codex_identity_committed = True
+            return True
+        return False
+
+    async def _cleanup_codex_monitor_thread(
+        self,
+        monitor_session_id: int,
+    ) -> bool:
+        """Delete one terminal Monitor's exact thread, durably and idempotently."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        cleanup_locks = getattr(self, "_monitor_cleanup_locks", None)
+        if cleanup_locks is None:
+            cleanup_locks = {}
+            self._monitor_cleanup_locks = cleanup_locks
+        lock = cleanup_locks.setdefault(
+            monitor_session_id,
+            asyncio.Lock(),
+        )
+        async with lock:
+            async with self.db_factory() as db:
+                session = await db.get(MonitorSession, monitor_session_id)
+                if (
+                    session is None
+                    or session.agent_type != "monitor"
+                    or session.source != "ccm"
+                    or session.remote_id is not None
+                    or (session.provider or "claude").lower() != "codex"
+                ):
+                    return True
+                if session.status == "running":
+                    return False
+
+                thread_id = session.codex_thread_id
+                codex_home = session.codex_home
+                if bool(thread_id) != bool(codex_home):
+                    error = (
+                        "Codex Monitor runtime identity is incomplete; exact "
+                        "thread cleanup cannot be proven"
+                    )
+                    session.codex_cleanup_pending = True
+                    session.codex_cleanup_error = error
+                    await db.commit()
+                    logger.error(
+                        "%s: session=%s thread=%r home=%r",
+                        error,
+                        monitor_session_id,
+                        thread_id,
+                        codex_home,
+                    )
+                    return False
+                if not thread_id:
+                    if (
+                        session.codex_cleanup_pending
+                        or session.codex_cleanup_error is not None
+                    ):
+                        session.codex_cleanup_pending = False
+                        session.codex_cleanup_error = None
+                        await db.commit()
+                    return True
+
+                session.codex_cleanup_pending = True
+                session.codex_cleanup_error = None
+                await db.commit()
+
+            cleanup_error: BaseException | None = None
+            try:
+                async with self.instance_manager.codex_home_app_server_guard(
+                    codex_home
+                ) as admitted_home:
+                    registry = (
+                        self.instance_manager
+                        ._ensure_codex_app_server_registry()
+                    )
+                    await registry.delete_thread(admitted_home, thread_id)
+            except Exception as exc:
+                if not self._codex_thread_already_absent(exc):
+                    cleanup_error = exc
+
+            if cleanup_error is not None:
+                message = (
+                    "Codex Monitor thread cleanup failed: "
+                    f"{cleanup_error}"
+                )[:2000]
+                async with self.db_factory() as db:
+                    await db.execute(
+                        update(MonitorSession)
+                        .where(
+                            MonitorSession.id == monitor_session_id,
+                            MonitorSession.status != "running",
+                            MonitorSession.codex_thread_id == thread_id,
+                            MonitorSession.codex_home == codex_home,
+                        )
+                        .values(
+                            codex_cleanup_pending=True,
+                            codex_cleanup_error=message,
+                        )
+                    )
+                    await db.commit()
+                logger.error(
+                    "Codex Monitor terminal cleanup remains pending: "
+                    "session=%s thread=%s home=%s",
+                    monitor_session_id,
+                    thread_id,
+                    codex_home,
+                    exc_info=(
+                        type(cleanup_error),
+                        cleanup_error,
+                        cleanup_error.__traceback__,
+                    ),
+                )
+                return False
+
+            async with self.db_factory() as db:
+                cleared = await db.execute(
+                    update(MonitorSession)
+                    .where(
+                        MonitorSession.id == monitor_session_id,
+                        MonitorSession.status != "running",
+                        MonitorSession.codex_thread_id == thread_id,
+                        MonitorSession.codex_home == codex_home,
+                    )
+                    .values(
+                        codex_thread_id=None,
+                        codex_home=None,
+                        codex_account_id=None,
+                        codex_cleanup_pending=False,
+                        codex_cleanup_error=None,
+                        active_turn_generation=None,
+                        turn_started_at=None,
+                    )
+                )
+                await db.commit()
+            if cleared.rowcount:
+                logger.info(
+                    "Codex Monitor thread deleted: session=%s thread=%s "
+                    "home=%s",
+                    monitor_session_id,
+                    thread_id,
+                    codex_home,
+                )
+                return True
+            return False
+
+    async def _fail_codex_monitor_runtime_recycle(
+        self,
+        monitor_session_id: int,
+        generation: int,
+        error: BaseException,
+    ) -> bool:
+        """Terminalize a Monitor that cannot safely refresh its MCP runtime."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        message = (
+            "Codex Monitor MCP runtime recycle failed: "
+            f"{error}"
+        )[:2000]
+        now = datetime.utcnow()
+        task_id: int | None = None
+        async with self.db_factory() as db:
+            failed = await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.remote_id.is_(None),
+                    MonitorSession.provider == "codex",
+                    MonitorSession.status == "running",
+                    MonitorSession.turn_generation == generation,
+                    MonitorSession.active_turn_generation.is_(None),
+                )
+                .values(
+                    status="failed",
+                    completed_at=now,
+                    next_check_at=None,
+                    turn_started_at=None,
+                    last_error=message,
+                    codex_cleanup_pending=True,
+                )
+            )
+            if failed.rowcount:
+                task_id = await db.scalar(
+                    select(MonitorSession.task_id).where(
+                        MonitorSession.id == monitor_session_id
+                    )
+                )
+            await db.commit()
+        if task_id is not None:
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {
+                    "event": "monitor_session_status",
+                    "monitor_session_id": monitor_session_id,
+                    "status": "failed",
+                },
+            )
+        return bool(failed.rowcount)
+
+    async def _recycle_codex_monitor_thread_runtime(
+        self,
+        monitor_session_id: int,
+        generation: int,
+    ) -> bool:
+        """Unload one idle Monitor thread so its next MCP generation is fresh."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        cleanup_locks = getattr(self, "_monitor_cleanup_locks", None)
+        if cleanup_locks is None:
+            cleanup_locks = {}
+            self._monitor_cleanup_locks = cleanup_locks
+        lock = cleanup_locks.setdefault(
+            monitor_session_id,
+            asyncio.Lock(),
+        )
+        async with lock:
+            async with self.db_factory() as db:
+                session = await db.get(MonitorSession, monitor_session_id)
+                if session is None or session.status != "running":
+                    return False
+                if (
+                    session.agent_type != "monitor"
+                    or session.source != "ccm"
+                    or session.remote_id is not None
+                    or (session.provider or "claude").lower() != "codex"
+                    or session.turn_generation != generation
+                    or session.active_turn_generation is not None
+                ):
+                    raise RuntimeError(
+                        "Codex Monitor runtime recycle lost its exact idle "
+                        "generation"
+                    )
+                thread_id = session.codex_thread_id
+                codex_home = session.codex_home
+                if bool(thread_id) != bool(codex_home):
+                    raise RuntimeError(
+                        "Codex Monitor runtime identity is incomplete before "
+                        "MCP recycle"
+                    )
+                if not thread_id:
+                    # A launch that failed before thread/start has no runtime
+                    # to recycle; the next generation may safely try afresh.
+                    return False
+
+            async with self.instance_manager.codex_home_app_server_guard(
+                codex_home
+            ) as admitted_home:
+                registry = (
+                    self.instance_manager
+                    ._ensure_codex_app_server_registry()
+                )
+                await registry.recycle_thread_runtime(
+                    admitted_home,
+                    thread_id,
+                )
+
+            logger.info(
+                "Codex Monitor thread runtime recycled: session=%s "
+                "generation=%s thread=%s home=%s",
+                monitor_session_id,
+                generation,
+                thread_id,
+                codex_home,
+            )
+            return True
+
+    async def _recover_codex_monitor_cleanups(self) -> None:
+        """Fail closed on corrupt identities and retry terminal cleanup."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        cleanup_ids: list[int] = []
+        now = datetime.utcnow()
+        async with self.db_factory() as db:
+            result = await db.execute(
+                select(MonitorSession).where(
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.remote_id.is_(None),
+                    MonitorSession.provider == "codex",
+                )
+            )
+            sessions = list(result.scalars().all())
+            for session in sessions:
+                has_thread = bool(session.codex_thread_id)
+                has_home = bool(session.codex_home)
+                if has_thread != has_home:
+                    error = (
+                        "Codex Monitor runtime identity is incomplete after "
+                        "service restart"
+                    )
+                    if session.status == "running":
+                        session.status = "failed"
+                        session.completed_at = now
+                        session.next_check_at = None
+                        session.active_turn_generation = None
+                        session.turn_started_at = None
+                        session.last_error = error
+                    session.codex_cleanup_pending = True
+                    session.codex_cleanup_error = error
+                    continue
+                if session.status != "running":
+                    if has_thread:
+                        cleanup_ids.append(session.id)
+                    elif (
+                        session.codex_cleanup_pending
+                        or session.codex_cleanup_error is not None
+                    ):
+                        session.codex_cleanup_pending = False
+                        session.codex_cleanup_error = None
+            await db.commit()
+
+        for session_id in cleanup_ids:
+            try:
+                await self._cleanup_codex_monitor_thread(session_id)
+            except Exception:
+                # Per-row cleanup state is durable. One unavailable account must
+                # not prevent unrelated Monitor schedulers from recovering.
+                logger.exception(
+                    "Codex Monitor startup cleanup failed: session=%s",
+                    session_id,
+                )
+
+    async def _recover_monitor_sessions(self) -> None:
+        """Rehydrate every durable local CCM Monitor after startup cleanup."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        async with self.db_factory() as db:
+            result = await db.execute(
+                select(MonitorSession).where(
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.status == "running",
+                    MonitorSession.remote_id.is_(None),
+                    MonitorSession.active_turn_generation.is_(None),
+                )
+            )
+            sessions = list(result.scalars().all())
+        for session in sessions:
+            self.start_monitor_session(session)
+
     def start_monitor_session(self, monitor_session):
+        """Start one durable scheduler, idempotently, for a Monitor row."""
+
         if getattr(self, "_shutting_down", False):
             raise RuntimeError(
                 "GlobalDispatcher is shutting down; monitor admission is closed"
             )
+        if not hasattr(self, "_monitor_tasks"):
+            self._monitor_tasks = {}
+        existing = self._monitor_tasks.get(monitor_session.id)
+        if existing is not None and not existing.done():
+            return
         task = asyncio.create_task(
             self._monitor_session_lifecycle(monitor_session.id)
         )
         self._monitor_tasks[monitor_session.id] = task
 
-    async def _monitor_session_lifecycle(self, monitor_session_id: int):
-        """Run a persistent monitor sub-agent process.
+    @staticmethod
+    def _monitor_failure_backoff(failures: int) -> float:
+        return min(
+            MONITOR_FAILURE_BACKOFF_BASE
+            * (2 ** max(0, failures - 1)),
+            MONITOR_FAILURE_BACKOFF_MAX,
+        )
 
-        New flow: read DB → build prompt → generate MCP config → launch
-        persistent Claude subprocess → wait for process exit (up to 4h) →
-        check session status → cleanup.
+    async def _release_interrupted_monitor_turn(
+        self,
+        monitor_session_id: int,
+        generation: int,
+    ) -> None:
+        """Return an exactly reaped shutdown turn to the durable schedule."""
 
-        The sub-agent communicates via its own MCP tools (report_status,
-        mark_complete, get_context) which call back into the CCM API.
+        from backend.models.monitor_session import MonitorSession
+
+        async with self.db_factory() as db:
+            await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation == generation,
+                )
+                .values(
+                    active_turn_generation=None,
+                    turn_started_at=None,
+                    next_check_at=datetime.utcnow(),
+                )
+            )
+            await db.commit()
+
+    async def _mark_monitor_turn_uncertain(
+        self,
+        monitor_session_id: int,
+        generation: int,
+        error: str,
+    ) -> None:
+        """Fail closed when an exact process group cannot be proven dead."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        completed_at = datetime.utcnow()
+        task_id: int | None = None
+        async with self.db_factory() as db:
+            row = await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation == generation,
+                )
+                .values(
+                    status="failed",
+                    completed_at=completed_at,
+                    next_check_at=None,
+                    last_error=error[:2000],
+                )
+            )
+            if row.rowcount:
+                task_id = await db.scalar(
+                    select(MonitorSession.task_id).where(
+                        MonitorSession.id == monitor_session_id
+                    )
+                )
+            await db.commit()
+        if task_id is not None:
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {
+                    "event": "monitor_session_status",
+                    "monitor_session_id": monitor_session_id,
+                    "status": "failed",
+                },
+            )
+
+    async def _record_monitor_turn_failure(
+        self,
+        monitor_session_id: int,
+        generation: int,
+        error: str,
+    ) -> None:
+        """Release one failed turn with bounded backoff or a terminal state."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        terminal = False
+        task_id: int | None = None
+        async with self.db_factory() as db:
+            state = (
+                await db.execute(
+                    select(
+                        MonitorSession.task_id,
+                        MonitorSession.consecutive_failures,
+                    ).where(
+                        MonitorSession.id == monitor_session_id,
+                        MonitorSession.agent_type == "monitor",
+                        MonitorSession.source == "ccm",
+                        MonitorSession.status == "running",
+                        MonitorSession.active_turn_generation == generation,
+                    )
+                )
+            ).one_or_none()
+            if state is None:
+                await db.rollback()
+                return
+            task_id, previous_failures = state
+            failures = previous_failures + 1
+            terminal = (
+                failures >= MONITOR_MAX_CONSECUTIVE_FAILURES
+            )
+            now = datetime.utcnow()
+            values = {
+                "active_turn_generation": None,
+                "turn_started_at": None,
+                "consecutive_failures": failures,
+                "last_error": error[:2000],
+                "next_check_at": (
+                    None
+                    if terminal
+                    else now
+                    + timedelta(
+                        seconds=self._monitor_failure_backoff(failures)
+                    )
+                ),
+            }
+            if terminal:
+                values.update(
+                    status="failed",
+                    completed_at=now,
+                )
+            advanced = await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation == generation,
+                )
+                .values(**values)
+            )
+            await db.commit()
+            if not advanced.rowcount:
+                return
+        if terminal and task_id is not None:
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {
+                    "event": "monitor_session_status",
+                    "monitor_session_id": monitor_session_id,
+                    "status": "failed",
+                },
+            )
+
+    async def _claim_due_monitor_turn(
+        self,
+        monitor_session_id: int,
+    ) -> dict[str, object] | None:
+        """Wait until due, then atomically claim one scheduled generation."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        while True:
+            now = datetime.utcnow()
+            async with self.db_factory() as db:
+                ms = await db.get(MonitorSession, monitor_session_id)
+                if (
+                    ms is None
+                    or ms.agent_type != "monitor"
+                    or ms.source != "ccm"
+                    or ms.status != "running"
+                    or ms.remote_id is not None
+                ):
+                    return None
+                if ms.active_turn_generation is not None:
+                    # Another scheduler owns the durable generation. This
+                    # lifecycle must not wait beside it and later duplicate it.
+                    return None
+                due_at = ms.next_check_at or now
+                delay = max(0.0, (due_at - now).total_seconds())
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
+            claimed_at = datetime.utcnow()
+            async with self.db_factory() as db:
+                next_generation = MonitorSession.turn_generation + 1
+                claimed = await db.execute(
+                    update(MonitorSession)
+                    .where(
+                        MonitorSession.id == monitor_session_id,
+                        MonitorSession.agent_type == "monitor",
+                        MonitorSession.source == "ccm",
+                        MonitorSession.status == "running",
+                        MonitorSession.remote_id.is_(None),
+                        MonitorSession.active_turn_generation.is_(None),
+                        or_(
+                            MonitorSession.next_check_at.is_(None),
+                            MonitorSession.next_check_at <= claimed_at,
+                        ),
+                    )
+                    # MySQL evaluates assignments left-to-right. Store the
+                    # old-generation + 1 expression before updating its source.
+                    .ordered_values(
+                        (
+                            MonitorSession.active_turn_generation,
+                            next_generation,
+                        ),
+                        (
+                            MonitorSession.turn_started_at,
+                            claimed_at,
+                        ),
+                        (
+                            MonitorSession.next_check_at,
+                            None,
+                        ),
+                        (
+                            MonitorSession.turn_generation,
+                            next_generation,
+                        ),
+                    )
+                )
+                if not claimed.rowcount:
+                    await db.rollback()
+                    await asyncio.sleep(0)
+                    continue
+                db.expire_all()
+                ms = await db.get(MonitorSession, monitor_session_id)
+                if ms is None or ms.active_turn_generation is None:
+                    await db.rollback()
+                    return None
+                task = await db.get(Task, ms.task_id)
+                if task is None:
+                    ms.status = "failed"
+                    ms.completed_at = datetime.utcnow()
+                    ms.next_check_at = None
+                    ms.active_turn_generation = None
+                    ms.turn_started_at = None
+                    ms.last_error = "Monitor parent task no longer exists"
+                    await db.commit()
+                    return None
+                task_provider = (task.provider or "claude").lower()
+                monitor_provider = (ms.provider or "claude").lower()
+                if task_provider != monitor_provider:
+                    ms.status = "failed"
+                    ms.completed_at = datetime.utcnow()
+                    ms.next_check_at = None
+                    ms.active_turn_generation = None
+                    ms.turn_started_at = None
+                    ms.last_error = (
+                        "Monitor provider no longer matches its parent task"
+                    )
+                    await db.commit()
+                    return None
+                task_cwd = (
+                    task.last_cwd
+                    or task.target_repo
+                    or os.getcwd()
+                )
+                codex_model: str | None = None
+                codex_effort: str | None = None
+                codex_service_tier: str | None = None
+                if monitor_provider == "codex":
+                    from backend.services.codex_models import (
+                        clamp_codex_effort,
+                        validate_codex_service_tier,
+                    )
+
+                    if bool(ms.codex_thread_id) != bool(ms.codex_home):
+                        error = (
+                            "Codex Monitor runtime identity is incomplete; "
+                            "refusing to guess a thread owner"
+                        )
+                        ms.status = "failed"
+                        ms.completed_at = datetime.utcnow()
+                        ms.next_check_at = None
+                        ms.active_turn_generation = None
+                        ms.turn_started_at = None
+                        ms.last_error = error
+                        ms.codex_cleanup_pending = True
+                        ms.codex_cleanup_error = error
+                        await db.commit()
+                        return None
+
+                    codex_model = (
+                        ms.model
+                        or task.model
+                        or settings.default_codex_model
+                    )
+                    codex_effort = (
+                        ms.codex_effort_level
+                        if ms.codex_effort_level is not None
+                        else clamp_codex_effort(
+                            codex_model,
+                            task.effort_level or settings.default_effort,
+                        )
+                    )
+                    requested_service_tier = (
+                        ms.codex_service_tier
+                        if ms.codex_service_tier is not None
+                        else task.codex_service_tier
+                    )
+                    try:
+                        # Revalidate an already-frozen tuple as well. A model
+                        # catalog/code upgrade can make an older Fast
+                        # combination unsupported; leaving the row "running"
+                        # after the claim coroutine exits would be neither
+                        # resumable nor visibly failed.
+                        codex_service_tier = validate_codex_service_tier(
+                            "codex",
+                            codex_model,
+                            requested_service_tier,
+                        )
+                    except ValueError as exc:
+                        error = (
+                            "Codex Monitor frozen runtime configuration is "
+                            f"invalid: {exc}"
+                        )
+                        ms.status = "failed"
+                        ms.completed_at = datetime.utcnow()
+                        ms.next_check_at = None
+                        ms.active_turn_generation = None
+                        ms.turn_started_at = None
+                        ms.last_error = error
+                        await db.commit()
+                        return None
+                    task_cwd = ms.codex_cwd or task_cwd
+                    # Freeze the effective runtime tuple before the first RPC.
+                    # Later parent Task edits cannot silently move an existing
+                    # Monitor thread to a different model/tier/directory.
+                    ms.model = codex_model
+                    ms.codex_effort_level = codex_effort
+                    ms.codex_service_tier = codex_service_tier
+                    ms.codex_cwd = task_cwd
+                    ms.codex_disable_project_config = True
+                snapshot = {
+                    "task_id": ms.task_id,
+                    "generation": ms.active_turn_generation,
+                    "provider": monitor_provider,
+                    "description": ms.description,
+                    "context": ms.monitor_context,
+                    "interval": ms.interval,
+                    "model": (
+                        codex_model
+                        if monitor_provider == "codex"
+                        else ms.model
+                    ),
+                    "cwd": task_cwd,
+                    "codex_effort_level": codex_effort,
+                    "codex_service_tier": codex_service_tier,
+                    "codex_thread_id": ms.codex_thread_id,
+                    "codex_home": ms.codex_home,
+                    "codex_account_id": ms.codex_account_id,
+                    "codex_disable_project_config": bool(
+                        ms.codex_disable_project_config
+                    ),
+                    "parent_codex_account_id": (
+                        task.metadata_ or {}
+                    ).get("codex_account_id"),
+                    "task_routing": (
+                        task.provider,
+                        task.model,
+                        task.codex_service_tier,
+                    ),
+                }
+                commit, cancellation = await _settle_despite_cancellation(
+                    db.commit()
+                )
+                commit.result()
+            if cancellation is not None:
+                cleanup, _ = await _settle_despite_cancellation(
+                    self._release_interrupted_monitor_turn(
+                        monitor_session_id,
+                        int(snapshot["generation"]),
+                    )
+                )
+                cleanup.result()
+                raise cancellation
+            return snapshot
+
+    def _resolve_codex_monitor_home(
+        self,
+        snapshot: dict[str, object],
+    ) -> tuple[str | None, str | None]:
+        """Resolve a frozen Monitor route without rotating an existing thread."""
+
+        persisted_thread = snapshot.get("codex_thread_id")
+        persisted_home = snapshot.get("codex_home")
+        persisted_account = snapshot.get("codex_account_id")
+        if bool(persisted_thread) != bool(persisted_home):
+            raise RuntimeError(
+                "Codex Monitor runtime identity is incomplete; refusing to "
+                "guess its thread owner"
+            )
+
+        model = str(snapshot["model"])
+        tier = str(snapshot["codex_service_tier"] or "default")
+        pool = self.codex_pool
+        if not (pool and pool.enabled):
+            if persisted_account is not None:
+                raise RuntimeError(
+                    "Codex Monitor persisted account cannot be validated "
+                    "because the Codex pool is unavailable"
+                )
+            return (
+                None if persisted_home is None else str(persisted_home),
+                None if persisted_account is None else str(persisted_account),
+            )
+
+        if persisted_home is not None:
+            home = pool.canonical_home(str(persisted_home))
+            if persisted_account is not None:
+                account_home = pool.home_for_account(str(persisted_account))
+                if (
+                    account_home is None
+                    or pool.canonical_home(account_home) != home
+                ):
+                    raise RuntimeError(
+                        "Codex Monitor persisted account does not own its "
+                        "persisted CODEX_HOME"
+                    )
+            if (
+                not pool.is_home_available(home)
+                or not pool.supports_model_for_home(
+                    home,
+                    model,
+                    service_tier=tier,
+                )
+            ):
+                raise RuntimeError(
+                    "Codex Monitor's persisted account is unavailable or no "
+                    f"longer supports model {model!r} / tier {tier!r}; "
+                    "automatic thread rotation is not permitted"
+                )
+            return home, (
+                str(persisted_account)
+                if persisted_account is not None
+                else pool.account_id_for_home(home)
+            )
+
+        parent_account = snapshot.get("parent_codex_account_id")
+        candidate = (
+            pool.home_for_account(str(parent_account))
+            if parent_account
+            else None
+        )
+        if candidate is not None:
+            candidate = pool.canonical_home(candidate)
+            if (
+                not pool.is_home_available(candidate)
+                or not pool.supports_model_for_home(
+                    candidate,
+                    model,
+                    service_tier=tier,
+                )
+            ):
+                candidate = None
+        home = candidate or pool.select(
+            model=model,
+            service_tier=tier,
+        )
+        if not home:
+            raise RuntimeError(
+                "No available Codex account supports Monitor model "
+                f"{model!r} with service tier {tier!r}"
+            )
+        home = pool.canonical_home(home)
+        return home, pool.account_id_for_home(home)
+
+    def _revalidate_codex_monitor_route(
+        self,
+        *,
+        admitted_home: str,
+        account_id: str | None,
+        model: str,
+        service_tier: str,
+    ) -> None:
+        """Recheck a preselected pool route while its home fence is held.
+
+        Native account retirement has no Store credential lease. It can win
+        after selection but before ``codex_home_app_server_guard``. Once this
+        callback runs, retirement either still holds maintenance (so the guard
+        cannot have admitted us) or its pool tombstone is visible and must
+        reject the stale selection before thread/start creates a rollout.
         """
+
+        pool = self.codex_pool
+        if account_id is None:
+            # The unpooled default CODEX_HOME has no removable pool identity.
+            return
+        if pool is None:
+            raise RuntimeError(
+                "Codex Monitor selected account cannot be validated because "
+                "the Codex pool is unavailable"
+            )
+        canonical_home = pool.canonical_home(admitted_home)
+        account_home = pool.home_for_account(account_id)
+        if (
+            not pool.enabled
+            or account_home is None
+            or pool.canonical_home(account_home) != canonical_home
+            or not pool.is_home_available(canonical_home)
+            or not pool.supports_model_for_home(
+                canonical_home,
+                model,
+                service_tier=service_tier,
+            )
+        ):
+            raise RuntimeError(
+                "Codex Monitor selected account became unavailable or changed "
+                "before native thread admission"
+            )
+
+    async def _launch_codex_monitor_turn(
+        self,
+        monitor_session_id: int,
+        snapshot: dict[str, object],
+        *,
+        prompt: str,
+    ) -> _MonitorTurnHandle:
+        """Start/resume one read-only Codex Monitor under a DB write barrier."""
+
         from backend.models.monitor_session import MonitorSession
         from backend.services.mcp_config import (
+            build_monitor_agent_mcp_server_specs,
+        )
+        from backend.services.worker_proxy import get_task_operation_lock
+
+        generation = int(snapshot["generation"])
+        task_id = int(snapshot["task_id"])
+        model = str(snapshot["model"])
+        effort = snapshot.get("codex_effort_level")
+        tier = str(snapshot["codex_service_tier"] or "default")
+        persisted_thread = snapshot.get("codex_thread_id")
+        persisted_home = snapshot.get("codex_home")
+        codex_home, account_id = self._resolve_codex_monitor_home(snapshot)
+        expected_provider, expected_model, expected_tier = snapshot[
+            "task_routing"
+        ]
+        process = None
+        handle: _MonitorTurnHandle | None = None
+
+        async def launch_admitted_turn(
+            admitted_home: str,
+        ) -> _MonitorTurnHandle:
+            nonlocal process, handle
+            registry = (
+                self.instance_manager._ensure_codex_app_server_registry()
+            )
+
+            async def guard_current_generation(
+                db,
+                *,
+                thread_id: str | None,
+                home: str | None,
+            ) -> None:
+                """Lock Task -> Monitor for one exact launch generation."""
+
+                task_guard = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
+                        (
+                            Task.provider.is_(None)
+                            if expected_provider is None
+                            else Task.provider == expected_provider
+                        ),
+                        (
+                            Task.model.is_(None)
+                            if expected_model is None
+                            else Task.model == expected_model
+                        ),
+                        Task.codex_service_tier == expected_tier,
+                        task_retry_not_superseded_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                monitor_guard = await db.execute(
+                    update(MonitorSession)
+                    .where(
+                        MonitorSession.id == monitor_session_id,
+                        MonitorSession.task_id == task_id,
+                        MonitorSession.agent_type == "monitor",
+                        MonitorSession.source == "ccm",
+                        MonitorSession.status == "running",
+                        MonitorSession.remote_id.is_(None),
+                        MonitorSession.provider == "codex",
+                        MonitorSession.active_turn_generation == generation,
+                        (
+                            MonitorSession.codex_thread_id.is_(None)
+                            if thread_id is None
+                            else MonitorSession.codex_thread_id == thread_id
+                        ),
+                        (
+                            MonitorSession.codex_home.is_(None)
+                            if home is None
+                            else MonitorSession.codex_home == home
+                        ),
+                    )
+                    .values(status=MonitorSession.status)
+                )
+                current_task = await db.get(
+                    Task,
+                    task_id,
+                    populate_existing=True,
+                )
+                if (
+                    task_guard.rowcount != 1
+                    or monitor_guard.rowcount != 1
+                    or current_task is None
+                    or has_pending_worker_routing(current_task)
+                ):
+                    await db.rollback()
+                    raise RuntimeError(
+                        "Codex Monitor launch admission changed or Task "
+                        "routing synchronization is pending"
+                    )
+
+            async with self.db_factory() as db:
+                await guard_current_generation(
+                    db,
+                    thread_id=(
+                        None
+                        if persisted_thread is None
+                        else str(persisted_thread)
+                    ),
+                    home=(
+                        None
+                        if persisted_home is None
+                        else str(persisted_home)
+                    ),
+                )
+
+                async def bind_started_thread(thread_id: str) -> None:
+                    """Durably bind thread/start before turn/start admission."""
+
+                    nonlocal handle
+                    if (
+                        persisted_thread is not None
+                        and thread_id != str(persisted_thread)
+                    ):
+                        raise RuntimeError(
+                            "Codex thread/resume returned a different Monitor "
+                            "thread identity"
+                        )
+                    handle = _MonitorTurnHandle(
+                        session_id=monitor_session_id,
+                        generation=generation,
+                        provider="codex",
+                        process=None,
+                        codex_home=admitted_home,
+                        codex_thread_id=thread_id,
+                        codex_account_id=account_id,
+                        codex_created_thread=persisted_thread is None,
+                        codex_identity_committed=(
+                            persisted_thread is not None
+                        ),
+                    )
+                    # Publish even the pre-turn identity synchronously. If its
+                    # DB commit fails, this is the only exact evidence needed
+                    # to compensate the newly created rollout.
+                    self._monitor_turn_handles[monitor_session_id] = handle
+
+                    bound = await db.execute(
+                        update(MonitorSession)
+                        .where(
+                            MonitorSession.id == monitor_session_id,
+                            MonitorSession.task_id == task_id,
+                            MonitorSession.agent_type == "monitor",
+                            MonitorSession.source == "ccm",
+                            MonitorSession.status == "running",
+                            MonitorSession.remote_id.is_(None),
+                            MonitorSession.provider == "codex",
+                            MonitorSession.active_turn_generation == generation,
+                            (
+                                MonitorSession.codex_thread_id.is_(None)
+                                if persisted_thread is None
+                                else MonitorSession.codex_thread_id
+                                == str(persisted_thread)
+                            ),
+                            (
+                                MonitorSession.codex_home.is_(None)
+                                if persisted_home is None
+                                else MonitorSession.codex_home
+                                == str(persisted_home)
+                            ),
+                        )
+                        .values(
+                            codex_thread_id=thread_id,
+                            codex_home=admitted_home,
+                            codex_account_id=account_id,
+                            codex_cleanup_pending=False,
+                            codex_cleanup_error=None,
+                        )
+                    )
+                    if bound.rowcount != 1:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Codex Monitor lost its generation before runtime "
+                            "identity could be persisted"
+                        )
+                    commit, cancellation = await _settle_despite_cancellation(
+                        db.commit()
+                    )
+                    commit.result()
+                    handle.codex_identity_committed = True
+                    if cancellation is not None:
+                        raise cancellation
+
+                    # Re-establish the Task -> Monitor write barrier after the
+                    # identity commit. It remains held while turn/start is on
+                    # the wire, so terminalization and an immediate callback
+                    # cannot race ahead of adapter publication.
+                    await guard_current_generation(
+                        db,
+                        thread_id=thread_id,
+                        home=admitted_home,
+                    )
+
+                async def publish_prepared_turn(
+                    prepared_process: object,
+                    thread_id: str,
+                ) -> None:
+                    nonlocal process
+                    if (
+                        handle is None
+                        or not handle.codex_identity_committed
+                        or handle.codex_thread_id != thread_id
+                        or self._monitor_turn_handles.get(
+                            monitor_session_id
+                        )
+                        is not handle
+                    ):
+                        raise RuntimeError(
+                            "Codex Monitor turn reached admission without a "
+                            "durable exact owner"
+                        )
+                    process = prepared_process
+                    handle.process = prepared_process
+
+                returned_process, thread_id = await registry.start_turn(
+                    codex_home=admitted_home,
+                    prompt=prompt,
+                    cwd=str(snapshot["cwd"]),
+                    model=model,
+                    effort=(None if effort is None else str(effort)),
+                    codex_service_tier=tier,
+                    resume_session_id=(
+                        None
+                        if persisted_thread is None
+                        else str(persisted_thread)
+                    ),
+                    git_env=None,
+                    task_id=task_id,
+                    mcp_specs=build_monitor_agent_mcp_server_specs(
+                        monitor_session_id,
+                        task_id,
+                        turn_generation=generation,
+                    ),
+                    disable_project_config=True,
+                    sandbox_mode="read-only",
+                    disable_autonomous_features=True,
+                    on_thread_started=bind_started_thread,
+                    on_turn_prepared=publish_prepared_turn,
+                )
+                if (
+                    handle is None
+                    or process is None
+                    or returned_process is not process
+                    or handle.process is not returned_process
+                    or handle.codex_thread_id != thread_id
+                ):
+                    raise RuntimeError(
+                        "Codex app-server did not publish the prepared Monitor "
+                        "turn through its ownership barrier"
+                    )
+
+                commit, cancellation = await _settle_despite_cancellation(
+                    db.commit()
+                )
+                commit.result()
+            if cancellation is not None:
+                raise cancellation
+            assert handle is not None
+            return handle
+
+        try:
+            async with get_task_operation_lock(task_id):
+                async with (
+                    self.instance_manager._cloudrouter_runtime_admission(
+                        "codex",
+                        codex_home,
+                        model,
+                        service_tier=tier,
+                    )
+                ):
+                    async with (
+                        self.instance_manager.codex_home_app_server_guard(
+                            codex_home
+                        )
+                    ) as admitted_home:
+                        self._revalidate_codex_monitor_route(
+                            admitted_home=admitted_home,
+                            account_id=account_id,
+                            model=model,
+                            service_tier=tier,
+                        )
+                        handle = await launch_admitted_turn(admitted_home)
+        except BaseException:
+            if handle is not None:
+                try:
+                    cleanup, _ = await _settle_despite_cancellation(
+                        self._finalize_codex_monitor_turn(
+                            handle,
+                            reason=(
+                                "Codex Monitor launch admission did not commit "
+                                "or its owner was cancelled"
+                            ),
+                        )
+                    )
+                    cleanup.result()
+                    if (
+                        handle.codex_created_thread
+                        and not handle.codex_identity_committed
+                    ):
+                        if (
+                            handle.process is not None
+                            and getattr(
+                                handle.process,
+                                "returncode",
+                                None,
+                            )
+                            is None
+                        ):
+                            raise RuntimeError(
+                                "Uncommitted Codex Monitor turn is still live"
+                            )
+                        registry = (
+                            self.instance_manager
+                            ._ensure_codex_app_server_registry()
+                        )
+                        try:
+                            await registry.delete_thread(
+                                handle.codex_home,
+                                str(handle.codex_thread_id),
+                            )
+                        except Exception as delete_exc:
+                            if not self._codex_thread_already_absent(
+                                delete_exc
+                            ):
+                                raise
+                        if (
+                            self._monitor_turn_handles.get(
+                                monitor_session_id
+                            )
+                            is handle
+                        ):
+                            self._monitor_turn_handles.pop(
+                                monitor_session_id,
+                                None,
+                            )
+                except BaseException as cleanup_exc:
+                    # Retain exact in-memory evidence. Terminal DB cleanup can
+                    # also recover it if the identity commit actually won.
+                    self._monitor_turn_handles[
+                        monitor_session_id
+                    ] = handle
+                    if (
+                        handle.codex_created_thread
+                        and not handle.codex_identity_committed
+                    ):
+                        try:
+                            persistence, _ = (
+                                await _settle_despite_cancellation(
+                                    self
+                                    ._persist_uncommitted_codex_monitor_cleanup(
+                                        handle,
+                                        cleanup_exc,
+                                    )
+                                )
+                            )
+                            if (
+                                persistence.result()
+                                and (
+                                    handle.process is None
+                                    or getattr(
+                                        handle.process,
+                                        "returncode",
+                                        None,
+                                    )
+                                    is not None
+                                )
+                                and self._monitor_turn_handles.get(
+                                    monitor_session_id
+                                )
+                                is handle
+                            ):
+                                self._monitor_turn_handles.pop(
+                                    monitor_session_id,
+                                    None,
+                                )
+                        except BaseException:
+                            logger.exception(
+                                "Could not persist uncommitted Codex Monitor "
+                                "cleanup evidence: session=%s thread=%s",
+                                monitor_session_id,
+                                handle.codex_thread_id,
+                            )
+                    logger.exception(
+                        "Failed to clean up uncommitted Codex Monitor turn: "
+                        "session=%s thread=%s home=%s",
+                        monitor_session_id,
+                        handle.codex_thread_id,
+                        handle.codex_home,
+                    )
+            raise
+
+        if codex_home and self.codex_pool:
+            self.codex_pool.record_routed_account(codex_home)
+        logger.info(
+            "Codex Monitor turn launched: session=%s generation=%s "
+            "thread=%s home=%s",
+            monitor_session_id,
+            generation,
+            handle.codex_thread_id,
+            handle.codex_home,
+        )
+        return handle
+
+    async def _launch_scheduled_monitor_turn(
+        self,
+        monitor_session_id: int,
+        snapshot: dict[str, object],
+    ) -> _MonitorTurnHandle:
+        """Launch one Monitor turn with provider-specific ownership semantics."""
+
+        from backend.services.mcp_config import (
             generate_monitor_agent_mcp_config,
+        )
+
+        provider = str(snapshot["provider"])
+        generation = int(snapshot["generation"])
+        task_id = int(snapshot["task_id"])
+        prompt = self._build_monitor_agent_prompt(
+            description=str(snapshot["description"]),
+            context=(
+                None
+                if snapshot["context"] is None
+                else str(snapshot["context"])
+            ),
+            interval=int(snapshot["interval"]),
+        )
+        if provider == "codex":
+            return await self._launch_codex_monitor_turn(
+                monitor_session_id,
+                snapshot,
+                prompt=prompt,
+            )
+        if provider != "claude":
+            raise RuntimeError(
+                f"Scheduled Monitor provider {provider!r} is not supported"
+            )
+
+        mcp_config_path = generate_monitor_agent_mcp_config(
+            monitor_session_id=monitor_session_id,
+            task_id=task_id,
+            turn_generation=generation,
+        )
+        process = await self._launch_monitor_agent(
+            prompt=prompt,
+            cwd=str(snapshot["cwd"]),
+            model=(
+                None
+                if snapshot["model"] is None
+                else str(snapshot["model"])
+            ),
+            monitor_session_id=monitor_session_id,
+            mcp_config_path=mcp_config_path,
+            interval_seconds=int(snapshot["interval"]),
+        )
+        handle = _MonitorTurnHandle(
+            session_id=monitor_session_id,
+            generation=generation,
+            provider="claude",
+            process=process,
+            config_path=mcp_config_path,
+        )
+        self._monitor_turn_handles[monitor_session_id] = handle
+        return handle
+
+    async def _execute_scheduled_monitor_turn(
+        self,
+        monitor_session_id: int,
+        snapshot: dict[str, object],
+    ) -> None:
+        """Run, reap, and reconcile exactly one claimed Monitor turn."""
+
+        from backend.models.monitor_session import MonitorSession
+        from backend.services.mcp_config import (
             cleanup_monitor_agent_mcp_config,
         )
 
-        task_id: int | None = None
-        proc: asyncio.subprocess.Process | None = None
+        generation = int(snapshot["generation"])
+        handle: _MonitorTurnHandle | None = None
+        turn_error: str | None = None
+        cancellation: asyncio.CancelledError | None = None
+        handles = getattr(self, "_monitor_turn_handles", None)
+        if handles is None:
+            handles = {}
+            self._monitor_turn_handles = handles
+        active_turns = getattr(self, "_monitor_active_turns", None)
+        if active_turns is None:
+            active_turns = set()
+            self._monitor_active_turns = active_turns
+        active_turns.add(monitor_session_id)
 
         try:
-            async with self.db_factory() as db:
-                ms = await db.get(MonitorSession, monitor_session_id)
-                if not ms:
-                    return
-                task = await db.get(Task, ms.task_id)
-                if not task:
-                    return
-                task_id = ms.task_id
-                ms_description = ms.description
-                ms_context = ms.monitor_context
-                ms_interval = ms.interval
-                ms_max_checks = ms.max_checks
-                model = ms.model
-                task_cwd = task.last_cwd or task.target_repo or os.getcwd()
-
-            # Dynamic timeout: expected duration + 50% buffer, minimum 30 min
-            expected_seconds = ms_interval * ms_max_checks
-            timeout_seconds = max(expected_seconds * 1.5, 1800)
-
-            prompt = self._build_monitor_agent_prompt(
-                description=ms_description,
-                context=ms_context,
-                interval=ms_interval,
+            launched = await self._launch_scheduled_monitor_turn(
+                monitor_session_id,
+                snapshot,
             )
-
-            mcp_config_path = generate_monitor_agent_mcp_config(
-                monitor_session_id=monitor_session_id,
-                task_id=task_id,
-            )
-
-            proc = await self._launch_monitor_agent(
-                prompt=prompt,
-                cwd=task_cwd,
-                model=model,
-                monitor_session_id=monitor_session_id,
-                mcp_config_path=mcp_config_path,
-                interval_seconds=ms_interval,
-            )
-
+            if isinstance(launched, tuple):
+                # Compatibility for focused tests and older embedders that
+                # patch the provider seam. Production launchers return the
+                # provider-aware handle.
+                process, config_path = launched
+                handle = _MonitorTurnHandle(
+                    session_id=monitor_session_id,
+                    generation=generation,
+                    provider=str(snapshot["provider"]),
+                    process=process,
+                    config_path=config_path,
+                )
+                handles[monitor_session_id] = handle
+            else:
+                handle = launched
+            process = handle.process
             try:
                 await asyncio.wait_for(
-                    proc.wait(),
-                    timeout=timeout_seconds,
+                    process.wait(),
+                    timeout=MONITOR_TURN_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"Monitor session {monitor_session_id} timed out after {timeout_seconds:.0f}s, killing"
+                turn_error = (
+                    "Monitor check turn timed out after "
+                    f"{MONITOR_TURN_TIMEOUT:.0f}s"
                 )
-                await self._terminate_aux_process(proc)
-            # A successful wait proves only that the CLI parent exited.  Its
-            # dedicated group may still contain tool descendants.
-            await self._terminate_aux_process(proc)
-
-            # If session is still running after process exit, the sub-agent
-            # exited abnormally without calling mark_complete → mark failed
-            async with self.db_factory() as db:
-                ms = await db.get(MonitorSession, monitor_session_id)
-                if ms and ms.status == "running":
-                    ms.status = "failed"
-                    ms.completed_at = datetime.utcnow()
-                    await db.commit()
-                    await self.broadcaster.broadcast(
-                        f"task:{task_id}",
-                        {
-                            "event": "monitor_session_status",
-                            "monitor_session_id": monitor_session_id,
-                            "status": "failed",
-                        },
-                    )
-                    logger.warning(
-                        f"Monitor session {monitor_session_id} process exited "
-                        f"(rc={proc.returncode}) without calling mark_complete, marked failed"
-                    )
-
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(f"Monitor session {monitor_session_id} failed unexpectedly")
-            try:
-                async with self.db_factory() as db:
-                    ms = await db.get(MonitorSession, monitor_session_id)
-                    if ms and ms.status == "running":
-                        ms.status = "failed"
-                        ms.completed_at = datetime.utcnow()
-                        await db.commit()
-                        await self.broadcaster.broadcast(
-                            f"task:{ms.task_id}",
-                            {"event": "monitor_session_status", "monitor_session_id": ms.id, "status": "failed"},
-                        )
-            except Exception:
-                pass
-        finally:
-            delayed_cancellation = await self._finalize_aux_lifecycle_process(
-                session_id=monitor_session_id,
-                process=proc,
-                process_map=self._monitor_processes,
+            if turn_error is None and process.returncode not in (0, None):
+                turn_error = (
+                    "Monitor check turn exited with "
+                    f"code {process.returncode}"
+                )
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception as exc:
+            turn_error = f"Monitor check turn failed: {exc}"
+            logger.exception(
+                "Monitor session %s generation %s failed",
+                monitor_session_id,
+                generation,
             )
-            if monitor_session_id not in self._monitor_processes:
+        finally:
+            delayed_cancellation: asyncio.CancelledError | None = None
+            handle = handle or handles.get(monitor_session_id)
+            reaped = handle is None
+            if handle is not None and handle.provider == "codex":
+                process = handle.process
+                if (
+                    turn_error is not None
+                    or cancellation is not None
+                    or getattr(process, "returncode", None) is None
+                ):
+                    try:
+                        reaped = await self._finalize_codex_monitor_turn(
+                            handle,
+                            reason=(
+                                turn_error
+                                or "CCM Monitor lifecycle was cancelled"
+                            ),
+                        )
+                    except asyncio.CancelledError as exc:
+                        delayed_cancellation = exc
+                        reaped = (
+                            getattr(process, "returncode", None) is not None
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to stop Codex Monitor turn: session=%s "
+                            "generation=%s",
+                            monitor_session_id,
+                            generation,
+                        )
+                        reaped = False
+                else:
+                    reaped = (
+                        getattr(process, "returncode", None) is not None
+                    )
+                    if (
+                        reaped
+                        and handles.get(monitor_session_id) is handle
+                    ):
+                        handles.pop(monitor_session_id, None)
+            elif handle is not None:
+                delayed_cancellation = (
+                    await self._finalize_aux_lifecycle_process(
+                        session_id=monitor_session_id,
+                        process=handle.process,
+                        process_map=self._monitor_processes,
+                    )
+                )
+                reaped = (
+                    monitor_session_id not in self._monitor_processes
+                )
+                if (
+                    reaped
+                    and handles.get(monitor_session_id) is handle
+                ):
+                    handles.pop(monitor_session_id, None)
+
+            if reaped and (
+                handle is None or handle.provider == "claude"
+            ):
                 getattr(
                     self, "_monitor_config_dirs", {}
                 ).pop(monitor_session_id, None)
-            cleanup_monitor_agent_mcp_config(monitor_session_id)
-            log_fh = self._monitor_log_fhs.pop(monitor_session_id, None)
+            cleanup_monitor_agent_mcp_config(
+                monitor_session_id,
+                generation,
+            )
+            log_fh = self._monitor_log_fhs.pop(
+                monitor_session_id,
+                None,
+            )
             if log_fh:
                 try:
                     log_fh.close()
                 except Exception:
                     pass
-            if self._monitor_tasks.get(monitor_session_id) is asyncio.current_task():
-                self._monitor_tasks.pop(monitor_session_id, None)
+
+            if not reaped:
+                await self._mark_monitor_turn_uncertain(
+                    monitor_session_id,
+                    generation,
+                    (
+                        turn_error
+                        or "Monitor turn could not be proven terminal"
+                    ),
+                )
+            elif cancellation is not None or delayed_cancellation is not None:
+                await self._release_interrupted_monitor_turn(
+                    monitor_session_id,
+                    generation,
+                )
+            elif turn_error is not None:
+                await self._record_monitor_turn_failure(
+                    monitor_session_id,
+                    generation,
+                    turn_error,
+                )
+            else:
+                # A successful process exit is not a successful check unless
+                # its exact callback already consumed this generation.
+                async with self.db_factory() as db:
+                    still_active = await db.scalar(
+                        select(MonitorSession.id).where(
+                            MonitorSession.id == monitor_session_id,
+                            MonitorSession.status == "running",
+                            MonitorSession.active_turn_generation
+                            == generation,
+                        )
+                    )
+                if still_active is not None:
+                    await self._record_monitor_turn_failure(
+                        monitor_session_id,
+                        generation,
+                        (
+                            "Monitor check turn exited without calling "
+                            "report_status or mark_complete"
+                        ),
+                    )
+
+            if reaped:
+                try:
+                    if str(snapshot["provider"]) == "codex":
+                        if (
+                            cancellation is None
+                            and delayed_cancellation is None
+                        ):
+                            recycle, recycle_cancellation = (
+                                await _settle_despite_cancellation(
+                                    self
+                                    ._recycle_codex_monitor_thread_runtime(
+                                        monitor_session_id,
+                                        generation,
+                                    )
+                                )
+                            )
+                            if recycle_cancellation is not None:
+                                delayed_cancellation = recycle_cancellation
+                            try:
+                                recycle.result()
+                            except asyncio.CancelledError as exc:
+                                if delayed_cancellation is None:
+                                    delayed_cancellation = exc
+                            except Exception as exc:
+                                logger.error(
+                                    "Codex Monitor runtime recycle failed: "
+                                    "session=%s generation=%s",
+                                    monitor_session_id,
+                                    generation,
+                                    exc_info=(
+                                        type(exc),
+                                        exc,
+                                        exc.__traceback__,
+                                    ),
+                                )
+                                failure, failure_cancellation = (
+                                    await _settle_despite_cancellation(
+                                        self
+                                        ._fail_codex_monitor_runtime_recycle(
+                                            monitor_session_id,
+                                            generation,
+                                            exc,
+                                        )
+                                    )
+                                )
+                                failure.result()
+                                if (
+                                    delayed_cancellation is None
+                                    and failure_cancellation is not None
+                                ):
+                                    delayed_cancellation = (
+                                        failure_cancellation
+                                    )
+
+                        async with self.db_factory() as db:
+                            terminal_codex = await db.scalar(
+                                select(MonitorSession.id).where(
+                                    MonitorSession.id
+                                    == monitor_session_id,
+                                    MonitorSession.status != "running",
+                                    MonitorSession.provider == "codex",
+                                )
+                            )
+                        if terminal_codex is not None:
+                            await self._cleanup_codex_monitor_thread(
+                                monitor_session_id
+                            )
+                finally:
+                    active_turns.discard(monitor_session_id)
             if delayed_cancellation is not None:
-                raise delayed_cancellation
+                cancellation = delayed_cancellation
+
+        if cancellation is not None:
+            raise cancellation
+
+    async def _monitor_session_lifecycle(
+        self,
+        monitor_session_id: int,
+    ) -> None:
+        """Run recoverable, provider-neutral scheduled Monitor turns."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        try:
+            while True:
+                snapshot = await self._claim_due_monitor_turn(
+                    monitor_session_id
+                )
+                if snapshot is None:
+                    return
+                await self._execute_scheduled_monitor_turn(
+                    monitor_session_id,
+                    snapshot,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Monitor scheduler %s failed unexpectedly",
+                monitor_session_id,
+            )
+        finally:
+            if (
+                self._monitor_tasks.get(monitor_session_id)
+                is asyncio.current_task()
+            ):
+                self._monitor_tasks.pop(monitor_session_id, None)
+            # Some terminal transitions happen while claiming a generation
+            # rather than while executing one (for example, the parent Task's
+            # provider changed between checks). Claude has no durable runtime
+            # after that point, but a Codex Monitor may still own an idle
+            # native thread. Cover every scheduler exit so that exact thread
+            # cleanup does not wait for a future CCM process restart.
+            try:
+                async with self.db_factory() as db:
+                    terminal_codex = await db.scalar(
+                        select(MonitorSession.id).where(
+                            MonitorSession.id == monitor_session_id,
+                            MonitorSession.agent_type == "monitor",
+                            MonitorSession.source == "ccm",
+                            MonitorSession.remote_id.is_(None),
+                            MonitorSession.status != "running",
+                            MonitorSession.provider == "codex",
+                        )
+                    )
+                if terminal_codex is not None:
+                    await self._cleanup_codex_monitor_thread(
+                        monitor_session_id
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The exact identity and cleanup error remain durable. A
+                # transient cleanup outage must not hide the scheduler's
+                # original terminal transition.
+                logger.exception(
+                    "Codex Monitor terminal cleanup failed at scheduler exit: "
+                    "session=%s",
+                    monitor_session_id,
+                )
 
     async def _launch_monitor_agent(
         self,
@@ -7603,7 +9504,7 @@ class GlobalDispatcher:
         mcp_config_path: Path,
         interval_seconds: int = 300,
     ) -> asyncio.subprocess.Process:
-        """Launch a persistent Claude subprocess for a monitor sub-agent.
+        """Launch one short-lived Claude Monitor check turn.
 
         Stdout is written to a log file (not PIPE) to prevent buffer blocking.
         The process runs in its own session (start_new_session=True) so it can
@@ -7627,12 +9528,9 @@ class GlobalDispatcher:
                if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
         config_dir: str | None = None
 
-        # Bash 单调用超时上限默认 600s：interval 更长时，子 agent 的一次
-        # time.sleep(interval) 会被 CLI 转后台（不阻塞）→ 它转投 ScheduleWakeup
-        # 并结束回合 → -p 进程退出 → monitor 被误判 failed（2026-07-16 task 35
-        # #192/#193/#194 三连死）。按 interval 抬高上限并留检查余量；只抬不降，
-        # 环境里已有更大值时保留。
-        want_ms = (max(interval_seconds, 0) + 600) * 1000
+        # One scheduled turn performs a single check and never sleeps. Preserve
+        # a caller's larger shell limit, but do not scale it with the interval.
+        want_ms = 600_000
         try:
             have_ms = int(env.get("BASH_MAX_TIMEOUT_MS", "0"))
         except ValueError:
@@ -7689,9 +9587,9 @@ class GlobalDispatcher:
     def _build_monitor_agent_prompt(
         self, description: str, context: str | None, interval: int = 300
     ) -> str:
-        """Build the system prompt for a monitor sub-agent."""
+        """Build one read-only check turn for a scheduled Monitor."""
         parts = [
-            "你是一个自主监控 Agent，持续监控目标并在有变化时主动汇报。",
+            "你是一个只读 Monitor Agent。本回合只执行一次状态检查。",
             "",
             "## 监控目标",
             description,
@@ -7701,39 +9599,28 @@ class GlobalDispatcher:
             parts.append("## 上下文")
             parts.append(context)
         parts.append("")
-        # 等待指引必须按 interval 生成：默认 Bash timeout 只有 120s，单次
-        # sleep 又不能超过 CLI 的单调用上限（launch 时已按 interval 抬高
-        # BASH_MAX_TIMEOUT_MS），两头都要在 prompt 里写死数字，子 agent
-        # 才不会自己发明等待方式（ScheduleWakeup / 转后台 = 进程退出即死）。
-        sleep_timeout_ms = (interval + 120) * 1000
         parts.append(f"""\
 ## 你的 MCP 工具
-- report_status(summary, is_important): 报告状态。重要变化设 is_important=True
-- mark_complete(reason): 监控目标完成时调用，然后立即停止所有活动
-- get_context(): 获取最新监控配置
+- report_status / mcp__ccm_monitor_agent__report_status(summary, is_important):
+  报告状态。重要变化设 is_important=True
+- mark_complete / mcp__ccm_monitor_agent__mark_complete(reason):
+  监控目标已经结束或无需继续监控时调用
+- get_context / mcp__ccm_monitor_agent__get_context(): 获取最新监控配置
+
+Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
+必须使用对应工具，不要因为名称带前缀而声称工具不可用。
 
 ## 行为准则
-1. 用 Bash 执行 ps、tail、cat 等命令检查状态
-2. 每次检查后调用 report_status 汇报
-3. 你的检查间隔是 {interval} 秒。等待下一轮检查时，用 python 延时命令一次睡满整个间隔，
-   并且必须像下面这样显式传大 timeout（默认只有 120 秒，会截断长等待）：
-   `Bash(command="python3 -c 'import time; time.sleep({interval})'", timeout={sleep_timeout_ms})`
-   【重要】不要使用 bash 的 sleep 命令（会被系统拦截），必须用 python3 的 time.sleep。
-   【兜底】如果这个 sleep 没有阻塞等待、而是立即返回（提示转入后台/超出时限），改用
-   连续多次 `time.sleep(300)`（每次一个独立 Bash 调用，timeout=360000）累计等够
-   {interval} 秒，绝不因此改用其他等待方式。
-4. 【关键】你必须严格按以下循环执行，绝不中断：
-   检查 → report_status → python sleep → 检查 → report_status → python sleep → ...
-   每一步都是一个独立的工具调用。你的进程必须持续运行直到目标完成。
-5. 任务完成/失败/异常 → mark_complete 并说明原因，然后停止
-6. 你是只读观察者，不要修改任何文件
-7. 【禁止】不要使用内置的 Agent 工具
-8. 【禁止】不要使用 Monitor 工具、ScheduleWakeup 工具或 run_in_background —— 你是
-   一次性 claude -p 进程，回合一结束进程就退出，"到点自动唤醒"的承诺对你不成立，
-   用了必死
-9. 【禁止】不要在调用 mark_complete 之前结束你的回合（end_turn）
+1. 用 Bash 执行 ps、tail、cat 等只读命令检查一次当前状态
+2. 如果目标仍需继续监控，调用一次 report_status
+3. 如果目标已经完成、失败或不再需要监控，改为调用一次 mark_complete
+4. report_status 与 mark_complete 二选一；成功调用后立即结束本回合
+5. 你是只读观察者，严禁修改文件、启动后台任务或改变系统状态
+6. 不要 sleep，不要等待 {interval} 秒；下一轮由 CCM Scheduler 定时启动
+7. 禁止使用 Agent、Task、Monitor、ScheduleWakeup 或 run_in_background
+8. 结束本回合前必须成功调用上述两个回调之一
 
-先做一次初始状态检查并 report_status，然后用 python sleep 等待，然后继续下一轮。""")
+现在执行一次检查，完成回调后立即结束。""")
         return "\n".join(parts)
 
     # -----------------------------------------------------------------------

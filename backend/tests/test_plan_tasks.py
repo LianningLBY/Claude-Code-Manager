@@ -89,6 +89,16 @@ async def test_related_plans_are_independent_and_limited(
         json={"input": "one too many"},
     )
     assert fourth.status_code == 429
+    generic_bypass = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Bypass attempt",
+            "description": "one too many through generic create",
+            "mode": "plan",
+            "plan_target_task_id": target_id,
+        },
+    )
+    assert generic_bypass.status_code == 429
 
     history = await client.get(f"/api/tasks/{target_id}/plans")
     assert history.status_code == 200
@@ -98,6 +108,46 @@ async def test_related_plans_are_independent_and_limited(
         target = await db.get(Task, target_id)
     assert target.status == "completed"
     assert target.session_id == session_id
+
+
+@pytest.mark.asyncio
+async def test_plan_tasks_never_silently_downgrade_codex_fast(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == target_id)
+            .values(
+                provider="codex",
+                model="gpt-5.6-sol",
+                codex_service_tier="priority",
+            )
+        )
+        await db.commit()
+
+    related = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={"input": "Plan this Fast target safely"},
+    )
+    assert related.status_code == 201, related.text
+    assert related.json()["codex_service_tier"] == "default"
+
+    standalone = await client.post(
+        "/api/tasks",
+        json={
+            "title": "No hidden Fast downgrade",
+            "description": "Plan it",
+            "mode": "plan",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "priority",
+        },
+    )
+    assert standalone.status_code == 422
+    assert "Fast is not supported" in standalone.text
 
 
 @pytest.mark.asyncio
@@ -265,6 +315,114 @@ async def test_approved_plan_is_applied_only_with_selected_user_message(
     )
     assert second.status_code == 400
     assert "already been applied" in second.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_plan_application_is_restored_when_dispatcher_is_shutting_down(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    created = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={"input": "Make a shutdown-safe plan"},
+    )
+    plan_id = created.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == plan_id)
+            .values(
+                status="completed",
+                plan_content="A plan that must remain attachable",
+                plan_approved=True,
+            )
+        )
+        await db.commit()
+
+    dispatcher = MagicMock()
+    dispatcher.enqueue_message = AsyncMock(
+        side_effect=RuntimeError(
+            "Dispatcher is shutting down; message admission is closed"
+        )
+    )
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    with (
+        patch("backend.main.dispatcher", dispatcher),
+        patch("backend.main.broadcaster", broadcaster),
+    ):
+        response = await client.post(
+            f"/api/tasks/{target_id}/chat",
+            json={
+                "message": "Please implement it",
+                "plan_task_ids": [plan_id],
+            },
+        )
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+    assert plan.plan_applied_at is None
+    assert plan.plan_applied_to_session_id is None
+    assert plan.plan_applied_log_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_plan_reaps_legacy_ralph_lifecycle_first(
+    client,
+    session_factory,
+):
+    import backend.main
+
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Cancellable Plan",
+            "description": "Plan safely",
+            "target_repo": "/tmp",
+            "mode": "plan",
+        },
+    )
+    plan_id = created.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == plan_id)
+            .values(status="executing", instance_id=77)
+        )
+        await db.commit()
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "stop_plan_agent_lifecycle",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as dispatcher_stop,
+        patch.object(
+            backend.main.ralph_loop,
+            "stop_plan_agent_lifecycle",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as ralph_stop,
+        patch(
+            "backend.api.tasks._settle_task_launch_barrier",
+            new_callable=AsyncMock,
+        ),
+    ):
+        response = await client.post(f"/api/tasks/{plan_id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    dispatcher_stop.assert_awaited_once_with(plan_id, 77)
+    ralph_stop.assert_awaited_once_with(plan_id)
 
 
 @pytest.mark.asyncio

@@ -139,9 +139,9 @@ async def _create_related_plan(
         if provider == "codex"
         else settings.default_model
     )
-    codex_service_tier = (
-        target.codex_service_tier if provider == "codex" else "default"
-    )
+    # Plan Agents use isolated ephemeral/read-only exec. Fast requires the
+    # app-server proxy proof chain and must never be silently downgraded.
+    codex_service_tier = "default"
     from backend.api.tasks import _validate_task_service_tier_configuration
 
     try:

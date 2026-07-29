@@ -1547,7 +1547,21 @@ class CodexAppServer:
         disable_project_config: bool = False,
         skill_context: str = "",
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
+        sandbox_mode: str = "danger-full-access",
+        disable_autonomous_features: bool = False,
+        on_thread_started: (
+            Callable[[str], Awaitable[None]] | None
+        ) = None,
+        on_turn_prepared: (
+            Callable[[CodexTurnProcess, str], Awaitable[None]] | None
+        ) = None,
     ) -> tuple[CodexTurnProcess, str]:
+        if sandbox_mode not in {
+            "danger-full-access",
+            "workspace-write",
+            "read-only",
+        }:
+            raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
         service_tier = normalize_codex_service_tier(codex_service_tier)
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -1575,12 +1589,29 @@ class CodexAppServer:
                     f"Invalid required Codex MCP configuration: {exc}"
                 ) from exc
             raise
+        if self._actual_tier_proxy_route is not None:
+            # A thread-scoped ``features`` table can outrank the app-server's
+            # process-level ``--disable enable_request_compression`` override
+            # (observed with Codex 0.145.0).  The proof proxy must inspect the
+            # exact Responses JSON, so reinforce the setting in the same
+            # config layer used by thread/start and thread/resume.
+            _deep_merge_config(
+                thread_config,
+                {
+                    "features": {
+                        "enable_request_compression": False,
+                    },
+                },
+            )
         if disable_project_config:
             _deep_merge_config(
                 thread_config,
                 codex_untrusted_project_config(cwd),
             )
-        if service_tier == CODEX_SERVICE_TIER_PRIORITY:
+        if (
+            service_tier == CODEX_SERVICE_TIER_PRIORITY
+            or disable_autonomous_features
+        ):
             # Hidden model work must not escape the proof boundary. Native
             # child requests are still lineage-checked by the proxy, but Fast
             # disables autonomous fanout/memory as a second fail-closed layer.
@@ -1588,6 +1619,11 @@ class CodexAppServer:
                 thread_config,
                 {
                     "features": {
+                        # Monitor/other isolated auxiliary turns may only use
+                        # their explicitly injected CCM callback MCP. Do not
+                        # inherit ChatGPT Apps through the shared native home.
+                        "apps": False,
+                        "enable_mcp_apps": False,
                         "multi_agent": False,
                         # 5.6 model-catalog defaults can materialize v2 as a
                         # feature config object.  Override that exact shape;
@@ -1603,7 +1639,11 @@ class CodexAppServer:
                         "realtime_conversation": False,
                         # Remote compaction v2 uses the ordinary streaming
                         # /responses path and inherits this thread's tier.
-                        "remote_compaction_v2": True,
+                        "remote_compaction_v2": (
+                            False
+                            if disable_autonomous_features
+                            else True
+                        ),
                     },
                     "agents": {
                         "max_threads": 1,
@@ -1675,7 +1715,7 @@ class CodexAppServer:
             # through the guardian subagent, which would create hidden model
             # work outside the root turn.
             "approvalsReviewer": "user",
-            "sandbox": "danger-full-access",
+            "sandbox": sandbox_mode,
             # This field is intentionally present even for Standard.  JSON null
             # clears a sticky service tier inherited from a resumed thread.
             "serviceTier": rpc_service_tier,
@@ -1721,6 +1761,14 @@ class CodexAppServer:
                     + message
                 )
             raise CodexAppServerError(message)
+        thread_id = str(thread_id)
+        self._known_threads.add(thread_id)
+        if on_thread_started is not None:
+            # A caller that owns durable lifecycle state can bind the exact
+            # native identity before any model turn is admitted. In
+            # particular, Monitor uses this hook to survive a process crash
+            # between thread/start and turn/start without guessing a rollout.
+            await on_thread_started(thread_id)
         # A native Goal can continue after CCM has finished and detached its
         # process adapter.  Resuming such a thread may report ``active`` even
         # though Task/Instance rows look terminal.  Never send turn/start into
@@ -1778,7 +1826,6 @@ class CodexAppServer:
                     "Codex service tier cannot change while an older request "
                     f"in this native thread lineage is active: {exc}"
                 ) from exc
-        self._known_threads.add(thread_id)
         existing = self._contexts_by_thread.get(thread_id)
         if existing and existing.process.returncode is None:
             raise CodexAppServerBusyError(
@@ -1820,6 +1867,19 @@ class CodexAppServer:
         self._contexts_by_thread[thread_id] = context
         # Persist the native thread id through the same event path as exec.
         turn_process.feed({"type": "thread.started", "thread_id": thread_id})
+        if on_turn_prepared is not None:
+            try:
+                # Publish the adapter before turn/start goes on the wire. This
+                # closes the last shutdown/maintenance window in which model
+                # work could exist without an exact in-memory owner.
+                await on_turn_prepared(turn_process, thread_id)
+            except BaseException:
+                self._detach_turn_context(context)
+                turn_process.finish(
+                    1,
+                    "Codex turn ownership preparation failed",
+                )
+                raise
 
         model_prompt = prompt
         if required_context:
@@ -1844,6 +1904,22 @@ class CodexAppServer:
             # between thread admission and this turn.
             "serviceTier": rpc_service_tier,
         }
+        if sandbox_mode == "read-only":
+            # Repeat the policy at turn/start.  This is a schema-backed field
+            # and prevents a resumed thread's sticky/default settings from
+            # widening a Monitor turn after thread admission.
+            turn_params["sandboxPolicy"] = {
+                "type": "readOnly",
+                "networkAccess": False,
+            }
+        elif sandbox_mode == "workspace-write":
+            turn_params["sandboxPolicy"] = {
+                "type": "workspaceWrite",
+                "writableRoots": [os.path.abspath(cwd)],
+                "networkAccess": False,
+                "excludeTmpdirEnvVar": False,
+                "excludeSlashTmp": False,
+            }
         turn_request = asyncio.create_task(self._request("turn/start", turn_params))
         turn_cancelled = False
         while not turn_request.done():
@@ -2515,6 +2591,10 @@ class CodexAppServer:
 
         if not thread_id:
             raise ValueError("thread_id is required")
+        # Terminal cleanup is durable and may be retried after a CCM restart.
+        # Start this home's transport on demand instead of requiring an earlier
+        # turn in the current process to have populated the registry.
+        await self.ensure_started()
         if self.has_active_thread(thread_id):
             raise CodexAppServerBusyError(
                 f"Codex thread {thread_id} still has an active turn"
@@ -2548,6 +2628,49 @@ class CodexAppServer:
         if status == "notLoaded":
             self._known_threads.discard(thread_id)
         return status
+
+    async def recycle_thread_runtime(self, thread_id: str) -> None:
+        """Reload one idle thread without changing its persisted identity.
+
+        Codex keeps a resumed thread's MCP clients alive, so a later
+        ``thread/resume`` does not apply generation-specific MCP arguments.
+        Archiving unloads that runtime; unarchiving restores the same persisted
+        thread and history so the next resume creates fresh MCP clients.
+        """
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        await self.ensure_started()
+        if self.has_active_thread(thread_id):
+            raise CodexAppServerBusyError(
+                f"Codex thread {thread_id} still has an active turn"
+            )
+
+        async def _archive_then_unarchive() -> None:
+            await self._request(
+                "thread/archive",
+                {"threadId": thread_id},
+            )
+            response = await self._request(
+                "thread/unarchive",
+                {"threadId": thread_id},
+            )
+            thread = (
+                response.get("thread")
+                if isinstance(response, dict)
+                else None
+            )
+            if not isinstance(thread, dict) or thread.get("id") != thread_id:
+                raise CodexAppServerError(
+                    "thread/unarchive returned an invalid thread for "
+                    f"{thread_id}"
+                )
+
+        # Cancellation after archive is on the wire must not leave a resumable
+        # Monitor rollout stranded in the archive. Settle the whole pair before
+        # propagating cancellation or any RPC failure.
+        await _settle_registry_cleanup(_archive_then_unarchive())
+        self._known_threads.add(thread_id)
 
     async def abandon_turn(
         self,
@@ -3860,9 +3983,8 @@ class CodexAppServerRegistry:
                 )
             server = self._servers.get(home)
             if server is None:
-                raise CodexAppServerError(
-                    f"Codex app-server is unavailable for thread {thread_id}"
-                )
+                server = self._new_server(home)
+                self._servers[home] = server
             self._starting_threads[thread_id] = token
             self._starting[home] = self._starting.get(home, 0) + 1
 
@@ -3928,6 +4050,66 @@ class CodexAppServerRegistry:
                         self._starting_threads.pop(thread_id, None)
 
             await _settle_registry_cleanup(_release_unsubscribe_thread())
+
+    async def recycle_thread_runtime(
+        self,
+        codex_home: str | os.PathLike[str] | None,
+        thread_id: str,
+    ) -> None:
+        """Reload one exact idle thread while retaining its home ownership."""
+
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        home = normalize_codex_home(codex_home)
+        token = object()
+
+        async with self._lock:
+            if self._shutdown_requested:
+                raise CodexAppServerBusyError(
+                    "Codex app-server registry is shutting down"
+                )
+            if home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is draining: {home}"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if owner is not None and owner != home:
+                raise CodexThreadHomeMismatchError(
+                    f"Codex thread {thread_id} is bound to {owner}, not {home}"
+                )
+            if thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} is being rebound"
+                )
+            if thread_id in self._starting_threads:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has a request in flight"
+                )
+            server = self._servers.get(home)
+            if server is None:
+                server = self._new_server(home)
+                self._servers[home] = server
+            if server.has_active_thread(thread_id):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} still has an active turn"
+                )
+            # Preserve this exact route even if archive succeeds but unarchive
+            # fails; terminal cleanup still needs the authoritative home.
+            if owner is None:
+                self._thread_owners[thread_id] = home
+            self._starting_threads[thread_id] = token
+            self._starting[home] = self._starting.get(home, 0) + 1
+
+        try:
+            await server.recycle_thread_runtime(thread_id)
+        finally:
+            async def _release_recycle_thread() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is token:
+                        self._starting_threads.pop(thread_id, None)
+
+            await _settle_registry_cleanup(_release_recycle_thread())
 
     async def abort_unclaimed_turn(
         self,

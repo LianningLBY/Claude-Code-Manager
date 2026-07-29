@@ -202,6 +202,12 @@ async def _runtime_retirement_fence(account, store):
             blockers.extend(
                 runtime.dispatcher.api_account_aux_runtime_users(account)
             )
+            blockers.extend(
+                await runtime.dispatcher.codex_monitor_runtime_users(
+                    account.codex_home,
+                    account_id=account.id,
+                )
+            )
             if blockers:
                 summary = ", ".join(blockers[:5])
                 raise CloudRouterAccountBusyError(
@@ -234,6 +240,12 @@ async def _runtime_retirement_fence(account, store):
                 )
                 blockers.extend(
                     runtime.dispatcher.api_account_aux_runtime_users(account)
+                )
+                blockers.extend(
+                    await runtime.dispatcher.codex_monitor_runtime_users(
+                        account.codex_home,
+                        account_id=account.id,
+                    )
                 )
                 if blockers:
                     raise CloudRouterAccountBusyError(

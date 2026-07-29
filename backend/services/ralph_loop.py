@@ -39,6 +39,7 @@ class RalphLoop:
         self.instance_manager = instance_manager
         self.broadcaster = broadcaster
         self._loops: dict[int, asyncio.Task] = {}
+        self._plan_lifecycles: dict[int, tuple[int, asyncio.Task]] = {}
         self._shutting_down = False
 
     async def start(self, instance_id: int):
@@ -113,6 +114,57 @@ class RalphLoop:
     def is_running(self, instance_id: int) -> bool:
         task = self._loops.get(instance_id)
         return task is not None and not task.done()
+
+    async def stop_plan_agent_lifecycle(
+        self,
+        task_id: int,
+        *,
+        timeout: float = DEFAULT_RALPH_STOP_TIMEOUT,
+    ) -> bool:
+        """Cancel one exact Plan child and settle its Ralph producer."""
+
+        registered = self._plan_lifecycles.get(task_id)
+        if registered is None:
+            return False
+        instance_id, lifecycle = registered
+        if lifecycle.done():
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        lifecycle.cancel()
+        done, pending = await asyncio.wait(
+            {lifecycle},
+            timeout=max(0.0, deadline - loop.time()),
+        )
+        if pending:
+            return False
+        await asyncio.gather(*done, return_exceptions=True)
+        # Awaiting the cancelled child propagates cancellation into the legacy
+        # producer. Settle it too so it cannot reclaim the still-active DB row
+        # before the API publishes the terminal generation.
+        producer = self._loops.get(instance_id)
+        if producer is not None and not producer.done():
+            producer.cancel()
+            done, pending = await asyncio.wait(
+                {producer},
+                timeout=max(0.0, deadline - loop.time()),
+            )
+            if pending:
+                return False
+            await asyncio.gather(*done, return_exceptions=True)
+        if (
+            producer is not None
+            and self._loops.get(instance_id) is producer
+            and producer.done()
+        ):
+            self._loops.pop(instance_id, None)
+        from backend.services.plan_agent_runner import (
+            has_unreaped_plan_agent_for_task,
+        )
+
+        if has_unreaped_plan_agent_for_task(task_id):
+            return False
+        return True
 
     async def _launch_task_on_bound_account(
         self,
@@ -1026,7 +1078,16 @@ class RalphLoop:
                         codex_pool=dispatcher.codex_pool,
                         cloudrouter_store=dispatcher.cloudrouter_store,
                     )
-                    plan_result = await runner.run(task, cwd=cwd)
+                    plan_lifecycle = asyncio.create_task(
+                        runner.run(task, cwd=cwd)
+                    )
+                    registered_plan = (instance_id, plan_lifecycle)
+                    self._plan_lifecycles[task.id] = registered_plan
+                    try:
+                        plan_result = await plan_lifecycle
+                    finally:
+                        if self._plan_lifecycles.get(task.id) == registered_plan:
+                            self._plan_lifecycles.pop(task.id, None)
 
                     stored = await self._store_plan_if_owned(
                         instance_id,

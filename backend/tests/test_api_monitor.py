@@ -1,5 +1,6 @@
 """Tests for Monitor API endpoints."""
 import asyncio
+from datetime import datetime
 
 import pytest
 from fastapi import HTTPException
@@ -464,13 +465,16 @@ async def test_worker_sub_agent_create_is_proxied_without_local_start(
 
 
 @pytest.mark.asyncio
-async def test_worker_monitor_create_routes_before_local_codex_gate(
+async def test_worker_codex_monitor_create_rejects_before_proxy(
     client,
     session_factory,
+    monkeypatch,
 ):
+    from backend.config import settings
     from backend.api.monitor import create_monitor_session
     from backend.schemas.monitor_session import MonitorSessionCreate
 
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     task_id = await _create_task_with_monitor(client, session_factory)
     async with session_factory() as db:
         await db.execute(
@@ -489,21 +493,129 @@ async def test_worker_monitor_create_routes_before_local_codex_gate(
             patch("backend.main.worker_proxy", proxy),
             patch("backend.main.dispatcher", dispatcher),
         ):
+            with pytest.raises(HTTPException) as exc:
+                await create_monitor_session(
+                    task_id,
+                    MonitorSessionCreate(description="remote monitor"),
+                    _admin_request(),
+                    db,
+                )
+
+    assert exc.value.status_code == 400
+    assert "local, non-shared" in exc.value.detail
+    proxy.proxy_to_worker.assert_not_awaited()
+    dispatcher.start_monitor_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_claude_monitor_create_still_routes_to_worker(
+    client,
+    session_factory,
+):
+    from backend.api.monitor import create_monitor_session
+    from backend.schemas.monitor_session import MonitorSessionCreate
+
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(worker_id=80, provider="claude")
+        )
+        await db.commit()
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"proxied": True})
+    dispatcher = MagicMock()
+    dispatcher.start_monitor_session = MagicMock()
+    async with session_factory() as db:
+        with (
+            patch("backend.main.worker_proxy", proxy),
+            patch("backend.main.dispatcher", dispatcher),
+        ):
             result = await create_monitor_session(
                 task_id,
-                MonitorSessionCreate(description="remote monitor"),
+                MonitorSessionCreate(description="remote Claude monitor"),
                 _admin_request(),
                 db,
             )
 
     assert result == {"proxied": True}
     proxy.proxy_to_worker.assert_awaited_once()
-    proxied_task, method, path = proxy.proxy_to_worker.call_args.args
-    assert proxied_task.id == task_id
-    assert proxied_task.worker_id == 79
-    assert method == "POST"
-    assert path == f"/api/tasks/{task_id}/monitor-sessions"
     dispatcher.start_monitor_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_monitor_migration_race_rejects_without_proxy_or_row(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api.monitor import create_monitor_session
+    from backend.config import settings
+    from backend.schemas.monitor_session import MonitorSessionCreate
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    response = await client.post("/api/tasks", json={
+        "title": "Codex monitor migration race",
+        "description": "d",
+        "provider": "codex",
+        "enabled_skills": {"monitor": True},
+    })
+    assert response.status_code == 201, response.text
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="in_progress")
+        )
+        await db.commit()
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"proxied": True})
+    dispatcher = MagicMock()
+    dispatcher.start_monitor_session = MagicMock()
+    async with session_factory() as db:
+        original_rollback = db.rollback
+        rollback_count = 0
+
+        async def migrate_after_routing_read():
+            nonlocal rollback_count
+            rollback_count += 1
+            await original_rollback()
+            if rollback_count == 1:
+                async with session_factory() as migration_db:
+                    await migration_db.execute(
+                        update(Task)
+                        .where(Task.id == task_id)
+                        .values(worker_id=88)
+                    )
+                    await migration_db.commit()
+
+        with (
+            patch.object(db, "rollback", side_effect=migrate_after_routing_read),
+            patch("backend.main.worker_proxy", proxy),
+            patch("backend.main.dispatcher", dispatcher),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await create_monitor_session(
+                    task_id,
+                    MonitorSessionCreate(description="must stay local"),
+                    _admin_request(),
+                    db,
+                )
+
+    assert exc.value.status_code == 400
+    proxy.proxy_to_worker.assert_not_awaited()
+    dispatcher.start_monitor_session.assert_not_called()
+    async with session_factory() as db:
+        row_count = await db.scalar(
+            select(func.count(MonitorSession.id)).where(
+                MonitorSession.task_id == task_id,
+            )
+        )
+    assert row_count == 0
 
 
 @pytest.mark.asyncio
@@ -626,11 +738,109 @@ async def test_delete_monitor_session(client, session_factory):
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
+    mock_dispatcher.stop_monitor_session_process.assert_awaited_once_with(
+        ms_id,
+        terminal=True,
+    )
 
     async with session_factory() as db:
         ms = await db.get(MonitorSession, ms_id)
         assert ms.status == "cancelled"
         assert ms.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_monitor_session_reports_unconfirmed_runtime_cleanup(
+    client,
+    session_factory,
+):
+    """A terminal row must not disguise an unconfirmed Codex thread delete."""
+
+    resp = await client.post("/api/tasks", json={
+        "title": "Codex monitor cleanup",
+        "description": "d",
+        "target_repo": "/tmp",
+        "provider": "codex",
+    })
+    task_id = resp.json()["id"]
+
+    async with session_factory() as db:
+        ms = MonitorSession(
+            task_id=task_id,
+            description="cleanup-pending",
+            status="running",
+            codex_thread_id="thread-cleanup-pending",
+            codex_home="/tmp/codex-home",
+            codex_cleanup_pending=True,
+        )
+        db.add(ms)
+        await db.commit()
+        await db.refresh(ms)
+        ms_id = ms.id
+
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.stop_monitor_session_process = AsyncMock(
+        side_effect=RuntimeError("terminal thread cleanup remains pending")
+    )
+    mock_dispatcher.broadcaster = MagicMock()
+    mock_dispatcher.broadcaster.broadcast = AsyncMock()
+
+    with patch("backend.main.dispatcher", mock_dispatcher):
+        response = await client.delete(
+            f"/api/tasks/{task_id}/monitor-sessions/{ms_id}"
+        )
+
+    assert response.status_code == 409
+    assert "runtime cleanup could not be confirmed" in response.json()["detail"]
+    mock_dispatcher.stop_monitor_session_process.assert_awaited_once_with(
+        ms_id,
+        terminal=True,
+    )
+    mock_dispatcher.broadcaster.broadcast.assert_not_awaited()
+
+    async with session_factory() as db:
+        ms = await db.get(MonitorSession, ms_id)
+        assert ms.status == "cancelled"
+        assert ms.completed_at is not None
+        assert ms.codex_thread_id == "thread-cleanup-pending"
+        assert ms.codex_home == "/tmp/codex-home"
+        assert ms.codex_cleanup_pending is True
+
+    async def complete_retry(session_id, *, terminal):
+        assert session_id == ms_id
+        assert terminal is True
+        async with session_factory() as db:
+            await db.execute(
+                update(MonitorSession)
+                .where(MonitorSession.id == session_id)
+                .values(
+                    codex_thread_id=None,
+                    codex_home=None,
+                    codex_account_id=None,
+                    codex_cleanup_pending=False,
+                    codex_cleanup_error=None,
+                )
+            )
+            await db.commit()
+
+    mock_dispatcher.stop_monitor_session_process.side_effect = complete_retry
+    with patch("backend.main.dispatcher", mock_dispatcher):
+        retry = await client.delete(
+            f"/api/tasks/{task_id}/monitor-sessions/{ms_id}"
+        )
+
+    assert retry.status_code == 200
+    assert retry.json() == {"ok": True}
+    assert mock_dispatcher.stop_monitor_session_process.await_count == 2
+    # The terminal row was already cancelled by the first request, so retrying
+    # cleanup must not publish a duplicate status transition.
+    mock_dispatcher.broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        ms = await db.get(MonitorSession, ms_id)
+        assert ms.status == "cancelled"
+        assert ms.codex_thread_id is None
+        assert ms.codex_home is None
+        assert ms.codex_cleanup_pending is False
 
 
 @pytest.mark.asyncio
@@ -966,6 +1176,8 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
             description="two checks",
             status="running",
             max_checks=2,
+            turn_generation=1,
+            active_turn_generation=1,
         )
         db.add(session)
         await db.commit()
@@ -976,19 +1188,24 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_monitor_session_process = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
-        first = await client.post(
-            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
-            json={"summary": "first"},
-        )
-        async with session_factory() as db:
-            after_first = await db.get(MonitorSession, session_id)
-            assert after_first.status == "running"
-            assert after_first.checks_done == 1
-            assert after_first.completed_at is None
-        second = await client.post(
-            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
-            json={"summary": "second"},
-        )
+            first = await client.post(
+                f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+                json={"summary": "first", "turn_generation": 1},
+            )
+            async with session_factory() as db:
+                after_first = await db.get(MonitorSession, session_id)
+                assert after_first.status == "running"
+                assert after_first.checks_done == 1
+                assert after_first.completed_at is None
+                # Simulate the scheduler claiming the next due turn.
+                after_first.turn_generation = 2
+                after_first.active_turn_generation = 2
+                after_first.next_check_at = None
+                await db.commit()
+            second = await client.post(
+                f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+                json={"summary": "second", "turn_generation": 2},
+            )
 
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
@@ -1010,7 +1227,110 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
     assert session.status == "completed"
     assert session.checks_done == 2
     assert [report.check_number for report in reports] == [1, 2]
-    dispatcher.stop_monitor_session_process.assert_awaited_once_with(session_id)
+    # The scheduled lifecycle observes the terminal callback after the short
+    # turn exits; the callback must not cancel its own MCP response in flight.
+    dispatcher.stop_monitor_session_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_callback_requires_exact_active_turn_generation(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="generation fence",
+            status="running",
+            interval=30,
+            turn_generation=7,
+            active_turn_generation=7,
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    dispatcher = MagicMock()
+    dispatcher.broadcaster.broadcast = AsyncMock()
+    dispatcher.enqueue_message = AsyncMock()
+    with patch("backend.main.dispatcher", dispatcher):
+        stale = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+            json={
+                "summary": "stale",
+                "turn_generation": 6,
+            },
+        )
+        accepted = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+            json={
+                "summary": "current",
+                "turn_generation": 7,
+            },
+        )
+        duplicate = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+            json={
+                "summary": "duplicate",
+                "turn_generation": 7,
+            },
+        )
+
+    assert stale.status_code == 409
+    assert accepted.status_code == 200
+    assert accepted.json()["check_number"] == 1
+    assert duplicate.status_code == 409
+    async with session_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        reports = list(
+            (
+                await db.execute(
+                    select(MonitorCheck).where(
+                        MonitorCheck.monitor_session_id == session_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert session.checks_done == 1
+    assert session.active_turn_generation is None
+    assert session.next_check_at is not None
+    assert [report.summary for report in reports] == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_monitor_rejects_callback_before_generation_claim(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="not claimed",
+            status="running",
+            next_check_at=datetime.utcnow(),
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+        json={"summary": "must not bypass scheduler"},
+    )
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        assert session.checks_done == 0
+        assert session.next_check_at is not None
 
 
 @pytest.mark.asyncio
@@ -1165,7 +1485,8 @@ async def test_task_cancel_routes_ccm_auxiliary_reapers_by_agent_type(
 
     assert response.status_code == 200, response.text
     mock_dispatcher.stop_monitor_session_process.assert_awaited_once_with(
-        monitor_id
+        monitor_id,
+        terminal=True,
     )
     mock_dispatcher.stop_sub_agent_session_process.assert_awaited_once_with(
         sub_agent_id
@@ -1173,9 +1494,15 @@ async def test_task_cancel_routes_ccm_auxiliary_reapers_by_agent_type(
 
 
 @pytest.mark.asyncio
-async def test_create_monitor_rejects_codex_task(client, session_factory):
-    """Monitor 子 agent 硬编码 claude CLI——codex 任务必须显式 400，
-    而不是静默起一个 Claude 子进程。"""
+async def test_create_monitor_accepts_local_codex_task(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A local Codex task may create the scheduled Monitor runtime."""
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
         "provider": "codex",
@@ -1186,11 +1513,19 @@ async def test_create_monitor_rejects_codex_task(client, session_factory):
         await db.execute(update(Task).where(Task.id == task_id).values(status="in_progress"))
         await db.commit()
 
-    resp = await client.post(f"/api/tasks/{task_id}/monitor-sessions", json={
-        "description": "watch build",
-    })
-    assert resp.status_code == 400
-    assert "claude-only" in resp.json()["detail"]
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.start_monitor_session = MagicMock()
+    mock_dispatcher.broadcaster = MagicMock()
+    mock_dispatcher.broadcaster.broadcast = AsyncMock()
+    with patch("backend.main.dispatcher", mock_dispatcher):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions",
+            json={"description": "watch build"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["provider"] == "codex"
+    mock_dispatcher.start_monitor_session.assert_called_once()
 
 
 @pytest.mark.asyncio

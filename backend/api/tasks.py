@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -147,6 +147,15 @@ def _validate_task_service_tier_configuration(
     """Validate every model request hidden behind one Task configuration."""
 
     validate_codex_service_tier(provider, model, codex_service_tier)
+    if (
+        (provider or "claude").lower() == "codex"
+        and (codex_service_tier or "default") == "priority"
+        and mode == "plan"
+    ):
+        raise ValueError(
+            "Codex Fast is not supported for read-only Plan Agent tasks; "
+            "use Standard"
+        )
     if not (
         (provider or "claude").lower() == "codex"
         and (codex_service_tier or "default") == "priority"
@@ -191,22 +200,38 @@ async def _validate_skill_configuration(
     enabled_skills: dict | None,
     selected_user_skills: list[int] | None,
     user_skill_snapshots: list[dict] | None = None,
+    worker_id: int | None = None,
+    shared_from_id: int | None = None,
+    metadata: dict | None = None,
 ) -> list[int] | None:
     """Validate and normalize task-scoped Skill selections."""
 
     from backend.config import settings as app_settings
     from backend.models.user_skill import UserSkill
     from backend.services.skill_context import (
+        codex_monitor_supported_for_scope,
         normalize_user_skill_ids,
         skill_supported,
         user_skill_snapshot_from_mapping,
     )
 
     provider = (provider or "claude").lower()
+    codex_monitor_enabled = codex_monitor_supported_for_scope(
+        provider=provider,
+        worker_id=worker_id,
+        shared_from_id=shared_from_id,
+        metadata=metadata,
+        codex_main_mcp_enabled=app_settings.codex_main_mcp_enabled,
+    )
     unsupported = sorted(
         name
         for name, enabled in (enabled_skills or {}).items()
-        if enabled and not skill_supported(provider, name)
+        if enabled
+        and not skill_supported(
+            provider,
+            name,
+            codex_monitor_enabled=codex_monitor_enabled,
+        )
     )
     if unsupported:
         raise HTTPException(
@@ -497,9 +522,11 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     if user_skill_snapshots is not None:
         from backend.services.skill_context import (
             USER_SKILL_SNAPSHOTS_METADATA_KEY,
+            WORKER_MANAGED_TASK_METADATA_KEY,
         )
 
         meta[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
+        meta[WORKER_MANAGED_TASK_METADATA_KEY] = True
     if meta:
         data["metadata_"] = meta
 
@@ -510,6 +537,16 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         if target is None:
             raise HTTPException(404, "Plan target Task not found")
         await require_task_control(request, target, db)
+        if not target.session_id:
+            raise HTTPException(
+                400,
+                "Run the target Task before creating a session Plan",
+            )
+        if target.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Shared shadow tasks cannot own Plan Tasks",
+            )
         if (
             data.get("worker_id") != target.worker_id
             or data.get("project_id") != target.project_id
@@ -518,13 +555,40 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
                 422,
                 "Related Plan must use the target Task's Project and Worker",
             )
+        from backend.services.plan_tasks import (
+            ACTIVE_PLAN_STATUSES,
+            MAX_ACTIVE_PLANS_PER_TASK,
+        )
+
+        active_count = await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.plan_target_task_id == target.id,
+                Task.mode == "plan",
+                Task.status.in_(ACTIVE_PLAN_STATUSES),
+            )
+        )
+        if int(active_count or 0) >= MAX_ACTIVE_PLANS_PER_TASK:
+            raise HTTPException(
+                429,
+                f"Task already has {MAX_ACTIVE_PLANS_PER_TASK} active Plans",
+            )
+        supersedes_id = data.get("supersedes_plan_task_id")
+        if supersedes_id is not None:
+            supersedes = await db.get(Task, supersedes_id)
+            if (
+                supersedes is None
+                or supersedes.mode != "plan"
+                or supersedes.plan_target_task_id != target.id
+            ):
+                raise HTTPException(
+                    400,
+                    "Superseded Plan does not belong to this Task",
+                )
+            await require_task_control(request, supersedes, db)
         # The execution node owns its LogEntry ids and repository. Re-capture
         # the same target boundary locally instead of trusting a Manager-side
         # watermark whose integer id has no cross-database meaning.
-        from backend.services.plan_tasks import (
-            capture_task_context,
-            latest_task_log_id,
-        )
+        from backend.services.plan_tasks import capture_task_context, latest_task_log_id
 
         local_context_log_id = await latest_task_log_id(db, target.id)
         data["plan_context_session_id"] = target.session_id
@@ -553,6 +617,18 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
                     422,
                     f"{plan_only_field} requires mode='plan'",
                 )
+    elif data.get("supersedes_plan_task_id") is not None:
+        supersedes = await db.get(Task, data["supersedes_plan_task_id"])
+        if (
+            supersedes is None
+            or supersedes.mode != "plan"
+            or supersedes.plan_target_task_id is not None
+        ):
+            raise HTTPException(
+                400,
+                "Standalone Plan can only supersede another standalone Plan",
+            )
+        await require_task_control(request, supersedes, db)
 
     if clone_from_task_id:
         source = await db.get(Task, clone_from_task_id)
@@ -591,6 +667,9 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         enabled_skills=validation_skills,
         selected_user_skills=data.get("selected_user_skills"),
         user_skill_snapshots=user_skill_snapshots,
+        worker_id=data.get("worker_id"),
+        shared_from_id=data.get("shared_from_id"),
+        metadata=data.get("metadata_"),
     )
     try:
         _validate_task_service_tier_configuration(
@@ -657,14 +736,19 @@ async def import_migrated_task(
         "clone_from_task_id",
     ):
         data.pop(transient_field, None)
-    if user_skill_snapshots is not None:
-        from backend.services.skill_context import (
-            USER_SKILL_SNAPSHOTS_METADATA_KEY,
-        )
+    from backend.services.skill_context import (
+        USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        WORKER_MANAGED_TASK_METADATA_KEY,
+    )
 
-        data["metadata_"] = {
-            USER_SKILL_SNAPSHOTS_METADATA_KEY: user_skill_snapshots,
-        }
+    migration_metadata = {
+        WORKER_MANAGED_TASK_METADATA_KEY: True,
+    }
+    if user_skill_snapshots is not None:
+        migration_metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = (
+            user_skill_snapshots
+        )
+    data["metadata_"] = migration_metadata
     data.update(
         worker_id=None,
         status=source_status,
@@ -680,6 +764,20 @@ async def import_migrated_task(
         )
     if not data.get("effort_level"):
         data["effort_level"] = app_settings.default_effort
+    validation_skills = dict(data.get("enabled_skills") or {})
+    validation_skills.update(
+        _explicit_command_skills(data.get("description"))
+    )
+    data["selected_user_skills"] = await _validate_skill_configuration(
+        db,
+        provider=data.get("provider"),
+        enabled_skills=validation_skills,
+        selected_user_skills=data.get("selected_user_skills"),
+        user_skill_snapshots=user_skill_snapshots,
+        worker_id=None,
+        shared_from_id=None,
+        metadata=data.get("metadata_"),
+    )
     try:
         _validate_task_service_tier_configuration(
             provider=data.get("provider"),
@@ -1870,12 +1968,14 @@ async def update_task(
     if user_skill_snapshots is not None:
         from backend.services.skill_context import (
             USER_SKILL_SNAPSHOTS_METADATA_KEY,
+            WORKER_MANAGED_TASK_METADATA_KEY,
         )
 
         metadata = dict(updates.get("metadata_") or task.metadata_ or {})
         metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = (
             user_skill_snapshots
         )
+        metadata[WORKER_MANAGED_TASK_METADATA_KEY] = True
         updates["metadata_"] = metadata
 
     # "off" sentinel → explicit NULL. Do this before the Worker branch so both
@@ -1887,9 +1987,22 @@ async def update_task(
     # synchronization or Worker migration can create externally visible state.
     effective_provider = updates.get("provider", task.provider)
     effective_description = updates.get("description", task.description)
+    effective_worker_id = task.worker_id
+    if "worker_id" in updates:
+        requested_worker_id = updates["worker_id"]
+        effective_worker_id = (
+            None if requested_worker_id == -1 else requested_worker_id
+        )
+    effective_metadata = updates.get("metadata_", task.metadata_)
     command_skills = _explicit_command_skills(effective_description)
     skill_configuration_changed = bool(
-        {"provider", "enabled_skills", "selected_user_skills"} & updates.keys()
+        {
+            "provider",
+            "enabled_skills",
+            "selected_user_skills",
+            "worker_id",
+        }
+        & updates.keys()
     ) or user_skill_snapshots is not None or bool(
         command_skills and "description" in updates
     )
@@ -1919,6 +2032,9 @@ async def update_task(
                     USER_SKILL_SNAPSHOTS_METADATA_KEY
                 )
             ),
+            worker_id=effective_worker_id,
+            shared_from_id=task.shared_from_id,
+            metadata=effective_metadata,
         )
         if "selected_user_skills" in updates:
             updates["selected_user_skills"] = normalized_user_skills
@@ -2694,7 +2810,7 @@ async def _stop_task_session_local_impl(
 ) -> dict:
     """Cancellation-safe local core for ``POST /stop-session``."""
 
-    from backend.main import dispatcher, instance_manager
+    from backend.main import dispatcher, instance_manager, ralph_loop
 
     await db.rollback()
     try:
@@ -2735,10 +2851,16 @@ async def _stop_task_session_local_impl(
     await _settle_task_launch_barrier(task_id, probe_instance_id)
     if probe_is_active_plan:
         try:
-            await dispatcher.stop_plan_agent_lifecycle(
+            stopped = await dispatcher.stop_plan_agent_lifecycle(
                 task_id,
                 probe_instance_id,
             )
+            if not stopped:
+                stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
+            if not stopped:
+                raise RuntimeError(
+                    f"No exact Plan lifecycle owns Task {task_id}"
+                )
         except Exception as exc:
             raise HTTPException(
                 409,
@@ -3133,7 +3255,7 @@ async def _cancel_local_task_impl(
 ) -> Task:
     """Cancellation-safe local core for ``POST /cancel``."""
 
-    from backend.main import dispatcher
+    from backend.main import dispatcher, ralph_loop
 
     await db.rollback()
     try:
@@ -3165,8 +3287,24 @@ async def _cancel_local_task_impl(
             "Task execution location changed while cancellation was starting",
         )
     probe_instance_id = probe.instance_id
+    probe_is_active_plan = (
+        probe.mode == "plan"
+        and probe.status in {"in_progress", "executing"}
+    )
     await db.rollback()
     await _settle_task_launch_barrier(task_id, probe_instance_id)
+    if probe_is_active_plan:
+        stopped = await dispatcher.stop_plan_agent_lifecycle(
+            task_id,
+            probe_instance_id,
+        )
+        if not stopped:
+            stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
+        if not stopped:
+            raise HTTPException(
+                409,
+                "Plan Agent process cleanup could not be confirmed",
+            )
 
     db.expire_all()
     active_task = (
@@ -3349,7 +3487,13 @@ async def _cancel_local_task_impl(
             MonitorSession.task_id == task_id,
             MonitorSession.status == "running",
         )
-        .values(status="cancelled", completed_at=datetime.utcnow())
+        .values(
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            next_check_at=None,
+            active_turn_generation=None,
+            turn_started_at=None,
+        )
     )
     committed_retry_count = active_task.retry_count
     committed_instance_id = active_task.instance_id
@@ -3368,7 +3512,10 @@ async def _cancel_local_task_impl(
             if agent_type == "sub_agent":
                 await dispatcher.stop_sub_agent_session_process(session_id)
             elif agent_type == "monitor":
-                await dispatcher.stop_monitor_session_process(session_id)
+                await dispatcher.stop_monitor_session_process(
+                    session_id,
+                    terminal=True,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

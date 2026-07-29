@@ -3230,7 +3230,12 @@ async def test_worker_pending_marker_blocks_direct_retry_chat_and_plan_approve(
     )
     staged_plan = await client.post(
         f"/api/tasks/{plan.id}/routing-config/stage",
-        json={**payload, "op_id": "block-plan-approve"},
+        json={
+            **payload,
+            "op_id": "block-plan-approve",
+            "model": "gpt-5.5",
+            "codex_service_tier": "default",
+        },
     )
     assert staged_plan.status_code == 200
     approve = await client.post(f"/api/tasks/{plan.id}/plan/approve")

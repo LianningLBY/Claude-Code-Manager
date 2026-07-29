@@ -141,6 +141,9 @@ async def _validate_chat_command_admission(
         provider=task.provider,
         enabled_skills=command.required_skills,
         selected_user_skills=None,
+        worker_id=task.worker_id,
+        shared_from_id=task.shared_from_id,
+        metadata=task.metadata_,
     )
 
 
@@ -681,10 +684,11 @@ async def send_chat_message(
             expected_task_routing=admitted_routing,
             source_log_id=user_log.id,
         )
-    except TaskStartPausedError as exc:
+    except (TaskStartPausedError, RuntimeError) as exc:
         if approved_plans:
-            # Admission failed before any consumer could own the prompt. Restore
-            # the exact application rows so the user can retry after restart.
+            # Both failures happen before queue admission can publish an item.
+            # Restore the exact application rows so a shutdown race cannot
+            # permanently consume a Plan that the model never received.
             async with get_task_operation_lock(task_id):
                 for plan in approved_plans:
                     await db.execute(

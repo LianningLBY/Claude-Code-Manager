@@ -122,6 +122,30 @@ async def test_stop_cancels():
 
 
 @pytest.mark.asyncio
+async def test_stop_plan_agent_lifecycle_settles_exact_ralph_producer():
+    rl = _make_ralph_loop()
+    plan_child = asyncio.create_task(asyncio.Event().wait())
+
+    async def producer():
+        await plan_child
+
+    producer_task = asyncio.create_task(producer())
+    await asyncio.sleep(0)
+    rl._loops[7] = producer_task
+    rl._plan_lifecycles[23] = (7, plan_child)
+
+    with patch(
+        "backend.services.plan_agent_runner.has_unreaped_plan_agent_for_task",
+        return_value=False,
+    ):
+        assert await rl.stop_plan_agent_lifecycle(23) is True
+
+    assert plan_child.done()
+    assert producer_task.done()
+    assert 7 not in rl._loops
+
+
+@pytest.mark.asyncio
 async def test_stop_timeout_retains_live_loop_evidence():
     rl = _make_ralph_loop()
     release = asyncio.Event()

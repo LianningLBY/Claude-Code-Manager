@@ -21,6 +21,7 @@ mcp = FastMCP("ccm-monitor-agent", instructions="Monitor sub-agent tools")
 
 _MONITOR_SESSION_ID: int = 0
 _TASK_ID: int = 0
+_TURN_GENERATION: int | None = None
 _API_BASE: str = "http://localhost:8000"
 _AUTH_TOKEN: str = ""
 
@@ -52,13 +53,14 @@ async def report_status(summary: str, is_important: bool = False) -> str:
                     "summary": summary,
                     "status": "success",
                     "is_important": is_important,
+                    "turn_generation": _TURN_GENERATION,
                 },
             )
-            if resp.status_code in (400, 404):
+            if resp.status_code in (400, 404, 409):
                 return json.dumps({
                     "success": False,
                     "session_ended": True,
-                    "error": f"Session is no longer active (HTTP {resp.status_code}). Call mark_complete or stop all activity.",
+                    "error": f"Session or turn is no longer active (HTTP {resp.status_code}). Stop all activity now.",
                 }, ensure_ascii=False)
             resp.raise_for_status()
             data = resp.json()
@@ -86,9 +88,12 @@ async def mark_complete(reason: str) -> str:
             resp = await client.post(
                 _api_url("/complete"),
                 headers=_headers(),
-                json={"reason": reason},
+                json={
+                    "reason": reason,
+                    "turn_generation": _TURN_GENERATION,
+                },
             )
-            if resp.status_code in (400, 404):
+            if resp.status_code in (400, 404, 409):
                 return "Session already ended. Stop all activity now."
             resp.raise_for_status()
             return "Session completed. Your task is done — stop all activity now."
@@ -127,12 +132,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CCM Monitor Agent MCP Server")
     parser.add_argument("--monitor-session-id", type=int, required=True)
     parser.add_argument("--task-id", type=int, required=True)
+    parser.add_argument("--turn-generation", type=int)
     parser.add_argument("--api-base", default="http://localhost:8000")
     parser.add_argument("--auth-token", default="")
     args = parser.parse_args()
 
     _MONITOR_SESSION_ID = args.monitor_session_id
     _TASK_ID = args.task_id
+    _TURN_GENERATION = args.turn_generation
     _API_BASE = args.api_base
     _AUTH_TOKEN = args.auth_token
 

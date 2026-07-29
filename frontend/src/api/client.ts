@@ -90,6 +90,8 @@ export interface RuntimeSettings {
   codex_app_server_enabled: boolean;
   /** Absent when proxying an older Worker that predates this capability. */
   codex_main_mcp_enabled?: boolean;
+  /** Absent on pre-PR7B2 runtimes; unknown must fail closed for Monitor. */
+  codex_monitor_enabled?: boolean;
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
   context_compact_threshold: number;
@@ -107,6 +109,7 @@ export interface GlobalSettings {
 export interface Project {
   id: number;
   name: string;
+  worker_id?: number | null;
   git_url: string | null;
   has_remote: boolean;
   local_path: string | null;
@@ -222,6 +225,8 @@ export interface Task {
     plan_review_verdict?: 'approve' | 'revise';
     plan_review_feedback?: string;
     plan_review_exhausted?: boolean;
+    ccm_worker_managed_task?: boolean;
+    ccm_user_skill_snapshots?: unknown[];
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -480,9 +485,18 @@ export interface MonitorSession {
   monitor_context: string | null;
   interval: number;
   max_checks: number;
+  model: string | null;
+  provider: string;
   status: string;
   checks_done: number;
   last_summary: string | null;
+  next_check_at: string | null;
+  turn_generation: number;
+  active_turn_generation: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
+  codex_cleanup_pending: boolean;
+  codex_cleanup_error: string | null;
   created_at: string;
   completed_at: string | null;
 }

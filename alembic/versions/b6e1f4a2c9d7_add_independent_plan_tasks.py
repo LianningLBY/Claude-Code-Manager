@@ -1,7 +1,7 @@
 """add independent Plan Task relationships and pipeline audit
 
 Revision ID: b6e1f4a2c9d7
-Revises: a84f2d9c7e31
+Revises: c8f5d3a72b10
 Create Date: 2026-07-29
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = "b6e1f4a2c9d7"
-down_revision: Union[str, None] = "a84f2d9c7e31"
+down_revision: Union[str, None] = "c8f5d3a72b10"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -2034,6 +2034,7 @@ def _install_retirement_runtime(
         instance_manager=instance_manager,
         dispatcher=dispatcher or types.SimpleNamespace(
             api_account_aux_runtime_users=Mock(return_value=[]),
+            codex_monitor_runtime_users=AsyncMock(return_value=[]),
         ),
         task_migrator=None,
     )
@@ -2041,6 +2042,93 @@ def _install_retirement_runtime(
     import backend
     monkeypatch.setattr(backend, "main", runtime, raising=False)
     return runtime
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_retirement_blocks_persisted_codex_monitor_owner(
+    tmp_path,
+    monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(return_value=[]),
+        begin_codex_app_server_home_maintenance=AsyncMock(),
+        end_codex_app_server_home_maintenance=AsyncMock(),
+        detach_api_account_containers=AsyncMock(),
+    )
+    dispatcher = types.SimpleNamespace(
+        api_account_aux_runtime_users=Mock(return_value=[]),
+        codex_monitor_runtime_users=AsyncMock(
+            return_value=["monitor 17"]
+        ),
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+        dispatcher=dispatcher,
+    )
+
+    with pytest.raises(
+        CloudRouterAccountBusyError,
+        match="monitor 17",
+    ):
+        async with cloudrouter_api._runtime_retirement_fence(
+            account,
+            store,
+        ):
+            pass
+
+    manager.begin_codex_app_server_home_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_retirement_rechecks_monitor_after_home_fence(
+    tmp_path,
+    monkeypatch,
+):
+    """The post-maintenance check closes precheck-to-fence admission races."""
+
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(return_value=[]),
+        begin_codex_app_server_home_maintenance=AsyncMock(),
+        end_codex_app_server_home_maintenance=AsyncMock(),
+        detach_api_account_containers=AsyncMock(),
+    )
+    monitor_users = AsyncMock(
+        side_effect=[[], ["monitor 18"]]
+    )
+    dispatcher = types.SimpleNamespace(
+        api_account_aux_runtime_users=Mock(return_value=[]),
+        codex_monitor_runtime_users=monitor_users,
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+        dispatcher=dispatcher,
+    )
+
+    with pytest.raises(
+        CloudRouterAccountBusyError,
+        match="acquired a runtime user",
+    ):
+        async with cloudrouter_api._runtime_retirement_fence(
+            account,
+            store,
+        ):
+            pass
+
+    assert monitor_users.await_count == 2
+    manager.begin_codex_app_server_home_maintenance.assert_awaited_once_with(
+        account.codex_home,
+        require_idle=True,
+    )
+    manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
+        account.codex_home
+    )
+    manager.detach_api_account_containers.assert_not_awaited()
 
 
 @pytest.mark.asyncio

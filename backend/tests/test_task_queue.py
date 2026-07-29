@@ -681,6 +681,79 @@ async def test_delete_task_rejects_running_auxiliary_session(queue):
 
 
 @pytest.mark.asyncio
+async def test_delete_task_preserves_terminal_codex_monitor_cleanup_owner(
+    queue,
+):
+    """A Task delete cannot erase a retryable native-thread cleanup."""
+
+    from backend.models.monitor_session import MonitorSession
+
+    task = await queue.create(
+        title="codex monitor cleanup",
+        description="d",
+    )
+    task.status = "completed"
+    monitor = MonitorSession(
+        task_id=task.id,
+        description="finished but cleanup pending",
+        provider="codex",
+        status="completed",
+        codex_thread_id="monitor-thread-pending-delete",
+        codex_home="/tmp/codex-monitor-pending-delete",
+        codex_cleanup_pending=True,
+        codex_cleanup_error="transport unavailable",
+    )
+    queue.db.add(monitor)
+    await queue.db.commit()
+    task_id = task.id
+    monitor_id = monitor.id
+
+    assert await queue.delete(task_id) is False
+
+    queue.db.expire_all()
+    assert await queue.db.get(Task, task_id) is not None
+    monitor = await queue.db.get(MonitorSession, monitor_id)
+    assert monitor is not None
+    assert monitor.codex_thread_id == "monitor-thread-pending-delete"
+    assert monitor.codex_cleanup_pending is True
+
+
+@pytest.mark.asyncio
+async def test_delete_task_preserves_uncommitted_monitor_turn_handle(queue):
+    """In-memory pre-commit ownership also fences child-row deletion."""
+
+    from backend.main import dispatcher
+    from backend.models.monitor_session import MonitorSession
+
+    task = await queue.create(
+        title="monitor pre-commit owner",
+        description="d",
+    )
+    task.status = "completed"
+    monitor = MonitorSession(
+        task_id=task.id,
+        description="pre-commit owner",
+        provider="codex",
+        status="completed",
+    )
+    queue.db.add(monitor)
+    await queue.db.commit()
+    task_id = task.id
+    monitor_id = monitor.id
+    marker = object()
+    dispatcher._monitor_turn_handles[monitor_id] = marker
+
+    try:
+        assert await queue.delete(task_id) is False
+        queue.db.expire_all()
+        assert await queue.db.get(Task, task_id) is not None
+        assert await queue.db.get(MonitorSession, monitor_id) is not None
+    finally:
+        if dispatcher._monitor_turn_handles.get(monitor_id) is marker:
+            dispatcher._monitor_turn_handles.pop(monitor_id, None)
+
+
+@pytest.mark.asyncio
 async def test_delete_task_preserves_orphan_when_pid_probe_is_denied(queue):
     """Permission/unknown PID probes fail closed without losing evidence."""
     task = await queue.create(title="orphan-denied", description="d")

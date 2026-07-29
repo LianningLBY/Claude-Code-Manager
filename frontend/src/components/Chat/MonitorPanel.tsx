@@ -8,8 +8,9 @@ interface MonitorPanelProps {
   sessions: MonitorSession[];
   onSessionsChange: (sessions: MonitorSession[]) => void;
   onClose: () => void;
-  /** task 的执行 provider；codex 任务不支持子 agent，面板显式标注 */
+  /** Task provider 与精确 Monitor capability；未知/不支持时面板显式标注。 */
   provider?: string;
+  monitorSupported?: boolean;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -55,6 +56,9 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
   const [checks, setChecks] = useState<MonitorCheck[]>([]);
   const [stopping, setStopping] = useState(false);
   const isNative = session.source === 'native';
+  const cleanupPending = (
+    session.provider === 'codex' && session.codex_cleanup_pending
+  );
 
   const loadChecks = useCallback(() => {
     api.getMonitorChecks(taskId, session.id).then(setChecks).catch(() => {});
@@ -70,7 +74,10 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
       await api.deleteMonitorSession(taskId, session.id);
       onStopped();
     } catch {
-      // ignore
+      // Terminal cleanup can fail after the backend has already persisted the
+      // cancelled row. Refresh so the durable retry state and error become
+      // visible instead of leaving a stale "running" row on screen.
+      onStopped();
     } finally {
       setStopping(false);
     }
@@ -101,13 +108,26 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
               <span className="ml-2 text-gray-400">— {session.last_summary}</span>
             )}
           </div>
+          {cleanupPending && (
+            <div className="mt-1 text-xs text-amber-300">
+              <span>Codex runtime cleanup pending</span>
+              {session.codex_cleanup_error && (
+                <span
+                  className="ml-1 text-amber-400"
+                  title={session.codex_cleanup_error}
+                >
+                  — {session.codex_cleanup_error}
+                </span>
+              )}
+            </div>
+          )}
         </div>
-        {session.status === 'running' && !isNative && (
+        {(session.status === 'running' || cleanupPending) && !isNative && (
           <button
             className="text-gray-400 hover:text-red-400 p-1 disabled:opacity-50"
             onClick={handleStop}
             disabled={stopping}
-            title="Stop monitor"
+            title={cleanupPending ? 'Retry Codex cleanup' : 'Stop monitor'}
           >
             <StopCircle size={16} />
           </button>
@@ -135,7 +155,14 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
   );
 }
 
-export function MonitorPanel({ taskId, sessions, onSessionsChange, onClose, provider }: MonitorPanelProps) {
+export function MonitorPanel({
+  taskId,
+  sessions,
+  onSessionsChange,
+  onClose,
+  provider,
+  monitorSupported,
+}: MonitorPanelProps) {
   const refresh = useCallback(() => {
     api.listMonitorSessions(taskId).then(onSessionsChange).catch(() => {});
   }, [taskId, onSessionsChange]);
@@ -156,9 +183,9 @@ export function MonitorPanel({ taskId, sessions, onSessionsChange, onClose, prov
           <X size={16} />
         </button>
       </div>
-      {provider === 'codex' && (
+      {provider === 'codex' && monitorSupported !== true && (
         <div className="mx-2 mt-2 rounded border border-amber-700/50 bg-amber-900/20 px-2 py-1.5 text-xs text-amber-300">
-          Sub-Agent 已支持 Codex；后台 Monitor 仍仅支持 Claude
+          Codex Monitor 当前仅支持 capability 已确认的本地、非共享任务
         </div>
       )}
       <div className="p-2 space-y-2 max-h-64 overflow-y-auto">

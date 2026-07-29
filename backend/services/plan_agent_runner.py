@@ -159,6 +159,15 @@ def has_unreaped_plan_agent_for_task(task_id: int) -> bool:
     )
 
 
+def active_plan_agent_task_ids() -> set[int]:
+    """Return Task ids with an exact live or unreaped Plan process."""
+
+    return {
+        retained.task_id
+        for retained in _PLAN_AGENT_PROCESSES.values()
+    }
+
+
 def _group_alive(process_group_id: int | None) -> bool:
     if process_group_id is None:
         return False

@@ -964,3 +964,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **实现**：新增有界对话快照、HEAD/dirty 指纹、审批/应用审计和 Planner/Reviewer run/step 表；`PlanAgentRunner` 对 Claude 强制 Read/Grep/Glob 且禁 Bash/MCP/子 agent，对 Codex 强制 ephemeral/read-only sandbox/空 MCP/禁 multi-agent，统一账号池、CloudRouter admission、transient retry 与 exact process-group cleanup。ChatView 提供多 Plan 历史、审批、revision、stale 确认和持久 composer attachments。
 - **Worker/并发边界**：Manager-local 的 user/log/execution Task id 不接受 Worker mirror 覆盖；active、待审批、approved-but-unapplied Plan 阻止目标迁移，关联 Plan 不可单独迁移。Git 指纹禁 optional locks/fsmonitor，Task 列表不返回 60K transcript 快照。
 - **验证**：Plan/Dispatcher/Ralph/Worker/迁移/Alembic 相关后端 `523 passed`；前端 Plan/Chat `77 passed`，TypeScript + Vite production build 通过。后端全量仅余 13 个失败，并已在未包含本改动的 `origin/main@4249605` 独立 worktree 上逐项复现同样的 13 个失败，确认不是 Plan 回归；全仓 ESLint 仍有 59 个既有 error（本次变更文件未新增 error）。生产手工验收尚未执行。
+
+### 2026-07-29 — PR7B2：本地 Codex Monitor capability 与 UI 收尾（本提交）
+
+- **问题**：PR7B1 已完成 Codex Monitor 的持久 thread、generation fence、read-only profile、停止和恢复语义，但公开 API/MCP/UI 仍沿用 blanket Codex 拒绝。若直接移除这一层，Worker/Shared 或迁移副本可能拿到只适用于本机的 Monitor runtime；前端 Runtime Settings 瞬时失败还可能在切换无关 Skill 时删除未知的持久选择。
+- **解决**：`skill_context.py` 集中计算 Codex Monitor capability：主 MCP 开启、`worker_id/shared_from_id` 均为空且 metadata 没有 Worker 管理标记或 User Skill snapshot 时才开放。Task 创建/更新/迁移导入、chat `$monitor`、Monitor API、MCP discovery/read/enable、主 MCP spec 与 Instance launch 共用该判定；Monitor API 在路由写屏障后再次检查，关闭迁移竞态。Runtime Settings 增加只读派生 capability，TaskForm/徽章/Chat/面板结合精确任务范围展示；capability 未知时隐藏/禁用但保留所有现有 key，后续请求可恢复。
+- **预防**：部署级 capability 只回答“服务是否具备能力”，不能代替 Task scope；所有产生持久化、远端代理或进程副作用的入口必须在副作用前校验，并在可能改变路由的写屏障后复核。跨 Worker snapshot 的“存在”本身就是远端管理证据，不能因 `worker_id` 暂时为空而猜成本地任务。
+- **验证**：Linux 容器聚焦后端共 `118 passed`，覆盖 Task/Chat/Monitor API、Runtime Settings、Skill context、MCP server/spec、Instance launch 及 PR7B1 的多轮/恢复/关机/停止/清理不变量；前端五个聚焦文件 `127 passed`，production build 通过。真实本地 Codex 手测验证 5 轮普通/重要报告后自动完成，以及活动 Monitor Stop 后清空调度、删除精确 thread 且不终止共享 app-server；未运行全量测试。

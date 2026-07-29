@@ -127,6 +127,29 @@ async def test_native_codex_plan_uses_default_home_exec_guard(db_factory):
     assert calls == [None]
 
 
+def test_retained_plan_agent_is_exposed_as_update_blocker(monkeypatch):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    dispatcher = MagicMock(spec=GlobalDispatcher)
+    dispatcher._active_auxiliary_session_ids.return_value = (set(), set())
+    dispatcher._monitor_processes = {}
+    dispatcher._monitor_turn_handles = {}
+    dispatcher._monitor_active_turns = set()
+    monkeypatch.setattr(
+        "backend.services.plan_agent_runner.active_plan_agent_task_ids",
+        lambda: {42},
+    )
+
+    blockers = GlobalDispatcher.active_auxiliary_blockers(dispatcher)
+
+    assert blockers == [{
+        "id": 42,
+        "title": "Plan Agent Task #42",
+        "status": "running_auxiliary",
+        "kind": "plan_agent",
+    }]
+
+
 @pytest.mark.asyncio
 async def test_pipeline_revises_then_persists_audited_approval(
     db_factory,

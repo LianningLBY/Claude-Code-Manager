@@ -168,6 +168,71 @@ async def test_codex_cannot_read_monitor_skill():
 
 
 @pytest.mark.asyncio
+async def test_local_codex_can_read_enabled_monitor_skill(monkeypatch):
+    from backend.config import settings
+    from backend.services.skill_loader import Skill
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    task_data = {
+        "provider": "codex",
+        "worker_id": None,
+        "shared_from_id": None,
+        "metadata_": {},
+        "enabled_skills": {"monitor": True},
+    }
+    skills = {
+        "monitor": Skill(
+            name="monitor",
+            description="Watch work",
+            body="monitor body",
+        ),
+    }
+    with patch.object(
+        mcp_mod,
+        "_get_task_data",
+        new=AsyncMock(return_value=task_data),
+    ), patch(
+        "backend.services.skill_loader.discover_skills",
+        return_value=skills,
+    ):
+        result = json.loads(await mcp_mod.ccm_read_skill("monitor"))
+
+    assert result["success"] is True
+    assert result["body"] == "monitor body"
+
+
+@pytest.mark.asyncio
+async def test_worker_managed_codex_cannot_enable_monitor(monkeypatch):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    get_response = MagicMock()
+    get_response.raise_for_status = MagicMock()
+    get_response.json.return_value = {
+        "provider": "codex",
+        "worker_id": None,
+        "shared_from_id": None,
+        "metadata_": {"ccm_worker_managed_task": True},
+        "enabled_skills": {},
+    }
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=get_response)
+    client.put = AsyncMock()
+
+    with patch(
+        "backend.mcp.ccm_skills_server.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = json.loads(await mcp_mod.ccm_enable_skill("monitor"))
+
+    assert result["success"] is False
+    assert "not supported" in result["error"]
+    client.put.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_read_skill_rejects_skill_not_enabled_for_task(monkeypatch):
     from backend.config import settings
     from backend.services.skill_loader import Skill

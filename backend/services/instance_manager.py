@@ -9565,7 +9565,48 @@ class InstanceManager:
             and self._pty_backend is not None
             and instance_id in getattr(self._pty_backend, "_sessions", {})
         )
-        if pty_managed:
+        from backend.services.codex_app_server import CodexTurnProcess
+
+        codex_app_server_managed = (
+            process_live and isinstance(process, CodexTurnProcess)
+        )
+        if codex_app_server_managed:
+            # A CodexTurnProcess is an adapter for one native turn; its PID is
+            # the persistent, account-scoped app-server transport rather than
+            # a task-owned POSIX process.  Generic SIGINT/TERM/KILL escalation
+            # only repeats the turn RPC and then waits forever for the shared
+            # transport PID to exit.  This is especially visible after the
+            # parent turn reaches terminal while a descendant tool remains
+            # active: descendant cleanup can fail, yet killing the adapter
+            # cannot reap that native work.
+            #
+            # The registry owns the required fail-closed escalation.  It first
+            # interrupts the exact parent/descendant turn and, if that cannot
+            # be confirmed, drains and shuts down only this account's
+            # transport before finishing the adapter.
+            registry = self._codex_app_server
+            codex_home = self._config_dirs.get(instance_id)
+            if registry is None or not codex_home:
+                raise RuntimeError(
+                    "Codex app-server turn has no registered account owner "
+                    f"for instance {instance_id}"
+                )
+            await registry.abort_unclaimed_turn(
+                codex_home,
+                process,
+                reason="CCM task session interrupted",
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(process.wait()),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Codex app-server turn for instance {instance_id} "
+                    "survived account transport cleanup"
+                ) from exc
+        elif pty_managed:
             # Esc-interrupt the turn, then tear the session down; the proxy's
             # wait() is unblocked by the backend's on_exit.  Claim terminal
             # ownership before awaiting the consumer: FullMirror.on_exit then

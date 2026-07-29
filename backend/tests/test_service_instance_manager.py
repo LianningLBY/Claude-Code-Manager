@@ -33,6 +33,7 @@ from backend.services.codex_app_server import (
     CodexRequiredMcpPreTurnError,
     CodexServiceTierUnavailableError,
     CodexThreadHomeMismatchError,
+    CodexTurnProcess,
 )
 from backend.services.codex_tier_proxy import CodexTierProxyRoute
 from backend.services.mcp_config import (
@@ -4346,6 +4347,63 @@ async def test_stop_kills_on_timeout(db_factory):
     assert result is True
     mock_proc.terminate.assert_called_once()
     mock_proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
+    """A native turn adapter must never be treated as a POSIX process group."""
+    async with db_factory() as db:
+        inst = Instance(name="codex-stop-inst", status="running", pid=43_210)
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+        inst_id = inst.id
+
+    async def interrupt():
+        raise AssertionError("InstanceManager must use registry cleanup")
+
+    process = CodexTurnProcess(43_210, interrupt, thread_id="thread-stuck")
+    registry = MagicMock()
+
+    async def abort_turn(codex_home, exact_process, *, reason):
+        assert codex_home == "/tmp/codex-stop-home"
+        assert exact_process is process
+        assert reason == "CCM task session interrupted"
+        process.finish(
+            130,
+            termination_kind="internal_abort",
+        )
+        return True
+
+    registry.abort_unclaimed_turn = AsyncMock(side_effect=abort_turn)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    im._codex_app_server = registry
+    im._config_dirs[inst_id] = "/tmp/codex-stop-home"
+    im.processes[inst_id] = process
+
+    with (
+        patch.object(
+            im,
+            "_signal_managed_process_tree",
+            new_callable=AsyncMock,
+        ) as signal_tree,
+        patch.object(
+            im,
+            "_wait_process_tree",
+            new_callable=AsyncMock,
+        ) as wait_tree,
+    ):
+        assert await im.stop(inst_id) is True
+
+    registry.abort_unclaimed_turn.assert_awaited_once()
+    signal_tree.assert_not_awaited()
+    wait_tree.assert_not_awaited()
+    assert process.returncode == 130
+    async with db_factory() as db:
+        inst = await db.get(Instance, inst_id)
+        assert inst.status == "idle"
+        assert inst.pid is None
 
 
 @pytest.mark.asyncio

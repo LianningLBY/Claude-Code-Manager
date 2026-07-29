@@ -958,7 +958,7 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **PR #77 第六轮评审修复（commit 60c096a）**：`send_chat_message` 原先在解析和校验开头 `$command` 前就分流 Worker/Shared chat，Codex `$monitor` 会先在 Manager 写日志并广播，再由远端拒绝并留下幽灵消息。现统一命令解析/能力校验：Worker 在 task operation lock 内按刷新后的 Manager provider、Shared 按刷新后的 shadow provider，在任何日志、广播、附件/Skill 同步和远端请求前 fail closed；远端仍接收原始消息做二次校验。新增 Worker `$monitor`/未知命令负向、合法 `$sub-agent` 正向和 Shared 无副作用回归，相关定向矩阵 `10 passed`；本地合成 Shared Codex Task 手测返回预期 400，数据库匹配用户日志为 0；未运行全量测试。
 - **PR #77 第七轮评审修复（本提交）**：Dispatcher 原先在 task operation lock 外把 pending Worker Task claim 为 `in_progress`，随后把 claim 前已加载的 Task 对象交给 WorkerProxy；Skill 保存与首次转发的两个锁顺序都可能让 Manager 与远端创建 payload 使用不同配置。现 pending Skill 保存与首次 claim 共用 operation lock，claim 胜出后活跃 generation 的 Skill 编辑返回 409；WorkerProxy 在远端创建前于同一锁内重新加载 Manager 权威行并校验完整 Worker generation，陈旧转发 fail closed。新增两个锁顺序、权威 Skill 重载、generation 变化拒绝及 pending/终态可编辑回归；新增核心用例 `6 passed`，相邻 Worker/Skill/dispatch 矩阵 `18 passed, 107 deselected`，`git diff --check` 通过；未运行全量测试。
 
-### 2026-07-29 — 独立 Plan Task 与显式应用协议
+### 2026-07-29 — 独立 Plan Task 与显式应用协议（commit 76e2dc3）
 
 - **决策**：Plan 永远是独立 Task。关联 Plan 只用 `plan_target_task_id` 指向目标 Task；approve/reject 不再启动 turn 或改变目标 session。已批准方案只有随下一条真实用户消息显式携带时才进入模型上下文，standalone Plan 则显式创建新的执行 Task。
 - **实现**：新增有界对话快照、HEAD/dirty 指纹、审批/应用审计和 Planner/Reviewer run/step 表；`PlanAgentRunner` 对 Claude 强制 Read/Grep/Glob 且禁 Bash/MCP/子 agent，对 Codex 强制 ephemeral/read-only sandbox/空 MCP/禁 multi-agent，统一账号池、CloudRouter admission、transient retry 与 exact process-group cleanup。ChatView 提供多 Plan 历史、审批、revision、stale 确认和持久 composer attachments。

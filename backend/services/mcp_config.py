@@ -133,6 +133,7 @@ def build_mcp_server_specs(
     api_base: str | None = None,
     *,
     provider: str = "claude",
+    codex_monitor_enabled: bool = False,
 ) -> tuple[McpServerSpec, ...]:
     """Build the main task's CCM MCP server specs.
 
@@ -142,7 +143,10 @@ def build_mcp_server_specs(
     """
 
     enabled_tools = CCM_SKILLS_TOOLS
-    if (provider or "claude").lower() == "codex":
+    if (
+        (provider or "claude").lower() == "codex"
+        and not codex_monitor_enabled
+    ):
         from backend.services.skill_context import (
             CODEX_UNSUPPORTED_MAIN_TOOLS,
         )

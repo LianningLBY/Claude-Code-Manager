@@ -21,12 +21,14 @@ vi.mock('../../api/client', () => ({
       pty_available: false,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: true,
     }),
     getWorkerRuntimeSettings: vi.fn().mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: true,
     }),
     config: vi.fn().mockResolvedValue({ model_options: ['claude-opus-4-6'], codex_model_options: [] }),
     getInjectCapabilities: vi.fn().mockResolvedValue({
@@ -69,6 +71,12 @@ vi.mock('../../hooks/useWebSocket', () => ({
 
 vi.mock('../Secrets/SecretPicker', () => ({
   SecretPicker: () => null,
+}));
+
+vi.mock('./SubAgentIndicator', () => ({
+  SubAgentIndicator: ({ onNavigate }: { onNavigate?: () => void }) => (
+    <button onClick={onNavigate}>Open monitors</button>
+  ),
 }));
 
 import { api } from '../../api/client';
@@ -127,12 +135,14 @@ describe('ChatView', () => {
       pty_available: false,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: true,
     });
     (api.getWorkerRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: true,
     });
     (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getInjectCapabilities as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -367,6 +377,47 @@ describe('ChatView', () => {
 
       await waitFor(() => expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7));
       expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    });
+
+    it('opens the Monitor panel without a warning for local Codex capability', async () => {
+      render(
+        <ChatView
+          task={makeTask({
+            provider: 'codex',
+            worker_id: null,
+            shared_from_id: null,
+          })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+      await userEvent.click(screen.getByRole('button', { name: 'Open monitors' }));
+      expect(screen.getByText('Sub-Agents')).toBeInTheDocument();
+      expect(
+        screen.queryByText(/Codex Monitor 当前仅支持 capability/),
+      ).not.toBeInTheDocument();
+    });
+
+    it('keeps the Monitor warning for a Codex Worker task', async () => {
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', worker_id: 7 })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7);
+      });
+      await userEvent.click(screen.getByRole('button', { name: 'Open monitors' }));
+      expect(
+        screen.getByText(/Codex Monitor 当前仅支持 capability/),
+      ).toBeInTheDocument();
     });
   });
 

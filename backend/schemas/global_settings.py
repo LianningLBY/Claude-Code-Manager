@@ -26,6 +26,9 @@ class RuntimeSettingsResponse(BaseModel):
     pty_available: bool
     codex_app_server_enabled: bool
     codex_main_mcp_enabled: bool
+    # Versioned capability signal. Exact Task scope is still enforced by the
+    # Task/API gates; Worker and shared Codex Tasks remain unsupported.
+    codex_monitor_enabled: bool
     auto_sort_on_access: bool
     # Effective value (DB override, else env default)
     context_compact_threshold: float

@@ -19,11 +19,13 @@ vi.mock('../../api/client', () => ({
       },
     }),
     listSkills: vi.fn().mockResolvedValue([
+      { key: 'monitor', label: 'Monitor' },
       { key: 'code-review', label: 'Code Review' },
       { key: 'sub-agent', label: 'Sub-Agent' },
     ]),
     getRuntimeSettings: vi.fn().mockResolvedValue({
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: true,
     }),
     updateTask: vi.fn().mockResolvedValue({}),
   },
@@ -85,12 +87,35 @@ describe('PluginsBadge capability failures', () => {
     first.unmount();
     vi.mocked(api.getRuntimeSettings).mockResolvedValueOnce({
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: true,
     } as Awaited<ReturnType<typeof api.getRuntimeSettings>>);
     render(<PluginsBadge task={task} onRefresh={vi.fn()} />);
     await userEvent.click(screen.getByTitle('Plugins'));
 
     expect(await screen.findByText('Code Review')).toBeInTheDocument();
     expect(api.getRuntimeSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows Monitor for local Codex but hides it for Worker scope', async () => {
+    const local = render(
+      <PluginsBadge
+        task={makeCodexTask({ worker_id: null })}
+        onRefresh={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByTitle('Plugins'));
+    expect(await screen.findByText('Monitor')).toBeInTheDocument();
+    local.unmount();
+
+    render(
+      <PluginsBadge
+        task={makeCodexTask({ worker_id: 9 })}
+        onRefresh={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByTitle('Plugins'));
+    await screen.findByText('Sub-Agent');
+    expect(screen.queryByText('Monitor')).not.toBeInTheDocument();
   });
 });
 

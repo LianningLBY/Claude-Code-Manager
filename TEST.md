@@ -572,7 +572,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_service_instance_manager.py::test_parse_codex_reasoning_becomes_thinking` 等 | codex 解析器：reasoning→thinking、file_change/mcp_tool_call/web_search→tool 事件、todo_list、error item、turn.failed 嵌套 message |
 | `test_codex_models.py::TestCodexContextWindow` | codex 模型窗口表（272K/128K，models_cache.json 实测）与回退 |
 | `test_task_migrator.py::test_migrate_codex_task_uses_codex_session_mover` 等 | 迁移按 provider 分流搬 session；rollout 文件 glob 定位 |
-| `test_api_monitor.py::test_create_monitor_rejects_codex_task` / `test_create_sub_agent_rejects_codex_task` | monitor / sub-agent 对 codex 任务显式 400（不静默跑成 Claude 子进程） |
+| `test_api_monitor.py::test_create_monitor_accepts_local_codex_task` / `test_create_sub_agent_accepts_codex_task` | 本地 Codex Monitor 与 Sub-Agent 都走各自的 Codex runtime；Worker/Shared Monitor 仍在启动任何错误 provider 子进程前显式拒绝 |
 | `test_service_pr_review.py::test_create_pr_review_task_codex_provider` | PR 审核 task 透传 repo.provider，codex 未配模型时补默认 |
 | `test_claude_pool.py::TestDispatcherRotationCodexGate` | dispatcher 轮换 gate 正反两例：codex 限额文案不轮换不冷却任何账号；同类 claude 文案照常轮换 |
 | `test_claude_pool.py::TestChatTransientRetryCodex` | chat transient retry 全链路：codex 文案触发重试且 relaunch 带 `provider=codex`；claude 文案对 codex 任务不生效；限额不触发重试；claude 正向对照 |
@@ -593,24 +593,24 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_service_dispatcher.py::test_codex_precompact_uses_full_context_tokens` | Codex 预压缩按 current context（含会进入下一请求的 output）和有效窗口触发 |
 | `test_api_pr_monitor.py::test_create_repo_with_codex_provider` 等 | PR Monitor API 层 provider 创建/默认/更新（含显式 null 清空模型防跨家族残留） |
 | 前端 `ProjectTodoList.test.tsx` | Todo Run 建 task 带 provider |
-| 前端 `TaskForm.test.tsx::Codex provider UI gating` | Codex 开放普通/User Skills 与 Sub-Agent、明确隐藏 Monitor；主 MCP kill switch 关闭时只显示 Sub-Agent |
-| 前端 `MonitorPanel.test.tsx` | codex 任务的 Monitor 面板显示「暂不支持 Codex」横幅，claude 无横幅 |
+| 前端 `TaskForm.test.tsx::Codex provider UI gating` | Codex 开放普通/User Skills 与 Sub-Agent；仅 capability 已确认的本地 Project 显示 Monitor，Worker Project 与 kill switch 关闭状态隐藏 |
+| 前端 `MonitorPanel.test.tsx` | 本地 Codex capability 已确认时不显示警告；Worker、Shared 或 capability 未知时显示本地范围限制，Claude 无横幅 |
 
 ##### Codex 普通 Skills / User Skills 对等（PR 6）
 
 | 测试 | 验证内容 |
 |------|---------|
-| `test_skill_context.py` | Claude/Codex 使用同一 task-scoped 普通/User Skill 目录；禁用项不声明、User Skill 去重且正文不预注入、Codex 排除 Monitor、Worker snapshot 可独立解析 |
+| `test_skill_context.py` | Claude/Codex 使用同一 task-scoped 普通/User Skill 目录；禁用项不声明、User Skill 去重且正文不预注入；Codex 仅在确认的本地范围包含 Monitor，Worker snapshot 可独立解析并保持关闭 |
 | `test_codex_app_server.py::test_turn_start_prefixes_task_skills_in_schema_backed_text_input` | app-server 的 fresh/resume 都把 canonical context 精确写入 Codex 0.144.6 支持的 `turn/start.input[].text`，且请求不含 schema 外字段 |
 | `test_codex_app_server.py::test_stdio_protocol_delivers_skill_catalog_in_model_visible_input` | 经真实 stdio JSON-RPC 边界和 0.144.6 `TurnStartParams` 字段过滤后，模型可见输入仍包含普通/User Skill catalog、bounded markers 与原始 prompt；未知字段会被测试 peer 丢弃并导致断言失败 |
 | `test_codex_app_server.py::test_explicit_context_turn_rejection_is_replay_safe` | app-server 显式拒绝 schema-backed context turn 时归类为 pre-turn safe fallback；未知 admission 状态仍禁止重放 |
 | `test_service_instance_manager.py` 的 canonical Skill adapter 用例 | Claude、PTY、Codex exec 与 app-server 消费同一 context，且只注入一次 |
 | `test_service_instance_manager.py::test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | safe fallback 同时保留 required MCP 与完全相同的 Skill context |
-| `test_mcp_config.py::test_codex_main_server_does_not_advertise_monitor_tools` | Codex 主 MCP 不声明三个 Monitor 工具，Claude 保持不变 |
+| `test_mcp_config.py::test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope` | Codex 主 MCP 仅为确认的本地范围声明三个 Monitor 工具；默认/Worker 范围继续裁掉，Claude 保持不变 |
 | `test_mcp_server.py::test_read_skill_rejects_skill_not_enabled_for_task` | `ccm_read_skill` 拒绝读取当前 Task 未启用的普通 Skill |
 | `test_mcp_server.py::test_codex_kill_switch_allows_only_selected_sub_agent_skill` | 主 MCP kill switch 关闭时，即使遗留配置启用了普通 Skill 也拒绝读取，同时保留已选 Sub-Agent controller |
 | `test_mcp_server.py::test_user_skill_read_is_scoped_to_selected_worker_snapshot` | `ccm_read_user_skill` 只读当前 Task 选中 ID，并优先使用 Worker snapshot |
-| `test_api_tasks.py` / `test_api_chat_plan.py` 的 Codex Skill capability 用例 | Monitor 拒绝、`$monitor` 在创建/description 更新/follow-up 三个入口持久化前拒绝、kill switch、User Skill ID 校验/去重、provider 切换与 legacy 配置更新边界 |
+| `test_api_tasks.py` / `test_api_chat_plan.py` 的 Codex Skill capability 用例 | 本地 Codex 的 Monitor 与 `$monitor` 在创建/description 更新/follow-up 三个入口允许；Worker/Shared/kill switch 关闭时在持久化、日志、广播和代理前拒绝；另覆盖 User Skill ID 校验/去重、provider 切换与 legacy 配置更新边界 |
 | `test_worker_relay_proxy.py::test_codex_worker_chat_rejects_invalid_command_before_manager_side_effects` | Worker-backed Codex chat 在 Manager operation lock 内按权威 provider 拒绝 `$monitor` 与未知的开头命令，且不写日志、不广播、不同步附件/Skills、不访问 Worker |
 | `test_api_chat_plan.py::test_codex_shared_chat_rejects_monitor_before_local_side_effects` | Shared Codex shadow 在本地日志、广播和 owner proxy 前拒绝 `$monitor`；瞬时远端拒绝不会留下幽灵消息 |
 | `test_worker_relay_proxy.py::test_codex_worker_chat_allows_sub_agent_command` | Worker-backed Codex 仍允许 `$sub-agent`，并把未改写的原始 `$command` 消息交给 Worker 端二次校验/执行 |
@@ -626,7 +626,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_worker_relay_proxy.py::test_initial_worker_forward_uses_skill_update_that_wins_claim_lock` / `test_initial_worker_forward_rejects_skill_update_after_claim` | 确定性覆盖首次 dispatch 的两个锁顺序：先完成的 pending Skill 保存进入远端创建 payload；claim 先完成后活跃 Skill 修改返回 409，Manager/Worker 不分叉 |
 | `test_worker_relay_proxy.py::test_worker_skill_update_shares_execution_admission_lock` | Worker Skill 保存与执行准入共用 task operation lock；pending/终态仍允许保存，不允许保存提交穿过正在进行的 Retry/Approve 准入窗口 |
 | `test_api_chat_plan.py::test_codex_fork_starts_before_selected_user_message` | Fork 继承普通/User Skill 选择，附件 seed 保持只消费一次 |
-| 前端 `skillCapabilities.test.ts` | Claude 不变；Codex 始终禁 Monitor，kill switch 关闭时只保留 Sub-Agent |
+| 前端 `skillCapabilities.test.ts` | Claude 不变；Codex Monitor 仅在主 MCP 与 Monitor capability 均确认且任务为本地范围时开放，Worker/Shared/未知/kill switch 关闭时只保留安全子集 |
 | 前端 `TaskBadges.test.tsx::preserves hidden Skills when runtime capability discovery fails` | Runtime Settings 瞬时失败时切换 Sub-Agent 保留当前隐藏 ordinary Skills；失败 capability 不做页面生命周期缓存，后续加载可恢复 |
 
 ##### `test_service_worktree_manager.py` — Worktree 管理器
@@ -807,7 +807,7 @@ Monitor 的调度、generation 栅栏和失败恢复已有聚焦自动化测试�
 
 #### PR7B1 Codex Monitor 内部运行时
 
-PR7B1 只建立可审计的 Codex runtime ownership；公开创建 API、TaskForm 和 MonitorPanel 的 Codex capability 仍保持关闭，开放行为留给 PR7B2。
+这是 PR7B1 合并时的历史边界：当时只建立可审计的 Codex runtime ownership，公开 capability 仍关闭。PR7B2 的开放范围与回归见下一节。
 
 | 聚焦测试 | 验证内容 |
 |---------|---------|
@@ -820,7 +820,32 @@ PR7B1 只建立可审计的 Codex runtime ownership；公开创建 API、TaskFor
 | account/task deletion fence cases | 新 Monitor 可从已失效父账号换到可用账号，已有 thread 绝不自动换号；持久或 in-flight owner 阻止原生/API Codex 账号删除，且 home maintenance 后再次核对关闭 precheck 竞态；cleanup evidence 和未提交 handle 阻止父 Task 被删除 |
 | `test_monitor_profile_is_read_only_and_disables_autonomous_features` | thread 与 turn 都为 read-only，network 关闭，multi-agent/fanout/memory/remote compaction 关闭，owner hook 先于 `turn/start` |
 | `test_mcp_config.py` | required Monitor callback MCP 复用后端当前 Python 解释器且命令真实存在，兼容 Linux venv、Docker system Python 与 Windows `Scripts/python.exe` |
-| `test_create_monitor_rejects_codex_task` / `MonitorPanel.test.tsx` | PR7B1 capability 边界不被内部 runner 意外打开；已有内部 Codex Monitor 可从面板精确 Stop，终态 thread 删除失败会显示 durable error 并保留“Retry Codex cleanup”入口 |
+| PR7B1 merge-time capability 回归（历史）/ `MonitorPanel.test.tsx` | PR7B1 未提前开放公开入口；已有内部 Codex Monitor 可从面板精确 Stop，终态 thread 删除失败会显示 durable error 并保留“Retry Codex cleanup”入口 |
+
+#### PR7B2 Codex Monitor capability 与 UI 收尾
+
+Codex Monitor 只在以下条件同时满足时开放：主 MCP 开关有效、任务为本地且非 Shared、metadata 没有 Worker 管理标记或 User Skill snapshot。Runtime Settings 的 `codex_monitor_enabled` 只报告部署级 capability；后端仍必须结合当前 Task 的精确范围判定，前端 capability 未知时 fail closed 且不得清除已保存的 Skill key。
+
+| 聚焦测试 | 验证内容 |
+|---------|---------|
+| `test_skill_context.py::test_codex_monitor_scope_is_local_and_fail_closed` | 集中式 scope 判定覆盖本地正向，以及 Worker、Shared、显式 Worker marker、snapshot 与 kill switch 负向 |
+| `test_api_tasks.py` 的 PR7B2 capability 用例 | 本地 Codex 可在创建、更新和 description `$monitor` 中启用；Worker create、migration-import 与本地→Worker 迁移在产生目标端副作用前拒绝 |
+| `test_api_chat_plan.py::test_local_codex_chat_accepts_monitor_command` 及 Worker/Shared 负向 | follow-up `$monitor` 本地可入队；Worker/Shared 在日志、广播和 proxy 前拒绝 |
+| `test_api_monitor.py::test_create_monitor_accepts_local_codex_task` 及 Worker/race 用例 | 公开 Monitor API 本地可创建；Worker 在 proxy 前拒绝；路由写屏障内迁移到 Worker 的竞态复核后不建行 |
+| `test_mcp_config.py::test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope` | 只有确认的本地 Codex main MCP spec 声明 create/check/stop 三个 Monitor 工具 |
+| `test_mcp_server.py::test_local_codex_can_read_enabled_monitor_skill` / Worker 负向 | MCP discovery/read/enable 与 API 使用同一 capability，不允许 Worker 管理副本自行打开 |
+| `test_api_settings_runtime.py` / `test_service_instance_manager.py` | Runtime GET/PUT/WS 报告部署 capability；每次 launch 从当前 Task generation 重建精确工具范围 |
+| 前端 `skillCapabilities.test.ts`、`TaskForm.test.tsx`、`TaskBadges.test.tsx` | 本地展示、Worker 隐藏、设置读取失败后保留未知/当前 Skill key，后续重试可恢复 |
+| 前端 `MonitorPanel.test.tsx`、`ChatView.test.tsx` | 本地 capability 已确认时不误报，Worker/Shared/未知时显示限制提示，WebSocket 设置更新可即时收口 |
+
+人工 E2E（测试环境）：
+
+1. 确认 `/api/settings/runtime` 返回 `codex_main_mcp_enabled=true` 且 `codex_monitor_enabled=true`。
+2. 新建本地、非共享 Codex Task；配置面板应能看到并勾选 Monitor，保存后工具徽章仍列出 Monitor。
+3. 发送以 `$monitor` 开头的消息，让它创建短间隔、最多两次检查的只读 Monitor；展开 Monitor 徽章，应看到同一 session 的 check 递增并最终 completed。
+4. 再创建一个较长间隔 Monitor，在 active turn 或 sleeping schedule 时点 Stop；状态必须停止且不再新增 check，共享 app-server 不应被终止。
+5. 若有 Worker Project，切换到该 Project 后 Monitor 应立即隐藏；直接构造 Worker/Shared `$monitor` 请求应在任何消息或 Monitor 行落库前返回 400。
+6. 可选恢复测试：让 Monitor 完成第一次 check 后进入 sleeping schedule，重启 CCM；下一次到期应复用持久化 Codex thread/history 并继续检查。
 
 聚焦回归命令：
 

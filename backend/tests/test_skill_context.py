@@ -8,7 +8,9 @@ from backend.models.task import Task
 from backend.models.user_skill import UserSkill
 from backend.services.skill_context import (
     USER_SKILL_SNAPSHOTS_METADATA_KEY,
+    WORKER_MANAGED_TASK_METADATA_KEY,
     build_task_skill_context,
+    codex_monitor_supported_for_scope,
     normalize_user_skill_ids,
     wrap_skill_context,
 )
@@ -58,7 +60,13 @@ def test_user_skill_id_normalization_is_ordered_and_deduplicated():
 
 
 @pytest.mark.asyncio
-async def test_claude_and_codex_share_task_directory_semantics(db_session):
+async def test_local_claude_and_codex_share_task_directory_semantics(
+    db_session,
+    monkeypatch,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     user_skill = UserSkill(
         name="Personal review",
         description="Apply my review checklist",
@@ -105,17 +113,53 @@ async def test_claude_and_codex_share_task_directory_semantics(db_session):
         assert "PRIVATE FULL USER SKILL BODY" not in context
         assert "ccm_read_user_skill" in context
     assert "**monitor**" in claude_context
-    assert "**monitor**" not in codex_context
+    assert "**monitor**" in codex_context
+
+
+def test_codex_monitor_scope_is_local_and_fail_closed():
+    assert codex_monitor_supported_for_scope(
+        provider="codex",
+        codex_main_mcp_enabled=True,
+    )
+    assert not codex_monitor_supported_for_scope(
+        provider="codex",
+        worker_id=3,
+        codex_main_mcp_enabled=True,
+    )
+    assert not codex_monitor_supported_for_scope(
+        provider="codex",
+        shared_from_id=4,
+        codex_main_mcp_enabled=True,
+    )
+    assert not codex_monitor_supported_for_scope(
+        provider="codex",
+        metadata={WORKER_MANAGED_TASK_METADATA_KEY: True},
+        codex_main_mcp_enabled=True,
+    )
+    assert not codex_monitor_supported_for_scope(
+        provider="codex",
+        metadata={USER_SKILL_SNAPSHOTS_METADATA_KEY: []},
+        codex_main_mcp_enabled=True,
+    )
+    assert not codex_monitor_supported_for_scope(
+        provider="codex",
+        codex_main_mcp_enabled=False,
+    )
 
 
 @pytest.mark.asyncio
 async def test_worker_snapshot_is_authoritative_without_local_user_skill(
     db_session,
+    monkeypatch,
 ):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     task = Task(
         title="worker snapshot",
         description="use snapshot",
         provider="codex",
+        enabled_skills={"monitor": True},
         selected_user_skills=[91],
         metadata_={
             USER_SKILL_SNAPSHOTS_METADATA_KEY: [{
@@ -131,7 +175,9 @@ async def test_worker_snapshot_is_authoritative_without_local_user_skill(
 
     with patch(
         "backend.services.skill_context.discover_skills",
-        return_value={},
+        return_value={
+            "monitor": _skill("monitor", "Watch work in background"),
+        },
     ):
         context = await build_task_skill_context(
             db_session,
@@ -142,6 +188,7 @@ async def test_worker_snapshot_is_authoritative_without_local_user_skill(
 
     assert "**Manager skill** (id=91): Copied to Worker" in context
     assert "Manager-only body" not in context
+    assert "**monitor**" not in context
 
 
 @pytest.mark.asyncio

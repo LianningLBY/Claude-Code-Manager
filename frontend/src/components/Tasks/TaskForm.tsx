@@ -89,6 +89,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [dropError, setDropError] = useState('');
   const [enabledPlugins, setEnabledPlugins] = useState<Record<string, boolean>>({});
   const [codexTaskSkillsEnabled, setCodexTaskSkillsEnabled] = useState(false);
+  const [codexMonitorEnabled, setCodexMonitorEnabled] = useState(false);
   const [showPluginsDropdown, setShowPluginsDropdown] = useState(false);
   const [showConfigPanel, setShowConfigPanel] = useState(false);
   const [starOnCreate, setStarOnCreate] = useState(false);
@@ -152,6 +153,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         setCodexTaskSkillsEnabled(
           runtime.codex_main_mcp_enabled !== false,
         );
+        setCodexMonitorEnabled(runtime.codex_monitor_enabled === true);
       })
       .catch(() => {});
   }, []);
@@ -168,6 +170,11 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   }, [projectId]);
 
   const [availableSkills, setAvailableSkills] = useState<{ key: string; label: string; description: string }[]>([]);
+  const selectedProject = projectId
+    ? projects.find((project) => project.id === projectId)
+    : undefined;
+  const remoteTaskScope = Boolean(workerId)
+    || selectedProject?.worker_id != null;
   useEffect(() => {
     api.listSkillsCached()
       .then((skills) => setAvailableSkills(
@@ -176,6 +183,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             provider,
             skill.key,
             codexTaskSkillsEnabled,
+            codexMonitorEnabled,
+            remoteTaskScope,
           ))
           .map((s) => ({ key: s.key, label: s.label, description: s.description })),
       ))
@@ -184,7 +193,12 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           ? [{ key: 'sub-agent', label: 'Sub-Agent', description: 'Parallel one-shot sub-agents' }]
           : [{ key: 'monitor', label: 'Monitor', description: 'Background monitoring sub-agents' }],
       ));
-  }, [provider, codexTaskSkillsEnabled]);
+  }, [
+    provider,
+    codexTaskSkillsEnabled,
+    codexMonitorEnabled,
+    remoteTaskScope,
+  ]);
   const AVAILABLE_PLUGINS = availableSkills;
   const enabledPluginCount = AVAILABLE_PLUGINS.filter(
     (skill) => enabledPlugins[skill.key],
@@ -221,6 +235,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           provider,
           key,
           codexTaskSkillsEnabled,
+          codexMonitorEnabled,
+          remoteTaskScope,
         )
       ))
       .reduce((acc, [k]) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
@@ -422,6 +438,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                 provider,
                 key,
                 codexTaskSkillsEnabled,
+                codexMonitorEnabled,
+                remoteTaskScope,
               )
             ))
             .reduce((acc, [k]) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
@@ -896,18 +914,24 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             )}
           </div>
         )}
-        {/* Codex supports ordinary Skills/User Skills through task context;
-            persistent Monitor lifecycle remains a separate PR. */}
         {provider === 'codex' && (
           <span
             className="text-xs text-gray-500 px-1 py-1.5 whitespace-nowrap"
-            title={codexTaskSkillsEnabled
-              ? '普通 Skills、User Skills 与 Sub-Agent 已支持 Codex；Monitor 尚未支持'
-              : 'Codex 主任务 MCP 已关闭；仅 Sub-Agent 可用'}
+            title={!codexTaskSkillsEnabled
+              ? 'Codex 主任务 MCP 已关闭；仅 Sub-Agent 可用'
+              : remoteTaskScope
+                ? 'Codex Monitor 当前仅支持本地、非共享任务'
+                : codexMonitorEnabled
+                  ? 'Codex Monitor 已对本地任务开放'
+                  : '当前后端尚未声明 Codex Monitor capability'}
           >
-            {codexTaskSkillsEnabled
-              ? 'Monitor 暂不支持 Codex'
-              : '主任务 MCP 已关闭 · 仅 Sub-Agent 可用'}
+            {!codexTaskSkillsEnabled
+              ? '主任务 MCP 已关闭 · 仅 Sub-Agent 可用'
+              : remoteTaskScope
+                ? 'Monitor 仅支持本地 Codex'
+                : codexMonitorEnabled
+                  ? '本地 Codex Monitor 已启用'
+                  : 'Codex Monitor capability 未知'}
           </span>
         )}
         {/* Plugins dropdown */}

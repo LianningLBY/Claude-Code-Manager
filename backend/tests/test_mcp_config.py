@@ -380,15 +380,21 @@ def test_default_api_base_and_empty_auth_token(monkeypatch):
     assert "--auth-token" not in spec.args
 
 
-def test_codex_main_server_does_not_advertise_monitor_tools():
+def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():
     (claude_spec,) = build_mcp_server_specs(42, provider="claude")
-    (codex_spec,) = build_mcp_server_specs(42, provider="codex")
+    (closed_codex_spec,) = build_mcp_server_specs(42, provider="codex")
+    (local_codex_spec,) = build_mcp_server_specs(
+        42,
+        provider="codex",
+        codex_monitor_enabled=True,
+    )
 
     monitor_tools = {"create_monitor", "check_monitors", "stop_monitor"}
     assert monitor_tools.issubset(claude_spec.enabled_tools)
-    assert monitor_tools.isdisjoint(codex_spec.enabled_tools)
-    assert "ccm_read_skill" in codex_spec.enabled_tools
-    assert "ccm_read_user_skill" in codex_spec.enabled_tools
+    assert monitor_tools.isdisjoint(closed_codex_spec.enabled_tools)
+    assert monitor_tools.issubset(local_codex_spec.enabled_tools)
+    assert "ccm_read_skill" in closed_codex_spec.enabled_tools
+    assert "ccm_read_user_skill" in closed_codex_spec.enabled_tools
 
 
 @pytest.mark.parametrize(

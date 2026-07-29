@@ -25,17 +25,30 @@ describe('MonitorPanel codex annotation', () => {
     vi.clearAllMocks();
   });
 
-  it('shows the split capability notice for codex tasks', () => {
+  it('fails closed when the Codex Monitor capability is unknown', () => {
     render(<MonitorPanel {...baseProps} provider="codex" />);
     expect(
-      screen.getByText('Sub-Agent 已支持 Codex；后台 Monitor 仍仅支持 Claude'),
+      screen.getByText(/Codex Monitor 当前仅支持 capability/),
     ).toBeInTheDocument();
+  });
+
+  it('shows no notice for a confirmed local Codex task', () => {
+    render(
+      <MonitorPanel
+        {...baseProps}
+        provider="codex"
+        monitorSupported
+      />,
+    );
+    expect(
+      screen.queryByText(/Codex Monitor 当前仅支持 capability/),
+    ).not.toBeInTheDocument();
   });
 
   it('shows no notice for claude tasks', () => {
     render(<MonitorPanel {...baseProps} provider="claude" />);
     expect(
-      screen.queryByText('Sub-Agent 已支持 Codex；后台 Monitor 仍仅支持 Claude'),
+      screen.queryByText(/Codex Monitor 当前仅支持 capability/),
     ).not.toBeInTheDocument();
   });
 

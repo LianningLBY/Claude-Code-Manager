@@ -245,6 +245,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [ptyMode, setPtyMode] = useState(false);
   const [codexAppServerEnabled, setCodexAppServerEnabled] = useState(false);
   const [codexMainMcpEnabled, setCodexMainMcpEnabled] = useState<boolean | null>(null);
+  const [codexMonitorEnabled, setCodexMonitorEnabled] = useState<boolean | null>(null);
   const [injecting, setInjecting] = useState(false);
   const injectingRef = useRef(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
@@ -257,6 +258,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   useEffect(() => {
     let active = true;
     setCodexMainMcpEnabled(null);
+    setCodexMonitorEnabled(null);
     const settingsRequest = task.worker_id == null
       ? api.getRuntimeSettings()
       : api.getWorkerRuntimeSettings(task.worker_id);
@@ -267,6 +269,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       setCodexMainMcpEnabled(
         typeof s.codex_main_mcp_enabled === 'boolean'
           ? s.codex_main_mcp_enabled
+          : null,
+      );
+      setCodexMonitorEnabled(
+        typeof s.codex_monitor_enabled === 'boolean'
+          ? s.codex_monitor_enabled
           : null,
       );
     }).catch(() => {});
@@ -537,6 +544,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         }
         if (typeof msg.data.codex_main_mcp_enabled === 'boolean') {
           setCodexMainMcpEnabled(msg.data.codex_main_mcp_enabled);
+        }
+        if (typeof msg.data.codex_monitor_enabled === 'boolean') {
+          setCodexMonitorEnabled(msg.data.codex_monitor_enabled);
         }
       }
       return;
@@ -1114,6 +1124,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     () => monitorSessions.filter((s) => s.status === 'running').length,
     [monitorSessions]
   );
+  const workerManagedTask = task.metadata_?.ccm_worker_managed_task === true
+    || task.metadata_?.ccm_user_skill_snapshots !== undefined;
+  const monitorSupported = task.provider !== 'codex' || (
+    codexMainMcpEnabled === true
+    && codexMonitorEnabled === true
+    && task.worker_id == null
+    && task.shared_from_id == null
+    && !workerManagedTask
+  );
 
   const grouped = useMemo(() => groupMessages(deduplicateSystemEvents(messages)), [messages]);
 
@@ -1674,6 +1693,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             onSessionsChange={setMonitorSessions}
             onClose={() => setShowMonitorPanel(false)}
             provider={task.provider}
+            monitorSupported={monitorSupported}
           />
         </div>
       )}

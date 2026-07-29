@@ -137,6 +137,9 @@ async def _validate_chat_command_admission(
         provider=task.provider,
         enabled_skills=command.required_skills,
         selected_user_skills=None,
+        worker_id=task.worker_id,
+        shared_from_id=task.shared_from_id,
+        metadata=task.metadata_,
     )
 
 

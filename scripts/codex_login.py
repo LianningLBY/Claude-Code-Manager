@@ -30,9 +30,11 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -399,6 +401,87 @@ def _write_private_json(path: Path, data: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _write_private_text(path: Path, content: str) -> None:
+    """Atomically persist text with owner-only permissions from first byte."""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _ensure_full_access_config(codex_home: Path) -> None:
+    """Persist CCM's unrestricted Codex defaults without losing user config."""
+
+    config_path = codex_home / "config.toml"
+    if config_path.exists() or config_path.is_symlink():
+        info = config_path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_size > 1024 * 1024
+        ):
+            raise RuntimeError("Refusing unsafe Codex config.toml")
+        original = config_path.read_text(encoding="utf-8")
+    else:
+        original = ""
+
+    try:
+        parsed = tomllib.loads(original)
+    except tomllib.TOMLDecodeError as exc:
+        raise RuntimeError("Refusing invalid Codex config.toml") from exc
+
+    lines = original.splitlines(keepends=True)
+    first_table = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^[ \t]*\[", line)
+        ),
+        len(lines),
+    )
+    preamble = "".join(lines[:first_table])
+    remainder = "".join(lines[first_table:])
+    settings = {
+        "approval_policy": '"never"',
+        "sandbox_mode": '"danger-full-access"',
+    }
+    managed_lines: list[str] = []
+    for key, value in settings.items():
+        pattern = re.compile(
+            rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=[^\r\n]*(?:\r?\n|$)"
+        )
+        if pattern.search(preamble):
+            preamble = pattern.sub("", preamble, count=1)
+        elif key in parsed:
+            raise RuntimeError(
+                f"Refusing unsupported top-level Codex config key syntax: {key}"
+            )
+        managed_lines.append(f"{key} = {value}\n")
+
+    content = "".join(managed_lines) + preamble + remainder
+    if content and not content.endswith("\n"):
+        content += "\n"
+    _write_private_text(config_path, content)
+
+
 class _ManualOtpReader:
     """Read login initialization and human OTPs over one stdin pipe."""
 
@@ -749,6 +832,8 @@ async def codex_login(
             return {"ok": False, "error": "codex did not write auth.json", "logs": logs}
 
         logs.append("auth.json written by codex")
+        _ensure_full_access_config(codex_home_path)
+        logs.append("config.toml set to full access")
 
         # 5. Smoke test
         logs.append("Running smoke test...")

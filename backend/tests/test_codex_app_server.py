@@ -434,6 +434,122 @@ async def test_standard_turn_remains_available_without_actual_tier_route():
 
 
 @pytest.mark.asyncio
+async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
+    server = CodexAppServer(
+        "codex",
+        actual_tier_proxy_route=CodexTierProxyRoute(
+            "https://upstream.example/v1",
+        ),
+    )
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-read-only-monitor",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+        },
+        {"turn": {"id": "turn-read-only-monitor"}},
+    ])
+    ownership_events = []
+
+    async def bind_thread(thread_id):
+        assert server._request.await_count == 1
+        ownership_events.append(("thread", thread_id))
+
+    async def publish_turn(process, thread_id):
+        assert server._request.await_count == 1
+        ownership_events.append(("turn", process, thread_id))
+
+    process, _thread_id = await server.start_turn(
+        prompt="inspect without writes",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=903,
+        codex_service_tier="default",
+        sandbox_mode="read-only",
+        disable_autonomous_features=True,
+        on_thread_started=bind_thread,
+        on_turn_prepared=publish_turn,
+    )
+
+    thread_call, turn_call = server._request.await_args_list
+    params = thread_call.args[1]
+    assert params["sandbox"] == "read-only"
+    assert params["config"]["features"] == {
+        "enable_request_compression": False,
+        "apps": False,
+        "enable_mcp_apps": False,
+        "multi_agent": False,
+        "multi_agent_v2": {
+            "enabled": False,
+            "max_concurrent_threads_per_session": 1,
+            "hide_spawn_agent_metadata": True,
+        },
+        "enable_fanout": False,
+        "memories": False,
+        "realtime_conversation": False,
+        "remote_compaction_v2": False,
+    }
+    assert params["config"]["agents"] == {
+        "max_threads": 1,
+        "max_depth": 1,
+    }
+    assert params["config"]["memories"] == {
+        "generate_memories": False,
+        "use_memories": False,
+        "dedicated_tools": False,
+    }
+    assert turn_call.args[1]["sandboxPolicy"] == {
+        "type": "readOnly",
+        "networkAccess": False,
+    }
+    assert ownership_events == [
+        ("thread", "thread-read-only-monitor"),
+        ("turn", process, "thread-read-only-monitor"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_turn_owner_hook_failure_prevents_model_admission():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "thread": {
+            "id": "thread-owner-hook-failure",
+            "status": {"type": "idle"},
+        },
+        "serviceTier": "default",
+    })
+
+    async def reject_owner(_process, _thread_id):
+        raise RuntimeError("owner commit failed")
+
+    with pytest.raises(RuntimeError, match="owner commit failed"):
+        await server.start_turn(
+            prompt="must not start",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=904,
+            on_turn_prepared=reject_owner,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "thread/start"
+    ]
+    assert not server.has_active_thread("thread-owner-hook-failure")
+
+
+@pytest.mark.asyncio
 async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
     server = CodexAppServer(
         "codex",
@@ -507,6 +623,9 @@ async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
     thread_call = server._request.await_args_list[1]
     fast_config = thread_call.args[1]["config"]
     assert fast_config["features"] == {
+        "enable_request_compression": False,
+        "apps": False,
+        "enable_mcp_apps": False,
         "multi_agent": False,
         "multi_agent_v2": {
             "enabled": False,
@@ -1340,6 +1459,82 @@ async def test_unsubscribe_thread_rejects_active_turn_and_validates_status():
     server._request = AsyncMock(return_value={"status": "unexpected"})
     with pytest.raises(CodexAppServerError, match="invalid status"):
         await server.unsubscribe_thread("thread-parent")
+
+
+@pytest.mark.asyncio
+async def test_recycle_thread_runtime_reloads_idle_thread_and_keeps_identity():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {},
+        {"thread": {"id": "thread-monitor"}},
+    ])
+    process = MagicMock(returncode=None)
+    server._contexts_by_thread["thread-monitor"] = SimpleNamespace(
+        process=process,
+        thread_id="thread-monitor",
+    )
+    server._known_threads.add("thread-monitor")
+
+    with pytest.raises(CodexAppServerBusyError, match="active turn"):
+        await server.recycle_thread_runtime("thread-monitor")
+
+    process.returncode = 0
+    await server.recycle_thread_runtime("thread-monitor")
+
+    assert [call.args for call in server._request.await_args_list] == [
+        ("thread/archive", {"threadId": "thread-monitor"}),
+        ("thread/unarchive", {"threadId": "thread-monitor"}),
+    ]
+    assert "thread-monitor" in server._known_threads
+
+
+@pytest.mark.asyncio
+async def test_recycle_thread_runtime_unarchives_despite_cancellation():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    archive_started = asyncio.Event()
+    release_archive = asyncio.Event()
+    calls = []
+
+    async def request(method, params):
+        calls.append((method, params))
+        if method == "thread/archive":
+            archive_started.set()
+            await release_archive.wait()
+            return {}
+        return {"thread": {"id": "thread-monitor"}}
+
+    server._request = AsyncMock(side_effect=request)
+    operation = asyncio.create_task(
+        server.recycle_thread_runtime("thread-monitor")
+    )
+    await archive_started.wait()
+    operation.cancel()
+    await asyncio.sleep(0)
+    assert not operation.done()
+
+    release_archive.set()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+
+    assert calls == [
+        ("thread/archive", {"threadId": "thread-monitor"}),
+        ("thread/unarchive", {"threadId": "thread-monitor"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recycle_thread_runtime_rejects_wrong_unarchived_thread():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {},
+        {"thread": {"id": "different-thread"}},
+    ])
+
+    with pytest.raises(CodexAppServerError, match="invalid thread"):
+        await server.recycle_thread_runtime("thread-monitor")
 
 
 @pytest.mark.asyncio
@@ -3707,6 +3902,7 @@ class _RegistryFakeServer:
         self.shutdown_count = 0
         self.steered = []
         self.create_thread_calls = []
+        self.recycle_thread_calls = []
         type(self).instances.append(self)
 
     @property
@@ -3770,6 +3966,12 @@ class _RegistryFakeServer:
         if thread_id in self.active_threads:
             raise CodexAppServerBusyError(f"{thread_id} is active")
         return "unsubscribed"
+
+    async def recycle_thread_runtime(self, thread_id):
+        if thread_id in self.active_threads:
+            raise CodexAppServerBusyError(f"{thread_id} is active")
+        self.recycle_thread_calls.append(thread_id)
+        self.known_threads.add(thread_id)
 
     async def read_rate_limits(self):
         return {
@@ -4206,6 +4408,71 @@ async def test_registry_delete_thread_releases_exact_owner_without_shutdown(
     assert home not in registry._starting
     assert server.shutdown_count == 0
     assert registry._servers[home] is server
+
+
+@pytest.mark.asyncio
+async def test_registry_recycles_exact_thread_without_releasing_owner(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "monitor-runtime")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        _, thread_id = await registry.start_turn(
+            codex_home=home,
+            resume_session_id=None,
+            task_id=52,
+        )
+        server = registry._servers[home]
+        server.active_threads.discard(thread_id)
+
+        await registry.recycle_thread_runtime(home, thread_id)
+
+    assert registry._thread_owners[thread_id] == home
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
+    assert server.recycle_thread_calls == [thread_id]
+    assert server.shutdown_count == 0
+    assert registry._servers[home] is server
+
+
+@pytest.mark.asyncio
+async def test_server_delete_thread_starts_transport_for_cold_cleanup():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={})
+
+    await server.delete_thread("thread-after-restart")
+
+    server.ensure_started.assert_awaited_once()
+    server._request.assert_awaited_once_with(
+        "thread/delete",
+        {"threadId": "thread-after-restart"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_registry_delete_thread_cold_starts_exact_home(
+    tmp_path, reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "cold-cleanup")
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        await registry.delete_thread(home, "thread-after-restart")
+
+    assert len(_RegistryFakeServer.instances) == 1
+    assert _RegistryFakeServer.instances[0].codex_home == home
+    assert registry._servers[home] is _RegistryFakeServer.instances[0]
+    assert "thread-after-restart" not in registry._thread_owners
+    assert "thread-after-restart" not in registry._starting_threads
+    assert home not in registry._starting
 
 
 @pytest.mark.asyncio

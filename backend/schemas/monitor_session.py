@@ -43,6 +43,8 @@ class MonitorSessionResponse(BaseModel):
     active_turn_generation: int | None
     consecutive_failures: int
     last_error: str | None
+    codex_cleanup_pending: bool = False
+    codex_cleanup_error: str | None = None
     created_at: datetime
     completed_at: datetime | None
 

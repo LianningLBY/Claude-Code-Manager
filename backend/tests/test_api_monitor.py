@@ -627,11 +627,109 @@ async def test_delete_monitor_session(client, session_factory):
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
+    mock_dispatcher.stop_monitor_session_process.assert_awaited_once_with(
+        ms_id,
+        terminal=True,
+    )
 
     async with session_factory() as db:
         ms = await db.get(MonitorSession, ms_id)
         assert ms.status == "cancelled"
         assert ms.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_monitor_session_reports_unconfirmed_runtime_cleanup(
+    client,
+    session_factory,
+):
+    """A terminal row must not disguise an unconfirmed Codex thread delete."""
+
+    resp = await client.post("/api/tasks", json={
+        "title": "Codex monitor cleanup",
+        "description": "d",
+        "target_repo": "/tmp",
+        "provider": "codex",
+    })
+    task_id = resp.json()["id"]
+
+    async with session_factory() as db:
+        ms = MonitorSession(
+            task_id=task_id,
+            description="cleanup-pending",
+            status="running",
+            codex_thread_id="thread-cleanup-pending",
+            codex_home="/tmp/codex-home",
+            codex_cleanup_pending=True,
+        )
+        db.add(ms)
+        await db.commit()
+        await db.refresh(ms)
+        ms_id = ms.id
+
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.stop_monitor_session_process = AsyncMock(
+        side_effect=RuntimeError("terminal thread cleanup remains pending")
+    )
+    mock_dispatcher.broadcaster = MagicMock()
+    mock_dispatcher.broadcaster.broadcast = AsyncMock()
+
+    with patch("backend.main.dispatcher", mock_dispatcher):
+        response = await client.delete(
+            f"/api/tasks/{task_id}/monitor-sessions/{ms_id}"
+        )
+
+    assert response.status_code == 409
+    assert "runtime cleanup could not be confirmed" in response.json()["detail"]
+    mock_dispatcher.stop_monitor_session_process.assert_awaited_once_with(
+        ms_id,
+        terminal=True,
+    )
+    mock_dispatcher.broadcaster.broadcast.assert_not_awaited()
+
+    async with session_factory() as db:
+        ms = await db.get(MonitorSession, ms_id)
+        assert ms.status == "cancelled"
+        assert ms.completed_at is not None
+        assert ms.codex_thread_id == "thread-cleanup-pending"
+        assert ms.codex_home == "/tmp/codex-home"
+        assert ms.codex_cleanup_pending is True
+
+    async def complete_retry(session_id, *, terminal):
+        assert session_id == ms_id
+        assert terminal is True
+        async with session_factory() as db:
+            await db.execute(
+                update(MonitorSession)
+                .where(MonitorSession.id == session_id)
+                .values(
+                    codex_thread_id=None,
+                    codex_home=None,
+                    codex_account_id=None,
+                    codex_cleanup_pending=False,
+                    codex_cleanup_error=None,
+                )
+            )
+            await db.commit()
+
+    mock_dispatcher.stop_monitor_session_process.side_effect = complete_retry
+    with patch("backend.main.dispatcher", mock_dispatcher):
+        retry = await client.delete(
+            f"/api/tasks/{task_id}/monitor-sessions/{ms_id}"
+        )
+
+    assert retry.status_code == 200
+    assert retry.json() == {"ok": True}
+    assert mock_dispatcher.stop_monitor_session_process.await_count == 2
+    # The terminal row was already cancelled by the first request, so retrying
+    # cleanup must not publish a duplicate status transition.
+    mock_dispatcher.broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        ms = await db.get(MonitorSession, ms_id)
+        assert ms.status == "cancelled"
+        assert ms.codex_thread_id is None
+        assert ms.codex_home is None
+        assert ms.codex_cleanup_pending is False
 
 
 @pytest.mark.asyncio
@@ -1276,7 +1374,8 @@ async def test_task_cancel_routes_ccm_auxiliary_reapers_by_agent_type(
 
     assert response.status_code == 200, response.text
     mock_dispatcher.stop_monitor_session_process.assert_awaited_once_with(
-        monitor_id
+        monitor_id,
+        terminal=True,
     )
     mock_dispatcher.stop_sub_agent_session_process.assert_awaited_once_with(
         sub_agent_id

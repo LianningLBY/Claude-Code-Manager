@@ -12,7 +12,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import Integer, String, Text, DateTime
+from sqlalchemy import Boolean, Integer, String, Text, DateTime
 from sqlalchemy.orm import Mapped, mapped_column, synonym
 from backend.database import Base
 
@@ -59,6 +59,42 @@ class SubAgentSession(Base):
     )
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # A Codex Monitor owns a thread independent from its parent Task.  These
+    # fields are deliberately explicit instead of being hidden in ``meta``:
+    # restart recovery, account retirement and terminal cleanup all need to
+    # query and CAS the exact runtime owner without parsing provider-specific
+    # JSON.  A non-null thread/home pair remains durable cleanup evidence even
+    # after the Monitor itself reaches a terminal status.
+    codex_thread_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    codex_home: Mapped[str | None] = mapped_column(Text, nullable=True)
+    codex_account_id: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+    codex_effort_level: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+    )
+    codex_service_tier: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+    )
+    codex_cwd: Mapped[str | None] = mapped_column(Text, nullable=True)
+    codex_disable_project_config: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+    codex_cleanup_pending: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+    codex_cleanup_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
     # 类别专属元数据 JSON（native-*: tool_use_id / agent_id / background ...）
     meta: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

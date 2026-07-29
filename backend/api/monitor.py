@@ -399,7 +399,21 @@ async def delete_monitor_session(
     await db.commit()
 
     from backend.main import dispatcher
-    await dispatcher.stop_monitor_session_process(session_id)
+    try:
+        await dispatcher.stop_monitor_session_process(
+            session_id,
+            terminal=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            409,
+            (
+                "Monitor was cancelled, but runtime cleanup could not be "
+                "confirmed; retry Stop"
+            ),
+        ) from exc
 
     from backend.services.mcp_config import cleanup_monitor_agent_mcp_config
     cleanup_monitor_agent_mcp_config(session_id)

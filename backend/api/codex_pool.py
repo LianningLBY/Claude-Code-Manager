@@ -1449,6 +1449,13 @@ def _get_instance_manager():
     return instance_manager
 
 
+def _get_dispatcher():
+    from backend.main import dispatcher
+    if not dispatcher:
+        raise HTTPException(status_code=503, detail="Dispatcher is not available")
+    return dispatcher
+
+
 @router.get("/status")
 async def codex_pool_status():
     pool = _get_pool()
@@ -2192,6 +2199,21 @@ async def codex_delete_account(request: Request, account_id: str):
     _reject_unresolved_login_transactions(pool)
 
     instance_manager = _get_instance_manager()
+    dispatcher = _get_dispatcher()
+
+    monitor_users = await dispatcher.codex_monitor_runtime_users(
+        acc.codex_home,
+        account_id=acc.id,
+    )
+    if monitor_users:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Codex account is still used by "
+                + ", ".join(monitor_users[:5])
+                + "; stop it and retry deletion"
+            ),
+        )
     await _login_lock.acquire()
     maintenance_started = False
     try:
@@ -2202,6 +2224,19 @@ async def codex_delete_account(request: Request, account_id: str):
         except CodexAppServerBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         maintenance_started = True
+        monitor_users = await dispatcher.codex_monitor_runtime_users(
+            acc.codex_home,
+            account_id=acc.id,
+        )
+        if monitor_users:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Codex account acquired a Monitor owner before deletion "
+                    "was fenced; retry after stopping "
+                    + ", ".join(monitor_users[:5])
+                ),
+            )
 
         pool_path = _pool_config_path(pool)
         data = json.loads(pool_path.read_text())

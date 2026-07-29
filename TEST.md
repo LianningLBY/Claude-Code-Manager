@@ -805,6 +805,23 @@ Monitor 的调度、generation 栅栏和失败恢复已有聚焦自动化测试�
 | 服务重启恢复 | 只恢复无 active generation 的安全 schedule；孤儿 active generation fail closed |
 | `stop_monitor` → 精确回收 | delete_monitor_session 终止当前短回合并清理 generation 专属 MCP 配置 |
 
+#### PR7B1 Codex Monitor 内部运行时
+
+PR7B1 只建立可审计的 Codex runtime ownership；公开创建 API、TaskForm 和 MonitorPanel 的 Codex capability 仍保持关闭，开放行为留给 PR7B2。
+
+| 聚焦测试 | 验证内容 |
+|---------|---------|
+| `test_codex_monitor_reuses_thread_with_read_only_generation_specs` | 连续两轮复用同一 native thread；第一轮后先 `thread/archive → thread/unarchive` 卸载旧 MCP runtime，再以新 callback generation 恢复同一 thread/history；model/effort/tier/cwd 冻结；只注入唯一 required `ccm_monitor_agent`，不继承父 Task 的 `ccm_skills`/skill context；终态删除 thread |
+| `test_codex_monitor_recycle_failure_fails_closed_and_cleans_thread` / app-server recycle cases | archive/unarchive 成对 settle，取消也不能把 thread 留在 archive；错误 thread identity 或任一回收失败都禁止进入下一轮，Monitor 立即失败并清理精确 thread |
+| `test_recovered_codex_monitor_resumes_persisted_thread_on_cold_registry` | 模拟 CCM/app-server 内存状态全部丢失，只凭 DB 中 frozen thread/home 恢复 schedule 并 resume 原 thread |
+| `test_codex_monitor_callback_cannot_beat_identity_commit` | `thread/start` 身份先持久化，callback DB 写必须等到精确 turn adapter 已发布 |
+| `test_uncommitted_codex_monitor_thread_is_deleted_before_turn_start` / `test_failed_uncommitted_thread_delete_becomes_durable_cleanup` | 身份提交失败时不允许 model admission；补偿删除再次失败仍留下可重试的 exact thread/home evidence |
+| shutdown / stop / cleanup recovery cases | 正常关机只 interrupt turn 并保留 thread；用户终止在 DB 终态后删除；无法证明 turn 终止则保留 handle 并 fail closed；冷启动重试 terminal cleanup；claim 阶段的 provider 漂移或失效冻结配置也立即清理 |
+| account/task deletion fence cases | 新 Monitor 可从已失效父账号换到可用账号，已有 thread 绝不自动换号；持久或 in-flight owner 阻止原生/API Codex 账号删除，且 home maintenance 后再次核对关闭 precheck 竞态；cleanup evidence 和未提交 handle 阻止父 Task 被删除 |
+| `test_monitor_profile_is_read_only_and_disables_autonomous_features` | thread 与 turn 都为 read-only，network 关闭，multi-agent/fanout/memory/remote compaction 关闭，owner hook 先于 `turn/start` |
+| `test_mcp_config.py` | required Monitor callback MCP 复用后端当前 Python 解释器且命令真实存在，兼容 Linux venv、Docker system Python 与 Windows `Scripts/python.exe` |
+| `test_create_monitor_rejects_codex_task` / `MonitorPanel.test.tsx` | PR7B1 capability 边界不被内部 runner 意外打开；已有内部 Codex Monitor 可从面板精确 Stop，终态 thread 删除失败会显示 durable error 并保留“Retry Codex cleanup”入口 |
+
 聚焦回归命令：
 
 ```bash

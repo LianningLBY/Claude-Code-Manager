@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +18,12 @@ from typing import Mapping, Sequence, cast
 
 
 _CCM_ROOT = str(Path(__file__).resolve().parent.parent.parent)
-_VENV_PYTHON = str(Path(_CCM_ROOT) / ".venv" / "bin" / "python3")
+# MCP servers are children of the running backend and need its exact dependency
+# environment. Reusing that interpreter is portable across Linux venvs,
+# container system Python, and Windows ``Scripts/python.exe``; constructing a
+# repository-relative ``.venv/bin/python3`` path breaks Windows-hosted bind
+# mounts even though the backend itself has all required packages.
+_VENV_PYTHON = sys.executable
 _MCP_STARTUP_TIMEOUT_SEC = 10.0
 _MCP_TOOL_TIMEOUT_SEC = 60.0
 _TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -67,6 +73,7 @@ class McpServerSpec:
     env: Mapping[str, str] = field(default_factory=dict)
     required: bool = False
     enabled_tools: tuple[str, ...] = ()
+    default_tools_approval_mode: str | None = None
     startup_timeout_sec: float | None = None
     tool_timeout_sec: float | None = None
 
@@ -111,6 +118,10 @@ def _ccm_server_spec(
         cwd=_CCM_ROOT,
         required=True,
         enabled_tools=enabled_tools,
+        # These are CCM-owned, task-scoped tools whose handlers enforce the
+        # exact Task/session/generation again. Codex app-server otherwise
+        # treats approvalPolicy="never" as a user rejection at call time.
+        default_tools_approval_mode="approve",
         startup_timeout_sec=_MCP_STARTUP_TIMEOUT_SEC,
         tool_timeout_sec=_MCP_TOOL_TIMEOUT_SEC,
     )
@@ -289,6 +300,20 @@ def render_codex_mcp_config(specs: Sequence[McpServerSpec]) -> dict[str, object]
             server["env"] = dict(spec.env)
         if spec.enabled_tools:
             server["enabled_tools"] = list(spec.enabled_tools)
+        if spec.default_tools_approval_mode is not None:
+            if spec.default_tools_approval_mode not in {
+                "auto",
+                "prompt",
+                "writes",
+                "approve",
+            }:
+                raise ValueError(
+                    "Invalid Codex default_tools_approval_mode for "
+                    f"{spec.name!r}"
+                )
+            server["default_tools_approval_mode"] = (
+                spec.default_tools_approval_mode
+            )
         if spec.startup_timeout_sec is not None:
             server["startup_timeout_sec"] = spec.startup_timeout_sec
         if spec.tool_timeout_sec is not None:

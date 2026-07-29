@@ -1875,6 +1875,31 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     expect(imgs.length).toBeGreaterThan(0);
   });
 
+  it('用带用户名的服务端消息替换无前缀乐观消息，不显示两个气泡', async () => {
+    const task = makeTask({ id: 12 });
+    render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    await act(async () => {
+      wsUserMessage(12, {
+        content: '检查训练状态',
+        raw_content: '检查训练状态',
+      });
+    });
+    expect(screen.getByText('检查训练状态')).toBeInTheDocument();
+
+    await act(async () => {
+      wsUserMessage(12, {
+        id: 991,
+        content: '[Admin] 检查训练状态',
+        raw_content: '检查训练状态',
+      });
+    });
+
+    expect(screen.getByText('[Admin] 检查训练状态')).toBeInTheDocument();
+    expect(screen.queryByText('检查训练状态')).not.toBeInTheDocument();
+  });
+
   it('Capacitor（手机 App）下附件相对 URL 必须拼上远程服务器地址', async () => {
     (window as Record<string, unknown>).Capacitor = {};
     localStorage.setItem('cc_server_url', 'https://ccm.example.com');

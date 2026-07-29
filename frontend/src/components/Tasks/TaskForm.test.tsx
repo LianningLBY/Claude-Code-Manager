@@ -49,6 +49,7 @@ vi.mock('../../api/client', () => ({
     }),
     getRuntimeSettings: vi.fn().mockResolvedValue({
       codex_main_mcp_enabled: true,
+      codex_monitor_enabled: true,
     }),
     setDefaultSkills: vi.fn().mockResolvedValue({}),
   },
@@ -455,19 +456,50 @@ describe('Codex provider UI gating', () => {
     expect(screen.getByText('Thinking')).toBeInTheDocument();
   });
 
-  it('shows Codex ordinary/User Skills while keeping Monitor unavailable', async () => {
+  it('shows Monitor with ordinary/User Skills for local Codex', async () => {
     const cliSelect = await renderAndOpenConfig();
-    expect(screen.queryByText(/Monitor 暂不支持 Codex/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/本地 Codex Monitor 已启用/)).not.toBeInTheDocument();
 
     await userEvent.selectOptions(cliSelect, 'codex');
     expect(
-      screen.getByText('Monitor 暂不支持 Codex'),
+      screen.getByText('本地 Codex Monitor 已启用'),
     ).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText(/Plugins/)).toBeInTheDocument());
     expect(screen.getByText('Skills')).toBeInTheDocument();
     await userEvent.click(screen.getByText(/Plugins/));
     expect(screen.getByText('Sub-Agent')).toBeInTheDocument();
     expect(screen.getByText('Code Review')).toBeInTheDocument();
+    expect(screen.getByText('Monitor')).toBeInTheDocument();
+  });
+
+  it('keeps Codex Monitor hidden for a Worker project', async () => {
+    vi.mocked(api.listProjects).mockResolvedValueOnce([
+      {
+        id: 1,
+        name: 'test-project',
+        worker_id: 9,
+        git_url: '',
+        has_remote: false,
+        local_path: '/tmp/test',
+        status: 'ready',
+        show_in_selector: true,
+        tags: [],
+        sort_order: 0,
+        badge_color: null,
+        env_files: [],
+      },
+    ] as Awaited<ReturnType<typeof api.listProjects>>);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(
+      await waitFor(() => screen.getByDisplayValue('Claude')),
+      'codex',
+    );
+
+    expect(screen.getByText('Monitor 仅支持本地 Codex')).toBeInTheDocument();
+    await userEvent.click(screen.getByText(/Plugins/));
+    expect(screen.getByText('Sub-Agent')).toBeInTheDocument();
     expect(screen.queryByText('Monitor')).not.toBeInTheDocument();
   });
 

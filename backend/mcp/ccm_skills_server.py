@@ -38,6 +38,21 @@ async def _get_task_data() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _codex_monitor_enabled(task_data: dict) -> bool:
+    from backend.config import settings
+    from backend.services.skill_context import (
+        codex_monitor_supported_for_scope,
+    )
+
+    return codex_monitor_supported_for_scope(
+        provider=task_data.get("provider"),
+        worker_id=task_data.get("worker_id"),
+        shared_from_id=task_data.get("shared_from_id"),
+        metadata=task_data.get("metadata_"),
+        codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+    )
+
+
 @mcp.tool()
 async def ccm_command_help() -> str:
     """列出所有可用的 CCM 命令和技能。
@@ -55,12 +70,17 @@ async def ccm_command_help() -> str:
         task_data = await _get_task_data()
         enabled_skills = task_data.get("enabled_skills") or {}
         provider = task_data.get("provider") or "claude"
+        codex_monitor_enabled = _codex_monitor_enabled(task_data)
 
         # Built-in commands
         commands = []
         for cmd in COMMAND_REGISTRY.values():
             if any(
-                not skill_supported(provider, skill_name)
+                not skill_supported(
+                    provider,
+                    skill_name,
+                    codex_monitor_enabled=codex_monitor_enabled,
+                )
                 for skill_name in cmd.required_skills
             ):
                 continue
@@ -72,7 +92,11 @@ async def ccm_command_help() -> str:
 
         # Skills from SKILL.md files
         skills = discover_skills(
-            exclude={"monitor"} if provider == "codex" else None
+            exclude=(
+                {"monitor"}
+                if provider == "codex" and not codex_monitor_enabled
+                else None
+            )
         )
         skill_list = []
         for name, skill in skills.items():
@@ -108,7 +132,11 @@ async def ccm_read_skill(skill_name: str) -> str:
         from backend.services.skill_context import skill_supported
         task_data = await _get_task_data()
         provider = (task_data.get("provider") or "claude").lower()
-        if not skill_supported(provider, skill_name):
+        if not skill_supported(
+            provider,
+            skill_name,
+            codex_monitor_enabled=_codex_monitor_enabled(task_data),
+        ):
             return json.dumps({
                 "success": False,
                 "error": (
@@ -365,6 +393,21 @@ async def ccm_enable_skill(skill_name: str) -> str:
             resp = await client.get(_api_url(""), headers=_headers())
             resp.raise_for_status()
             task_data = resp.json()
+            from backend.services.skill_context import skill_supported
+
+            provider = (task_data.get("provider") or "claude").lower()
+            if not skill_supported(
+                provider,
+                skill_name,
+                codex_monitor_enabled=_codex_monitor_enabled(task_data),
+            ):
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"Skill '{skill_name}' is not supported by provider "
+                        f"{provider} for this Task scope"
+                    ),
+                }, ensure_ascii=False)
             skills = task_data.get("enabled_skills") or {}
             if skills.get(skill_name):
                 return json.dumps({"success": True, "message": f"{skill_name} 已经是启用状态"}, ensure_ascii=False)

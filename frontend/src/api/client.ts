@@ -88,6 +88,8 @@ export interface RuntimeSettings {
   codex_app_server_enabled: boolean;
   /** Absent when proxying an older Worker that predates this capability. */
   codex_main_mcp_enabled?: boolean;
+  /** Absent on pre-PR7B2 runtimes; unknown must fail closed for Monitor. */
+  codex_monitor_enabled?: boolean;
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
   context_compact_threshold: number;
@@ -105,6 +107,7 @@ export interface GlobalSettings {
 export interface Project {
   id: number;
   name: string;
+  worker_id?: number | null;
   git_url: string | null;
   has_remote: boolean;
   local_path: string | null;
@@ -209,6 +212,8 @@ export interface Task {
     fork_seed_message?: string;
     fork_seed_log_id?: number | null;
     fork_seed_uploads?: UploadResult[];
+    ccm_worker_managed_task?: boolean;
+    ccm_user_skill_snapshots?: unknown[];
   } | null;
   context_window_usage: {
     input_tokens: number;

@@ -6,8 +6,12 @@ import { skillSupportedByProvider } from '../../config/skillCapabilities';
 
 // Plugins (SKILL.md-based) loaded from API at page load, cached globally
 let _pluginsCache: { key: string; label: string }[] | null = null;
+interface CodexTaskSkillsCapability {
+  mainMcpEnabled: boolean;
+  monitorEnabled: boolean;
+}
 let _codexTaskSkillsCapability:
-  | Promise<boolean>
+  | Promise<CodexTaskSkillsCapability>
   | null = null;
 
 export async function loadPlugins(): Promise<{ key: string; label: string }[]> {
@@ -21,10 +25,13 @@ export async function loadPlugins(): Promise<{ key: string; label: string }[]> {
   }
 }
 
-async function loadCodexTaskSkillsCapability(): Promise<boolean> {
+async function loadCodexTaskSkillsCapability(): Promise<CodexTaskSkillsCapability> {
   if (!_codexTaskSkillsCapability) {
     _codexTaskSkillsCapability = api.getRuntimeSettings()
-      .then((runtime) => runtime.codex_main_mcp_enabled !== false)
+      .then((runtime) => ({
+        mainMcpEnabled: runtime.codex_main_mcp_enabled !== false,
+        monitorEnabled: runtime.codex_monitor_enabled === true,
+      }))
       .catch((error) => {
         // A transient settings failure is capability uncertainty, not a
         // page-lifetime proof that ordinary Codex Skills are disabled.
@@ -40,15 +47,21 @@ async function loadCodexTaskSkillsCapability(): Promise<boolean> {
 export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () => void }) {
   const [open, setOpen] = useState(false);
   const [tools, setTools] = useState<{ key: string; label: string }[]>([]);
+  const remoteTaskScope = task.worker_id != null
+    || task.shared_from_id != null
+    || task.metadata_?.ccm_worker_managed_task === true
+    || task.metadata_?.ccm_user_skill_snapshots !== undefined;
 
   useEffect(() => {
     Promise.all([loadPlugins(), loadCodexTaskSkillsCapability()])
-      .then(([plugins, codexTaskSkillsEnabled]) => setTools(
+      .then(([plugins, capability]) => setTools(
         plugins.filter((plugin) => (
           skillSupportedByProvider(
             task.provider,
             plugin.key,
-            codexTaskSkillsEnabled,
+            capability.mainMcpEnabled,
+            capability.monitorEnabled,
+            remoteTaskScope,
           )
         )),
       ))
@@ -56,12 +69,18 @@ export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () =>
         loadPlugins()
           .then((plugins) => setTools(
             plugins.filter((plugin) => (
-              skillSupportedByProvider(task.provider, plugin.key, false)
+              skillSupportedByProvider(
+                task.provider,
+                plugin.key,
+                false,
+                false,
+                remoteTaskScope,
+              )
             )),
           ))
           .catch(() => {});
       });
-  }, [task.provider]);
+  }, [task.provider, remoteTaskScope]);
 
   useEffect(() => {
     if (!open) return;

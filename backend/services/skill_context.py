@@ -22,6 +22,7 @@ from backend.services.skill_loader import (
 logger = logging.getLogger(__name__)
 
 USER_SKILL_SNAPSHOTS_METADATA_KEY = "ccm_user_skill_snapshots"
+WORKER_MANAGED_TASK_METADATA_KEY = "ccm_worker_managed_task"
 CODEX_UNSUPPORTED_SKILLS = frozenset({"monitor"})
 CODEX_UNSUPPORTED_MAIN_TOOLS = frozenset(
     {"create_monitor", "check_monitors", "stop_monitor"}
@@ -47,28 +48,96 @@ class UserSkillSnapshot:
         }
 
 
-def skill_supported(provider: str | None, skill_name: str) -> bool:
+def is_worker_managed_task_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    """Identify a Task copy whose executable row is owned by a Manager.
+
+    New Manager-to-Worker writes carry an explicit marker.  The snapshot key
+    remains a compatibility marker for copies created before PR7B2; Worker
+    forwarding has always sent that key even when the selected list was empty.
+    """
+
+    return bool(
+        isinstance(metadata, Mapping)
+        and (
+            metadata.get(WORKER_MANAGED_TASK_METADATA_KEY) is True
+            or USER_SKILL_SNAPSHOTS_METADATA_KEY in metadata
+        )
+    )
+
+
+def codex_monitor_supported_for_scope(
+    *,
+    provider: str | None,
+    worker_id: int | None = None,
+    shared_from_id: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    codex_main_mcp_enabled: bool = False,
+) -> bool:
+    """Return whether this exact Task scope may expose CCM Monitor.
+
+    Claude Monitor remains unchanged.  Codex Monitor is deliberately limited
+    to a local, non-shared Task whose main-task MCP capability is known to be
+    enabled.  Manager-owned Worker copies remain closed even though their
+    Worker-local database row has ``worker_id=NULL``.
+    """
+
+    if (provider or "claude").lower() != "codex":
+        return True
+    return bool(
+        codex_main_mcp_enabled
+        and worker_id is None
+        and shared_from_id is None
+        and not is_worker_managed_task_metadata(metadata)
+    )
+
+
+def skill_supported(
+    provider: str | None,
+    skill_name: str,
+    *,
+    codex_monitor_enabled: bool = False,
+) -> bool:
     return not (
         (provider or "claude").lower() == "codex"
         and skill_name in CODEX_UNSUPPORTED_SKILLS
+        and not codex_monitor_enabled
     )
 
 
 def supported_skill_names(
     provider: str | None,
     names: Iterable[str],
+    *,
+    codex_monitor_enabled: bool = False,
 ) -> list[str]:
-    return [name for name in names if skill_supported(provider, name)]
+    return [
+        name
+        for name in names
+        if skill_supported(
+            provider,
+            name,
+            codex_monitor_enabled=codex_monitor_enabled,
+        )
+    ]
 
 
 def filter_enabled_skills(
     provider: str | None,
     enabled_skills: Mapping[str, bool] | None,
+    *,
+    codex_monitor_enabled: bool = False,
 ) -> dict[str, bool]:
     return {
         name: bool(enabled)
         for name, enabled in (enabled_skills or {}).items()
-        if enabled and skill_supported(provider, name)
+        if enabled
+        and skill_supported(
+            provider,
+            name,
+            codex_monitor_enabled=codex_monitor_enabled,
+        )
     }
 
 
@@ -221,13 +290,27 @@ async def build_task_skill_context(
     if task is None:
         return ""
     provider = (provider or task.provider or "claude").lower()
+    from backend.config import settings
+
+    codex_monitor_enabled = codex_monitor_supported_for_scope(
+        provider=provider,
+        worker_id=task.worker_id,
+        shared_from_id=task.shared_from_id,
+        metadata=task.metadata_,
+        codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+    )
     effective_skills = filter_enabled_skills(
         provider,
         enabled_skills if enabled_skills is not None else task.enabled_skills,
+        codex_monitor_enabled=codex_monitor_enabled,
     )
     discovered = discover_skills(
         project_dir=project_dir,
-        exclude=set(CODEX_UNSUPPORTED_SKILLS) if provider == "codex" else None,
+        exclude=(
+            set(CODEX_UNSUPPORTED_SKILLS)
+            if provider == "codex" and not codex_monitor_enabled
+            else None
+        ),
     )
     plugin_context = build_skill_prompt_content(discovered, effective_skills)
     user_skills = await load_user_skill_snapshots(

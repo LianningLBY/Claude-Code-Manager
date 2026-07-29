@@ -1666,7 +1666,12 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
 
     argv = list(exec_mock.await_args.args)
     expected_mcp_args = render_codex_exec_config_args(
-        build_mcp_server_specs(task.id, {}, provider="codex")
+        build_mcp_server_specs(
+            task.id,
+            {},
+            provider="codex",
+            codex_monitor_enabled=True,
+        )
     )
     flag_index = argv.index("-c")
     assert argv[flag_index : flag_index + 2] == expected_mcp_args
@@ -2347,7 +2352,12 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     exec_mock.assert_awaited_once()
     argv = list(exec_mock.await_args.args)
     expected_mcp_args = render_codex_exec_config_args(
-        build_mcp_server_specs(task.id, {}, provider="codex")
+        build_mcp_server_specs(
+            task.id,
+            {},
+            provider="codex",
+            codex_monitor_enabled=True,
+        )
     )
     flag_index = argv.index("-c")
     assert argv[flag_index : flag_index + 2] == expected_mcp_args

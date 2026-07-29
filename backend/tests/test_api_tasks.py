@@ -6,7 +6,7 @@ from datetime import datetime
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -114,7 +114,7 @@ async def test_explicit_skill_save_clears_temporary_generation_marker(
 
 
 @pytest.mark.asyncio
-async def test_codex_rejects_monitor_even_when_main_mcp_is_enabled(
+async def test_local_codex_accepts_monitor_when_main_mcp_is_enabled(
     client,
     monkeypatch,
 ):
@@ -122,18 +122,18 @@ async def test_codex_rejects_monitor_even_when_main_mcp_is_enabled(
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     response = await client.post("/api/tasks", json={
-        "title": "No Codex Monitor",
+        "title": "Local Codex Monitor",
         "description": "d",
         "provider": "codex",
         "enabled_skills": {"monitor": True},
     })
 
-    assert response.status_code == 400
-    assert "does not support Skills: monitor" in response.text
+    assert response.status_code == 201, response.text
+    assert response.json()["enabled_skills"]["monitor"] is True
 
 
 @pytest.mark.asyncio
-async def test_codex_rejects_monitor_command_even_when_skill_is_not_enabled(
+async def test_local_codex_accepts_monitor_command_without_persisting_skill(
     client,
     monkeypatch,
 ):
@@ -141,18 +141,18 @@ async def test_codex_rejects_monitor_command_even_when_skill_is_not_enabled(
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     response = await client.post("/api/tasks", json={
-        "title": "No Codex Monitor command bypass",
+        "title": "Local Codex Monitor command",
         "description": "$monitor watch the build",
         "provider": "codex",
         "enabled_skills": {},
     })
 
-    assert response.status_code == 400
-    assert "does not support Skills: monitor" in response.text
+    assert response.status_code == 201, response.text
+    assert response.json()["enabled_skills"].get("monitor") is not True
 
 
 @pytest.mark.asyncio
-async def test_codex_rejects_monitor_command_added_by_task_update(
+async def test_local_codex_accepts_monitor_command_added_by_task_update(
     client,
     monkeypatch,
 ):
@@ -160,7 +160,7 @@ async def test_codex_rejects_monitor_command_added_by_task_update(
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     created = await client.post("/api/tasks", json={
-        "title": "No updated Codex Monitor command bypass",
+        "title": "Updated local Codex Monitor command",
         "description": "ordinary task",
         "provider": "codex",
     })
@@ -170,8 +170,43 @@ async def test_codex_rejects_monitor_command_added_by_task_update(
         json={"description": "$monitor watch the build"},
     )
 
+    assert response.status_code == 200, response.text
+    assert response.json()["description"] == "$monitor watch the build"
+
+
+@pytest.mark.asyncio
+async def test_codex_worker_create_rejects_monitor_before_task_write(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.task import Task
+    from backend.models.worker import Worker
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with session_factory() as db:
+        db.add(Worker(
+            id=40,
+            name="monitor-closed-worker",
+            status="ready",
+            private_ip="10.0.0.40",
+            auth_token="token",
+        ))
+        await db.commit()
+
+    response = await client.post("/api/tasks", json={
+        "title": "No Worker Codex Monitor",
+        "description": "d",
+        "provider": "codex",
+        "worker_id": 40,
+        "enabled_skills": {"monitor": True},
+    })
+
     assert response.status_code == 400
     assert "does not support Skills: monitor" in response.text
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Task.id))) == 0
 
 
 @pytest.mark.asyncio
@@ -294,7 +329,13 @@ async def test_unrelated_update_allows_legacy_codex_monitor_configuration(
 
 
 @pytest.mark.asyncio
-async def test_provider_switch_rejects_inherited_monitor(client):
+async def test_local_provider_switch_accepts_inherited_monitor(
+    client,
+    monkeypatch,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     created = await client.post("/api/tasks", json={
         "title": "Claude Monitor",
         "description": "d",
@@ -307,26 +348,39 @@ async def test_provider_switch_rejects_inherited_monitor(client):
         json={"provider": "codex"},
     )
 
-    assert response.status_code == 400
-    assert "does not support Skills: monitor" in response.text
+    assert response.status_code == 200, response.text
+    assert response.json()["provider"] == "codex"
+    assert response.json()["enabled_skills"]["monitor"] is True
 
 
 @pytest.mark.asyncio
 async def test_invalid_skill_update_is_rejected_before_worker_migration(
     client,
     session_factory,
+    monkeypatch,
 ):
+    from backend.config import settings
     from backend.models.task import Task
+    from backend.models.worker import Worker
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
 
     async with session_factory() as db:
+        worker = Worker(
+            id=41,
+            name="monitor-destination",
+            status="ready",
+            private_ip="10.0.0.41",
+            auth_token="token",
+        )
         task = Task(
             title="Do not migrate invalid configuration",
             description="d",
-            provider="claude",
-            worker_id=41,
-            enabled_skills={},
+            provider="codex",
+            worker_id=None,
+            enabled_skills={"monitor": True},
         )
-        db.add(task)
+        db.add_all([worker, task])
         await db.commit()
         await db.refresh(task)
         task_id = task.id
@@ -335,9 +389,7 @@ async def test_invalid_skill_update_is_rejected_before_worker_migration(
     migrator.migrate = AsyncMock()
     with patch("backend.main.task_migrator", migrator):
         response = await client.put(f"/api/tasks/{task_id}", json={
-            "worker_id": -1,
-            "provider": "codex",
-            "enabled_skills": {"monitor": True},
+            "worker_id": 41,
         })
 
     assert response.status_code == 400
@@ -345,9 +397,9 @@ async def test_invalid_skill_update_is_rejected_before_worker_migration(
     migrator.migrate.assert_not_awaited()
     async with session_factory() as db:
         persisted = await db.get(Task, task_id)
-    assert persisted.worker_id == 41
-    assert persisted.provider == "claude"
-    assert persisted.enabled_skills == {}
+    assert persisted.worker_id is None
+    assert persisted.provider == "codex"
+    assert persisted.enabled_skills == {"monitor": True}
 
 
 @pytest.mark.asyncio
@@ -429,6 +481,7 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
             "id": 7001,
             "title": "Migrated",
             "description": "Resume an existing session",
+            "provider": "claude",
             "session_id": "session-1",
             "last_cwd": "/workspace/repo",
             "retry_count": 2,
@@ -458,6 +511,33 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
         "description": "Manager copy",
         "content": "full body",
     }]
+    assert task.metadata_["ccm_worker_managed_task"] is True
+
+
+@pytest.mark.asyncio
+async def test_migration_import_rejects_codex_monitor_worker_copy(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.task import Task
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7008,
+        "title": "Worker Monitor remains closed",
+        "description": "d",
+        "provider": "codex",
+        "enabled_skills": {"monitor": True},
+        "source_status": "completed",
+        "user_skill_snapshots": [],
+    })
+
+    assert response.status_code == 400
+    assert "does not support Skills: monitor" in response.text
+    async with session_factory() as db:
+        assert await db.get(Task, 7008) is None
 
 
 @pytest.mark.asyncio

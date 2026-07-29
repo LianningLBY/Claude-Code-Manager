@@ -465,13 +465,16 @@ async def test_worker_sub_agent_create_is_proxied_without_local_start(
 
 
 @pytest.mark.asyncio
-async def test_worker_monitor_create_routes_before_local_codex_gate(
+async def test_worker_codex_monitor_create_rejects_before_proxy(
     client,
     session_factory,
+    monkeypatch,
 ):
+    from backend.config import settings
     from backend.api.monitor import create_monitor_session
     from backend.schemas.monitor_session import MonitorSessionCreate
 
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     task_id = await _create_task_with_monitor(client, session_factory)
     async with session_factory() as db:
         await db.execute(
@@ -490,21 +493,129 @@ async def test_worker_monitor_create_routes_before_local_codex_gate(
             patch("backend.main.worker_proxy", proxy),
             patch("backend.main.dispatcher", dispatcher),
         ):
+            with pytest.raises(HTTPException) as exc:
+                await create_monitor_session(
+                    task_id,
+                    MonitorSessionCreate(description="remote monitor"),
+                    _admin_request(),
+                    db,
+                )
+
+    assert exc.value.status_code == 400
+    assert "local, non-shared" in exc.value.detail
+    proxy.proxy_to_worker.assert_not_awaited()
+    dispatcher.start_monitor_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_claude_monitor_create_still_routes_to_worker(
+    client,
+    session_factory,
+):
+    from backend.api.monitor import create_monitor_session
+    from backend.schemas.monitor_session import MonitorSessionCreate
+
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(worker_id=80, provider="claude")
+        )
+        await db.commit()
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"proxied": True})
+    dispatcher = MagicMock()
+    dispatcher.start_monitor_session = MagicMock()
+    async with session_factory() as db:
+        with (
+            patch("backend.main.worker_proxy", proxy),
+            patch("backend.main.dispatcher", dispatcher),
+        ):
             result = await create_monitor_session(
                 task_id,
-                MonitorSessionCreate(description="remote monitor"),
+                MonitorSessionCreate(description="remote Claude monitor"),
                 _admin_request(),
                 db,
             )
 
     assert result == {"proxied": True}
     proxy.proxy_to_worker.assert_awaited_once()
-    proxied_task, method, path = proxy.proxy_to_worker.call_args.args
-    assert proxied_task.id == task_id
-    assert proxied_task.worker_id == 79
-    assert method == "POST"
-    assert path == f"/api/tasks/{task_id}/monitor-sessions"
     dispatcher.start_monitor_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_monitor_migration_race_rejects_without_proxy_or_row(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api.monitor import create_monitor_session
+    from backend.config import settings
+    from backend.schemas.monitor_session import MonitorSessionCreate
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    response = await client.post("/api/tasks", json={
+        "title": "Codex monitor migration race",
+        "description": "d",
+        "provider": "codex",
+        "enabled_skills": {"monitor": True},
+    })
+    assert response.status_code == 201, response.text
+    task_id = response.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="in_progress")
+        )
+        await db.commit()
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"proxied": True})
+    dispatcher = MagicMock()
+    dispatcher.start_monitor_session = MagicMock()
+    async with session_factory() as db:
+        original_rollback = db.rollback
+        rollback_count = 0
+
+        async def migrate_after_routing_read():
+            nonlocal rollback_count
+            rollback_count += 1
+            await original_rollback()
+            if rollback_count == 1:
+                async with session_factory() as migration_db:
+                    await migration_db.execute(
+                        update(Task)
+                        .where(Task.id == task_id)
+                        .values(worker_id=88)
+                    )
+                    await migration_db.commit()
+
+        with (
+            patch.object(db, "rollback", side_effect=migrate_after_routing_read),
+            patch("backend.main.worker_proxy", proxy),
+            patch("backend.main.dispatcher", dispatcher),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await create_monitor_session(
+                    task_id,
+                    MonitorSessionCreate(description="must stay local"),
+                    _admin_request(),
+                    db,
+                )
+
+    assert exc.value.status_code == 400
+    proxy.proxy_to_worker.assert_not_awaited()
+    dispatcher.start_monitor_session.assert_not_called()
+    async with session_factory() as db:
+        row_count = await db.scalar(
+            select(func.count(MonitorSession.id)).where(
+                MonitorSession.task_id == task_id,
+            )
+        )
+    assert row_count == 0
 
 
 @pytest.mark.asyncio
@@ -1383,23 +1494,38 @@ async def test_task_cancel_routes_ccm_auxiliary_reapers_by_agent_type(
 
 
 @pytest.mark.asyncio
-async def test_create_monitor_rejects_codex_task(client, session_factory):
-    """Monitor 子 agent 硬编码 claude CLI——codex 任务必须显式 400，
-    而不是静默起一个 Claude 子进程。"""
+async def test_create_monitor_accepts_local_codex_task(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A local Codex task may create the scheduled Monitor runtime."""
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
         "provider": "codex",
+        "enabled_skills": {"monitor": True},
     })
     task_id = resp.json()["id"]
     async with session_factory() as db:
         await db.execute(update(Task).where(Task.id == task_id).values(status="in_progress"))
         await db.commit()
 
-    resp = await client.post(f"/api/tasks/{task_id}/monitor-sessions", json={
-        "description": "watch build",
-    })
-    assert resp.status_code == 400
-    assert "claude-only" in resp.json()["detail"]
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.start_monitor_session = MagicMock()
+    mock_dispatcher.broadcaster = MagicMock()
+    mock_dispatcher.broadcaster.broadcast = AsyncMock()
+    with patch("backend.main.dispatcher", mock_dispatcher):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions",
+            json={"description": "watch build"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["provider"] == "codex"
+    mock_dispatcher.start_monitor_session.assert_called_once()
 
 
 @pytest.mark.asyncio

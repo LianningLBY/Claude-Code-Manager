@@ -11,6 +11,7 @@ async def test_get_runtime_settings(client):
     assert "pty_available" in data
     assert "codex_app_server_enabled" in data
     assert "codex_main_mcp_enabled" in data
+    assert "codex_monitor_enabled" in data
 
 
 @pytest.mark.asyncio
@@ -25,6 +26,7 @@ async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
     get_resp = await client.get("/api/settings/runtime")
     assert get_resp.status_code == 200
     assert get_resp.json()["codex_main_mcp_enabled"] is enabled
+    assert get_resp.json()["codex_monitor_enabled"] is enabled
 
     put_resp = await client.put(
         "/api/settings/runtime",
@@ -32,6 +34,7 @@ async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
     )
     assert put_resp.status_code == 200
     assert put_resp.json()["codex_main_mcp_enabled"] is enabled
+    assert put_resp.json()["codex_monitor_enabled"] is enabled
 
 
 @pytest.mark.asyncio

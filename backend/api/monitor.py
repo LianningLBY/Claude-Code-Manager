@@ -164,6 +164,29 @@ async def _monitor_callback_error(
     )
 
 
+def _require_monitor_capability(task: Task) -> None:
+    """Enforce the same exact Task scope used by Task/Chat/MCP admission."""
+
+    from backend.config import settings
+    from backend.services.skill_context import (
+        codex_monitor_supported_for_scope,
+    )
+
+    if codex_monitor_supported_for_scope(
+        provider=task.provider,
+        worker_id=task.worker_id,
+        shared_from_id=task.shared_from_id,
+        metadata=task.metadata_,
+        codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+    ):
+        return
+    raise HTTPException(
+        400,
+        "Codex Monitor requires a local, non-shared Task and enabled "
+        "Codex main-task MCP",
+    )
+
+
 @router.post("", response_model=MonitorSessionResponse)
 async def create_monitor_session(
     task_id: int,
@@ -177,6 +200,9 @@ async def create_monitor_session(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, db)
+    # Codex Worker and shared Tasks must fail before a proxy/network side
+    # effect. Claude Worker routing remains unchanged.
+    _require_monitor_capability(task)
     if task.worker_id is not None:
         # Worker task：monitor 子进程依赖 task 所在机器的文件系统（ps/tail/signal
         # file），必须在 worker 上跑。本地镜像行由 relay 的 monitor_session_created
@@ -214,6 +240,7 @@ async def create_monitor_session(
                 task = await db.get(Task, task_id)
                 if task is None:
                     raise HTTPException(404, "Task not found")
+                _require_monitor_capability(task)
                 if task.worker_id is not None:
                     from backend.main import worker_proxy
                     if worker_proxy is None:
@@ -234,13 +261,7 @@ async def create_monitor_session(
             task = await db.get(Task, task_id)
             if task is None:
                 raise HTTPException(404, "Task not found")
-            # Monitor agents are currently hard-wired to Claude CLI.
-            if (task.provider or "claude").lower() != "claude":
-                raise HTTPException(
-                    400,
-                    "Monitor sub-agents are claude-only; this task runs on "
-                    f"provider '{task.provider}'",
-                )
+            _require_monitor_capability(task)
             skills = task.enabled_skills or {}
             if not skills.get("monitor"):
                 raise HTTPException(

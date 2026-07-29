@@ -919,6 +919,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       stream_item_id: itemId,
       native_item_type: (msg.data.native_item_type as string) || null,
       native_item_status: (msg.data.native_item_status as string) || null,
+      pty_cold_start: Boolean(msg.data.pty_cold_start),
       persisted: isPersisted,
     };
     setMessages((prev) => {
@@ -930,7 +931,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           return next;
         }
       }
-      return [...prev, entry];
+      // A PTY recovery notice describes only the active reconnect interval.
+      // The first durable event proves recovery progressed, so retire the
+      // notice instead of allowing later history merges to move it downward.
+      const current = isPersisted
+        ? prev.filter((candidate) => !candidate.pty_cold_start)
+        : prev;
+      return [...current, entry];
     });
   }, [markAskUserResolved, task.id, task.worker_id]);
 

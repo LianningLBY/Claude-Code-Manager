@@ -68,4 +68,39 @@ describe('mergeChatHistory ephemeral events', () => {
       'final answer',
     ]);
   });
+
+  it('keeps a PTY recovery notice in place until durable progress retires it', () => {
+    const older = message({
+      id: 10,
+      content: 'older output',
+      timestamp: '2026-01-01T00:00:00Z',
+      persisted: true,
+    });
+    const recovery = message({
+      id: 1000,
+      role: 'system',
+      event_type: 'system_event',
+      content: '正在恢复 PTY 会话，请稍候...',
+      timestamp: '2026-01-01T00:00:01Z',
+      pty_cold_start: true,
+    });
+
+    expect(mergeChatHistory([older], [older, recovery]).map((entry) => entry.content)).toEqual([
+      'older output',
+      '正在恢复 PTY 会话，请稍候...',
+    ]);
+
+    const progress = message({
+      id: 11,
+      content: 'recovered output',
+      timestamp: '2026-01-01T00:00:02Z',
+      persisted: true,
+    });
+    expect(
+      mergeChatHistory([older, progress], [older, recovery]).map((entry) => entry.content),
+    ).toEqual([
+      'older output',
+      'recovered output',
+    ]);
+  });
 });

@@ -80,11 +80,15 @@ function isExpiredEphemeral(
   current: ChatMessage[],
   snapshot: ChatMessage[],
 ): boolean {
-  if (message.event_type !== 'transient_retry') return false;
+  const isTransientRetry = message.event_type === 'transient_retry';
+  const isPtyRecovery = Boolean(message.pty_cold_start);
+  if (!isTransientRetry && !isPtyRecovery) return false;
 
   if (
     current.slice(currentIndex + 1).some((candidate) =>
-      candidate.persisted && candidate.event_type !== 'transient_retry'
+      candidate.persisted
+      && candidate.event_type !== 'transient_retry'
+      && !candidate.pty_cold_start
     )
   ) {
     return true;
@@ -93,7 +97,11 @@ function isExpiredEphemeral(
   const ephemeralTime = message.timestamp ? Date.parse(message.timestamp) : Number.NaN;
   if (!Number.isFinite(ephemeralTime)) return false;
   return snapshot.some((candidate) => {
-    if (!candidate.persisted || candidate.event_type === 'transient_retry') return false;
+    if (
+      !candidate.persisted
+      || candidate.event_type === 'transient_retry'
+      || candidate.pty_cold_start
+    ) return false;
     const candidateTime = candidate.timestamp ? Date.parse(candidate.timestamp) : Number.NaN;
     return Number.isFinite(candidateTime) && candidateTime > ephemeralTime;
   });

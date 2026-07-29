@@ -82,10 +82,16 @@ _MANUAL_RETRYABLE_STATUSES = frozenset(
 _WORKER_ROUTING_CONFIG_FIELDS = frozenset(
     {"provider", "model", "codex_service_tier"}
 )
+_WORKER_SKILL_CONFIG_FIELDS = frozenset(
+    {"enabled_skills", "selected_user_skills", "metadata_"}
+)
 _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
     {"worker_id", "project_id", "target_repo"}
 )
 _LOCAL_ROUTING_EDITABLE_STATUSES = (
+    WORKER_ROUTING_SAFE_STATUSES | {"pending"}
+)
+_WORKER_SKILL_EDITABLE_STATUSES = (
     WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 )
 
@@ -166,6 +172,89 @@ def _validate_task_service_tier_configuration(
         evaluator_model,
         "priority",
     )
+
+
+def _explicit_command_skills(message: str | None) -> dict[str, bool]:
+    """Return the temporary Skills requested by one leading $command."""
+
+    from backend.services.command_registry import parse_command
+
+    command, _command_args = parse_command(message or "")
+    return dict(command.required_skills or {}) if command else {}
+
+
+async def _validate_skill_configuration(
+    db: AsyncSession,
+    *,
+    provider: str | None,
+    enabled_skills: dict | None,
+    selected_user_skills: list[int] | None,
+    user_skill_snapshots: list[dict] | None = None,
+) -> list[int] | None:
+    """Validate and normalize task-scoped Skill selections."""
+
+    from backend.config import settings as app_settings
+    from backend.models.user_skill import UserSkill
+    from backend.services.skill_context import (
+        normalize_user_skill_ids,
+        skill_supported,
+        user_skill_snapshot_from_mapping,
+    )
+
+    provider = (provider or "claude").lower()
+    unsupported = sorted(
+        name
+        for name, enabled in (enabled_skills or {}).items()
+        if enabled and not skill_supported(provider, name)
+    )
+    if unsupported:
+        raise HTTPException(
+            400,
+            "Provider "
+            f"{(provider or 'claude').lower()} does not support Skills: "
+            + ", ".join(unsupported),
+        )
+
+    normalized = normalize_user_skill_ids(selected_user_skills)
+    unavailable_without_main_mcp = sorted(
+        name
+        for name, enabled in (enabled_skills or {}).items()
+        if enabled and name != "sub-agent"
+    )
+    if (
+        provider == "codex"
+        and not app_settings.codex_main_mcp_enabled
+        and (unavailable_without_main_mcp or normalized)
+    ):
+        raise HTTPException(
+            400,
+            "Codex main-task MCP is disabled; only Sub-Agent can be enabled",
+        )
+    if not normalized:
+        return [] if selected_user_skills is not None else None
+    found = set()
+    for value in user_skill_snapshots or []:
+        if not isinstance(value, dict):
+            continue
+        snapshot = user_skill_snapshot_from_mapping(value)
+        if snapshot is not None:
+            found.add(snapshot.id)
+    if user_skill_snapshots is None:
+        found.update(
+            (
+                await db.execute(
+                    select(UserSkill.id).where(UserSkill.id.in_(normalized))
+                )
+            ).scalars().all()
+        )
+    missing = [skill_id for skill_id in normalized if skill_id not in found]
+    if missing:
+        raise HTTPException(
+            400,
+            "Selected User Skills do not exist: "
+            + ", ".join(str(skill_id) for skill_id in missing),
+        )
+    return normalized
 
 
 def _find_session_jsonl(session_id: str, provider: str = "claude") -> Path | None:
@@ -393,6 +482,9 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     attachments = data.pop("attachments", None)
     secret_ids = data.pop("secret_ids", None)
     clone_from_task_id = data.pop("clone_from_task_id", None)
+    user_skill_snapshots = data.pop("user_skill_snapshots", None)
+    if user_skill_snapshots is not None:
+        require_admin(request)
     meta = data.get("metadata_") or {}
     all_paths = file_paths or image_paths
     if all_paths:
@@ -401,6 +493,12 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         meta["attachments"] = attachments
     if secret_ids:
         meta["secret_ids"] = secret_ids
+    if user_skill_snapshots is not None:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        meta[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
     if meta:
         data["metadata_"] = meta
 
@@ -424,6 +522,17 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         )
     if not data.get("effort_level"):
         data["effort_level"] = app_settings.default_effort
+    validation_skills = dict(data.get("enabled_skills") or {})
+    validation_skills.update(
+        _explicit_command_skills(data.get("description"))
+    )
+    data["selected_user_skills"] = await _validate_skill_configuration(
+        db,
+        provider=data.get("provider"),
+        enabled_skills=validation_skills,
+        selected_user_skills=data.get("selected_user_skills"),
+        user_skill_snapshots=user_skill_snapshots,
+    )
     try:
         _validate_task_service_tier_configuration(
             provider=data.get("provider"),
@@ -469,8 +578,8 @@ async def import_migrated_task(
     dispatcher.  Task migration used to call that endpoint and cancel in a
     second request, leaving a real window where the destination Worker could
     claim and execute the imported task.  This admin-only endpoint persists
-    the task as ``cancelled`` in the same transaction and never wakes the
-    dispatcher.
+    only a non-dispatchable source status in the same transaction and never
+    wakes the dispatcher.
 
     Existing inactive copies are refreshed with a status CAS.  If a legacy
     copy has already become active, fail closed instead of cancelling work
@@ -479,6 +588,8 @@ async def import_migrated_task(
     require_admin(request)
 
     data = body.model_dump()
+    source_status = data.pop("source_status")
+    user_skill_snapshots = data.pop("user_skill_snapshots", None)
     for transient_field in (
         "image_paths",
         "file_paths",
@@ -487,9 +598,17 @@ async def import_migrated_task(
         "clone_from_task_id",
     ):
         data.pop(transient_field, None)
+    if user_skill_snapshots is not None:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        data["metadata_"] = {
+            USER_SKILL_SNAPSHOTS_METADATA_KEY: user_skill_snapshots,
+        }
     data.update(
         worker_id=None,
-        status="cancelled",
+        status=source_status,
         created_by=get_current_user_id(request),
     )
 
@@ -540,9 +659,9 @@ async def import_migrated_task(
     task = await db.get(Task, body.id)
     if task is None:  # defensive: a concurrent delete must not look successful
         raise HTTPException(409, "Destination task disappeared during migration import")
-    if old_status != "cancelled":
+    if old_status != source_status:
         from backend.services.task_events import broadcast_status_change
-        await broadcast_status_change(task.id, "cancelled")
+        await broadcast_status_change(task.id, source_status)
     return task
 
 
@@ -1619,6 +1738,42 @@ async def _update_worker_task_with_routing_config(
         return updated
 
 
+async def _update_worker_task_with_skill_configuration(
+    task_id: int,
+    updates: dict,
+    request: Request,
+    queue: TaskQueue,
+    *,
+    expected_worker_id: int,
+) -> Task:
+    """Serialize Manager-authoritative Skill saves with Worker execution."""
+
+    await queue.db.rollback()
+    async with get_task_operation_lock(task_id):
+        queue.db.expire_all()
+        current = await queue.db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, queue.db)
+        if current.worker_id != expected_worker_id:
+            raise HTTPException(
+                409,
+                "Task Worker assignment changed before Skill configuration "
+                "could be saved",
+            )
+        if current.status not in _WORKER_SKILL_EDITABLE_STATUSES:
+            raise HTTPException(
+                409,
+                "Worker Task Skill configuration cannot change after an "
+                "execution claim became active; wait for the current Worker "
+                "turn to finish",
+            )
+        updated = await queue.update_task(task_id, **updates)
+        if updated is None:
+            raise HTTPException(404, "Task not found")
+        return updated
+
+
 @router.put("/{task_id}", response_model=TaskResponse)
 async def update_task(
     task_id: int, body: TaskUpdate, request: Request, queue: TaskQueue = Depends(_get_queue)
@@ -1628,6 +1783,9 @@ async def update_task(
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, queue.db)
     updates = body.model_dump(exclude_unset=True)
+    user_skill_snapshots = updates.pop("user_skill_snapshots", None)
+    if user_skill_snapshots is not None:
+        require_admin(request)
     try:
         _validate_task_service_tier_configuration(
             provider=updates.get("provider", task.provider),
@@ -1650,13 +1808,124 @@ async def update_task(
         # lets lifecycle cleanup distinguish that user write from its own
         # temporary value.
         updates["metadata_"] = clear_temporary_skills_marker(task.metadata_)
+    if user_skill_snapshots is not None:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        metadata = dict(updates.get("metadata_") or task.metadata_ or {})
+        metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = (
+            user_skill_snapshots
+        )
+        updates["metadata_"] = metadata
 
     # "off" sentinel → explicit NULL. Do this before the Worker branch so both
     # mirrors receive the same normalized value in a combined config update.
     if updates.get("system_prompt_mode") == "off":
         updates["system_prompt_mode"] = None
 
-    # An already-forwarded Worker owns the executable Task row.  Synchronize
+    # Validate the effective Skill configuration before routing
+    # synchronization or Worker migration can create externally visible state.
+    effective_provider = updates.get("provider", task.provider)
+    effective_description = updates.get("description", task.description)
+    command_skills = _explicit_command_skills(effective_description)
+    skill_configuration_changed = bool(
+        {"provider", "enabled_skills", "selected_user_skills"} & updates.keys()
+    ) or user_skill_snapshots is not None or bool(
+        command_skills and "description" in updates
+    )
+    if skill_configuration_changed:
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+        )
+
+        effective_skills = dict(updates.get(
+            "enabled_skills",
+            task.enabled_skills,
+        ) or {})
+        effective_skills.update(command_skills)
+        effective_user_skills = updates.get(
+            "selected_user_skills",
+            task.selected_user_skills,
+        )
+        normalized_user_skills = await _validate_skill_configuration(
+            queue.db,
+            provider=effective_provider,
+            enabled_skills=effective_skills,
+            selected_user_skills=effective_user_skills,
+            user_skill_snapshots=(
+                user_skill_snapshots
+                if user_skill_snapshots is not None
+                else (task.metadata_ or {}).get(
+                    USER_SKILL_SNAPSHOTS_METADATA_KEY
+                )
+            ),
+        )
+        if "selected_user_skills" in updates:
+            updates["selected_user_skills"] = normalized_user_skills
+
+    worker_id_supplied = "worker_id" in updates
+    target_project = None
+    target_project_id = updates.get("project_id", task.project_id)
+    if target_project_id is not None:
+        from backend.models.project import Project
+
+        target_project = await queue.db.get(Project, target_project_id)
+        if target_project is None:
+            raise HTTPException(404, "Project not found")
+        await require_project_access(request, target_project_id, queue.db)
+        if (
+            "project_id" in updates
+            and not worker_id_supplied
+            and task.worker_id != target_project.worker_id
+        ):
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+    elif "project_id" in updates and not worker_id_supplied:
+        await require_worker_target_access(request, task.worker_id, queue.db)
+
+    # 执行位置切换走 TaskMigrator（同 mode/model 一样在 task 详情改，
+    # 但语义是迁移而非改字段）。-1 = 切回本机
+    if "worker_id" in updates:
+        target = updates.pop("worker_id")
+        if target == -1:
+            target = None
+        if target_project is not None and target != target_project.worker_id:
+            raise HTTPException(
+                400,
+                "Task Worker must match the selected Project location",
+            )
+        if target_project is None:
+            await require_worker_target_access(request, target, queue.db)
+        if task.worker_id != target:
+            from backend.main import task_migrator
+            if task_migrator is None:
+                raise HTTPException(503, "Worker 功能未启用")
+            from backend.services.task_migrator import MigrationError
+            try:
+                # 同步执行：迁移结束后才返回，前端拿到的就是最终状态。
+                # 大工作目录会久——前端按钮置灰 + migrating 状态广播兜底
+                if updates:
+                    await task_migrator.migrate(
+                        task_id,
+                        target,
+                        task_updates=updates,
+                    )
+                else:
+                    await task_migrator.migrate(task_id, target)
+            except MigrationError as e:
+                raise HTTPException(409, str(e))
+            # migrate 在独立 session 写库；当前 DI session 的 identity map
+            # 还缓存着旧 worker_id，必须 expire 否则响应返回迁移前的值
+            queue.db.expire_all()
+            migrated = await queue.get(task_id)
+            if not migrated:
+                raise HTTPException(404, "Task not found")
+            return migrated
+
+    # An already-forwarded Worker owns the executable Task row. Synchronize
     # its complete routing tuple before making the Manager mirror visible.
     if (
         task.worker_id is not None
@@ -1684,54 +1953,22 @@ async def update_task(
             )
         )
 
-    target_project = None
-    target_project_id = updates.get("project_id", task.project_id)
-    if target_project_id is not None:
-        from backend.models.project import Project
-
-        target_project = await queue.db.get(Project, target_project_id)
-        if target_project is None:
-            raise HTTPException(404, "Project not found")
-        await require_project_access(request, target_project_id, queue.db)
-        if (
-            "project_id" in updates
-            and "worker_id" not in updates
-            and task.worker_id != target_project.worker_id
-        ):
-            raise HTTPException(
-                400,
-                "Task Worker must match the selected Project location",
+    # Skill-only edits remain Manager-authoritative until the next turn, but
+    # they must commit under the same lock as retry/chat/plan approval.  This
+    # gives every execution admission one unambiguous final tuple to sync.
+    if (
+        task.worker_id is not None
+        and _WORKER_SKILL_CONFIG_FIELDS.intersection(updates)
+    ):
+        return await _finish_task_operation(
+            _update_worker_task_with_skill_configuration(
+                task_id,
+                updates,
+                request,
+                queue,
+                expected_worker_id=task.worker_id,
             )
-    elif "project_id" in updates and "worker_id" not in updates:
-        await require_worker_target_access(request, task.worker_id, queue.db)
-
-    # 执行位置切换走 TaskMigrator（同 mode/model 一样在 task 详情改，
-    # 但语义是迁移而非改字段）。-1 = 切回本机
-    if "worker_id" in updates:
-        target = updates.pop("worker_id")
-        if target == -1:
-            target = None
-        if target_project is not None and target != target_project.worker_id:
-            raise HTTPException(
-                400,
-                "Task Worker must match the selected Project location",
-            )
-        if target_project is None:
-            await require_worker_target_access(request, target, queue.db)
-        if task.worker_id != target:
-            from backend.main import task_migrator
-            if task_migrator is None:
-                raise HTTPException(503, "Worker 功能未启用")
-            from backend.services.task_migrator import MigrationError
-            try:
-                # 同步执行：迁移结束后才返回，前端拿到的就是最终状态。
-                # 大工作目录会久——前端按钮置灰 + migrating 状态广播兜底
-                await task_migrator.migrate(task_id, target)
-            except MigrationError as e:
-                raise HTTPException(409, str(e))
-            # migrate 在独立 session 写库；当前 DI session 的 identity map
-            # 还缓存着旧 worker_id，必须 expire 否则响应返回迁移前的值
-            queue.db.expire_all()
+        )
 
     if not updates:
         task = await queue.get(task_id)
@@ -2211,6 +2448,17 @@ async def _proxy(
             **proxy_options,
         )
     return await worker_proxy.proxy_to_worker(task, method, path, body)
+
+
+async def _sync_worker_skill_selection_before_execution(task: Task) -> None:
+    """Confirm Manager Skills on the Worker before an executable transition."""
+
+    from backend.main import worker_proxy
+
+    if worker_proxy is None:
+        raise HTTPException(503, "Worker 功能未启用")
+    worker = await worker_proxy.require_ready_worker(task.worker_id)
+    await worker_proxy.sync_task_skill_selection(worker, task)
 
 
 async def _sync_task_from_worker_response(
@@ -3156,6 +3404,23 @@ async def retry_task(
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
+            await _sync_worker_skill_selection_before_execution(current)
+            await db.rollback()
+            db.expire_all()
+            current = await db.get(Task, task_id)
+            if (
+                current is None
+                or worker_task_generation(
+                    current,
+                    expected_worker_id=observed.worker_id,
+                )
+                != observed
+            ):
+                raise HTTPException(
+                    409,
+                    "Task Worker generation changed while Skill selection was "
+                    "being synchronized",
+                )
             result = await _proxy(
                 current,
                 "POST",
@@ -3289,6 +3554,23 @@ async def approve_plan(
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
+            await _sync_worker_skill_selection_before_execution(current)
+            await db.rollback()
+            db.expire_all()
+            current = await db.get(Task, task_id)
+            if (
+                current is None
+                or worker_task_generation(
+                    current,
+                    expected_worker_id=observed.worker_id,
+                )
+                != observed
+            ):
+                raise HTTPException(
+                    409,
+                    "Task Worker generation changed while Skill selection was "
+                    "being synchronized",
+                )
             result = await _proxy(
                 current,
                 "POST",

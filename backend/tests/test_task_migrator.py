@@ -100,6 +100,227 @@ async def test_migrate_local_to_worker(db_factory, session_factory, monkeypatch)
     m._ensure_worker_task.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "source_is_worker",
+    [False, True],
+    ids=["local-to-worker", "worker-to-worker"],
+)
+@pytest.mark.parametrize(
+    "local_collision",
+    [False, True],
+    ids=["missing-local-row", "colliding-local-row"],
+)
+async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
+    db_factory,
+    session_factory,
+    monkeypatch,
+    source_is_worker,
+    local_collision,
+):
+    from backend.models.user_skill import UserSkill
+
+    source = (
+        await _mk_worker(session_factory, name="source")
+        if source_is_worker
+        else None
+    )
+    destination = await _mk_worker(
+        session_factory,
+        name="destination",
+        private_ip="10.0.0.10",
+    )
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id if source else None,
+        provider="claude",
+        enabled_skills={},
+        selected_user_skills=None,
+        metadata_={"existing": "value"},
+    )
+    snapshots = [{
+        "id": 81,
+        "name": "Personal Review",
+        "description": "Review checklist",
+        "content": "Check the final diff.",
+    }]
+    final_metadata = {
+        "existing": "value",
+        "ccm_user_skill_snapshots": snapshots,
+    }
+    if local_collision:
+        async with session_factory() as db:
+            db.add(UserSkill(
+                id=81,
+                name="Wrong local collision",
+                description="must not replace Manager snapshot",
+                content="wrong local body",
+            ))
+            await db.commit()
+    task_updates = {
+        "provider": "codex",
+        "enabled_skills": {"sub-agent": True},
+        "selected_user_skills": [81],
+        "metadata_": final_metadata,
+    }
+    requests = []
+
+    class Response:
+        status_code = 201
+        text = ""
+
+        def __init__(self, status):
+            self.status = status
+
+        def json(self):
+            return {"status": self.status}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            requests.append((url, headers, json))
+            return Response(json["source_status"])
+
+    monkeypatch.setattr(
+        task_migrator_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+    proxy = AsyncMock()
+    proxy.ensure_worker_project.return_value = 17
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    migrator = _migrator(db_factory)
+    migrator._ensure_worker_task = (
+        TaskMigrator._ensure_worker_task.__get__(migrator, TaskMigrator)
+    )
+
+    await migrator.migrate(
+        task.id,
+        destination.id,
+        task_updates=task_updates,
+    )
+
+    assert len(requests) == 1
+    _url, _headers, payload = requests[0]
+    assert payload["provider"] == "codex"
+    assert payload["source_status"] == "completed"
+    assert payload["enabled_skills"] == {"sub-agent": True}
+    assert payload["selected_user_skills"] == [81]
+    assert payload["user_skill_snapshots"] == snapshots
+    async with session_factory() as db:
+        persisted = await db.get(Task, task.id)
+    assert persisted.worker_id == destination.id
+    assert persisted.provider == payload["provider"]
+    assert persisted.enabled_skills == payload["enabled_skills"]
+    assert persisted.selected_user_skills == payload["selected_user_skills"]
+    assert persisted.metadata_["ccm_user_skill_snapshots"] == snapshots
+
+
+async def test_coordinated_migration_failure_keeps_original_manager_config(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    destination = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        provider="claude",
+        enabled_skills={"monitor": True},
+        selected_user_skills=None,
+        metadata_={"original": True},
+        status="failed",
+    )
+    migrator = _migrator(db_factory)
+    migrator._ensure_worker_task = AsyncMock(
+        side_effect=RuntimeError("destination import failed")
+    )
+    proxy = AsyncMock()
+    proxy.ensure_worker_project.return_value = 17
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    with pytest.raises(RuntimeError, match="destination import failed"):
+        await migrator.migrate(
+            task.id,
+            destination.id,
+            task_updates={
+                "provider": "codex",
+                "enabled_skills": {"sub-agent": True},
+                "selected_user_skills": [81],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": [{
+                        "id": 81,
+                        "name": "Personal Review",
+                        "description": "",
+                        "content": "Review.",
+                    }],
+                },
+            },
+        )
+
+    async with session_factory() as db:
+        persisted = await db.get(Task, task.id)
+    assert persisted.worker_id is None
+    assert persisted.status == "failed"
+    assert persisted.provider == "claude"
+    assert persisted.enabled_skills == {"monitor": True}
+    assert persisted.selected_user_skills is None
+    assert persisted.metadata_ == {"original": True}
+
+
+async def test_coordinated_migration_claim_cas_preserves_concurrent_config(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    destination = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        provider="claude",
+        enabled_skills={},
+    )
+    migrator = _migrator(db_factory)
+    real_get_worker = migrator._get_worker
+
+    async def update_while_validating(worker_id):
+        worker = await real_get_worker(worker_id)
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(enabled_skills={"concurrent": True})
+            )
+            await db.commit()
+        return worker
+
+    monkeypatch.setattr(
+        migrator,
+        "_get_worker",
+        update_while_validating,
+    )
+
+    with pytest.raises(MigrationError):
+        await migrator.migrate(
+            task.id,
+            destination.id,
+            task_updates={"enabled_skills": {"sub-agent": True}},
+        )
+
+    async with session_factory() as db:
+        persisted = await db.get(Task, task.id)
+    assert persisted.worker_id is None
+    assert persisted.status == "completed"
+    assert persisted.enabled_skills == {"concurrent": True}
+    migrator._ensure_worker_task.assert_not_called()
+
+
 async def test_migrate_worker_to_local(db_factory, session_factory):
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, worker_id=w.id, session_id="sess-1")
@@ -551,10 +772,12 @@ async def test_worker_task_import_is_one_inert_request(
         status_code = 201
         text = ""
 
-        @staticmethod
-        def json():
+        def __init__(self, status):
+            self.status = status
+
+        def json(self):
             return {
-                "status": "cancelled",
+                "status": self.status,
                 "codex_service_tier": "priority",
             }
 
@@ -571,7 +794,7 @@ async def test_worker_task_import_is_one_inert_request(
 
         async def post(self, url, *, headers, json):
             requests.append((url, headers, json))
-            return Response()
+            return Response(json["source_status"])
 
     monkeypatch.setattr(
         task_migrator_module.httpx,
@@ -586,8 +809,11 @@ async def test_worker_task_import_is_one_inert_request(
     url, _headers, payload = requests[0]
     assert url.endswith("/api/tasks/migration-import")
     assert payload["id"] == t.id
+    assert payload["source_status"] == "completed"
     assert payload["project_id"] == 17
     assert payload["retry_count"] == 2
+    assert payload["selected_user_skills"] is None
+    assert payload["user_skill_snapshots"] == []
     assert payload["codex_service_tier"] == "priority"
 
 

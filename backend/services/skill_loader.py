@@ -227,35 +227,7 @@ def build_skill_prompt_file(
     """
     import tempfile
 
-    lines: list[str] = []
-
-    # Filter to enabled skills (if enabled_skills provided)
-    active = skills
-    if enabled_skills is not None:
-        active = {
-            k: v for k, v in skills.items()
-            if enabled_skills.get(k, False) or v.ccm.always
-        }
-
-    # L0: Skill directory (all active skills, name + description)
-    if active:
-        lines.append("## Available Skills\n")
-        lines.append("The following skills are available. Use ccm_read_skill(name) to load full details.\n")
-        for skill in sorted(active.values(), key=lambda s: s.ccm.priority, reverse=True):
-            desc = skill.description.strip().replace("\n", " ")[:100]
-            lines.append(f"- **{skill.name}**: {desc}")
-        lines.append("")
-
-    # L1: Always-on skill bodies (budget-controlled)
-    always_skills = select_always_skills(active)
-    if always_skills:
-        lines.append("## Active Skill Instructions\n")
-        for skill in always_skills:
-            lines.append(f"### {skill.name}\n")
-            lines.append(skill.body)
-            lines.append("")
-
-    content = "\n".join(lines)
+    content = build_skill_prompt_content(skills, enabled_skills)
     if not content.strip():
         return ""
 
@@ -267,6 +239,52 @@ def build_skill_prompt_file(
         f.write(content)
 
     return path
+
+
+def build_skill_prompt_content(
+    skills: dict[str, Skill],
+    enabled_skills: dict[str, bool] | None = None,
+) -> str:
+    """Render the canonical plugin Skill directory and always-on bodies.
+
+    This function deliberately has no provider or transport knowledge.  Claude
+    can materialize the returned text as an append-system-prompt file, while
+    Codex can attach the exact same text to a turn.
+    """
+
+    lines: list[str] = []
+
+    active = skills
+    if enabled_skills is not None:
+        active = {
+            key: skill
+            for key, skill in skills.items()
+            if enabled_skills.get(key, False) or skill.ccm.always
+        }
+
+    if active:
+        lines.append("## Available Skills\n")
+        lines.append(
+            "The following skills are available. "
+            "Use ccm_read_skill(name) to load full details.\n"
+        )
+        for skill in sorted(
+            active.values(),
+            key=lambda item: (-item.ccm.priority, item.name),
+        ):
+            desc = skill.description.strip().replace("\n", " ")[:100]
+            lines.append(f"- **{skill.name}**: {desc}")
+        lines.append("")
+
+    always_skills = select_always_skills(active)
+    if always_skills:
+        lines.append("## Active Skill Instructions\n")
+        for skill in always_skills:
+            lines.append(f"### {skill.name}\n")
+            lines.append(skill.body)
+            lines.append("")
+
+    return "\n".join(lines)
 
 
 def get_skill_disallowed_tools(

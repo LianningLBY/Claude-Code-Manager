@@ -151,3 +151,152 @@ async def test_stop_monitor_api_error():
     data = json.loads(result)
     assert data["success"] is False
     assert "not found" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_codex_cannot_read_monitor_skill():
+    with patch.object(
+        mcp_mod,
+        "_get_task_data",
+        new=AsyncMock(return_value={"provider": "codex"}),
+    ):
+        result = await mcp_mod.ccm_read_skill("monitor")
+
+    data = json.loads(result)
+    assert data["success"] is False
+    assert "not supported" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_read_skill_rejects_skill_not_enabled_for_task(monkeypatch):
+    from backend.config import settings
+    from backend.services.skill_loader import Skill
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    task_data = {
+        "provider": "codex",
+        "enabled_skills": {},
+    }
+    skills = {
+        "code-review": Skill(
+            name="code-review",
+            description="Review changes",
+            body="review body",
+        ),
+    }
+    with patch.object(
+        mcp_mod,
+        "_get_task_data",
+        new=AsyncMock(return_value=task_data),
+    ), patch(
+        "backend.services.skill_loader.discover_skills",
+        return_value=skills,
+    ):
+        result = json.loads(await mcp_mod.ccm_read_skill("code-review"))
+
+    assert result["success"] is False
+    assert "not enabled for this task" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_codex_kill_switch_allows_only_selected_sub_agent_skill(
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.services.skill_loader import Skill
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    task_data = {
+        "provider": "codex",
+        # Include a stale ordinary selection to prove the kill switch remains
+        # authoritative even if legacy task state bypassed API validation.
+        "enabled_skills": {
+            "code-review": True,
+            "sub-agent": True,
+        },
+    }
+    skills = {
+        "code-review": Skill(
+            name="code-review",
+            description="Review changes",
+            body="review body",
+        ),
+        "sub-agent": Skill(
+            name="sub-agent",
+            description="Delegate tracked work",
+            body="sub-agent body",
+        ),
+    }
+    with patch.object(
+        mcp_mod,
+        "_get_task_data",
+        new=AsyncMock(return_value=task_data),
+    ), patch(
+        "backend.services.skill_loader.discover_skills",
+        return_value=skills,
+    ):
+        ordinary = json.loads(
+            await mcp_mod.ccm_read_skill("code-review")
+        )
+        sub_agent = json.loads(
+            await mcp_mod.ccm_read_skill("sub-agent")
+        )
+
+    assert ordinary["success"] is False
+    assert "main-task MCP is disabled" in ordinary["error"]
+    assert sub_agent["success"] is True
+    assert sub_agent["body"] == "sub-agent body"
+
+
+@pytest.mark.asyncio
+async def test_user_skill_read_is_scoped_to_selected_worker_snapshot():
+    task_data = {
+        "provider": "codex",
+        "selected_user_skills": [8],
+        "metadata_": {
+            "ccm_user_skill_snapshots": [{
+                "id": 8,
+                "name": "Worker copy",
+                "description": "Manager snapshot",
+                "content": "full copied body",
+            }],
+        },
+    }
+    with patch.object(
+        mcp_mod,
+        "_get_task_data",
+        new=AsyncMock(return_value=task_data),
+    ):
+        selected = json.loads(await mcp_mod.ccm_read_user_skill(8))
+        unselected = json.loads(await mcp_mod.ccm_read_user_skill(9))
+
+    assert selected == {
+        "success": True,
+        "id": 8,
+        "name": "Worker copy",
+        "description": "Manager snapshot",
+        "content": "full copied body",
+    }
+    assert unselected["success"] is False
+    assert "not selected" in unselected["error"]
+
+
+@pytest.mark.asyncio
+async def test_missing_worker_snapshot_never_falls_back_to_local_user_skill():
+    task_data = {
+        "provider": "codex",
+        "selected_user_skills": [8],
+        "metadata_": {"ccm_user_skill_snapshots": []},
+    }
+    with patch.object(
+        mcp_mod,
+        "_get_task_data",
+        new=AsyncMock(return_value=task_data),
+    ), patch(
+        "backend.database.async_session",
+    ) as local_db:
+        result = json.loads(await mcp_mod.ccm_read_user_skill(8))
+
+    assert result["success"] is False
+    assert "authoritative task snapshot" in result["error"]
+    local_db.assert_not_called()

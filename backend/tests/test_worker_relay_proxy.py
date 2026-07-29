@@ -19,6 +19,7 @@ from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
 from backend.schemas.task import TaskCreate
 from backend.services.worker_proxy import (
@@ -397,22 +398,213 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         provider="codex",
         codex_service_tier="priority",
         enable_workflows=False,
+        selected_user_skills=[5],
         tags=["pr-review"],
         metadata_={"pr_review_id": 123},
     )
     proxy.get_worker = AsyncMock(return_value=worker)
     proxy.ensure_worker_project = AsyncMock(return_value=34)
+    proxy._user_skill_snapshots = AsyncMock(return_value=[{
+        "id": 5,
+        "name": "Manager skill",
+        "description": "copied",
+        "content": "body",
+    }])
 
     await proxy._forward_task_to_worker_locked(task)
 
     parsed_on_worker = TaskCreate.model_validate(captured_payload)
     assert captured_payload["tags"] == ["pr-review"]
+    assert captured_payload["selected_user_skills"] == [5]
+    assert captured_payload["user_skill_snapshots"] == [{
+        "id": 5,
+        "name": "Manager skill",
+        "description": "copied",
+        "content": "body",
+    }]
     assert captured_payload["codex_service_tier"] == "priority"
     assert parsed_on_worker.tags == ["pr-review"]
     assert parsed_on_worker.codex_service_tier == "priority"
     # metadata_ is intentionally not a public TaskCreate field; the hidden
     # termination endpoint accepts the forwarded tag only for Worker copies.
     assert not hasattr(parsed_on_worker, "metadata_")
+
+
+async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
+    captured_payload = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": task.id,
+                "status": task.status,
+                "retry_count": task.retry_count,
+                # Worker instance ids belong to a different database and are
+                # intentionally not comparable with the Manager mirror.
+                "instance_id": None,
+                "enabled_skills": captured_payload["enabled_skills"],
+                "selected_user_skills": captured_payload[
+                    "selected_user_skills"
+                ],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": captured_payload[
+                        "user_skill_snapshots"
+                    ],
+                },
+            }
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def put(self, _url, *, headers, json):
+            captured_payload.update(json)
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    proxy._user_skill_snapshots = AsyncMock(return_value=[{
+        "id": 6,
+        "name": "Updated skill",
+        "description": "latest selection",
+        "content": "body",
+    }])
+    worker = Worker(
+        id=78,
+        name="worker",
+        private_ip="10.0.0.78",
+        auth_token="token",
+    )
+    task = Task(
+        id=902,
+        title="remote",
+        description="continue",
+        worker_id=worker.id,
+        enabled_skills={"code-review": True},
+        selected_user_skills=[6],
+    )
+
+    await proxy.sync_task_skill_selection(worker, task)
+
+    assert captured_payload == {
+        "enabled_skills": {"code-review": True},
+        "selected_user_skills": [6],
+        "user_skill_snapshots": [{
+            "id": 6,
+            "name": "Updated skill",
+            "description": "latest selection",
+            "content": "body",
+        }],
+    }
+
+
+async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
+    monkeypatch,
+):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": task.id,
+                "status": task.status,
+                "retry_count": task.retry_count,
+                "instance_id": task.instance_id,
+                "enabled_skills": {},
+                "selected_user_skills": [],
+                "metadata_": {"ccm_user_skill_snapshots": []},
+            }
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def put(self, _url, *, headers, json):
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    proxy._user_skill_snapshots = AsyncMock(return_value=[{
+        "id": 9,
+        "name": "Authoritative",
+        "description": "Manager copy",
+        "content": "body",
+    }])
+    worker = Worker(
+        id=79,
+        name="worker",
+        private_ip="10.0.0.79",
+        auth_token="token",
+    )
+    task = Task(
+        id=903,
+        title="remote",
+        description="continue",
+        worker_id=worker.id,
+        instance_id=444,
+        enabled_skills={"code-review": True},
+        selected_user_skills=[9],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await proxy.sync_task_skill_selection(worker, task)
+
+    assert exc.value.status_code == 409
+    assert "execution was blocked" in exc.value.detail
+
+
+@pytest.mark.parametrize(
+    "local_collision",
+    [False, True],
+    ids=["missing-local-row", "colliding-local-row"],
+)
+async def test_worker_proxy_uses_authoritative_user_skill_snapshots(
+    session_factory,
+    local_collision,
+):
+    from backend.models.user_skill import UserSkill
+
+    if local_collision:
+        async with session_factory() as db:
+            db.add(UserSkill(
+                id=86,
+                name="Wrong Worker-local skill",
+                description="must not replace Manager snapshot",
+                content="wrong local body",
+            ))
+            await db.commit()
+
+    authoritative = [{
+        "id": 86,
+        "name": "Manager snapshot",
+        "description": "authoritative",
+        "content": "correct Manager body",
+    }]
+    task = Task(
+        id=986,
+        title="snapshot forwarding",
+        selected_user_skills=[86],
+        metadata_={"ccm_user_skill_snapshots": authoritative},
+    )
+    proxy = WorkerProxy(session_factory, relay=AsyncMock())
+
+    assert await proxy._user_skill_snapshots(task) == authoritative
 
 
 async def test_worker_fast_fails_before_forward_when_capability_is_unproven(
@@ -1799,6 +1991,298 @@ async def test_dispatch_worker_forwards_refreshed_claimed_task(
     assert forwarded_task.title == "current title"
 
 
+def _capture_initial_worker_task_create(
+    monkeypatch,
+    captured_payloads,
+    *,
+    post_entered=None,
+    release_post=None,
+):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            captured_payloads.append(json)
+            if post_entered is not None:
+                post_entered.set()
+            if release_post is not None:
+                await release_post.wait()
+            return Response()
+
+    monkeypatch.setattr(
+        worker_proxy_module.httpx,
+        "AsyncClient",
+        Client,
+    )
+
+
+async def test_worker_forward_reloads_authoritative_skills_after_lock_wait(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    async with session_factory() as db:
+        user_skill = UserSkill(
+            name="Reloaded forward skill",
+            description="latest description",
+            content="latest content",
+        )
+        db.add(user_skill)
+        await db.commit()
+        await db.refresh(user_skill)
+        user_skill_id = user_skill.id
+    stale_task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        enabled_skills={"code-review": False},
+        selected_user_skills=[],
+    )
+    captured_payloads = []
+    _capture_initial_worker_task_create(
+        monkeypatch,
+        captured_payloads,
+    )
+    proxy = WorkerProxy(db_factory, relay=AsyncMock())
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=None)
+    lock = proxy.task_operation_lock(stale_task.id)
+
+    await lock.acquire()
+    forward = asyncio.create_task(
+        proxy.forward_task_to_worker(stale_task)
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert captured_payloads == []
+
+    async with session_factory() as db:
+        current = await db.get(Task, stale_task.id)
+        current.enabled_skills = {"code-review": True}
+        current.selected_user_skills = [user_skill_id]
+        await db.commit()
+    lock.release()
+    await forward
+
+    assert captured_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
+    assert captured_payloads[0]["selected_user_skills"] == [user_skill_id]
+    assert captured_payloads[0]["user_skill_snapshots"] == [{
+        "id": user_skill_id,
+        "name": "Reloaded forward skill",
+        "description": "latest description",
+        "content": "latest content",
+    }]
+
+
+async def test_worker_forward_rejects_generation_change_after_lock_wait(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    stale_task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+    )
+    captured_payloads = []
+    _capture_initial_worker_task_create(
+        monkeypatch,
+        captured_payloads,
+    )
+    proxy = WorkerProxy(db_factory, relay=AsyncMock())
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=None)
+    lock = proxy.task_operation_lock(stale_task.id)
+
+    await lock.acquire()
+    forward = asyncio.create_task(
+        proxy.forward_task_to_worker(stale_task)
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == stale_task.id)
+            .values(retry_count=Task.retry_count + 1)
+        )
+        await db.commit()
+    lock.release()
+
+    with pytest.raises(
+        RuntimeError,
+        match="generation changed before initial forwarding",
+    ):
+        await forward
+    assert captured_payloads == []
+
+
+async def test_initial_worker_forward_uses_skill_update_that_wins_claim_lock(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    """A pending Skill save that wins the fence must reach task creation."""
+
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    async with session_factory() as db:
+        user_skill = UserSkill(
+            name="Initial dispatch skill",
+            description="fresh description",
+            content="fresh content",
+        )
+        db.add(user_skill)
+        await db.commit()
+        await db.refresh(user_skill)
+        user_skill_id = user_skill.id
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+        enabled_skills={"code-review": False},
+        selected_user_skills=[],
+    )
+
+    captured_payloads = []
+    _capture_initial_worker_task_create(
+        monkeypatch,
+        captured_payloads,
+    )
+    proxy = WorkerProxy(db_factory, relay=AsyncMock())
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=None)
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    original_get_lock = worker_proxy_module.get_task_operation_lock
+    lock = original_get_lock(task.id)
+    await lock.acquire()
+    claim_lock_requested = asyncio.Event()
+
+    def observed_get_lock(task_id):
+        claim_lock_requested.set()
+        return original_get_lock(task_id)
+
+    monkeypatch.setattr(
+        worker_proxy_module,
+        "get_task_operation_lock",
+        observed_get_lock,
+    )
+    dispatch_request = asyncio.create_task(
+        dispatcher._dispatch_worker_tasks()
+    )
+    await claim_lock_requested.wait()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        current.enabled_skills = {"code-review": True}
+        current.selected_user_skills = [user_skill_id]
+        await db.commit()
+    lock.release()
+
+    await dispatch_request
+    forward = dispatcher._running_tasks.get(f"worker-{task.id}")
+    assert forward is not None
+    await forward
+
+    assert len(captured_payloads) == 1
+    assert captured_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
+    assert captured_payloads[0]["selected_user_skills"] == [user_skill_id]
+    assert captured_payloads[0]["user_skill_snapshots"] == [{
+        "id": user_skill_id,
+        "name": "Initial dispatch skill",
+        "description": "fresh description",
+        "content": "fresh content",
+    }]
+
+
+async def test_initial_worker_forward_rejects_skill_update_after_claim(
+    client,
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    """A Skill edit cannot change the Manager mirror after remote creation wins."""
+
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+        enabled_skills={"code-review": False},
+    )
+    post_entered = asyncio.Event()
+    release_post = asyncio.Event()
+    captured_payloads = []
+    _capture_initial_worker_task_create(
+        monkeypatch,
+        captured_payloads,
+        post_entered=post_entered,
+        release_post=release_post,
+    )
+    proxy = WorkerProxy(db_factory, relay=AsyncMock())
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=None)
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+    forward = dispatcher._running_tasks.get(f"worker-{task.id}")
+    assert forward is not None
+    await post_entered.wait()
+
+    update_request = asyncio.create_task(client.put(
+        f"/api/tasks/{task.id}",
+        json={"enabled_skills": {"code-review": True}},
+    ))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not update_request.done()
+
+    release_post.set()
+    await forward
+    response = await update_request
+
+    assert response.status_code == 409
+    assert "execution claim" in response.text
+    assert captured_payloads[0]["enabled_skills"] == {
+        "code-review": False,
+    }
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "in_progress"
+    assert current.enabled_skills == {"code-review": False}
+
+
 async def test_dispatch_worker_target_repo_fill_preserves_concurrent_project_edit(
     session_factory,
     broadcaster,
@@ -3058,6 +3542,377 @@ async def test_worker_execution_reconciles_orphan_stage_to_manager_tuple(
     assert proxy.proxy_to_worker.await_count == 3
 
 
+@pytest.mark.parametrize(
+    ("status", "mode", "action_path", "retry_delta"),
+    [
+        pytest.param(
+            "completed",
+            "auto",
+            "retry",
+            1,
+            id="retry",
+        ),
+        pytest.param(
+            "plan_review",
+            "plan",
+            "plan/approve",
+            0,
+            id="plan-approve",
+        ),
+    ],
+)
+async def test_worker_execution_admission_syncs_latest_manager_skills(
+    client,
+    session_factory,
+    monkeypatch,
+    status,
+    mode,
+    action_path,
+    retry_delta,
+):
+    worker = await _mk_worker(session_factory)
+    async with session_factory() as db:
+        user_skill = UserSkill(
+            name=f"Final {action_path} skill",
+            description="Manager-authoritative description",
+            content="Manager-authoritative content",
+        )
+        db.add(user_skill)
+        await db.commit()
+        await db.refresh(user_skill)
+        user_skill_id = user_skill.id
+
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status=status,
+        mode=mode,
+        plan_content="approved plan" if mode == "plan" else None,
+        enabled_skills={"code-review": False},
+        selected_user_skills=[],
+    )
+    admission_order = []
+    worker_skill_payloads = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": task.id,
+                "status": task.status,
+                "retry_count": task.retry_count,
+                "instance_id": task.instance_id,
+                "enabled_skills": self.payload["enabled_skills"],
+                "selected_user_skills": self.payload[
+                    "selected_user_skills"
+                ],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": self.payload[
+                        "user_skill_snapshots"
+                    ],
+                },
+            }
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def put(self, _url, *, headers, json):
+            admission_order.append("skills")
+            worker_skill_payloads.append(json)
+            return Response(json)
+
+    async def protocol(current, method, path, body=None, **_kwargs):
+        if method == "GET":
+            assert path.endswith("/routing-config/status")
+            return _routing_snapshot(current)
+        assert method == "POST"
+        assert path.endswith(f"/{action_path}")
+        assert admission_order[-1] == "skills"
+        admission_order.append(action_path)
+        return _remote_task(
+            current,
+            status="pending",
+            retry_count=current.retry_count + retry_delta,
+            completed_at=None,
+            plan_approved=True if mode == "plan" else current.plan_approved,
+        )
+
+    proxy = WorkerProxy(session_factory, relay=AsyncMock())
+    proxy.proxy_to_worker = AsyncMock(side_effect=protocol)
+    monkeypatch.setattr(
+        worker_proxy_module.httpx,
+        "AsyncClient",
+        Client,
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    updated = await client.put(
+        f"/api/tasks/{task.id}",
+        json={
+            "enabled_skills": {"code-review": True},
+            "selected_user_skills": [user_skill_id],
+        },
+    )
+    assert updated.status_code == 200, updated.text
+
+    response = await client.post(f"/api/tasks/{task.id}/{action_path}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "pending"
+    assert admission_order == ["skills", action_path]
+    assert len(worker_skill_payloads) == 1
+    assert worker_skill_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
+    assert worker_skill_payloads[0]["selected_user_skills"] == [
+        user_skill_id,
+    ]
+    assert worker_skill_payloads[0]["user_skill_snapshots"] == [{
+        "id": user_skill_id,
+        "name": f"Final {action_path} skill",
+        "description": "Manager-authoritative description",
+        "content": "Manager-authoritative content",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("source_status", "mode", "action_path"),
+    [
+        pytest.param("completed", "auto", "retry", id="retry"),
+        pytest.param("completed", "auto", "chat", id="chat"),
+        pytest.param(
+            "plan_review",
+            "plan",
+            "plan/approve",
+            id="plan-approve",
+        ),
+    ],
+)
+async def test_migrated_inert_task_can_start_its_next_worker_turn(
+    client,
+    db_factory,
+    session_factory,
+    monkeypatch,
+    source_status,
+    mode,
+    action_path,
+):
+    """Migration and the next admission agree on one remote generation."""
+
+    from backend.services.task_migrator import TaskMigrator
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        status=source_status,
+        mode=mode,
+        plan_content="ready plan" if mode == "plan" else None,
+        instance_id=444,
+        enabled_skills={"code-review": True},
+    )
+    relay = AsyncMock()
+    remote: dict = {}
+    imported_statuses = []
+    skill_payloads = []
+
+    class Response:
+        text = ""
+
+        def __init__(self, payload, status_code=200):
+            self.payload = payload
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return dict(self.payload)
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, *, headers, json):
+            assert url.endswith("/api/tasks/migration-import")
+            imported_statuses.append(json["source_status"])
+            remote.update({
+                "id": json["id"],
+                "status": json["source_status"],
+                "retry_count": json["retry_count"],
+                "instance_id": None,
+                "enabled_skills": json["enabled_skills"],
+                "selected_user_skills": json["selected_user_skills"],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": json[
+                        "user_skill_snapshots"
+                    ],
+                },
+                "provider": json["provider"],
+                "model": json["model"],
+                "codex_service_tier": json["codex_service_tier"],
+            })
+            return Response(remote, status_code=201)
+
+        async def put(self, url, *, headers, json):
+            assert url.endswith(f"/api/tasks/{task.id}")
+            skill_payloads.append(json)
+            remote["enabled_skills"] = json["enabled_skills"]
+            remote["selected_user_skills"] = json["selected_user_skills"]
+            remote["metadata_"]["ccm_user_skill_snapshots"] = json[
+                "user_skill_snapshots"
+            ]
+            return Response(remote)
+
+    async def worker_protocol(current, method, path, body=None, **_kwargs):
+        if method == "GET":
+            assert path.endswith("/routing-config/status")
+            return _routing_snapshot(
+                current,
+                status=remote["status"],
+            )
+        assert method == "POST"
+        if action_path == "retry":
+            assert path.endswith("/retry")
+            assert remote["status"] == "completed"
+            remote.update(
+                status="pending",
+                retry_count=remote["retry_count"] + 1,
+                instance_id=None,
+            )
+            return _remote_task(
+                current,
+                status="pending",
+                retry_count=remote["retry_count"],
+                completed_at=None,
+            )
+        if action_path == "plan/approve":
+            assert path.endswith("/plan/approve")
+            assert remote["status"] == "plan_review"
+            remote.update(status="pending", instance_id=None)
+            return _remote_task(
+                current,
+                status="pending",
+                retry_count=remote["retry_count"],
+                completed_at=None,
+                plan_approved=True,
+            )
+        assert path.endswith("/chat")
+        assert remote["status"] == "completed"
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": "migrated-session",
+        }
+
+    monkeypatch.setattr(
+        worker_proxy_module.httpx,
+        "AsyncClient",
+        Client,
+    )
+    proxy = WorkerProxy(db_factory, relay=relay)
+    proxy.ensure_worker_project = AsyncMock(return_value=17)
+    proxy.proxy_to_worker = AsyncMock(side_effect=worker_protocol)
+    migrator = TaskMigrator(
+        db_factory=db_factory,
+        relay=relay,
+        broadcaster=None,
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "task_migrator", migrator)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+
+    migrated = await client.put(
+        f"/api/tasks/{task.id}",
+        json={"worker_id": worker.id},
+    )
+
+    assert migrated.status_code == 200, migrated.text
+    assert migrated.json()["status"] == source_status
+    assert migrated.json()["worker_id"] == worker.id
+    assert imported_statuses == [source_status]
+    assert remote["instance_id"] is None
+
+    if action_path == "chat":
+        response = await client.post(
+            f"/api/tasks/{task.id}/chat",
+            json={"message": "continue after migration"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["queued"] is True
+    else:
+        response = await client.post(
+            f"/api/tasks/{task.id}/{action_path}",
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "pending"
+
+    assert len(skill_payloads) == 1
+    assert skill_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
+
+
+@pytest.mark.parametrize("status", ["pending", "completed"])
+async def test_worker_skill_update_shares_execution_admission_lock(
+    client,
+    session_factory,
+    monkeypatch,
+    status,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status=status,
+        enabled_skills={"code-review": False},
+    )
+    update_entered = asyncio.Event()
+    original_update = tasks_api_module.TaskQueue.update_task
+
+    async def observed_update(self, task_id, **updates):
+        update_entered.set()
+        return await original_update(self, task_id, **updates)
+
+    monkeypatch.setattr(
+        tasks_api_module.TaskQueue,
+        "update_task",
+        observed_update,
+    )
+    lock = worker_proxy_module.get_task_operation_lock(task.id)
+    async with lock:
+        pending = asyncio.create_task(client.put(
+            f"/api/tasks/{task.id}",
+            json={"enabled_skills": {"code-review": True}},
+        ))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not update_entered.is_set()
+
+    response = await pending
+
+    assert response.status_code == 200, response.text
+    assert update_entered.is_set()
+    assert response.json()["enabled_skills"]["code-review"] is True
+
+
 async def test_worker_standard_execution_accepts_matching_legacy_routing(
     session_factory,
     monkeypatch,
@@ -3705,6 +4560,97 @@ async def test_local_dequeue_skips_worker_tasks(session_factory):
         q = TaskQueue(db)
         got = await q.dequeue()
     assert got is not None and got.id == local.id
+
+
+@pytest.mark.parametrize(
+    ("message", "detail"),
+    [
+        ("$monitor watch the build", "does not support Skills: monitor"),
+        ("$not-a-command explain this", "$not-a-command"),
+    ],
+)
+async def test_codex_worker_chat_rejects_invalid_command_before_manager_side_effects(
+    client,
+    session_factory,
+    monkeypatch,
+    message,
+    detail,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        provider="codex",
+        status="completed",
+    )
+    proxy = AsyncMock()
+    proxy.relay = AsyncMock()
+    broadcaster = FakeBroadcaster()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": message},
+    )
+
+    assert response.status_code == 400
+    assert detail in response.text
+    async with session_factory() as db:
+        stored = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert stored == []
+    assert broadcaster.sent == []
+    proxy.require_ready_worker.assert_not_awaited()
+    proxy.push_files.assert_not_awaited()
+    proxy.sync_task_skill_selection.assert_not_awaited()
+    proxy.proxy_to_worker.assert_not_awaited()
+    proxy.relay.subscribe_task.assert_not_awaited()
+
+
+async def test_codex_worker_chat_allows_sub_agent_command(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        provider="codex",
+        status="completed",
+    )
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = AsyncMock()
+
+    async def route_then_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        return {"ok": True, "queued": True}
+
+    proxy.proxy_to_worker.side_effect = route_then_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+
+    message = "$sub-agent review the change"
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": message},
+    )
+
+    assert response.status_code == 200, response.text
+    chat_call = next(
+        call
+        for call in proxy.proxy_to_worker.await_args_list
+        if call.args[1] == "POST"
+    )
+    assert chat_call.kwargs["body"]["message"] == message
+    proxy.sync_task_skill_selection.assert_awaited_once()
 
 
 async def test_chat_proxy_for_worker_task(client, session_factory, monkeypatch):

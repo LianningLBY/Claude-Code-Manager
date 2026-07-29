@@ -13,6 +13,15 @@ from pydantic import (
 from backend.config import settings
 
 
+class UserSkillSnapshotPayload(BaseModel):
+    """Internal Manager→Worker copy of one selected User Skill."""
+
+    id: int = Field(gt=0)
+    name: str = Field(min_length=1, max_length=100)
+    description: str = ""
+    content: str = ""
+
+
 def _normalize_task_provider(value: object) -> str:
     """Canonicalize an explicit task provider without accepting empty input."""
 
@@ -61,6 +70,7 @@ class TaskCreate(BaseModel):
     enable_workflows: bool = False
     enabled_skills: dict | None = None
     selected_user_skills: list[int] | None = None
+    user_skill_snapshots: list[UserSkillSnapshotPayload] | None = None
     tags: list[str] | None = None
     image_paths: list[str] | None = None  # kept for backwards compat
     file_paths: list[str] | None = None
@@ -96,6 +106,15 @@ class TaskMigrationImport(TaskCreate):
     # Keep Manager and destination Worker retry generations monotonic. This is
     # intentionally internal-only; public task creation always starts at zero.
     retry_count: int = Field(default=0, ge=0)
+    # Migration may preserve an already-inert source state without ever
+    # exposing a dispatchable ``pending`` row on the destination Worker.
+    source_status: Literal[
+        "plan_review",
+        "completed",
+        "failed",
+        "cancelled",
+        "conflict",
+    ] = "cancelled"
 
 
 class TaskTerminationRequest(BaseModel):
@@ -198,6 +217,7 @@ class TaskUpdate(BaseModel):
     enable_workflows: bool | None = None
     enabled_skills: dict | None = None
     selected_user_skills: list[int] | None = None
+    user_skill_snapshots: list[UserSkillSnapshotPayload] | None = None
     provider: str | None = None
     starred: bool | None = None
     tags: list[str] | None = None

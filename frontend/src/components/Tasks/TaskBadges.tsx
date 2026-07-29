@@ -2,9 +2,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { Wrench, Users, Settings } from '../icons';
 import { api } from '../../api/client';
 import type { CodexServiceTier, Task, SubAgentSummary } from '../../api/client';
+import { skillSupportedByProvider } from '../../config/skillCapabilities';
 
 // Plugins (SKILL.md-based) loaded from API at page load, cached globally
 let _pluginsCache: { key: string; label: string }[] | null = null;
+let _codexTaskSkillsCapability:
+  | Promise<boolean>
+  | null = null;
 
 export async function loadPlugins(): Promise<{ key: string; label: string }[]> {
   if (_pluginsCache) return _pluginsCache;
@@ -17,6 +21,20 @@ export async function loadPlugins(): Promise<{ key: string; label: string }[]> {
   }
 }
 
+async function loadCodexTaskSkillsCapability(): Promise<boolean> {
+  if (!_codexTaskSkillsCapability) {
+    _codexTaskSkillsCapability = api.getRuntimeSettings()
+      .then((runtime) => runtime.codex_main_mcp_enabled !== false)
+      .catch((error) => {
+        // A transient settings failure is capability uncertainty, not a
+        // page-lifetime proof that ordinary Codex Skills are disabled.
+        _codexTaskSkillsCapability = null;
+        throw error;
+      });
+  }
+  return _codexTaskSkillsCapability;
+}
+
 /** Wrench badge with a dropdown to toggle per-task tools (shared by the
  * task list and the split-mode sidebar). */
 export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () => void }) {
@@ -24,8 +42,26 @@ export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () =>
   const [tools, setTools] = useState<{ key: string; label: string }[]>([]);
 
   useEffect(() => {
-    loadPlugins().then(setTools).catch(() => {});
-  }, []);
+    Promise.all([loadPlugins(), loadCodexTaskSkillsCapability()])
+      .then(([plugins, codexTaskSkillsEnabled]) => setTools(
+        plugins.filter((plugin) => (
+          skillSupportedByProvider(
+            task.provider,
+            plugin.key,
+            codexTaskSkillsEnabled,
+          )
+        )),
+      ))
+      .catch(() => {
+        loadPlugins()
+          .then((plugins) => setTools(
+            plugins.filter((plugin) => (
+              skillSupportedByProvider(task.provider, plugin.key, false)
+            )),
+          ))
+          .catch(() => {});
+      });
+  }, [task.provider]);
 
   useEffect(() => {
     if (!open) return;
@@ -55,9 +91,15 @@ export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () =>
                 key={tool.key}
                 onClick={async (e) => {
                   e.stopPropagation();
-                  const newSkills = { ...(task.enabled_skills || {}), [tool.key]: !enabled };
+                  const nextSkills = {
+                    ...(task.enabled_skills || {}),
+                    [tool.key]: !enabled,
+                  };
                   try {
-                    await api.updateTask(task.id, { enabled_skills: newSkills });
+                    // ``tools`` is only the currently visible capability
+                    // subset. Preserve persisted keys that are hidden because
+                    // capability discovery is unavailable or provider-filtered.
+                    await api.updateTask(task.id, { enabled_skills: nextSkills });
                     onRefresh();
                   } catch { /* keep current state */ }
                 }}

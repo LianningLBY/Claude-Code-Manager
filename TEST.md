@@ -131,6 +131,7 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_create_task_defaults_to_standard_service_tier` / `test_create_fast_codex_task_persists_priority` | Task 默认持久化 Standard，Codex Fast 持久化 `priority` |
 | `test_create_fast_task_rejects_incompatible_configuration` / `test_update_validates_merged_provider_model_and_service_tier` | Claude、mini/Spark 与合并更新不能绕过 Fast 能力校验 |
 | `test_migration_import_*_fast_service_tier` | Worker migration-import 保留兼容 Fast，拒绝不支持模型 |
+| `test_migration_import_preserves_inert_status_without_waking_dispatcher` | Worker migration-import 原子保留 `plan_review` 等不可调度源状态，且不产生 pending 窗口、不 wake Dispatcher |
 
 #### `test_api_chat_plan.py` — Chat 和 Plan API
 
@@ -554,7 +555,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_service_dispatcher.py::test_goal_initial_prompt_codex_references_agents_md` | codex goal 任务的 prompt 指向 AGENTS.md |
 | `test_service_dispatcher.py::test_build_task_prompt_provider_doc` | task prompt 前导按 provider 引用 CLAUDE.md / AGENTS.md |
 | `test_service_dispatcher.py::test_build_task_prompt_carries_doc_sync_note` | 两种 provider 的 prompt 前导都下发 CLAUDE.md/AGENTS.md 关键内容同步纪律 |
-| `test_service_dispatcher.py::test_build_task_prompt_codex_skips_skill_templates` | skills 模板只注入 claude（MCP 工具 codex 不可用） |
+| `test_service_dispatcher.py::test_build_task_prompt_codex_skips_skill_templates` | dispatcher 基础 prompt 不重复拼接 Skill 模板；provider adapter 在 launch 时统一注入 |
 | `test_service_dispatcher.py::test_loop_prompt_codex_references_agents_md` | loop prompt 按 provider 引用文档 |
 | `test_api_projects.py::test_inject_agents_md_*` | project 创建注入 AGENTS.md symlink：正常创建 / 无 CLAUDE.md 不动 / 已存在不覆盖（实现在 `services/agent_docs.py`） |
 | `test_service_dispatcher.py::test_lifecycle_backfills_agents_md` | 存量项目惰性补齐：任务启动时对 target_repo 补 AGENTS.md symlink |
@@ -592,8 +593,41 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_service_dispatcher.py::test_codex_precompact_uses_full_context_tokens` | Codex 预压缩按 current context（含会进入下一请求的 output）和有效窗口触发 |
 | `test_api_pr_monitor.py::test_create_repo_with_codex_provider` 等 | PR Monitor API 层 provider 创建/默认/更新（含显式 null 清空模型防跨家族残留） |
 | 前端 `ProjectTodoList.test.tsx` | Todo Run 建 task 带 provider |
-| 前端 `TaskForm.test.tsx::Codex provider UI gating` | codex 下 Thinking 隐藏、显式「Skills / Monitor 仅支持 Claude」标注（非静默消失） |
+| 前端 `TaskForm.test.tsx::Codex provider UI gating` | Codex 开放普通/User Skills 与 Sub-Agent、明确隐藏 Monitor；主 MCP kill switch 关闭时只显示 Sub-Agent |
 | 前端 `MonitorPanel.test.tsx` | codex 任务的 Monitor 面板显示「暂不支持 Codex」横幅，claude 无横幅 |
+
+##### Codex 普通 Skills / User Skills 对等（PR 6）
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_skill_context.py` | Claude/Codex 使用同一 task-scoped 普通/User Skill 目录；禁用项不声明、User Skill 去重且正文不预注入、Codex 排除 Monitor、Worker snapshot 可独立解析 |
+| `test_codex_app_server.py::test_turn_start_prefixes_task_skills_in_schema_backed_text_input` | app-server 的 fresh/resume 都把 canonical context 精确写入 Codex 0.144.6 支持的 `turn/start.input[].text`，且请求不含 schema 外字段 |
+| `test_codex_app_server.py::test_stdio_protocol_delivers_skill_catalog_in_model_visible_input` | 经真实 stdio JSON-RPC 边界和 0.144.6 `TurnStartParams` 字段过滤后，模型可见输入仍包含普通/User Skill catalog、bounded markers 与原始 prompt；未知字段会被测试 peer 丢弃并导致断言失败 |
+| `test_codex_app_server.py::test_explicit_context_turn_rejection_is_replay_safe` | app-server 显式拒绝 schema-backed context turn 时归类为 pre-turn safe fallback；未知 admission 状态仍禁止重放 |
+| `test_service_instance_manager.py` 的 canonical Skill adapter 用例 | Claude、PTY、Codex exec 与 app-server 消费同一 context，且只注入一次 |
+| `test_service_instance_manager.py::test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | safe fallback 同时保留 required MCP 与完全相同的 Skill context |
+| `test_mcp_config.py::test_codex_main_server_does_not_advertise_monitor_tools` | Codex 主 MCP 不声明三个 Monitor 工具，Claude 保持不变 |
+| `test_mcp_server.py::test_read_skill_rejects_skill_not_enabled_for_task` | `ccm_read_skill` 拒绝读取当前 Task 未启用的普通 Skill |
+| `test_mcp_server.py::test_codex_kill_switch_allows_only_selected_sub_agent_skill` | 主 MCP kill switch 关闭时，即使遗留配置启用了普通 Skill 也拒绝读取，同时保留已选 Sub-Agent controller |
+| `test_mcp_server.py::test_user_skill_read_is_scoped_to_selected_worker_snapshot` | `ccm_read_user_skill` 只读当前 Task 选中 ID，并优先使用 Worker snapshot |
+| `test_api_tasks.py` / `test_api_chat_plan.py` 的 Codex Skill capability 用例 | Monitor 拒绝、`$monitor` 在创建/description 更新/follow-up 三个入口持久化前拒绝、kill switch、User Skill ID 校验/去重、provider 切换与 legacy 配置更新边界 |
+| `test_worker_relay_proxy.py::test_codex_worker_chat_rejects_invalid_command_before_manager_side_effects` | Worker-backed Codex chat 在 Manager operation lock 内按权威 provider 拒绝 `$monitor` 与未知的开头命令，且不写日志、不广播、不同步附件/Skills、不访问 Worker |
+| `test_api_chat_plan.py::test_codex_shared_chat_rejects_monitor_before_local_side_effects` | Shared Codex shadow 在本地日志、广播和 owner proxy 前拒绝 `$monitor`；瞬时远端拒绝不会留下幽灵消息 |
+| `test_worker_relay_proxy.py::test_codex_worker_chat_allows_sub_agent_command` | Worker-backed Codex 仍允许 `$sub-agent`，并把未改写的原始 `$command` 消息交给 Worker 端二次校验/执行 |
+| `test_api_tasks.py::test_invalid_skill_update_is_rejected_before_worker_migration` | 组合更新的 provider/Skill 配置在迁移前校验；400 不调用 migrator，也不改变持久状态 |
+| `test_api_tasks.py::test_valid_skill_update_is_coordinated_with_worker_migration` | 有效的 Worker+provider/Skill 组合更新作为最终配置快照交给 migrator，不再迁移旧配置后单独更新 Manager |
+| `test_task_migrator.py::test_coordinated_migration_*` | 本地→Worker、Worker→Worker 的 destination import payload 与 Manager 最终 provider/Skills/User Skill snapshots 完全一致；导入失败保留原配置，认领 CAS 不覆盖并发配置 |
+| `test_worker_relay_proxy.py::test_worker_proxy_uses_authoritative_user_skill_snapshots` | Worker 转发在 Manager snapshot 对应的本地 User Skill 缺失或同 ID 内容碰撞时都坚持使用 metadata 权威正文 |
+| `test_worker_relay_proxy.py` / `test_task_migrator.py` 的 Skill snapshot 用例 | Worker 初次转发、续聊同步和迁移 payload 保留选择与正文 snapshot |
+| `test_worker_relay_proxy.py::test_worker_skill_selection_sync_*` | Worker Skill 同步必须读回并确认完整普通/User Skill 元组与权威 snapshot；确认缺失或陈旧时 fail closed |
+| `test_worker_relay_proxy.py::test_worker_execution_admission_syncs_latest_manager_skills` | 已转发 Task 在 Manager 保存最新普通/User Skills 后，Retry 与 Plan Approve 都先同步并确认最终元组/snapshot，再允许 Worker 进入 pending |
+| `test_worker_relay_proxy.py::test_migrated_inert_task_can_start_its_next_worker_turn` | 本地 completed/plan-review Task 经真实迁移流程导入 Worker 后，即使 Manager/Worker `instance_id` 不同，Retry、chat 与 Plan Approve 仍使用同一 status/retry generation 完成 Skill 同步并启动下一轮 |
+| `test_worker_relay_proxy.py::test_worker_forward_reloads_authoritative_skills_after_lock_wait` / `test_worker_forward_rejects_generation_change_after_lock_wait` | WorkerProxy 等锁后重新加载 Manager 权威 Skill 元组；generation 已变化时在远端创建前 fail closed |
+| `test_worker_relay_proxy.py::test_initial_worker_forward_uses_skill_update_that_wins_claim_lock` / `test_initial_worker_forward_rejects_skill_update_after_claim` | 确定性覆盖首次 dispatch 的两个锁顺序：先完成的 pending Skill 保存进入远端创建 payload；claim 先完成后活跃 Skill 修改返回 409，Manager/Worker 不分叉 |
+| `test_worker_relay_proxy.py::test_worker_skill_update_shares_execution_admission_lock` | Worker Skill 保存与执行准入共用 task operation lock；pending/终态仍允许保存，不允许保存提交穿过正在进行的 Retry/Approve 准入窗口 |
+| `test_api_chat_plan.py::test_codex_fork_starts_before_selected_user_message` | Fork 继承普通/User Skill 选择，附件 seed 保持只消费一次 |
+| 前端 `skillCapabilities.test.ts` | Claude 不变；Codex 始终禁 Monitor，kill switch 关闭时只保留 Sub-Agent |
+| 前端 `TaskBadges.test.tsx::preserves hidden Skills when runtime capability discovery fails` | Runtime Settings 瞬时失败时切换 Sub-Agent 保留当前隐藏 ordinary Skills；失败 capability 不做页面生命周期缓存，后续加载可恢复 |
 
 ##### `test_service_worktree_manager.py` — Worktree 管理器
 

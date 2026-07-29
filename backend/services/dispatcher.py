@@ -2495,32 +2495,44 @@ class GlobalDispatcher:
                             continue
                         await db.commit()
                         task.target_repo = project.local_path
-            async with self.db_factory() as db:
-                claimed = await db.execute(
-                    update(Task)
-                    .where(
-                        *self._task_status_generation_predicates(
-                            pending_generation
-                        ),
-                        Task.worker_id == worker.id,
-                        Task.shared_from_id.is_(None),
-                        task_retry_not_superseded_predicate(),
-                    )
-                    .values(status="in_progress", started_at=datetime.utcnow())
-                )
-                claimed_generation = None
-                claimed_task = None
-                if claimed.rowcount:
-                    claimed_task = await db.get(
-                        Task,
-                        task.id,
-                        populate_existing=True,
-                    )
-                    if claimed_task is not None:
-                        claimed_generation = self._task_status_generation(
-                            claimed_task
+            # Claiming a pending Worker task is execution admission. It must
+            # share the same per-task fence as Skill saves and forwarding:
+            # a save that wins first is included in the refreshed claim, while
+            # a save that loses observes ``in_progress`` and is rejected.
+            from backend.services.worker_proxy import (
+                get_task_operation_lock,
+            )
+
+            async with get_task_operation_lock(task.id):
+                async with self.db_factory() as db:
+                    claimed = await db.execute(
+                        update(Task)
+                        .where(
+                            *self._task_status_generation_predicates(
+                                pending_generation
+                            ),
+                            Task.worker_id == worker.id,
+                            Task.shared_from_id.is_(None),
+                            task_retry_not_superseded_predicate(),
                         )
-                await db.commit()
+                        .values(
+                            status="in_progress",
+                            started_at=datetime.utcnow(),
+                        )
+                    )
+                    claimed_generation = None
+                    claimed_task = None
+                    if claimed.rowcount:
+                        claimed_task = await db.get(
+                            Task,
+                            task.id,
+                            populate_existing=True,
+                        )
+                        if claimed_task is not None:
+                            claimed_generation = self._task_status_generation(
+                                claimed_task
+                            )
+                    await db.commit()
             if (
                 not claimed.rowcount
                 or claimed_generation is None

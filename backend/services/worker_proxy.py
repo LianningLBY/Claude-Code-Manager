@@ -20,6 +20,7 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
+from backend.services.worker_relay import worker_task_generation
 
 logger = logging.getLogger(__name__)
 
@@ -234,9 +235,36 @@ class WorkerProxy:
                 "支持 Codex Fast，任务未转发"
             )
 
-    async def forward_task_to_worker(self, task: Task):
+    async def forward_task_to_worker(
+        self,
+        task: Task,
+        *,
+        operation_lock_held: bool = False,
+    ):
+        if operation_lock_held:
+            current = await self._authoritative_forward_task(task)
+            return await self._forward_task_to_worker_locked(current)
         async with self.task_operation_lock(task.id):
-            return await self._forward_task_to_worker_locked(task)
+            current = await self._authoritative_forward_task(task)
+            return await self._forward_task_to_worker_locked(current)
+
+    async def _authoritative_forward_task(self, task: Task) -> Task:
+        """Reload one claimed generation before serializing Worker create."""
+
+        if self.db_factory is None:
+            return task
+        expected = worker_task_generation(task)
+        if expected is None:
+            raise RuntimeError(
+                "Task is no longer assigned to a Worker before forwarding"
+            )
+        async with self.db_factory() as db:
+            current = await db.get(Task, task.id)
+        if current is None or worker_task_generation(current) != expected:
+            raise RuntimeError(
+                "Task Worker generation changed before initial forwarding"
+            )
+        return current
 
     async def _forward_task_to_worker_locked(self, task: Task):
         worker = await self.get_worker(task.worker_id)
@@ -251,6 +279,7 @@ class WorkerProxy:
 
         # 先订阅 relay 再创建：worker Dispatcher 可能创建后立即执行，后订阅丢初始事件
         await self.relay.subscribe_task(worker, task.id)
+        user_skill_snapshots = await self._user_skill_snapshots(task)
 
         payload = {
             "id": task.id,  # 关键：Manager 分配的全局 ID
@@ -275,6 +304,8 @@ class WorkerProxy:
             "timeout_hours": task.timeout_hours,
             "enable_workflows": task.enable_workflows,
             "enabled_skills": task.enabled_skills,
+            "selected_user_skills": task.selected_user_skills,
+            "user_skill_snapshots": user_skill_snapshots,
             "tags": list(task.tags) if task.tags else None,
         }
         async with httpx.AsyncClient(timeout=30) as c:
@@ -300,6 +331,90 @@ class WorkerProxy:
                         f"Worker {worker.name} 未确认 Codex Fast 任务配置"
                     )
         logger.info("task %s forwarded to worker %s", task.id, worker.id)
+
+    async def _user_skill_snapshots(self, task: Task) -> list[dict]:
+        from backend.services.skill_context import (
+            build_user_skill_snapshot_payload,
+            normalize_user_skill_ids,
+        )
+
+        if not normalize_user_skill_ids(task.selected_user_skills):
+            return []
+        async with self.db_factory() as db:
+            return await build_user_skill_snapshot_payload(
+                db,
+                task.selected_user_skills,
+                metadata=task.metadata_,
+            )
+
+    async def sync_task_skill_selection(
+        self,
+        worker: Worker,
+        task: Task,
+    ) -> None:
+        """Refresh and confirm a remote task's Skills before a new turn."""
+
+        from backend.services.command_registry import ensure_default_skills
+        from backend.services.skill_context import (
+            USER_SKILL_SNAPSHOTS_METADATA_KEY,
+            normalize_user_skill_ids,
+        )
+
+        user_skill_snapshots = await self._user_skill_snapshots(task)
+        payload = {
+            "enabled_skills": ensure_default_skills(task.enabled_skills),
+            "selected_user_skills": normalize_user_skill_ids(
+                task.selected_user_skills
+            ),
+            "user_skill_snapshots": user_skill_snapshots,
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.put(
+                self._api(worker, f"/api/tasks/{task.id}"),
+                headers=self._headers(worker),
+                json=payload,
+            )
+            response.raise_for_status()
+            try:
+                confirmed = response.json()
+            except Exception as exc:
+                raise HTTPException(
+                    502,
+                    "Worker Skill selection synchronization returned an "
+                    "invalid confirmation",
+                ) from exc
+
+        confirmed_metadata = (
+            confirmed.get("metadata_")
+            if isinstance(confirmed, dict)
+            else None
+        )
+        confirmed_snapshots = (
+            confirmed_metadata.get(USER_SKILL_SNAPSHOTS_METADATA_KEY)
+            if isinstance(confirmed_metadata, dict)
+            else None
+        )
+        # ``instance_id`` is node-local execution ownership. A task migrated
+        # from Manager to Worker deliberately keeps the old Manager instance
+        # id while the imported Worker row has no corresponding local
+        # instance. The globally assigned task id plus the monotonic retry
+        # generation and coordinated inert status identify the remote copy;
+        # comparing unrelated database ids would reject every such migration.
+        if (
+            not isinstance(confirmed, dict)
+            or confirmed.get("id") != task.id
+            or confirmed.get("status") != task.status
+            or confirmed.get("retry_count") != task.retry_count
+            or confirmed.get("enabled_skills") != payload["enabled_skills"]
+            or confirmed.get("selected_user_skills")
+            != payload["selected_user_skills"]
+            or confirmed_snapshots != user_skill_snapshots
+        ):
+            raise HTTPException(
+                409,
+                "Worker Skill selection does not exactly match the Manager; "
+                "execution was blocked",
+            )
 
     async def push_files(self, worker: Worker, paths: list[str]):
         """chat 附件推到 worker 同一绝对路径（worker 上 Claude 用 Read 读）。"""

@@ -95,6 +95,10 @@ class CodexAppServerError(RuntimeError):
     """Raised when app-server rejects a request or loses its transport."""
 
 
+class CodexAppServerRequestError(CodexAppServerError):
+    """The server explicitly rejected one JSON-RPC request."""
+
+
 class CodexAppServerBusyError(CodexAppServerError):
     """The requested account home still has an active Codex turn."""
 
@@ -123,7 +127,7 @@ class CodexRequiredMcpError(CodexAppServerError):
 
 
 class CodexRequiredMcpPreTurnError(CodexRequiredMcpError):
-    """Required MCP failed before turn/start, so MCP-equivalent exec is safe."""
+    """Required task context failed before admission, so exec replay is safe."""
 
 
 class CodexThreadHomeMismatchError(CodexAppServerError):
@@ -1541,6 +1545,7 @@ class CodexAppServer:
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
         disable_project_config: bool = False,
+        skill_context: str = "",
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
     ) -> tuple[CodexTurnProcess, str]:
         service_tier = normalize_codex_service_tier(codex_service_tier)
@@ -1559,6 +1564,7 @@ class CodexAppServer:
             else None
         )
         required_mcp = any(spec.required for spec in mcp_specs)
+        required_context = bool(skill_context.strip())
         try:
             thread_config: dict[str, Any] = (
                 render_codex_mcp_config(mcp_specs) if mcp_specs else {}
@@ -1617,15 +1623,21 @@ class CodexAppServer:
             # treats this as unsafe to replay through exec.
             raise
         except Exception as exc:
-            if required_mcp:
+            if required_mcp or required_context:
                 error_type = (
                     CodexRequiredMcpError
                     if self.shutdown_requested
                     else CodexRequiredMcpPreTurnError
                 )
                 raise error_type(
-                    "Codex app-server could not start required MCP transport: "
-                    f"{exc}"
+                    (
+                        "Codex app-server could not start required MCP "
+                        "transport: "
+                        if required_mcp
+                        else "Codex app-server could not start required task "
+                        "context: "
+                    )
+                    + str(exc)
                 ) from exc
             raise
         actual_tier_proxy = self._actual_tier_proxy
@@ -1682,10 +1694,16 @@ class CodexAppServer:
         try:
             response = await self._request(thread_method, thread_params)
         except Exception as exc:
-            if required_mcp:
+            if required_mcp or required_context:
                 raise CodexRequiredMcpPreTurnError(
-                    f"{thread_method} could not initialize required MCP "
-                    f"configuration: {exc}"
+                    (
+                        f"{thread_method} could not initialize required MCP "
+                        "configuration: "
+                        if required_mcp
+                        else f"{thread_method} could not initialize required "
+                        "task context: "
+                    )
+                    + str(exc)
                 ) from exc
             raise
 
@@ -1693,9 +1711,14 @@ class CodexAppServer:
         thread_id = thread.get("id") if isinstance(thread, dict) else None
         if not thread_id:
             message = "thread start/resume returned no thread id"
-            if required_mcp:
+            if required_mcp or required_context:
                 raise CodexRequiredMcpPreTurnError(
-                    f"Required MCP configuration was not admitted: {message}"
+                    (
+                        "Required MCP configuration was not admitted: "
+                        if required_mcp
+                        else "Required task context was not admitted: "
+                    )
+                    + message
                 )
             raise CodexAppServerError(message)
         # A native Goal can continue after CCM has finished and detached its
@@ -1798,9 +1821,19 @@ class CodexAppServer:
         # Persist the native thread id through the same event path as exec.
         turn_process.feed({"type": "thread.started", "thread_id": thread_id})
 
+        model_prompt = prompt
+        if required_context:
+            from backend.services.skill_context import wrap_skill_context
+
+            # Codex 0.144.6 silently drops unknown TurnStartParams fields.
+            # Keep the canonical task context in the schema-backed text input
+            # so the primary app-server route and exec fallback expose the
+            # same bounded, model-visible prompt.
+            model_prompt = wrap_skill_context(prompt, skill_context)
+
         turn_params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": [{"type": "text", "text": model_prompt}],
             "cwd": os.path.abspath(cwd),
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
@@ -1841,10 +1874,24 @@ class CodexAppServer:
         except BaseException as exc:
             self._detach_turn_context(context)
             turn_process.finish(1, "Codex app-server rejected turn/start")
-            if required_mcp and isinstance(exc, Exception):
+            if (
+                (required_mcp or required_context)
+                and isinstance(exc, CodexAppServerRequestError)
+            ):
+                # An explicit JSON-RPC rejection proves that no turn was
+                # admitted.  InstanceManager may therefore replay once
+                # through exec with the same MCP config and canonical context.
+                raise CodexRequiredMcpPreTurnError(
+                    "turn/start rejected required CCM task context before "
+                    f"admission: {exc}"
+                ) from exc
+            if (
+                (required_mcp or required_context)
+                and isinstance(exc, Exception)
+            ):
                 raise CodexRequiredMcpError(
-                    "turn/start could not preserve required MCP "
-                    f"configuration: {exc}"
+                    "turn/start failed with unknown admission state while "
+                    f"preserving required CCM task context: {exc}"
                 ) from exc
             raise
 
@@ -1854,9 +1901,14 @@ class CodexAppServer:
             self._detach_turn_context(context)
             turn_process.finish(1, "Codex app-server turn/start returned no turn id")
             message = "turn/start returned no turn id"
-            if required_mcp:
+            if required_mcp or required_context:
                 raise CodexRequiredMcpError(
-                    f"Required MCP turn was not admitted: {message}"
+                    (
+                        "Required MCP turn was not admitted: "
+                        if required_mcp
+                        else "Required task context turn was not admitted: "
+                    )
+                    + message
                 )
             raise CodexAppServerError(message)
         context.admitted_turn_id = str(turn_id)
@@ -2678,7 +2730,7 @@ class CodexAppServer:
             self._pending.pop(request_id, None)
         if "error" in response:
             error = response.get("error") or {}
-            raise CodexAppServerError(
+            raise CodexAppServerRequestError(
                 f"{method} failed: {error.get('message') or error}"
             )
         result = response.get("result")

@@ -104,6 +104,42 @@ def _validate_chat_service_tier(task: Task, model_override: str | None) -> None:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _parse_chat_command(message: str):
+    """Parse one leading command and reject unknown command-like input."""
+
+    from backend.services.command_registry import parse_command
+
+    command, command_args = parse_command(message)
+    stripped = message.strip()
+    if stripped.startswith("$") and command is None:
+        unknown_cmd = stripped.split(None, 1)[0]
+        raise HTTPException(
+            400,
+            f"未知命令 {unknown_cmd}，输入 $help 查看可用命令",
+        )
+    return command, command_args
+
+
+async def _validate_chat_command_admission(
+    task: Task,
+    command,
+    db: AsyncSession,
+) -> None:
+    """Validate a command's temporary Skills against the task provider."""
+
+    if command is None or not command.required_skills:
+        return
+
+    from backend.api.tasks import _validate_skill_configuration
+
+    await _validate_skill_configuration(
+        db,
+        provider=task.provider,
+        enabled_skills=command.required_skills,
+        selected_user_skills=None,
+    )
+
+
 def _native_ids(raw_json: str | None) -> tuple[str | None, str | None]:
     """Return (item_id, turn_id) from one persisted normalized event."""
 
@@ -429,10 +465,26 @@ async def send_chat_message(
             409,
             "This PR review task was superseded by a newer push",
         )
+    command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
-        return await _send_shared_chat(task, body, db)
+        return await _send_shared_chat(
+            task,
+            body,
+            db,
+            command=command,
+        )
     if task.worker_id is not None:
-        return await _send_worker_chat(task, body, db, request)
+        return await _send_worker_chat(
+            task,
+            body,
+            db,
+            request,
+            command=command,
+        )
+    if body.secret_ids:
+        from backend.api.deps import require_admin
+
+        require_admin(request)
 
     # Worker-local stage/ack/reconcile and direct chat admission share this
     # process-wide lock.  A stage that wins first returns 409 here; a stage
@@ -462,24 +514,14 @@ async def send_chat_message(
             effective_model=body.model or task.model,
         )
         _validate_chat_service_tier(task, body.model)
+        if not task.session_id:
+            raise HTTPException(
+                400,
+                "No previous session on this task. Run the task first.",
+            )
+        await _validate_chat_command_admission(task, command, db)
 
-    if body.secret_ids:
-        from backend.api.deps import require_admin
-
-        require_admin(request)
-    if not task.session_id:
-        raise HTTPException(400, "No previous session on this task. Run the task first.")
-
-    # Parse $command syntax
-    from backend.services.command_registry import parse_command
-    command, command_args = parse_command(body.message)
     command_skills: dict | None = None
-
-    # Check for unknown $command
-    stripped = body.message.strip()
-    if stripped.startswith("$") and command is None:
-        unknown_cmd = stripped.split(None, 1)[0]
-        raise HTTPException(400, f"未知命令 {unknown_cmd}，输入 $help 查看可用命令")
 
     # Keep sender identity presentation-only.  The raw text is what the model
     # receives; the prefixed form is only stored/broadcast for the chat UI.
@@ -889,11 +931,22 @@ async def fork_codex_task(
     return forked_task
 
 
-async def _send_shared_chat(task: Task, body: ChatMessage, db: AsyncSession):
+async def _send_shared_chat(
+    task: Task,
+    body: ChatMessage,
+    db: AsyncSession,
+    *,
+    command=None,
+):
     """Shared (shadow) task: store locally, broadcast, proxy to sharer CCM."""
     from backend.main import broadcaster
     from backend.models.task_share import SharedTaskReceived
     from backend.services.shared_proxy import proxy_chat
+
+    if command is None:
+        command, _command_args = _parse_chat_command(body.message)
+    await db.refresh(task)
+    await _validate_chat_command_admission(task, command, db)
 
     # Find the shared record
     result = await db.execute(
@@ -948,7 +1001,14 @@ async def _send_shared_chat(task: Task, body: ChatMessage, db: AsyncSession):
     return {"ok": True, "queued": True}
 
 
-async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, request: Request | None = None):
+async def _send_worker_chat(
+    task: Task,
+    body: ChatMessage,
+    db: AsyncSession,
+    request: Request | None = None,
+    *,
+    command=None,
+):
     """Worker task 的 chat 代理。"""
     from backend.main import broadcaster, worker_proxy
     if worker_proxy is None:
@@ -978,17 +1038,21 @@ async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, req
                 409,
                 "This PR review task was superseded by a newer push",
             )
+        if command is None:
+            command, _command_args = _parse_chat_command(body.message)
         from backend.api.tasks import _ensure_worker_routing_ready
         from backend.api.tasks import _require_expected_task_routing
 
-        await _ensure_worker_routing_ready(
-            current,
-            operation_lock_held=True,
-        )
         _require_expected_task_routing(
             current,
             body.expected_routing,
             effective_model=body.model or current.model,
+        )
+        _validate_chat_service_tier(current, body.model)
+        await _validate_chat_command_admission(current, command, db)
+        await _ensure_worker_routing_ready(
+            current,
+            operation_lock_held=True,
         )
 
         # Preserve the sender prefix for the Manager UI, but forward only the
@@ -1066,6 +1130,7 @@ async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, req
 
         # 4. Ensure relay subscription before the remote turn can emit events.
         await worker_proxy.relay.subscribe_task(worker, current.id)
+        await worker_proxy.sync_task_skill_selection(worker, current)
 
         # 5. The common operation lock is already held; asking WorkerProxy to
         # acquire it again would deadlock.

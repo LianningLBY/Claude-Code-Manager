@@ -40,11 +40,15 @@ vi.mock('../../api/client', () => ({
     listSkillsCached: vi.fn().mockResolvedValue([
       { key: 'monitor', label: 'Monitor', description: 'Background monitoring sub-agents' },
       { key: 'sub-agent', label: 'Sub-Agent', description: 'Parallel one-shot sub-agents' },
+      { key: 'code-review', label: 'Code Review', description: 'Review code changes' },
     ]),
     listUserSkillsCached: vi.fn().mockResolvedValue([]),
     getDefaultSkills: vi.fn().mockResolvedValue({
       default_enabled_plugins: null,
       default_enabled_user_skills: null,
+    }),
+    getRuntimeSettings: vi.fn().mockResolvedValue({
+      codex_main_mcp_enabled: true,
     }),
     setDefaultSkills: vi.fn().mockResolvedValue({}),
   },
@@ -451,15 +455,36 @@ describe('Codex provider UI gating', () => {
     expect(screen.getByText('Thinking')).toBeInTheDocument();
   });
 
-  it('shows that Codex supports Sub-Agent but not user Skills or Monitor', async () => {
+  it('shows Codex ordinary/User Skills while keeping Monitor unavailable', async () => {
     const cliSelect = await renderAndOpenConfig();
-    expect(screen.queryByText(/Skills \/ Monitor 仅支持 Claude/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Monitor 暂不支持 Codex/)).not.toBeInTheDocument();
 
     await userEvent.selectOptions(cliSelect, 'codex');
     expect(
-      screen.getByText('Skills / Monitor 仅支持 Claude · Sub-Agent 可用'),
+      screen.getByText('Monitor 暂不支持 Codex'),
     ).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText(/Plugins/)).toBeInTheDocument());
+    expect(screen.getByText('Skills')).toBeInTheDocument();
+    await userEvent.click(screen.getByText(/Plugins/));
+    expect(screen.getByText('Sub-Agent')).toBeInTheDocument();
+    expect(screen.getByText('Code Review')).toBeInTheDocument();
+    expect(screen.queryByText('Monitor')).not.toBeInTheDocument();
+  });
+
+  it('keeps only Sub-Agent when Codex main-task MCP is disabled', async () => {
+    (api.getRuntimeSettings as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ codex_main_mcp_enabled: false });
+    const cliSelect = await renderAndOpenConfig();
+
+    await userEvent.selectOptions(cliSelect, 'codex');
+    expect(
+      await screen.findByText('主任务 MCP 已关闭 · 仅 Sub-Agent 可用'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Skills')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText(/Plugins/));
+    expect(screen.getByText('Sub-Agent')).toBeInTheDocument();
+    expect(screen.queryByText('Code Review')).not.toBeInTheDocument();
+    expect(screen.queryByText('Monitor')).not.toBeInTheDocument();
   });
 });
 

@@ -3051,10 +3051,12 @@ async def test_cancel_retries_cancelled_auxiliary_cleanup(
         monitor_id = monitor.id
 
     attempts = 0
+    terminal_values = []
 
-    async def fail_once(session_id):
+    async def fail_once(session_id, *, terminal=False):
         nonlocal attempts
         assert session_id == monitor_id
+        terminal_values.append(terminal)
         attempts += 1
         if attempts == 1:
             raise RuntimeError("process group still alive")
@@ -3092,6 +3094,7 @@ async def test_cancel_retries_cancelled_auxiliary_cleanup(
     assert second.status_code == 200, second.text
     assert second.json()["status"] == "cancelled"
     assert attempts == 2
+    assert terminal_values == [True, True]
 
 
 @pytest.mark.asyncio

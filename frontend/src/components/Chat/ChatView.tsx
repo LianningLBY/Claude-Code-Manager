@@ -812,15 +812,35 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
       setSending(true);
       setMessages((prev) => {
-        // Skip if last message is an optimistic duplicate (same content, recent).
-        // 但服务端广播可能带附件而乐观回显没有 —— 去重时必须把附件合并进去，
-        // 整条丢弃会让刚发的图片消失（2026-07-16 用户反馈）
+        // Reconcile the optimistic bubble with the authoritative broadcast.
+        // The optimistic content can be raw text while the server content is
+        // prefixed with the sender name, so display content alone is not a
+        // stable identity. raw_content is the canonical user input.
         const last = prev[prev.length - 1];
-        if (last && last.role === 'user' && last.event_type === 'user_message' && last.content === content) {
-          if ((imageUrls?.length || attachments?.length) && !last.image_urls?.length && !last.attachments?.length) {
-            return [...prev.slice(0, -1), { ...last, image_urls: imageUrls, attachments }];
-          }
-          return prev;
+        const matchesOptimistic = Boolean(
+          last
+          && last.role === 'user'
+          && last.event_type === 'user_message'
+          && (
+            last.content === content
+            || (
+              rawContent !== null
+              && last.raw_content === rawContent
+            )
+          )
+        );
+        if (last && matchesOptimistic) {
+          return [...prev.slice(0, -1), {
+            ...last,
+            id: isPersisted ? persistedId : last.id,
+            content,
+            source,
+            raw_content: rawContent ?? last.raw_content,
+            timestamp: eventTimestamp,
+            image_urls: imageUrls?.length ? imageUrls : last.image_urls,
+            attachments: attachments?.length ? attachments : last.attachments,
+            persisted: isPersisted || last.persisted,
+          }];
         }
         return [...prev, {
           id: isPersisted ? persistedId : Date.now() + Math.random(), role: 'user', event_type: 'user_message',

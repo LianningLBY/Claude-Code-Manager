@@ -1053,6 +1053,63 @@ async def test_chat_sender_prefix_is_display_only(session_factory):
 
 
 @pytest.mark.asyncio
+async def test_service_token_sender_prefix_is_display_only(session_factory):
+    """A service-token request has an Admin label even without a bound User."""
+    import json
+    from types import SimpleNamespace
+    from sqlalchemy import select
+
+    from backend.api.chat import ChatMessage, send_chat_message
+    from backend.models.log_entry import LogEntry
+
+    async with session_factory() as db:
+        task = Task(
+            title="Token prefix test",
+            description="d",
+            target_repo="/tmp",
+            session_id="token-prefix-session",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        mock_d = _mock_dispatcher()
+        mock_broadcaster = MagicMock()
+        mock_broadcaster.broadcast = AsyncMock()
+        request = SimpleNamespace(state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        ))
+
+        with patch("backend.main.dispatcher", mock_d), \
+             patch("backend.main.broadcaster", mock_broadcaster):
+            await send_chat_message(
+                task.id,
+                ChatMessage(message="[BUG] keep this raw"),
+                request,
+                db,
+            )
+
+        stored = (await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalar_one()
+
+    assert mock_d.enqueue_message.call_args.kwargs["prompt"] == "[BUG] keep this raw"
+    assert stored.content == "[Admin] [BUG] keep this raw"
+    assert json.loads(stored.raw_json) == {
+        "raw_content": "[BUG] keep this raw",
+        "sender_name": "Admin",
+    }
+    event = mock_broadcaster.broadcast.call_args.args[1]
+    assert event["content"] == "[Admin] [BUG] keep this raw"
+    assert event["raw_content"] == "[BUG] keep this raw"
+
+
+@pytest.mark.asyncio
 async def test_shared_chat_sender_prefix_is_display_only(client, session_factory):
     """Shared-task sender names are shown in chat but excluded from enqueue."""
     import json

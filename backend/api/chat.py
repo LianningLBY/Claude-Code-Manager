@@ -38,6 +38,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
 
 
+async def _sender_display_name(
+    request: Request,
+    db: AsyncSession,
+) -> str | None:
+    """Resolve the presentation identity without changing access ownership."""
+    user_id = getattr(request.state, "user_id", None)
+    if user_id:
+        from backend.models.user import User
+
+        sender = await db.get(User, user_id)
+        if sender:
+            return sender.name
+
+    # The deployment service token is a real super-admin identity, but it is
+    # intentionally not bound to a disabled/deleted User row.  Give it the
+    # same stable presentation name returned by the frontend login fallback.
+    if getattr(request.state, "auth_type", None) == "token":
+        return "Admin"
+    return None
+
+
 class ChatMessage(BaseModel):
     message: str
     image_paths: list[str] | None = None  # kept for backwards compatibility
@@ -462,16 +483,11 @@ async def send_chat_message(
 
     # Keep sender identity presentation-only.  The raw text is what the model
     # receives; the prefixed form is only stored/broadcast for the chat UI.
-    user_id = getattr(request.state, "user_id", None)
     model_message = body.message
     display_content = model_message
-    sender_display_name = None
-    if user_id:
-        from backend.models.user import User
-        sender = await db.get(User, user_id)
-        if sender:
-            sender_display_name = sender.name
-            display_content = f"[{sender.name}] {model_message}"
+    sender_display_name = await _sender_display_name(request, db)
+    if sender_display_name:
+        display_content = f"[{sender_display_name}] {model_message}"
 
     # Explicit commands append their invocation instructions. Permanently
     # enabled skills are advertised by the launch-time skill directory; merely
@@ -981,13 +997,9 @@ async def _send_worker_chat(task: Task, body: ChatMessage, db: AsyncSession, req
         display_content = model_message
         sender_display_name = None
         if request:
-            uid = getattr(request.state, "user_id", None)
-            if uid:
-                from backend.models.user import User
-                sender = await db.get(User, uid)
-                if sender:
-                    sender_display_name = sender.name
-                    display_content = f"[{sender.name}] {model_message}"
+            sender_display_name = await _sender_display_name(request, db)
+            if sender_display_name:
+                display_content = f"[{sender_display_name}] {model_message}"
 
         worker = await worker_proxy.require_ready_worker(observed.worker_id)
 
@@ -1445,15 +1457,9 @@ async def _inject_display_content(
     raw_content: str,
 ) -> tuple[str, str | None]:
     display_content = raw_content
-    sender_display_name = None
-    user_id = getattr(request.state, "user_id", None)
-    if user_id:
-        from backend.models.user import User
-
-        sender = await db.get(User, user_id)
-        if sender:
-            sender_display_name = sender.name
-            display_content = f"[{sender.name}] {raw_content}"
+    sender_display_name = await _sender_display_name(request, db)
+    if sender_display_name:
+        display_content = f"[{sender_display_name}] {raw_content}"
     return display_content, sender_display_name
 
 

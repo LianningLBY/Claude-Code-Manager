@@ -3275,7 +3275,13 @@ async def _cancel_local_task_impl(
             MonitorSession.task_id == task_id,
             MonitorSession.status == "running",
         )
-        .values(status="cancelled", completed_at=datetime.utcnow())
+        .values(
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            next_check_at=None,
+            active_turn_generation=None,
+            turn_started_at=None,
+        )
     )
     committed_retry_count = active_task.retry_count
     committed_instance_id = active_task.instance_id

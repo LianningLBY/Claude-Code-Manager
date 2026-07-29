@@ -27,6 +27,12 @@ async def test_monitor_session_crud(db_session):
     assert ms.id is not None
     assert ms.status == "running"
     assert ms.checks_done == 0
+    assert ms.provider == "claude"
+    assert ms.next_check_at is None
+    assert ms.turn_generation == 0
+    assert ms.active_turn_generation is None
+    assert ms.consecutive_failures == 0
+    assert ms.last_error is None
     assert ms.interval == 60
     assert ms.max_checks == 10
     assert ms.completed_at is None

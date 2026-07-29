@@ -958,7 +958,13 @@ async def _terminate_local_task_generation_impl(
                     MonitorSession.agent_type.in_(("monitor", "sub_agent")),
                     MonitorSession.status == "running",
                 )
-                .values(status="cancelled", completed_at=datetime.utcnow())
+                .values(
+                    status="cancelled",
+                    completed_at=datetime.utcnow(),
+                    next_check_at=None,
+                    active_turn_generation=None,
+                    turn_started_at=None,
+                )
             )
         expected_retry_count = observed_generation.retry_count
         expected_instance_id = observed_generation.instance_id

@@ -234,13 +234,19 @@ async def _reset_stale_discussion_agents():
 
 
 async def _cleanup_stale_sub_agents():
-    """Close terminal parents' stale children, except live PTY generations.
+    """Close terminal parents' stale children, except owned async generations.
 
     A foreground Task may already be terminal while its exact persistent-PTY
     generation still owns native child output.  The dispatcher startup
     recovery is authoritative for an orphaned background marker and will fail
     both the parent and its native children; pre-emptively calling those rows
     completed here would erase that failure evidence.
+
+    Local CCM Monitors are durable schedulers whose parent normally finishes
+    between checks.  The dispatcher must likewise see their persisted
+    generation: a sleeping generation is rehydrated, while an active generation
+    from an unclean shutdown is failed closed.  Remote mirrors and ordinary
+    one-shot children remain subject to this terminal-parent cleanup.
     """
     from backend.models.sub_agent import SubAgentSession
     from backend.models.task import Task
@@ -257,6 +263,11 @@ async def _cleanup_stale_sub_agents():
                 and not (
                     task.pty_background_generation is not None
                     and sa.source == "native"
+                )
+                and not (
+                    sa.source == "ccm"
+                    and sa.agent_type == "monitor"
+                    and sa.remote_id is None
                 )
                 and task.status in ("completed", "failed", "cancelled")
             ):

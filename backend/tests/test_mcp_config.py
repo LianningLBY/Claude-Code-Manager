@@ -201,6 +201,26 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
     assert CCM_MONITOR_AGENT_TOOLS == EXPECTED_MONITOR_TOOLS
 
 
+def test_monitor_agent_mcp_spec_carries_exact_turn_generation(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+
+    spec = build_monitor_agent_mcp_server_specs(
+        7,
+        42,
+        api_base="http://manager:8321",
+        turn_generation=9,
+    )[0]
+
+    assert spec.args[2:8] == (
+        "--monitor-session-id",
+        "7",
+        "--task-id",
+        "42",
+        "--turn-generation",
+        "9",
+    )
+
+
 def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
     _set_spec_snapshot_runtime(monkeypatch)
 

@@ -1,9 +1,9 @@
 import asyncio
 from weakref import WeakValueDictionary
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import case, func, select, update
+from sqlalchemy import and_, case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
@@ -127,6 +127,43 @@ async def _monitor_session_or_error(
     raise HTTPException(400, "Monitor session is not running")
 
 
+def _monitor_callback_generation_predicate(
+    turn_generation: int | None,
+):
+    """Fence a callback to its exact scheduled turn.
+
+    ``None`` is retained only for isolated legacy/direct rows that have never
+    entered scheduled-turn state. A real schedule has either a due timestamp
+    or a non-null active generation, so omitting the token cannot bypass the
+    fence before or during a turn.
+    """
+
+    if turn_generation is None:
+        return and_(
+            MonitorSession.active_turn_generation.is_(None),
+            MonitorSession.next_check_at.is_(None),
+            MonitorSession.turn_generation == 0,
+        )
+    return MonitorSession.active_turn_generation == turn_generation
+
+
+async def _monitor_callback_error(
+    db: AsyncSession,
+    task_id: int,
+    session_id: int,
+) -> None:
+    db.expire_all()
+    session = await db.get(MonitorSession, session_id)
+    if session is None or session.task_id != task_id:
+        raise HTTPException(404, "Monitor session not found")
+    if session.status != "running":
+        raise HTTPException(400, "Monitor session is not running")
+    raise HTTPException(
+        409,
+        "Monitor turn generation is no longer active",
+    )
+
+
 @router.post("", response_model=MonitorSessionResponse)
 async def create_monitor_session(
     task_id: int,
@@ -240,6 +277,8 @@ async def create_monitor_session(
                 interval=body.interval,
                 max_checks=body.max_checks,
                 model=body.model,
+                provider=(task.provider or "claude").lower(),
+                next_check_at=datetime.utcnow(),
             )
             db.add(ms)
             await db.flush()
@@ -329,7 +368,13 @@ async def delete_monitor_session(
                 MonitorSession.task_id == task_id,
                 MonitorSession.status == "running",
             )
-            .values(status="cancelled", completed_at=datetime.utcnow())
+            .values(
+                status="cancelled",
+                completed_at=datetime.utcnow(),
+                next_check_at=None,
+                active_turn_generation=None,
+                turn_started_at=None,
+            )
         )
         await db.commit()
         return result
@@ -343,7 +388,13 @@ async def delete_monitor_session(
             MonitorSession.source == "ccm",
             MonitorSession.status == "running",
         )
-        .values(status="cancelled", completed_at=datetime.utcnow())
+        .values(
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            next_check_at=None,
+            active_turn_generation=None,
+            turn_started_at=None,
+        )
     )
     await db.commit()
 
@@ -413,6 +464,9 @@ async def create_monitor_check(
             MonitorSession.agent_type == "monitor",
             MonitorSession.source == "ccm",
             MonitorSession.status == "running",
+            _monitor_callback_generation_predicate(
+                body.turn_generation
+            ),
         )
         # MySQL evaluates assignments in a single-table UPDATE from left to
         # right. Keep both limit expressions ahead of ``checks_done`` so they
@@ -432,13 +486,18 @@ async def create_monitor_check(
                     else_=MonitorSession.completed_at,
                 ),
             ),
+            (MonitorSession.active_turn_generation, None),
+            (MonitorSession.turn_started_at, None),
+            (MonitorSession.next_check_at, None),
+            (MonitorSession.consecutive_failures, 0),
+            (MonitorSession.last_error, None),
             (MonitorSession.checks_done, next_check),
             (MonitorSession.last_summary, body.summary),
         )
     )
     if not advanced.rowcount:
         await db.rollback()
-        await _monitor_session_or_error(db, task_id, session_id)
+        await _monitor_callback_error(db, task_id, session_id)
 
     state = (
         await db.execute(
@@ -446,6 +505,7 @@ async def create_monitor_check(
                 MonitorSession.checks_done,
                 MonitorSession.max_checks,
                 MonitorSession.status,
+                MonitorSession.interval,
             )
             .where(
                 MonitorSession.id == session_id,
@@ -454,8 +514,27 @@ async def create_monitor_check(
             .with_for_update()
         )
     ).one()
-    new_checks_done, max_checks, persisted_status = state
+    (
+        new_checks_done,
+        max_checks,
+        persisted_status,
+        interval,
+    ) = state
     auto_complete = persisted_status == "completed"
+    if not auto_complete:
+        await db.execute(
+            update(MonitorSession)
+            .where(
+                MonitorSession.id == session_id,
+                MonitorSession.task_id == task_id,
+                MonitorSession.status == "running",
+                MonitorSession.active_turn_generation.is_(None),
+            )
+            .values(
+                next_check_at=completed_at
+                + timedelta(seconds=interval)
+            )
+        )
 
     check = MonitorCheck(
         monitor_session_id=session_id,
@@ -549,9 +628,6 @@ async def create_monitor_check(
             user_message_text=f"[Monitor #{session_id}] 监控完成: {body.summary}",
             monitor_session_id=session_id,
         )
-        # Kill the sub-agent process since it's no longer needed
-        await dispatcher.stop_monitor_session_process(session_id)
-
     return check
 
 
@@ -573,17 +649,25 @@ async def complete_monitor_session(
             MonitorSession.agent_type == "monitor",
             MonitorSession.source == "ccm",
             MonitorSession.status == "running",
+            _monitor_callback_generation_predicate(
+                body.turn_generation
+            ),
         )
         .values(
             status="completed",
             completed_at=datetime.utcnow(),
             last_summary=body.reason,
             checks_done=MonitorSession.checks_done + 1,
+            active_turn_generation=None,
+            turn_started_at=None,
+            next_check_at=None,
+            consecutive_failures=0,
+            last_error=None,
         )
     )
     if not completed.rowcount:
         await db.rollback()
-        await _monitor_session_or_error(db, task_id, session_id)
+        await _monitor_callback_error(db, task_id, session_id)
     checks_done = await db.scalar(
         select(MonitorSession.checks_done)
         .where(

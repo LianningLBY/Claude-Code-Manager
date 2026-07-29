@@ -35,9 +35,30 @@ class SubAgentSession(Base):
     interval: Mapped[int] = mapped_column(Integer, default=120)
     max_checks: Mapped[int] = mapped_column(Integer, default=50)
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Monitor scheduling is owned by CCM rather than by a long-lived model
+    # process. ``provider`` is frozen when the session is admitted so restart
+    # recovery never guesses which runner owns an existing row.
+    provider: Mapped[str] = mapped_column(String(20), default="claude")
     status: Mapped[str] = mapped_column(String(20), default="running")
     checks_done: Mapped[int] = mapped_column(Integer, default=0)
     last_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Durable scheduled-turn state. A nullable active generation separates a
+    # recoverable sleeping session from a turn that may still own real work.
+    next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+    turn_generation: Mapped[int] = mapped_column(Integer, default=0)
+    active_turn_generation: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    turn_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 类别专属元数据 JSON（native-*: tool_use_id / agent_id / background ...）
     meta: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

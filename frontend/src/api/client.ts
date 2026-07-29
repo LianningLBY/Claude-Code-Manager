@@ -419,9 +419,16 @@ export interface MonitorSession {
   monitor_context: string | null;
   interval: number;
   max_checks: number;
+  model: string | null;
+  provider: string;
   status: string;
   checks_done: number;
   last_summary: string | null;
+  next_check_at: string | null;
+  turn_generation: number;
+  active_turn_generation: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
   created_at: string;
   completed_at: string | null;
 }

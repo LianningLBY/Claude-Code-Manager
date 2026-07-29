@@ -31,6 +31,8 @@ ccm:
 2. **禁止**自己用 Bash/Read 等工具手动执行监控循环
 3. **禁止**使用内置的 Agent 工具或 Monitor 工具来执行监控任务——这些内置工具不在 CCM 系统的管理范围内，无法被追踪和记录
 4. 所有监控必须通过 `create_monitor` 工具发起，由 CCM 子 agent 系统统一管理
+5. `description` 和 `context` 必须自包含：写清只读检查方法、路径/进程名和完成条件；每次检查是独立的新回合，不能依赖上一轮模型记忆
+6. 不要让子 agent 自己 sleep、等待下一轮或启动后台任务；检查间隔由 CCM Scheduler 管理
 
 ### 可用工具
 
@@ -44,7 +46,7 @@ ccm:
 
 1. 用户描述需要监控的内容
 2. 调用 `create_monitor` 创建子 agent，指定合理的检查间隔和次数
-3. 子 agent 会独立运行并定期汇报状态
+3. CCM Scheduler 会按间隔启动独立的只读检查回合并汇报状态
 4. 用户可随时通过 `check_monitors` 查看进展
 5. 监控完成或用户要求时调用 `stop_monitor` 停止
 

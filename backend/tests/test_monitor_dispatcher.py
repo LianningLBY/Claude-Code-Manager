@@ -1,15 +1,12 @@
-"""Tests for the monitor sub-agent lifecycle (persistent subprocess design).
+"""Tests for the durable scheduled-turn Monitor lifecycle.
 
-Current design (replaces the old per-check subprocess loop):
-- ``start_monitor_session`` spawns ``_monitor_session_lifecycle`` as an asyncio task.
-- The lifecycle launches ONE persistent Claude subprocess (``_launch_monitor_agent``)
-  with a dedicated MCP config; the sub-agent loops internally and reports back via
-  MCP tools that call the CCM API (POST .../checks, POST .../complete).
-- MonitorCheck records and per-check broadcasts are therefore written by the API
-  endpoints, not by the dispatcher; tests for those live at the API level below.
+``start_monitor_session`` owns one recoverable scheduler. Each due check claims
+an exact DB generation, launches one short provider turn, and requires that
+turn to consume its generation through a callback before another check can run.
 """
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime
 import os
 import signal
 import sys
@@ -40,7 +37,9 @@ def dispatcher(db_factory, mock_broadcaster):
     d._running_tasks = {}
     d._monitor_tasks = {}
     d._monitor_processes = {}
+    d._monitor_config_dirs = {}
     d._monitor_log_fhs = {}
+    d._monitor_active_turns = set()
     d._sub_agent_tasks = {}
     d._sub_agent_processes = {}
     d._sub_agent_log_fhs = {}
@@ -218,6 +217,8 @@ def test_build_monitor_agent_prompt(dispatcher):
     # The sub-agent must be told about its MCP callback tools
     assert "report_status" in prompt
     assert "mark_complete" in prompt
+    assert "只执行一次状态检查" in prompt
+    assert "不要 sleep" in prompt
 
 
 def test_build_monitor_agent_prompt_no_context(dispatcher):
@@ -746,22 +747,17 @@ async def test_failed_codex_sub_agent_thread_delete_retains_cleanup_evidence(
 
 
 def test_build_monitor_agent_prompt_interval_guidance(dispatcher):
-    """等待指引按 interval 生成：单次睡满间隔 + 显式大 timeout + 拆分兜底。
-
-    2026-07-16 task 35：interval 3600/1800 的 monitor 首查后长 sleep 被 CLI
-    转后台 → 子 agent 转投 ScheduleWakeup 结束回合 → -p 进程退出 → 误判 failed。
-    """
+    """The model never owns the interval in scheduled-turn mode."""
     prompt = dispatcher._build_monitor_agent_prompt("watch", None, interval=1800)
-    assert "1800 秒" in prompt
-    assert "time.sleep(1800)" in prompt
-    assert f"timeout={(1800 + 120) * 1000}" in prompt
-    # 长 sleep 被拦时的拆分兜底
-    assert "time.sleep(300)" in prompt
+    assert "不要 sleep" in prompt
+    assert "等待 1800 秒" in prompt
+    assert "time.sleep" not in prompt
+    assert "ScheduleWakeup" in prompt
 
 
 @pytest.mark.asyncio
 async def test_launch_monitor_agent_raises_bash_max_timeout(dispatcher, tmp_path):
-    """BASH_MAX_TIMEOUT_MS 按 interval 抬高，否则单次长 sleep 被 CLI 转后台。"""
+    """A one-check turn no longer scales shell timeout with interval."""
     dispatcher.pool = None
     captured = {}
 
@@ -777,7 +773,7 @@ async def test_launch_monitor_agent_raises_bash_max_timeout(dispatcher, tmp_path
             interval_seconds=3600,
         )
 
-    assert captured["env"]["BASH_MAX_TIMEOUT_MS"] == str((3600 + 600) * 1000)
+    assert captured["env"]["BASH_MAX_TIMEOUT_MS"] == "600000"
     dispatcher._monitor_log_fhs[990001].close()
 
 
@@ -821,6 +817,76 @@ async def test_start_monitor_session(dispatcher):
         await dispatcher._monitor_tasks[1]
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_start_monitor_session_is_idempotent(dispatcher):
+    ms = MagicMock(id=11)
+    release = asyncio.Event()
+
+    async def lifecycle(_session_id):
+        await release.wait()
+
+    with patch.object(
+        dispatcher,
+        "_monitor_session_lifecycle",
+        side_effect=lifecycle,
+    ) as run:
+        dispatcher.start_monitor_session(ms)
+        first = dispatcher._monitor_tasks[11]
+        dispatcher.start_monitor_session(ms)
+        assert dispatcher._monitor_tasks[11] is first
+        assert run.call_count == 1
+        release.set()
+        await first
+
+
+@pytest.mark.asyncio
+async def test_recover_monitor_sessions_rehydrates_only_safe_schedules(
+    dispatcher,
+    db_factory,
+):
+    task_id, scheduled_id = await _seed_task_and_monitor(db_factory)
+    async with db_factory() as db:
+        active = MonitorSession(
+            task_id=task_id,
+            description="uncertain",
+            status="running",
+            turn_generation=2,
+            active_turn_generation=2,
+        )
+        remote = MonitorSession(
+            task_id=task_id,
+            description="remote mirror",
+            status="running",
+            remote_id=91,
+        )
+        db.add_all([active, remote])
+        await db.commit()
+
+    with patch.object(dispatcher, "start_monitor_session") as start:
+        await dispatcher._recover_monitor_sessions()
+
+    assert [call.args[0].id for call in start.call_args_list] == [
+        scheduled_id
+    ]
+
+
+def test_scheduled_monitor_without_active_turn_is_not_restart_blocker(
+    dispatcher,
+):
+    dispatcher._monitor_tasks[1] = MagicMock(done=MagicMock(return_value=False))
+    assert dispatcher.active_auxiliary_blockers() == []
+
+    dispatcher._monitor_active_turns.add(1)
+    assert dispatcher.active_auxiliary_blockers() == [
+        {
+            "id": 1,
+            "title": "监控子 Agent #1",
+            "status": "running_auxiliary",
+            "kind": "monitor",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -901,7 +967,79 @@ async def test_stop_aux_timeout_retains_lifecycle_evidence(dispatcher):
         await asyncio.wait_for(lifecycle, timeout=1)
 
 
-# === Lifecycle: persistent subprocess state transitions ===
+# === Lifecycle: durable scheduled-turn state transitions ===
+
+
+@pytest.mark.asyncio
+async def test_scheduler_runs_two_generation_fenced_checks(
+    dispatcher,
+    db_factory,
+    client,
+):
+    task_id, ms_id = await _seed_task_and_monitor(
+        db_factory,
+        max_checks=2,
+        interval=0,
+    )
+    dispatcher.enqueue_message = AsyncMock()
+    launched_generations = []
+
+    async def launch(_session_id, snapshot):
+        generation = int(snapshot["generation"])
+        launched_generations.append(generation)
+        process = _fake_proc(returncode=0)
+
+        async def report():
+            response = await client.post(
+                f"/api/tasks/{task_id}/monitor-sessions/{ms_id}/checks",
+                json={
+                    "summary": f"check-{generation}",
+                    "turn_generation": generation,
+                },
+            )
+            assert response.status_code == 200, response.text
+            return 0
+
+        process.wait = AsyncMock(side_effect=report)
+        return process, MagicMock()
+
+    with (
+        patch("backend.main.dispatcher", dispatcher),
+        patch.object(
+            dispatcher,
+            "_launch_scheduled_monitor_turn",
+            side_effect=launch,
+        ),
+        patch.object(
+            dispatcher,
+            "_finalize_aux_lifecycle_process",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        await dispatcher._monitor_session_lifecycle(ms_id)
+
+    assert launched_generations == [1, 2]
+    async with db_factory() as db:
+        session = await db.get(MonitorSession, ms_id)
+        reports = list(
+            (
+                await db.execute(
+                    select(MonitorCheck)
+                    .where(MonitorCheck.monitor_session_id == ms_id)
+                    .order_by(MonitorCheck.check_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert session.status == "completed"
+    assert session.checks_done == 2
+    assert session.active_turn_generation is None
+    assert [report.summary for report in reports] == [
+        "check-1",
+        "check-2",
+    ]
 
 
 @pytest.mark.asyncio
@@ -916,7 +1054,12 @@ async def test_lifecycle_completed_by_subagent(dispatcher, db_factory, mock_broa
         async with db_factory() as db:
             await db.execute(
                 update(MonitorSession).where(MonitorSession.id == ms_id)
-                .values(status="completed")
+                .values(
+                    status="completed",
+                    active_turn_generation=None,
+                    turn_started_at=None,
+                    next_check_at=None,
+                )
             )
             await db.commit()
         return 0
@@ -945,7 +1088,7 @@ async def test_lifecycle_completed_by_subagent(dispatcher, db_factory, mock_broa
     assert failed_events == []
 
     # MCP config cleaned up, bookkeeping dicts emptied
-    mock_cleanup.assert_called_once_with(ms_id)
+    mock_cleanup.assert_called_once_with(ms_id, 1)
     assert ms_id not in dispatcher._monitor_tasks
     assert ms_id not in dispatcher._monitor_processes
 
@@ -965,7 +1108,12 @@ async def test_normal_parent_exit_kills_residual_monitor_group(
             await db.execute(
                 update(MonitorSession)
                 .where(MonitorSession.id == ms_id)
-                .values(status="completed")
+                .values(
+                    status="completed",
+                    active_turn_generation=None,
+                    turn_started_at=None,
+                    next_check_at=None,
+                )
             )
             await db.commit()
         return 0
@@ -1119,13 +1267,66 @@ time.sleep(30)
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_abnormal_exit_marks_failed(dispatcher, db_factory, mock_broadcaster):
-    """Process exits without mark_complete → session marked failed + broadcast."""
+async def test_failed_turn_releases_with_backoff(
+    dispatcher,
+    db_factory,
+):
+    """A non-terminal turn failure releases its claim and schedules a retry."""
+    _, ms_id = await _seed_task_and_monitor(db_factory)
+    started_at = datetime.utcnow()
+    async with db_factory() as db:
+        ms = await db.get(MonitorSession, ms_id)
+        ms.turn_generation = 7
+        ms.active_turn_generation = 7
+        ms.turn_started_at = started_at
+        ms.next_check_at = None
+        await db.commit()
+
+    await dispatcher._record_monitor_turn_failure(
+        ms_id,
+        7,
+        "provider exited before callback",
+    )
+
+    async with db_factory() as db:
+        ms = await db.get(MonitorSession, ms_id)
+        assert ms.status == "running"
+        assert ms.active_turn_generation is None
+        assert ms.turn_started_at is None
+        assert ms.consecutive_failures == 1
+        assert ms.last_error == "provider exited before callback"
+        assert ms.next_check_at is not None
+        delay = (ms.next_check_at - datetime.utcnow()).total_seconds()
+        assert 3.0 <= delay <= 5.0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_abnormal_exit_marks_failed(
+    dispatcher,
+    db_factory,
+    mock_broadcaster,
+    monkeypatch,
+):
+    """Three failed scheduled turns end the session after bounded retries."""
     task_id, ms_id = await _seed_task_and_monitor(db_factory)
+    monkeypatch.setattr(
+        "backend.services.dispatcher.MONITOR_FAILURE_BACKOFF_BASE",
+        0,
+    )
+    monkeypatch.setattr(
+        "backend.services.dispatcher.MONITOR_FAILURE_BACKOFF_MAX",
+        0,
+    )
 
     proc = _fake_proc(returncode=1)
-    with patch.object(dispatcher, "_launch_monitor_agent", new_callable=AsyncMock, return_value=proc):
+    with patch.object(
+        dispatcher,
+        "_launch_monitor_agent",
+        new_callable=AsyncMock,
+        return_value=proc,
+    ) as launch:
         await dispatcher._monitor_session_lifecycle(ms_id)
+    assert launch.await_count == 3
 
     async with db_factory() as db:
         ms = await db.get(MonitorSession, ms_id)
@@ -1142,9 +1343,22 @@ async def test_lifecycle_abnormal_exit_marks_failed(dispatcher, db_factory, mock
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_timeout_kills_process(dispatcher, db_factory, mock_broadcaster):
-    """Overall lifecycle timeout → process killed, session marked failed."""
+async def test_lifecycle_timeout_kills_process(
+    dispatcher,
+    db_factory,
+    mock_broadcaster,
+    monkeypatch,
+):
+    """Repeated one-turn timeouts are reaped and eventually fail."""
     task_id, ms_id = await _seed_task_and_monitor(db_factory)
+    monkeypatch.setattr(
+        "backend.services.dispatcher.MONITOR_FAILURE_BACKOFF_BASE",
+        0,
+    )
+    monkeypatch.setattr(
+        "backend.services.dispatcher.MONITOR_FAILURE_BACKOFF_MAX",
+        0,
+    )
 
     proc = _fake_proc(returncode=None)
 
@@ -1186,7 +1400,7 @@ async def test_lifecycle_timeout_kills_process(dispatcher, db_factory, mock_broa
 
 @pytest.mark.asyncio
 async def test_lifecycle_cancelled(dispatcher, db_factory, mock_broadcaster):
-    """Cancelling the lifecycle task kills the subprocess and cleans up."""
+    """Shutdown cancellation reaps the turn and leaves it recoverable."""
     task_id, ms_id = await _seed_task_and_monitor(db_factory)
 
     proc = _fake_proc(returncode=None)
@@ -1232,12 +1446,30 @@ async def test_lifecycle_cancelled(dispatcher, db_factory, mock_broadcaster):
     assert signals, "subprocess group should be killed on cancellation"
     assert ms_id not in dispatcher._monitor_tasks
     assert ms_id not in dispatcher._monitor_processes
+    async with db_factory() as db:
+        session = await db.get(MonitorSession, ms_id)
+        assert session.status == "running"
+        assert session.active_turn_generation is None
+        assert session.next_check_at is not None
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_launch_failure_marks_failed(dispatcher, db_factory, mock_broadcaster):
-    """Unexpected exception (e.g. launch crash) → session marked failed."""
+async def test_lifecycle_launch_failure_marks_failed(
+    dispatcher,
+    db_factory,
+    mock_broadcaster,
+    monkeypatch,
+):
+    """Repeated pre-spawn failures follow the same terminal threshold."""
     task_id, ms_id = await _seed_task_and_monitor(db_factory)
+    monkeypatch.setattr(
+        "backend.services.dispatcher.MONITOR_FAILURE_BACKOFF_BASE",
+        0,
+    )
+    monkeypatch.setattr(
+        "backend.services.dispatcher.MONITOR_FAILURE_BACKOFF_MAX",
+        0,
+    )
 
     with patch.object(
         dispatcher, "_launch_monitor_agent",
@@ -1259,7 +1491,7 @@ async def test_lifecycle_launch_failure_marks_failed(dispatcher, db_factory, moc
 async def _seed_via_api(client, session_factory, max_checks=50):
     resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
-        "enabled_skills": {"monitor": True},
+        "enabled_skills": {"monitor": True}, "provider": "claude",
     })
     task_id = resp.json()["id"]
     async with session_factory() as db:

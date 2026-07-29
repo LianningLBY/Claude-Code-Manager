@@ -1,5 +1,6 @@
 """Tests for Monitor API endpoints."""
 import asyncio
+from datetime import datetime
 
 import pytest
 from fastapi import HTTPException
@@ -966,6 +967,8 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
             description="two checks",
             status="running",
             max_checks=2,
+            turn_generation=1,
+            active_turn_generation=1,
         )
         db.add(session)
         await db.commit()
@@ -976,19 +979,24 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_monitor_session_process = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
-        first = await client.post(
-            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
-            json={"summary": "first"},
-        )
-        async with session_factory() as db:
-            after_first = await db.get(MonitorSession, session_id)
-            assert after_first.status == "running"
-            assert after_first.checks_done == 1
-            assert after_first.completed_at is None
-        second = await client.post(
-            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
-            json={"summary": "second"},
-        )
+            first = await client.post(
+                f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+                json={"summary": "first", "turn_generation": 1},
+            )
+            async with session_factory() as db:
+                after_first = await db.get(MonitorSession, session_id)
+                assert after_first.status == "running"
+                assert after_first.checks_done == 1
+                assert after_first.completed_at is None
+                # Simulate the scheduler claiming the next due turn.
+                after_first.turn_generation = 2
+                after_first.active_turn_generation = 2
+                after_first.next_check_at = None
+                await db.commit()
+            second = await client.post(
+                f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+                json={"summary": "second", "turn_generation": 2},
+            )
 
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
@@ -1010,7 +1018,110 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
     assert session.status == "completed"
     assert session.checks_done == 2
     assert [report.check_number for report in reports] == [1, 2]
-    dispatcher.stop_monitor_session_process.assert_awaited_once_with(session_id)
+    # The scheduled lifecycle observes the terminal callback after the short
+    # turn exits; the callback must not cancel its own MCP response in flight.
+    dispatcher.stop_monitor_session_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_callback_requires_exact_active_turn_generation(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="generation fence",
+            status="running",
+            interval=30,
+            turn_generation=7,
+            active_turn_generation=7,
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    dispatcher = MagicMock()
+    dispatcher.broadcaster.broadcast = AsyncMock()
+    dispatcher.enqueue_message = AsyncMock()
+    with patch("backend.main.dispatcher", dispatcher):
+        stale = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+            json={
+                "summary": "stale",
+                "turn_generation": 6,
+            },
+        )
+        accepted = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+            json={
+                "summary": "current",
+                "turn_generation": 7,
+            },
+        )
+        duplicate = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+            json={
+                "summary": "duplicate",
+                "turn_generation": 7,
+            },
+        )
+
+    assert stale.status_code == 409
+    assert accepted.status_code == 200
+    assert accepted.json()["check_number"] == 1
+    assert duplicate.status_code == 409
+    async with session_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        reports = list(
+            (
+                await db.execute(
+                    select(MonitorCheck).where(
+                        MonitorCheck.monitor_session_id == session_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert session.checks_done == 1
+    assert session.active_turn_generation is None
+    assert session.next_check_at is not None
+    assert [report.summary for report in reports] == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_monitor_rejects_callback_before_generation_claim(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="not claimed",
+            status="running",
+            next_check_at=datetime.utcnow(),
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/monitor-sessions/{session_id}/checks",
+        json={"summary": "must not bypass scheduler"},
+    )
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        assert session.checks_done == 0
+        assert session.next_check_at is not None
 
 
 @pytest.mark.asyncio
@@ -1179,7 +1290,6 @@ async def test_create_monitor_rejects_codex_task(client, session_factory):
     resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
         "provider": "codex",
-        "enabled_skills": {"monitor": True},
     })
     task_id = resp.json()["id"]
     async with session_factory() as db:

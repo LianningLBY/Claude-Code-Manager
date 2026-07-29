@@ -891,7 +891,13 @@ class TaskQueue:
         await self.db.execute(
             update(MonitorSession)
             .where(MonitorSession.task_id == task_id, MonitorSession.status == "running")
-            .values(status="cancelled", completed_at=datetime.utcnow())
+            .values(
+                status="cancelled",
+                completed_at=datetime.utcnow(),
+                next_check_at=None,
+                active_turn_generation=None,
+                turn_started_at=None,
+            )
         )
 
         await self.db.commit()

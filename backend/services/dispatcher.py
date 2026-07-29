@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select, update, func, or_
@@ -173,6 +173,10 @@ TASK_QUEUE_ABORT_TIMEOUT = 15.0
 AUX_LIFECYCLE_CANCEL_TIMEOUT = 10.0
 DISPATCHER_BACKGROUND_STOP_TIMEOUT = 10.0
 SHUTDOWN_LIFECYCLE_CANCEL_TIMEOUT = 15.0
+MONITOR_TURN_TIMEOUT = 600.0
+MONITOR_MAX_CONSECUTIVE_FAILURES = 3
+MONITOR_FAILURE_BACKOFF_BASE = 5.0
+MONITOR_FAILURE_BACKOFF_MAX = 300.0
 
 
 @dataclass(frozen=True)
@@ -532,6 +536,9 @@ class GlobalDispatcher:
         self._monitor_processes: dict[int, asyncio.subprocess.Process] = {}  # monitor_session_id -> subprocess
         self._monitor_config_dirs: dict[int, str] = {}
         self._monitor_log_fhs: dict[int, object] = {}  # monitor_session_id -> log file handle
+        # Scheduled lifecycles sleep without blocking maintenance. Only a
+        # claimed turn contributes to active auxiliary blockers.
+        self._monitor_active_turns: set[int] = set()
 
         # Sub-agent (one-shot tasks) lifecycle — parallel to monitor
         self._sub_agent_tasks: dict[int, asyncio.Task] = {}      # session_id -> asyncio task
@@ -623,6 +630,7 @@ class GlobalDispatcher:
             # manager-owned snapshot without being represented in that snapshot.
             async with self._chat_launch_admission_lock:
                 await self._cleanup_stale_state()
+            await self._recover_monitor_sessions()
 
             # Ensure we have worker instances up to max_concurrent_instances
             await self._ensure_instances()
@@ -1357,7 +1365,20 @@ class GlobalDispatcher:
                         # ``monitor`` agent_type. Source is authoritative.
                         manager_owned = ms.task_id in live_task_ids
                     elif ms.agent_type == "monitor":
-                        manager_owned = ms.id in active_monitor_ids
+                        if ms.id in active_monitor_ids:
+                            manager_owned = True
+                        elif ms.active_turn_generation is None:
+                            # A scheduled Monitor owns no model process while
+                            # it waits. It is durable and will be rehydrated
+                            # immediately after startup reconciliation.
+                            manager_owned = (
+                                await db.get(Task, ms.task_id)
+                            ) is not None
+                        else:
+                            # An unclean restart with an active generation
+                            # cannot prove that the old child is gone. Fail
+                            # closed instead of starting a duplicate checker.
+                            manager_owned = False
                     elif ms.agent_type == "sub_agent":
                         manager_owned = ms.id in active_sub_agent_ids
                     elif ms.agent_type in {
@@ -1383,6 +1404,12 @@ class GlobalDispatcher:
                     )
                     ms.status = "failed"
                     ms.completed_at = datetime.utcnow()
+                    if ms.agent_type == "monitor":
+                        ms.next_check_at = None
+                        ms.last_error = (
+                            "Monitor turn ownership could not be recovered "
+                            "after service restart"
+                        )
 
             await db.commit()
 
@@ -2018,7 +2045,17 @@ class GlobalDispatcher:
     def active_auxiliary_blockers(self) -> list[dict[str, object]]:
         """Return live CCM-owned auxiliary generations that a restart kills."""
 
-        monitor_ids, sub_agent_ids = self._active_auxiliary_session_ids()
+        _scheduled_monitor_ids, sub_agent_ids = (
+            self._active_auxiliary_session_ids()
+        )
+        monitor_ids = {
+            session_id
+            for session_id in (
+                set(self._monitor_processes)
+                | set(getattr(self, "_monitor_active_turns", set()))
+            )
+            if type(session_id) is int
+        }
         return [
             *(
                 {
@@ -7322,6 +7359,10 @@ class GlobalDispatcher:
         await self._stop_aux_session(
             session_id, self._monitor_tasks, self._monitor_processes
         )
+        if session_id not in self._monitor_processes:
+            getattr(self, "_monitor_active_turns", set()).discard(
+                session_id
+            )
 
     async def stop_sub_agent_session_process(self, session_id: int) -> None:
         if (
@@ -7377,148 +7418,539 @@ class GlobalDispatcher:
             self._sub_agent_codex_homes.pop(session_id, None)
             self._sub_agent_codex_threads.pop(session_id, None)
 
+    async def _recover_monitor_sessions(self) -> None:
+        """Rehydrate every durable local CCM Monitor after startup cleanup."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        async with self.db_factory() as db:
+            result = await db.execute(
+                select(MonitorSession).where(
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.status == "running",
+                    MonitorSession.remote_id.is_(None),
+                    MonitorSession.active_turn_generation.is_(None),
+                )
+            )
+            sessions = list(result.scalars().all())
+        for session in sessions:
+            self.start_monitor_session(session)
+
     def start_monitor_session(self, monitor_session):
+        """Start one durable scheduler, idempotently, for a Monitor row."""
+
         if getattr(self, "_shutting_down", False):
             raise RuntimeError(
                 "GlobalDispatcher is shutting down; monitor admission is closed"
             )
+        if not hasattr(self, "_monitor_tasks"):
+            self._monitor_tasks = {}
+        existing = self._monitor_tasks.get(monitor_session.id)
+        if existing is not None and not existing.done():
+            return
         task = asyncio.create_task(
             self._monitor_session_lifecycle(monitor_session.id)
         )
         self._monitor_tasks[monitor_session.id] = task
 
-    async def _monitor_session_lifecycle(self, monitor_session_id: int):
-        """Run a persistent monitor sub-agent process.
+    @staticmethod
+    def _monitor_failure_backoff(failures: int) -> float:
+        return min(
+            MONITOR_FAILURE_BACKOFF_BASE
+            * (2 ** max(0, failures - 1)),
+            MONITOR_FAILURE_BACKOFF_MAX,
+        )
 
-        New flow: read DB → build prompt → generate MCP config → launch
-        persistent Claude subprocess → wait for process exit (up to 4h) →
-        check session status → cleanup.
+    async def _release_interrupted_monitor_turn(
+        self,
+        monitor_session_id: int,
+        generation: int,
+    ) -> None:
+        """Return an exactly reaped shutdown turn to the durable schedule."""
 
-        The sub-agent communicates via its own MCP tools (report_status,
-        mark_complete, get_context) which call back into the CCM API.
-        """
         from backend.models.monitor_session import MonitorSession
+
+        async with self.db_factory() as db:
+            await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation == generation,
+                )
+                .values(
+                    active_turn_generation=None,
+                    turn_started_at=None,
+                    next_check_at=datetime.utcnow(),
+                )
+            )
+            await db.commit()
+
+    async def _mark_monitor_turn_uncertain(
+        self,
+        monitor_session_id: int,
+        generation: int,
+        error: str,
+    ) -> None:
+        """Fail closed when an exact process group cannot be proven dead."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        completed_at = datetime.utcnow()
+        task_id: int | None = None
+        async with self.db_factory() as db:
+            row = await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation == generation,
+                )
+                .values(
+                    status="failed",
+                    completed_at=completed_at,
+                    next_check_at=None,
+                    last_error=error[:2000],
+                )
+            )
+            if row.rowcount:
+                task_id = await db.scalar(
+                    select(MonitorSession.task_id).where(
+                        MonitorSession.id == monitor_session_id
+                    )
+                )
+            await db.commit()
+        if task_id is not None:
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {
+                    "event": "monitor_session_status",
+                    "monitor_session_id": monitor_session_id,
+                    "status": "failed",
+                },
+            )
+
+    async def _record_monitor_turn_failure(
+        self,
+        monitor_session_id: int,
+        generation: int,
+        error: str,
+    ) -> None:
+        """Release one failed turn with bounded backoff or a terminal state."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        terminal = False
+        task_id: int | None = None
+        async with self.db_factory() as db:
+            state = (
+                await db.execute(
+                    select(
+                        MonitorSession.task_id,
+                        MonitorSession.consecutive_failures,
+                    ).where(
+                        MonitorSession.id == monitor_session_id,
+                        MonitorSession.agent_type == "monitor",
+                        MonitorSession.source == "ccm",
+                        MonitorSession.status == "running",
+                        MonitorSession.active_turn_generation == generation,
+                    )
+                )
+            ).one_or_none()
+            if state is None:
+                await db.rollback()
+                return
+            task_id, previous_failures = state
+            failures = previous_failures + 1
+            terminal = (
+                failures >= MONITOR_MAX_CONSECUTIVE_FAILURES
+            )
+            now = datetime.utcnow()
+            values = {
+                "active_turn_generation": None,
+                "turn_started_at": None,
+                "consecutive_failures": failures,
+                "last_error": error[:2000],
+                "next_check_at": (
+                    None
+                    if terminal
+                    else now
+                    + timedelta(
+                        seconds=self._monitor_failure_backoff(failures)
+                    )
+                ),
+            }
+            if terminal:
+                values.update(
+                    status="failed",
+                    completed_at=now,
+                )
+            advanced = await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation == generation,
+                )
+                .values(**values)
+            )
+            await db.commit()
+            if not advanced.rowcount:
+                return
+        if terminal and task_id is not None:
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {
+                    "event": "monitor_session_status",
+                    "monitor_session_id": monitor_session_id,
+                    "status": "failed",
+                },
+            )
+
+    async def _claim_due_monitor_turn(
+        self,
+        monitor_session_id: int,
+    ) -> dict[str, object] | None:
+        """Wait until due, then atomically claim one scheduled generation."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        while True:
+            now = datetime.utcnow()
+            async with self.db_factory() as db:
+                ms = await db.get(MonitorSession, monitor_session_id)
+                if (
+                    ms is None
+                    or ms.agent_type != "monitor"
+                    or ms.source != "ccm"
+                    or ms.status != "running"
+                    or ms.remote_id is not None
+                ):
+                    return None
+                if ms.active_turn_generation is not None:
+                    # Another scheduler owns the durable generation. This
+                    # lifecycle must not wait beside it and later duplicate it.
+                    return None
+                due_at = ms.next_check_at or now
+                delay = max(0.0, (due_at - now).total_seconds())
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
+            claimed_at = datetime.utcnow()
+            async with self.db_factory() as db:
+                next_generation = MonitorSession.turn_generation + 1
+                claimed = await db.execute(
+                    update(MonitorSession)
+                    .where(
+                        MonitorSession.id == monitor_session_id,
+                        MonitorSession.agent_type == "monitor",
+                        MonitorSession.source == "ccm",
+                        MonitorSession.status == "running",
+                        MonitorSession.remote_id.is_(None),
+                        MonitorSession.active_turn_generation.is_(None),
+                        or_(
+                            MonitorSession.next_check_at.is_(None),
+                            MonitorSession.next_check_at <= claimed_at,
+                        ),
+                    )
+                    # MySQL evaluates assignments left-to-right. Store the
+                    # old-generation + 1 expression before updating its source.
+                    .ordered_values(
+                        (
+                            MonitorSession.active_turn_generation,
+                            next_generation,
+                        ),
+                        (
+                            MonitorSession.turn_started_at,
+                            claimed_at,
+                        ),
+                        (
+                            MonitorSession.next_check_at,
+                            None,
+                        ),
+                        (
+                            MonitorSession.turn_generation,
+                            next_generation,
+                        ),
+                    )
+                )
+                if not claimed.rowcount:
+                    await db.rollback()
+                    await asyncio.sleep(0)
+                    continue
+                db.expire_all()
+                ms = await db.get(MonitorSession, monitor_session_id)
+                if ms is None or ms.active_turn_generation is None:
+                    await db.rollback()
+                    return None
+                task = await db.get(Task, ms.task_id)
+                if task is None:
+                    ms.status = "failed"
+                    ms.completed_at = datetime.utcnow()
+                    ms.next_check_at = None
+                    ms.active_turn_generation = None
+                    ms.turn_started_at = None
+                    ms.last_error = "Monitor parent task no longer exists"
+                    await db.commit()
+                    return None
+                task_provider = (task.provider or "claude").lower()
+                monitor_provider = (ms.provider or "claude").lower()
+                if task_provider != monitor_provider:
+                    ms.status = "failed"
+                    ms.completed_at = datetime.utcnow()
+                    ms.next_check_at = None
+                    ms.active_turn_generation = None
+                    ms.turn_started_at = None
+                    ms.last_error = (
+                        "Monitor provider no longer matches its parent task"
+                    )
+                    await db.commit()
+                    return None
+                snapshot = {
+                    "task_id": ms.task_id,
+                    "generation": ms.active_turn_generation,
+                    "provider": monitor_provider,
+                    "description": ms.description,
+                    "context": ms.monitor_context,
+                    "interval": ms.interval,
+                    "model": ms.model,
+                    "cwd": (
+                        task.last_cwd
+                        or task.target_repo
+                        or os.getcwd()
+                    ),
+                }
+                commit, cancellation = await _settle_despite_cancellation(
+                    db.commit()
+                )
+                commit.result()
+            if cancellation is not None:
+                cleanup, _ = await _settle_despite_cancellation(
+                    self._release_interrupted_monitor_turn(
+                        monitor_session_id,
+                        int(snapshot["generation"]),
+                    )
+                )
+                cleanup.result()
+                raise cancellation
+            return snapshot
+
+    async def _launch_scheduled_monitor_turn(
+        self,
+        monitor_session_id: int,
+        snapshot: dict[str, object],
+    ) -> tuple[asyncio.subprocess.Process, Path]:
+        """Provider-neutral turn seam; PR7B adds the Codex implementation."""
+
+        provider = str(snapshot["provider"])
+        if provider != "claude":
+            raise RuntimeError(
+                f"Scheduled Monitor provider {provider!r} is not supported"
+            )
         from backend.services.mcp_config import (
             generate_monitor_agent_mcp_config,
+        )
+
+        generation = int(snapshot["generation"])
+        task_id = int(snapshot["task_id"])
+        prompt = self._build_monitor_agent_prompt(
+            description=str(snapshot["description"]),
+            context=(
+                None
+                if snapshot["context"] is None
+                else str(snapshot["context"])
+            ),
+            interval=int(snapshot["interval"]),
+        )
+        mcp_config_path = generate_monitor_agent_mcp_config(
+            monitor_session_id=monitor_session_id,
+            task_id=task_id,
+            turn_generation=generation,
+        )
+        process = await self._launch_monitor_agent(
+            prompt=prompt,
+            cwd=str(snapshot["cwd"]),
+            model=(
+                None
+                if snapshot["model"] is None
+                else str(snapshot["model"])
+            ),
+            monitor_session_id=monitor_session_id,
+            mcp_config_path=mcp_config_path,
+            interval_seconds=int(snapshot["interval"]),
+        )
+        return process, mcp_config_path
+
+    async def _execute_scheduled_monitor_turn(
+        self,
+        monitor_session_id: int,
+        snapshot: dict[str, object],
+    ) -> None:
+        """Run, reap, and reconcile exactly one claimed Monitor turn."""
+
+        from backend.models.monitor_session import MonitorSession
+        from backend.services.mcp_config import (
             cleanup_monitor_agent_mcp_config,
         )
 
-        task_id: int | None = None
-        proc: asyncio.subprocess.Process | None = None
+        generation = int(snapshot["generation"])
+        process: asyncio.subprocess.Process | None = None
+        config_path: Path | None = None
+        turn_error: str | None = None
+        cancellation: asyncio.CancelledError | None = None
+        active_turns = getattr(self, "_monitor_active_turns", None)
+        if active_turns is None:
+            active_turns = set()
+            self._monitor_active_turns = active_turns
+        active_turns.add(monitor_session_id)
 
         try:
-            async with self.db_factory() as db:
-                ms = await db.get(MonitorSession, monitor_session_id)
-                if not ms:
-                    return
-                task = await db.get(Task, ms.task_id)
-                if not task:
-                    return
-                task_id = ms.task_id
-                ms_description = ms.description
-                ms_context = ms.monitor_context
-                ms_interval = ms.interval
-                ms_max_checks = ms.max_checks
-                model = ms.model
-                task_cwd = task.last_cwd or task.target_repo or os.getcwd()
-
-            # Dynamic timeout: expected duration + 50% buffer, minimum 30 min
-            expected_seconds = ms_interval * ms_max_checks
-            timeout_seconds = max(expected_seconds * 1.5, 1800)
-
-            prompt = self._build_monitor_agent_prompt(
-                description=ms_description,
-                context=ms_context,
-                interval=ms_interval,
+            process, config_path = await self._launch_scheduled_monitor_turn(
+                monitor_session_id,
+                snapshot,
             )
-
-            mcp_config_path = generate_monitor_agent_mcp_config(
-                monitor_session_id=monitor_session_id,
-                task_id=task_id,
-            )
-
-            proc = await self._launch_monitor_agent(
-                prompt=prompt,
-                cwd=task_cwd,
-                model=model,
-                monitor_session_id=monitor_session_id,
-                mcp_config_path=mcp_config_path,
-                interval_seconds=ms_interval,
-            )
-
             try:
                 await asyncio.wait_for(
-                    proc.wait(),
-                    timeout=timeout_seconds,
+                    process.wait(),
+                    timeout=MONITOR_TURN_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"Monitor session {monitor_session_id} timed out after {timeout_seconds:.0f}s, killing"
+                turn_error = (
+                    "Monitor check turn timed out after "
+                    f"{MONITOR_TURN_TIMEOUT:.0f}s"
                 )
-                await self._terminate_aux_process(proc)
-            # A successful wait proves only that the CLI parent exited.  Its
-            # dedicated group may still contain tool descendants.
-            await self._terminate_aux_process(proc)
-
-            # If session is still running after process exit, the sub-agent
-            # exited abnormally without calling mark_complete → mark failed
-            async with self.db_factory() as db:
-                ms = await db.get(MonitorSession, monitor_session_id)
-                if ms and ms.status == "running":
-                    ms.status = "failed"
-                    ms.completed_at = datetime.utcnow()
-                    await db.commit()
-                    await self.broadcaster.broadcast(
-                        f"task:{task_id}",
-                        {
-                            "event": "monitor_session_status",
-                            "monitor_session_id": monitor_session_id,
-                            "status": "failed",
-                        },
-                    )
-                    logger.warning(
-                        f"Monitor session {monitor_session_id} process exited "
-                        f"(rc={proc.returncode}) without calling mark_complete, marked failed"
-                    )
-
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(f"Monitor session {monitor_session_id} failed unexpectedly")
-            try:
-                async with self.db_factory() as db:
-                    ms = await db.get(MonitorSession, monitor_session_id)
-                    if ms and ms.status == "running":
-                        ms.status = "failed"
-                        ms.completed_at = datetime.utcnow()
-                        await db.commit()
-                        await self.broadcaster.broadcast(
-                            f"task:{ms.task_id}",
-                            {"event": "monitor_session_status", "monitor_session_id": ms.id, "status": "failed"},
-                        )
-            except Exception:
-                pass
-        finally:
-            delayed_cancellation = await self._finalize_aux_lifecycle_process(
-                session_id=monitor_session_id,
-                process=proc,
-                process_map=self._monitor_processes,
+            if turn_error is None and process.returncode not in (0, None):
+                turn_error = (
+                    "Monitor check turn exited with "
+                    f"code {process.returncode}"
+                )
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception as exc:
+            turn_error = f"Monitor check turn failed: {exc}"
+            logger.exception(
+                "Monitor session %s generation %s failed",
+                monitor_session_id,
+                generation,
             )
-            if monitor_session_id not in self._monitor_processes:
+        finally:
+            delayed_cancellation = None
+            if process is not None:
+                delayed_cancellation = (
+                    await self._finalize_aux_lifecycle_process(
+                        session_id=monitor_session_id,
+                        process=process,
+                        process_map=self._monitor_processes,
+                    )
+                )
+            reaped = (
+                process is None
+                or monitor_session_id not in self._monitor_processes
+            )
+            if reaped:
                 getattr(
                     self, "_monitor_config_dirs", {}
                 ).pop(monitor_session_id, None)
-            cleanup_monitor_agent_mcp_config(monitor_session_id)
-            log_fh = self._monitor_log_fhs.pop(monitor_session_id, None)
+            cleanup_monitor_agent_mcp_config(
+                monitor_session_id,
+                generation,
+            )
+            log_fh = self._monitor_log_fhs.pop(
+                monitor_session_id,
+                None,
+            )
             if log_fh:
                 try:
                     log_fh.close()
                 except Exception:
                     pass
-            if self._monitor_tasks.get(monitor_session_id) is asyncio.current_task():
-                self._monitor_tasks.pop(monitor_session_id, None)
+
+            if not reaped:
+                await self._mark_monitor_turn_uncertain(
+                    monitor_session_id,
+                    generation,
+                    (
+                        turn_error
+                        or "Monitor process group could not be proven terminal"
+                    ),
+                )
+            elif cancellation is not None or delayed_cancellation is not None:
+                await self._release_interrupted_monitor_turn(
+                    monitor_session_id,
+                    generation,
+                )
+            elif turn_error is not None:
+                await self._record_monitor_turn_failure(
+                    monitor_session_id,
+                    generation,
+                    turn_error,
+                )
+            else:
+                # A successful process exit is not a successful check unless
+                # its exact callback already consumed this generation.
+                async with self.db_factory() as db:
+                    still_active = await db.scalar(
+                        select(MonitorSession.id).where(
+                            MonitorSession.id == monitor_session_id,
+                            MonitorSession.status == "running",
+                            MonitorSession.active_turn_generation
+                            == generation,
+                        )
+                    )
+                if still_active is not None:
+                    await self._record_monitor_turn_failure(
+                        monitor_session_id,
+                        generation,
+                        (
+                            "Monitor check turn exited without calling "
+                            "report_status or mark_complete"
+                        ),
+                    )
+
+            if reaped:
+                active_turns.discard(monitor_session_id)
             if delayed_cancellation is not None:
-                raise delayed_cancellation
+                cancellation = delayed_cancellation
+
+        if cancellation is not None:
+            raise cancellation
+
+    async def _monitor_session_lifecycle(
+        self,
+        monitor_session_id: int,
+    ) -> None:
+        """Run recoverable, provider-neutral scheduled Monitor turns."""
+
+        try:
+            while True:
+                snapshot = await self._claim_due_monitor_turn(
+                    monitor_session_id
+                )
+                if snapshot is None:
+                    return
+                await self._execute_scheduled_monitor_turn(
+                    monitor_session_id,
+                    snapshot,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Monitor scheduler %s failed unexpectedly",
+                monitor_session_id,
+            )
+        finally:
+            if (
+                self._monitor_tasks.get(monitor_session_id)
+                is asyncio.current_task()
+            ):
+                self._monitor_tasks.pop(monitor_session_id, None)
 
     async def _launch_monitor_agent(
         self,
@@ -7529,7 +7961,7 @@ class GlobalDispatcher:
         mcp_config_path: Path,
         interval_seconds: int = 300,
     ) -> asyncio.subprocess.Process:
-        """Launch a persistent Claude subprocess for a monitor sub-agent.
+        """Launch one short-lived Claude Monitor check turn.
 
         Stdout is written to a log file (not PIPE) to prevent buffer blocking.
         The process runs in its own session (start_new_session=True) so it can
@@ -7553,12 +7985,9 @@ class GlobalDispatcher:
                if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
         config_dir: str | None = None
 
-        # Bash 单调用超时上限默认 600s：interval 更长时，子 agent 的一次
-        # time.sleep(interval) 会被 CLI 转后台（不阻塞）→ 它转投 ScheduleWakeup
-        # 并结束回合 → -p 进程退出 → monitor 被误判 failed（2026-07-16 task 35
-        # #192/#193/#194 三连死）。按 interval 抬高上限并留检查余量；只抬不降，
-        # 环境里已有更大值时保留。
-        want_ms = (max(interval_seconds, 0) + 600) * 1000
+        # One scheduled turn performs a single check and never sleeps. Preserve
+        # a caller's larger shell limit, but do not scale it with the interval.
+        want_ms = 600_000
         try:
             have_ms = int(env.get("BASH_MAX_TIMEOUT_MS", "0"))
         except ValueError:
@@ -7615,9 +8044,9 @@ class GlobalDispatcher:
     def _build_monitor_agent_prompt(
         self, description: str, context: str | None, interval: int = 300
     ) -> str:
-        """Build the system prompt for a monitor sub-agent."""
+        """Build one read-only check turn for a scheduled Monitor."""
         parts = [
-            "你是一个自主监控 Agent，持续监控目标并在有变化时主动汇报。",
+            "你是一个只读 Monitor Agent。本回合只执行一次状态检查。",
             "",
             "## 监控目标",
             description,
@@ -7627,39 +8056,23 @@ class GlobalDispatcher:
             parts.append("## 上下文")
             parts.append(context)
         parts.append("")
-        # 等待指引必须按 interval 生成：默认 Bash timeout 只有 120s，单次
-        # sleep 又不能超过 CLI 的单调用上限（launch 时已按 interval 抬高
-        # BASH_MAX_TIMEOUT_MS），两头都要在 prompt 里写死数字，子 agent
-        # 才不会自己发明等待方式（ScheduleWakeup / 转后台 = 进程退出即死）。
-        sleep_timeout_ms = (interval + 120) * 1000
         parts.append(f"""\
 ## 你的 MCP 工具
 - report_status(summary, is_important): 报告状态。重要变化设 is_important=True
-- mark_complete(reason): 监控目标完成时调用，然后立即停止所有活动
+- mark_complete(reason): 监控目标已经结束或无需继续监控时调用
 - get_context(): 获取最新监控配置
 
 ## 行为准则
-1. 用 Bash 执行 ps、tail、cat 等命令检查状态
-2. 每次检查后调用 report_status 汇报
-3. 你的检查间隔是 {interval} 秒。等待下一轮检查时，用 python 延时命令一次睡满整个间隔，
-   并且必须像下面这样显式传大 timeout（默认只有 120 秒，会截断长等待）：
-   `Bash(command="python3 -c 'import time; time.sleep({interval})'", timeout={sleep_timeout_ms})`
-   【重要】不要使用 bash 的 sleep 命令（会被系统拦截），必须用 python3 的 time.sleep。
-   【兜底】如果这个 sleep 没有阻塞等待、而是立即返回（提示转入后台/超出时限），改用
-   连续多次 `time.sleep(300)`（每次一个独立 Bash 调用，timeout=360000）累计等够
-   {interval} 秒，绝不因此改用其他等待方式。
-4. 【关键】你必须严格按以下循环执行，绝不中断：
-   检查 → report_status → python sleep → 检查 → report_status → python sleep → ...
-   每一步都是一个独立的工具调用。你的进程必须持续运行直到目标完成。
-5. 任务完成/失败/异常 → mark_complete 并说明原因，然后停止
-6. 你是只读观察者，不要修改任何文件
-7. 【禁止】不要使用内置的 Agent 工具
-8. 【禁止】不要使用 Monitor 工具、ScheduleWakeup 工具或 run_in_background —— 你是
-   一次性 claude -p 进程，回合一结束进程就退出，"到点自动唤醒"的承诺对你不成立，
-   用了必死
-9. 【禁止】不要在调用 mark_complete 之前结束你的回合（end_turn）
+1. 用 Bash 执行 ps、tail、cat 等只读命令检查一次当前状态
+2. 如果目标仍需继续监控，调用一次 report_status
+3. 如果目标已经完成、失败或不再需要监控，改为调用一次 mark_complete
+4. report_status 与 mark_complete 二选一；成功调用后立即结束本回合
+5. 你是只读观察者，严禁修改文件、启动后台任务或改变系统状态
+6. 不要 sleep，不要等待 {interval} 秒；下一轮由 CCM Scheduler 定时启动
+7. 禁止使用 Agent、Task、Monitor、ScheduleWakeup 或 run_in_background
+8. 结束本回合前必须成功调用上述两个回调之一
 
-先做一次初始状态检查并 report_status，然后用 python sleep 等待，然后继续下一轮。""")
+现在执行一次检查，完成回调后立即结束。""")
         return "\n".join(parts)
 
     # -----------------------------------------------------------------------

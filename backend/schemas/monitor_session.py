@@ -34,9 +34,15 @@ class MonitorSessionResponse(BaseModel):
     interval: int
     max_checks: int
     model: str | None
+    provider: str
     status: str
     checks_done: int
     last_summary: str | None
+    next_check_at: datetime | None
+    turn_generation: int
+    active_turn_generation: int | None
+    consecutive_failures: int
+    last_error: str | None
     created_at: datetime
     completed_at: datetime | None
 
@@ -47,10 +53,12 @@ class MonitorCheckCreate(BaseModel):
     summary: str
     status: str = "success"
     is_important: bool = False
+    turn_generation: int | None = None
 
 
 class MonitorCompleteRequest(BaseModel):
     reason: str
+    turn_generation: int | None = None
 
 
 class MonitorCheckResponse(BaseModel):

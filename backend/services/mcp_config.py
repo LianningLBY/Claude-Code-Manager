@@ -157,19 +157,25 @@ def build_monitor_agent_mcp_server_specs(
     monitor_session_id: int,
     task_id: int,
     api_base: str | None = None,
+    turn_generation: int | None = None,
 ) -> tuple[McpServerSpec, ...]:
     """Build MCP callback specs for one monitor agent."""
 
+    context_args = [
+        "--monitor-session-id",
+        str(monitor_session_id),
+        "--task-id",
+        str(task_id),
+    ]
+    if turn_generation is not None:
+        context_args.extend(
+            ("--turn-generation", str(turn_generation))
+        )
     return (
         _ccm_server_spec(
             name="ccm_monitor_agent",
             module="backend.mcp.ccm_monitor_agent_server",
-            context_args=(
-                "--monitor-session-id",
-                str(monitor_session_id),
-                "--task-id",
-                str(task_id),
-            ),
+            context_args=tuple(context_args),
             enabled_tools=CCM_MONITOR_AGENT_TOOLS,
             api_base=api_base,
         ),
@@ -378,25 +384,44 @@ def cleanup_mcp_config(task_id: int):
 
 
 def generate_monitor_agent_mcp_config(
-    monitor_session_id: int, task_id: int, api_base: str | None = None
+    monitor_session_id: int,
+    task_id: int,
+    api_base: str | None = None,
+    turn_generation: int | None = None,
 ) -> Path:
     """为 monitor 子 agent 生成专用 MCP config。
 
     Returns:
         配置文件路径，调用方负责清理。
     """
-    config_path = Path(tempfile.gettempdir()) / f"ccm_monitor_agent_{monitor_session_id}.json"
+    generation_suffix = (
+        f"_{turn_generation}" if turn_generation is not None else ""
+    )
+    config_path = (
+        Path(tempfile.gettempdir())
+        / f"ccm_monitor_agent_{monitor_session_id}{generation_suffix}.json"
+    )
     specs = build_monitor_agent_mcp_server_specs(
         monitor_session_id,
         task_id,
         api_base,
+        turn_generation,
     )
     return _write_claude_mcp_config(specs, config_path)
 
 
-def cleanup_monitor_agent_mcp_config(monitor_session_id: int):
+def cleanup_monitor_agent_mcp_config(
+    monitor_session_id: int,
+    turn_generation: int | None = None,
+):
     """清理 monitor 子 agent 的 MCP config 文件。"""
-    config_path = Path(tempfile.gettempdir()) / f"ccm_monitor_agent_{monitor_session_id}.json"
+    generation_suffix = (
+        f"_{turn_generation}" if turn_generation is not None else ""
+    )
+    config_path = (
+        Path(tempfile.gettempdir())
+        / f"ccm_monitor_agent_{monitor_session_id}{generation_suffix}.json"
+    )
     config_path.unlink(missing_ok=True)
 
 

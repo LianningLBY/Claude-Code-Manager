@@ -767,15 +767,15 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 
 ### 子 Agent 系统集成测试
 
-> 以下功能通过启动开发服务（`./start-dev.sh`，端口 8003）进行端到端集成验证，暂无独立单元测试文件。
+Monitor 的调度、generation 栅栏和失败恢复已有聚焦自动化测试；真实 Claude CLI/MCP 通信仍需启动开发服务（`./start-dev.sh`，端口 8003）做端到端冒烟。
 
 #### 子 Agent MCP Server (`ccm_monitor_agent_server.py`)
 
 | 验证项 | 说明 |
 |--------|------|
-| MCP 进程启动 | `claude --mcp-config` 启动子 Agent 进程，进程正常运行 |
-| `report_status` tool | 子 Agent 调用 → POST `/checks` → DB MonitorCheck 记录 + WebSocket 广播 |
-| `mark_complete` tool | 子 Agent 调用 → POST `/complete` → session 状态变为 completed，进程自行退出 |
+| MCP 进程启动 | 每个到期 generation 用独立 `claude --mcp-config` 启动一次短回合 |
+| `report_status` tool | 子 Agent 携带 `turn_generation` 调用 → POST `/checks` → DB MonitorCheck 记录 + WebSocket 广播 + 安排下次检查 |
+| `mark_complete` tool | 子 Agent 携带 `turn_generation` 调用 → POST `/complete` → session 状态变为 completed |
 | `get_context` tool | 子 Agent 调用 → GET session 信息，返回 description/context/checks_done |
 
 #### 子 Agent API (`sub_agents.py`)
@@ -789,18 +789,34 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 
 | 验证项 | 说明 |
 |--------|------|
-| `POST /{session_id}/checks` | 子 Agent 报告状态，创建 MonitorCheck 记录，WebSocket 广播 |
-| `POST /{session_id}/complete` | 子 Agent 标记完成，session 状态更新，WebSocket 广播 |
+| `POST /{session_id}/checks` | 只接受当前 active generation；成功后原子释放本轮、创建 MonitorCheck、广播并设置 `next_check_at` |
+| `POST /{session_id}/complete` | 只接受当前 active generation；成功后原子完成 session 并清空调度字段 |
+| 过期/重复/漏 generation | 当前存在 active generation 时返回 409，不得重复写 check 或完成新一轮 |
 | checks_done >= max_checks | 自动标记 session 为 completed |
 
 #### Dispatcher 子 Agent 生命周期
 
 | 验证项 | 说明 |
 |--------|------|
-| `_launch_monitor_agent()` | 构建 Claude CLI + MCP config 命令，启动持久子进程 |
-| `_build_monitor_agent_prompt()` | Agent 风格 prompt 包含监控目标、上下文、MCP 工具说明 |
-| `_monitor_session_lifecycle()` | 启动子进程 → wait → 检查状态 → 清理（MCP config + 日志） |
-| `stop_monitor` → 进程 kill | delete_monitor_session 终止子进程 + 清理 MCP 配置文件 |
+| `_claim_due_monitor_turn()` | 等待 `next_check_at`，CAS 领取并递增 generation，拒绝父 Task/provider 漂移 |
+| `_launch_monitor_agent()` | 构建 Claude CLI + generation 专属 MCP config，启动一次短回合 |
+| `_build_monitor_agent_prompt()` | 只允许执行一次状态检查并恰好回调一次；禁止 sleep/后台等待/子 Agent |
+| `_monitor_session_lifecycle()` | 到期领取 → 启动短回合 → 等待 generation 回调 → 安排下一轮；失败有界退避 |
+| 服务重启恢复 | 只恢复无 active generation 的安全 schedule；孤儿 active generation fail closed |
+| `stop_monitor` → 精确回收 | delete_monitor_session 终止当前短回合并清理 generation 专属 MCP 配置 |
+
+聚焦回归命令：
+
+```bash
+python -m pytest \
+  backend/tests/test_monitor_models.py \
+  backend/tests/test_api_monitor.py \
+  backend/tests/test_monitor_dispatcher.py \
+  backend/tests/test_mcp_config.py \
+  backend/tests/test_stale_state_cleanup.py
+```
+
+关键覆盖包括：两轮 generation-fenced 调度、重复/过期回调拒绝、失败退避与三次失败终止、取消时精确回收、睡眠 Monitor 不阻塞维护、启动恢复安全筛选，以及 Alembic upgrade → downgrade → upgrade。
 
 #### 前端子 Agent UI
 

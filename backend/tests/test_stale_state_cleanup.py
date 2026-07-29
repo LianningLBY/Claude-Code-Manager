@@ -11,6 +11,7 @@ Covers dispatcher ownership recovery and stale-state cleanup:
 """
 import asyncio
 import os
+from datetime import datetime
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -188,6 +189,23 @@ async def test_startup_cleanup_uses_exact_auxiliary_ownership(db_factory):
                 status="running",
             ),
             SubAgentSession(
+                task_id=parent.id,
+                description="recoverable scheduled monitor",
+                agent_type="monitor",
+                source="ccm",
+                status="running",
+                next_check_at=datetime.utcnow(),
+            ),
+            SubAgentSession(
+                task_id=parent.id,
+                description="uncertain active monitor",
+                agent_type="monitor",
+                source="ccm",
+                status="running",
+                turn_generation=3,
+                active_turn_generation=3,
+            ),
+            SubAgentSession(
                 task_id=998,
                 remote_id=88,
                 description="remote mirror",
@@ -227,7 +245,12 @@ async def test_startup_cleanup_uses_exact_auxiliary_ownership(db_factory):
         "running",
         "failed",
         "running",
+        "failed",
+        "running",
     ]
+    async with db_factory() as db:
+        uncertain = await db.get(SubAgentSession, row_ids[6])
+    assert "could not be recovered" in uncertain.last_error
 
 
 @pytest.mark.asyncio
@@ -1653,7 +1676,7 @@ async def test_stop_session_in_progress_task_marked_completed(client, session_fa
 
 
 @pytest.mark.asyncio
-async def test_startup_sub_agent_cleanup_preserves_only_native_background_rows(
+async def test_startup_sub_agent_cleanup_defers_durable_monitor_recovery(
     db_factory,
 ):
     from backend import main as main_module
@@ -1684,14 +1707,39 @@ async def test_startup_sub_agent_cleanup_preserves_only_native_background_rows(
                 task_id=background_task.id,
                 source="ccm",
                 agent_type="monitor",
-                description="ordinary CCM monitor cleanup",
+                description="sleeping durable CCM monitor",
                 status="running",
+                next_check_at=datetime.utcnow(),
+            ),
+            SubAgentSession(
+                task_id=ordinary_task.id,
+                source="ccm",
+                agent_type="monitor",
+                description="uncertain active CCM monitor",
+                status="running",
+                turn_generation=4,
+                active_turn_generation=4,
             ),
             SubAgentSession(
                 task_id=ordinary_task.id,
                 source="native",
                 agent_type="native-agent",
                 description="no live background generation",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=ordinary_task.id,
+                source="ccm",
+                agent_type="sub_agent",
+                description="ordinary one-shot CCM child",
+                status="running",
+            ),
+            SubAgentSession(
+                task_id=ordinary_task.id,
+                source="ccm",
+                agent_type="monitor",
+                remote_id=77,
+                description="remote monitor mirror",
                 status="running",
             ),
         ]
@@ -1706,10 +1754,28 @@ async def test_startup_sub_agent_cleanup_preserves_only_native_background_rows(
         current = [await db.get(SubAgentSession, row_id) for row_id in row_ids]
         assert current[0].status == "running"
         assert current[0].completed_at is None
-        assert current[1].status == "completed"
-        assert current[1].completed_at is not None
-        assert current[2].status == "completed"
-        assert current[2].completed_at is not None
+        assert current[1].status == "running"
+        assert current[1].completed_at is None
+        assert current[2].status == "running"
+        assert current[2].completed_at is None
+        assert current[3].status == "completed"
+        assert current[3].completed_at is not None
+        assert current[4].status == "completed"
+        assert current[4].completed_at is not None
+        assert current[5].status == "completed"
+        assert current[5].completed_at is not None
+
+    dispatcher = _make_dispatcher(db_factory)
+    await dispatcher._cleanup_stale_state()
+    with patch.object(dispatcher, "start_monitor_session") as start:
+        await dispatcher._recover_monitor_sessions()
+
+    assert [call.args[0].id for call in start.call_args_list] == [row_ids[1]]
+    async with db_factory() as db:
+        uncertain = await db.get(SubAgentSession, row_ids[2])
+        assert uncertain.status == "failed"
+        assert uncertain.next_check_at is None
+        assert "could not be recovered" in (uncertain.last_error or "")
 
 
 @pytest.mark.asyncio

@@ -2571,6 +2571,115 @@ def test_pool_login_registration_reactivates_tombstone_with_quota_cutoff(
     }
 
 
+@pytest.mark.asyncio
+async def test_delete_account_blocks_persisted_codex_monitor_owner(
+    monkeypatch,
+    tmp_path,
+):
+    account = SimpleNamespace(
+        id="codex-2",
+        codex_home=str(tmp_path / ".codex-codex-2"),
+        email="",
+        auth_kind="oauth",
+        retired=False,
+        cleanup_pending=False,
+    )
+    pool = SimpleNamespace(account=lambda account_id: account)
+    manager = _maintenance_manager()
+    dispatcher = SimpleNamespace(
+        codex_monitor_runtime_users=AsyncMock(
+            return_value=["monitor 23"]
+        ),
+    )
+    monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_instance_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: dispatcher,
+    )
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_reject_unresolved_login_transactions",
+        Mock(),
+    )
+    monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
+
+    with pytest.raises(HTTPException) as blocked:
+        await codex_pool_api.codex_delete_account(
+            _admin_request(),
+            account.id,
+        )
+
+    assert blocked.value.status_code == 409
+    assert "monitor 23" in blocked.value.detail
+    manager.begin_codex_app_server_home_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_account_rechecks_monitor_owner_after_home_fence(
+    monkeypatch,
+    tmp_path,
+):
+    """A Monitor admitted during the precheck window still blocks deletion."""
+
+    account = SimpleNamespace(
+        id="codex-2",
+        codex_home=str(tmp_path / ".codex-codex-2"),
+        email="",
+        auth_kind="oauth",
+        retired=False,
+        cleanup_pending=False,
+    )
+    pool = SimpleNamespace(account=lambda account_id: account)
+    manager = _maintenance_manager()
+    monitor_users = AsyncMock(
+        side_effect=[[], ["monitor 24"]]
+    )
+    dispatcher = SimpleNamespace(
+        codex_monitor_runtime_users=monitor_users,
+    )
+    monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_instance_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: dispatcher,
+    )
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_reject_unresolved_login_transactions",
+        Mock(),
+    )
+    monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
+
+    with pytest.raises(HTTPException) as blocked:
+        await codex_pool_api.codex_delete_account(
+            _admin_request(),
+            account.id,
+        )
+
+    assert blocked.value.status_code == 409
+    assert "monitor 24" in blocked.value.detail
+    assert monitor_users.await_count == 2
+    manager.begin_codex_app_server_home_maintenance.assert_awaited_once_with(
+        account.codex_home,
+        require_idle=True,
+    )
+    manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
+        account.codex_home
+    )
+    assert not codex_pool_api._login_lock.locked()
+
+
 async def test_delete_account_scrubs_credentials_but_keeps_routable_sessions(
     monkeypatch, tmp_path,
 ):
@@ -2612,6 +2721,13 @@ async def test_delete_account_scrubs_credentials_but_keeps_routable_sessions(
     manager = _maintenance_manager()
     monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
     monkeypatch.setattr(codex_pool_api, "_get_instance_manager", lambda: manager)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: SimpleNamespace(
+            codex_monitor_runtime_users=AsyncMock(return_value=[]),
+        ),
+    )
     monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
 
     result = await codex_pool_api.codex_delete_account(
@@ -2674,6 +2790,13 @@ async def test_delete_config_commit_failure_leaves_live_credentials_untouched(
     manager = _maintenance_manager()
     monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
     monkeypatch.setattr(codex_pool_api, "_get_instance_manager", lambda: manager)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: SimpleNamespace(
+            codex_monitor_runtime_users=AsyncMock(return_value=[]),
+        ),
+    )
     monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
     monkeypatch.setattr(
         codex_pool_api,
@@ -2718,6 +2841,13 @@ async def test_delete_cleanup_failure_can_be_retried_from_pending_tombstone(
     manager = _maintenance_manager()
     monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
     monkeypatch.setattr(codex_pool_api, "_get_instance_manager", lambda: manager)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: SimpleNamespace(
+            codex_monitor_runtime_users=AsyncMock(return_value=[]),
+        ),
+    )
     monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
     real_purge = codex_pool_api._purge_retired_codex_home
     purge_calls = 0
@@ -2795,6 +2925,13 @@ async def test_delete_rejects_unmanaged_home_before_mutating_account(
     monkeypatch.setattr(codex_pool_api.Path, "home", lambda: user_home)
     monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
     monkeypatch.setattr(codex_pool_api, "_get_instance_manager", lambda: manager)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: SimpleNamespace(
+            codex_monitor_runtime_users=AsyncMock(return_value=[]),
+        ),
+    )
     monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
 
     with pytest.raises(HTTPException) as exc_info:
@@ -3034,6 +3171,13 @@ async def test_delete_account_is_wrapped_in_idle_maintenance(monkeypatch, tmp_pa
     monkeypatch.setattr(codex_pool_api.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
     monkeypatch.setattr(codex_pool_api, "_get_instance_manager", lambda: manager)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: SimpleNamespace(
+            codex_monitor_runtime_users=AsyncMock(return_value=[]),
+        ),
+    )
     monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
 
     result = await codex_pool_api.codex_delete_account(_admin_request(), account.id)
@@ -3074,6 +3218,13 @@ async def test_delete_busy_account_returns_409_without_mutating_pool(monkeypatch
     monkeypatch.setattr(codex_pool_api.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: pool)
     monkeypatch.setattr(codex_pool_api, "_get_instance_manager", lambda: manager)
+    monkeypatch.setattr(
+        codex_pool_api,
+        "_get_dispatcher",
+        lambda: SimpleNamespace(
+            codex_monitor_runtime_users=AsyncMock(return_value=[]),
+        ),
+    )
     monkeypatch.setattr(codex_pool_api, "_login_lock", asyncio.Lock())
 
     with pytest.raises(HTTPException) as exc_info:

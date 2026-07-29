@@ -10,6 +10,7 @@ background callers such as PR Monitor.
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,8 @@ from backend.services.task_queue import (
     PR_REVIEW_SUPERSEDED_METADATA_KEY,
     task_retry_not_superseded_predicate,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from backend.services.worker_relay import WorkerTaskGeneration
@@ -975,6 +978,34 @@ async def _terminate_local_task_generation_impl(
         )
         await db.commit()
         break
+
+    # Monitor process reaping intentionally happened while the parent Task was
+    # still active.  Only after the terminal DB commit may a Codex Monitor's
+    # resumable thread be deleted.  Cleanup failures remain durable on the
+    # Monitor row and are retried at service startup.
+    cleanup_codex_monitor = getattr(
+        dispatcher,
+        "_cleanup_codex_monitor_thread",
+        None,
+    )
+    if callable(cleanup_codex_monitor):
+        for session_id, agent_type, source, _status in auxiliary_sessions:
+            if (
+                session_id in reaped_auxiliary_ids
+                and agent_type == "monitor"
+                and source == "ccm"
+            ):
+                try:
+                    await cleanup_codex_monitor(session_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Terminal Codex Monitor cleanup will be retried: "
+                        "session=%s task=%s",
+                        session_id,
+                        task_id,
+                    )
 
     # A real owner stop publishes its own exact terminal/background event after
     # reap.  The local/no-owner and detached paths have not, so publish once

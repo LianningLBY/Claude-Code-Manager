@@ -3300,7 +3300,10 @@ async def _cancel_local_task_impl(
             if agent_type == "sub_agent":
                 await dispatcher.stop_sub_agent_session_process(session_id)
             elif agent_type == "monitor":
-                await dispatcher.stop_monitor_session_process(session_id)
+                await dispatcher.stop_monitor_session_process(
+                    session_id,
+                    terminal=True,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

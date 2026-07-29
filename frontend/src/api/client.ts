@@ -429,6 +429,8 @@ export interface MonitorSession {
   active_turn_generation: number | null;
   consecutive_failures: number;
   last_error: string | null;
+  codex_cleanup_pending: boolean;
+  codex_cleanup_error: string | null;
   created_at: string;
   completed_at: string | null;
 }

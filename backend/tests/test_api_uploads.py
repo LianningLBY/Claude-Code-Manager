@@ -20,6 +20,109 @@ def _file_tuple(name: str, data: bytes, content_type: str = "image/png"):
     return (name, io.BytesIO(data), content_type)
 
 
+# ── live-injection attachment validation ────────────────────────────────────
+
+def test_validate_upload_attachment_uses_server_authoritative_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    uploaded = tmp_path / "11111111-1111-4111-8111-111111111111.png"
+    uploaded.write_bytes(_png_bytes())
+
+    result = uploads_mod.validate_upload_attachments(
+        file_paths=[str(uploaded)],
+        image_paths=[str(uploaded)],
+        attachments=[{
+            "url": (
+                "/api/uploads/"
+                "11111111-1111-4111-8111-111111111111.png"
+            ),
+            "name": "original-name.png",
+            "is_image": True,
+        }],
+    )
+
+    assert result == [uploads_mod.ValidatedUploadAttachment(
+        path=str(uploaded),
+        url=(
+            "/api/uploads/"
+            "11111111-1111-4111-8111-111111111111.png"
+        ),
+        name="original-name.png",
+        is_image=True,
+    )]
+
+
+def test_validate_upload_attachment_rejects_symlink(
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    target = tmp_path / "target.txt"
+    target.write_text("secret", encoding="utf-8")
+    link = tmp_path / "22222222-2222-4222-8222-222222222222.txt"
+    link.symlink_to(target)
+
+    with pytest.raises(
+        uploads_mod.UploadAttachmentValidationError,
+        match="missing or unsafe",
+    ):
+        uploads_mod.validate_upload_attachments(
+            file_paths=[str(link)],
+        )
+
+
+def test_validate_upload_attachment_rejects_forged_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    uploaded = tmp_path / "33333333-3333-4333-8333-333333333333.txt"
+    uploaded.write_text("notes", encoding="utf-8")
+
+    with pytest.raises(
+        uploads_mod.UploadAttachmentValidationError,
+        match="does not match",
+    ):
+        uploads_mod.validate_upload_attachments(
+            file_paths=[str(uploaded)],
+            attachments=[{
+                "url": "/api/uploads/different.txt",
+                "name": "../escape.txt",
+                "is_image": True,
+            }],
+        )
+
+
+def test_validate_upload_attachment_refreshes_cleanup_ttl(
+    tmp_path,
+    monkeypatch,
+):
+    import os
+    import time
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    uploaded = tmp_path / "55555555-5555-4555-8555-555555555555.txt"
+    uploaded.write_text("old fork attachment", encoding="utf-8")
+    expired = time.time() - 16 * 86400
+    os.utime(uploaded, (expired, expired))
+
+    uploads_mod.validate_upload_attachments(
+        file_paths=[str(uploaded)],
+    )
+
+    assert uploads_mod.cleanup_expired_uploads() == 0
+    assert uploaded.exists()
+
+
 # ── upload endpoint ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -90,6 +193,67 @@ async def test_upload_invalid_type(client, tmp_path, monkeypatch):
     )
     assert resp.status_code == 400
     assert "not allowed" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_control_characters_in_filename(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    boundary = "ccm-upload-boundary"
+    body = (
+        f"--{boundary}\r\n"
+        "Content-Disposition: form-data; name=\"files\"; "
+        "filename*=UTF-8''proof.%0Awhoami%0A\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "\r\n"
+        "payload\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+    response = await client.post(
+        "/api/uploads",
+        content=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "filename" in response.json()["detail"].lower()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_discards_shell_unsafe_extension_from_saved_path(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    response = await client.post(
+        "/api/uploads",
+        files=[(
+            "files",
+            (
+                "proof.$(touch injected)",
+                io.BytesIO(b"payload"),
+                "application/octet-stream",
+            ),
+        )],
+    )
+
+    assert response.status_code == 200
+    saved = response.json()[0]
+    assert uploads_mod.is_managed_upload_basename(
+        saved["path"].rsplit("/", 1)[-1],
+    )
+    assert saved["path"].rsplit("/", 1)[-1] == saved["id"]
 
 
 @pytest.mark.asyncio

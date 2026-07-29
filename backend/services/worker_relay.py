@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 import httpx
 import websockets
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
@@ -49,6 +49,7 @@ _TASK_STATUSES = frozenset(
 _TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "conflict"}
 )
+_WORKER_BACKGROUND_MIRROR_SENTINEL = "worker-relay:background-active:v1"
 _FP_PREFIX = 1000  # chars; compare only a prefix so the chat/history endpoint's
                    # 20k truncation of tool_input/tool_output can't cause a false
                    # "missing" (which would re-insert an already-present entry).
@@ -70,6 +71,7 @@ class WorkerTaskGeneration:
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
+    pty_background_generation: str | None
 
 
 def worker_task_generation(
@@ -95,6 +97,7 @@ def worker_task_generation(
         instance_id=task.instance_id,
         started_at=task.started_at,
         completed_at=task.completed_at,
+        pty_background_generation=task.pty_background_generation,
     )
 
 
@@ -114,6 +117,10 @@ def worker_task_generation_predicates(
         _nullable_eq(Task.instance_id, generation.instance_id),
         _nullable_eq(Task.started_at, generation.started_at),
         _nullable_eq(Task.completed_at, generation.completed_at),
+        _nullable_eq(
+            Task.pty_background_generation,
+            generation.pty_background_generation,
+        ),
     )
 
 
@@ -134,6 +141,7 @@ async def read_worker_task_generation(
                 Task.instance_id,
                 Task.started_at,
                 Task.completed_at,
+                Task.pty_background_generation,
             ).where(
                 Task.id == task_id,
                 Task.worker_id == worker_id,
@@ -151,6 +159,7 @@ async def read_worker_task_generation(
         instance_id=row.instance_id,
         started_at=row.started_at,
         completed_at=row.completed_at,
+        pty_background_generation=row.pty_background_generation,
     )
 
 
@@ -199,6 +208,19 @@ def authoritative_worker_task_values(
         "status": status,
         "retry_count": remote_task["retry_count"],
     }
+    remote_background_active = remote_task.get(
+        "background_active",
+        _WORKER_BACKGROUND_MIRROR_SENTINEL,
+    )
+    if type(remote_background_active) is bool:
+        # The Worker generation token is deliberately not part of TaskResponse.
+        # Mirror only its strict public boolean into a Manager-owned sentinel;
+        # never accept a remote token or a truthy/falsey lookalike.
+        values["pty_background_generation"] = (
+            _WORKER_BACKGROUND_MIRROR_SENTINEL
+            if remote_background_active
+            else None
+        )
     for field in (
         "plan_approved",
         "error_message",
@@ -454,7 +476,15 @@ class WorkerRelay:
             result = await db.execute(
                 select(Task).where(
                     Task.worker_id == worker.id,
-                    Task.status.in_(["executing", "in_progress", "plan_review"]),
+                    or_(
+                        Task.status.in_(
+                            ["executing", "in_progress", "plan_review"]
+                        ),
+                        (
+                            (Task.status == "completed")
+                            & Task.pty_background_generation.isnot(None)
+                        ),
+                    ),
                 )
             )
             active = result.scalars().all()
@@ -531,17 +561,87 @@ class WorkerRelay:
                     {
                         key: value
                         for key, value in payload.items()
-                        if key not in ("instance_id", "worker_id")
+                        if key not in (
+                            "instance_id",
+                            "worker_id",
+                            "pty_background_generation",
+                        )
                     }
                 )
                 event["event"] = "status_change"
                 event["task_id"] = generation.task_id
                 event["new_status"] = generation.status
+            # The just-committed authoritative snapshot wins over a possibly
+            # stale/spoofed boolean carried by the status event itself.
+            event["background_active"] = (
+                generation.pty_background_generation is not None
+            )
             try:
                 await self.broadcaster.broadcast("tasks", event)
             except Exception:
                 logger.exception(
                     "failed to publish Worker status for task %s",
+                    generation.task_id,
+                )
+            await db.commit()
+            return True
+
+    async def _publish_background_generation(
+        self,
+        generation: WorkerTaskGeneration,
+        *,
+        channels: tuple[str, ...],
+    ) -> bool:
+        """Publish a controlled background marker for one exact mirror.
+
+        The no-op update is a second CAS fence between the authoritative GET
+        commit and WebSocket publication.  A retry, reassignment, or newer
+        marker transition therefore suppresses the stale event.
+        """
+
+        valid_channels = {
+            "tasks",
+            f"task:{generation.task_id}",
+        }
+        selected_channels = tuple(
+            dict.fromkeys(
+                channel
+                for channel in channels
+                if channel in valid_channels
+            )
+        )
+        if not selected_channels:
+            return False
+        async with self.db_factory() as db:
+            guarded = await db.execute(
+                update(Task)
+                .where(*worker_task_generation_predicates(generation))
+                .values(
+                    pty_background_generation=(
+                        generation.pty_background_generation
+                    )
+                )
+            )
+            if guarded.rowcount != 1:
+                await db.rollback()
+                return False
+            event = {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": generation.task_id,
+                "background_active": (
+                    generation.pty_background_generation is not None
+                ),
+            }
+            try:
+                for selected_channel in selected_channels:
+                    await self.broadcaster.broadcast(
+                        selected_channel,
+                        event,
+                    )
+            except Exception:
+                logger.exception(
+                    "failed to publish Worker background marker for task %s",
                     generation.task_id,
                 )
             await db.commit()
@@ -605,7 +705,14 @@ class WorkerRelay:
                 )
                 if (
                     generation is not None
-                    and generation.status in ("executing", "in_progress")
+                    and (
+                        generation.status in ("executing", "in_progress")
+                        or (
+                            generation.status == "completed"
+                            and generation.pty_background_generation
+                            is not None
+                        )
+                    )
                 ):
                     disconnected_generations[task_id] = generation
         for attempt in range(10):
@@ -647,6 +754,7 @@ class WorkerRelay:
                         error_message=(
                             f"Worker {worker.name} 断连且无法重连"
                         ),
+                        pty_background_generation=None,
                     )
                 )
                 if failed.rowcount != 1:
@@ -784,6 +892,40 @@ class WorkerRelay:
                 logger.debug("worker skill evolution failed", exc_info=True)
 
         # 3) 字段同步
+        if event_type == "background_activity":
+            event_background_active = data.get("background_active")
+            if type(event_background_active) is not bool:
+                return
+            # WebSocket ordering is not authoritative.  Re-read the Worker and
+            # accept the event only when its strict boolean agrees with that
+            # fresh snapshot, then CAS it onto the exact Manager generation.
+            remote_task = await self._fetch_task_snapshot(worker, task_id)
+            if (
+                remote_task is None
+                or type(remote_task.get("background_active")) is not bool
+                or remote_task["background_active"]
+                is not event_background_active
+            ):
+                return
+            async with self.db_factory() as db:
+                resulting = await apply_authoritative_worker_task(
+                    db,
+                    observed,
+                    remote_task,
+                )
+            if (
+                resulting is None
+                or (
+                    resulting.pty_background_generation is not None
+                ) != event_background_active
+            ):
+                return
+            await self._publish_background_generation(
+                resulting,
+                channels=(channel,),
+            )
+            return
+
         if event_type == "status_change":
             new_status = data.get("new_status")
             if not isinstance(new_status, str):
@@ -1098,5 +1240,14 @@ class WorkerRelay:
                         and resulting.status != status_observed.status
                     ):
                         await self._publish_status_generation(resulting)
+                    elif (
+                        resulting is not None
+                        and resulting.pty_background_generation
+                        != status_observed.pty_background_generation
+                    ):
+                        await self._publish_background_generation(
+                            resulting,
+                            channels=("tasks", f"task:{tid}"),
+                        )
                 except Exception:
                     logger.exception("backfill task %s from worker %s failed", tid, worker.id)

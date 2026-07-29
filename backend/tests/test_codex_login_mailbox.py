@@ -3258,6 +3258,36 @@ async def test_successful_login_replaces_auth_and_removes_backup(monkeypatch, tm
 
     assert result["ok"] is True
     assert auth_path.read_text() == "new-auth"
+    assert (codex_home / "config.toml").read_text() == (
+        'approval_policy = "never"\n'
+        'sandbox_mode = "danger-full-access"\n'
+    )
+    assert (codex_home / "config.toml").stat().st_mode & 0o777 == 0o600
     assert not list(codex_home.glob(".auth.json.login-backup-*"))
     assert codex_home.stat().st_mode & 0o777 == 0o700
     assert spawn.await_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL
+
+
+def test_full_access_config_preserves_existing_codex_settings(tmp_path):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config = codex_home / "config.toml"
+    config.write_text(
+        'approval_policy = "on-request"\n'
+        'personality = "pragmatic"\n'
+        '\n'
+        '[projects."/workspace"]\n'
+        'trust_level = "trusted"\n'
+    )
+
+    codex_login._ensure_full_access_config(codex_home)
+
+    assert config.read_text() == (
+        'approval_policy = "never"\n'
+        'sandbox_mode = "danger-full-access"\n'
+        'personality = "pragmatic"\n'
+        '\n'
+        '[projects."/workspace"]\n'
+        'trust_level = "trusted"\n'
+    )
+    assert config.stat().st_mode & 0o777 == 0o600

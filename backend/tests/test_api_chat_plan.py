@@ -1,5 +1,6 @@
 """Tests for Chat and Plan API endpoints."""
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -1056,6 +1057,63 @@ async def test_chat_sender_prefix_is_display_only(session_factory):
 
 
 @pytest.mark.asyncio
+async def test_service_token_sender_prefix_is_display_only(session_factory):
+    """A service-token request has an Admin label even without a bound User."""
+    import json
+    from types import SimpleNamespace
+    from sqlalchemy import select
+
+    from backend.api.chat import ChatMessage, send_chat_message
+    from backend.models.log_entry import LogEntry
+
+    async with session_factory() as db:
+        task = Task(
+            title="Token prefix test",
+            description="d",
+            target_repo="/tmp",
+            session_id="token-prefix-session",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        mock_d = _mock_dispatcher()
+        mock_broadcaster = MagicMock()
+        mock_broadcaster.broadcast = AsyncMock()
+        request = SimpleNamespace(state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        ))
+
+        with patch("backend.main.dispatcher", mock_d), \
+             patch("backend.main.broadcaster", mock_broadcaster):
+            await send_chat_message(
+                task.id,
+                ChatMessage(message="[BUG] keep this raw"),
+                request,
+                db,
+            )
+
+        stored = (await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalar_one()
+
+    assert mock_d.enqueue_message.call_args.kwargs["prompt"] == "[BUG] keep this raw"
+    assert stored.content == "[Admin] [BUG] keep this raw"
+    assert json.loads(stored.raw_json) == {
+        "raw_content": "[BUG] keep this raw",
+        "sender_name": "Admin",
+    }
+    event = mock_broadcaster.broadcast.call_args.args[1]
+    assert event["content"] == "[Admin] [BUG] keep this raw"
+    assert event["raw_content"] == "[BUG] keep this raw"
+
+
+@pytest.mark.asyncio
 async def test_shared_chat_sender_prefix_is_display_only(client, session_factory):
     """Shared-task sender names are shown in chat but excluded from enqueue."""
     import json
@@ -2005,6 +2063,28 @@ async def test_update_task_model_persists(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_inject_capabilities_advertise_attachment_protocol(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="codex",
+    )
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/inject-capabilities",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "attachment_protocol": 1,
+        "codex_native_inputs": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_inject_requires_pty_mode(client, session_factory):
     """PTY 模式关闭时注入返回 400。"""
     task_id = await _create_task_with_session(
@@ -2082,6 +2162,85 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_inject_delivers_uploaded_image_to_pty_and_persists_metadata(
+    client,
+    session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """A file-only PTY injection must carry a readable path and attachment UI."""
+    saved_name = "11111111-1111-4111-8111-111111111111.png"
+    upload_path = tmp_path / saved_name
+    upload_path.write_bytes(b"not-a-real-png")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+    )
+
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(return_value=True)
+    mock_broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        mock_broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={
+                "message": "",
+                "file_paths": [str(upload_path)],
+                "image_paths": [str(upload_path)],
+                "attachments": [{
+                    "url": f"/api/uploads/{saved_name}",
+                    "name": "screenshot.png",
+                    "is_image": True,
+                }],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["attachment_count"] == 1
+    injected = mock_im.inject_pty_message.await_args
+    assert injected.args[0] == "test-session-123"
+    assert str(upload_path) in injected.args[1]
+    assert injected.kwargs == {"require_host_file_access": True}
+
+    events = [
+        call.args[1]
+        for call in mock_broadcaster.broadcast.call_args_list
+        if call.args[1].get("source") == "inject"
+    ]
+    assert len(events) == 1
+    assert events[0]["attachments"] == [{
+        "url": f"/api/uploads/{saved_name}",
+        "name": "screenshot.png",
+        "is_image": True,
+    }]
+    assert events[0]["image_urls"] == [f"/api/uploads/{saved_name}"]
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    metadata = json.loads(stored.raw_json)
+    assert metadata["source"] == "inject"
+    assert metadata["raw_content"] == ""
+    assert metadata["file_paths"] == [str(upload_path)]
+    assert metadata["image_paths"] == [str(upload_path)]
+    assert metadata["attachments"] == events[0]["attachments"]
+
+
+@pytest.mark.asyncio
 async def test_inject_no_live_session_409(client, session_factory):
     """会话不存活时注入返回 409。"""
     from backend.models.task import Task
@@ -2133,6 +2292,178 @@ async def test_codex_inject_steers_without_pty_mode(
         if call.args[1].get("source") == "inject"
     ]
     assert len(injected) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_inject_uses_native_image_and_file_inputs(
+    client,
+    session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
+    image_saved_name = "22222222-2222-4222-8222-222222222222.png"
+    file_saved_name = "33333333-3333-4333-8333-333333333333.txt"
+    image_path = tmp_path / image_saved_name
+    file_path = tmp_path / file_saved_name
+    image_path.write_bytes(b"image")
+    file_path.write_text("details", encoding="utf-8")
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="codex",
+    )
+    mock_im = MagicMock()
+    mock_im.inject_codex_message = AsyncMock(return_value=True)
+    mock_broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        mock_broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={
+                "message": "Use both attachments",
+                "file_paths": [str(image_path), str(file_path)],
+                "image_paths": [str(image_path)],
+                "attachments": [
+                    {
+                        "url": f"/api/uploads/{image_saved_name}",
+                        "name": "evidence.png",
+                        "is_image": True,
+                    },
+                    {
+                        "url": f"/api/uploads/{file_saved_name}",
+                        "name": "notes.txt",
+                        "is_image": False,
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    injected = mock_im.inject_codex_message.await_args
+    assert injected.args[0] == "test-session-123"
+    assert str(image_path) in injected.args[1]
+    assert str(file_path) in injected.args[1]
+    assert injected.kwargs["input_items"] == [
+        {"type": "text", "text": injected.args[1]},
+        {"type": "localImage", "path": str(image_path)},
+        {"type": "mention", "name": "notes.txt", "path": str(file_path)},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inject_rejects_non_upload_path_without_side_effects(
+    client,
+    session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.config import settings
+
+    upload_dir = tmp_path / "uploads"
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_text("must not be injected", encoding="utf-8")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="codex",
+    )
+    mock_im = MagicMock()
+    mock_im.inject_codex_message = AsyncMock(return_value=True)
+    mock_broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        mock_broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={
+                "message": "read this",
+                "file_paths": [str(outside_path)],
+            },
+        )
+
+    assert response.status_code == 422
+    assert "upload directory" in response.json()["detail"]
+    mock_im.inject_codex_message.assert_not_awaited()
+    mock_broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        count = await db.scalar(
+            select(func.count())
+            .select_from(LogEntry)
+            .where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_inject_container_attachment_fails_before_persisting(
+    client,
+    session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services.instance_manager import (
+        LiveAttachmentInjectionUnsupportedError,
+    )
+
+    upload_path = (
+        tmp_path / "44444444-4444-4444-8444-444444444444.txt"
+    )
+    upload_path.write_text("evidence", encoding="utf-8")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+    )
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(
+        side_effect=LiveAttachmentInjectionUnsupportedError(
+            "container cannot read manager upload",
+        )
+    )
+    mock_broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        mock_broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={
+                "message": "inspect",
+                "file_paths": [str(upload_path)],
+            },
+        )
+
+    assert response.status_code == 409
+    assert "隔离容器" in response.json()["detail"]
+    mock_broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        count = await db.scalar(
+            select(func.count())
+            .select_from(LogEntry)
+            .where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    assert count == 0
 
 
 @pytest.mark.asyncio
@@ -2230,8 +2561,10 @@ async def test_inject_rejects_remote_worker_task(client, session_factory):
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock()
 
-    with patch("backend.main.instance_manager", mock_im), \
-         patch("backend.main.broadcaster", MagicMock(broadcast=AsyncMock())):
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        MagicMock(broadcast=AsyncMock()),
+    ):
         resp = await client.post(
             f"/api/tasks/{task_id}/inject", json={"message": "x"}
         )

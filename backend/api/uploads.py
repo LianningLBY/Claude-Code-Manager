@@ -1,8 +1,14 @@
 import asyncio
+from dataclasses import dataclass
 import logging
+import os
+import re
+import stat
+import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
@@ -22,11 +28,239 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 _MAX_TOTAL_SIZE_BYTES = 50 * 1024 * 1024  # bound request memory
 _MAX_FILES = 10
+_SAFE_EXTENSION_RE = re.compile(r"^\.[a-z0-9]{1,16}$")
+_MANAGED_UPLOAD_NAME_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}(?:\.[a-z0-9]{1,16})?$"
+)
+_UPLOAD_FS_LOCK = threading.RLock()
+
+
+class UploadAttachmentValidationError(ValueError):
+    """A client-provided upload reference is not one CCM created."""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedUploadAttachment:
+    """Server-authoritative metadata for one already-uploaded regular file."""
+
+    path: str
+    url: str
+    name: str
+    is_image: bool
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "name": self.name,
+            "is_image": self.is_image,
+        }
 
 
 def _get_upload_dir() -> Path:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     return UPLOAD_DIR
+
+
+def is_managed_upload_basename(value: object) -> bool:
+    """Return whether *value* can only be a CCM-generated upload basename."""
+
+    return (
+        isinstance(value, str)
+        and _MANAGED_UPLOAD_NAME_RE.fullmatch(value) is not None
+    )
+
+
+def _safe_display_filename(value: str | None) -> str:
+    """Normalize the untrusted multipart filename used only for display."""
+
+    raw = value or "file"
+    name = os.path.basename(raw.replace("\\", "/"))
+    if (
+        not name
+        or name in {".", ".."}
+        or len(name) > 255
+        or any(ord(character) < 32 or ord(character) == 127 for character in name)
+    ):
+        raise HTTPException(400, "Invalid upload filename")
+    return name
+
+
+def _safe_saved_extension(filename: str) -> str:
+    extension = Path(filename).suffix.lower()
+    return extension if _SAFE_EXTENSION_RE.fullmatch(extension) else ""
+
+
+def validate_upload_attachments(
+    *,
+    file_paths: list[str] | None,
+    image_paths: list[str] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> list[ValidatedUploadAttachment]:
+    """Validate and refresh attachment TTL against the cleanup thread."""
+
+    with _UPLOAD_FS_LOCK:
+        return _validate_upload_attachments_locked(
+            file_paths=file_paths,
+            image_paths=image_paths,
+            attachments=attachments,
+        )
+
+
+def _validate_upload_attachments_locked(
+    *,
+    file_paths: list[str] | None,
+    image_paths: list[str] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> list[ValidatedUploadAttachment]:
+    """Resolve client attachment references without trusting paths or flags.
+
+    Uploaded paths are capabilities returned by ``POST /api/uploads``.  Only
+    direct, owned, non-symlink regular files below this process's upload root
+    are accepted.  Metadata is derived from those files; when a caller sends
+    display metadata, its ordering and URL/type claims must match exactly.
+    """
+
+    raw_files = list(file_paths or [])
+    raw_images = list(image_paths or [])
+    # ``image_paths`` predates ``file_paths``.  Keep an image-only legacy
+    # client working, but never silently union two independent attachment
+    # lists because that would break the attachment metadata ordering.
+    if not raw_files and raw_images:
+        raw_files = list(raw_images)
+    if len(raw_files) > _MAX_FILES:
+        raise UploadAttachmentValidationError(
+            f"Maximum {_MAX_FILES} files allowed per request"
+        )
+    if len(set(raw_files)) != len(raw_files):
+        raise UploadAttachmentValidationError("Duplicate upload paths are not allowed")
+    if len(set(raw_images)) != len(raw_images):
+        raise UploadAttachmentValidationError("Duplicate image paths are not allowed")
+
+    upload_root = _get_upload_dir().resolve(strict=True)
+    resolved: list[tuple[str, str, bool, int]] = []
+    by_raw_path: dict[str, tuple[str, bool]] = {}
+    total_size = 0
+    open_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for raw_path in raw_files:
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or "\x00" in raw_path
+            or not os.path.isabs(raw_path)
+        ):
+            raise UploadAttachmentValidationError("Invalid upload path")
+        candidate = Path(os.path.abspath(raw_path))
+        if candidate.parent != upload_root:
+            raise UploadAttachmentValidationError(
+                "Attachments must come from the CCM upload directory"
+            )
+        if not is_managed_upload_basename(candidate.name):
+            raise UploadAttachmentValidationError(
+                "Attachment path is not a CCM-managed upload"
+            )
+        if candidate.suffix.lower() in _BLOCKED_EXTENSIONS:
+            raise UploadAttachmentValidationError("Blocked upload type")
+        try:
+            descriptor = os.open(candidate, open_flags)
+        except OSError as exc:
+            raise UploadAttachmentValidationError(
+                "Uploaded file is missing or unsafe"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            current = candidate.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or opened.st_dev != current.st_dev
+                or opened.st_ino != current.st_ino
+                or (
+                    hasattr(opened, "st_uid")
+                    and opened.st_uid != os.getuid()
+                )
+                or opened.st_size > _MAX_SIZE_BYTES
+            ):
+                raise UploadAttachmentValidationError(
+                    "Uploaded file is not a safe regular file"
+                )
+            size = opened.st_size
+        finally:
+            os.close(descriptor)
+        total_size += size
+        if total_size > _MAX_TOTAL_SIZE_BYTES:
+            raise UploadAttachmentValidationError(
+                "Combined uploads exceed 50 MB limit"
+            )
+        canonical = str(candidate)
+        is_image = candidate.suffix.lower() in _IMAGE_EXTENSIONS
+        resolved.append((canonical, candidate.name, is_image, size))
+        by_raw_path[raw_path] = (canonical, is_image)
+
+    for raw_image in raw_images:
+        match = by_raw_path.get(raw_image)
+        if match is None:
+            raise UploadAttachmentValidationError(
+                "image_paths must be a subset of file_paths"
+            )
+        if not match[1]:
+            raise UploadAttachmentValidationError(
+                "image_paths contains a non-image upload"
+            )
+
+    if attachments is not None and len(attachments) != len(resolved):
+        raise UploadAttachmentValidationError(
+            "Attachment metadata must match file_paths ordering"
+        )
+
+    result: list[ValidatedUploadAttachment] = []
+    for index, (canonical, saved_name, is_image, _size) in enumerate(resolved):
+        url = f"/api/uploads/{saved_name}"
+        display_name = saved_name
+        if attachments is not None:
+            supplied = attachments[index]
+            if not isinstance(supplied, dict):
+                raise UploadAttachmentValidationError(
+                    "Invalid attachment metadata"
+                )
+            supplied_name = supplied.get("name")
+            if (
+                not isinstance(supplied_name, str)
+                or not supplied_name
+                or len(supplied_name) > 255
+                or supplied_name != os.path.basename(supplied_name)
+                or supplied_name in {".", ".."}
+                or any(ord(character) < 32 for character in supplied_name)
+                or supplied.get("url") != url
+                or type(supplied.get("is_image")) is not bool
+                or supplied["is_image"] is not is_image
+            ):
+                raise UploadAttachmentValidationError(
+                    "Attachment metadata does not match the uploaded file"
+                )
+            display_name = supplied_name
+        result.append(ValidatedUploadAttachment(
+            path=canonical,
+            url=url,
+            name=display_name,
+            is_image=is_image,
+        ))
+    # Reusing a fork attachment is an active reference. Refresh its cleanup
+    # TTL while serialized with the expiry scanner so it cannot disappear
+    # between validation and transport admission.
+    try:
+        for upload in result:
+            os.utime(upload.path, None, follow_symlinks=False)
+    except OSError as exc:
+        raise UploadAttachmentValidationError(
+            "Uploaded file changed while it was being validated"
+        ) from exc
+    return result
 
 
 @router.post("")
@@ -38,7 +272,8 @@ async def upload_files(files: list[UploadFile] = File(...)):
     pending: list[tuple[UploadFile, str, bytes, str, str]] = []
     total_size = 0
     for file in files:
-        ext = Path(file.filename or "file").suffix.lower()
+        display_name = _safe_display_filename(file.filename)
+        ext = _safe_saved_extension(display_name)
         if ext in _BLOCKED_EXTENSIONS:
             raise HTTPException(400, f"File type '{ext}' is not allowed")
 
@@ -52,6 +287,7 @@ async def upload_files(files: list[UploadFile] = File(...)):
 
         file_id = str(uuid.uuid4())
         saved_name = f"{file_id}{ext}" if ext else file_id
+        file.filename = display_name
         pending.append((file, ext, data, file_id, saved_name))
 
     # Validation is intentionally all-or-nothing.  If any later write fails,
@@ -110,15 +346,16 @@ async def get_file(filename: str):
 
 def cleanup_expired_uploads() -> int:
     """Delete files in UPLOAD_DIR older than _CLEANUP_MAX_AGE_DAYS. Returns count deleted."""
-    if not UPLOAD_DIR.is_dir():
-        return 0
-    cutoff = time.time() - _CLEANUP_MAX_AGE_DAYS * 86400
-    deleted = 0
-    for f in UPLOAD_DIR.iterdir():
-        if f.is_file() and f.stat().st_mtime < cutoff:
-            f.unlink()
-            deleted += 1
-    return deleted
+    with _UPLOAD_FS_LOCK:
+        if not UPLOAD_DIR.is_dir():
+            return 0
+        cutoff = time.time() - _CLEANUP_MAX_AGE_DAYS * 86400
+        deleted = 0
+        for f in UPLOAD_DIR.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                deleted += 1
+        return deleted
 
 
 async def start_upload_cleanup_loop() -> asyncio.Task:

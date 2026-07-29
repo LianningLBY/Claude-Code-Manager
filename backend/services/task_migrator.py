@@ -287,6 +287,10 @@ class TaskMigrator:
                 raise MigrationError("已被新 push 取代的 PR review task 不可迁移")
             if task.status in ("in_progress", "executing", "migrating"):
                 raise MigrationError(f"task 状态 {task.status}，先停止再切换")
+            if task.pty_background_generation is not None:
+                raise MigrationError(
+                    "Claude PTY 后台活动仍在输出，结束后再迁移"
+                )
             observed = migration_task_generation(task)
             prev_status = observed.status
             src_worker_id = observed.worker_id
@@ -523,6 +527,7 @@ class TaskMigrator:
                 .where(
                     *migration_generation_predicates(observed),
                     *_task_value_predicates(expected_values or {}),
+                    Task.pty_background_generation.is_(None),
                     task_retry_not_superseded_predicate(),
                 )
                 .values(status="migrating")

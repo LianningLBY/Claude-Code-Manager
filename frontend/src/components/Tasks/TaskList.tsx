@@ -24,6 +24,7 @@ const statusColors: Record<string, string> = {
   pending: 'bg-yellow-500',
   in_progress: 'bg-blue-500',
   executing: 'bg-blue-400 animate-pulse',
+  background: 'bg-teal-400 animate-pulse',
   plan_review: 'bg-purple-500',
   completed: 'bg-green-500',
   failed: 'bg-red-500',
@@ -65,8 +66,12 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
     await api.deleteTask(id);
     onRefresh();
   };
-  const handleCancel = async (id: number) => {
-    await api.cancelTask(id);
+  const handleCancel = async (task: Task) => {
+    if (task.background_active) {
+      await api.stopTaskSession(task.id);
+    } else {
+      await api.cancelTask(task.id);
+    }
     onRefresh();
   };
   const handleRetry = async (task: Task) => {
@@ -161,7 +166,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
           </span>
           {/* Row 1: status dot + badges (left, wraps) | action buttons (right, no wrap) */}
           <div className="flex items-center gap-2">
-            <span className={`w-2.5 h-2.5 rounded-full shrink-0 self-start mt-[9px] ${statusColors[t.status] || 'bg-gray-500'}`} />
+            <span className={`w-2.5 h-2.5 rounded-full shrink-0 self-start mt-[9px] ${statusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`} />
             <div className="flex items-center gap-2 flex-wrap flex-1 min-w-0 min-h-[28px]">
               <span className="text-xs text-gray-500">#{t.id}</span>
               {t.shared_from_id && (
@@ -177,7 +182,9 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
               {t.priority > 0 && (
                 <span className="text-xs bg-indigo-600/30 text-indigo-300 px-1.5 rounded">P{t.priority}</span>
               )}
-              <span className="hidden sm:inline text-xs text-gray-500 capitalize">{t.status.replace('_', ' ')}</span>
+              <span className="hidden sm:inline text-xs text-gray-500 capitalize">
+                {t.background_active ? 'background' : t.status.replace('_', ' ')}
+              </span>
               <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
                 {t.provider === 'codex' ? 'Codex' : 'Claude'}
               </span>
@@ -248,9 +255,9 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
                     >
                       <UserPlus size={14} /> Team Share
                     </button>
-                    {['in_progress', 'executing'].includes(t.status) && (
+                    {(t.background_active || ['in_progress', 'executing'].includes(t.status)) && (
                       <button
-                        onClick={() => { handleCancel(t.id); setMenuOpenId(null); }}
+                        onClick={() => { handleCancel(t); setMenuOpenId(null); }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-yellow-400 hover:bg-gray-800 text-left"
                       >
                         <XCircle size={14} /> Cancel
@@ -271,7 +278,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
                       {t.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
                       {t.archived ? 'Unarchive' : 'Archive'}
                     </button>
-                    {['pending', 'failed', 'cancelled', 'completed'].includes(t.status) && (
+                    {!t.background_active && ['pending', 'failed', 'cancelled', 'completed'].includes(t.status) && (
                       <button
                         onClick={() => { handleDelete(t.id); setMenuOpenId(null); }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-red-400 hover:bg-gray-800 text-left"

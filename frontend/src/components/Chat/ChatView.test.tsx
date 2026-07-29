@@ -29,6 +29,10 @@ vi.mock('../../api/client', () => ({
       codex_main_mcp_enabled: true,
     }),
     config: vi.fn().mockResolvedValue({ model_options: ['claude-opus-4-6'], codex_model_options: [] }),
+    getInjectCapabilities: vi.fn().mockResolvedValue({
+      attachment_protocol: 1,
+      codex_native_inputs: true,
+    }),
     injectTaskMessage: vi.fn().mockResolvedValue({ ok: true, injected: true }),
     listQuickPhrases: vi.fn().mockResolvedValue([]),
     createQuickPhrase: vi.fn().mockResolvedValue({}),
@@ -129,6 +133,67 @@ describe('ChatView', () => {
       pty_available: false,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+    });
+    (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getInjectCapabilities as ReturnType<typeof vi.fn>).mockResolvedValue({
+      attachment_protocol: 1,
+      codex_native_inputs: true,
+    });
+    (api.injectTaskMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      injected: true,
+    });
+  });
+
+  describe('legacy Codex completion compatibility', () => {
+    it('hides only raw-classified collab item completions from history', async () => {
+      const legacyNoise: ChatMessage = {
+        id: 901,
+        role: 'system',
+        event_type: 'system_event',
+        content: 'completed',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+        native_item_type: 'collabAgentToolCall',
+        native_item_status: 'completed',
+      };
+      const legitimateSystemMessage: ChatMessage = {
+        ...legacyNoise,
+        id: 902,
+        native_item_type: null,
+        native_item_status: null,
+      };
+      const visibleReply: ChatMessage = {
+        ...legacyNoise,
+        id: 903,
+        role: 'assistant',
+        event_type: 'message',
+        content: 'Reply after agent wait',
+        native_item_type: null,
+        native_item_status: null,
+      };
+      (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([
+        legacyNoise,
+        legitimateSystemMessage,
+        visibleReply,
+      ]);
+
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(await screen.findByText('Reply after agent wait')).toBeInTheDocument();
+      expect(screen.getAllByText('— completed —')).toHaveLength(1);
     });
   });
 
@@ -305,6 +370,277 @@ describe('ChatView', () => {
     });
   });
 
+  describe('PTY background activity', () => {
+    it('shows the background badge while the foreground status is still executing', () => {
+      const task = makeTask({ id: 31, status: 'executing', background_active: false });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: 31,
+            new_status: 'executing',
+            background_active: true,
+          },
+        });
+      });
+
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+    });
+
+    it('consumes only matching strict-boolean global background events', () => {
+      const task = makeTask({ id: 32, background_active: false });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 32,
+            background_active: true,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 32,
+            background_active: 'false',
+          },
+        });
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 999,
+            background_active: false,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 32,
+            background_active: false,
+          },
+        });
+      });
+      expect(screen.queryByText('后台运行中')).not.toBeInTheDocument();
+    });
+
+    it('does not coerce a malformed task-channel marker to false', () => {
+      const task = makeTask({ id: 33, background_active: false });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:33',
+          data: {
+            event_type: 'background_activity',
+            background_active: true,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:33',
+          data: {
+            event_type: 'background_activity',
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+    });
+
+    it('keeps a WS false marker across a stale polling prop that rebounds true', () => {
+      const task = makeTask({
+        id: 36,
+        status: 'completed',
+        background_active: false,
+      });
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 36,
+            background_active: false,
+          },
+        });
+      });
+
+      // Models a request started before the WS false event and resolved after
+      // it with the old durable marker.
+      rerender(
+        <ChatView
+          task={{ ...task, background_active: true }}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.queryByText('后台运行中')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    });
+
+    it('expires a stale WS status even when the polled status never changes', () => {
+      vi.useFakeTimers();
+      try {
+        const task = makeTask({
+          id: 37,
+          status: 'completed',
+          background_active: false,
+        });
+        render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+        act(() => {
+          capturedOnMessage?.({
+            channel: 'tasks',
+            data: {
+              event: 'status_change',
+              task_id: 37,
+              new_status: 'executing',
+              background_active: false,
+            },
+          });
+        });
+        expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
+
+        act(() => {
+          vi.advanceTimersByTime(7001);
+        });
+        expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('treats an ownerless background tail as processing and keeps Interrupt usable', async () => {
+      const task = makeTask({
+        id: 34,
+        status: 'completed',
+        background_active: true,
+      });
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
+      fireEvent.change(textarea, { target: { value: 'wait behind background work' } });
+      expect(screen.getByTitle(/Add to queue/)).toBeInTheDocument();
+
+      const interrupt = screen.getByTitle('Interrupt session');
+      expect(interrupt).toBeEnabled();
+      await userEvent.click(interrupt);
+      await waitFor(() => {
+        expect(api.stopTaskSession).toHaveBeenCalledWith(34);
+      });
+
+      rerender(
+        <ChatView
+          task={{ ...task, background_active: false }}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+      expect(screen.getByTitle(/Send \(Ctrl\+Enter\)/)).toBeInTheDocument();
+    });
+
+    it('does not finish or dequeue at terminal/process_exit until the marker clears', async () => {
+      const task = makeTask({
+        id: 35,
+        status: 'executing',
+        background_active: false,
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:35',
+          data: {
+            event_type: 'user_message',
+            content: 'foreground request',
+          },
+        });
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+
+      const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
+      fireEvent.change(textarea, { target: { value: 'queued follow-up' } });
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: 35,
+            new_status: 'completed',
+            background_active: true,
+          },
+        });
+      });
+      expect(screen.getByText('后台运行中')).toBeInTheDocument();
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:35',
+          data: { event_type: 'process_exit', exit_code: 0 },
+        });
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'background_activity',
+            task_id: 35,
+            background_active: false,
+          },
+        });
+      });
+
+      await waitFor(
+        () => expect(api.sendTaskChat).toHaveBeenCalled(),
+        { timeout: 2000 },
+      );
+      expect(
+        (api.sendTaskChat as ReturnType<typeof vi.fn>).mock.calls[0][1],
+      ).toBe('queued follow-up');
+      await waitFor(() => {
+        expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      });
+    });
+  });
+
   describe('Live turn injection', () => {
     it('steers an executing Codex turn even when Claude PTY is off', async () => {
       const task = makeTask({
@@ -329,9 +665,254 @@ describe('ChatView', () => {
             model: null,
             codex_service_tier: 'default',
           },
+          undefined,
         );
       });
       expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('uploads images and files and injects their exact server metadata into the active turn', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockImplementation(async ([file]) => [{
+        id: `upload-${file.name}`,
+        filename: file.name,
+        path: `/srv/uploads/${file.name}`,
+        url: `/api/uploads/${file.name}`,
+        is_image: file.type.startsWith('image/'),
+      }]);
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: true,
+        attachment_count: 2,
+      });
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      const picker = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+      await userEvent.upload(picker, [
+        new File(['png'], 'diagram.png', { type: 'image/png' }),
+        new File(['notes'], 'notes.txt', { type: 'text/plain' }),
+      ]);
+      await waitFor(() => expect(api.uploadImages).toHaveBeenCalledTimes(2));
+      await screen.findByText('notes.txt');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      await waitFor(() => {
+        expect(api.getInjectCapabilities).toHaveBeenCalledWith(task.id);
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          '(files attached)',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          {
+            file_paths: [
+              '/srv/uploads/diagram.png',
+              '/srv/uploads/notes.txt',
+            ],
+            image_paths: ['/srv/uploads/diagram.png'],
+            attachments: [
+              {
+                url: '/api/uploads/diagram.png',
+                name: 'diagram.png',
+                is_image: true,
+              },
+              {
+                url: '/api/uploads/notes.txt',
+                name: 'notes.txt',
+                is_image: false,
+              },
+            ],
+          },
+        );
+      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.queryByText('notes.txt')).not.toBeInTheDocument();
+      });
+    });
+
+    it('does not contact an old inject endpoint before attachment capability is confirmed', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockResolvedValue([{
+        id: 'upload-evidence',
+        filename: 'evidence.txt',
+        path: '/srv/uploads/evidence.txt',
+        url: '/api/uploads/evidence.txt',
+        is_image: false,
+      }]);
+      vi.mocked(api.getInjectCapabilities).mockRejectedValue(
+        new Error('HTTP 404'),
+      );
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
+      );
+      await screen.findByText('evidence.txt');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      expect(await screen.findByText(/HTTP 404/)).toHaveTextContent(
+        '消息和附件已保留',
+      );
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+    });
+
+    it('keeps attachments unless the server confirms the exact attachment count', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockResolvedValue([{
+        id: 'upload-evidence',
+        filename: 'evidence.txt',
+        path: '/srv/uploads/evidence.txt',
+        url: '/api/uploads/evidence.txt',
+        is_image: false,
+      }]);
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: true,
+      });
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
+      );
+      await screen.findByText('evidence.txt');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      expect(await screen.findByText(/没有确认全部附件均已注入/)).toHaveTextContent(
+        '消息和附件已保留',
+      );
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+    });
+
+    it('freezes composer edits while an injection request is in flight', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      let resolveInjection!: (value: {
+        ok: boolean;
+        injected: boolean;
+      }) => void;
+      vi.mocked(api.injectTaskMessage).mockImplementation(
+        () => new Promise((resolve) => {
+          resolveInjection = resolve;
+        }),
+      );
+      render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      const textbox = screen.getByRole('textbox');
+      await userEvent.type(textbox, 'snapshot');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalled());
+
+      expect(textbox).toBeDisabled();
+      expect(screen.getByTitle('Attach files')).toBeDisabled();
+      expect(screen.getByTitle(/注入模式已开启/)).toBeDisabled();
+
+      await act(async () => {
+        resolveInjection({ ok: true, injected: true });
+      });
+      await waitFor(() => expect(textbox).not.toBeDisabled());
+      expect(textbox).toHaveValue('');
+    });
+
+    it('keeps the text and uploaded attachment when the server does not confirm injection', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockResolvedValue([{
+        id: 'upload-evidence',
+        filename: 'evidence.txt',
+        path: '/srv/uploads/evidence.txt',
+        url: '/api/uploads/evidence.txt',
+        is_image: false,
+      }]);
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: false,
+      });
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
+      );
+      await screen.findByText('evidence.txt');
+      await userEvent.type(screen.getByRole('textbox'), '请结合附件继续');
+      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+
+      expect(await screen.findByText(/服务器没有确认消息已注入/)).toHaveTextContent(
+        '消息和附件已保留',
+      );
+      expect(screen.getByRole('textbox')).toHaveValue('请结合附件继续');
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('does not silently drop a failed upload when injecting text', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      vi.mocked(api.uploadImages).mockRejectedValue(new Error('upload rejected'));
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['bad'], 'broken.txt', { type: 'text/plain' }),
+      );
+      await screen.findByTitle('Click to retry');
+      await userEvent.type(screen.getByRole('textbox'), '不要漏掉附件');
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', ctrlKey: true });
+
+      expect(await screen.findByText('Retry or remove failed attachments before sending.')).toBeInTheDocument();
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(screen.getByText('broken.txt')).toBeInTheDocument();
     });
 
     it('does not offer local injection for worker tasks', async () => {
@@ -1292,6 +1873,31 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     // 但图片必须显示出来（去重时合并附件，而不是整条丢弃）
     const imgs = document.querySelectorAll('img[src*="/api/uploads/shot.png"]');
     expect(imgs.length).toBeGreaterThan(0);
+  });
+
+  it('用带用户名的服务端消息替换无前缀乐观消息，不显示两个气泡', async () => {
+    const task = makeTask({ id: 12 });
+    render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    await act(async () => {
+      wsUserMessage(12, {
+        content: '检查训练状态',
+        raw_content: '检查训练状态',
+      });
+    });
+    expect(screen.getByText('检查训练状态')).toBeInTheDocument();
+
+    await act(async () => {
+      wsUserMessage(12, {
+        id: 991,
+        content: '[Admin] 检查训练状态',
+        raw_content: '检查训练状态',
+      });
+    });
+
+    expect(screen.getByText('[Admin] 检查训练状态')).toBeInTheDocument();
+    expect(screen.queryByText('检查训练状态')).not.toBeInTheDocument();
   });
 
   it('Capacitor（手机 App）下附件相对 URL 必须拼上远程服务器地址', async () => {

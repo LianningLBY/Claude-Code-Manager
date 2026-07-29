@@ -5,6 +5,8 @@ import { api, isApiRequestError } from '../../api/client';
 import type {
   ApiAccountProvider,
   CloudRouterApiQuota,
+  CloudRouterUsageBreakdown,
+  CloudRouterUsageMetrics,
   CodexLoginMethod,
   CodexLoginStatus,
   CodexPoolAccountUsage,
@@ -99,6 +101,139 @@ function formatApiTimestamp(value: string | number | null | undefined): string {
   });
 }
 
+function finiteMetric(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function metricTokenTotal(metrics: CloudRouterUsageMetrics): number | null {
+  const explicit = finiteMetric(metrics.total_tokens);
+  if (explicit != null) return explicit;
+  const parts = [
+    metrics.input_tokens,
+    metrics.output_tokens,
+    metrics.cache_creation_tokens,
+    metrics.cache_write_tokens,
+    metrics.cache_read_tokens,
+  ].map(finiteMetric).filter((value): value is number => value != null);
+  return parts.length > 0 ? parts.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function UsageMetricSummary({
+  label,
+  metrics,
+  currency,
+}: {
+  label: string;
+  metrics: CloudRouterUsageMetrics | null | undefined;
+  currency?: string | null;
+}) {
+  if (!metrics) return null;
+  const cost = finiteMetric(metrics.actual_cost ?? metrics.cost);
+  const requests = finiteMetric(metrics.requests);
+  const tokens = metricTokenTotal(metrics);
+  if (cost == null && requests == null && tokens == null) return null;
+  return (
+    <div className="rounded border border-gray-700/70 bg-gray-900/40 px-2 py-1.5">
+      <div className="text-[10px] font-medium text-gray-300">{label}</div>
+      <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-gray-500">
+        {cost != null && <span>费用 <span className="text-gray-300">{formatApiAmount(cost, currency || 'USD')}</span></span>}
+        {requests != null && <span>请求 <span className="text-gray-300">{requests.toLocaleString()}</span></span>}
+        {tokens != null && <span>Tokens <span className="text-gray-300">{tokens.toLocaleString()}</span></span>}
+      </div>
+    </div>
+  );
+}
+
+function usageBreakdownRows(
+  value: CloudRouterUsageBreakdown | null | undefined,
+  labelField: 'model' | 'date',
+): Array<{ key: string; label: string; metrics: CloudRouterUsageMetrics }> {
+  if (!value) return [];
+  const looksLikeOneRecord = !Array.isArray(value) && (
+    typeof value.model === 'string'
+    || typeof value.date === 'string'
+    || [
+      value.requests,
+      value.total_tokens,
+      value.actual_cost,
+      value.cost,
+    ].some((metric) => typeof metric === 'number')
+  );
+  const entries: Array<readonly [string, CloudRouterUsageMetrics]> = Array.isArray(value)
+    ? value.map((metrics, index) => [String(index), metrics] as const)
+    : looksLikeOneRecord
+      ? [['0', value as CloudRouterUsageMetrics]]
+      : Object.entries(value) as Array<[string, CloudRouterUsageMetrics]>;
+  return entries
+    .filter((entry): entry is readonly [string, CloudRouterUsageMetrics] =>
+      Boolean(entry[1]) && typeof entry[1] === 'object' && !Array.isArray(entry[1])
+    )
+    .slice(0, 20)
+    .map(([key, metrics]) => {
+      const supplied = metrics[labelField];
+      return {
+        key,
+        label: typeof supplied === 'string' && supplied.trim() ? supplied.trim() : key,
+        metrics,
+      };
+    });
+}
+
+function ApiUsageDetails({
+  quota,
+  currency,
+}: {
+  quota: CloudRouterApiQuota;
+  currency?: string | null;
+}) {
+  const usage = quota.usage;
+  const daily = usageBreakdownRows(usage?.daily_usage, 'date');
+  const models = usageBreakdownRows(usage?.model_stats, 'model');
+  const hasSummary = Boolean(
+    usage?.today && (
+      finiteMetric(usage.today.actual_cost ?? usage.today.cost) != null
+      || finiteMetric(usage.today.requests) != null
+      || metricTokenTotal(usage.today) != null
+    )
+  ) || Boolean(
+    usage?.total && (
+      finiteMetric(usage.total.actual_cost ?? usage.total.cost) != null
+      || finiteMetric(usage.total.requests) != null
+      || metricTokenTotal(usage.total) != null
+    )
+  );
+  if (!hasSummary && daily.length === 0 && models.length === 0) return null;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
+        <UsageMetricSummary label="当前 Key 今日用量" metrics={usage?.today} currency={currency} />
+        <UsageMetricSummary label="当前 Key 累计用量" metrics={usage?.total} currency={currency} />
+      </div>
+      {daily.length > 0 && (
+        <details className="rounded border border-gray-700/60 bg-gray-900/30 px-2 py-1">
+          <summary className="cursor-pointer text-[10px] text-gray-400">逐日用量（最多显示 20 条）</summary>
+          <div className="mt-1 space-y-1">
+            {daily.map((row) => (
+              <UsageMetricSummary key={`${row.key}:${row.label}`} label={row.label} metrics={row.metrics} currency={currency} />
+            ))}
+          </div>
+        </details>
+      )}
+      {models.length > 0 && (
+        <details className="rounded border border-gray-700/60 bg-gray-900/30 px-2 py-1">
+          <summary className="cursor-pointer text-[10px] text-gray-400">逐模型用量（最多显示 20 条）</summary>
+          <div className="mt-1 space-y-1">
+            {models.map((row) => (
+              <UsageMetricSummary key={`${row.key}:${row.label}`} label={row.label} metrics={row.metrics} currency={currency} />
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
 function ApiQuotaPanel({ quota, onRefresh }: {
   quota: CloudRouterApiQuota | null | undefined;
   onRefresh: () => void;
@@ -124,11 +259,9 @@ function ApiQuotaPanel({ quota, onRefresh }: {
   const state = quota.state || quota.status || 'unknown';
   const currency = quota.currency || quota.unit;
   const normalizedState = state.trim().toLowerCase();
-  const noExpiry = quota.known === true
-    && quota.stale !== true
-    && quota.available !== false
-    && ['ok', 'active'].includes(normalizedState)
-    && quota.mode?.trim().toLowerCase() === 'wallet'
+  const unlimited = quota.unlimited === true
+    || quota.mode?.trim().toLowerCase() === 'unrestricted';
+  const expiryNotSupplied = unlimited
     && quota.expires_at == null
     && quota.days_until_expiry == null;
   const total = quota.quota;
@@ -137,9 +270,9 @@ function ApiQuotaPanel({ quota, onRefresh }: {
     ? Math.min(100, Math.max(0, (total.used / total.limit) * 100))
     : null;
   const remaining = quota.remaining ?? total?.remaining;
-  const stateColor = ['ok', 'active'].includes(state)
+  const stateColor = ['ok', 'active'].includes(normalizedState)
     ? 'text-green-400'
-    : ['exhausted', 'quota_exhausted', 'expired', 'forbidden', 'error'].includes(state)
+    : ['exhausted', 'quota_exhausted', 'expired', 'forbidden', 'error'].includes(normalizedState)
       ? 'text-red-400'
       : 'text-yellow-400';
 
@@ -156,6 +289,11 @@ function ApiQuotaPanel({ quota, onRefresh }: {
         {quota.group_name && (
           <span className="text-gray-500">
             分组 <span className="text-gray-300">{quota.group_name}</span>
+          </span>
+        )}
+        {quota.stale === true && (
+          <span className="rounded bg-amber-600/20 px-1 py-0.5 font-medium text-amber-300" title="刷新失败后保留的上次成功结果">
+            缓存数据
           </span>
         )}
         <button
@@ -175,7 +313,22 @@ function ApiQuotaPanel({ quota, onRefresh }: {
           分组并发上限 <span className="font-medium text-foreground">{quota.concurrency.toLocaleString()}</span>
         </div>
       )}
-      {total && (total.used != null || total.limit != null || total.remaining != null) ? (
+      {unlimited ? (
+        <div className="rounded border border-emerald-600/30 bg-emerald-950/20 p-2 text-[10px] leading-relaxed">
+          <div className="font-medium text-emerald-300">Key 无独立额度上限</div>
+          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-gray-400">
+            <span>Key 额度上限：<span className="font-medium text-emerald-300">等于所属账号额度上限</span></span>
+            <span>Key 剩余额度：<span className="text-gray-300">等于所属账号剩余额度</span></span>
+            {expiryNotSupplied && (
+              <span>Key 使用时间：<span className="font-medium text-emerald-300">不限制</span></span>
+            )}
+          </div>
+          <div className="mt-0.5 text-gray-400">
+            此 Key 未设置独立额度，实际额度随所属账号；下方仅展示当前 Key 的调用用量。
+            账号额度具体数值、充值和结算状态请前往 CloudRouter 控制台查看。
+          </div>
+        </div>
+      ) : total && (total.used != null || total.limit != null || total.remaining != null) ? (
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2 text-[10px]">
             <span className="text-gray-400">{hasSharedGroup ? '分组共享总额度' : '总额度'}</span>
@@ -204,17 +357,26 @@ function ApiQuotaPanel({ quota, onRefresh }: {
       ) : (
         <div className="text-xs text-gray-500">总额度：无法确认</div>
       )}
+      <ApiUsageDetails quota={quota} currency={currency} />
       <div className="grid grid-cols-1 gap-1 text-[10px] text-gray-500">
         <span>到期时间：<span className="text-gray-300">
-          {noExpiry ? '无期限' : formatApiTimestamp(quota.expires_at)}
+          {expiryNotSupplied
+            ? '不限制'
+            : formatApiTimestamp(quota.expires_at)}
         </span></span>
         <span>剩余天数：<span className="text-gray-300">
-          {noExpiry
-            ? '无期限'
-            : quota.days_until_expiry == null
-              ? '无法确认'
-              : `${quota.days_until_expiry.toLocaleString()} 天`}
+          {quota.days_until_expiry == null
+            ? expiryNotSupplied ? '不限制' : '无法确认'
+            : `${quota.days_until_expiry.toLocaleString()} 天`}
         </span></span>
+        <span>数据时间：<span className={quota.stale ? 'text-amber-300' : 'text-gray-300'}>
+          {formatApiTimestamp(quota.fetched_at)}
+        </span></span>
+        {quota.stale === true && quota.refresh_failed_at != null && (
+          <span>刷新失败时间：<span className="text-amber-300">
+            {formatApiTimestamp(quota.refresh_failed_at)}
+          </span></span>
+        )}
       </div>
       {quota.windows?.map((window, index) => {
         const utilization = window.utilization != null
@@ -258,7 +420,7 @@ function ApiQuotaPanel({ quota, onRefresh }: {
           </div>
         );
       })}
-      {quota.reason && state !== 'active' && <div className="text-[10px] text-red-400 break-all">{quota.reason}</div>}
+      {quota.reason && normalizedState !== 'active' && <div className="text-[10px] text-red-400 break-all">{quota.reason}</div>}
     </div>
   );
 }
@@ -321,10 +483,11 @@ function formatWindowName(minutes: number | null): string {
   return `${hours}小时窗口`;
 }
 
-function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetPreferred, onRelogin, onRetryUsage, onDelete, deleting, reloginState }: {
+function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCooldown, onSetPreferred, onRelogin, onRetryUsage, onDelete, deleting, reloginState }: {
   account: PoolAccountUsage;
   preferred: string | null;
   lastSelected: string | null;
+  apiKeyHint?: string;
   onClearCooldown: (id: string) => void;
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
@@ -426,6 +589,11 @@ function AccountCard({ account, preferred, lastSelected, onClearCooldown, onSetP
         </div>
       </div>
       {!isApi && account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
+      {isApi && apiKeyHint && (
+        <div className="text-[10px] text-sky-300/80 font-mono" title="来自管理员 API 账号目录的脱敏 Key 指纹">
+          Key 指纹：{apiKeyHint}
+        </div>
+      )}
       {isApi && (
         <div className="text-[10px] text-gray-500 font-mono truncate" title={account.config_dir}>
           CLAUDE_CONFIG_DIR: {account.config_dir}
@@ -535,10 +703,11 @@ function CodexOtpPrompt({ state, onSubmit }: {
   );
 }
 
-function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, deleting, onRetryUsage, reloginState }: {
+function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, deleting, onRetryUsage, reloginState }: {
   account: CodexPoolAccountUsage;
   preferred: string | null;
   lastSelected: string | null;
+  apiKeyHint?: string;
   onClearCooldown: (id: string) => void;
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
@@ -653,6 +822,11 @@ function CodexAccountCard({ account, preferred, lastSelected, onClearCooldown, o
         </div>
       </div>
       {!isApi && account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
+      {isApi && apiKeyHint && (
+        <div className="text-[10px] text-sky-300/80 font-mono" title="来自管理员 API 账号目录的脱敏 Key 指纹">
+          Key 指纹：{apiKeyHint}
+        </div>
+      )}
       <div className="text-[10px] text-gray-500 font-mono truncate" title={account.codex_home}>
         CODEX_HOME: {account.codex_home}
       </div>
@@ -1178,6 +1352,7 @@ export function PoolDrawer() {
   const [claudeEnabled, setClaudeEnabled] = useState(false);
   const [codexEnabled, setCodexEnabled] = useState(false);
   const [apiAccountsAvailable, setApiAccountsAvailable] = useState(false);
+  const [apiAccountHints, setApiAccountHints] = useState<Record<string, string>>({});
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<PoolTab>('claude');
 
@@ -1192,6 +1367,21 @@ export function PoolDrawer() {
   const [codexError, setCodexError] = useState<string | null>(null);
   const codexUsageRequestSeq = useRef(0);
 
+  const loadApiAccountCatalog = useCallback(async () => {
+    try {
+      const accounts = await api.getCloudRouterAccounts();
+      setApiAccountHints(Object.fromEntries(
+        accounts
+          .filter((account) => Boolean(account.id && account.key_hint))
+          .map((account) => [account.id, account.key_hint]),
+      ));
+      setApiAccountsAvailable(true);
+    } catch {
+      // This endpoint is administrator-only. Native Pool views remain usable
+      // for other users without exposing even a partial credential fingerprint.
+    }
+  }, []);
+
   useEffect(() => {
     api.getPoolStatus()
       .then((s) => setClaudeEnabled(s.enabled))
@@ -1201,10 +1391,8 @@ export function PoolDrawer() {
       .catch(() => setCodexEnabled(false));
     // The API-account manager remains available even when both native pools
     // are disabled, so users can add the first key from the same drawer.
-    api.getCloudRouterAccounts()
-      .then(() => setApiAccountsAvailable(true))
-      .catch(() => setApiAccountsAvailable(false));
-  }, []);
+    void loadApiAccountCatalog();
+  }, [loadApiAccountCatalog]);
 
   const loadClaudeUsage = useCallback(async (force?: boolean) => {
     setClaudeLoading(true);
@@ -1391,7 +1579,11 @@ export function PoolDrawer() {
   const refreshBothPools = useCallback(async () => {
     // create/refresh already performs the live API-provider requests. Read the
     // resulting pool snapshots without issuing duplicate force requests.
-    await Promise.all([loadClaudeUsage(false), loadCodexUsage(false)]);
+    await Promise.all([
+      loadClaudeUsage(false),
+      loadCodexUsage(false),
+      loadApiAccountCatalog(),
+    ]);
     const [claudeResult, codexResult] = await Promise.allSettled([
       api.getPoolStatus(),
       api.getCodexPoolStatus(),
@@ -1407,7 +1599,7 @@ export function PoolDrawer() {
     if (!nextClaudeEnabled && nextCodexEnabled) setTab('codex');
     else if (nextClaudeEnabled && !nextCodexEnabled) setTab('claude');
     setApiAccountsAvailable(true);
-  }, [loadClaudeUsage, loadCodexUsage]);
+  }, [loadApiAccountCatalog, loadClaudeUsage, loadCodexUsage]);
 
   const handleApiRefresh = useCallback(async (accountId: string | null | undefined) => {
     if (!accountId) {
@@ -1613,6 +1805,7 @@ export function PoolDrawer() {
                       account={a}
                       preferred={claudeStatus?.preferred ?? null}
                       lastSelected={claudeStatus?.last_selected ?? null}
+                      apiKeyHint={a.api_account_id ? apiAccountHints[a.api_account_id] : undefined}
                       onClearCooldown={handleClaudeClearCooldown}
                       onSetPreferred={handleClaudeSetPreferred}
                       onRelogin={handleClaudeRelogin}
@@ -1655,6 +1848,7 @@ export function PoolDrawer() {
                       account={a}
                       preferred={codexStatus.preferred ?? null}
                       lastSelected={codexStatus.last_selected ?? null}
+                      apiKeyHint={a.api_account_id ? apiAccountHints[a.api_account_id] : undefined}
                       onClearCooldown={handleCodexClearCooldown}
                       onSetPreferred={handleCodexSetPreferred}
                       onRelogin={handleCodexRelogin}

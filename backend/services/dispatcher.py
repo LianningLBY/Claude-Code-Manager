@@ -173,6 +173,8 @@ TASK_QUEUE_ABORT_TIMEOUT = 15.0
 AUX_LIFECYCLE_CANCEL_TIMEOUT = 10.0
 DISPATCHER_BACKGROUND_STOP_TIMEOUT = 10.0
 SHUTDOWN_LIFECYCLE_CANCEL_TIMEOUT = 15.0
+
+
 @dataclass(frozen=True)
 class _TaskStatusGeneration:
     """Exact durable Task generation used to fence status publication."""
@@ -185,6 +187,7 @@ class _TaskStatusGeneration:
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
+    pty_background_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -479,6 +482,12 @@ class GlobalDispatcher:
         self.db_factory = db_factory
         self.instance_manager = instance_manager
         self.broadcaster = broadcaster
+        # Detached PTY chat epochs finalize outside the dispatcher lifecycle.
+        # Route their exact terminal point back through the same PR completion
+        # consumer used by ordinary foreground tasks.
+        self.instance_manager.pty_background_completion_handler = (
+            self._handle_pty_background_completion
+        )
         self._dispatch_task: asyncio.Task | None = None
         # New tasks wake the loop immediately.  The 2s timeout remains as a
         # safety poll for tasks inserted by legacy/direct DB paths.
@@ -948,6 +957,25 @@ class GlobalDispatcher:
                 )
             )
             active_tasks = list(active_result.scalars().all())
+            live_background_task_ids = (
+                self.instance_manager.active_pty_background_task_ids()
+                if reconcile_auxiliary
+                else set()
+            )
+            stale_background_tasks: list[Task] = []
+            if reconcile_auxiliary:
+                background_result = await db.execute(
+                    select(Task).where(
+                        Task.pty_background_generation.isnot(None),
+                        Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
+                    )
+                )
+                stale_background_tasks = [
+                    task
+                    for task in background_result.scalars().all()
+                    if task.id not in live_background_task_ids
+                ]
 
             # Establish the global lifecycle lock order before touching any
             # Instance row.  Startup cleanup may later update active tasks and
@@ -955,6 +983,9 @@ class GlobalDispatcher:
             # exact no-op UPDATE is also a CAS on SQLite/MySQL configurations
             # where SELECT FOR UPDATE alone is insufficient.
             task_ids_to_lock = {task.id for task in active_tasks}
+            task_ids_to_lock.update(
+                task.id for task in stale_background_tasks
+            )
             task_ids_to_lock.update(
                 inst.current_task_id
                 for inst, _ in stale_instances
@@ -995,6 +1026,62 @@ class GlobalDispatcher:
                             locked_task.id,
                         )
                         return
+
+            from backend.models.sub_agent import SubAgentSession
+
+            reset_tasks: list[_TaskStatusGeneration] = []
+            recovered_background_task_ids: set[int] = set()
+            for task in stale_background_tasks:
+                error = (
+                    "CCM restarted before Claude PTY background activity "
+                    "reached a terminal turn"
+                )
+                recovered = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task.id,
+                        Task.status == task.status,
+                        Task.pty_background_generation
+                        == task.pty_background_generation,
+                        Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
+                    )
+                    .values(
+                        status="failed",
+                        completed_at=datetime.utcnow(),
+                        error_message=error,
+                        pty_background_generation=None,
+                    )
+                )
+                if recovered.rowcount:
+                    recovered_background_task_ids.add(task.id)
+                    await db.execute(
+                        update(SubAgentSession)
+                        .where(
+                            SubAgentSession.task_id == task.id,
+                            SubAgentSession.source == "native",
+                            SubAgentSession.status == "running",
+                        )
+                        .values(
+                            status="failed",
+                            completed_at=datetime.utcnow(),
+                        )
+                    )
+                    db.add(
+                        LogEntry(
+                            instance_id=None,
+                            task_id=task.id,
+                            event_type="system_event",
+                            role="system",
+                            content=error,
+                            is_error=True,
+                        )
+                    )
+                    resulting_generation = (
+                        await self._read_task_status_generation(db, task.id)
+                    )
+                    if resulting_generation is not None:
+                        reset_tasks.append(resulting_generation)
 
             # Task locks are now held.  Instance quarantine may safely follow;
             # all later Task transitions reuse the already locked rows.
@@ -1042,8 +1129,9 @@ class GlobalDispatcher:
                 if pid_may_be_alive:
                     unmanaged_live_instance_pids[inst.id] = inst.pid
 
-            reset_tasks: list[_TaskStatusGeneration] = []
             for t in active_tasks:
+                if t.id in recovered_background_task_ids:
+                    continue
                 if t.id in live_task_ids:
                     continue
                 if t.instance_id in reconciliation_race_instance_ids:
@@ -1396,6 +1484,7 @@ class GlobalDispatcher:
                   set(self._sub_agent_tasks)
                   | set(self._sub_agent_processes)
                   | set(self._sub_agent_codex_processes)
+                  | set(self._sub_agent_codex_homes)
                   | set(self._sub_agent_codex_threads)
               )),
         ]
@@ -1651,6 +1740,19 @@ class GlobalDispatcher:
             if fallback_stop_token:
                 self.instance_manager._end_stopping(instance_id)
 
+        # A late autonomous PTY turn can outlive its foreground Instance claim.
+        # Such a generation is retained only in _pty_background_states with the
+        # exact native Session object; it is therefore absent from every
+        # instance-keyed snapshot above.  Stop it through the Task/session/token
+        # API before application shutdown dismantles the generic PTY pool.
+        #
+        # Do this after ordinary Instance generations: an attached background
+        # waiter is settled by stop(instance_id), while an ownerless tail must
+        # never address that now-reusable instance key.
+        shutdown_failures.extend(
+            await self._stop_detached_pty_background_generations_for_shutdown()
+        )
+
         # A fresh lifecycle cancelled before spawning has no manager generation
         # for stop() to release.  Return only those proven process-free claims;
         # a failed reap keeps its active Task owner fail-closed.
@@ -1696,6 +1798,154 @@ class GlobalDispatcher:
                 f"terminal: {'; '.join(shutdown_failures)}"
             )
         logger.info("GlobalDispatcher shutdown complete")
+
+    async def _stop_detached_pty_background_generations_for_shutdown(
+        self,
+    ) -> list[str]:
+        """Stop retained ownerless PTY tails by exact Task/session generation.
+
+        ``FullMirrorCCMBackend`` deliberately keeps a native Session object after
+        its foreground Instance has become idle so late autonomous output can be
+        mirrored.  No instance-keyed process map identifies that Session.  A
+        generic pool shutdown would kill it but leave the durable Task marker
+        claiming background work is still active, so graceful shutdown must use
+        InstanceManager's exact detached-stop transaction first.
+        """
+
+        states = getattr(self.instance_manager, "_pty_background_states", None)
+        if not isinstance(states, dict) or not states:
+            return []
+
+        failures: list[str] = []
+        # Retain the objects as values so Python cannot reuse an attempted
+        # object's id for a same-key replacement during this shutdown pass.
+        attempted_states: dict[int, object] = {}
+        shutdown_error = (
+            "Claude PTY background activity was interrupted by dispatcher "
+            "shutdown"
+        )
+
+        # A terminal callback may replace/remove a state while an earlier exact
+        # stop is in flight. Re-snapshot until every state observed by this
+        # shutdown pass has either been retired, attempted, or proven attached.
+        while True:
+            snapshot = [
+                (key, state)
+                for key, state in list(states.items())
+                if id(state) not in attempted_states
+            ]
+            if not snapshot:
+                break
+
+            for key, state in snapshot:
+                attempted_states[id(state)] = state
+                task_id = getattr(state, "task_id", None)
+                session_id = getattr(state, "session_id", None)
+                generation = getattr(state, "generation", None)
+                expected_key = (
+                    (task_id, session_id)
+                    if isinstance(task_id, int)
+                    and isinstance(session_id, str)
+                    else None
+                )
+                if (
+                    expected_key is None
+                    or key != expected_key
+                    or not isinstance(generation, str)
+                    or not generation
+                ):
+                    failures.append(
+                        "retained PTY background state has invalid exact "
+                        f"identity: {key!r}"
+                    )
+                    continue
+
+                try:
+                    async with self.db_factory() as db:
+                        task = await db.get(Task, task_id)
+                        owner_id = await db.scalar(
+                            select(Instance.id)
+                            .where(Instance.current_task_id == task_id)
+                            .limit(1)
+                        )
+                except Exception as exc:
+                    failures.append(
+                        "detached PTY background task "
+                        f"{task_id} generation inspection failed: {exc!r}"
+                    )
+                    logger.exception(
+                        "Could not inspect detached PTY background task %s "
+                        "during dispatcher shutdown",
+                        task_id,
+                    )
+                    continue
+
+                if states.get(key) is not state:
+                    continue
+                # Attached generations should already have been retired by the
+                # ordinary exact Instance stop above. A surviving state is
+                # still the only live Session handle; silently skipping it
+                # would let a stale DB owner (or a lost manager registry)
+                # escape graceful shutdown. The detached API cannot safely
+                # borrow an instance-owned generation, so retain the evidence
+                # and fail closed.
+                if owner_id is not None:
+                    failures.append(
+                        "PTY background task "
+                        f"{task_id} session {session_id} remained attached "
+                        f"to instance {owner_id} after exact shutdown"
+                    )
+                    continue
+                if task is None:
+                    failures.append(
+                        "detached PTY background task "
+                        f"{task_id} session {session_id} has no durable Task row"
+                    )
+                    continue
+
+                stopped = False
+                try:
+                    stopped = bool(
+                        await self.instance_manager
+                        .stop_detached_pty_background_generation(
+                            task_id,
+                            session_id,
+                            generation,
+                            expected_status=task.status,
+                            expected_retry_count=task.retry_count,
+                            expected_instance_id=task.instance_id,
+                            expected_started_at=task.started_at,
+                            expected_completed_at=task.completed_at,
+                            terminal_status="failed",
+                            error_message=shutdown_error,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to stop detached PTY background task %s "
+                        "session %s during dispatcher shutdown",
+                        task_id,
+                        session_id,
+                    )
+
+                # A successful exact transaction retires this object. Natural
+                # completion may also retire it while the stop is revalidating;
+                # either outcome is safe. A still-indexed object retains the
+                # only exact Session handle and must keep shutdown fail-closed.
+                state_survived = states.get(key) is state
+                retired_outcome = getattr(state, "outcome", None)
+                retired_safely = not state_survived and (
+                    stopped
+                    or retired_outcome
+                    in {"completed", "superseded", "failed", "abandoned"}
+                )
+                if not retired_safely:
+                    failures.append(
+                        "detached PTY background task "
+                        f"{task_id} session {session_id} generation survived"
+                    )
+
+        return failures
 
     def status(self) -> dict:
         return {
@@ -1756,6 +2006,11 @@ class GlobalDispatcher:
         sub_agent_ids.update(
             session_id
             for session_id in self._sub_agent_codex_threads
+            if type(session_id) is int
+        )
+        sub_agent_ids.update(
+            session_id
+            for session_id in self._sub_agent_codex_homes
             if type(session_id) is int
         )
         return monitor_ids, sub_agent_ids
@@ -4054,7 +4309,13 @@ class GlobalDispatcher:
     @staticmethod
     def _task_lifecycle_queue_fence(
         generation: _TaskLifecycleGeneration,
-    ) -> tuple[int, int | None, datetime | None, datetime | None]:
+    ) -> tuple[
+        int,
+        int | None,
+        datetime | None,
+        datetime | None,
+        str | None,
+    ]:
         """Adapt the stronger lifecycle fence to TaskQueue's CAS fields."""
 
         return (
@@ -4062,6 +4323,7 @@ class GlobalDispatcher:
             generation.instance_id,
             generation.started_at,
             generation.completed_at,
+            None,
         )
 
     async def _read_owned_lifecycle_task(
@@ -4131,6 +4393,12 @@ class GlobalDispatcher:
                 if generation.completed_at is None
                 else Task.completed_at == generation.completed_at
             ),
+            (
+                Task.pty_background_generation.is_(None)
+                if generation.pty_background_generation is None
+                else Task.pty_background_generation
+                == generation.pty_background_generation
+            ),
         ]
 
     @staticmethod
@@ -4146,6 +4414,7 @@ class GlobalDispatcher:
             instance_id=task.instance_id,
             started_at=task.started_at,
             completed_at=task.completed_at,
+            pty_background_generation=task.pty_background_generation,
         )
 
     @staticmethod
@@ -4166,6 +4435,7 @@ class GlobalDispatcher:
                     Task.instance_id,
                     Task.started_at,
                     Task.completed_at,
+                    Task.pty_background_generation,
                 ).where(Task.id == task_id)
             )
         ).one_or_none()
@@ -4180,6 +4450,7 @@ class GlobalDispatcher:
             instance_id=row.instance_id,
             started_at=row.started_at,
             completed_at=row.completed_at,
+            pty_background_generation=row.pty_background_generation,
         )
 
     async def _publish_task_generation_events(
@@ -4346,13 +4617,13 @@ class GlobalDispatcher:
         )
         return status
 
-    async def _complete_owned_task(
+    async def _complete_owned_task_result(
         self,
         generation: _TaskLifecycleGeneration,
         *,
         count_completion: bool = False,
-    ) -> bool:
-        """Complete and broadcast only if this active Instance still owns it."""
+    ) -> tuple[bool, bool]:
+        """Return ``(completed, background_active_at_commit)``."""
 
         async with self.db_factory() as db:
             task = await self._read_owned_lifecycle_task(
@@ -4361,7 +4632,10 @@ class GlobalDispatcher:
                 for_update=True,
             )
             if task is None:
-                return False
+                return False, False
+            background_active = (
+                task.pty_background_generation is not None
+            )
             observed_generation = self._task_status_generation(task)
             changed = await db.execute(
                 update(Task)
@@ -4379,7 +4653,7 @@ class GlobalDispatcher:
             )
             if not changed.rowcount:
                 await db.rollback()
-                return False
+                return False, False
             if count_completion:
                 # Global lifecycle order is Task -> Instance.  The Task row is
                 # already locked above before this accounting write.
@@ -4395,14 +4669,29 @@ class GlobalDispatcher:
             )
             if resulting_generation is None:
                 await db.rollback()
-                return False
+                return False, False
             await db.commit()
 
         await self._broadcast_task_status_generation(
             resulting_generation,
             instance_id=generation.instance_id,
+            extra={"background_active": background_active},
         )
-        return True
+        return True, background_active
+
+    async def _complete_owned_task(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        count_completion: bool = False,
+    ) -> bool:
+        """Complete and broadcast only if this active Instance still owns it."""
+
+        completed, _ = await self._complete_owned_task_result(
+            generation,
+            count_completion=count_completion,
+        )
+        return completed
 
     async def _fail_owned_task(
         self,
@@ -5063,16 +5352,19 @@ class GlobalDispatcher:
                 return
 
             # === Claude Code completed successfully ===
-            completed = await self._complete_owned_task(
+            completed, background_active = (
+                await self._complete_owned_task_result(
                 lifecycle_generation,
                 count_completion=True,
+                )
             )
             if not completed:
                 return
 
             logger.info(f"Task {task.id} ({task.title}) completed successfully on instance {instance_id}")
 
-            await self._handle_pr_review_completion(task)
+            if not background_active:
+                await self._handle_pr_review_completion(task)
 
         except asyncio.CancelledError:
             lifecycle_cancelled = True
@@ -5262,6 +5554,25 @@ class GlobalDispatcher:
                 if self._running_tasks.get(instance_id) is lifecycle_task:
                     self._running_tasks.pop(instance_id, None)
 
+    async def _handle_pty_background_completion(
+        self,
+        task_id: int,
+    ) -> None:
+        """Run deferred terminal consumers after the exact PTY tail commits."""
+
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id)
+            if (
+                task is None
+                or task.status != "completed"
+                or task.pty_background_generation is not None
+            ):
+                return
+            # Detach the ORM object before the session closes; the completion
+            # handler only reads already-loaded scalar fields/metadata.
+            db.expunge(task)
+        await self._handle_pr_review_completion(task)
+
     async def _handle_pr_review_completion(self, task: Task):
         meta = task.metadata_ or {}
         pr_review_id = meta.get("pr_review_id")
@@ -5271,13 +5582,42 @@ class GlobalDispatcher:
             from backend.models.pr_monitor import MonitoredRepo, PRReview
             from backend.services.pr_review_service import check_and_update_review
             async with self.db_factory() as db:
+                current_task = await db.get(Task, task.id)
+                session_id = (
+                    current_task.session_id if current_task is not None else None
+                )
+
+                def background_handoff_pending() -> bool:
+                    return bool(
+                        session_id
+                        and self.instance_manager
+                        .has_pty_autonomous_activity_handoff(
+                            task.id, session_id
+                        )
+                    )
+
+                if (
+                    current_task is None
+                    or current_task.status != "completed"
+                    or current_task.retry_count != task.retry_count
+                    or current_task.pty_background_generation is not None
+                    or background_handoff_pending()
+                ):
+                    return
                 review = await db.get(PRReview, pr_review_id)
                 if not review:
                     return
                 repo = await db.get(MonitoredRepo, review.repo_id)
                 if not repo:
                     return
-                await check_and_update_review(db, pr_review_id, repo.repo_full_name)
+                await check_and_update_review(
+                    db,
+                    pr_review_id,
+                    repo.repo_full_name,
+                    terminal_task_id=task.id,
+                    terminal_task_retry_count=task.retry_count,
+                    background_handoff_pending=background_handoff_pending,
+                )
         except Exception as e:
             logger.error(f"PR review completion handler error: {e}", exc_info=True)
 
@@ -7657,6 +7997,7 @@ class GlobalDispatcher:
                                 else Task.model == expected_model
                             ),
                             Task.codex_service_tier == expected_tier,
+                            task_retry_not_superseded_predicate(),
                         ]
                         task_guard = await db.execute(
                             update(Task)
@@ -8301,7 +8642,37 @@ class GlobalDispatcher:
         """Check the task's exact durable owner against all local generations."""
 
         task = await db.get(Task, task_id, populate_existing=True)
-        if task is None or task.instance_id is None:
+        if task is None:
+            return False
+        if task.pty_background_generation is not None:
+            # A detached PTY epoch can outlive the foreground Instance owner.
+            # Starting a resume while that epoch is still mirroring output
+            # would create two writers for the same native session. Keep the
+            # queued message pending until its exact durable fence is cleared.
+            return True
+        session_id = task.session_id
+        if session_id:
+            generation_lookup = getattr(
+                self.instance_manager,
+                "pty_background_generation_for",
+                None,
+            )
+            if callable(generation_lookup):
+                generation = generation_lookup(task_id, session_id)
+                if isinstance(generation, str) and generation:
+                    return True
+            handoff_lookup = getattr(
+                self.instance_manager,
+                "has_pty_autonomous_activity_handoff",
+                None,
+            )
+            if callable(handoff_lookup) and (
+                handoff_lookup(task_id, session_id) is True
+            ):
+                # The idle callback records this synchronously before its DB
+                # marker can be delayed on the transition lock.
+                return True
+        if task.instance_id is None:
             return False
         instance_id = task.instance_id
 
@@ -8539,6 +8910,26 @@ class GlobalDispatcher:
                     f"Task {task_id} is still establishing its first session"
                 )
 
+            # Do not inspect/recover the native session while an exact
+            # foreground consumer or detached PTY epoch can still append to
+            # it.  In particular, a late autonomous turn may have no Instance
+            # owner but remains a live writer through its durable marker.
+            for attempt in range(60):
+                if not await self._queued_task_has_live_generation(
+                    db, task_id
+                ):
+                    break
+                await asyncio.sleep(2)
+            else:
+                logger.warning(
+                    "Task %s still busy after 120s, re-queueing message: %s",
+                    task_id,
+                    msg.source,
+                )
+                await self._get_task_queue(task_id).put(msg)
+                await asyncio.sleep(5)
+                return
+
             # Recover before resuming when the session can't be resumed:
             #   - task=failed after an abnormal exit (session may still be on disk), OR
             #   - the session JSONL is gone (resume would die with "No conversation
@@ -8638,6 +9029,7 @@ class GlobalDispatcher:
                     ),
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
+                    Task.pty_background_generation.is_(None),
                     task_retry_not_superseded_predicate(),
                 )
                 # Acquire the exact Task write barrier before inspecting the
@@ -8707,21 +9099,6 @@ class GlobalDispatcher:
                 # 的话前端要等 executing 广播才知道任务被认领（轮询窗口内分叉）
                 from backend.services.task_events import broadcast_status_change
                 await broadcast_status_change(task_id, "in_progress")
-
-            # Wait for the task's exact local generation to become idle.  The
-            # parent process alone is insufficient: terminal Codex consumers
-            # still own rollout migration/rebind work, while a fresh lifecycle
-            # can own Task.instance_id before it has registered any process.
-            for attempt in range(60):
-                if not await self._queued_task_has_live_generation(db, task_id):
-                    break
-                await asyncio.sleep(2)
-            else:
-                logger.warning(f"Task {task_id} still busy after 120s, re-queueing message: {msg.source}")
-                q = self._get_task_queue(task_id)
-                await q.put(msg)
-                await asyncio.sleep(5)
-                return
 
             # Fence startup reconciliation from this point through successful
             # spawn.  Refresh after acquiring because start() or another owner
@@ -8974,6 +9351,14 @@ class GlobalDispatcher:
             # commit point. A paused updater either observes this executing
             # generation or prevents the launch before the CAS is committed.
             async with self.task_start_guard():
+                if await self._queued_task_has_live_generation(
+                    db, task_id
+                ):
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "A foreground or detached PTY generation became active "
+                        "during queued launch preparation"
+                    )
                 # Acquire the Task write barrier without publishing execution
                 # yet.  A concurrent settings save that committed before this
                 # point is then visible to the refresh below; one that starts
@@ -9006,6 +9391,7 @@ class GlobalDispatcher:
                         ),
                         Task.worker_id.is_(None),
                         Task.shared_from_id.is_(None),
+                        Task.pty_background_generation.is_(None),
                         task_retry_not_superseded_predicate(),
                     )
                     .values(status=Task.status)
@@ -9049,6 +9435,11 @@ class GlobalDispatcher:
                     raise QueuedMessagePrelaunchError(
                         "Task routing configuration synchronization is pending; "
                         "preserving the exact message for retry"
+                    )
+                if task.pty_background_generation is not None:
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Detached PTY activity won the final launch fence"
                     )
                 current_effective_model = msg.model_override or task.model
                 current_routing = (

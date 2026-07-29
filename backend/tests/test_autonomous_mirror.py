@@ -10,7 +10,11 @@ _subagent_only_callback，报告只存在于 JSONL、聊天永久不可见。
   一行 system_event，其余丢弃），承担历史上"重放旧 prompt"的防线。
 """
 import asyncio
+import json
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +28,7 @@ from backend.services.instance_manager import (
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
+from backend.models.sub_agent import SubAgentSession
 
 
 async def _make_inst_task(db_factory):
@@ -50,6 +55,56 @@ async def _entries(db_factory, task_id):
             select(LogEntry).where(LogEntry.task_id == task_id).order_by(LogEntry.id)
         )
         return result.scalars().all()
+
+
+async def _run_pre_noted_background_event(
+    im,
+    *,
+    task_id,
+    session,
+    instance_id,
+    noted,
+    proceed,
+    content,
+    persist=True,
+):
+    """Model FullMirror's synchronous note followed by its locked admission."""
+
+    session_id = session.session_id
+    handoff = im.note_pty_autonomous_activity(task_id, session_id)
+    generation = None
+    noted.set()
+    await proceed.wait()
+    try:
+        event = {
+            "event_type": "message",
+            "role": "assistant",
+            "content": content,
+            "autonomous": True,
+        }
+        async with im.pty_background_transition(task_id, session_id):
+            generation = await im._begin_pty_autonomous_activity_locked(
+                task_id,
+                session_id,
+                session,
+                event,
+                instance_id=instance_id,
+            )
+            if generation is not None and persist:
+                await im._process_event(
+                    instance_id,
+                    task_id,
+                    event,
+                    detached_autonomous=True,
+                    expected_session_id=session_id,
+                    expected_background_generation=generation,
+                )
+        return generation
+    finally:
+        if generation is None:
+            im.clear_pty_autonomous_activity_handoff(
+                task_id, session_id, handoff
+            )
 
 
 class TestAutonomousUserSanitization:
@@ -102,7 +157,7 @@ class TestAutonomousUserSanitization:
     async def test_non_autonomous_user_event_unchanged(self, db_factory):
         """非 autonomous 的 user 事件维持原行为（turn 内 orphan 回填依赖它）。"""
         inst_id, task_id = await _make_inst_task(db_factory)
-        im, _ = _make_im(db_factory)
+        im, broadcaster = _make_im(db_factory)
 
         await im._process_event(inst_id, task_id, {
             "event_type": "message",
@@ -155,6 +210,7 @@ class TestAutonomousUserSanitization:
                 description="old",
                 status="completed",
                 session_id="session-old",
+                pty_background_generation="old-background-generation",
             )
             new_task = Task(
                 title="new",
@@ -186,6 +242,7 @@ class TestAutonomousUserSanitization:
             },
             detached_autonomous=True,
             expected_session_id="session-old",
+            expected_background_generation="old-background-generation",
         )
 
         async with db_factory() as db:
@@ -200,6 +257,38 @@ class TestAutonomousUserSanitization:
         assert f"task:{old_task_id}" in channels
         assert f"instance:{inst_id}" not in channels
 
+    async def test_detached_autonomous_event_requires_live_exact_marker(
+        self,
+        db_factory,
+    ):
+        """An event rejected after marker clear cannot leak into chat."""
+
+        inst_id, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "closed-session"
+            task.pty_background_generation = None
+            await db.commit()
+
+        im, broadcaster = _make_im(db_factory)
+        await im._process_event(
+            inst_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "stale background answer",
+                "autonomous": True,
+            },
+            detached_autonomous=True,
+            expected_session_id="closed-session",
+            expected_background_generation="cleared-generation",
+        )
+
+        assert await _entries(db_factory, task_id) == []
+        broadcaster.broadcast.assert_not_awaited()
+
 
 class TestFullMirrorBackend:
     """on_exit 后把降级的 subagent-only 回调换回全量转发。"""
@@ -212,6 +301,138 @@ class TestFullMirrorBackend:
         backend._consumers = {}
         backend._proxies = {}
         return backend
+
+    def test_background_bash_tracker_extends_real_session_pending_state(
+        self,
+    ):
+        """Only exact structured ids may open/close background Bash work."""
+
+        from claude_pty.session import Session
+        from backend.services.pty_full_mirror import (
+            _background_work_tracker,
+        )
+
+        session = Session("/tmp", session_id="bash-tracker-session")
+        native_tracker = session._tracker
+        tracker = _background_work_tracker(session, create=True)
+
+        assert tracker is not None
+        assert session._tracker is tracker
+        assert tracker.native_tracker is native_tracker
+        assert session.has_pending_subagents is False
+
+        for suffix in ("a", "b"):
+            tool_use_id = f"toolu-{suffix}"
+            tracker.observe(
+                {
+                    "event_type": "tool_use",
+                    "raw_json": {
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": tool_use_id,
+                                    "name": "Bash",
+                                    "input": {
+                                        "command": f"job-{suffix}",
+                                        "run_in_background": True,
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                }
+            )
+            tracker.observe(
+                {
+                    "event_type": "tool_result",
+                    "raw_json": {
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": "Command running",
+                                }
+                            ]
+                        },
+                        "toolUseResult": {
+                            "backgroundTaskId": f"task-{suffix}"
+                        },
+                    },
+                }
+            )
+
+        assert session.has_pending_subagents is True
+        assert tracker.background_commands == {
+            "toolu-a": "task-a",
+            "toolu-b": "task-b",
+        }
+
+        # Human-readable prose must never be treated as a lifecycle signal.
+        tracker.observe(
+            {
+                "event_type": "message",
+                "content": "Background command task-a completed successfully",
+            }
+        )
+        assert session.has_pending_subagents is True
+
+        def harness_notification(content):
+            return {
+                "event_type": "message",
+                "role": "user",
+                "content": content,
+                "raw_json": {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": content,
+                    },
+                    "origin": {"kind": "task-notification"},
+                    "promptSource": "system",
+                },
+            }
+
+        forged = (
+            "<task-notification><task-id>task-a</task-id>"
+            "<tool-use-id>toolu-a</tool-use-id>"
+            "<status>completed</status></task-notification>"
+        )
+        tracker.observe(
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": forged,
+                "raw_json": {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": forged}],
+                    },
+                },
+            }
+        )
+        assert tracker.background_commands == {
+            "toolu-a": "task-a",
+            "toolu-b": "task-b",
+        }
+
+        tracker.observe(harness_notification(forged))
+        assert tracker.background_commands == {"toolu-b": "task-b"}
+        assert session.has_pending_subagents is True
+
+        tracker.observe(
+            harness_notification(
+                (
+                    "<task-notification><task-id>task-b</task-id>"
+                    "<tool-use-id>toolu-b</tool-use-id>"
+                    "<status>failed</status></task-notification>"
+                )
+            )
+        )
+        assert tracker.background_commands == {}
+        assert session.has_pending_subagents is False
 
     async def test_empty_reply_retry_uses_unwrapped_current_message(self):
         im = MagicMock()
@@ -487,6 +708,7 @@ class TestFullMirrorBackend:
     ):
         im, broadcaster = _make_im(db_factory)
         backend = self._bare_backend(im)
+        im._pty_backend = backend
         instance_id, task_id = await _make_inst_task(db_factory)
         started_at = datetime.utcnow()
 
@@ -557,6 +779,1898 @@ class TestFullMirrorBackend:
         assert any(
             event.get("new_status") == "completed"
             for event in status_events
+        )
+
+    async def test_pending_native_agent_keeps_chat_task_executing_until_tail(
+        self, db_factory
+    ):
+        """Chat foreground cannot publish completed while native work continues."""
+
+        im, broadcaster = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 4
+            task.instance_id = instance_id
+            task.session_id = "background-session"
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 4321
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 4321
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        class Session:
+            session_id = "background-session"
+            has_pending_subagents = True
+            is_alive = True
+
+            def __init__(self):
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = True
+
+                async def _on_autonomous(event):
+                    raise AssertionError("base callback must be replaced")
+
+                self.on_autonomous_event = _on_autonomous
+
+        proxy = Proxy()
+        session = Session()
+        proxy.session = session
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        im._launch_params[instance_id] = {"_retried": True}
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=4,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        exit_task = asyncio.create_task(exit_turn())
+        for _ in range(50):
+            await asyncio.sleep(0)
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                if task.pty_background_generation is not None:
+                    break
+        else:
+            pytest.fail("chat background epoch was not armed")
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "executing"
+            assert task.background_active is True
+            assert task.pty_background_generation
+            assert inst.status == "running"
+            assert inst.current_task_id == task_id
+            assert inst.pid == 4321
+        assert exit_task.done() is False
+        assert proxy.returncode is None
+        task_events = [
+            call.args[1]
+            for call in broadcaster.broadcast.await_args_list
+            if call.args[0] == f"task:{task_id}"
+        ]
+        assert any(
+            event.get("event_type") == "background_activity"
+            and event.get("background_active") is True
+            for event in task_events
+        )
+        assert not any(
+            event.get("event_type") == "process_exit"
+            for event in task_events
+        )
+
+        session.has_pending_subagents = False
+        session._reader._tracker.has_pending = False
+
+        def pty_event(payload):
+            event = MagicMock()
+            event.to_dict.return_value = payload
+            return event
+
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "native agent final report",
+                }
+            )
+        )
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "system_event",
+                    "content": "turn_duration",
+                }
+            )
+        )
+        await asyncio.wait_for(exit_task, 1)
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert task.background_active is False
+            assert inst.status == "idle"
+            assert inst.current_task_id is None
+            assert inst.pid is None
+        assert proxy.returncode == 0
+
+    async def test_background_bash_keeps_chat_executing_until_exact_notice(
+        self, db_factory
+    ):
+        """Bash backgroundTaskId is a completion barrier just like an agent."""
+
+        from claude_pty.subagents import SubagentTracker
+
+        im, broadcaster = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 3
+            task.instance_id = instance_id
+            task.session_id = "background-bash-session"
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 7654
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 7654
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        class Session:
+            session_id = "background-bash-session"
+            is_alive = True
+
+            def __init__(self):
+                self._tracker = SubagentTracker()
+                # This is the real pinned claude-pty JsonlReader field name.
+                self._reader = SimpleNamespace(tracker=self._tracker)
+
+                async def _on_autonomous(event):
+                    raise AssertionError("base callback must be replaced")
+
+                self.on_autonomous_event = _on_autonomous
+
+            @property
+            def has_pending_subagents(self):
+                return self._tracker.has_pending
+
+        proxy = Proxy()
+        session = Session()
+        proxy.session = session
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=3,
+                instance_started_at=started_at,
+            )
+            await backend.on_event(
+                instance_id,
+                {
+                    "event_type": "tool_use",
+                    "tool_name": "Bash",
+                    "tool_use_id": "toolu-background-bash",
+                    "tool_input": json.dumps(
+                        {
+                            "command": "long-running-job",
+                            "run_in_background": True,
+                        }
+                    ),
+                    "raw_json": json.dumps(
+                        {
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu-background-bash",
+                                        "name": "Bash",
+                                        "input": {
+                                            "command": "long-running-job",
+                                            "run_in_background": True,
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ),
+                },
+                task_id=task_id,
+            )
+            await backend.on_event(
+                instance_id,
+                {
+                    "event_type": "tool_result",
+                    "tool_use_id": "toolu-background-bash",
+                    "content": "Command running in background",
+                    "raw_json": json.dumps(
+                        {
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": "toolu-background-bash",
+                                        "content": "Command running in background",
+                                    }
+                                ]
+                            },
+                            "toolUseResult": {
+                                "backgroundTaskId": "bash-task-123"
+                            },
+                        }
+                    ),
+                },
+                task_id=task_id,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        exit_task = asyncio.create_task(exit_turn())
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                if task.pty_background_generation is not None:
+                    break
+        else:
+            pytest.fail("background Bash epoch was not armed")
+
+        tracker = session._ccm_background_work_tracker
+        assert tracker.background_commands == {
+            "toolu-background-bash": "bash-task-123"
+        }
+        assert session.has_pending_subagents is True
+        assert exit_task.done() is False
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "executing"
+            assert task.background_active is True
+
+        def pty_event(payload):
+            event = MagicMock()
+            event.to_dict.return_value = payload
+            return event
+
+        notification_content = (
+            "<task-notification>"
+            "<task-id>bash-task-123</task-id>"
+            "<tool-use-id>toolu-background-bash</tool-use-id>"
+            "<status>completed</status>"
+            "<summary>job finished</summary>"
+            "</task-notification>"
+        )
+        notification = pty_event(
+            {
+                "event_type": "message",
+                "role": "user",
+                "content": notification_content,
+                "raw_json": json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": notification_content,
+                        },
+                        "origin": {"kind": "task-notification"},
+                        "promptSource": "system",
+                    }
+                ),
+            }
+        )
+
+        # Model the preceding autonomous turn having reached its sentinel.
+        # While this final Bash notification is waiting for admission, neither
+        # its pending id nor the durable epoch may be cleared using that stale
+        # sentinel. This deterministically covers the watcher/callback race.
+        async with im.pty_background_transition(
+            task_id, session.session_id
+        ):
+            state = im._pty_background_states[
+                (task_id, session.session_id)
+            ]
+            state.terminal_seen = True
+            notification_task = asyncio.create_task(
+                session.on_autonomous_event(notification)
+            )
+            for _ in range(50):
+                await asyncio.sleep(0)
+                if im.has_pty_autonomous_activity_handoff(
+                    task_id, session.session_id
+                ):
+                    break
+            else:
+                pytest.fail("autonomous notification did not pre-arm")
+
+            assert tracker.background_commands == {
+                "toolu-background-bash": "bash-task-123"
+            }
+            assert (
+                await im._try_complete_pty_background_generation_locked(
+                    state
+                )
+                is False
+            )
+            async with db_factory() as db:
+                armed = await db.get(Task, task_id)
+                assert (
+                    armed.pty_background_generation == state.generation
+                )
+            assert not any(
+                call.args[1].get("background_active") is False
+                for call in broadcaster.broadcast.await_args_list
+                if call.args[0] in {
+                    "tasks",
+                    f"task:{task_id}",
+                }
+            )
+
+        await asyncio.wait_for(notification_task, 1)
+        assert tracker.background_commands == {}
+        assert session.has_pending_subagents is False
+        assert exit_task.done() is False
+
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "system_event",
+                    "content": "turn_duration",
+                }
+            )
+        )
+        await asyncio.wait_for(exit_task, 1)
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert task.background_active is False
+            assert task.pty_background_generation is None
+            assert inst.status == "idle"
+            assert inst.current_task_id is None
+            assert inst.pid is None
+        assert proxy.returncode == 0
+        status_events = [
+            call.args[1]
+            for call in broadcaster.broadcast.await_args_list
+            if call.args[0] == "tasks"
+        ]
+        assert any(
+            event.get("new_status") == "completed"
+            and event.get("background_active") is False
+            for event in status_events
+        )
+
+    async def test_chat_background_watchdog_preserves_precise_failure(
+        self,
+        db_factory,
+        monkeypatch,
+    ):
+        im, broadcaster = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 5
+            task.instance_id = instance_id
+            task.session_id = "watchdog-chat-session"
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 5432
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 5432
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        class Session:
+            session_id = "watchdog-chat-session"
+            has_pending_subagents = True
+            is_alive = True
+
+            def __init__(self):
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = True
+
+                async def _on_autonomous(event):
+                    raise AssertionError("base callback must be replaced")
+
+                self.on_autonomous_event = _on_autonomous
+
+        proxy = Proxy()
+        session = Session()
+        proxy.session = session
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=5,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        exit_task = asyncio.create_task(exit_turn())
+        for _ in range(50):
+            await asyncio.sleep(0)
+            async with db_factory() as db:
+                armed = await db.get(Task, task_id)
+                if armed.pty_background_generation is not None:
+                    state = im._pty_background_states.get(
+                        (task_id, session.session_id)
+                    )
+                    if state is not None:
+                        break
+        else:
+            pytest.fail("chat background epoch was not armed")
+
+        session.has_pending_subagents = False
+        session._reader._tracker.has_pending = False
+        state.started_monotonic = 0
+        state.last_event_monotonic = 0
+        monkeypatch.setattr(
+            "backend.services.instance_manager.PTY_BACKGROUND_MAX_SECONDS",
+            0,
+        )
+
+        async def stop_backend(key):
+            assert key == instance_id
+            session.is_alive = False
+            await asyncio.wait_for(exit_task, 1)
+
+        backend.stop = AsyncMock(side_effect=stop_backend)
+        im._wait_process_tree = AsyncMock()
+        assert await im._fail_pty_background_generation(state) is True
+        await asyncio.wait_for(exit_task, 1)
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "failed"
+            assert task.background_active is False
+            assert "background activity did not reach" in (
+                task.error_message or ""
+            )
+            assert "Process exited with code" not in (
+                task.error_message or ""
+            )
+            assert inst.status == "error"
+            assert inst.current_task_id is None
+            assert inst.pid is None
+        assert proxy.returncode == 1
+        broadcaster.broadcast.assert_any_await(
+            "tasks",
+            {
+                "event": "status_change",
+                "task_id": task_id,
+                "new_status": "failed",
+                "instance_id": instance_id,
+                "background_active": False,
+            },
+        )
+
+    @pytest.mark.parametrize("loop_iteration", [None, 0, 3])
+    async def test_dispatcher_owned_turn_waits_for_background_before_proxy_completion(
+        self, db_factory, loop_iteration
+    ):
+        """Initial, loop, and goal turns cannot advance on partial output."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 2
+            task.instance_id = instance_id
+            task.session_id = "initial-background-session"
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 9876
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            sa = SubAgentSession(
+                task_id=task_id,
+                source="native",
+                agent_type="native-monitor",
+                description="initial monitor",
+                status="running",
+            )
+            db.add(sa)
+            await db.commit()
+            sa_id = sa.id
+
+        class Proxy:
+            pid = 9876
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        class Session:
+            session_id = "initial-background-session"
+            has_pending_subagents = True
+            is_alive = True
+
+            def __init__(self):
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = True
+
+                async def _on_autonomous(event):
+                    raise AssertionError("stale instance-bound callback ran")
+
+                self.on_autonomous_event = _on_autonomous
+
+        proxy = Proxy()
+        session = Session()
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+
+        async def exit_initial_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=False,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=2,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=False,
+                loop_iteration=loop_iteration,
+            )
+
+        exit_task = asyncio.create_task(exit_initial_turn())
+        for _ in range(50):
+            await asyncio.sleep(0)
+            async with db_factory() as db:
+                armed_task = await db.get(Task, task_id)
+                if (
+                    armed_task.pty_background_generation is not None
+                    and getattr(
+                        session.on_autonomous_event, "__name__", ""
+                    )
+                    == "_full_autonomous_mirror"
+                ):
+                    break
+        else:
+            pytest.fail("dispatcher-owned PTY epoch was not armed")
+
+        assert session.on_autonomous_event.__name__ == (
+            "_full_autonomous_mirror"
+        )
+        async with db_factory() as db:
+            armed_task = await db.get(Task, task_id)
+            assert armed_task.status == "executing"
+            assert armed_task.pty_background_generation is not None
+            old_sa = await db.get(SubAgentSession, sa_id)
+            old_sa.status = "completed"
+            old_sa.completed_at = datetime.utcnow()
+            await db.commit()
+        assert exit_task.done() is False
+        assert proxy.returncode is None
+
+        session.has_pending_subagents = False
+        session._reader._tracker.has_pending = False
+
+        def pty_event(payload):
+            event = MagicMock()
+            event.to_dict.return_value = payload
+            return event
+
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "initial task background report",
+                }
+            )
+        )
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "system_event",
+                    "content": "turn_duration",
+                }
+            )
+        )
+        await asyncio.wait_for(exit_task, 1)
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            # Dispatcher still owns the lifecycle transition, but can now
+            # safely read loop signals / evaluate goal output.
+            assert task.status == "executing"
+            assert task.pty_background_generation is None
+            assert inst.status == "running"
+            assert inst.pid == 9876
+            assert inst.current_task_id == task_id
+            assert inst.started_at == started_at
+        assert proxy.returncode == 0
+
+    async def test_launch_time_autonomous_callback_closes_on_exit_arm_race(
+        self, db_factory
+    ):
+        """Idle watcher output cannot consume its sentinel before on_exit arms."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 1
+            task.instance_id = instance_id
+            task.session_id = "arm-race-session"
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 2468
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 2468
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        class Session:
+            session_id = "arm-race-session"
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = False
+
+                async def _on_autonomous(event):
+                    raise AssertionError("base callback must be replaced")
+
+                self.on_autonomous_event = _on_autonomous
+
+        proxy = Proxy()
+        session = Session()
+        proxy.session = session
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        backend._restore_full_autonomous_mirror(
+            session,
+            instance_id,
+            task_id,
+            None,
+            replace_base_binding=True,
+        )
+
+        pending_entered = asyncio.Event()
+        release_pending_check = asyncio.Event()
+
+        async def held_pending(_task_id, _session):
+            pending_entered.set()
+            await release_pending_check.wait()
+            return False
+
+        im.pty_background_activity_pending = held_pending
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=False,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=1,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=False,
+            )
+
+        def pty_event(payload):
+            event = MagicMock()
+            event.to_dict.return_value = payload
+            return event
+
+        exit_task = asyncio.create_task(exit_turn())
+        await asyncio.wait_for(pending_entered.wait(), 1)
+        raced_callback = asyncio.create_task(
+            session.on_autonomous_event(
+                pty_event(
+                    {
+                        "event_type": "message",
+                        "role": "assistant",
+                        "content": "raced background output",
+                    }
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert im.has_pty_autonomous_activity_handoff(
+            task_id, session.session_id
+        )
+        assert raced_callback.done() is False
+
+        release_pending_check.set()
+        await asyncio.wait_for(raced_callback, 1)
+        async with db_factory() as db:
+            assert (
+                await db.get(Task, task_id)
+            ).pty_background_generation is not None
+
+        await asyncio.sleep(0)
+        assert exit_task.done() is False
+        assert proxy.returncode is None
+
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "system_event",
+                    "content": "turn_duration",
+                }
+            )
+        )
+        await asyncio.wait_for(exit_task, 1)
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            assert current.status == "executing"
+            assert current.pty_background_generation is None
+        assert proxy.returncode == 0
+
+    async def test_post_exit_proof_closes_proxy_to_terminal_commit_gap(
+        self, db_factory
+    ):
+        """A queued idle callback survives consumer-map cleanup exactly once."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "post-exit-gap-session"
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 4
+            task.instance_id = instance_id
+            task.session_id = session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 8642
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = False
+
+                async def _on_autonomous(event):
+                    raise AssertionError("base callback must be replaced")
+
+                self.on_autonomous_event = _on_autonomous
+
+        class Proxy:
+            pid = 8642
+            returncode = None
+
+            def __init__(self, session):
+                self.session = session
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        session = Session()
+        proxy = Proxy(session)
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=False,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=4,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=False,
+            )
+
+        await asyncio.wait_for(asyncio.create_task(exit_turn()), 1)
+        await asyncio.sleep(0)
+        assert proxy.returncode == 0
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        proof = im._pty_post_exit_generations[(task_id, session_id)]
+        assert proof.process is proxy
+        assert proof.session is session
+
+        def pty_event(payload):
+            event = MagicMock()
+            event.to_dict.return_value = payload
+            return event
+
+        # Dispatcher/Ralph has not committed its terminal result yet. The Task
+        # is still executing, so completed-only detached admission cannot help.
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "arrived after proxy completion",
+                }
+            )
+        )
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            assert current.status == "executing"
+            assert current.pty_background_generation is not None
+        assert (task_id, session_id) not in im._pty_post_exit_generations
+        assert any(
+            entry.content == "arrived after proxy completion"
+            for entry in await _entries(db_factory, task_id)
+        )
+
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "system_event",
+                    "content": "turn_duration",
+                }
+            )
+        )
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            assert current.status == "executing"
+            assert current.pty_background_generation is None
+
+    async def test_post_exit_callback_cannot_borrow_replacement_proof(
+        self, db_factory
+    ):
+        """An old callback remains rejected after same-key PTY hot reuse."""
+
+        im, _ = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "post-exit-aba-session"
+
+        class Session:
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        class Proxy:
+            returncode = 0
+
+            def __init__(self, pid, session):
+                self.pid = pid
+                self.session = session
+
+        session = Session()
+        old_proxy = Proxy(9753, session)
+        old_consumer = asyncio.create_task(asyncio.sleep(60))
+        old_record = im._track_output_consumer(
+            instance_id,
+            old_proxy,
+            old_consumer,
+            chat_initiated=False,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=2,
+            instance_started_at=started_at,
+        )
+        im.processes[instance_id] = old_proxy
+        im._claim_pty_terminal_owner(old_record, "consumer")
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 2
+            task.instance_id = instance_id
+            task.session_id = session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = old_proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+        old_proof = im.retain_pty_post_exit_generation(
+            instance_id,
+            task_id,
+            session_id,
+            session,
+            old_record,
+        )
+        assert old_proof is not None
+
+        noted = asyncio.Event()
+        proceed = asyncio.Event()
+        callback = asyncio.create_task(
+            _run_pre_noted_background_event(
+                im,
+                task_id=task_id,
+                session=session,
+                instance_id=instance_id,
+                noted=noted,
+                proceed=proceed,
+                content="must be dropped",
+            )
+        )
+        await asyncio.wait_for(noted.wait(), 1)
+
+        # Same reusable slot/session/task key, but a new consumer epoch. Tracking
+        # it invalidates the old proof before publishing the replacement.
+        new_proxy = Proxy(9753, session)
+        new_consumer = asyncio.create_task(asyncio.sleep(60))
+        new_record = im._track_output_consumer(
+            instance_id,
+            new_proxy,
+            new_consumer,
+            chat_initiated=False,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=2,
+            instance_started_at=started_at + timedelta(seconds=1),
+        )
+        im.processes[instance_id] = new_proxy
+        im._claim_pty_terminal_owner(new_record, "consumer")
+        async with db_factory() as db:
+            inst = await db.get(Instance, instance_id)
+            inst.started_at = started_at + timedelta(seconds=1)
+            await db.commit()
+        new_proof = im.retain_pty_post_exit_generation(
+            instance_id,
+            task_id,
+            session_id,
+            session,
+            new_record,
+        )
+        assert new_proof is not None and new_proof is not old_proof
+
+        proceed.set()
+        assert await asyncio.wait_for(callback, 1) is None
+        assert (
+            im._pty_post_exit_generations[(task_id, session_id)]
+            is new_proof
+        )
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            assert current.pty_background_generation is None
+        assert await _entries(db_factory, task_id) == []
+
+        im.discard_pty_post_exit_generations(record=new_record)
+        for consumer in (old_consumer, new_consumer):
+            consumer.cancel()
+        await asyncio.gather(
+            old_consumer, new_consumer, return_exceptions=True
+        )
+
+    async def test_post_exit_proof_expires_after_terminal_commit(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "post-exit-expiry-session"
+
+        class Session:
+            is_alive = True
+            session_id = "post-exit-expiry-session"
+
+        class Proxy:
+            pid = 1122
+            returncode = 0
+            session = Session()
+
+        proxy = Proxy()
+        consumer = asyncio.create_task(asyncio.sleep(60))
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=False,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=1,
+            instance_started_at=started_at,
+        )
+        im._claim_pty_terminal_owner(record, "consumer")
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 1
+            task.instance_id = instance_id
+            task.session_id = session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        assert im.retain_pty_post_exit_generation(
+            instance_id,
+            task_id,
+            session_id,
+            proxy.session,
+            record,
+        ) is not None
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.completed_at = datetime.utcnow()
+            await db.commit()
+
+        for _ in range(20):
+            if (task_id, session_id) not in im._pty_post_exit_generations:
+                break
+            await asyncio.sleep(0.02)
+        assert (task_id, session_id) not in im._pty_post_exit_generations
+
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    async def test_noted_post_exit_callback_survives_terminal_poll(
+        self, db_factory
+    ):
+        """Terminal cleanup cannot strand a callback that captured the proof."""
+
+        im, _ = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "post-exit-terminal-race"
+
+        class Session:
+            is_alive = True
+            session_id = "post-exit-terminal-race"
+
+        class Proxy:
+            pid = 3344
+            returncode = 0
+            session = Session()
+
+        proxy = Proxy()
+        consumer = asyncio.create_task(asyncio.sleep(60))
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=False,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=3,
+            instance_started_at=started_at,
+        )
+        im._claim_pty_terminal_owner(record, "consumer")
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 3
+            task.instance_id = instance_id
+            task.session_id = session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        proof = im.retain_pty_post_exit_generation(
+            instance_id,
+            task_id,
+            session_id,
+            proxy.session,
+            record,
+        )
+        assert proof is not None
+        # Model FullMirror's identity cleanup after process.complete().
+        im._consumer_records.pop(instance_id, None)
+        im._tasks.pop(instance_id, None)
+        im.processes.pop(instance_id, None)
+
+        noted = asyncio.Event()
+        proceed = asyncio.Event()
+        callback = asyncio.create_task(
+            _run_pre_noted_background_event(
+                im,
+                task_id=task_id,
+                session=proxy.session,
+                instance_id=instance_id,
+                noted=noted,
+                proceed=proceed,
+                content="terminal-race output",
+            )
+        )
+        await asyncio.wait_for(noted.wait(), 1)
+
+        # The dispatcher wins its terminal commit and releases the Instance
+        # while the exact callback is still paused before the transition lock.
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.completed_at = datetime.utcnow()
+            inst = await db.get(Instance, instance_id)
+            inst.status = "idle"
+            inst.pid = None
+            inst.current_task_id = None
+            await db.commit()
+
+        await asyncio.sleep(0.12)
+        assert (
+            im._pty_post_exit_generations[(task_id, session_id)]
+            is proof
+        )
+
+        proceed.set()
+        generation = await asyncio.wait_for(callback, 1)
+        assert generation is not None
+        assert (task_id, session_id) not in im._pty_post_exit_generations
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation == generation
+
+        await im.finish_pty_autonomous_activity(
+            task_id,
+            session_id,
+            generation,
+            {
+                "event_type": "system_event",
+                "content": "turn_duration",
+            },
+        )
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    async def test_exact_stop_reaps_post_exit_session_and_invalidates_callback(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "post-exit-stop-session"
+
+        class Session:
+            is_alive = True
+            session_id = "post-exit-stop-session"
+
+            async def stop(self):
+                self.is_alive = False
+
+        class Proxy:
+            pid = 5566
+            returncode = 0
+
+            def __init__(self):
+                self.session = Session()
+
+        proxy = Proxy()
+        consumer = asyncio.create_task(asyncio.sleep(60))
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=False,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=5,
+            instance_started_at=started_at,
+        )
+        im._claim_pty_terminal_owner(record, "consumer")
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 5
+            task.instance_id = instance_id
+            task.session_id = session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        assert im.retain_pty_post_exit_generation(
+            instance_id,
+            task_id,
+            session_id,
+            proxy.session,
+            record,
+        ) is not None
+        im._consumer_records.pop(instance_id, None)
+        im._tasks.pop(instance_id, None)
+        im.processes.pop(instance_id, None)
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+        noted = asyncio.Event()
+        proceed = asyncio.Event()
+        callback = asyncio.create_task(
+            _run_pre_noted_background_event(
+                im,
+                task_id=task_id,
+                session=proxy.session,
+                instance_id=instance_id,
+                noted=noted,
+                proceed=proceed,
+                content="must not survive exact stop",
+            )
+        )
+        await asyncio.wait_for(noted.wait(), 1)
+
+        assert await im.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_pid=proxy.pid,
+            expected_started_at=started_at,
+            task_status="completed",
+        )
+        assert proxy.session.is_alive is False
+        assert (task_id, session_id) not in im._pty_post_exit_generations
+
+        proceed.set()
+        assert await asyncio.wait_for(callback, 1) is None
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation is None
+            assert inst.status == "idle"
+            assert inst.current_task_id is None
+            assert inst.pid is None
+        assert await _entries(db_factory, task_id) == []
+
+    async def test_concurrent_background_arm_has_single_durable_winner(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        class Session:
+            session_id = "double-arm-session"
+
+        class Proxy:
+            pid = 1357
+            session = Session()
+
+        proxy = Proxy()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 6
+            task.instance_id = instance_id
+            task.session_id = proxy.session.session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        consumer = asyncio.current_task()
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=False,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=6,
+            instance_started_at=started_at,
+        )
+        won_a, won_b = await asyncio.gather(
+            im.arm_pty_background_generation(
+                instance_id,
+                task_id,
+                proxy.session.session_id,
+                "generation-a",
+                record,
+            ),
+            im.arm_pty_background_generation(
+                instance_id,
+                task_id,
+                proxy.session.session_id,
+                "generation-b",
+                record,
+            ),
+        )
+        assert sorted((won_a, won_b)) == [False, True]
+        async with db_factory() as db:
+            marker = (
+                await db.get(Task, task_id)
+            ).pty_background_generation
+        assert marker in {"generation-a", "generation-b"}
+        assert won_a is (marker == "generation-a")
+        assert won_b is (marker == "generation-b")
+
+    async def test_terminal_clear_serializes_against_on_exit_reuse(
+        self, db_factory
+    ):
+        im, broadcaster = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        generation = "terminal-clear-generation"
+
+        class Session:
+            session_id = "terminal-clear-session"
+            has_pending_subagents = False
+            is_alive = True
+
+        class Proxy:
+            pid = 9753
+            session = Session()
+
+        proxy = Proxy()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 3
+            task.instance_id = instance_id
+            task.session_id = proxy.session.session_id
+            task.pty_background_generation = generation
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        consumer = asyncio.current_task()
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=False,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=3,
+            instance_started_at=started_at,
+        )
+        im.register_pty_background_generation(
+            task_id,
+            proxy.session.session_id,
+            generation,
+            proxy.session,
+        )
+        state = im._pty_background_states[
+            (task_id, proxy.session.session_id)
+        ]
+        state.terminal_seen = True
+
+        publication_entered = asyncio.Event()
+        release_publication = asyncio.Event()
+
+        async def held_broadcast(channel, payload):
+            if (
+                payload.get("event_type") == "background_activity"
+                and payload.get("background_active") is False
+                and not publication_entered.is_set()
+            ):
+                publication_entered.set()
+                await release_publication.wait()
+
+        broadcaster.broadcast.side_effect = held_broadcast
+        completing = asyncio.create_task(
+            im._try_complete_pty_background_generation(state)
+        )
+        await asyncio.wait_for(publication_entered.wait(), 1)
+        async with db_factory() as db:
+            assert (
+                await db.get(Task, task_id)
+            ).pty_background_generation is None
+
+        async def simulate_on_exit_reuse():
+            async with im.pty_background_transition(
+                task_id, proxy.session.session_id
+            ):
+                existing = im.pty_background_generation_for(
+                    task_id, proxy.session.session_id
+                )
+                if existing is None:
+                    return False
+                return await im.arm_pty_background_generation(
+                    instance_id,
+                    task_id,
+                    proxy.session.session_id,
+                    existing,
+                    record,
+                )
+
+        reusing = asyncio.create_task(simulate_on_exit_reuse())
+        await asyncio.sleep(0)
+        assert reusing.done() is False
+        release_publication.set()
+        assert await asyncio.wait_for(completing, 1) is True
+        assert await asyncio.wait_for(reusing, 1) is False
+        async with db_factory() as db:
+            assert (
+                await db.get(Task, task_id)
+            ).pty_background_generation is None
+
+    async def test_autonomous_turn_clears_marker_only_after_exact_sentinel(
+        self, db_factory
+    ):
+        im, broadcaster = _make_im(db_factory)
+        terminal_handler = AsyncMock()
+        im.pty_background_completion_handler = terminal_handler
+        _, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "autonomous-session"
+            task.completed_at = datetime.utcnow()
+            await db.commit()
+
+        class Session:
+            session_id = "autonomous-session"
+            has_pending_subagents = False
+            is_alive = True
+
+        session = Session()
+        generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            session,
+            {
+                "event_type": "tool_use",
+                "role": "assistant",
+                "tool_name": "Bash",
+                "autonomous": True,
+            },
+        )
+        assert generation
+        await im.finish_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            generation,
+            {
+                "event_type": "tool_result",
+                "role": "tool",
+                "autonomous": True,
+            },
+        )
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.background_active is True
+        terminal_handler.assert_not_awaited()
+
+        await im.finish_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            generation,
+            {
+                "event_type": "system_event",
+                "content": "turn_duration",
+                "autonomous": True,
+            },
+        )
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.background_active is False
+        terminal_handler.assert_awaited_once_with(task_id)
+        task_events = [
+            call.args[1]
+            for call in broadcaster.broadcast.await_args_list
+            if call.args[0] == f"task:{task_id}"
+        ]
+        assert any(
+            event.get("event_type") == "background_activity"
+            and event.get("background_active") is False
+            for event in task_events
+        )
+
+    async def test_exact_background_state_remains_waitable_after_removal(
+        self, db_factory
+    ):
+        """Completion between registration and wait cannot become failure."""
+
+        im, _ = _make_im(db_factory)
+
+        class Session:
+            session_id = "early-complete-session"
+
+        state = im.register_pty_background_generation(
+            987,
+            Session.session_id,
+            "early-complete-generation",
+            Session(),
+        )
+        state.outcome = "completed"
+        im._discard_pty_background_state(
+            (state.task_id, state.session_id),
+            state.generation,
+        )
+
+        assert (
+            await im.wait_pty_background_outcome(state)
+            == "completed"
+        )
+        assert (
+            await im.wait_pty_background_generation(
+                state.task_id,
+                state.session_id,
+                state.generation,
+            )
+            is None
+        )
+
+    async def test_turn_sentinel_waits_for_durable_native_agent_completion(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "agent-session"
+            task.completed_at = datetime.utcnow()
+            sa = SubAgentSession(
+                task_id=task_id,
+                source="native",
+                agent_type="native-monitor",
+                description="still running",
+                status="running",
+            )
+            db.add(sa)
+            await db.commit()
+            sa_id = sa.id
+
+        class Session:
+            session_id = "agent-session"
+            has_pending_subagents = False
+            is_alive = True
+
+        session = Session()
+        generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            session,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "processing report",
+                "autonomous": True,
+            },
+        )
+        terminal = {
+            "event_type": "system_event",
+            "content": "turn_duration",
+            "autonomous": True,
+        }
+        await im.finish_pty_autonomous_activity(
+            task_id, session.session_id, generation, terminal
+        )
+        async with db_factory() as db:
+            assert (await db.get(Task, task_id)).background_active is True
+            sa = await db.get(SubAgentSession, sa_id)
+            sa.status = "completed"
+            sa.completed_at = datetime.utcnow()
+            await db.commit()
+
+        # The watcher uses this same exact-sentinel evidence if the durable
+        # SubAgentSession commit lands just after the callback.
+        state = im._pty_background_states[(task_id, session.session_id)]
+        assert state.terminal_seen is True
+        assert await im._try_complete_pty_background_generation(state) is True
+        async with db_factory() as db:
+            assert (await db.get(Task, task_id)).background_active is False
+
+    async def test_new_autonomous_turn_invalidates_previous_turn_sentinel(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "multi-turn-session"
+            task.completed_at = datetime.utcnow()
+            sa = SubAgentSession(
+                task_id=task_id,
+                source="native",
+                agent_type="native-agent",
+                description="second agent",
+                status="running",
+            )
+            db.add(sa)
+            await db.commit()
+            sa_id = sa.id
+
+        class Session:
+            session_id = "multi-turn-session"
+            has_pending_subagents = False
+            is_alive = True
+
+        session = Session()
+        generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            session,
+            {"event_type": "message", "role": "assistant"},
+        )
+        await im.finish_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            generation,
+            {"event_type": "system_event", "content": "turn_duration"},
+        )
+        state = im._pty_background_states[
+            (task_id, session.session_id)
+        ]
+        assert state.terminal_seen is True
+
+        assert (
+            await im.begin_pty_autonomous_activity(
+                task_id,
+                session.session_id,
+                session,
+                {
+                    "event_type": "tool_use",
+                    "role": "assistant",
+                    "tool_name": "Bash",
+                },
+            )
+            == generation
+        )
+        assert state.terminal_seen is False
+
+        async with db_factory() as db:
+            sa = await db.get(SubAgentSession, sa_id)
+            sa.status = "completed"
+            sa.completed_at = datetime.utcnow()
+            await db.commit()
+
+        assert (
+            await im._try_complete_pty_background_generation(state)
+            is False
+        )
+        async with db_factory() as db:
+            assert (await db.get(Task, task_id)).background_active is True
+
+        await im.finish_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            generation,
+            {"event_type": "system_event", "content": "turn_duration"},
+        )
+        async with db_factory() as db:
+            assert (await db.get(Task, task_id)).background_active is False
+
+    async def test_watchdog_hard_bound_stops_even_stuck_live_tool(
+        self, db_factory, monkeypatch
+    ):
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "watchdog-session"
+            task.pty_background_generation = "watchdog-generation"
+            await db.commit()
+
+        class Session:
+            session_id = "watchdog-session"
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.is_alive = False
+
+        session = Session()
+        im.register_pty_background_generation(
+            task_id,
+            session.session_id,
+            "watchdog-generation",
+            session,
+        )
+        state = im._pty_background_states[
+            (task_id, session.session_id)
+        ]
+        stale = time.monotonic() - 100
+        state.started_monotonic = stale
+        state.last_event_monotonic = stale
+        state.pending_tools = 1
+        monkeypatch.setattr(
+            "backend.services.instance_manager.PTY_BACKGROUND_MAX_SECONDS",
+            10,
+        )
+
+        assert await im._fail_pty_background_generation(state) is True
+        assert session.stop_calls == 1
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "failed"
+            assert task.background_active is False
+
+    async def test_old_autonomous_sentinel_cannot_clear_new_background_epoch(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "aba-session"
+            task.completed_at = datetime.utcnow()
+            await db.commit()
+
+        class Session:
+            session_id = "aba-session"
+            has_pending_subagents = False
+            is_alive = True
+
+        session = Session()
+        old_generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            session,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "old turn",
+                "autonomous": True,
+            },
+        )
+        new_generation = "new-background-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.pty_background_generation = new_generation
+            await db.commit()
+        im.register_pty_background_generation(
+            task_id,
+            session.session_id,
+            new_generation,
+            session,
+        )
+
+        await im.finish_pty_autonomous_activity(
+            task_id,
+            session.session_id,
+            old_generation,
+            {
+                "event_type": "system_event",
+                "content": "turn_duration",
+                "autonomous": True,
+            },
+        )
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.pty_background_generation == new_generation
+        state = im._pty_background_states[(task_id, session.session_id)]
+        im._discard_pty_background_state(
+            (task_id, session.session_id), state.generation
         )
 
     async def test_stop_owned_pty_exit_does_not_reenter_lifecycle_lock(
@@ -667,6 +2781,777 @@ class TestFullMirrorBackend:
         assert instance_id not in im._tasks
         assert instance_id not in im._consumer_records
         assert instance_id not in im._stopping
+
+    async def test_stop_immediately_takes_over_exact_background_waiter(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        generation = "stop-background-generation"
+
+        class Session:
+            session_id = "stop-background-session"
+            has_pending_subagents = True
+            is_alive = True
+
+        class Proxy:
+            pid = 25_711
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        session = Session()
+        proxy = Proxy()
+        proxy.session = session
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 9
+            task.instance_id = instance_id
+            task.session_id = session.session_id
+            task.pty_background_generation = generation
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        start_wait = asyncio.Event()
+        record_ready = asyncio.Event()
+
+        async def wait_for_background():
+            await start_wait.wait()
+            object.__setattr__(
+                record, "pty_terminal_owner", "consumer"
+            )
+            object.__setattr__(
+                record, "pty_background_waiting", True
+            )
+            record_ready.set()
+            try:
+                await im.wait_pty_background_generation(
+                    task_id, session.session_id, generation
+                )
+            finally:
+                object.__setattr__(
+                    record, "pty_background_waiting", False
+                )
+
+        consumer = asyncio.create_task(wait_for_background())
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=9,
+            instance_started_at=started_at,
+        )
+        im.processes[instance_id] = proxy
+        im._tasks[instance_id] = consumer
+        backend._sessions[instance_id] = session
+        backend._consumers[instance_id] = consumer
+        backend._proxies[instance_id] = proxy
+        im.register_pty_background_generation(
+            task_id, session.session_id, generation, session
+        )
+
+        async def stop_backend(key):
+            assert key == instance_id
+            assert record.pty_terminal_owner == "stop"
+            await asyncio.wait_for(consumer, 0.2)
+            proxy.complete(130)
+
+        backend.stop = AsyncMock(side_effect=stop_backend)
+        im._wait_process_tree = AsyncMock()
+        start_wait.set()
+        await record_ready.wait()
+
+        assert await asyncio.wait_for(
+            im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_pid=proxy.pid,
+                expected_started_at=started_at,
+                task_status="completed",
+            ),
+            1,
+        )
+        backend.stop.assert_awaited_once_with(instance_id)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation is None
+            assert inst.status == "idle"
+            assert inst.current_task_id is None
+
+    async def test_active_stop_invalidates_pre_noted_callback_before_return(
+        self, db_factory
+    ):
+        """A callback queued behind exact active stop cannot revive its marker."""
+
+        im, broadcaster = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        generation = "active-stop-fence-generation"
+
+        class Session:
+            session_id = "active-stop-fence-session"
+            has_pending_subagents = False
+            is_alive = True
+
+        class Proxy:
+            pid = 25_713
+            returncode = None
+
+            def __init__(self, session):
+                self.session = session
+
+        session = Session()
+        proxy = Proxy(session)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 10
+            task.instance_id = instance_id
+            task.session_id = session.session_id
+            task.pty_background_generation = generation
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        consumer = asyncio.create_task(asyncio.Event().wait())
+        im.processes[instance_id] = proxy
+        im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=10,
+            instance_started_at=started_at,
+        )
+        backend._sessions[instance_id] = session
+        backend._consumers[instance_id] = consumer
+        backend._proxies[instance_id] = proxy
+        im.register_pty_background_generation(
+            task_id, session.session_id, generation, session
+        )
+
+        noted = asyncio.Event()
+        proceed = asyncio.Event()
+        callback = asyncio.create_task(
+            _run_pre_noted_background_event(
+                im,
+                task_id=task_id,
+                session=session,
+                instance_id=instance_id,
+                noted=noted,
+                proceed=proceed,
+                content="must not survive active stop",
+            )
+        )
+        await noted.wait()
+
+        stop_entered = asyncio.Event()
+        release_stop = asyncio.Event()
+
+        async def stop_backend(key):
+            assert key == instance_id
+            stop_entered.set()
+            await release_stop.wait()
+            session.is_alive = False
+            proxy.returncode = 130
+            backend._sessions.pop(instance_id, None)
+
+        backend.stop = AsyncMock(side_effect=stop_backend)
+        im._wait_process_tree = AsyncMock()
+        stopping = asyncio.create_task(
+            im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_pid=proxy.pid,
+                expected_started_at=started_at,
+                task_status="completed",
+            )
+        )
+        await stop_entered.wait()
+        proceed.set()
+        await asyncio.sleep(0)
+        assert callback.done() is False
+
+        release_stop.set()
+        assert await asyncio.wait_for(stopping, 1) is True
+        assert await asyncio.wait_for(callback, 1) is None
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation is None
+        assert await _entries(db_factory, task_id) == []
+        assert not any(
+            call.args[1].get("content")
+            == "must not survive active stop"
+            for call in broadcaster.broadcast.await_args_list
+        )
+        assert not im.has_pty_autonomous_activity_handoff(
+            task_id, session.session_id
+        )
+
+    async def test_live_active_stop_failure_restores_exact_epoch_for_retry(
+        self, db_factory
+    ):
+        """An active backend exception preserves only its still-live epoch."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        generation = "active-stop-retry-generation"
+
+        class Session:
+            session_id = "active-stop-retry-session"
+            has_pending_subagents = False
+            is_alive = True
+
+        class Proxy:
+            pid = 25_714
+            returncode = None
+
+            def __init__(self, session):
+                self.session = session
+
+        session = Session()
+        proxy = Proxy(session)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 14
+            task.instance_id = instance_id
+            task.session_id = session.session_id
+            task.pty_background_generation = generation
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        consumer = asyncio.create_task(asyncio.Event().wait())
+        im.processes[instance_id] = proxy
+        im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=14,
+            instance_started_at=started_at,
+        )
+        backend._sessions[instance_id] = session
+        backend._consumers[instance_id] = consumer
+        backend._proxies[instance_id] = proxy
+        state = im.register_pty_background_generation(
+            task_id, session.session_id, generation, session
+        )
+        handoff = im.note_pty_autonomous_activity(
+            task_id, session.session_id
+        )
+
+        stop_calls = 0
+
+        async def stop_backend(key):
+            nonlocal stop_calls
+            assert key == instance_id
+            stop_calls += 1
+            if stop_calls == 1:
+                raise RuntimeError("active Session remains alive")
+            session.is_alive = False
+            proxy.returncode = 130
+            backend._sessions.pop(instance_id, None)
+
+        backend.stop = AsyncMock(side_effect=stop_backend)
+        im._wait_process_tree = AsyncMock()
+        with pytest.raises(
+            RuntimeError, match="active Session remains alive"
+        ):
+            await im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_pid=proxy.pid,
+                expected_started_at=started_at,
+                task_status="completed",
+            )
+
+        assert state.accepting_events is True
+        assert state.done.is_set() is False
+        assert state.session is session
+        assert (
+            im._pty_background_states[(task_id, session.session_id)]
+            is state
+        )
+        assert (
+            im._pty_autonomous_activity_handoffs[
+                (task_id, session.session_id)
+            ]
+            is handoff
+        )
+        assert consumer.done() is False
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.pty_background_generation == generation
+            assert inst.current_task_id == task_id
+            assert inst.pid == proxy.pid
+
+        async with im.pty_background_transition(
+            task_id, session.session_id
+        ):
+            assert (
+                await im._begin_pty_autonomous_activity_locked(
+                    task_id,
+                    session.session_id,
+                    session,
+                    {
+                        "event_type": "message",
+                        "role": "assistant",
+                        "content": "accepted after active stop failure",
+                    },
+                    instance_id=instance_id,
+                )
+                == generation
+            )
+
+        assert await im.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_pid=proxy.pid,
+            expected_started_at=started_at,
+            task_status="completed",
+        )
+        assert stop_calls == 2
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.pty_background_generation is None
+            assert inst.current_task_id is None
+            assert inst.pid is None
+        assert (task_id, session.session_id) not in im._pty_background_states
+        assert not im.has_pty_autonomous_activity_handoff(
+            task_id, session.session_id
+        )
+
+    async def test_detached_stop_invalidates_pre_noted_callback_before_return(
+        self, db_factory
+    ):
+        """Ownerless exact stop fences a callback already queued on its lock."""
+
+        im, broadcaster = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        _, task_id = await _make_inst_task(db_factory)
+        generation = "detached-stop-fence-generation"
+        completed_at = datetime.utcnow()
+
+        stop_entered = asyncio.Event()
+        release_stop = asyncio.Event()
+
+        class Session:
+            session_id = "detached-stop-fence-session"
+            has_pending_subagents = False
+            is_alive = True
+
+            async def stop(self):
+                stop_entered.set()
+                await release_stop.wait()
+                self.is_alive = False
+
+        session = Session()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.retry_count = 11
+            task.instance_id = None
+            task.started_at = None
+            task.completed_at = completed_at
+            task.session_id = session.session_id
+            task.pty_background_generation = generation
+            await db.commit()
+        im.register_pty_background_generation(
+            task_id, session.session_id, generation, session
+        )
+
+        noted = asyncio.Event()
+        proceed = asyncio.Event()
+        callback = asyncio.create_task(
+            _run_pre_noted_background_event(
+                im,
+                task_id=task_id,
+                session=session,
+                instance_id=0,
+                noted=noted,
+                proceed=proceed,
+                content="must not survive detached stop",
+            )
+        )
+        await noted.wait()
+        stopping = asyncio.create_task(
+            im.stop_detached_pty_background_generation(
+                task_id,
+                session.session_id,
+                generation,
+                expected_status="completed",
+                expected_retry_count=11,
+                expected_instance_id=None,
+                expected_started_at=None,
+                expected_completed_at=completed_at,
+            )
+        )
+        await stop_entered.wait()
+        proceed.set()
+        await asyncio.sleep(0)
+        assert callback.done() is False
+
+        release_stop.set()
+        assert await asyncio.wait_for(stopping, 1) is True
+        assert await asyncio.wait_for(callback, 1) is None
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation is None
+        assert await _entries(db_factory, task_id) == []
+        broadcaster.broadcast.assert_not_awaited()
+        assert not im.has_pty_autonomous_activity_handoff(
+            task_id, session.session_id
+        )
+
+    async def test_live_detached_stop_failure_restores_exact_epoch_for_retry(
+        self, db_factory
+    ):
+        """A thrown stop with a live exact Session keeps admission retryable."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        _, task_id = await _make_inst_task(db_factory)
+        generation = "live-stop-retry-generation"
+        completed_at = datetime.utcnow()
+
+        class Session:
+            session_id = "live-stop-retry-session"
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    raise RuntimeError("session remains alive")
+                self.is_alive = False
+
+        session = Session()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.retry_count = 12
+            task.instance_id = None
+            task.started_at = None
+            task.completed_at = completed_at
+            task.session_id = session.session_id
+            task.pty_background_generation = generation
+            await db.commit()
+        state = im.register_pty_background_generation(
+            task_id, session.session_id, generation, session
+        )
+
+        noted = asyncio.Event()
+        proceed = asyncio.Event()
+        callback = asyncio.create_task(
+            _run_pre_noted_background_event(
+                im,
+                task_id=task_id,
+                session=session,
+                instance_id=0,
+                noted=noted,
+                proceed=proceed,
+                content="admitted after failed live stop",
+                persist=False,
+            )
+        )
+        await noted.wait()
+        handoff = im._pty_autonomous_activity_handoffs[
+            (task_id, session.session_id)
+        ]
+
+        assert not await im.stop_detached_pty_background_generation(
+            task_id,
+            session.session_id,
+            generation,
+            expected_status="completed",
+            expected_retry_count=12,
+            expected_instance_id=None,
+            expected_started_at=None,
+            expected_completed_at=completed_at,
+        )
+        assert session.is_alive is True
+        assert state.accepting_events is True
+        assert state.done.is_set() is False
+        assert (
+            im._pty_background_states[(task_id, session.session_id)]
+            is state
+        )
+        assert state.session is session
+        assert (
+            im._pty_autonomous_activity_handoffs[
+                (task_id, session.session_id)
+            ]
+            is handoff
+        )
+        async with db_factory() as db:
+            assert (
+                await db.get(Task, task_id)
+            ).pty_background_generation == generation
+
+        proceed.set()
+        assert await asyncio.wait_for(callback, 1) == generation
+        assert await im.stop_detached_pty_background_generation(
+            task_id,
+            session.session_id,
+            generation,
+            expected_status="completed",
+            expected_retry_count=12,
+            expected_instance_id=None,
+            expected_started_at=None,
+            expected_completed_at=completed_at,
+        )
+        assert session.stop_calls == 2
+        async with db_factory() as db:
+            assert (
+                await db.get(Task, task_id)
+            ).pty_background_generation is None
+        assert (task_id, session.session_id) not in im._pty_background_states
+        assert not im.has_pty_autonomous_activity_handoff(
+            task_id, session.session_id
+        )
+
+    async def test_dead_detached_session_after_cas_loss_stays_frozen_for_cleanup(
+        self, db_factory
+    ):
+        """A dead Session is never reopened when marker-clear CAS loses."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        _, task_id = await _make_inst_task(db_factory)
+        generation = "dead-stop-cleanup-generation"
+        completed_at = datetime.utcnow()
+        replacement_completed_at = completed_at + timedelta(seconds=1)
+
+        class Session:
+            session_id = "dead-stop-cleanup-session"
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.is_alive = False
+                if self.stop_calls == 1:
+                    # Invalidate only the post-stop marker-clear CAS. The exact
+                    # Task/session/generation remains available for retry.
+                    async with db_factory() as db:
+                        task = await db.get(Task, task_id)
+                        task.completed_at = replacement_completed_at
+                        await db.commit()
+
+        session = Session()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.retry_count = 13
+            task.instance_id = None
+            task.started_at = None
+            task.completed_at = completed_at
+            task.session_id = session.session_id
+            task.pty_background_generation = generation
+            await db.commit()
+        state = im.register_pty_background_generation(
+            task_id, session.session_id, generation, session
+        )
+        handoff = im.note_pty_autonomous_activity(
+            task_id, session.session_id
+        )
+
+        assert not await im.stop_detached_pty_background_generation(
+            task_id,
+            session.session_id,
+            generation,
+            expected_status="completed",
+            expected_retry_count=13,
+            expected_instance_id=None,
+            expected_started_at=None,
+            expected_completed_at=completed_at,
+        )
+        assert session.is_alive is False
+        assert state.accepting_events is False
+        assert im._has_reapable_pty_background_state(task_id) is True
+        assert (
+            im._pty_autonomous_activity_handoffs[
+                (task_id, session.session_id)
+            ]
+            is handoff
+        )
+        async with db_factory() as db:
+            assert (
+                await db.get(Task, task_id)
+            ).pty_background_generation == generation
+
+        async with im.pty_background_transition(
+            task_id, session.session_id
+        ):
+            assert (
+                await im._begin_pty_autonomous_activity_locked(
+                    task_id,
+                    session.session_id,
+                    session,
+                    {
+                        "event_type": "message",
+                        "role": "assistant",
+                        "content": "dead session must stay rejected",
+                    },
+                )
+                is None
+            )
+
+        assert await im.stop_detached_pty_background_generation(
+            task_id,
+            session.session_id,
+            generation,
+            expected_status="completed",
+            expected_retry_count=13,
+            expected_instance_id=None,
+            expected_started_at=None,
+            expected_completed_at=replacement_completed_at,
+        )
+        assert session.stop_calls == 2
+        async with db_factory() as db:
+            assert (
+                await db.get(Task, task_id)
+            ).pty_background_generation is None
+        assert (task_id, session.session_id) not in im._pty_background_states
+        assert not im.has_pty_autonomous_activity_handoff(
+            task_id, session.session_id
+        )
+
+    async def test_stale_background_stop_cannot_touch_replacement_owner(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        old_started_at = datetime.utcnow()
+
+        class Session:
+            session_id = "stale-background-session"
+
+        class Proxy:
+            pid = 25_712
+            returncode = None
+            session = Session()
+
+        proxy = Proxy()
+        hold = asyncio.Event()
+        consumer = asyncio.create_task(hold.wait())
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=2,
+            instance_started_at=old_started_at,
+        )
+        object.__setattr__(record, "pty_terminal_owner", "consumer")
+        object.__setattr__(record, "pty_background_waiting", True)
+        im.processes[instance_id] = proxy
+        im._tasks[instance_id] = consumer
+        backend._sessions[instance_id] = proxy.session
+        backend.stop = AsyncMock()
+
+        replacement_started_at = old_started_at + timedelta(seconds=1)
+        async with db_factory() as db:
+            old_task = await db.get(Task, task_id)
+            old_task.status = "executing"
+            old_task.retry_count = 2
+            old_task.instance_id = instance_id
+            old_task.session_id = proxy.session.session_id
+            old_task.pty_background_generation = "old-background"
+            replacement = Task(
+                title="replacement owner",
+                description="new generation",
+                status="executing",
+                instance_id=instance_id,
+            )
+            db.add(replacement)
+            await db.flush()
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 99_999
+            inst.current_task_id = replacement.id
+            inst.started_at = replacement_started_at
+            await db.commit()
+            replacement_id = replacement.id
+
+        im.register_pty_background_generation(
+            task_id,
+            proxy.session.session_id,
+            "old-background",
+            proxy.session,
+        )
+        assert not await im.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_pid=proxy.pid,
+            expected_started_at=old_started_at,
+            task_status="completed",
+        )
+        backend.stop.assert_not_awaited()
+        assert im.pty_background_generation_for(
+            task_id, proxy.session.session_id
+        ) == "old-background"
+        async with db_factory() as db:
+            inst = await db.get(Instance, instance_id)
+            assert inst.current_task_id == replacement_id
+            assert inst.pid == 99_999
+            assert inst.started_at == replacement_started_at
+
+        im.abandon_pty_background_generation(
+            task_id,
+            proxy.session.session_id,
+            "old-background",
+        )
+        hold.set()
+        await consumer
 
     async def test_consumer_owned_pty_exit_makes_stop_wait_outside_lock(
         self, db_factory
@@ -1159,6 +4044,104 @@ class TestFullMirrorBackend:
             assert "code 9" in task.error_message
             assert inst.status == "error"
 
+    async def test_handoff_during_terminal_commit_rearms_before_publish(
+        self, db_factory
+    ):
+        """A tool starting during commit cannot be preceded by completed."""
+
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "commit-handoff-session"
+
+        class Session:
+            def __init__(self):
+                self.session_id = session_id
+
+        class Proxy:
+            pid = 778
+            returncode = None
+
+            def __init__(self):
+                self.session = Session()
+
+        proxy = Proxy()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 4
+            task.instance_id = instance_id
+            task.session_id = session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        injected = False
+        im = None
+
+        @asynccontextmanager
+        async def racing_factory():
+            async with db_factory() as db:
+                class SessionProxy:
+                    def __getattr__(self, name):
+                        return getattr(db, name)
+
+                    async def commit(self):
+                        nonlocal injected
+                        await db.commit()
+                        if not injected:
+                            injected = True
+                            im.note_pty_autonomous_activity(
+                                task_id, session_id
+                            )
+
+                yield SessionProxy()
+
+        broadcaster = MagicMock(broadcast=AsyncMock())
+        im = InstanceManager(racing_factory, broadcaster)
+        consumer = asyncio.current_task()
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=4,
+            instance_started_at=started_at,
+        )
+
+        status = await im.finalize_pty_chat_generation(
+            instance_id,
+            task_id,
+            0,
+            record,
+            background_session_id=session_id,
+        )
+        assert status == "background_armed"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "executing"
+            assert task.pty_background_generation is not None
+            assert inst.status == "running"
+            assert inst.current_task_id == task_id
+            assert inst.pid == proxy.pid
+        assert not any(
+            call.args[1].get("new_status") == "completed"
+            for call in broadcaster.broadcast.await_args_list
+        )
+
+        state = im._pty_background_state_for_task(task_id)
+        assert state is not None
+        state.outcome = "superseded"
+        im._discard_pty_background_state(
+            (task_id, session_id), state.generation
+        )
+
     async def test_pty_api_error_overrides_zero_process_exit(
         self, db_factory
     ):
@@ -1490,6 +4473,12 @@ class TestFullMirrorBackend:
     async def test_mirror_forwards_to_process_event(self):
         im = MagicMock()
         im._process_event = AsyncMock()
+        im._begin_pty_autonomous_activity_locked = AsyncMock(
+            return_value="background-generation"
+        )
+        im._finish_pty_autonomous_activity_locked = AsyncMock()
+        im._is_pty_autonomous_terminal.return_value = False
+        im._is_pty_autonomous_activity.return_value = True
         backend = self._bare_backend(im)
         session = MagicMock()
 
@@ -1513,12 +4502,18 @@ class TestFullMirrorBackend:
             3,
             detached_autonomous=True,
             expected_session_id="session-27",
+            expected_background_generation="background-generation",
         )
 
-    async def test_mirror_swallows_process_event_errors(self):
-        """镜像回调绝不向 idle watcher 抛异常。"""
+    async def test_mirror_drops_event_when_background_admission_fails(self):
         im = MagicMock()
-        im._process_event = AsyncMock(side_effect=RuntimeError("db down"))
+        im._process_event = AsyncMock()
+        im._begin_pty_autonomous_activity_locked = AsyncMock(
+            return_value=None
+        )
+        im._finish_pty_autonomous_activity_locked = AsyncMock()
+        im._is_pty_autonomous_terminal.return_value = False
+        im._is_pty_autonomous_activity.return_value = True
         backend = self._bare_backend(im)
         session = MagicMock()
 
@@ -1526,6 +4521,39 @@ class TestFullMirrorBackend:
             pass
 
         session.on_autonomous_event = _subagent_only_callback
+        session.session_id = "closed-session"
+        backend._restore_full_autonomous_mirror(session, 7, 27, 3)
+
+        event = MagicMock()
+        event.to_dict.return_value = {
+            "event_type": "tool_use",
+            "role": "assistant",
+            "tool_name": "Bash",
+        }
+        await session.on_autonomous_event(event)
+
+        im._process_event.assert_not_awaited()
+        im._finish_pty_autonomous_activity_locked.assert_not_awaited()
+        im.clear_pty_autonomous_activity_handoff.assert_called_once()
+
+    async def test_mirror_swallows_process_event_errors(self):
+        """镜像回调绝不向 idle watcher 抛异常。"""
+        im = MagicMock()
+        im._process_event = AsyncMock(side_effect=RuntimeError("db down"))
+        im._begin_pty_autonomous_activity_locked = AsyncMock(
+            return_value="background-generation"
+        )
+        im._finish_pty_autonomous_activity_locked = AsyncMock()
+        im._is_pty_autonomous_terminal.return_value = False
+        im._is_pty_autonomous_activity.return_value = True
+        backend = self._bare_backend(im)
+        session = MagicMock()
+
+        async def _subagent_only_callback(event, **ctx):
+            pass
+
+        session.on_autonomous_event = _subagent_only_callback
+        session.session_id = "session-27"
         backend._restore_full_autonomous_mirror(session, 7, 27, None)
         event = MagicMock()
         event.to_dict.return_value = {"event_type": "message"}

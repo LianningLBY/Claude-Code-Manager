@@ -18,7 +18,7 @@ import signal
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -57,6 +57,17 @@ _CODEX_SERVICE_TIERS = frozenset({
 })
 _MODEL_LIST_PAGE_LIMIT = 100
 _MODEL_LIST_MAX_PAGES = 20
+# A parent Codex turn may emit ``turn/completed`` while native child threads
+# are still running.  Keep the adapter alive until every child is
+# authoritatively quiescent.  Notifications are the fast path; the periodic
+# read closes listener-attachment races without busy polling.
+_DESCENDANT_RECONCILE_INTERVAL = 5.0
+_DESCENDANT_RECONCILE_REQUEST_TIMEOUT = 5.0
+_DESCENDANT_INTERRUPT_CONFIRM_TIMEOUT = 10.0
+_DESCENDANT_INTERRUPT_POLL_INTERVAL = 0.1
+# Native sub-agents are otherwise allowed to run for hours.  Reaching this
+# fence is an explicit failure, never permission to publish a false success.
+_DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
 
 
 async def _settle_registry_cleanup(awaitable):
@@ -387,6 +398,20 @@ class _TurnContext:
     pending_admission_notifications: (
         list[tuple[str, dict[str, Any]]] | None
     ) = None
+    descendant_thread_ids: set[str] = field(default_factory=set)
+    active_descendant_thread_ids: set[str] = field(default_factory=set)
+    descendant_state_changed: asyncio.Event | None = None
+    descendant_interrupt_lock: asyncio.Lock | None = None
+    descendant_guard_task: asyncio.Task | None = None
+    deferred_terminal_notification: dict[str, Any] | None = None
+
+
+@dataclass
+class _ThreadRuntimeState:
+    """Last authoritative app-server lifecycle facts for one native thread."""
+
+    status_type: str | None = None
+    active_turn_ids: set[str] = field(default_factory=set)
 
 
 class CodexAppServer:
@@ -422,6 +447,12 @@ class CodexAppServer:
         self._thread_settings_waiters: dict[str, asyncio.Future] = {}
         self._contexts_by_thread: dict[str, _TurnContext] = {}
         self._contexts_by_turn: dict[str, _TurnContext] = {}
+        # Child threads are not CCM Tasks of their own, but app-server emits
+        # their lifecycle on the same connection.  These maps keep each child
+        # fenced to the exact parent adapter generation that observed it.
+        self._contexts_by_descendant: dict[str, _TurnContext] = {}
+        self._children_by_thread: dict[str, set[str]] = {}
+        self._thread_runtime: dict[str, _ThreadRuntimeState] = {}
         self._stderr_lines: deque[str] = deque(maxlen=100)
         self._request_id = 0
         self._write_lock = asyncio.Lock()
@@ -464,6 +495,30 @@ class CodexAppServer:
         admission_future = context.admission_observed_future
         if admission_future is not None and not admission_future.done():
             admission_future.cancel()
+        guard_task = getattr(context, "descendant_guard_task", None)
+        context.descendant_guard_task = None
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if (
+            guard_task is not None
+            and guard_task is not current_task
+            and not guard_task.done()
+        ):
+            guard_task.cancel()
+        state_changed = getattr(context, "descendant_state_changed", None)
+        if state_changed is not None:
+            state_changed.set()
+        for thread_id in list(
+            getattr(context, "descendant_thread_ids", set())
+        ):
+            if self._contexts_by_descendant.get(thread_id) is context:
+                self._contexts_by_descendant.pop(thread_id, None)
+        if hasattr(context, "descendant_thread_ids"):
+            context.descendant_thread_ids.clear()
+        if hasattr(context, "active_descendant_thread_ids"):
+            context.active_descendant_thread_ids.clear()
         if self._contexts_by_thread.get(context.thread_id) is context:
             self._contexts_by_thread.pop(context.thread_id, None)
         for turn_id, candidate in list(self._contexts_by_turn.items()):
@@ -557,6 +612,699 @@ class CodexAppServer:
         turn_id = params.get("turnId")
         return str(turn_id) if turn_id else None
 
+    @staticmethod
+    def _thread_status_type(status: Any) -> str | None:
+        if not isinstance(status, dict):
+            return None
+        status_type = status.get("type")
+        return str(status_type) if status_type else None
+
+    @staticmethod
+    def _thread_status_is_terminal(status_type: str | None) -> bool:
+        return status_type in {"idle", "systemError", "notLoaded"}
+
+    def _runtime_state_for(self, thread_id: str) -> _ThreadRuntimeState:
+        return self._thread_runtime.setdefault(
+            thread_id,
+            _ThreadRuntimeState(),
+        )
+
+    def _context_is_current(self, context: _TurnContext) -> bool:
+        return (
+            context.process.returncode is None
+            and self._contexts_by_thread.get(context.thread_id) is context
+        )
+
+    def _lineage_context_for_thread(
+        self,
+        thread_id: str,
+    ) -> _TurnContext | None:
+        context = self._contexts_by_thread.get(thread_id)
+        if context is None:
+            context = self._contexts_by_descendant.get(thread_id)
+        return context if context is not None and self._context_is_current(context) else None
+
+    @staticmethod
+    def _signal_descendant_state_change(context: _TurnContext) -> None:
+        changed = context.descendant_state_changed
+        if changed is not None:
+            changed.set()
+
+    def _mark_descendant_active(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+    ) -> None:
+        if not self._context_is_current(context):
+            return
+        context.active_descendant_thread_ids.add(thread_id)
+        self._signal_descendant_state_change(context)
+
+    def _mark_descendant_terminal(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+    ) -> None:
+        context.active_descendant_thread_ids.discard(thread_id)
+        self._signal_descendant_state_change(context)
+
+    def _contexts_tracking_descendant(
+        self,
+        thread_id: str,
+    ) -> list[_TurnContext]:
+        contexts: list[_TurnContext] = []
+        mapped = self._contexts_by_descendant.get(thread_id)
+        if mapped is not None and self._context_is_current(mapped):
+            contexts.append(mapped)
+        # A lineage conflict is fail-closed: the secondary context retains
+        # the child in its own set and reconciles it by thread/read even though
+        # the fast reverse lookup remains owned by the first generation.
+        for candidate in self._contexts_by_thread.values():
+            if (
+                candidate is not mapped
+                and thread_id
+                in getattr(candidate, "descendant_thread_ids", set())
+                and self._context_is_current(candidate)
+            ):
+                contexts.append(candidate)
+        return contexts
+
+    def _record_thread_status(
+        self,
+        thread_id: str,
+        status: Any,
+    ) -> None:
+        status_type = self._thread_status_type(status)
+        if status_type is None:
+            return
+        runtime = self._runtime_state_for(thread_id)
+        runtime.status_type = status_type
+        terminal = self._thread_status_is_terminal(status_type)
+        if terminal:
+            # App-server's status manager publishes a non-active status only
+            # after it has cleared the native running-turn fact.
+            runtime.active_turn_ids.clear()
+        for context in self._contexts_tracking_descendant(thread_id):
+            if status_type == "active":
+                self._mark_descendant_active(context, thread_id)
+            elif terminal:
+                self._mark_descendant_terminal(context, thread_id)
+
+    def _record_thread_turn_lifecycle(
+        self,
+        method: str,
+        thread_id: str,
+        turn_id: str | None,
+    ) -> None:
+        runtime = self._runtime_state_for(thread_id)
+        if method == "turn/started":
+            if turn_id:
+                runtime.active_turn_ids.add(turn_id)
+            runtime.status_type = "active"
+            for context in self._contexts_tracking_descendant(thread_id):
+                self._mark_descendant_active(context, thread_id)
+            return
+        if method != "turn/completed":
+            return
+        if turn_id:
+            runtime.active_turn_ids.discard(turn_id)
+        if not runtime.active_turn_ids:
+            # ``turn/completed`` itself is also an authoritative no-running-
+            # turn proof if a status notification was missed during listener
+            # attachment.
+            runtime.status_type = "idle"
+            for context in self._contexts_tracking_descendant(thread_id):
+                self._mark_descendant_terminal(context, thread_id)
+
+    def _record_child_relation(
+        self,
+        parent_thread_id: str,
+        child_thread_id: str,
+    ) -> None:
+        if not parent_thread_id or not child_thread_id:
+            return
+        if parent_thread_id == child_thread_id:
+            logger.error(
+                "Ignoring cyclic Codex child-thread relation %s",
+                child_thread_id,
+            )
+            return
+        self._children_by_thread.setdefault(parent_thread_id, set()).add(
+            child_thread_id
+        )
+
+    def _attach_descendant(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        *,
+        active: bool | None,
+        _seen: set[str] | None = None,
+    ) -> None:
+        if not thread_id or thread_id == context.thread_id:
+            return
+        if not self._context_is_current(context):
+            return
+        seen = _seen if _seen is not None else set()
+        if thread_id in seen:
+            return
+        seen.add(thread_id)
+        context.descendant_thread_ids.add(thread_id)
+        owner = self._contexts_by_descendant.get(thread_id)
+        if owner is None or owner is context or not self._context_is_current(owner):
+            self._contexts_by_descendant[thread_id] = context
+        elif owner is not context:
+            logger.error(
+                "Codex descendant %s is already fenced to task %s; "
+                "task %s will reconcile it without stealing ownership",
+                thread_id,
+                owner.task_id,
+                context.task_id,
+            )
+
+        runtime = self._thread_runtime.get(thread_id)
+        if active is True:
+            self._mark_descendant_active(context, thread_id)
+        elif active is False:
+            self._mark_descendant_terminal(context, thread_id)
+        elif runtime is None:
+            # A discovered child with no status proof is a blocker, not an
+            # implicit success.
+            self._mark_descendant_active(context, thread_id)
+        elif (
+            runtime.status_type == "active"
+            or bool(runtime.active_turn_ids)
+        ):
+            self._mark_descendant_active(context, thread_id)
+        elif self._thread_status_is_terminal(runtime.status_type):
+            self._mark_descendant_terminal(context, thread_id)
+        else:
+            self._mark_descendant_active(context, thread_id)
+
+        for child_id in self._children_by_thread.get(thread_id, set()):
+            self._attach_descendant(
+                context,
+                child_id,
+                active=None,
+                _seen=seen,
+            )
+
+    def _track_collaboration_item(
+        self,
+        context: _TurnContext,
+        event_thread_id: str,
+        item: Any,
+    ) -> None:
+        if not isinstance(item, dict):
+            return
+        item_type = item.get("type")
+        if item_type in {"subAgentActivity", "sub_agent_activity"}:
+            child_id = item.get("agentThreadId") or item.get("agent_thread_id")
+            if not child_id:
+                return
+            child_id = str(child_id)
+            self._record_child_relation(event_thread_id, child_id)
+            kind = str(item.get("kind") or "")
+            if kind == "interrupted":
+                active: bool | None = False
+            elif kind == "interacted":
+                # MultiAgentV2 uses the same item for queue-only send_message
+                # and turn-starting followup_task.  Do not guess: block first,
+                # then thread/status or thread/read supplies the proof.
+                active = True
+            elif kind == "started":
+                # This item is newer than any cached idle observation.  A
+                # delayed child turn/status notification must not let stale
+                # runtime state publish the parent as complete.
+                active = True
+            else:
+                active = None
+            self._attach_descendant(context, child_id, active=active)
+            return
+
+        if item_type not in {
+            "collabAgentToolCall",
+            "collab_agent_tool_call",
+        }:
+            return
+        sender_id = (
+            item.get("senderThreadId")
+            or item.get("sender_thread_id")
+            or event_thread_id
+        )
+        sender_id = str(sender_id)
+        receiver_ids = (
+            item.get("receiverThreadIds")
+            if "receiverThreadIds" in item
+            else item.get("receiver_thread_ids")
+        )
+        if not isinstance(receiver_ids, list):
+            receiver_ids = []
+        agent_states = (
+            item.get("agentsStates")
+            if "agentsStates" in item
+            else item.get("agents_states")
+        )
+        if not isinstance(agent_states, dict):
+            agent_states = {}
+        tool = str(item.get("tool") or "")
+        call_status = str(item.get("status") or "")
+        active_agent_statuses = {"pendingInit", "pending_init", "running"}
+        terminal_agent_statuses = {
+            "interrupted",
+            "completed",
+            "errored",
+            "shutdown",
+            "notFound",
+            "not_found",
+        }
+        for raw_child_id in receiver_ids:
+            child_id = str(raw_child_id)
+            self._record_child_relation(sender_id, child_id)
+            state = agent_states.get(child_id)
+            agent_status = (
+                str(state.get("status") or "")
+                if isinstance(state, dict)
+                else ""
+            )
+            active: bool | None
+            if agent_status in active_agent_statuses:
+                active = True
+            elif agent_status in terminal_agent_statuses:
+                active = False
+            elif tool == "closeAgent" and call_status == "completed":
+                active = False
+            elif (
+                tool in {"spawnAgent", "sendInput", "resumeAgent"}
+                and call_status != "failed"
+            ):
+                active = True
+            else:
+                active = None
+            self._attach_descendant(context, child_id, active=active)
+
+    async def _read_descendant_status(
+        self,
+        thread_id: str,
+    ) -> tuple[str, str | None, set[str] | None]:
+        try:
+            response = await asyncio.wait_for(
+                self._request(
+                    "thread/read",
+                    {"threadId": thread_id, "includeTurns": True},
+                ),
+                timeout=min(
+                    max(0.01, self.request_timeout),
+                    _DESCENDANT_RECONCILE_REQUEST_TIMEOUT,
+                ),
+            )
+        except (asyncio.TimeoutError, CodexAppServerError):
+            return thread_id, None, None
+        except Exception:
+            logger.exception(
+                "Could not reconcile Codex descendant thread %s",
+                thread_id,
+            )
+            return thread_id, None, None
+        thread = response.get("thread") if isinstance(response, dict) else None
+        if (
+            not isinstance(thread, dict)
+            or str(thread.get("id") or "") != thread_id
+        ):
+            return thread_id, None, None
+        active_turn_ids: set[str] | None = None
+        turns = thread.get("turns")
+        if isinstance(turns, list):
+            active_turn_ids = set()
+            for turn in turns:
+                if not isinstance(turn, dict) or not turn.get("id"):
+                    continue
+                status = str(turn.get("status") or "")
+                normalized_status = status.replace("_", "").lower()
+                if normalized_status in {
+                    "active",
+                    "inprogress",
+                    "running",
+                }:
+                    active_turn_ids.add(str(turn["id"]))
+        return (
+            thread_id,
+            self._thread_status_type(thread.get("status")),
+            active_turn_ids,
+        )
+
+    def _apply_descendant_read_state(
+        self,
+        thread_id: str,
+        status_type: str | None,
+        active_turn_ids: set[str] | None,
+    ) -> None:
+        if status_type is None:
+            return
+        runtime = self._runtime_state_for(thread_id)
+        if active_turn_ids is not None:
+            runtime.active_turn_ids = set(active_turn_ids)
+        self._record_thread_status(
+            thread_id,
+            {"type": status_type},
+        )
+
+    async def _reconcile_descendant_statuses(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        blockers = tuple(context.active_descendant_thread_ids)
+        if not blockers or not self._context_is_current(context):
+            return
+        results = await asyncio.gather(
+            *(self._read_descendant_status(thread_id) for thread_id in blockers)
+        )
+        if not self._context_is_current(context):
+            return
+        for thread_id, status_type, active_turn_ids in results:
+            self._apply_descendant_read_state(
+                thread_id,
+                status_type,
+                active_turn_ids,
+            )
+
+    def _promote_descendant_terminal_failure(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        if not self._context_is_current(context):
+            return
+        blockers = sorted(context.active_descendant_thread_ids)
+        message = (
+            "Codex parent turn completed, but CCM could not prove all native "
+            "sub-agents terminal before the safety deadline"
+        )
+        if blockers:
+            message += f": {', '.join(blockers)}"
+        context.deferred_terminal_notification = {
+            "threadId": context.thread_id,
+            "turn": {
+                "id": context.turn_id,
+                "status": "failed",
+                "error": {"message": message},
+            },
+        }
+        logger.error(
+            "%s; retaining the adapter until cleanup is authoritative",
+            message,
+        )
+
+    async def _wait_descendant_terminal(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DESCENDANT_INTERRUPT_CONFIRM_TIMEOUT
+        while (
+            self._context_is_current(context)
+            and thread_id in context.active_descendant_thread_ids
+        ):
+            (
+                _,
+                status_type,
+                active_turn_ids,
+            ) = await self._read_descendant_status(thread_id)
+            self._apply_descendant_read_state(
+                thread_id,
+                status_type,
+                active_turn_ids,
+            )
+            if thread_id not in context.active_descendant_thread_ids:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            changed = context.descendant_state_changed
+            if changed is None:
+                changed = asyncio.Event()
+                context.descendant_state_changed = changed
+            changed.clear()
+            try:
+                await asyncio.wait_for(
+                    changed.wait(),
+                    timeout=min(
+                        _DESCENDANT_INTERRUPT_POLL_INTERVAL,
+                        remaining,
+                    ),
+                )
+            except asyncio.TimeoutError:
+                pass
+        return (
+            not self._context_is_current(context)
+            or thread_id not in context.active_descendant_thread_ids
+        )
+
+    async def _interrupt_one_descendant(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+    ) -> bool:
+        if thread_id not in context.active_descendant_thread_ids:
+            return True
+        runtime = self._thread_runtime.get(thread_id)
+        active_turn_ids = (
+            set(runtime.active_turn_ids)
+            if runtime is not None
+            else set()
+        )
+        if len(active_turn_ids) != 1:
+            (
+                _,
+                status_type,
+                read_active_turn_ids,
+            ) = await self._read_descendant_status(thread_id)
+            self._apply_descendant_read_state(
+                thread_id,
+                status_type,
+                read_active_turn_ids,
+            )
+            if thread_id not in context.active_descendant_thread_ids:
+                return True
+            runtime = self._thread_runtime.get(thread_id)
+            active_turn_ids = (
+                set(runtime.active_turn_ids)
+                if runtime is not None
+                else set()
+            )
+        if len(active_turn_ids) != 1:
+            return False
+
+        turn_id = next(iter(active_turn_ids))
+        for attempt in range(2):
+            try:
+                await self._request(
+                    "turn/interrupt",
+                    {"threadId": thread_id, "turnId": turn_id},
+                )
+                break
+            except CodexAppServerError as exc:
+                actual_turn_id = _active_turn_id_from_error(exc)
+                if attempt or not actual_turn_id:
+                    return await self._wait_descendant_terminal(
+                        context,
+                        thread_id,
+                    )
+                turn_id = actual_turn_id
+                runtime = self._runtime_state_for(thread_id)
+                runtime.active_turn_ids = {turn_id}
+            except asyncio.TimeoutError:
+                return await self._wait_descendant_terminal(
+                    context,
+                    thread_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not interrupt Codex descendant turn "
+                    "thread=%s turn=%s",
+                    thread_id,
+                    turn_id,
+                )
+                return False
+        return await self._wait_descendant_terminal(context, thread_id)
+
+    async def _interrupt_active_descendants(
+        self,
+        context: _TurnContext,
+    ) -> bool:
+        lock = context.descendant_interrupt_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            context.descendant_interrupt_lock = lock
+        async with lock:
+            if not self._context_is_current(context):
+                return True
+            blockers = tuple(context.active_descendant_thread_ids)
+            if not blockers:
+                return True
+            results = await asyncio.gather(
+                *(
+                    self._interrupt_one_descendant(context, thread_id)
+                    for thread_id in blockers
+                )
+            )
+            return (
+                all(results)
+                and not context.active_descendant_thread_ids
+            )
+
+    async def _guard_deferred_terminal(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DESCENDANT_TERMINAL_TIMEOUT
+        try:
+            # Let already-buffered child and parent notifications drain before
+            # evaluating the first terminal snapshot.
+            await asyncio.sleep(0)
+            while (
+                self._context_is_current(context)
+                and context.deferred_terminal_notification is not None
+            ):
+                changed = context.descendant_state_changed
+                if changed is None:
+                    changed = asyncio.Event()
+                    context.descendant_state_changed = changed
+                changed.clear()
+                if not context.active_descendant_thread_ids:
+                    # A second loop turn closes the status-idle /
+                    # child-turn-completed ordering window and preserves any
+                    # late parent output before EOF.
+                    await asyncio.sleep(0)
+                    if (
+                        self._context_is_current(context)
+                        and context.deferred_terminal_notification is not None
+                        and not context.active_descendant_thread_ids
+                    ):
+                        params = context.deferred_terminal_notification
+                        context.deferred_terminal_notification = None
+                        self._finish_turn_context(context, params)
+                    return
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    turn = (
+                        context.deferred_terminal_notification.get("turn")
+                        or {}
+                    )
+                    if turn.get("status") == "completed":
+                        self._promote_descendant_terminal_failure(context)
+                    remaining = _DESCENDANT_RECONCILE_INTERVAL
+
+                turn = (
+                    context.deferred_terminal_notification.get("turn")
+                    or {}
+                )
+                if turn.get("status") != "completed":
+                    await self._interrupt_active_descendants(context)
+                    if not self._context_is_current(context):
+                        return
+                    if not context.active_descendant_thread_ids:
+                        continue
+                try:
+                    await asyncio.wait_for(
+                        changed.wait(),
+                        timeout=min(
+                            _DESCENDANT_RECONCILE_INTERVAL,
+                            remaining,
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    await self._reconcile_descendant_statuses(context)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if context.descendant_guard_task is asyncio.current_task():
+                context.descendant_guard_task = None
+
+    def _defer_terminal_turn_for_descendants(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+    ) -> None:
+        if context.deferred_terminal_notification is None:
+            context.deferred_terminal_notification = dict(params)
+        else:
+            logger.warning(
+                "Ignoring duplicate deferred Codex terminal notification "
+                "thread=%s turn=%s",
+                context.thread_id,
+                context.turn_id,
+            )
+            return
+        guard = context.descendant_guard_task
+        if guard is None or guard.done():
+            context.descendant_guard_task = asyncio.create_task(
+                self._guard_deferred_terminal(context),
+            )
+
+    def _finish_turn_context(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+    ) -> None:
+        """Publish one native parent terminal and only then close its adapter."""
+
+        if not self._context_is_current(context):
+            return
+        turn = params.get("turn") or {}
+        status = turn.get("status") or "completed"
+        error = turn.get("error")
+        if status == "completed":
+            context.process.feed(
+                {
+                    "type": "turn.completed",
+                    "usage": context.usage or {},
+                    "turn_id": context.turn_id,
+                }
+            )
+            exit_code = 0
+            stderr = ""
+        elif status == "interrupted":
+            context.process.feed(
+                {
+                    "type": "turn.completed",
+                    "usage": context.usage or {},
+                    "turn_id": context.turn_id,
+                }
+            )
+            exit_code = 130
+            stderr = ""
+        else:
+            normalized_error = self._normalize_turn_error(
+                error,
+                fallback=f"Codex turn ended with status {status}",
+            )
+            message = normalized_error["message"]
+            context.process.feed(
+                {"type": "turn.failed", "error": normalized_error}
+            )
+            exit_code = 1
+            stderr = str(message)
+        logger.info(
+            "Codex latency task=%s thread=%s stage=completed elapsed_ms=%.1f status=%s",
+            context.task_id,
+            context.thread_id,
+            (time.perf_counter() - context.launch_started) * 1000,
+            status,
+        )
+        context.process.finish(
+            exit_code,
+            stderr,
+            termination_kind=(
+                "user_interrupt"
+                if status == "interrupted"
+                else None
+            ),
+        )
+        self._detach_turn_context(context)
+
     async def _pause_active_goal(self, thread_id: str) -> None:
         """Pause an adopted native goal with one bounded protocol round trip."""
 
@@ -588,50 +1336,66 @@ class CodexAppServer:
 
         if not self._interrupt_context_is_current(context):
             return
-        turn_id = context.turn_id
-        if not turn_id:
-            raise CodexAppServerError(
-                f"Codex thread {context.thread_id} has no interruptible turn id"
-            )
-
-        goal_checked = False
-        if (
-            context.admitted_turn_id is not None
-            and turn_id != context.admitted_turn_id
-        ):
-            await self._pause_active_goal(context.thread_id)
-            goal_checked = True
-            if not self._interrupt_context_is_current(context):
-                return
-
-        for attempt in range(2):
-            try:
-                await self._request(
-                    "turn/interrupt",
-                    {"threadId": context.thread_id, "turnId": turn_id},
+        # Once the native parent has already reported terminal, only its
+        # descendants remain interruptible.  Re-sending a root interrupt would
+        # fail with "no active turn" and skip the real cleanup target.
+        if context.deferred_terminal_notification is None:
+            turn_id = context.turn_id
+            if not turn_id:
+                raise CodexAppServerError(
+                    f"Codex thread {context.thread_id} has no interruptible turn id"
                 )
-                return
-            except CodexAppServerError as exc:
-                actual_turn_id = _active_turn_id_from_error(exc)
-                if attempt or not actual_turn_id:
-                    raise
+
+            goal_checked = False
+            if (
+                context.admitted_turn_id is not None
+                and turn_id != context.admitted_turn_id
+            ):
+                await self._pause_active_goal(context.thread_id)
+                goal_checked = True
                 if not self._interrupt_context_is_current(context):
                     return
-                if not goal_checked:
-                    await self._pause_active_goal(context.thread_id)
-                    goal_checked = True
+
+            for attempt in range(2):
+                try:
+                    await self._request(
+                        "turn/interrupt",
+                        {"threadId": context.thread_id, "turnId": turn_id},
+                    )
+                    break
+                except CodexAppServerError as exc:
+                    actual_turn_id = _active_turn_id_from_error(exc)
+                    if attempt or not actual_turn_id:
+                        raise
                     if not self._interrupt_context_is_current(context):
                         return
-                if not self._bind_turn_context(
-                    context,
-                    actual_turn_id,
-                    observed=True,
-                ):
-                    raise CodexAppServerError(
-                        "Could not bind authoritative Codex active turn "
-                        f"{actual_turn_id}"
-                    ) from exc
-                turn_id = actual_turn_id
+                    if not goal_checked:
+                        await self._pause_active_goal(context.thread_id)
+                        goal_checked = True
+                        if not self._interrupt_context_is_current(context):
+                            return
+                    if not self._bind_turn_context(
+                        context,
+                        actual_turn_id,
+                        observed=True,
+                    ):
+                        raise CodexAppServerError(
+                            "Could not bind authoritative Codex active turn "
+                            f"{actual_turn_id}"
+                        ) from exc
+                    turn_id = actual_turn_id
+
+        if (
+            self._interrupt_context_is_current(context)
+            and not await self._interrupt_active_descendants(context)
+        ):
+            blockers = ", ".join(
+                sorted(context.active_descendant_thread_ids)
+            )
+            raise CodexAppServerError(
+                "Could not confirm Codex descendant cleanup"
+                + (f": {blockers}" if blockers else "")
+            )
 
     async def ensure_started(self) -> None:
         if self._shutdown_requested:
@@ -677,6 +1441,11 @@ class CodexAppServer:
 
     async def _start(self) -> None:
         self._stderr_lines.clear()
+        # These facts belong to one app-server process generation.  Persisted
+        # thread ownership is kept separately in ``_known_threads``.
+        self._contexts_by_descendant.clear()
+        self._children_by_thread.clear()
+        self._thread_runtime.clear()
         codex_home = Path(self.codex_home)
         codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -1032,6 +1801,8 @@ class CodexAppServer:
             process=turn_process,
             launch_started=launch_started,
             task_id=task_id,
+            descendant_state_changed=asyncio.Event(),
+            descendant_interrupt_lock=asyncio.Lock(),
             admission_observed_future=(
                 asyncio.get_running_loop().create_future()
                 if service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -1798,35 +2569,92 @@ class CodexAppServer:
             ),
             None,
         )
-        interrupt_confirmed = False
         try:
-            if context is not None and context.turn_id:
-                await self._interrupt_turn_context(context)
-                interrupt_confirmed = True
+            if context is None or not context.turn_id:
+                return process.returncode is not None
+            await self._interrupt_turn_context(context)
         except BaseException:
             logger.exception(
                 "Failed to interrupt unclaimed Codex turn in %s",
                 self.codex_home,
             )
-        finally:
-            if context is not None:
-                self._detach_turn_context(context)
+            # Keep every mapping and the adapter open.  The registry sees the
+            # false result and shuts down the whole account transport before
+            # it releases any task/instance ownership.
+            return False
+        if process.returncode is None:
+            if not self._context_is_current(context):
+                return False
+            self._detach_turn_context(context)
             process.finish(
                 130,
                 reason,
                 termination_kind="internal_abort",
             )
-        return interrupt_confirmed
+        return True
 
-    async def steer_turn(self, thread_id: str, content: str) -> bool:
+    async def steer_turn(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Append user input to the currently active regular turn.
 
         ``expectedTurnId`` makes the request race-safe: if the turn finishes
         between the local context lookup and the RPC, app-server rejects the
         stale steer instead of attaching it to a later turn.
         """
-        if not self.is_alive or not thread_id or not content:
+        if not self.is_alive or not thread_id or (not content and not input_items):
             return False
+        if input_items is None:
+            steer_input: list[dict[str, Any]] = [
+                {"type": "text", "text": content},
+            ]
+        else:
+            steer_input = []
+            for item in input_items:
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid Codex steer input item")
+                item_type = item.get("type")
+                if (
+                    item_type == "text"
+                    and set(item) == {"type", "text"}
+                    and isinstance(item.get("text"), str)
+                    and item["text"]
+                ):
+                    steer_input.append({
+                        "type": "text",
+                        "text": item["text"],
+                    })
+                elif (
+                    item_type == "localImage"
+                    and set(item) == {"type", "path"}
+                    and isinstance(item.get("path"), str)
+                    and os.path.isabs(item["path"])
+                ):
+                    steer_input.append({
+                        "type": "localImage",
+                        "path": item["path"],
+                    })
+                elif (
+                    item_type == "mention"
+                    and set(item) == {"type", "name", "path"}
+                    and isinstance(item.get("name"), str)
+                    and item["name"]
+                    and isinstance(item.get("path"), str)
+                    and os.path.isabs(item["path"])
+                ):
+                    steer_input.append({
+                        "type": "mention",
+                        "name": item["name"],
+                        "path": item["path"],
+                    })
+                else:
+                    raise ValueError("Invalid Codex steer input item")
+            if not steer_input:
+                raise ValueError("Codex steer input cannot be empty")
         context = self._contexts_by_thread.get(thread_id)
         if (
             context is None
@@ -1842,7 +2670,7 @@ class CodexAppServer:
                 {
                     "threadId": thread_id,
                     "expectedTurnId": expected_turn_id,
-                    "input": [{"type": "text", "text": content}],
+                    "input": steer_input,
                 },
             )
         except Exception as exc:
@@ -1862,7 +2690,7 @@ class CodexAppServer:
                         {
                             "threadId": thread_id,
                             "expectedTurnId": actual_turn_id,
-                            "input": [{"type": "text", "text": content}],
+                            "input": steer_input,
                         },
                     )
                 except Exception as retry_exc:
@@ -1965,8 +2793,12 @@ class CodexAppServer:
                 if future is not None and not future.done():
                     future.set_exception(error)
                 context.process.finish(1, str(error))
+                self._detach_turn_context(context)
             self._contexts_by_thread.clear()
             self._contexts_by_turn.clear()
+            self._contexts_by_descendant.clear()
+            self._children_by_thread.clear()
+            self._thread_runtime.clear()
 
     async def _stderr_loop(self, process: asyncio.subprocess.Process) -> None:
         assert process.stderr
@@ -2031,6 +2863,30 @@ class CodexAppServer:
             if isinstance(thread, dict):
                 child_id = thread.get("id")
                 parent_id = thread.get("parentThreadId")
+                if isinstance(child_id, str):
+                    self._record_thread_status(
+                        child_id,
+                        thread.get("status"),
+                    )
+                if (
+                    isinstance(child_id, str)
+                    and isinstance(parent_id, str)
+                ):
+                    self._record_child_relation(parent_id, child_id)
+                    lineage_context = self._lineage_context_for_thread(parent_id)
+                    if lineage_context is not None:
+                        status_type = self._thread_status_type(
+                            thread.get("status")
+                        )
+                        self._attach_descendant(
+                            lineage_context,
+                            child_id,
+                            active=(
+                                status_type == "active"
+                                if status_type is not None
+                                else None
+                            ),
+                        )
                 proxy = self._actual_tier_proxy
                 if (
                     proxy is not None
@@ -2052,21 +2908,45 @@ class CodexAppServer:
                         )
             return
         thread_id = params.get("threadId")
+        thread_id_str = str(thread_id) if thread_id else None
+        if method == "thread/status/changed":
+            if thread_id_str is not None:
+                self._record_thread_status(
+                    thread_id_str,
+                    params.get("status"),
+                )
+            return
+        if method == "thread/closed":
+            if thread_id_str is not None:
+                self._record_thread_status(
+                    thread_id_str,
+                    {"type": "notLoaded"},
+                )
+            return
         if method == "thread/settings/updated":
             waiter = (
-                self._thread_settings_waiters.get(str(thread_id))
-                if thread_id
+                self._thread_settings_waiters.get(thread_id_str)
+                if thread_id_str
                 else None
             )
             if waiter is not None and not waiter.done():
                 waiter.set_result(params)
             return
         turn_id = self._notification_turn_id(method, params)
+        if (
+            thread_id_str is not None
+            and method in {"turn/started", "turn/completed"}
+        ):
+            self._record_thread_turn_lifecycle(
+                method,
+                thread_id_str,
+                turn_id,
+            )
         context = self._contexts_by_turn.get(turn_id) if turn_id else None
         if (
             context is not None
-            and thread_id
-            and str(thread_id) != context.thread_id
+            and thread_id_str
+            and thread_id_str != context.thread_id
         ):
             logger.error(
                 "Ignoring Codex notification with mismatched thread/turn "
@@ -2077,8 +2957,8 @@ class CodexAppServer:
                 method,
             )
             return
-        if context is None and thread_id:
-            candidate = self._contexts_by_thread.get(str(thread_id))
+        if context is None and thread_id_str:
+            candidate = self._contexts_by_thread.get(thread_id_str)
             if candidate is not None and turn_id:
                 # turn/start can return a fresh submission id while its input
                 # is actually steered into an existing goal turn. The first
@@ -2106,6 +2986,24 @@ class CodexAppServer:
                     return
             context = candidate
         if context is None:
+            # Child-thread output is intentionally not rendered as if it were
+            # the root assistant's answer.  Its collaboration lifecycle still
+            # extends the exact root generation and may discover grandchildren.
+            lineage_context = (
+                self._contexts_by_descendant.get(thread_id_str)
+                if thread_id_str is not None
+                else None
+            )
+            if (
+                lineage_context is not None
+                and self._context_is_current(lineage_context)
+                and method in {"item/started", "item/completed"}
+            ):
+                self._track_collaboration_item(
+                    lineage_context,
+                    thread_id_str,
+                    params.get("item"),
+                )
             return
         if turn_id and context.observed_turn_id is None:
             if not self._bind_turn_context(context, turn_id, observed=True):
@@ -2146,6 +3044,11 @@ class CodexAppServer:
 
         if method == "item/started":
             item = params.get("item") or {}
+            self._track_collaboration_item(
+                context,
+                context.thread_id,
+                item,
+            )
             if item.get("type") == "userMessage" and not context.first_input_seen:
                 context.first_input_seen = True
                 logger.info(
@@ -2156,7 +3059,11 @@ class CodexAppServer:
                 )
             normalized = self._normalize_item(item)
             if normalized and normalized.get("type") in {
-                "command_execution", "file_change", "mcp_tool_call", "web_search"
+                "command_execution",
+                "file_change",
+                "mcp_tool_call",
+                "web_search",
+                "collab_agent_tool_call",
             }:
                 context.process.feed({
                     "type": "item.started",
@@ -2167,8 +3074,20 @@ class CodexAppServer:
 
         if method == "item/completed":
             item = params.get("item") or {}
+            self._track_collaboration_item(
+                context,
+                context.thread_id,
+                item,
+            )
             normalized = self._normalize_item(item)
-            if normalized and normalized.get("type") != "user_message":
+            if normalized and normalized.get("type") not in {
+                "user_message",
+                # These are lifecycle metadata, not user-facing completion
+                # events. Passing them to the generic parser would render
+                # misleading ``item.completed`` separators.
+                "sub_agent_activity",
+                "context_compaction",
+            }:
                 context.process.feed({
                     "type": "item.completed",
                     "item": normalized,
@@ -2239,55 +3158,16 @@ class CodexAppServer:
         if method == "turn/completed":
             turn = params.get("turn") or {}
             status = turn.get("status") or "completed"
-            error = turn.get("error")
-            if status == "completed":
-                context.process.feed(
-                    {
-                        "type": "turn.completed",
-                        "usage": context.usage or {},
-                        "turn_id": context.turn_id,
-                    }
+            if (
+                context.descendant_thread_ids
+                and (
+                    status == "completed"
+                    or context.active_descendant_thread_ids
                 )
-                exit_code = 0
-                stderr = ""
-            elif status == "interrupted":
-                context.process.feed(
-                    {
-                        "type": "turn.completed",
-                        "usage": context.usage or {},
-                        "turn_id": context.turn_id,
-                    }
-                )
-                exit_code = 130
-                stderr = ""
-            else:
-                normalized_error = self._normalize_turn_error(
-                    error,
-                    fallback=f"Codex turn ended with status {status}",
-                )
-                message = normalized_error["message"]
-                context.process.feed(
-                    {"type": "turn.failed", "error": normalized_error}
-                )
-                exit_code = 1
-                stderr = str(message)
-            logger.info(
-                "Codex latency task=%s thread=%s stage=completed elapsed_ms=%.1f status=%s",
-                context.task_id,
-                context.thread_id,
-                (time.perf_counter() - context.launch_started) * 1000,
-                status,
-            )
-            context.process.finish(
-                exit_code,
-                stderr,
-                termination_kind=(
-                    "user_interrupt"
-                    if status == "interrupted"
-                    else None
-                ),
-            )
-            self._detach_turn_context(context)
+            ):
+                self._defer_terminal_turn_for_descendants(context, params)
+                return
+            self._finish_turn_context(context, params)
 
     @staticmethod
     def _normalize_turn_error(
@@ -2317,12 +3197,21 @@ class CodexAppServer:
             "mcpToolCall": "mcp_tool_call",
             "webSearch": "web_search",
             "todoList": "todo_list",
+            "collabAgentToolCall": "collab_agent_tool_call",
+            "subAgentActivity": "sub_agent_activity",
+            "contextCompaction": "context_compaction",
         }
         normalized = dict(item)
         normalized["type"] = type_map.get(item_type, item_type)
         rename = {
             "aggregatedOutput": "aggregated_output",
             "exitCode": "exit_code",
+            "senderThreadId": "sender_thread_id",
+            "receiverThreadIds": "receiver_thread_ids",
+            "reasoningEffort": "reasoning_effort",
+            "agentsStates": "agents_states",
+            "agentPath": "agent_path",
+            "agentThreadId": "agent_thread_id",
         }
         for source, target in rename.items():
             if source in normalized:
@@ -3106,6 +3995,19 @@ class CodexAppServerRegistry:
             raise
         finally:
             if shutdown_completed:
+                # Transport termination is authoritative even if a test
+                # double, or a reader cancellation race, did not deliver its
+                # normal EOF cleanup.  Only now is it safe to detach/finish
+                # the abandoned adapter.
+                for context in list(server._contexts_by_thread.values()):
+                    if context.process is process:
+                        server._detach_turn_context(context)
+                process.finish(
+                    130,
+                    reason,
+                    termination_kind="internal_abort",
+                )
+
                 async def _detach_shutdown_home() -> None:
                     async with self._lock:
                         if self._servers.get(home) is server:
@@ -3120,13 +4022,25 @@ class CodexAppServerRegistry:
                 await _settle_registry_cleanup(_detach_shutdown_home())
         return True
 
-    async def steer_turn(self, thread_id: str, content: str) -> bool:
+    async def steer_turn(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> bool:
         async with self._lock:
             home = self._thread_owners.get(thread_id)
             server = self._servers.get(home) if home else None
         if server is None:
             return False
-        return await server.steer_turn(thread_id, content)
+        if input_items is None:
+            return await server.steer_turn(thread_id, content)
+        return await server.steer_turn(
+            thread_id,
+            content,
+            input_items=input_items,
+        )
 
     async def read_rate_limits(
         self, codex_home: str | os.PathLike[str] | None,

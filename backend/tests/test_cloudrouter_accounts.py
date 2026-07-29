@@ -695,25 +695,146 @@ async def test_wallet_negative_one_remaining_means_unlimited(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_unrestricted_zero_balance_remains_available(tmp_path, monkeypatch):
+async def test_unrestricted_real_usage_shape_is_unlimited_and_json_safe(
+    tmp_path, monkeypatch,
+):
     store, account = await _add(tmp_path, monkeypatch)
-    monkeypatch.setattr(store, "_request_json", AsyncMock(return_value={
+    request = AsyncMock(return_value={
         "balance": 0,
         "isValid": True,
         "mode": "unrestricted",
         "planName": "钱包余额",
         "remaining": 0,
         "unit": "USD",
-    }))
+        "usage": {
+            "today": {
+                "requests": 2,
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "total_tokens": 13,
+                "cache_creation_tokens": 4,
+                "cache_read_tokens": 5,
+                "cost": 1.5,
+                "actual_cost": 0.75,
+                "average_duration_ms": float("nan"),
+            },
+            "total": {
+                "requests": 20,
+                "total_tokens": 130,
+                "actual_cost": 7.5,
+            },
+            "rpm": 1,
+            "tpm": 13,
+        },
+        "daily_usage": [{
+            "date": "2026-07-28",
+            "requests": 2,
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "total_tokens": 13,
+            "cache_read_tokens": 5,
+            "cache_write_tokens": 4,
+            "cost": 1.5,
+            "actual_cost": 0.75,
+            "average_duration_ms": float("inf"),
+        }],
+        "model_stats": [{
+            "model": "claude-test-model",
+            "requests": 2,
+            "total_tokens": 13,
+            "cost": 1.5,
+            "actual_cost": 0.75,
+            "account_cost": 0.5,
+            "average_duration_ms": float("-inf"),
+            "untrusted_extra": "must-not-be-forwarded",
+        }],
+    })
+    monkeypatch.setattr(store, "_request_json", request)
 
     snapshot = await store.fetch_usage(account.id)
+    cached = await store.fetch_usage(account.id)
 
     assert snapshot["mode"] == "unrestricted"
     assert snapshot["state"] == "active"
     assert snapshot["available"] is True
+    assert snapshot["known"] is True
+    assert snapshot["unlimited"] is True
     assert snapshot["currency"] == "USD"
-    assert snapshot["balance"] == 0
-    assert snapshot["remaining"] == 0
+    assert "balance" not in snapshot
+    assert "remaining" not in snapshot
+    assert "expires_at" not in snapshot
+    assert "days_until_expiry" not in snapshot
+    assert snapshot["quota"] is None
+    assert snapshot["windows"] == []
+    assert snapshot["usage"]["today"]["actual_cost"] == 0.75
+    assert snapshot["usage"]["today"]["cost"] == 1.5
+    assert "average_duration_ms" not in snapshot["usage"]["today"]
+    assert snapshot["usage"]["daily_usage"] == [{
+        "date": "2026-07-28",
+        "requests": 2,
+        "input_tokens": 10,
+        "output_tokens": 3,
+        "total_tokens": 13,
+        "cache_write_tokens": 4,
+        "cache_read_tokens": 5,
+        "cost": 1.5,
+        "actual_cost": 0.75,
+    }]
+    assert snapshot["usage"]["model_stats"] == [{
+        "model": "claude-test-model",
+        "requests": 2,
+        "total_tokens": 13,
+        "cost": 1.5,
+        "actual_cost": 0.75,
+        "account_cost": 0.5,
+    }]
+    assert cached == snapshot
+    request.assert_awaited_once()
+    assert json.loads(json.dumps(snapshot, allow_nan=False)) == snapshot
+    assert store.cached_quota_decision(account.id) == {
+        "available": True,
+        "known": True,
+        "reason": "active",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_stale_refresh_never_resurrects_zero_balance(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "_request_json", AsyncMock(return_value={
+        "balance": 0,
+        "isValid": True,
+        "mode": "unrestricted",
+        "remaining": 0,
+        "usage": {"today": {"actual_cost": 0.75}},
+    }))
+    success_snapshot = await store.fetch_usage(account.id, force=True)
+    assert success_snapshot["unlimited"] is True
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(side_effect=CloudRouterUpstreamError(
+            "upstream_unavailable", status_code=503,
+        )),
+    )
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["known"] is False
+    assert snapshot["stale"] is True
+    assert snapshot["unlimited"] is True
+    assert "balance" not in snapshot
+    assert "remaining" not in snapshot
+    assert snapshot["usage"]["today"]["actual_cost"] == 0.75
+    assert snapshot["fetched_at"] == success_snapshot["fetched_at"]
+    assert snapshot["refresh_failed_at"]
+    assert store.cached_quota_decision(account.id) == {
+        "available": True,
+        "known": False,
+        "reason": "upstream_unavailable",
+    }
 
 
 @pytest.mark.asyncio
@@ -784,7 +905,8 @@ async def test_timeout_or_5xx_returns_unknown_stale_without_disabling(
     store, account = await _add(tmp_path, monkeypatch)
     success = AsyncMock(return_value={"mode": "wallet", "status": "active", "balance": 5})
     monkeypatch.setattr(store, "_request_json", success)
-    assert (await store.fetch_usage(account.id, force=True))["known"] is True
+    success_snapshot = await store.fetch_usage(account.id, force=True)
+    assert success_snapshot["known"] is True
     monkeypatch.setattr(store, "_request_json", AsyncMock(side_effect=
         CloudRouterUpstreamError("upstream_unavailable", status_code=503)
     ))
@@ -796,6 +918,8 @@ async def test_timeout_or_5xx_returns_unknown_stale_without_disabling(
     assert snapshot["known"] is False
     assert snapshot["stale"] is True
     assert snapshot["last_known_available"] is True
+    assert snapshot["fetched_at"] == success_snapshot["fetched_at"]
+    assert snapshot["refresh_failed_at"]
     assert store.cached_quota_decision(account.id)["available"] is True
 
 

@@ -5,6 +5,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorSession
@@ -112,7 +113,11 @@ async def test_termination_cancellation_during_generation_commit_still_reaps_own
                 await operation
 
     stop.assert_awaited_once()
-    publish.assert_awaited_once_with(task_id, "completed")
+    publish.assert_awaited_once_with(
+        task_id,
+        "completed",
+        background_active=False,
+    )
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         instance = await db.get(Instance, instance_id)
@@ -121,6 +126,891 @@ async def test_termination_cancellation_during_generation_commit_still_reaps_own
         assert instance.status == "idle"
         assert instance.pid is None
         assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manager_stop_result",
+    [True, False, "raise_after_commit"],
+)
+async def test_local_termination_keeps_task_executing_until_exact_stop_reaps(
+    db_factory,
+    manager_stop_result,
+):
+    """Terminal state cannot overtake reap or be double-published on False."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    started_at = datetime.utcnow()
+    generation = "foreground-tail-1"
+    async with db_factory() as db:
+        task = Task(
+            title="stop-first review",
+            description="test",
+            status="executing",
+            started_at=started_at,
+            pty_background_generation=generation,
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="stop-first-owner",
+            status="running",
+            pid=54101,
+            current_task_id=task.id,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+
+    stop_entered = asyncio.Event()
+    allow_reap = asyncio.Event()
+    publish = AsyncMock()
+
+    async def stop_exact(stopped_instance_id, **kwargs):
+        assert stopped_instance_id == instance_id
+        assert kwargs["expected_task_id"] == task_id
+        assert kwargs["expected_pid"] == 54101
+        assert kwargs["expected_started_at"] == started_at
+        assert kwargs["task_status"] == "completed"
+        stop_entered.set()
+        await allow_reap.wait()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            owner = await db.get(Instance, instance_id)
+            task.status = "completed"
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = None
+            owner.status = "idle"
+            owner.pid = None
+            owner.current_task_id = None
+            await db.commit()
+        if manager_stop_result == "raise_after_commit":
+            # The process/DB transition succeeded but its own WS publication
+            # failed. Task termination must recover with one fenced publish.
+            raise RuntimeError("post-commit publication failed")
+        # This models InstanceManager.stop's single post-reap publication.
+        await publish(task_id, "completed", background_active=False)
+        return manager_stop_result
+
+    async with db_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "wait_for_task_launch_barrier",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "stop",
+                new_callable=AsyncMock,
+                side_effect=stop_exact,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new=publish,
+            ),
+        ):
+            operation = asyncio.create_task(
+                termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+            )
+            await stop_entered.wait()
+            async with db_factory() as observer:
+                task = await observer.get(Task, task_id)
+                owner = await observer.get(Instance, instance_id)
+                assert task.status == "executing"
+                assert task.completed_at is None
+                assert task.pty_background_generation == generation
+                assert owner.current_task_id == task_id
+                assert owner.pid == 54101
+            publish.assert_not_awaited()
+            allow_reap.set()
+            result = await operation
+
+    assert result.terminal_status == "completed"
+    publish.assert_awaited_once_with(
+        task_id,
+        "completed",
+        background_active=False,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "completed"
+        assert task.error_message == "superseded"
+        assert task.pty_background_generation is None
+
+
+@pytest.mark.asyncio
+async def test_local_termination_gate_blocks_pending_reclaim_during_cleanup(
+    db_factory,
+):
+    """A committed non-terminal gate prevents dequeue in the stop window."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+    from backend.services.task_queue import TaskQueue
+
+    async with db_factory() as db:
+        task = Task(
+            title="pending supersede gate",
+            description="test",
+            status="pending",
+        )
+        db.add(task)
+        await db.flush()
+        monitor = MonitorSession(
+            task_id=task.id,
+            agent_type="monitor",
+            source="ccm",
+            description="hold cleanup open",
+            status="running",
+        )
+        db.add(monitor)
+        await db.commit()
+        task_id = task.id
+        monitor_id = monitor.id
+
+    cleanup_entered = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    async def delayed_monitor_stop(session_id):
+        assert session_id == monitor_id
+        cleanup_entered.set()
+        await allow_cleanup.wait()
+
+    async with db_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.dispatcher,
+                "stop_monitor_session_process",
+                new_callable=AsyncMock,
+                side_effect=delayed_monitor_stop,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new_callable=AsyncMock,
+            ),
+        ):
+            operation = asyncio.create_task(
+                termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+            )
+            await cleanup_entered.wait()
+            async with db_factory() as observer:
+                task = await observer.get(Task, task_id)
+                assert task.status == "pending"
+                assert task.completed_at is None
+                assert (
+                    (task.metadata_ or {}).get("pr_review_superseded")
+                    is True
+                )
+                assert await TaskQueue(observer).dequeue() is None
+                await observer.rollback()
+            allow_cleanup.set()
+            result = await operation
+
+    assert result.terminal_status == "completed"
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        monitor = await db.get(MonitorSession, monitor_id)
+        assert task.status == "completed"
+        assert monitor.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_supersede_gate_rejects_late_auxiliary_api_admission(
+    client,
+    session_factory,
+):
+    """The committed gate rejects children after the first aux snapshot."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "auxiliary admission gate",
+            "description": "test",
+            "provider": "claude",
+            "enabled_skills": {
+                "monitor": True,
+                "sub-agent": True,
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "executing"
+        monitor = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="hold first snapshot open",
+            status="running",
+        )
+        db.add(monitor)
+        await db.commit()
+        monitor_id = monitor.id
+
+    first_stop_entered = asyncio.Event()
+    allow_first_stop = asyncio.Event()
+
+    async def delayed_first_stop(session_id):
+        assert session_id == monitor_id
+        first_stop_entered.set()
+        await allow_first_stop.wait()
+
+    start_monitor = MagicMock()
+    start_sub_agent = MagicMock()
+    async with session_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.dispatcher,
+                "stop_monitor_session_process",
+                new_callable=AsyncMock,
+                side_effect=delayed_first_stop,
+            ),
+            patch.object(
+                backend.main.dispatcher,
+                "start_monitor_session",
+                start_monitor,
+            ),
+            patch.object(
+                backend.main.dispatcher,
+                "start_sub_agent_session",
+                start_sub_agent,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new_callable=AsyncMock,
+            ),
+        ):
+            operation = asyncio.create_task(
+                termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+            )
+            await first_stop_entered.wait()
+            try:
+                async with session_factory() as observer:
+                    task = await observer.get(Task, task_id)
+                    assert task.status == "executing"
+                    assert (
+                        (task.metadata_ or {}).get("pr_review_superseded")
+                        is True
+                    )
+
+                monitor_response = await client.post(
+                    f"/api/tasks/{task_id}/monitor-sessions",
+                    json={"description": "too late"},
+                )
+                sub_agent_response = await client.post(
+                    f"/api/tasks/{task_id}/sub-agent-sessions",
+                    json={"name": "too late", "prompt": "work"},
+                )
+            finally:
+                allow_first_stop.set()
+            result = await operation
+
+    assert monitor_response.status_code == 400, monitor_response.text
+    assert sub_agent_response.status_code == 400, sub_agent_response.text
+    start_monitor.assert_not_called()
+    start_sub_agent.assert_not_called()
+    assert result.terminal_status == "completed"
+    async with session_factory() as db:
+        descriptions = list(
+            (
+                await db.execute(
+                    select(MonitorSession.description).where(
+                        MonitorSession.task_id == task_id
+                    )
+                )
+            ).scalars()
+        )
+    assert descriptions == ["hold first snapshot open"]
+
+
+@pytest.mark.asyncio
+async def test_local_termination_second_sweep_reaps_late_auxiliary(
+    db_factory,
+):
+    """A late DB-terminal row with runtime evidence is really stopped."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        task = Task(
+            title="late auxiliary sweep",
+            description="test",
+            status="executing",
+        )
+        db.add(task)
+        await db.flush()
+        initial = MonitorSession(
+            task_id=task.id,
+            agent_type="monitor",
+            source="ccm",
+            description="initial monitor",
+            status="running",
+        )
+        db.add(initial)
+        await db.commit()
+        task_id = task.id
+        initial_id = initial.id
+
+    stopped: list[tuple[str, int]] = []
+    late_session_id: int | None = None
+
+    async def stop_initial_and_land_late(session_id):
+        nonlocal late_session_id
+        assert session_id == initial_id
+        stopped.append(("monitor", session_id))
+        async with db_factory() as late_db:
+            late = MonitorSession(
+                task_id=task_id,
+                agent_type="sub_agent",
+                source="ccm",
+                description="bypassed late child",
+                status="completed",
+            )
+            late_db.add(late)
+            await late_db.commit()
+            late_session_id = late.id
+            backend.main.dispatcher._sub_agent_processes[late.id] = object()
+
+    async def stop_late(session_id):
+        assert session_id == late_session_id
+        stopped.append(("sub_agent", session_id))
+        backend.main.dispatcher._sub_agent_processes.pop(session_id, None)
+
+    try:
+        async with db_factory() as db:
+            with (
+                patch.object(
+                    backend.main.dispatcher,
+                    "abort_task_queue",
+                    new_callable=AsyncMock,
+                    return_value=0,
+                ),
+                patch.object(
+                    backend.main.dispatcher,
+                    "stop_monitor_session_process",
+                    new_callable=AsyncMock,
+                    side_effect=stop_initial_and_land_late,
+                ),
+                patch.object(
+                    backend.main.dispatcher,
+                    "stop_sub_agent_session_process",
+                    new_callable=AsyncMock,
+                    side_effect=stop_late,
+                ),
+                patch(
+                    "backend.services.task_events.broadcast_status_change",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                result = await termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+    finally:
+        if late_session_id is not None:
+            backend.main.dispatcher._sub_agent_processes.pop(
+                late_session_id,
+                None,
+            )
+
+    assert late_session_id is not None
+    assert stopped == [
+        ("monitor", initial_id),
+        ("sub_agent", late_session_id),
+    ]
+    assert result.terminal_status == "completed"
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        sessions = list(
+            (
+                await db.execute(
+                    select(MonitorSession)
+                    .where(MonitorSession.task_id == task_id)
+                    .order_by(MonitorSession.id)
+                )
+            ).scalars()
+        )
+    assert task.status == "completed"
+    assert [session.status for session in sessions] == [
+        "cancelled",
+        "completed",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_type", "session_status"),
+    (
+        ("monitor", "completed"),
+        ("sub_agent", "completed"),
+        ("sub_agent", "failed"),
+        ("sub_agent", "stopped"),
+    ),
+)
+async def test_local_termination_reaps_db_terminal_auxiliary_with_runtime(
+    db_factory,
+    agent_type,
+    session_status,
+):
+    """A DB terminal status cannot hide an exact live auxiliary generation."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        task = Task(
+            title=f"terminal {agent_type} runtime",
+            description="test",
+            status="executing",
+        )
+        db.add(task)
+        await db.flush()
+        session = MonitorSession(
+            task_id=task.id,
+            agent_type=agent_type,
+            source="ccm",
+            description=f"{session_status} but live",
+            status=session_status,
+        )
+        db.add(session)
+        await db.commit()
+        task_id = task.id
+        session_id = session.id
+
+    runtime_map = (
+        backend.main.dispatcher._monitor_processes
+        if agent_type == "monitor"
+        else backend.main.dispatcher._sub_agent_processes
+    )
+    runtime_map[session_id] = object()
+
+    async def stop_exact(stopped_session_id):
+        assert stopped_session_id == session_id
+        runtime_map.pop(session_id, None)
+
+    monitor_stop = AsyncMock(
+        side_effect=(
+            stop_exact
+            if agent_type == "monitor"
+            else AssertionError("wrong monitor registry")
+        )
+    )
+    sub_agent_stop = AsyncMock(
+        side_effect=(
+            stop_exact
+            if agent_type == "sub_agent"
+            else AssertionError("wrong sub-agent registry")
+        )
+    )
+    try:
+        async with db_factory() as db:
+            with (
+                patch.object(
+                    backend.main.dispatcher,
+                    "abort_task_queue",
+                    new_callable=AsyncMock,
+                    return_value=0,
+                ),
+                patch.object(
+                    backend.main.dispatcher,
+                    "stop_monitor_session_process",
+                    monitor_stop,
+                ),
+                patch.object(
+                    backend.main.dispatcher,
+                    "stop_sub_agent_session_process",
+                    sub_agent_stop,
+                ),
+                patch(
+                    "backend.services.task_events.broadcast_status_change",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                result = await termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+    finally:
+        runtime_map.pop(session_id, None)
+
+    expected_stop = (
+        monitor_stop if agent_type == "monitor" else sub_agent_stop
+    )
+    unexpected_stop = (
+        sub_agent_stop if agent_type == "monitor" else monitor_stop
+    )
+    expected_stop.assert_awaited_once_with(session_id)
+    unexpected_stop.assert_not_awaited()
+    assert result.terminal_status == "completed"
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        session = await db.get(MonitorSession, session_id)
+    assert task.status == "completed"
+    assert session.status == session_status
+
+
+@pytest.mark.asyncio
+async def test_local_termination_skips_historical_terminal_auxiliary_rows(
+    db_factory,
+):
+    """Terminal rows absent from every exact registry are already reaped."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        task = Task(
+            title="historical auxiliary rows",
+            description="test",
+            status="executing",
+        )
+        db.add(task)
+        await db.flush()
+        sessions = [
+            MonitorSession(
+                task_id=task.id,
+                agent_type=agent_type,
+                source="ccm",
+                description=f"historical {agent_type} {status}",
+                status=status,
+            )
+            for agent_type, status in (
+                ("monitor", "completed"),
+                ("sub_agent", "completed"),
+                ("sub_agent", "failed"),
+                ("sub_agent", "stopped"),
+            )
+        ]
+        db.add_all(sessions)
+        await db.commit()
+        task_id = task.id
+        session_ids = [session.id for session in sessions]
+
+    monitor_ids, sub_agent_ids = (
+        backend.main.dispatcher._active_auxiliary_session_ids()
+    )
+    assert not (set(session_ids) & (monitor_ids | sub_agent_ids))
+    monitor_stop = AsyncMock(
+        side_effect=AssertionError("historical monitor was stopped")
+    )
+    sub_agent_stop = AsyncMock(
+        side_effect=AssertionError("historical sub-agent was stopped")
+    )
+    async with db_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.dispatcher,
+                "stop_monitor_session_process",
+                monitor_stop,
+            ),
+            patch.object(
+                backend.main.dispatcher,
+                "stop_sub_agent_session_process",
+                sub_agent_stop,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await termination.terminate_local_task_generation(
+                task_id,
+                db,
+                reason="superseded",
+            )
+
+    monitor_stop.assert_not_awaited()
+    sub_agent_stop.assert_not_awaited()
+    assert result.terminal_status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_local_termination_fails_closed_on_retained_terminal_runtime(
+    db_factory,
+):
+    """A stop return is insufficient while exact registry evidence remains."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        task = Task(
+            title="retained completed monitor",
+            description="test",
+            status="executing",
+        )
+        db.add(task)
+        await db.flush()
+        monitor = MonitorSession(
+            task_id=task.id,
+            agent_type="monitor",
+            source="ccm",
+            description="completed but retained",
+            status="completed",
+        )
+        db.add(monitor)
+        await db.commit()
+        task_id = task.id
+        monitor_id = monitor.id
+
+    backend.main.dispatcher._monitor_processes[monitor_id] = object()
+    try:
+        async with db_factory() as db:
+            with (
+                patch.object(
+                    backend.main.dispatcher,
+                    "abort_task_queue",
+                    new_callable=AsyncMock,
+                    return_value=0,
+                ),
+                patch.object(
+                    backend.main.dispatcher,
+                    "stop_monitor_session_process",
+                    new_callable=AsyncMock,
+                    return_value=None,
+                ) as stop,
+            ):
+                with pytest.raises(
+                    termination.TaskAuxiliaryTerminationConflict
+                ):
+                    await termination.terminate_local_task_generation(
+                        task_id,
+                        db,
+                        reason="superseded",
+                    )
+    finally:
+        backend.main.dispatcher._monitor_processes.pop(monitor_id, None)
+
+    stop.assert_awaited_once_with(monitor_id)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "executing"
+    assert (task.metadata_ or {}).get("pr_review_superseded") is True
+
+
+@pytest.mark.asyncio
+async def test_local_termination_stop_failure_preserves_active_generation(
+    db_factory,
+):
+    """An unconfirmed reap preserves every piece of recovery evidence."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    started_at = datetime.utcnow()
+    generation = "unreaped-tail"
+    async with db_factory() as db:
+        task = Task(
+            title="unreaped review",
+            description="test",
+            status="executing",
+            started_at=started_at,
+            pty_background_generation=generation,
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="unreaped-owner",
+            status="running",
+            pid=54201,
+            current_task_id=task.id,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+
+    async with db_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "wait_for_task_launch_barrier",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "stop",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new_callable=AsyncMock,
+            ) as publish,
+        ):
+            with pytest.raises(termination.TaskProcessTerminationConflict):
+                await termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+
+    publish.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = await db.get(Instance, instance_id)
+        assert task.status == "executing"
+        assert task.completed_at is None
+        assert task.error_message is None
+        assert task.pty_background_generation == generation
+        assert (task.metadata_ or {}).get("pr_review_superseded") is True
+        assert owner.status == "running"
+        assert owner.current_task_id == task_id
+        assert owner.pid == 54201
+        assert owner.started_at == started_at
+
+
+@pytest.mark.asyncio
+async def test_local_termination_rejects_new_background_marker_aba(
+    db_factory,
+):
+    """An old stop cannot clear or publish over a newly armed PTY epoch."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    started_at = datetime.utcnow()
+    old_generation = "background-epoch-old"
+    new_generation = "background-epoch-new"
+    async with db_factory() as db:
+        task = Task(
+            title="background ABA",
+            description="test",
+            status="executing",
+            started_at=started_at,
+            pty_background_generation=old_generation,
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="background-aba-owner",
+            status="running",
+            pid=54301,
+            current_task_id=task.id,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+
+    async def stop_old_generation(_instance_id, **_kwargs):
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            owner = await db.get(Instance, instance_id)
+            owner.status = "idle"
+            owner.pid = None
+            owner.current_task_id = None
+            task.pty_background_generation = new_generation
+            await db.commit()
+        return True
+
+    async with db_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "wait_for_task_launch_barrier",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "stop",
+                new_callable=AsyncMock,
+                side_effect=stop_old_generation,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new_callable=AsyncMock,
+            ) as publish,
+        ):
+            with pytest.raises(
+                termination.TaskGenerationTerminationConflict,
+                match="newer PTY background generation",
+            ):
+                await termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+
+    publish.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "executing"
+        assert task.completed_at is None
+        assert task.pty_background_generation == new_generation
+        assert (task.metadata_ or {}).get("pr_review_superseded") is True
 
 
 @pytest.mark.asyncio
@@ -247,6 +1137,27 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
         task.status = "executing"
         await db.commit()
 
+    public_snapshot = await client.get(f"/api/tasks/{task_id}")
+    assert public_snapshot.status_code == 200, public_snapshot.text
+    assert "pty_background_generation" not in public_snapshot.json()
+    termination_snapshot = await client.get(
+        f"/api/tasks/{task_id}/terminate-generation"
+    )
+    assert termination_snapshot.status_code == 200, termination_snapshot.text
+    assert termination_snapshot.json()["pty_background_generation"] is None
+
+    missing_marker = await client.post(
+        f"/api/tasks/{task_id}/terminate-generation",
+        json={
+            "expected_status": "executing",
+            "expected_retry_count": 0,
+            "expected_instance_id": None,
+            "expected_started_at": None,
+            "expected_completed_at": None,
+        },
+    )
+    assert missing_marker.status_code == 422, missing_marker.text
+
     with patch.object(
         backend.main.dispatcher,
         "abort_task_queue",
@@ -261,6 +1172,7 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
+                "expected_pty_background_generation": None,
             },
         )
 
@@ -269,6 +1181,68 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
     assert response.json()["status"] == "completed"
     assert response.json()["error_message"] == "Superseded by new PR push"
     assert response.json()["metadata_"]["pr_review_superseded"] is True
+
+
+@pytest.mark.asyncio
+async def test_hidden_termination_protocol_requires_service_identity(
+    session_factory,
+):
+    """An administrator JWT cannot read or mutate the opaque Worker fence."""
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from backend.api.tasks import _internal_pr_review_termination_task
+    from backend.config import settings
+
+    async with session_factory() as db:
+        task = Task(
+            title="internal termination auth",
+            description="test",
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": f"/api/tasks/{task_id}/terminate-generation",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+    request.state.user_id = None
+    request.state.user_role = "super_admin"
+    request.state.auth_type = "jwt"
+
+    original_auth_token = settings.auth_token
+    settings.auth_token = "worker-internal-test-token"
+    try:
+        async with session_factory() as db:
+            with pytest.raises(
+                HTTPException,
+                match="Internal service authentication required",
+            ) as denied:
+                await _internal_pr_review_termination_task(
+                    task_id,
+                    request,
+                    db,
+                )
+            assert denied.value.status_code == 403
+
+        request.state.auth_type = "token"
+        async with session_factory() as db:
+            authorized = await _internal_pr_review_termination_task(
+                task_id,
+                request,
+                db,
+            )
+            assert authorized.id == task_id
+    finally:
+        settings.auth_token = original_auth_token
 
 
 @pytest.mark.asyncio
@@ -334,11 +1308,12 @@ async def test_termination_retries_cancelled_ccm_auxiliary_cleanup(db_factory):
         async with db_factory() as db:
             task = await db.get(Task, task_id)
             monitor = await db.get(MonitorSession, monitor_id)
-            assert task.status == "completed"
-            assert monitor.status == "cancelled"
+            assert task.status == "executing"
+            assert (task.metadata_ or {}).get("pr_review_superseded") is True
+            assert monitor.status == "running"
 
-        # The retry includes already-cancelled CCM sessions, so retained exact
-        # process evidence is not silently forgotten.
+        # The retry sees the still-running durable row, reaps it, and only then
+        # publishes the Task/auxiliary terminal states together.
         async with db_factory() as db:
             result = await termination.terminate_local_task_generation(
                 task_id,
@@ -427,6 +1402,7 @@ async def test_hidden_termination_rejects_stale_remote_generation_before_abort(
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
+                "expected_pty_background_generation": None,
             },
         )
 
@@ -436,6 +1412,89 @@ async def test_hidden_termination_rejects_stale_remote_generation_before_abort(
         task = await db.get(Task, task_id)
         assert task.status == "pending"
         assert task.retry_count == 1
+        assert (
+            (task.metadata_ or {}).get("pr_review_superseded")
+            is not True
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshotted_generation", "new_generation"),
+    (
+        (None, "worker-tail-after-null-snapshot"),
+        ("worker-tail-a", "worker-tail-b"),
+    ),
+)
+async def test_hidden_termination_rejects_background_generation_aba(
+    client,
+    session_factory,
+    snapshotted_generation,
+    new_generation,
+):
+    """The Worker compares the POST body token, never arrival-time state."""
+
+    import backend.main
+
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "remote background ABA",
+            "description": "test",
+            "tags": ["pr-review"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "executing"
+        task.pty_background_generation = snapshotted_generation
+        await db.commit()
+
+    public_snapshot = await client.get(f"/api/tasks/{task_id}")
+    assert public_snapshot.status_code == 200, public_snapshot.text
+    assert "pty_background_generation" not in public_snapshot.json()
+    snapshot_response = await client.get(
+        f"/api/tasks/{task_id}/terminate-generation"
+    )
+    assert snapshot_response.status_code == 200, snapshot_response.text
+    snapshot = snapshot_response.json()
+    assert (
+        snapshot["pty_background_generation"]
+        == snapshotted_generation
+    )
+
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.pty_background_generation = new_generation
+        await db.commit()
+
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+    ) as abort:
+        response = await client.post(
+            f"/api/tasks/{task_id}/terminate-generation",
+            json={
+                "expected_status": snapshot["status"],
+                "expected_retry_count": snapshot["retry_count"],
+                "expected_instance_id": snapshot["instance_id"],
+                "expected_started_at": snapshot["started_at"],
+                "expected_completed_at": snapshot["completed_at"],
+                "expected_pty_background_generation": (
+                    snapshot["pty_background_generation"]
+                ),
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "executing"
+        assert task.pty_background_generation == new_generation
         assert (
             (task.metadata_ or {}).get("pr_review_superseded")
             is not True

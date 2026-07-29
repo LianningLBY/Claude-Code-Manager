@@ -105,6 +105,7 @@ class WebSocketBroadcaster:
             channel == "tasks"
             and data.get("event") == "status_change"
             and data.get("new_status") in ("completed", "failed", "cancelled")
+            and data.get("background_active") is not True
             and self.db_factory
         ):
             asyncio.create_task(self._notify_shared_status(data))

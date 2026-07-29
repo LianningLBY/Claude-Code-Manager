@@ -300,6 +300,45 @@ def test_rsync_transport_forces_single_identity(tmp_path):
     assert known_hosts.stat().st_mode & 0o777 == 0o600
 
 
+async def test_copy_file_uses_secluded_remote_arguments(
+    tmp_path,
+    monkeypatch,
+):
+    executor = SSHExecutor(
+        "10.0.0.9",
+        "ubuntu",
+        str(_private_key_file(tmp_path)),
+    )
+    executor.run = AsyncMock(return_value=(0, ""))
+    monkeypatch.setattr(
+        executor,
+        "_rsync_ssh_command",
+        lambda: "ssh-safe",
+    )
+    captured = {}
+
+    def fake_run(command, **_kwargs):
+        captured["command"] = command
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "backend.services.ssh_executor.subprocess.run",
+        fake_run,
+    )
+    local = tmp_path / "attachment.txt"
+    local.write_text("attachment", encoding="utf-8")
+
+    await executor.copy_file(
+        str(local),
+        "/srv/ccm/uploads/path with spaces\nand-newline",
+    )
+
+    assert "--secluded-args" in captured["command"]
+    assert captured["command"][-1].endswith(
+        ":/srv/ccm/uploads/path with spaces\nand-newline"
+    )
+
+
 def test_worker_known_hosts_is_scoped_to_cloud_instance(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 

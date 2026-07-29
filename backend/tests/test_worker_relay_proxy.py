@@ -204,6 +204,84 @@ async def test_authoritative_worker_apply_preserves_supersede_marker(
         }
 
 
+@pytest.mark.parametrize(
+    ("remote_value", "should_update", "expected_marker"),
+    [
+        (True, True, worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL),
+        (False, True, None),
+        (None, False, "manager-owned"),
+        (1, False, "manager-owned"),
+        ("true", False, "manager-owned"),
+    ],
+)
+async def test_authoritative_worker_background_uses_only_strict_boolean(
+    session_factory,
+    remote_value,
+    should_update,
+    expected_marker,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        pty_background_generation="manager-owned",
+    )
+    observed = worker_relay_module.worker_task_generation(task)
+    assert observed is not None
+    remote = _remote_task(
+        task,
+        background_active=remote_value,
+        # A remote token is never a mirror-safe field.
+        pty_background_generation="remote-secret-generation",
+    )
+
+    async with session_factory() as db:
+        resulting = await (
+            worker_relay_module.apply_authoritative_worker_task(
+                db,
+                observed,
+                remote,
+            )
+        )
+
+    assert resulting is not None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.pty_background_generation == expected_marker
+    if should_update:
+        assert (
+            current.pty_background_generation
+            != "remote-secret-generation"
+        )
+
+
+async def test_authoritative_worker_background_missing_field_preserves_marker(
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        pty_background_generation="manager-owned",
+    )
+    observed = worker_relay_module.worker_task_generation(task)
+    assert observed is not None
+
+    async with session_factory() as db:
+        resulting = await (
+            worker_relay_module.apply_authoritative_worker_task(
+                db,
+                observed,
+                _remote_task(task),
+            )
+        )
+
+    assert resulting is not None
+    assert resulting.pty_background_generation == "manager-owned"
+
+
 def test_worker_proxy_ssh_is_scoped_to_cloud_instance(monkeypatch):
     ssh_factory = Mock()
     monkeypatch.setattr(worker_proxy_module, "SSHExecutor", ssh_factory)
@@ -704,6 +782,309 @@ async def test_relay_status_change_syncs_task(relay, session_factory):
         assert current.status == "completed"
         assert current.completed_at is not None
         assert current.error_message is None
+    assert relay.broadcaster.sent == [
+        (
+            "tasks",
+            {
+                "event": "status_change",
+                "task_id": t.id,
+                "old_status": "in_progress",
+                "new_status": "completed",
+                "background_active": False,
+            },
+        )
+    ]
+
+
+async def test_relay_status_uses_authoritative_background_not_event_payload(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status="completed",
+            completed_at=None,
+            background_active=True,
+        )
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "completed",
+                "background_active": False,
+                "pty_background_generation": "remote-secret",
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert (
+        current.pty_background_generation
+        == worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL
+    )
+    assert broadcaster.sent == [
+        (
+            "tasks",
+            {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "completed",
+                "background_active": True,
+            },
+        )
+    ]
+
+
+async def test_relay_background_event_syncs_controlled_marker(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(task, background_active=True)
+    )
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": task.id,
+                "background_active": True,
+                "pty_background_generation": "remote-secret",
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert (
+        current.pty_background_generation
+        == worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL
+    )
+    assert broadcaster.sent == [
+        (
+            f"task:{task.id}",
+            {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": task.id,
+                "background_active": True,
+            },
+        )
+    ]
+
+    relay._fetch_task_snapshot.return_value = _remote_task(
+        task,
+        background_active=False,
+    )
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "background_activity",
+                "task_id": task.id,
+                "background_active": False,
+            },
+        },
+        worker,
+    )
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.pty_background_generation is None
+    assert broadcaster.sent[-1] == (
+        "tasks",
+        {
+            "event": "background_activity",
+            "event_type": "background_activity",
+            "task_id": task.id,
+            "background_active": False,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("event_value", "snapshot_value"),
+    [
+        ("true", True),
+        (1, True),
+        (True, False),
+        (True, None),
+        (True, "true"),
+    ],
+)
+async def test_relay_background_event_rejects_unconfirmed_boolean(
+    relay,
+    broadcaster,
+    session_factory,
+    event_value,
+    snapshot_value,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            background_active=snapshot_value,
+        )
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "background_activity",
+                "task_id": task.id,
+                "background_active": event_value,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.pty_background_generation is None
+    assert broadcaster.sent == []
+    if type(event_value) is bool:
+        relay._fetch_task_snapshot.assert_awaited_once()
+    else:
+        relay._fetch_task_snapshot.assert_not_awaited()
+
+
+async def test_delayed_background_event_cannot_publish_after_marker_changes(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    relay._tasks[worker.id] = {task.id}
+    fetch_started = asyncio.Event()
+    release_fetch = asyncio.Event()
+
+    async def delayed_snapshot(*_args, **_kwargs):
+        fetch_started.set()
+        await release_fetch.wait()
+        return _remote_task(task, background_active=True)
+
+    relay._fetch_task_snapshot = AsyncMock(side_effect=delayed_snapshot)
+    handling = asyncio.create_task(
+        relay._handle(
+            {
+                "channel": "tasks",
+                "data": {
+                    "event": "background_activity",
+                    "task_id": task.id,
+                    "background_active": True,
+                },
+            },
+            worker,
+        )
+    )
+    await fetch_started.wait()
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(
+                pty_background_generation=(
+                    worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL
+                )
+            )
+        )
+        await db.commit()
+    release_fetch.set()
+    await handling
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert (
+        current.pty_background_generation
+        == worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL
+    )
+    assert broadcaster.sent == []
+
+
+async def test_background_publication_fence_drops_superseded_result(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(task, background_active=True)
+    )
+    real_publish = relay._publish_background_generation
+
+    async def clear_before_publication(generation, *, channels):
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(pty_background_generation=None)
+            )
+            await db.commit()
+        return await real_publish(generation, channels=channels)
+
+    relay._publish_background_generation = AsyncMock(
+        side_effect=clear_before_publication
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "background_activity",
+                "task_id": task.id,
+                "background_active": True,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.pty_background_generation is None
+    assert broadcaster.sent == []
 
 
 async def test_relay_conflict_is_terminal_with_timestamp_and_error(
@@ -1141,6 +1522,80 @@ async def test_reconnect_backfill_cannot_write_after_task_moves_local(
     assert broadcaster.sent == []
 
 
+async def test_backfill_syncs_and_broadcasts_background_marker(
+    relay,
+    broadcaster,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return []
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(task, background_active=True)
+    )
+
+    await relay._backfill_missing_logs(worker, {task.id})
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert (
+        current.pty_background_generation
+        == worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL
+    )
+    expected = {
+        "event": "background_activity",
+        "event_type": "background_activity",
+        "task_id": task.id,
+        "background_active": True,
+    }
+    assert broadcaster.sent == [
+        ("tasks", expected),
+        (f"task:{task.id}", expected),
+    ]
+
+    broadcaster.sent.clear()
+    relay._fetch_task_snapshot.return_value = _remote_task(
+        task,
+        background_active=False,
+    )
+    await relay._backfill_missing_logs(worker, {task.id})
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.pty_background_generation is None
+    expected["background_active"] = False
+    assert broadcaster.sent == [
+        ("tasks", expected),
+        (f"task:{task.id}", expected),
+    ]
+
+
 async def test_reconnect_exhaustion_cannot_fail_same_worker_retry(
     relay,
     broadcaster,
@@ -1229,9 +1684,96 @@ async def test_reconnect_exhaustion_fails_only_exact_generation_and_publishes(
                 "event": "status_change",
                 "task_id": task.id,
                 "new_status": "failed",
+                "background_active": False,
             },
         )
     ]
+
+
+async def test_reconnect_exhaustion_fails_completed_background_and_clears_marker(
+    relay,
+    broadcaster,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        pty_background_generation=(
+            worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL
+        ),
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay.ensure_connection = AsyncMock(
+        side_effect=OSError("still disconnected")
+    )
+    monkeypatch.setattr(
+        worker_relay_module.asyncio,
+        "sleep",
+        AsyncMock(),
+    )
+
+    await relay._reconnect(worker)
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "failed"
+    assert current.pty_background_generation is None
+    assert current.completed_at is not None
+    assert "无法重连" in current.error_message
+    assert broadcaster.sent == [
+        (
+            "tasks",
+            {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "failed",
+                "background_active": False,
+            },
+        )
+    ]
+
+
+async def test_recover_includes_completed_task_with_background_marker(
+    relay,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    active = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="executing",
+    )
+    completed_background = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        pty_background_generation=(
+            worker_relay_module._WORKER_BACKGROUND_MIRROR_SENTINEL
+        ),
+    )
+    completed_plain = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    relay.subscribe_task = AsyncMock()
+    relay._backfill_missing_logs = AsyncMock()
+
+    await relay.recover(worker)
+
+    subscribed = {
+        call.args[1]
+        for call in relay.subscribe_task.await_args_list
+    }
+    assert subscribed == {active.id, completed_background.id}
+    assert completed_plain.id not in subscribed
+    relay._backfill_missing_logs.assert_awaited_once_with(
+        worker,
+        {active.id, completed_background.id},
+    )
 
 
 async def test_reconnect_snapshot_does_not_pop_new_connection_tasks(
@@ -4335,6 +4877,16 @@ async def test_delete_worker_task_remote_first_then_cleans_exact_manager_mirror(
         status="completed",
     )
     async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(
+                pty_background_generation=(
+                    worker_relay_module
+                    ._WORKER_BACKGROUND_MIRROR_SENTINEL
+                )
+            )
+        )
         log = LogEntry(
             task_id=task.id,
             event_type="message",

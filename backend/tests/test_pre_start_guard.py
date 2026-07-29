@@ -16,6 +16,11 @@ def _make_executable(path: Path, body: str) -> None:
     path.chmod(0o700)
 
 
+def _write_secure(path: Path, body: str) -> None:
+    path.write_text(body)
+    path.chmod(0o600)
+
+
 def _run_pre_start(
     tmp_path: Path,
     guard_rc: int,
@@ -181,7 +186,8 @@ def test_pre_start_uses_historical_default_when_dotenv_is_missing(
 def test_pre_start_authoritative_lease_port_precedes_dotenv(tmp_path):
     backups = tmp_path / "backups"
     backups.mkdir()
-    (backups / "deployment-lease.json").write_text(
+    _write_secure(
+        backups / "deployment-lease.json",
         '{"status":"starting","owner_token":"token","port":8543}'
     )
     (tmp_path / ".env").write_text("PORT=8003\n")
@@ -199,7 +205,8 @@ def test_pre_start_clean_terminal_lease_does_not_override_new_dotenv_port(
 ):
     backups = tmp_path / "backups"
     backups.mkdir()
-    (backups / "deployment-lease.json").write_text(
+    _write_secure(
+        backups / "deployment-lease.json",
         '{"status":"completed","owner_token":"old","port":8002,'
         '"deployment_incomplete":false}'
     )

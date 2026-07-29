@@ -195,6 +195,7 @@ export interface Task {
   selected_user_skills: number[] | null;
   shared_from_id: number | null;
   active_sub_agents: number;
+  background_active?: boolean;
   tags: string[] | null;
   metadata_: {
     image_paths?: string[];
@@ -268,6 +269,9 @@ export interface ChatMessage {
   /** Native Codex ids used to resolve a safe thread/fork boundary. */
   item_id?: string | null;
   turn_id?: string | null;
+  /** Native item metadata used for narrowly-scoped compatibility filtering. */
+  native_item_type?: string | null;
+  native_item_status?: string | null;
   /** True when this row came from persisted chat history, not live optimism. */
   persisted?: boolean;
   // 权限透传卡片（event_type === 'permission_request' 时存在）
@@ -503,6 +507,39 @@ export interface CloudRouterQuotaTotal {
   currency?: string | null;
 }
 
+export interface CloudRouterUsageMetrics {
+  requests?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  cache_creation_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  actual_cost?: number | null;
+  cost?: number | null;
+  account_cost?: number | null;
+  average_duration_ms?: number | null;
+  rpm?: number | null;
+  tpm?: number | null;
+  model?: string | null;
+  date?: string | null;
+}
+
+export type CloudRouterUsageBreakdown =
+  | CloudRouterUsageMetrics
+  | CloudRouterUsageMetrics[]
+  | Record<string, CloudRouterUsageMetrics>;
+
+export interface CloudRouterUsageDetails {
+  today?: CloudRouterUsageMetrics | null;
+  total?: CloudRouterUsageMetrics | null;
+  model_stats?: CloudRouterUsageBreakdown | null;
+  daily_usage?: CloudRouterUsageBreakdown | null;
+  rpm?: number | null;
+  tpm?: number | null;
+  average_duration_ms?: number | null;
+}
+
 export interface CloudRouterApiQuota {
   state: string;
   status?: string | null;
@@ -516,12 +553,16 @@ export interface CloudRouterApiQuota {
   available?: boolean;
   known?: boolean;
   stale?: boolean;
+  /** Explicit no-spend-cap marker. Older servers may expose only mode=unrestricted. */
+  unlimited?: boolean;
   reason?: string | null;
   plan_name?: string | null;
   expires_at?: string | number | null;
   days_until_expiry?: number | null;
   fetched_at?: string | number | null;
-  usage?: Record<string, unknown> | null;
+  /** Time of the latest failed refresh when stale data is retained. */
+  refresh_failed_at?: string | number | null;
+  usage?: CloudRouterUsageDetails | null;
   account_id?: string;
   /** Gateway label for the individual credential, when supplied. */
   key_name?: string | null;
@@ -573,6 +614,19 @@ export interface CloudRouterAccountProjection {
   cleanup_pending?: boolean;
   supported_models?: string[];
   api_quota?: CloudRouterApiQuota | null;
+}
+
+export interface InjectTaskAttachments {
+  /** All uploaded server-side paths, in the same order as attachments. */
+  file_paths: string[];
+  /** Image-only subset retained for backwards-compatible inject handlers. */
+  image_paths: string[];
+  attachments: FileAttachment[];
+}
+
+export interface InjectTaskCapabilities {
+  attachment_protocol?: number;
+  codex_native_inputs?: boolean;
 }
 
 export interface PoolAccountUsage extends CloudRouterAccountProjection {
@@ -1132,8 +1186,22 @@ export const api = {
   // Chat (task-based)
   sendTaskChat: (taskId: number, message: string, filePaths?: string[], secretIds?: number[], model?: string | null, expectedRouting?: TaskRoutingExpectation) =>
     request<{ ok: boolean; pid: number; instance_id: number; session_id: string }>(`/api/tasks/${taskId}/chat`, { method: 'POST', body: JSON.stringify({ message, file_paths: filePaths, secret_ids: secretIds, ...(model ? { model } : {}), expected_routing: expectedRouting }) }),
-  injectTaskMessage: (taskId: number, message: string, expectedRouting?: TaskRoutingExpectation) =>
-    request<{ ok: boolean; injected: boolean }>(`/api/tasks/${taskId}/inject`, { method: 'POST', body: JSON.stringify({ message, expected_routing: expectedRouting }) }),
+  getInjectCapabilities: (taskId: number) =>
+    request<InjectTaskCapabilities>(`/api/tasks/${taskId}/inject-capabilities`),
+  injectTaskMessage: (
+    taskId: number,
+    message: string,
+    expectedRouting?: TaskRoutingExpectation,
+    uploads?: InjectTaskAttachments,
+  ) =>
+    request<{ ok: boolean; injected: boolean; attachment_count?: number }>(`/api/tasks/${taskId}/inject`, {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        expected_routing: expectedRouting,
+        ...(uploads || {}),
+      }),
+    }),
   // touch=true 仅在用户真正打开聊天（首页加载）时传——后端以此更新访问排序；
   // 分页翻旧消息不传，避免后台轮询/旧版客户端把任务在列表里来回顶到最前
   getTaskChatHistory: (taskId: number, compact = true, limit = 0, beforeId = 0, touch = false) =>

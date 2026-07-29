@@ -14,7 +14,11 @@ logger = logging.getLogger(__name__)
 
 
 async def broadcast_status_change(
-    task_id: int, new_status: str, instance_id: int | None = None
+    task_id: int,
+    new_status: str,
+    instance_id: int | None = None,
+    *,
+    background_active: bool | None = None,
 ) -> None:
     """Broadcast a task status_change on the "tasks" channel (best-effort)."""
     try:
@@ -27,6 +31,8 @@ async def broadcast_status_change(
         }
         if instance_id is not None:
             data["instance_id"] = instance_id
+        if type(background_active) is bool:
+            data["background_active"] = background_active
         await broadcaster.broadcast("tasks", data)
     except Exception:
         # 广播失败不能影响状态写入本身；前端有 5s 轮询兜底

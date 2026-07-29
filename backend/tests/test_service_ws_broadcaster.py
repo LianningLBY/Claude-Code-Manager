@@ -143,6 +143,44 @@ async def test_broadcast_no_subscribers():
 
 
 @pytest.mark.asyncio
+async def test_terminal_share_notification_waits_for_background_tail():
+    b = WebSocketBroadcaster()
+    b.db_factory = object()
+    b._notify_shared_status = AsyncMock()
+
+    await b.broadcast(
+        "tasks",
+        {
+            "event": "status_change",
+            "task_id": 17,
+            "new_status": "completed",
+            "background_active": True,
+        },
+    )
+    await asyncio.sleep(0)
+    b._notify_shared_status.assert_not_awaited()
+
+    await b.broadcast(
+        "tasks",
+        {
+            "event": "status_change",
+            "task_id": 17,
+            "new_status": "completed",
+            "background_active": False,
+        },
+    )
+    await asyncio.sleep(0)
+    b._notify_shared_status.assert_awaited_once_with(
+        {
+            "event": "status_change",
+            "task_id": 17,
+            "new_status": "completed",
+            "background_active": False,
+        }
+    )
+
+
+@pytest.mark.asyncio
 async def test_broadcast_survives_concurrent_unsubscribe():
     """send 悬挂期间并发退订不得炸掉 broadcast。
 

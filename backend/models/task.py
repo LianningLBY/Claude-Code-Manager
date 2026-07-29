@@ -58,6 +58,13 @@ class Task(Base):
     plan_content: Mapped[str | None] = mapped_column(Text, nullable=True)  # Claude's proposed plan
     plan_approved: Mapped[bool | None] = mapped_column(default=None)  # None=pending, True=approved, False=rejected
     session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Exact Claude PTY background epoch.  A persistent session can
+    # finish foreground turn A, start turn B, and only then deliver A's late
+    # autonomous sentinel.  The token prevents that old sentinel from
+    # terminalizing B (task_id/session_id alone are vulnerable to ABA).
+    pty_background_generation: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     last_cwd: Mapped[str | None] = mapped_column(String(500), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     provider: Mapped[str] = mapped_column(String(20), default="claude", server_default="claude")
@@ -92,6 +99,12 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def background_active(self) -> bool:
+        """Public boolean view; never expose the internal generation token."""
+
+        return self.pty_background_generation is not None
 
 
 def _configure_task_properties():

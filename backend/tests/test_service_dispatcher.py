@@ -6,6 +6,7 @@ import sys
 import pytest
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -372,6 +373,62 @@ async def test_lifecycle_success(db_factory):
         assert t.status == "completed"
 
     assert d.broadcaster.broadcast.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_defers_pr_completion_until_background_epoch_finishes(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    d._handle_pr_review_completion = AsyncMock()
+
+    async with db_factory() as db:
+        inst = Instance(name="background-pr-worker")
+        task = Task(
+            title="background PR review",
+            description="review",
+            target_repo="/repo",
+            metadata_={"pr_review_id": 77},
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_id = task.id
+        task_obj = task
+
+    async def wait_and_arm_background():
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            current.pty_background_generation = "exact-background-epoch"
+            await db.commit()
+        return 0
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.wait = AsyncMock(side_effect=wait_and_arm_background)
+    d.instance_manager.processes = {inst_id: mock_proc}
+
+    await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "completed"
+        assert current.pty_background_generation == (
+            "exact-background-epoch"
+        )
+    d._handle_pr_review_completion.assert_not_awaited()
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.pty_background_generation = None
+        await db.commit()
+    await d.instance_manager.pty_background_completion_handler(task_id)
+    d._handle_pr_review_completion.assert_awaited_once()
+    assert (
+        d._handle_pr_review_completion.await_args.args[0].id == task_id
+    )
 
 
 @pytest.mark.asyncio
@@ -4925,6 +4982,64 @@ async def test_task_status_publication_fence_rejects_reclaimed_generation(
 
 
 @pytest.mark.asyncio
+async def test_completion_publication_fence_rejects_late_background_arm(
+    db_factory,
+):
+    """A background epoch armed after commit suppresses the stale terminal event."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="late-background-arm")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="late-background-arm",
+            status="executing",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        lifecycle_generation = d._task_lifecycle_generation(task)
+
+    completion_committed = asyncio.Event()
+    release_publication = asyncio.Event()
+    real_publish = d._broadcast_task_status_generation
+
+    async def arm_between_commit_and_publication(generation, **kwargs):
+        completion_committed.set()
+        await release_publication.wait()
+        return await real_publish(generation, **kwargs)
+
+    d._broadcast_task_status_generation = AsyncMock(
+        side_effect=arm_between_commit_and_publication
+    )
+    completion = asyncio.create_task(
+        d._complete_owned_task_result(lifecycle_generation)
+    )
+    await asyncio.wait_for(completion_committed.wait(), timeout=1)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "completed"
+        assert current.pty_background_generation is None
+        current.pty_background_generation = "late-background-epoch"
+        await db.commit()
+
+    release_publication.set()
+    assert await asyncio.wait_for(completion, timeout=1) == (True, False)
+
+    d.broadcaster.broadcast.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "completed"
+        assert (
+            current.pty_background_generation
+            == "late-background-epoch"
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["retry", "complete", "fail"])
 async def test_owned_mode_publication_cannot_cross_new_generation(
     db_factory,
@@ -5977,6 +6092,123 @@ async def test_queued_busy_detects_terminal_parent_consumer_and_fresh_lifecycle(
         if not consumer.done():
             consumer.cancel()
             await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_queued_busy_detects_detached_pty_background_epoch(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="detached PTY tail",
+            description="d",
+            status="completed",
+            session_id="session-1",
+            pty_background_generation="exact-background-epoch",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+        assert await d._queued_task_has_live_generation(db, task_id)
+
+        task.pty_background_generation = None
+        await db.commit()
+        assert not await d._queued_task_has_live_generation(db, task_id)
+
+
+@pytest.mark.asyncio
+async def test_queued_message_waits_for_detached_pty_background_epoch(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        task.instance_id = None
+        task.pty_background_generation = "exact-background-epoch"
+        await db.commit()
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay):
+        await real_sleep(0.01 if delay == 2 else 0)
+
+    monkeypatch.setattr(
+        "backend.services.dispatcher.asyncio.sleep", fast_sleep
+    )
+    queued = asyncio.create_task(
+        d._process_queued_message(task_id, msg)
+    )
+    try:
+        await real_sleep(0.05)
+        d.instance_manager.launch.assert_not_awaited()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.pty_background_generation = None
+            await db.commit()
+
+        await asyncio.wait_for(queued, timeout=1)
+    finally:
+        if not queued.done():
+            queued.cancel()
+            await asyncio.gather(queued, return_exceptions=True)
+
+    d.instance_manager.launch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_launch_preserves_background_epoch_started_during_routing(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+
+    routing_started = asyncio.Event()
+    release_routing = asyncio.Event()
+
+    async def delayed_routing(*_args, **_kwargs):
+        routing_started.set()
+        await release_routing.wait()
+        return None
+
+    d._resolve_resume_config_dir = AsyncMock(
+        side_effect=delayed_routing
+    )
+    queued = asyncio.create_task(
+        d._process_queued_message(task_id, msg)
+    )
+    await routing_started.wait()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.pty_background_generation = "routing-race-epoch"
+        await db.commit()
+    release_routing.set()
+
+    with pytest.raises(
+        QueuedMessagePrelaunchError,
+        match="generation became active",
+    ):
+        await queued
+
+    d.instance_manager.launch.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "completed"
+        assert (
+            task.pty_background_generation == "routing-race-epoch"
+        )
 
 
 @pytest.mark.asyncio
@@ -7094,6 +7326,210 @@ async def test_dispatcher_shutdown_quiesces_before_reaping_generations(
         await d.enqueue_message(22, "too late")
     with pytest.raises(RuntimeError, match="shutting down"):
         await d.start()
+
+
+async def _seed_detached_shutdown_generation(
+    dispatcher,
+    db_factory,
+    *,
+    stop_fails: bool = False,
+):
+    """Install one real ownerless PTY generation behind a test Dispatcher."""
+
+    from backend.services.instance_manager import InstanceManager
+
+    session_id = "detached-shutdown-session"
+    generation = "detached-shutdown-generation"
+    completed_at = datetime.now()
+    async with db_factory() as db:
+        task = Task(
+            title="detached PTY shutdown",
+            description="background tail",
+            status="completed",
+            session_id=session_id,
+            completed_at=completed_at,
+            pty_background_generation=generation,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    instance_manager = InstanceManager(db_factory, dispatcher.broadcaster)
+    session = SimpleNamespace(
+        session_id=session_id,
+        is_alive=True,
+    )
+
+    async def stop_session():
+        if stop_fails:
+            raise RuntimeError("native PTY session survived")
+        session.is_alive = False
+
+    session.stop = AsyncMock(side_effect=stop_session)
+    pool = SimpleNamespace(
+        _sessions={session_id: session},
+        _access_order={session_id: 1.0},
+        _lock=asyncio.Lock(),
+    )
+    instance_manager._pty_backend = SimpleNamespace(
+        _sessions={},
+        _pool=pool,
+    )
+    state = instance_manager.register_pty_background_generation(
+        task_id,
+        session_id,
+        generation,
+        session,
+    )
+    dispatcher.instance_manager = instance_manager
+    return task_id, session_id, generation, session, state
+
+
+@pytest.mark.asyncio
+async def test_shutdown_exactly_fails_detached_pty_background_generation(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    (
+        task_id,
+        session_id,
+        _generation,
+        session,
+        state,
+    ) = await _seed_detached_shutdown_generation(d, db_factory)
+    watcher = state.watcher
+
+    await d.shutdown()
+    if watcher is not None:
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    session.stop.assert_awaited_once_with()
+    assert not session.is_alive
+    assert (task_id, session_id) not in (
+        d.instance_manager._pty_background_states
+    )
+    assert session_id not in d.instance_manager._pty_backend._pool._sessions
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert task.pty_background_generation is None
+        assert task.error_message == (
+            "Claude PTY background activity was interrupted by dispatcher "
+            "shutdown"
+        )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fails_closed_when_detached_pty_session_survives(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    (
+        task_id,
+        session_id,
+        generation,
+        session,
+        state,
+    ) = await _seed_detached_shutdown_generation(
+        d,
+        db_factory,
+        stop_fails=True,
+    )
+    watcher = state.watcher
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "detached PTY background task .* generation survived"
+            ),
+        ):
+            await d.shutdown()
+
+        session.stop.assert_awaited_once_with()
+        assert session.is_alive
+        assert (
+            d.instance_manager._pty_background_states[
+                (task_id, session_id)
+            ]
+            is state
+        )
+        assert state.accepting_events
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation == generation
+            assert task.error_message is None
+    finally:
+        d.instance_manager._discard_pty_background_state(
+            (task_id, session_id),
+            generation,
+        )
+        if watcher is not None:
+            await asyncio.gather(watcher, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fails_closed_for_unmanaged_attached_pty_state(
+    db_factory,
+):
+    """A stale DB owner cannot hide a retained Session from shutdown."""
+
+    d = _make_dispatcher(db_factory)
+    (
+        task_id,
+        session_id,
+        generation,
+        session,
+        state,
+    ) = await _seed_detached_shutdown_generation(d, db_factory)
+    watcher = state.watcher
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = Instance(
+            name="lost-attached-owner",
+            status="running",
+            pid=998877,
+            current_task_id=task_id,
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        await db.commit()
+        owner_id = owner.id
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "PTY background task .* remained attached to instance "
+                f"{owner_id}"
+            ),
+        ):
+            await d.shutdown()
+
+        session.stop.assert_not_awaited()
+        assert session.is_alive
+        assert (
+            d.instance_manager._pty_background_states[
+                (task_id, session_id)
+            ]
+            is state
+        )
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation == generation
+            assert task.instance_id == owner_id
+    finally:
+        d.instance_manager._discard_pty_background_state(
+            (task_id, session_id),
+            generation,
+        )
+        if watcher is not None:
+            await asyncio.gather(watcher, return_exceptions=True)
 
 
 @pytest.mark.asyncio

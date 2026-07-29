@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api } from '../../api/client';
-import type { ChatMessage, CodexForkAnchor, FileAttachment, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
 import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
@@ -16,7 +16,10 @@ import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
-import { mergeChatHistory } from './messageMerge';
+import {
+  isLegacyCodexCollabCompleted,
+  mergeChatHistory,
+} from './messageMerge';
 
 interface ChatViewProps {
   task: Task;
@@ -132,6 +135,20 @@ function ContextUsageIndicator({ usage }: { usage: ContextUsage }) {
   );
 }
 
+function injectAttachments(uploadResults: UploadResult[]): InjectTaskAttachments {
+  return {
+    file_paths: uploadResults.map((result) => result.path),
+    image_paths: uploadResults
+      .filter((result) => result.is_image)
+      .map((result) => result.path),
+    attachments: uploadResults.map((result) => ({
+      url: result.url,
+      name: result.filename || result.url.split('/').pop() || 'file',
+      is_image: result.is_image,
+    })),
+  };
+}
+
 export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, inline }: ChatViewProps) {
   const projectName = useMemo(() => {
     if (!task.project_id) return null;
@@ -193,10 +210,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // WS 驱动的实时状态覆盖。task.status prop（5s 轮询）才是最终一致的事实源：
   // prop 变化时清掉覆盖（见下方 effect），否则错过一次 WS 事件就永久陈旧。
   const [localStatus, setLocalStatus] = useState<string | null>(null);
+  const [localBackgroundActive, setLocalBackgroundActive] = useState<boolean | null>(null);
   // 最近一次 WS status_change 时刻：在途旧轮询快照返回（prop 回退旧值）时
   // 不能击穿刚到的 WS 状态——否则终态 effect 会误触发 autoDequeue，把排队
   // 消息在 turn 进行中提前发出。超过一个轮询周期没有 WS 事件才允许清除。
   const lastWsStatusAt = useRef(0);
+  // Background markers need the same stale-poll protection in both directions:
+  // an older request can return `true` just after the authoritative WS `false`.
+  const lastWsBackgroundAt = useRef(0);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [interrupting, setInterrupting] = useState(false);
   const [stillRunning, setStillRunning] = useState(false);
@@ -225,6 +246,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [codexAppServerEnabled, setCodexAppServerEnabled] = useState(false);
   const [codexMainMcpEnabled, setCodexMainMcpEnabled] = useState<boolean | null>(null);
   const [injecting, setInjecting] = useState(false);
+  const injectingRef = useRef(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
   const [injectMode, setInjectMode] = useState(false);
   const canInject = task.worker_id == null && task.shared_from_id == null && (
@@ -276,23 +298,65 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return () => document.removeEventListener('mousedown', handle);
   }, [showModelMenu, modelOptions.length, task.provider]);
 
-  const handleInject = async () => {
-    const text = input.trim();
-    if (!text || injecting) return;
+  const handleInject = async (text: string, uploadResults: UploadResult[]) => {
+    if ((!text && uploadResults.length === 0) || injectingRef.current) return;
+    injectingRef.current = true;
     setInjecting(true);
     setError(null);
     try {
-      await api.injectTaskMessage(task.id, text, {
-        provider: task.provider,
-        model: task.model,
-        codex_service_tier: task.codex_service_tier,
-      });
-      setInput('');
+      if (uploadResults.length > 0) {
+        const capabilities = await api.getInjectCapabilities(task.id);
+        if (capabilities.attachment_protocol !== 1) {
+          throw new Error(
+            '当前服务器未确认附件注入协议，已在发送前停止；消息和附件未发送',
+          );
+        }
+      }
+      const result = await api.injectTaskMessage(
+        task.id,
+        text || '(files attached)',
+        {
+          provider: task.provider,
+          model: task.model,
+          codex_service_tier: task.codex_service_tier,
+        },
+        uploadResults.length > 0 ? injectAttachments(uploadResults) : undefined,
+      );
+      if (!result.ok || !result.injected) {
+        throw new Error('服务器没有确认消息已注入，输入和附件已保留');
+      }
+      if (
+        uploadResults.length > 0
+        && (
+          !Number.isInteger(result.attachment_count)
+          || result.attachment_count !== uploadResults.length
+        )
+      ) {
+        throw new Error(
+          '服务器没有确认全部附件均已注入，输入和附件已保留',
+        );
+      }
+      setInput((current) => (
+        current.trim() === text ? '' : current
+      ));
+      fileUpload.clear();
+      if (forkSeedUploads.length > 0) {
+        try {
+          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
+          localStorage.removeItem(forkSeedUploadsKey);
+        } catch { /* storage may be unavailable */ }
+        setForkSeedUploads([]);
+      }
     } catch (e) {
-      setError(`注入失败: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `未收到注入成功确认，消息和附件已保留；请先查看聊天记录或运行日志，再决定是否重试：${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
       onTaskUpdated?.();
       refreshHistoryRef.current();
     } finally {
+      injectingRef.current = false;
       setInjecting(false);
     }
   };
@@ -326,7 +390,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [distillError, setDistillError] = useState<string | null>(null);
   const [distillInstruction, setDistillInstruction] = useState('');
   const effectiveStatus = localStatus || task.status;
-  const isProcessing = sending || ['in_progress', 'executing'].includes(effectiveStatus);
+  const backgroundActive = localBackgroundActive ?? task.background_active === true;
+  // A native agent/monitor tail can remain active while the owning foreground
+  // turn is still `executing`; keep the marker independently visible.
+  const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const HISTORY_PAGE_SIZE = 200;
@@ -425,6 +492,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [autoDequeueFlag, setAutoDequeueFlag] = useState(0);
   const sendingRef = useRef(false);
   sendingRef.current = sending;
+  const backgroundActiveRef = useRef(false);
+  backgroundActiveRef.current = backgroundActive;
   const handleSendRef = useRef<(text: string, uploadResults?: UploadResult[]) => void>(() => {});
 
   useEffect(() => {
@@ -434,7 +503,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     // triggers autoDequeue in the same cycle as setSending(false) and the
     // ref still reads true → skips the queued message.
     const timer = setTimeout(() => {
-      if (sendingRef.current) return;
+      if (sendingRef.current || backgroundActiveRef.current) return;
       const queue = messageQueueRef.current;
       if (queue.length > 0) {
         const next = queue[0];
@@ -480,6 +549,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     );
     if (isStatusChange) {
       const newStatus = (msg.data!.new_status as string) || '';
+      if (typeof msg.data!.background_active === 'boolean') {
+        lastWsBackgroundAt.current = Date.now();
+        setLocalBackgroundActive(msg.data!.background_active);
+      }
       if (newStatus) {
         lastWsStatusAt.current = Date.now();
         setLocalStatus(newStatus);
@@ -487,10 +560,34 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       return;
     }
 
+    const isBackgroundActivity = (
+      msg.data
+      && (
+        (
+          msg.channel === 'tasks'
+          && msg.data.event === 'background_activity'
+          && Number(msg.data.task_id) === task.id
+        )
+        || (
+          msg.channel === `task:${task.id}`
+          && (
+            msg.data.event === 'background_activity'
+            || msg.data.event_type === 'background_activity'
+          )
+        )
+      )
+    );
+    if (isBackgroundActivity) {
+      if (typeof msg.data!.background_active === 'boolean') {
+        lastWsBackgroundAt.current = Date.now();
+        setLocalBackgroundActive(msg.data!.background_active);
+      }
+      return;
+    }
+
     if (msg.channel !== `task:${task.id}` || !msg.data) return;
 
     const eventType = msg.data.event_type as string || (msg.data.event as string);
-
     if (eventType === 'monitor_session_created' || eventType === 'monitor_session_status'
         || eventType === 'sub_agent_session_created' || eventType === 'sub_agent_session_status') {
       api.listMonitorSessions(task.id).then(setMonitorSessions).catch(() => {});
@@ -672,6 +769,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       // Small delay so any final output messages queued just before
       // process_exit are rendered before the "thinking" indicator hides.
       setTimeout(() => {
+        // A foreground process_exit is not terminal while an exact native
+        // background epoch is still active. Its false marker will drive the
+        // normal terminal effect after the final autonomous output arrives.
+        if (backgroundActiveRef.current) {
+          refreshHistoryRef.current();
+          return;
+        }
         setSending(false);
         setLocalStatus(null);  // Reset — status_change WS may have been missed
         setAutoDequeueFlag(f => f + 1);
@@ -708,15 +812,35 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
       setSending(true);
       setMessages((prev) => {
-        // Skip if last message is an optimistic duplicate (same content, recent).
-        // 但服务端广播可能带附件而乐观回显没有 —— 去重时必须把附件合并进去，
-        // 整条丢弃会让刚发的图片消失（2026-07-16 用户反馈）
+        // Reconcile the optimistic bubble with the authoritative broadcast.
+        // The optimistic content can be raw text while the server content is
+        // prefixed with the sender name, so display content alone is not a
+        // stable identity. raw_content is the canonical user input.
         const last = prev[prev.length - 1];
-        if (last && last.role === 'user' && last.event_type === 'user_message' && last.content === content) {
-          if ((imageUrls?.length || attachments?.length) && !last.image_urls?.length && !last.attachments?.length) {
-            return [...prev.slice(0, -1), { ...last, image_urls: imageUrls, attachments }];
-          }
-          return prev;
+        const matchesOptimistic = Boolean(
+          last
+          && last.role === 'user'
+          && last.event_type === 'user_message'
+          && (
+            last.content === content
+            || (
+              rawContent !== null
+              && last.raw_content === rawContent
+            )
+          )
+        );
+        if (last && matchesOptimistic) {
+          return [...prev.slice(0, -1), {
+            ...last,
+            id: isPersisted ? persistedId : last.id,
+            content,
+            source,
+            raw_content: rawContent ?? last.raw_content,
+            timestamp: eventTimestamp,
+            image_urls: imageUrls?.length ? imageUrls : last.image_urls,
+            attachments: attachments?.length ? attachments : last.attachments,
+            persisted: isPersisted || last.persisted,
+          }];
         }
         return [...prev, {
           id: isPersisted ? persistedId : Date.now() + Math.random(), role: 'user', event_type: 'user_message',
@@ -757,6 +881,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     const showTypes = ['message', 'result', 'tool_use', 'tool_result', 'system_init', 'system_event', 'thinking'];
     if (!showTypes.includes(eventType)) return;
+    if (isLegacyCodexCollabCompleted({
+      event_type: eventType,
+      content: (msg.data.content as string) || null,
+      native_item_type: (msg.data.native_item_type as string) || null,
+      native_item_status: (msg.data.native_item_status as string) || null,
+    })) return;
 
     // Skip noisy system events (heartbeats, telemetry subtypes)
     const skipSystemContent = ['task_progress', 'thinking_tokens', 'token_usage', 'api_request', 'api_response'];
@@ -787,6 +917,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       source: (msg.data.source as string) || null,
       item_id: itemId,
       stream_item_id: itemId,
+      native_item_type: (msg.data.native_item_type as string) || null,
+      native_item_status: (msg.data.native_item_status as string) || null,
       persisted: isPersisted,
     };
     setMessages((prev) => {
@@ -810,6 +942,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     ]).then(([msgs, askPending]) => {
       const filtered = msgs
         .filter((m) =>
+          !isLegacyCodexCollabCompleted(m) &&
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((m) => ({ ...m, persisted: true }));
@@ -859,6 +992,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, oldestId).then((msgs) => {
       const filtered = msgs
         .filter((m) =>
+          !isLegacyCodexCollabCompleted(m) &&
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((m) => ({ ...m, persisted: true }));
@@ -896,25 +1030,67 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     handleSubscribed,
   );
 
-  // Fresh server data arrived via polling — drop the WS override so a missed
-  // status_change/process_exit can't pin the header/spinner on a stale status.
-  // Guard: skip if a WS status arrived within the last poll cycle — the prop
-  // change may be a stale in-flight snapshot fetched before that event.
+  // Keep a WS status for one full polling cycle, then independently expire it.
+  // Depending only on a prop change leaves the override pinned forever when a
+  // poll returns the same scalar status (or when no later poll changes it).
   useEffect(() => {
-    if (Date.now() - lastWsStatusAt.current > 7000) {
+    if (localStatus === null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const clearWhenStale = () => {
+      const remaining = 7000 - (Date.now() - lastWsStatusAt.current);
+      if (remaining <= 0) {
+        setLocalStatus(null);
+      } else {
+        timer = setTimeout(clearWhenStale, remaining);
+      }
+    };
+    const remaining = 7000 - (Date.now() - lastWsStatusAt.current);
+    if (remaining <= 0) {
       setLocalStatus(null);
+      return;
     }
-  }, [task.status]);
+    timer = setTimeout(clearWhenStale, remaining);
+    return () => clearTimeout(timer);
+  }, [localStatus, task.status]);
+
+  // Keep either WS marker value for one full polling cycle. Even when it
+  // currently equals the prop, clearing it immediately would let an older
+  // in-flight poll response in the opposite direction overwrite the event.
+  useEffect(() => {
+    if (localBackgroundActive === null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const clearWhenStale = () => {
+      const remaining = 7000 - (Date.now() - lastWsBackgroundAt.current);
+      if (remaining <= 0) {
+        setLocalBackgroundActive(null);
+      } else {
+        // A same-value WS event updates the ref without causing a render.
+        // Re-check at the old deadline so that fresh event still gets its
+        // complete protection window.
+        timer = setTimeout(clearWhenStale, remaining);
+      }
+    };
+    const remaining = 7000 - (Date.now() - lastWsBackgroundAt.current);
+    if (remaining <= 0) {
+      setLocalBackgroundActive(null);
+      return;
+    }
+    timer = setTimeout(clearWhenStale, remaining);
+    return () => clearTimeout(timer);
+  }, [localBackgroundActive, task.background_active]);
 
   // Reset sending state when task reaches a terminal status
   // (catches cases where process_exit WebSocket event is missed — e.g. WS disconnect)
   // Also trigger auto-dequeue so pending box messages get sent.
   useEffect(() => {
-    if (['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)) {
+    if (
+      !backgroundActive
+      && ['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)
+    ) {
       setSending(false);
       setAutoDequeueFlag(f => f + 1);
     }
-  }, [effectiveStatus]);
+  }, [backgroundActive, effectiveStatus]);
 
   // Load chat history
   useEffect(() => {
@@ -985,13 +1161,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [input]);
 
   useFileDrop({
-    onDrop: (files) => fileUpload.addFiles(files, (msg) => setDropError(msg)),
-    disabled: !task.session_id && !task.shared_from_id,
+    onDrop: (files) => {
+      if (!injectingRef.current) {
+        fileUpload.addFiles(files, (msg) => setDropError(msg));
+      }
+    },
+    disabled: injecting || (!task.session_id && !task.shared_from_id),
   });
 
   useEffect(() => {
-    if (!task.session_id && !task.shared_from_id) return;
+    if (injecting || (!task.session_id && !task.shared_from_id)) return;
     const handlePaste = (e: ClipboardEvent) => {
+      if (injectingRef.current) return;
       const items = e.clipboardData?.items;
       if (!items) return;
       const files: File[] = [];
@@ -1008,7 +1189,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     };
     document.addEventListener('paste', handlePaste);
     return () => document.removeEventListener('paste', handlePaste);
-  }, [task.session_id, task.shared_from_id, fileUpload.addFiles]);
+  }, [
+    task.session_id,
+    task.shared_from_id,
+    fileUpload.addFiles,
+    injecting,
+  ]);
 
   useEffect(() => {
     if (dropError) {
@@ -1018,6 +1204,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [dropError]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (injectingRef.current) {
+      e.target.value = '';
+      return;
+    }
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
     fileUpload.addFiles(files, (msg) => setDropError(msg));
@@ -1091,13 +1281,24 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       : fileUpload.uploadedResults.length + forkSeedUploads.length;
     if (!text && sendableAttachmentCount === 0) return;
 
-    // 注入模式：发送动作直达当前 turn（仅文本；不开新 turn、不排队）
-    if (injectMode && canInject && !fromQueue) {
-      if (text) await handleInject();
+    if (!fromQueue && fileUpload.isUploading) {
+      setError('附件仍在上传，请等待上传完成后再发送。');
       return;
     }
     if (!fromQueue && fileUpload.hasFailed) {
       setError('Retry or remove failed attachments before sending.');
+      return;
+    }
+    // 注入模式：文本和已上传附件直达当前 turn，不新开 turn、不排队。
+    if (injectMode && canInject && !fromQueue) {
+      if (!isProcessing) {
+        setError('注入仅在 turn 正在运行时可用；空闲时请关闭注入模式发送普通消息。');
+        return;
+      }
+      await handleInject(
+        text,
+        [...forkSeedUploads, ...fileUpload.uploadedResults],
+      );
       return;
     }
 
@@ -1219,6 +1420,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               {providerLabel}
             </span>
             <FastModeBadge task={task} />
+            {backgroundActive && (
+              <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
+                后台运行中
+              </span>
+            )}
             {task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
@@ -1268,7 +1474,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Star size={18} fill={starred ? 'currentColor' : 'none'} />
             </button>
-            {(sending || stillRunning || ['in_progress', 'executing'].includes(effectiveStatus)) && (
+            {(isProcessing || stillRunning) && (
               <button
                 onClick={async () => {
                   setInterrupting(true);
@@ -1828,6 +2034,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     type="button"
                     aria-label={`Remove ${upload.filename || 'fork attachment'}`}
                     onClick={() => setForkSeedUploads((prev) => prev.filter((item) => item.id !== upload.id))}
+                    disabled={injecting}
                     className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
                   >
                     <X size={10} />
@@ -1852,13 +2059,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     </div>
                   )}
                   {upload.status === 'failed' && (
-                    <div className="absolute inset-0 bg-red-900/50 flex items-center justify-center cursor-pointer" onClick={() => fileUpload.retryFile(upload.id)} title="Click to retry">
+                    <div
+                      className={`absolute inset-0 bg-red-900/50 flex items-center justify-center ${injecting ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+                      onClick={() => {
+                        if (!injecting) fileUpload.retryFile(upload.id);
+                      }}
+                      title={injecting ? 'Injection in progress' : 'Click to retry'}
+                    >
                       <AlertCircle size={16} className="text-red-400" />
                     </div>
                   )}
                   <button
                     type="button"
                     onClick={() => fileUpload.removeFile(upload.id)}
+                    disabled={injecting}
                     className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
                   >
                     <X size={10} />
@@ -1874,26 +2088,27 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               ref={fileInputRef}
               type="file"
               multiple
+              disabled={injecting}
               className="hidden"
               onChange={handleFileSelect}
             />
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={(!task.session_id && !task.shared_from_id) || fileUpload.uploads.length >= 10}
+              disabled={injecting || (!task.session_id && !task.shared_from_id) || fileUpload.uploads.length >= 10}
               className="p-2 text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed"
               title="Attach files"
             >
               <Paperclip size={18} />
             </button>
-            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={!task.session_id && !task.shared_from_id} />
-            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={!task.session_id && !task.shared_from_id} />
+            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInject)} />
+            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || (!task.session_id && !task.shared_from_id)} />
             {/* Temp model override (one-shot) */}
             <div className="relative" data-temp-model>
               <button
                 type="button"
                 onClick={() => setShowModelMenu((v) => !v)}
-                disabled={!task.session_id && !task.shared_from_id}
+                disabled={injecting || (!task.session_id && !task.shared_from_id)}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   modelOverride ? 'text-indigo-300 bg-indigo-600/20' : 'text-gray-500 hover:text-gray-300'
                 }`}
@@ -1942,7 +2157,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <button
                 type="button"
                 onClick={() => setInjectMode((v) => !v)}
-                disabled={!task.session_id}
+                disabled={injecting || !task.session_id}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   injectMode ? 'text-teal-300 bg-teal-600/20' : 'text-gray-500 hover:text-teal-300'
                 }`}
@@ -1982,6 +2197,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             </div>
           </div>
           {/* Row 2: full-width input */}
+          {injectMode && canInject && (
+            <div className="text-[10px] leading-relaxed text-teal-300/80">
+              文本、图片和文件会注入当前 turn；只有服务器明确确认成功后才会清空输入和附件。
+            </div>
+          )}
           <div className="flex gap-2 items-end">
             <textarea
               ref={textareaRef}
@@ -1997,7 +2217,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
               }
-              disabled={!task.session_id && !task.shared_from_id}
+              disabled={injecting || (!task.session_id && !task.shared_from_id)}
               rows={1}
               className="flex-1 bg-gray-800 text-foreground rounded-xl px-4 py-2.5 text-sm border border-gray-700/70 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 resize-none disabled:opacity-50 max-h-48 overflow-y-auto transition-colors"
               style={{ minHeight: '40px' }}

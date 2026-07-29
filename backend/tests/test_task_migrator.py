@@ -101,6 +101,54 @@ async def test_migrate_local_to_worker(db_factory, session_factory, monkeypatch)
 
 
 @pytest.mark.parametrize(
+    ("plan_status", "approved"),
+    [
+        ("in_progress", None),
+        ("plan_review", None),
+        ("completed", True),
+    ],
+)
+async def test_target_migration_blocks_actionable_related_plans(
+    db_factory,
+    session_factory,
+    plan_status,
+    approved,
+):
+    worker = await _mk_worker(session_factory)
+    target = await _mk_task(session_factory)
+    await _mk_task(
+        session_factory,
+        mode="plan",
+        status=plan_status,
+        plan_target_task_id=target.id,
+        plan_approved=approved,
+        plan_applied_at=None,
+    )
+
+    with pytest.raises(MigrationError, match="待审批或待应用"):
+        await _migrator(db_factory).migrate(target.id, worker.id)
+
+
+async def test_related_plan_cannot_migrate_independently(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    target = await _mk_task(session_factory)
+    plan = await _mk_task(
+        session_factory,
+        mode="plan",
+        status="completed",
+        plan_target_task_id=target.id,
+        plan_approved=True,
+        plan_applied_at=None,
+    )
+
+    with pytest.raises(MigrationError, match="不能脱离目标 Task"):
+        await _migrator(db_factory).migrate(plan.id, worker.id)
+
+
+@pytest.mark.parametrize(
     "source_is_worker",
     [False, True],
     ids=["local-to-worker", "worker-to-worker"],

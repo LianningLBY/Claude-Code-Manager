@@ -20,7 +20,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **多 Provider（Claude / Codex）** — Task 级选择执行引擎：OpenAI Codex CLI（默认，`gpt-5.6-sol`）或 Claude Code。Codex 任务支持完整生命周期、多轮对话、Goal 模式评估、Plan 审批、上下文自动压缩、瞬时错误退避重试、账号池与跨 Worker rollout 迁移；指令文件读 `AGENTS.md`（自动注入）。PTY 热会话、ask_user 和 Claude 原生子 Agent 仍为 Claude 专属（Codex 下显式隐藏/拒绝，不静默降级）
 - **PTY 持久会话模式** — 默认模式，Claude Code 以常驻交互会话运行，多轮免冷启动（热 session 复用），首次启动有 Cold Start 指示器
 - **Goal 模式** — `mode="goal"` 使用自然语言完成条件（`goal_condition`），每 turn 后由轻量评估器（默认 Haiku）自动判断是否达成目标
-- **Plan Mode** — 敏感任务先生成只读计划，人工审批后再执行
+- **独立 Plan Task** — Planner/Reviewer 只读生成并审查方案；审批不自动执行，关联方案由用户显式附到下一条真实消息，standalone 方案可一键创建独立执行 Task
 - **Effort Level** — 支持 `low` / `medium` / `high` / `xhigh` / `max` 五档，优先级链：Task → Instance → 全局默认
 - **Model 配置** — 支持全称模型 ID（包括 `claude-opus-5`）；Opus 5 固定为 1M context 并支持 `low/medium/high/xhigh/max` effort，其他兼容模型可用 `[1m]` 后缀开启 1M context
 - **Codex Fast** — Codex Task 可选择 Standard 或 Fast；Fast 使用同一模型的 `priority` service tier，不会换模型或降低 effort。当前支持 GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；账号或模型无法确认 `priority` 时会在执行前明确失败，不会挂着 Fast 徽标偷偷按 Standard 运行
@@ -106,6 +106,7 @@ claude-manager/
 │   ├── database.py              # SQLAlchemy async engine + session
 │   ├── api/                     # REST + WebSocket 路由
 │   │   ├── tasks.py             # 任务 CRUD + plan 审批 + conflict 解决
+│   │   ├── plans.py             # 关联 Plan 历史、stale、revision、执行 Task
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop + Dispatcher 端点
 │   │   ├── projects.py          # Project CRUD + git clone
@@ -125,6 +126,7 @@ claude-manager/
 │   │   └── ask_user_hook.py     # AskUserQuestion PreToolUse hook 脚本
 │   ├── models/                  # SQLAlchemy ORM 模型
 │   │   ├── task.py              # Task (session_id, last_cwd, project_id, enabled_skills, effort_level...)
+│   │   ├── plan_agent.py        # Planner/Reviewer run + step 审计
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── sub_agent.py         # SubAgentSession + SubAgentReport (通用子 agent)
@@ -141,6 +143,8 @@ claude-manager/
 │       ├── instance_manager.py  # 子进程生命周期 (launch/stop/consume, MCP 注入)
 │       ├── claude_pool.py       # 多账号池 (限速检测/自动切换/session 迁移/额度查询)
 │       ├── goal_evaluator.py    # Goal 条件评估器 (claude -p 子进程)
+│       ├── plan_agent_runner.py # 严格只读 Planner/Reviewer pipeline
+│       ├── plan_tasks.py        # Plan 上下文、repo 指纹、stale 与附件校验
 │       ├── mcp_config.py        # MCP config 动态生成
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
 │       ├── cloud_provider.py    # AWS EC2 Provider (Worker 实例创建/启停/销毁)
@@ -368,10 +372,15 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 
 ### Plan Mode
 
-创建任务时选择 Mode = `plan`：
-1. Claude Code 先以只读模式分析代码，生成执行计划
-2. 任务进入 `plan_review` 状态，在 Tasks 页面显示计划内容
-3. 点击 Approve 批准后，任务重新入队执行
+Plan 始终是独立 `mode="plan"` Task：
+
+1. 在 New Task 创建 standalone Plan，或在已有 Chat 的 **Plans** 面板创建一个或多个关联 Plan
+2. Planner 以严格只读方式检查仓库，Reviewer 独立审查并可要求 Planner 修订；完成后进入 `plan_review`
+3. Approve/Reject 只更新该 Plan，不唤醒或改变原 Task/session
+4. 关联 Plan 批准后作为持久 composer attachment；用户发送下一条真实消息时可显式选择一个或多个方案，同一 turn 才把方案交给主 Agent
+5. standalone Plan 批准后点击 **Create execution Task**，创建新的普通 Task 实施方案
+
+若对话或仓库在规划后变化，审批/应用会要求 stale 二次确认。待审批或待应用的关联 Plan 会阻止目标 Task 迁移，避免跨 Worker 后方案与 session 分离。
 
 ### Goal Mode
 

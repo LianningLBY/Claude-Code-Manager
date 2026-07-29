@@ -756,7 +756,7 @@ async def test_plan_reject_not_plan_review(client):
 
 @pytest.mark.asyncio
 async def test_plan_approve_success(client, session_factory):
-    """Approving a plan-mode task in plan_review state should succeed."""
+    """Approval completes the Plan without scheduling an execution turn."""
     create_resp = await client.post("/api/tasks", json={
         "title": "Plan Task", "description": "d", "target_repo": "/tmp", "mode": "plan",
     })
@@ -774,8 +774,9 @@ async def test_plan_approve_success(client, session_factory):
     resp = await client.post(f"/api/tasks/{task_id}/plan/approve")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "pending"
+    assert data["status"] == "completed"
     assert data["plan_approved"] is True
+    assert data["plan_approved_at"] is not None
 
 
 @pytest.mark.asyncio

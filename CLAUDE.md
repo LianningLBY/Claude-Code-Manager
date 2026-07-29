@@ -26,6 +26,7 @@ claude-manager/
 │   ├── database.py              # SQLAlchemy async engine + session
 │   ├── api/                     # 路由
 │   │   ├── tasks.py             # 任务 CRUD + plan 审批 + conflict 解决
+│   │   ├── plans.py             # 关联 Plan 历史/stale/revision/执行 Task
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop 控制 + Dispatcher 端点
 │   │   ├── projects.py          # Project CRUD + git clone
@@ -44,6 +45,7 @@ claude-manager/
 │   ├── middleware/auth.py       # Bearer token 认证中间件
 │   ├── models/                  # SQLAlchemy ORM 模型
 │   │   ├── task.py              # Task (含 session_id, last_cwd, project_id, enabled_skills)
+│   │   ├── plan_agent.py        # Planner/Reviewer run + step 审计
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── project_todo.py      # ProjectTodo (per-project prompt 模板/清单, status open/done/archived, created_task_id 溯源)
@@ -66,6 +68,8 @@ claude-manager/
 │       ├── codex_session_migration.py # 跨账号安全复制/合并原生 rollout
 │       ├── dispatcher.py        # 全局调度器 (9 步任务生命周期, 含 goal 模式 + monitor 子 agent)
 │       ├── goal_evaluator.py    # Goal 条件评估器 (Claude/Codex provider 分流)
+│       ├── plan_agent_runner.py # 严格只读 Planner/Reviewer pipeline + exact process cleanup
+│       ├── plan_tasks.py        # Plan 上下文快照、repo 指纹、stale/附件校验
 │       ├── mcp_config.py        # Provider-neutral MCP specs + Claude/Codex renderers
 │       ├── skill_context.py     # Task-scoped 普通/User Skill 目录与 provider adapter
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
@@ -150,7 +154,7 @@ claude-manager/
 - **Codex Skill context（2026-07-28）**: 上方 Codex provider 对等逻辑中④“Skill 模板仅 Claude”是旧 staged 状态，现已由统一 `skill_context.py` 取代；Codex 普通/User Skills 已开放，Monitor 仍明确关闭
 - **Skills 系统**: `Task.enabled_skills` 控制普通 Skill，`selected_user_skills` 控制 User Skill。启用只表示能力可发现；只有消息开头真实解析到 `$command` 时才注入显式调用指令。initial/queued 两路都必须在 Task 写屏障内以 generation token 临时叠加 required skills，turn 结束只清理仍属于该 token 的 command keys，显式用户保存会清 marker。`skill_context.py` 每轮从同一 Task generation 生成唯一 L0 目录：Claude direct 用一个 append-system-prompt 文件，PTY/Codex exec 用带界限的 prompt context，Codex app-server 必须把同一 bounded context 前缀写入 schema-backed `turn/start.input[].text`；Codex 0.144.6 会静默丢弃未知 `TurnStartParams` 字段，禁止用自创 context 字段假装注入成功。普通 Skill 正文只允许 `ccm_read_skill` 读取 Task 已启用项或 `always` 项，User Skill 正文只由选中 ID 的 `ccm_read_user_skill` 按需读取。Worker 创建/迁移携带 Manager User Skill snapshot，续聊前同步最新选择，不能假设 Worker 有相同的本地 User Skill 表。Codex 必须裁掉 Monitor skill/工具；主任务 MCP kill switch 关闭时即使遗留 Task 状态还启用了普通 Skill，controller 也只能读取/操作已选中的 Sub-Agent。任务级 Distill 仍按 `Task.provider` 分流，Codex 使用绑定/健康账号运行独立只读 `codex exec --ephemeral`，不得复用或改写原 task thread/账号绑定
 - **Skill 命令能力门禁**: `$command` 的 `required_skills` 必须与显式勾选 Skill 共用 provider capability / 主 MCP kill switch 校验；新建 Task、更新初始 description 和 follow-up chat 都必须在 Task/LogEntry 持久化及消息入队前拒绝不兼容命令，不能让 `$monitor` 等命令绕过 Codex 能力边界。Worker chat 必须在 task operation lock 内按刷新后的 Manager provider 校验，Shared chat 必须按刷新后的 shadow provider 校验；两者都要早于 Manager 日志、广播、附件同步和远端请求，同时保留远端二次校验并转发原始消息。`PUT task` 同时切换 Worker 与 provider/Skills 时必须先校验完整有效配置，再允许 `TaskMigrator` 产生任何本机或远端变更
-- **Worker Skill 执行准入**: 已转发 Task 的 ordinary/User Skill 保存与 Retry、chat、Plan Approve 必须共用 task operation lock。首次调度时，pending Skill 保存与 Dispatcher claim 也必须共用该锁；claim 胜出后活跃 generation 的 Skill 编辑返回 409，WorkerProxy 在远端创建前重新读取 Manager 权威行并校验 generation，不能转发 claim 前缓存的旧配置。Manager 是最终配置权威；每个会让 Worker 开始新一轮执行的入口都必须先同步并读回确认 `enabled_skills`、`selected_user_skills`、User Skill snapshots 及当前 Worker generation，确认缺失、陈旧或不一致时 fail closed，绝不能先把远端状态切到 pending/executable。Manager/Worker 的 `instance_id` 属于不同数据库，禁止跨节点按数值比较；远端 generation 由全局 task id、协调后的 inert status 与单调 `retry_count` 证明
+- **Worker Skill 执行准入**: 已转发 Task 的 ordinary/User Skill 保存与 Retry/chat 必须共用 task operation lock；Plan Approve 自独立 Plan Task 起是纯控制面完成操作，不再同步执行 Skills 或进入 pending。首次调度时，pending Skill 保存与 Dispatcher claim 也必须共用该锁；claim 胜出后活跃 generation 的 Skill 编辑返回 409，WorkerProxy 在远端创建前重新读取 Manager 权威行并校验 generation，不能转发 claim 前缓存的旧配置。Manager 是最终配置权威；每个真正开始新一轮执行的入口都必须先同步并读回确认 `enabled_skills`、`selected_user_skills`、User Skill snapshots 及当前 Worker generation，确认缺失、陈旧或不一致时 fail closed，绝不能先把远端状态切到 pending/executable。Manager/Worker 的 `instance_id` 属于不同数据库，禁止跨节点按数值比较；远端 generation 由全局 task id、协调后的 inert status 与单调 `retry_count` 证明
 - **Monitor Skill**: 后台监控子 session，主 Agent 通过 MCP 工具（create_monitor / check_monitors / stop_monitor）创建和管理。子 session 是**持久 Claude 子 Agent 进程**，拥有自己的 MCP server（`ccm_monitor_agent_server.py`），通过 report_status / mark_complete / get_context 工具自主与系统通信。每 task 最多 5 个并发 monitor。**等待机制（长间隔必读）**：CLI 单次 Bash 调用默认墙钟上限 600s（与请求的 timeout 参数无关），超时命令被转后台并回话「完成会通知你」——对 -p 一次性进程这是空头支票，子 agent 信了就结束回合 → 进程退出 → monitor 误判 failed（2026-07-16 task 35 #192/#193/#194 三连死，A/B 对照实测复现）。故 `_launch_monitor_agent` 按 interval 抬高子进程 `BASH_MAX_TIMEOUT_MS`（只抬不降），`_build_monitor_agent_prompt` 按 interval 生成等待指引（单次 `time.sleep(interval)` + 显式大 timeout + 被拦时拆 300s 块兜底）
 - **子 Agent 架构**: 子 agent 是分类别的一等概念，统一存 `sub_agent_sessions`（`agent_type` 区分类别，`source` 区分启动方）。Monitor（agent_type=monitor, source=ccm）是第一个类别；PTY 模式下模型原生子 agent 自动镜像进来：`native-agent`（Agent/Task 工具）、`native-monitor`（内置 Monitor 工具），由 claude_pty 从 JSONL + subagents/ 目录观测，经 `_upsert_native_sub_agent` 入库并广播 `sub_agent_*` 事件。CCM 自有子 agent 生命周期：注册 → 启动持久进程 → 自主运行（MCP tools → HTTP API → DB + WebSocket）→ 完成/停止 → 清理，进程最长 4 小时超时兜底。**native 子 agent 完成的唤醒只靠 harness task-notification**（唤醒后产出经 FullMirror 镜像进聊天）；**严禁在 subagent_done 里 enqueue 唤醒 prompt**——它必然和通知 turn 赛跑，输了被 CLI 吸收成 mid-turn steering（无独立回显）→ send_prompt 回显锁定永不成立 → consumer 永挂 → 队列冻结 → 7200s 超时杀掉仍在干活的进程（07-15 task 32/33 事故；journal 里 7 月共 18 次无声超时杀，普通用户消息撞 turn 边界同样能触发，根治在 PTY 上游）。-p 模式的退出补唤醒（`monitor:native-exit-resume`、`monitor:complete`）不在此列，不能动
 - **PTY 权限透传**: BridgeHub 的 permission handler 由 instance_manager 注册（`_on_pty_permission_request`，bridge HTTP 线程 → `_loop` 调度）；卡片事件 `permission_request`/`permission_resolved` 走 task WS 频道，回包端点 `POST /api/tasks/{id}/permissions/{request_id}`；CC 侧 channel server 最多阻塞 120s，超时默认 deny
@@ -185,6 +189,7 @@ claude-manager/
 - **Android App**: Capacitor 打包，API/WS 地址通过 `config/server.ts` 动态获取，LoginPage 可展开配置 Server URL
 - **Goal 模式**: `mode="goal"` 任务使用自然语言完成条件（`goal_condition`），每 turn 后由独立评估器判断是否达成，使用 provider 原生 session resume 保持上下文。评估器跟随 Task provider：Claude 走 `claude -p`，Codex 走绑定账号的 ephemeral `codex exec`；Codex evaluator 的 usage-limit/auth 失败会换号后只重试评估，不重复工作 turn
 - **Goal 评估器**: `GoalEvaluator`（`backend/services/goal_evaluator.py`）读取对话日志摘要，发给轻量模型判断条件是否满足。Claude 默认 `claude-haiku-4-5`，Codex 使用 `default_codex_goal_evaluator_model`，均可由 `goal_evaluator_model` 覆盖；进程超时/非零退出属于运行错误，不得误记为“目标未达成”并消耗 turn
+- **独立 Plan Task（2026-07-29）**: Plan 永远是独立 `mode=plan` Task；session 内 Plan 用 `plan_target_task_id` 关联目标 Task，可并行最多 3 个，创建时固化有界对话快照与 HEAD/dirty 指纹。`PlanAgentRunner` 用一次性 Planner + 默认 Codex Reviewer（最多 2 轮修订）生成 `plan_review`，Claude 只开放 Read/Grep/Glob 且禁 Bash/MCP/子 agent，Codex 强制 ephemeral/read-only sandbox/空 MCP/禁 multi-agent；二者走账号池、CloudRouter admission、transient retry 与 exact process-group cleanup，但不复用只判断 goal 的 `GoalEvaluator` 语义。approve/reject 只更新 Plan，绝不 wake/enqueue/自动回填；关联 Plan 经下一条真实 chat 的显式 `plan_task_ids` 绑定并只应用一次，standalone approve 后显式创建新的 auto Task。stale 对话/repo 默认 409 二次确认；active/plan_review/approved-but-unapplied Plan 阻止目标迁移，关联 Plan 不可单独迁移。跨 Worker 的 `plan_approved_by`、`plan_applied_log_id`、`plan_execution_task_id` 是 Manager-local ID，严禁 Worker mirror 覆盖。完整设计/验收见 `docs/plans/plan-agent-design.md`
 - **调度器**: `GlobalDispatcher` 只负责分配任务、启动 Claude Code、判断成败。所有 git 操作（worktree、commit、merge、push）全由 Claude Code 自主完成
 - **任务生命周期**: pending → in_progress → executing → completed（失败回 pending 重试）
 - **项目**: `Project` 模型管理 git repo，支持 clone 已有仓库（has_remote=True）和本地 git init（has_remote=False）

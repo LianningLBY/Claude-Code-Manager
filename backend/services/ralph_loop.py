@@ -439,6 +439,8 @@ class RalphLoop:
         instance_id: int,
         task: Task,
         plan_content: str,
+        *,
+        metadata_updates: dict | None = None,
     ) -> bool:
         """Publish a plan only while this Ralph generation owns the task."""
 
@@ -452,13 +454,24 @@ class RalphLoop:
             task_generation_fence(task),
         )
         async with self.db_factory() as db:
-            result = await db.execute(
-                update(Task)
-                .where(*predicates)
-                .values(plan_content=plan_content, status="plan_review")
-            )
+            current = (
+                await db.execute(
+                    select(Task)
+                    .where(*predicates)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                await db.rollback()
+                return False
+            metadata = dict(current.metadata_ or {})
+            metadata.update(metadata_updates or {})
+            current.plan_content = plan_content
+            current.status = "plan_review"
+            current.metadata_ = metadata
+            current.error_message = None
             await db.commit()
-        return bool(result.rowcount)
+        return True
 
     async def _record_cancel_cleanup_failure(
         self,
@@ -999,38 +1012,34 @@ class RalphLoop:
 
                 # Plan mode handling
                 if task.mode == "plan" and not task.plan_approved:
-                    logger.info(f"Task {task.id} is in plan mode, running plan phase")
-                    plan_prompt = f"Please analyze the following task and create a detailed plan. Do NOT execute any changes, only describe what you would do:\n\n{task.description}"
-                    await self._launch_task_on_bound_account(
-                        instance_id,
-                        task,
-                        plan_prompt,
-                        cwd,
+                    logger.info(
+                        "Task %s is in Plan mode, running read-only pipeline",
+                        task.id,
                     )
-                    process = self.instance_manager.processes.get(instance_id)
-                    await self._wait_for_turn(
-                        instance_id,
-                        task,
-                        process,
-                        label="Plan phase",
+                    from backend.services.plan_agent_runner import (
+                        PlanAgentRunner,
                     )
-
-                    # Collect plan content from logs
-                    async with self.db_factory() as db:
-                        from sqlalchemy import select
-                        from backend.models.log_entry import LogEntry
-                        result = await db.execute(
-                            select(LogEntry.content)
-                            .where(LogEntry.task_id == task.id, LogEntry.event_type == "message", LogEntry.role == "assistant")
-                            .order_by(LogEntry.id)
-                        )
-                        plan_texts = [r[0] for r in result.all() if r[0]]
-                        plan_content = "\n".join(plan_texts)
+                    runner = PlanAgentRunner(
+                        db_factory=self.db_factory,
+                        instance_manager=self.instance_manager,
+                        claude_pool=dispatcher.pool,
+                        codex_pool=dispatcher.codex_pool,
+                        cloudrouter_store=dispatcher.cloudrouter_store,
+                    )
+                    plan_result = await runner.run(task, cwd=cwd)
 
                     stored = await self._store_plan_if_owned(
                         instance_id,
                         task,
-                        plan_content,
+                        plan_result.plan_content,
+                        metadata_updates={
+                            "plan_agent_run_id": plan_result.run_id,
+                            "plan_review_verdict": plan_result.verdict,
+                            "plan_review_feedback": plan_result.feedback,
+                            "plan_review_exhausted": (
+                                plan_result.review_exhausted
+                            ),
+                        },
                     )
                     if stored:
                         await self._broadcast_generation_event(

@@ -510,6 +510,26 @@ class TaskQueue:
             await self.db.rollback()
             return False
 
+        from backend.services.plan_agent_runner import (
+            has_unreaped_plan_agent_for_task,
+        )
+
+        if has_unreaped_plan_agent_for_task(task_id):
+            await self.db.rollback()
+            return False
+
+        # Plan history is a first-class child of its target Task. Refuse to
+        # create dangling history; users can explicitly delete those Plans
+        # before deleting the target.
+        related_plan_id = await self.db.scalar(
+            select(Task.id)
+            .where(Task.plan_target_task_id == task_id)
+            .limit(1)
+        )
+        if related_plan_id is not None:
+            await self.db.rollback()
+            return False
+
         from backend.models.monitor_session import MonitorCheck, MonitorSession
 
         monitor_rows = list(
@@ -594,6 +614,28 @@ class TaskQueue:
                 return False
 
         await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
+        from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+
+        plan_run_ids = list(
+            (
+                await self.db.execute(
+                    select(PlanAgentRun.id).where(
+                        PlanAgentRun.plan_task_id == task_id
+                    )
+                )
+            ).scalars().all()
+        )
+        if plan_run_ids:
+            await self.db.execute(
+                sa_delete(PlanAgentStep).where(
+                    PlanAgentStep.run_id.in_(plan_run_ids)
+                )
+            )
+            await self.db.execute(
+                sa_delete(PlanAgentRun).where(
+                    PlanAgentRun.id.in_(plan_run_ids)
+                )
+            )
         if monitor_ids:
             await self.db.execute(
                 sa_delete(MonitorCheck).where(

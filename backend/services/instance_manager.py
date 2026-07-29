@@ -2380,6 +2380,7 @@ class InstanceManager:
         from backend.services.goal_evaluator import (
             goal_evaluator_runtime_users,
         )
+        from backend.services.plan_agent_runner import plan_agent_runtime_users
         from backend.services.skill_distill import task_distill_runtime_users
 
         blockers.extend(goal_evaluator_runtime_users(
@@ -2392,6 +2393,10 @@ class InstanceManager:
             account.claude_config_dir,
         ))
         blockers.extend(task_distill_runtime_users(account.codex_home))
+        blockers.extend(plan_agent_runtime_users(
+            account.claude_config_dir,
+        ))
+        blockers.extend(plan_agent_runtime_users(account.codex_home))
 
         # After restart, an unknown/live generation may exist only as durable
         # Task/Instance recovery evidence. Missing/mismatched ownership cannot

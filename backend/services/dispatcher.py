@@ -582,6 +582,55 @@ class GlobalDispatcher:
     def is_running(self) -> bool:
         return self._running
 
+    async def stop_plan_agent_lifecycle(
+        self,
+        task_id: int,
+        instance_id: int | None,
+    ) -> bool:
+        """Cancel and reap the exact dispatcher lifecycle for a Plan Task.
+
+        Plan Agents are read-only auxiliary subprocesses rather than ordinary
+        InstanceManager turns. The Task's persisted instance_id plus the live
+        dispatcher slot is their owner generation.
+        """
+
+        if instance_id is None:
+            return False
+        lifecycle = self._running_tasks.get(instance_id)
+        if lifecycle is None or lifecycle.done():
+            return False
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id)
+            if (
+                task is None
+                or task.mode != "plan"
+                or task.instance_id != instance_id
+                or task.status not in {"in_progress", "executing"}
+                or self._running_tasks.get(instance_id) is not lifecycle
+            ):
+                return False
+        lifecycle.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(
+                    asyncio.gather(lifecycle, return_exceptions=True)
+                ),
+                timeout=AUX_LIFECYCLE_CANCEL_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Plan Task {task_id} lifecycle ignored cancellation"
+            ) from exc
+        from backend.services.plan_agent_runner import (
+            has_unreaped_plan_agent_for_task,
+        )
+
+        if has_unreaped_plan_agent_for_task(task_id):
+            raise RuntimeError(
+                f"Plan Task {task_id} process cleanup could not be confirmed"
+            )
+        return True
+
     async def start(self):
         if self._shutting_down:
             raise RuntimeError("GlobalDispatcher is shutting down")
@@ -1565,6 +1614,19 @@ class GlobalDispatcher:
             )
             logger.exception(
                 "Failed to reap retained skill distill during shutdown"
+            )
+        try:
+            from backend.services.plan_agent_runner import (
+                reap_unreaped_plan_agents,
+            )
+
+            await reap_unreaped_plan_agents()
+        except Exception as exc:
+            shutdown_failures.append(
+                f"Plan Agent cleanup failed: {exc!r}"
+            )
+            logger.exception(
+                "Failed to reap retained Plan Agent during shutdown"
             )
 
         managed_instance_ids = {
@@ -6920,59 +6982,66 @@ class GlobalDispatcher:
         git_env: dict | None = None,
         effort_level: str | None = None,
     ):
-        """Run plan phase for plan-mode tasks."""
+        """Run the independent, read-only Planner/Reviewer pipeline."""
         if not await self._ensure_owned_executing(generation):
             return
-        plan_prompt = (
-            f"Please analyze the following task and create a detailed plan. "
-            f"Do NOT execute any changes, only describe what you would do:\n\n{task.description}"
+
+        from backend.services.plan_agent_runner import (
+            PlanAgentCleanupError,
+            PlanAgentRunner,
         )
-        config_dir = await self._resolve_resume_config_dir(
-            task.session_id,
-            task.provider,
-            task_id=task.id,
-            expected_generation=generation,
-            **({"model": task.model} if task.model else {}),
-            codex_service_tier=task.codex_service_tier,
+        from backend.services.plan_tasks import capture_repo_revision
+
+        if task.plan_repo_revision is None:
+            initial_revision = await capture_repo_revision(cwd)
+            async with self.db_factory() as db:
+                current = await self._read_owned_lifecycle_task(db, generation)
+                if current is None:
+                    return
+                current.plan_repo_revision = initial_revision
+                await db.commit()
+                task.plan_repo_revision = initial_revision
+
+        runner = PlanAgentRunner(
+            db_factory=self.db_factory,
+            instance_manager=self.instance_manager,
+            claude_pool=self.pool,
+            codex_pool=self.codex_pool,
+            cloudrouter_store=self.cloudrouter_store,
         )
-        exit_code, config_dir = await self._launch_mode_turn_with_rotation(
-            instance_id,
-            task,
-            generation,
-            cwd,
-            git_env,
-            prompt=plan_prompt,
-            config_dir=config_dir,
-            resume_session_id=task.session_id,
-            loop_iteration=None,
-            effort_level=effort_level,
-            label="Plan phase",
-        )
-        if exit_code not in (0, -2, 130):
+        try:
+            result = await runner.run(task, cwd=cwd)
+        except asyncio.CancelledError:
+            raise
+        except PlanAgentCleanupError:
+            # A surviving process tree is not safe to retry automatically.
+            logger.exception(
+                "Plan Agent cleanup failed for task %s",
+                task.id,
+            )
+            await self._fail_owned_task(
+                generation,
+                "Plan Agent cleanup could not be confirmed",
+            )
+            return
+        except Exception as exc:
+            logger.exception("Plan Agent pipeline failed for task %s", task.id)
             await self._retry_or_fail_mode_task(
                 generation,
-                f"Plan phase failed (exit code {exit_code})",
+                f"Plan Agent pipeline failed: {exc}",
             )
             return
-        if exit_code in (-2, 130):
-            return
 
-        # Collect plan content from logs
         async with self.db_factory() as db:
-            from sqlalchemy import select as sa_select
-            from backend.models.log_entry import LogEntry
-            result = await db.execute(
-                sa_select(LogEntry.content)
-                .where(
-                    LogEntry.task_id == task.id,
-                    LogEntry.event_type == "message",
-                    LogEntry.role == "assistant",
-                )
-                .order_by(LogEntry.id)
+            plan_metadata = dict(task.metadata_ or {})
+            plan_metadata.update(
+                {
+                    "plan_agent_run_id": result.run_id,
+                    "plan_review_verdict": result.verdict,
+                    "plan_review_feedback": result.feedback,
+                    "plan_review_exhausted": result.review_exhausted,
+                }
             )
-            plan_texts = [r[0] for r in result.all() if r[0]]
-            plan_content = "\n".join(plan_texts)
-
             plan_ready = await db.execute(
                 update(Task)
                 .where(
@@ -6981,7 +7050,12 @@ class GlobalDispatcher:
                         statuses=("executing",),
                     )
                 )
-                .values(plan_content=plan_content, status="plan_review")
+                .values(
+                    plan_content=result.plan_content,
+                    status="plan_review",
+                    error_message=None,
+                    metadata_=plan_metadata,
+                )
             )
             await db.commit()
 

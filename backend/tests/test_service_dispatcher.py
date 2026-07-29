@@ -846,16 +846,23 @@ async def test_plan_phase(db_factory):
         inst_id = inst.id
         task_obj = task
 
-    mock_proc = MagicMock()
-    mock_proc.returncode = 0
-    mock_proc.wait = AsyncMock(return_value=0)
-    d.instance_manager.processes = {inst_id: mock_proc}
-
-    await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
+    plan_result = SimpleNamespace(
+        plan_content="read-only plan",
+        verdict="approve",
+        feedback="",
+        review_exhausted=False,
+        run_id=11,
+    )
+    with patch(
+        "backend.services.plan_agent_runner.PlanAgentRunner.run",
+        AsyncMock(return_value=plan_result),
+    ):
+        await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
 
     async with db_factory() as db:
         t = await db.get(Task, task_obj.id)
         assert t.status == "plan_review"
+        assert t.plan_content == "read-only plan"
 
 
 # === Prompt construction with image_paths ===

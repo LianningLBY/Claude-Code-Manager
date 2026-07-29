@@ -57,6 +57,43 @@ class Task(Base):
     goal_last_reason: Mapped[str | None] = mapped_column(Text, nullable=True)  # goal mode: evaluator's latest judgment reason
     plan_content: Mapped[str | None] = mapped_column(Text, nullable=True)  # Claude's proposed plan
     plan_approved: Mapped[bool | None] = mapped_column(default=None)  # None=pending, True=approved, False=rejected
+    # Independent Plan Task relationship and application audit.  Always relate
+    # through Task.id: the target's native session_id may change after
+    # compaction, recovery, account rotation, or Worker migration.
+    plan_target_task_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    plan_context_session_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+    plan_context_log_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # Bounded immutable transcript captured at Plan creation. This keeps a
+    # Worker-side Planner independent from node-local LogEntry ids.
+    plan_context_snapshot: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    plan_repo_revision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    supersedes_plan_task_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    plan_approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    plan_approved_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    plan_applied_to_session_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+    plan_applied_log_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    plan_execution_task_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # Exact Claude PTY background epoch.  A persistent session can
     # finish foreground turn A, start turn B, and only then deliver A's late

@@ -48,6 +48,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       ? detail
       : detail && typeof detail === 'object' && typeof detail.error === 'string'
         ? detail.error
+        : detail && typeof detail === 'object' && typeof detail.message === 'string'
+          ? detail.message
         : res.statusText;
     const requestError = new Error(message) as ApiRequestError;
     requestError.status = res.status;
@@ -179,6 +181,13 @@ export interface Task {
   goal_last_reason: string | null;
   plan_content: string | null;
   plan_approved: boolean | null;
+  plan_target_task_id: number | null;
+  supersedes_plan_task_id: number | null;
+  plan_approved_at: string | null;
+  plan_approved_by: number | null;
+  plan_applied_at: string | null;
+  plan_applied_to_session_id: string | null;
+  plan_execution_task_id: number | null;
   starred: boolean;
   archived: boolean;
   has_unread: boolean;
@@ -212,6 +221,10 @@ export interface Task {
     fork_seed_message?: string;
     fork_seed_log_id?: number | null;
     fork_seed_uploads?: UploadResult[];
+    plan_agent_run_id?: number;
+    plan_review_verdict?: 'approve' | 'revise';
+    plan_review_feedback?: string;
+    plan_review_exhausted?: boolean;
     ccm_worker_managed_task?: boolean;
     ccm_user_skill_snapshots?: unknown[];
   } | null;
@@ -293,6 +306,54 @@ export interface CodexForkAnchor {
   content: string;
   timestamp: string | null;
   attachments: FileAttachment[];
+}
+
+export interface PlanStaleness {
+  stale: boolean;
+  reasons: string[];
+  current_log_id: number | null;
+  current_repo_revision: Record<string, unknown> | null;
+}
+
+export interface PlanAgentStep {
+  id: number;
+  step_type: 'planner' | 'reviewer';
+  round: number;
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  status: string;
+  output: string | null;
+  error: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface PlanAgentRun {
+  id: number;
+  plan_task_id: number;
+  status: string;
+  combo_used: string | null;
+  planner_provider: string | null;
+  planner_model: string | null;
+  planner_effort: string | null;
+  reviewer_provider: string | null;
+  reviewer_model: string | null;
+  reviewer_effort: string | null;
+  round: number;
+  review_verdict: string | null;
+  review_feedback: string | null;
+  review_exhausted: boolean;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  steps: PlanAgentStep[];
+}
+
+export interface PlanExecutionResult {
+  plan_task: Task;
+  execution_task: Task;
 }
 
 export interface AskUserOption {
@@ -1157,10 +1218,47 @@ export const api = {
     request<Task>(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   retryTask: (id: number, expectedRouting?: TaskRoutingExpectation) =>
     request<Task>(`/api/tasks/${id}/retry`, { method: 'POST', body: JSON.stringify({ expected_routing: expectedRouting }) }),
-  approvePlan: (id: number, expectedRouting?: TaskRoutingExpectation) =>
-    request<Task>(`/api/tasks/${id}/plan/approve`, { method: 'POST', body: JSON.stringify({ expected_routing: expectedRouting }) }),
+  approvePlan: (id: number, expectedRouting?: TaskRoutingExpectation, confirmStale = false) =>
+    request<Task>(`/api/tasks/${id}/plan/approve`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_routing: expectedRouting,
+        confirm_stale: confirmStale,
+      }),
+    }),
   rejectPlan: (id: number) =>
     request<Task>(`/api/tasks/${id}/plan/reject`, { method: 'POST' }),
+  createRelatedPlan: (
+    targetTaskId: number,
+    data: {
+      input: string;
+      title?: string;
+      provider?: string;
+      model?: string;
+      effort_level?: string;
+      supersedes_plan_task_id?: number;
+    },
+  ) =>
+    request<Task>(`/api/tasks/${targetTaskId}/plans`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listRelatedPlans: (targetTaskId: number) =>
+    request<Task[]>(`/api/tasks/${targetTaskId}/plans`),
+  getPlanStaleness: (planTaskId: number) =>
+    request<PlanStaleness>(`/api/tasks/${planTaskId}/plan/staleness`),
+  revisePlan: (planTaskId: number, feedback: string, title?: string) =>
+    request<Task>(`/api/tasks/${planTaskId}/plan/revise`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback, title }),
+    }),
+  getPlanRuns: (planTaskId: number) =>
+    request<PlanAgentRun[]>(`/api/tasks/${planTaskId}/plan/runs`),
+  createPlanExecutionTask: (planTaskId: number) =>
+    request<PlanExecutionResult>(
+      `/api/tasks/${planTaskId}/plan/create-execution-task`,
+      { method: 'POST' },
+    ),
   // Instances
   listInstances: () => request<Instance[]>('/api/instances'),
   createInstance: (data: { name: string }) =>
@@ -1198,8 +1296,36 @@ export const api = {
     request<{ ok: boolean }>('/api/dispatcher/stop', { method: 'POST' }),
 
   // Chat (task-based)
-  sendTaskChat: (taskId: number, message: string, filePaths?: string[], secretIds?: number[], model?: string | null, expectedRouting?: TaskRoutingExpectation) =>
-    request<{ ok: boolean; pid: number; instance_id: number; session_id: string }>(`/api/tasks/${taskId}/chat`, { method: 'POST', body: JSON.stringify({ message, file_paths: filePaths, secret_ids: secretIds, ...(model ? { model } : {}), expected_routing: expectedRouting }) }),
+  sendTaskChat: (
+    taskId: number,
+    message: string,
+    filePaths?: string[],
+    secretIds?: number[],
+    model?: string | null,
+    expectedRouting?: TaskRoutingExpectation,
+    planTaskIds?: number[],
+    confirmedStalePlanTaskIds?: number[],
+  ) =>
+    request<{
+      ok: boolean;
+      pid: number;
+      instance_id: number;
+      session_id: string;
+      applied_plan_task_ids?: number[];
+    }>(`/api/tasks/${taskId}/chat`, {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        file_paths: filePaths,
+        secret_ids: secretIds,
+        ...(model ? { model } : {}),
+        expected_routing: expectedRouting,
+        ...(planTaskIds?.length ? { plan_task_ids: planTaskIds } : {}),
+        ...(confirmedStalePlanTaskIds?.length
+          ? { confirmed_stale_plan_task_ids: confirmedStalePlanTaskIds }
+          : {}),
+      }),
+    }),
   getInjectCapabilities: (taskId: number) =>
     request<InjectTaskCapabilities>(`/api/tasks/${taskId}/inject-capabilities`),
   injectTaskMessage: (

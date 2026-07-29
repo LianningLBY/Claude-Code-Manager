@@ -6,6 +6,9 @@ import type { Task, Project, ChatMessage } from '../../api/client';
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
+  isApiRequestError: (error: unknown) => (
+    error instanceof Error && 'status' in error
+  ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
     sendTaskChat: vi.fn().mockResolvedValue({}),
@@ -48,6 +51,13 @@ vi.mock('../../api/client', () => ({
     starTask: vi.fn().mockResolvedValue({}),
     distillTask: vi.fn().mockResolvedValue({}),
     saveDistilledSkill: vi.fn().mockResolvedValue({}),
+    listRelatedPlans: vi.fn().mockResolvedValue([]),
+    getPlanStaleness: vi.fn().mockResolvedValue({ stale: false, reasons: [] }),
+    createRelatedPlan: vi.fn().mockResolvedValue({}),
+    approvePlan: vi.fn().mockResolvedValue({}),
+    rejectPlan: vi.fn().mockResolvedValue({}),
+    revisePlan: vi.fn().mockResolvedValue({}),
+    cancelTask: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -130,6 +140,11 @@ describe('ChatView', () => {
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getPlanStaleness as ReturnType<typeof vi.fn>).mockResolvedValue({
+      stale: false,
+      reasons: [],
+    });
     (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -2048,6 +2063,95 @@ describe('failed attachment sending', () => {
 
     const send = screen.getByTitle('Retry or remove failed attachments before sending');
     expect(send).toBeDisabled();
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+});
+
+describe('independent Plan attachments', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.removeItem('ccm-plan-dismissed-1');
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
+    (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      use_pty_mode: false,
+      pty_available: false,
+      codex_app_server_enabled: true,
+      codex_main_mcp_enabled: true,
+    });
+    (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      applied_plan_task_ids: [81],
+    });
+  });
+
+  it('persists an approved Plan in the composer and sends its explicit id', async () => {
+    const plan = makeTask({
+      id: 81,
+      title: 'API migration Plan',
+      mode: 'plan',
+      status: 'completed',
+      plan_content: 'Change API and add tests',
+      plan_approved: true,
+      plan_target_task_id: 1,
+      plan_applied_at: null,
+    });
+    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+
+    await screen.findByText(/Plan #81/);
+    await userEvent.type(
+      screen.getByPlaceholderText('Type a follow-up message...'),
+      'Implement the approved Plan',
+    );
+    await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+    await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalledWith(
+      1,
+      'Implement the approved Plan',
+      undefined,
+      undefined,
+      null,
+      {
+        provider: 'claude',
+        model: null,
+        codex_service_tier: 'default',
+      },
+      [81],
+      [],
+    ));
+  });
+
+  it('approves a Plan without sending a chat turn', async () => {
+    const plan = makeTask({
+      id: 82,
+      title: 'Review me',
+      mode: 'plan',
+      status: 'plan_review',
+      plan_content: 'A candidate Plan',
+      plan_approved: null,
+      plan_target_task_id: 1,
+    });
+    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+    (api.approvePlan as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...plan,
+      status: 'completed',
+      plan_approved: true,
+    });
+
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => expect(api.approvePlan).toHaveBeenCalledWith(
+      82,
+      {
+        provider: 'claude',
+        model: null,
+        codex_service_tier: 'default',
+      },
+    ));
     expect(api.sendTaskChat).not.toHaveBeenCalled();
   });
 });

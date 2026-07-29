@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api } from '../../api/client';
+import { api, isApiRequestError } from '../../api/client';
 import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -33,6 +33,7 @@ interface ChatViewProps {
 interface QueuedMessage {
   text: string;
   uploadResults?: UploadResult[];
+  planTaskIds?: number[];
 }
 
 type MessageGroup =
@@ -387,6 +388,217 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
 
+  // Independent Plans associated with this Task. Approved, unapplied Plans
+  // become persistent composer attachments; a user can dismiss/reselect them.
+  const [plansOpen, setPlansOpen] = useState(false);
+  const [relatedPlans, setRelatedPlans] = useState<Task[]>([]);
+  const [plansLoading, setPlansLoading] = useState(false);
+  const [planInput, setPlanInput] = useState('');
+  const [planCreating, setPlanCreating] = useState(false);
+  const [planBusyId, setPlanBusyId] = useState<number | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [selectedPlanIds, setSelectedPlanIds] = useState<number[]>([]);
+  const [planStaleIds, setPlanStaleIds] = useState<Set<number>>(new Set());
+  const queuedPlanIdsRef = useRef<Set<number>>(new Set());
+  const planDismissedKey = `ccm-plan-dismissed-${task.id}`;
+
+  const readDismissedPlans = useCallback((): Set<number> => {
+    try {
+      const raw = localStorage.getItem(planDismissedKey);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return new Set(
+        Array.isArray(parsed)
+          ? parsed.filter((value): value is number => Number.isInteger(value))
+          : [],
+      );
+    } catch {
+      return new Set();
+    }
+  }, [planDismissedKey]);
+
+  const writeDismissedPlans = useCallback((ids: Set<number>) => {
+    try {
+      localStorage.setItem(planDismissedKey, JSON.stringify([...ids]));
+    } catch { /* storage may be unavailable */ }
+  }, [planDismissedKey]);
+
+  const refreshPlans = useCallback(async (showLoading = false) => {
+    if (!task.session_id || task.shared_from_id != null) {
+      setRelatedPlans([]);
+      setSelectedPlanIds([]);
+      return;
+    }
+    if (showLoading) setPlansLoading(true);
+    try {
+      const plans = await api.listRelatedPlans(task.id);
+      setRelatedPlans(plans);
+      const dismissed = readDismissedPlans();
+      const reserved = queuedPlanIdsRef.current;
+      setSelectedPlanIds(
+        plans
+          .filter((plan) =>
+            plan.status === 'completed'
+            && plan.plan_approved === true
+            && plan.plan_applied_at == null
+            && !dismissed.has(plan.id)
+            && !reserved.has(plan.id)
+          )
+          .map((plan) => plan.id),
+      );
+    } catch (error) {
+      if (showLoading) {
+        setPlanError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (showLoading) setPlansLoading(false);
+    }
+  }, [readDismissedPlans, task.id, task.session_id, task.shared_from_id]);
+
+  useEffect(() => {
+    setPlansOpen(false);
+    setRelatedPlans([]);
+    setSelectedPlanIds([]);
+    setPlanStaleIds(new Set());
+    void refreshPlans(true);
+    const timer = window.setInterval(() => void refreshPlans(false), 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshPlans]);
+
+  useEffect(() => {
+    if (!plansOpen || relatedPlans.length === 0) return;
+    let active = true;
+    Promise.all(
+      relatedPlans
+        .filter((plan) => ['plan_review', 'completed'].includes(plan.status))
+        .slice(0, 20)
+        .map(async (plan) => ({
+          id: plan.id,
+          stale: (await api.getPlanStaleness(plan.id)).stale,
+        })),
+    ).then((results) => {
+      if (!active) return;
+      setPlanStaleIds(new Set(
+        results.filter((item) => item.stale).map((item) => item.id),
+      ));
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [plansOpen, relatedPlans]);
+
+  const togglePlanAttachment = useCallback((planId: number) => {
+    setSelectedPlanIds((current) => {
+      const selected = current.includes(planId);
+      const dismissed = readDismissedPlans();
+      if (selected) dismissed.add(planId);
+      else dismissed.delete(planId);
+      writeDismissedPlans(dismissed);
+      return selected
+        ? current.filter((id) => id !== planId)
+        : [...current, planId];
+    });
+  }, [readDismissedPlans, writeDismissedPlans]);
+
+  const approveRelatedPlan = async (plan: Task) => {
+    const routing = {
+      provider: plan.provider,
+      model: plan.model,
+      codex_service_tier: plan.codex_service_tier,
+    };
+    setPlanBusyId(plan.id);
+    setPlanError(null);
+    try {
+      await api.approvePlan(plan.id, routing);
+    } catch (error) {
+      const detail = isApiRequestError(error) ? error.detail : null;
+      const stale = detail && typeof detail === 'object'
+        && 'staleness' in detail;
+      if (!stale || !window.confirm(
+        'This Plan was created from older conversation or repository state. Approve it anyway?',
+      )) {
+        setPlanError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      try {
+        await api.approvePlan(plan.id, routing, true);
+      } catch (confirmedError) {
+        setPlanError(
+          confirmedError instanceof Error
+            ? confirmedError.message
+            : String(confirmedError),
+        );
+        return;
+      }
+    } finally {
+      setPlanBusyId(null);
+    }
+    await refreshPlans();
+    onTaskUpdated?.();
+  };
+
+  const rejectRelatedPlan = async (planId: number) => {
+    setPlanBusyId(planId);
+    setPlanError(null);
+    try {
+      await api.rejectPlan(planId);
+    } catch (error) {
+      setPlanError(error instanceof Error ? error.message : String(error));
+      return;
+    } finally {
+      setPlanBusyId(null);
+    }
+    await refreshPlans();
+    onTaskUpdated?.();
+  };
+
+  const createRelatedPlan = async () => {
+    const request = planInput.trim();
+    if (!request || planCreating) return;
+    setPlanCreating(true);
+    setPlanError(null);
+    try {
+      await api.createRelatedPlan(task.id, { input: request });
+      setPlanInput('');
+      await refreshPlans();
+      onTaskUpdated?.();
+    } catch (error) {
+      setPlanError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPlanCreating(false);
+    }
+  };
+
+  const reviseRelatedPlan = async (plan: Task) => {
+    const feedback = window.prompt(
+      'What should the revised Plan change?',
+      plan.metadata_?.plan_review_feedback || '',
+    )?.trim();
+    if (!feedback) return;
+    setPlanBusyId(plan.id);
+    setPlanError(null);
+    try {
+      await api.revisePlan(plan.id, feedback);
+      await refreshPlans();
+      onTaskUpdated?.();
+    } catch (error) {
+      setPlanError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPlanBusyId(null);
+    }
+  };
+
+  const cancelRelatedPlan = async (planId: number) => {
+    setPlanBusyId(planId);
+    setPlanError(null);
+    try {
+      await api.cancelTask(planId);
+      await refreshPlans();
+      onTaskUpdated?.();
+    } catch (error) {
+      setPlanError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPlanBusyId(null);
+    }
+  };
+
   // Distill state
   const [distillOpen, setDistillOpen] = useState(false);
   const [distilling, setDistilling] = useState(false);
@@ -454,21 +666,48 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const messageQueueRef = useRef(messageQueue);
   useEffect(() => {
     messageQueueRef.current = messageQueue;
+    queuedPlanIdsRef.current = new Set(
+      messageQueue.flatMap((item) => item.planTaskIds || []),
+    );
     localStorage.setItem(`ccm-chat-queue-${task.id}`, JSON.stringify(messageQueue));
   }, [messageQueue, task.id]);
 
-  const addToQueue = useCallback((text: string, uploadResults?: UploadResult[]) => {
-    setMessageQueue(prev => [...prev, { text, uploadResults }]);
+  const addToQueue = useCallback((
+    text: string,
+    uploadResults?: UploadResult[],
+    planTaskIds?: number[],
+  ) => {
+    setMessageQueue(prev => [...prev, { text, uploadResults, planTaskIds }]);
+    if (planTaskIds?.length) {
+      setSelectedPlanIds((current) =>
+        current.filter((id) => !planTaskIds.includes(id))
+      );
+    }
   }, []);
 
   const removeFromQueue = useCallback((index: number) => {
-    setMessageQueue(prev => prev.filter((_, i) => i !== index));
+    setMessageQueue(prev => {
+      const removed = prev[index];
+      if (removed?.planTaskIds?.length) {
+        setSelectedPlanIds((current) => [
+          ...current,
+          ...removed.planTaskIds!.filter((id) => !current.includes(id)),
+        ]);
+      }
+      return prev.filter((_, i) => i !== index);
+    });
   }, []);
 
   const editQueueItem = useCallback((index: number) => {
     const item = messageQueueRef.current[index];
     if (!item) return;
     setInput(prev => prev.trim() ? `${prev.trim()}\n\n${item.text}` : item.text);
+    if (item.planTaskIds?.length) {
+      setSelectedPlanIds((current) => [
+        ...current,
+        ...item.planTaskIds!.filter((id) => !current.includes(id)),
+      ]);
+    }
     setMessageQueue(prev => prev.filter((_, i) => i !== index));
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, []);
@@ -481,8 +720,32 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const merged = queued.map(q => q.text).join('\n\n');
       return current ? `${current}\n\n${merged}` : merged;
     });
+    const queuedPlanIds = [
+      ...new Set(queued.flatMap((item) => item.planTaskIds || [])),
+    ];
+    if (queuedPlanIds.length > 0) {
+      setSelectedPlanIds((current) => [
+        ...current,
+        ...queuedPlanIds.filter((id) => !current.includes(id)),
+      ]);
+    }
     setMessageQueue([]);
     requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
+  const clearMessageQueue = useCallback(() => {
+    const queuedPlanIds = [
+      ...new Set(
+        messageQueueRef.current.flatMap((item) => item.planTaskIds || []),
+      ),
+    ];
+    if (queuedPlanIds.length > 0) {
+      setSelectedPlanIds((current) => [
+        ...current,
+        ...queuedPlanIds.filter((id) => !current.includes(id)),
+      ]);
+    }
+    setMessageQueue([]);
   }, []);
 
   const moveQueueItem = useCallback((index: number, direction: 'up' | 'down') => {
@@ -501,7 +764,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   sendingRef.current = sending;
   const backgroundActiveRef = useRef(false);
   backgroundActiveRef.current = backgroundActive;
-  const handleSendRef = useRef<(text: string, uploadResults?: UploadResult[]) => void>(() => {});
+  const handleSendRef = useRef<(
+    text: string,
+    uploadResults?: UploadResult[],
+    planTaskIds?: number[],
+  ) => void>(() => {});
 
   useEffect(() => {
     if (autoDequeueFlag === 0) return;
@@ -515,7 +782,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (queue.length > 0) {
         const next = queue[0];
         setMessageQueue(prev => prev.slice(1));
-        setTimeout(() => handleSendRef.current(next.text, next.uploadResults), 300);
+        setTimeout(
+          () => handleSendRef.current(
+            next.text,
+            next.uploadResults,
+            next.planTaskIds,
+          ),
+          300,
+        );
       }
     }, 200);
     return () => clearTimeout(timer);
@@ -1300,8 +1574,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   };
 
-  const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
+  const handleSend = async (
+    overrideText?: string,
+    fromQueue?: boolean,
+    preUploadedResults?: UploadResult[],
+    preSelectedPlanIds?: number[],
+  ) => {
     const text = (overrideText ?? input).trim();
+    const planIdsForTurn = fromQueue
+      ? (preSelectedPlanIds || [])
+      : selectedPlanIds;
     const sendableAttachmentCount = fromQueue
       ? (preUploadedResults?.length || 0)
       : fileUpload.uploadedResults.length + forkSeedUploads.length;
@@ -1332,7 +1614,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (isProcessing && !fromQueue) {
       if (text || fileUpload.uploads.length > 0) {
         const results = fileUpload.uploadedResults.length > 0 ? [...fileUpload.uploadedResults] : undefined;
-        addToQueue(text, results);
+        addToQueue(
+          text,
+          results,
+          planIdsForTurn.length > 0 ? [...planIdsForTurn] : undefined,
+        );
         setInput('');
         fileUpload.clear();
       }
@@ -1380,18 +1666,66 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         setSending(true);
       }
 
-      await api.sendTaskChat(
-        task.id,
-        text || '(files attached)',
-        uploadedPaths,
-        selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
-        modelOverride,
-        {
-          provider: task.provider,
-          model: modelOverride || task.model,
-          codex_service_tier: task.codex_service_tier,
-        },
-      );
+      const routing = {
+        provider: task.provider,
+        model: modelOverride || task.model,
+        codex_service_tier: task.codex_service_tier,
+      };
+      const confirmedStalePlanIds: number[] = [];
+      for (;;) {
+        try {
+          if (planIdsForTurn.length > 0) {
+            await api.sendTaskChat(
+              task.id,
+              text || '(files attached)',
+              uploadedPaths,
+              selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+              modelOverride,
+              routing,
+              planIdsForTurn,
+              confirmedStalePlanIds,
+            );
+          } else {
+            // Keep the legacy six-argument call for ordinary messages.
+            await api.sendTaskChat(
+              task.id,
+              text || '(files attached)',
+              uploadedPaths,
+              selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+              modelOverride,
+              routing,
+            );
+          }
+          break;
+        } catch (sendError) {
+          const detail = isApiRequestError(sendError)
+            ? sendError.detail
+            : null;
+          const stalePlanId = (
+            detail
+            && typeof detail === 'object'
+            && 'plan_task_id' in detail
+            && typeof detail.plan_task_id === 'number'
+          ) ? detail.plan_task_id : null;
+          if (
+            stalePlanId == null
+            || !planIdsForTurn.includes(stalePlanId)
+            || confirmedStalePlanIds.includes(stalePlanId)
+            || !window.confirm(
+              `Plan #${stalePlanId} is based on older conversation or repository state. Apply it to this message anyway?`,
+            )
+          ) {
+            throw sendError;
+          }
+          confirmedStalePlanIds.push(stalePlanId);
+        }
+      }
+      if (planIdsForTurn.length > 0) {
+        setSelectedPlanIds((current) =>
+          current.filter((id) => !planIdsForTurn.includes(id))
+        );
+        void refreshPlans();
+      }
       if (!fromQueue) {
         try {
           localStorage.setItem(forkSeedUploadsConsumedKey, '1');
@@ -1416,13 +1750,21 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       setError(errMsg);
       if (!fromQueue && text) setInput(text);
       if (fromQueue && (text || preUploadedResults?.length)) {
-        setMessageQueue(prev => [{ text, uploadResults: preUploadedResults }, ...prev]);
+        setMessageQueue(prev => [{
+          text,
+          uploadResults: preUploadedResults,
+          planTaskIds: preSelectedPlanIds,
+        }, ...prev]);
       }
     }
   };
 
   // Keep ref updated for auto-dequeue effect
-  handleSendRef.current = (text: string, uploadResults?: UploadResult[]) => handleSend(text, true, uploadResults);
+  handleSendRef.current = (
+    text: string,
+    uploadResults?: UploadResult[],
+    planTaskIds?: number[],
+  ) => handleSend(text, true, uploadResults, planTaskIds);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) {
@@ -1479,6 +1821,39 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               active={monitorCount > 0}
               onNavigate={() => setShowMonitorPanel(!showMonitorPanel)}
             />
+            {task.session_id && task.shared_from_id == null && (
+              <button
+                onClick={() => setPlansOpen((open) => !open)}
+                className={`relative p-1.5 transition-colors ${
+                  plansOpen
+                    ? 'text-indigo-300 bg-indigo-500/15 rounded'
+                    : 'text-gray-600 hover:text-indigo-300'
+                }`}
+                title="Independent Plans"
+                aria-label="Plans"
+              >
+                <ListTodo size={18} />
+                {relatedPlans.filter((plan) =>
+                  ['pending', 'in_progress', 'executing', 'plan_review'].includes(plan.status)
+                  || (
+                    plan.status === 'completed'
+                    && plan.plan_approved === true
+                    && plan.plan_applied_at == null
+                  )
+                ).length > 0 && (
+                  <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-indigo-500 px-1 text-[9px] font-bold leading-4 text-white">
+                    {relatedPlans.filter((plan) =>
+                      ['pending', 'in_progress', 'executing', 'plan_review'].includes(plan.status)
+                      || (
+                        plan.status === 'completed'
+                        && plan.plan_approved === true
+                        && plan.plan_applied_at == null
+                      )
+                    ).length}
+                  </span>
+                )}
+              </button>
+            )}
             <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
             <button
               onClick={() => {
@@ -1695,6 +2070,194 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             provider={task.provider}
             monitorSupported={monitorSupported}
           />
+        </div>
+      )}
+
+      {plansOpen && (
+        <div className="border-b border-gray-800 bg-gray-900/70 px-4 py-3">
+          <div className="mx-auto max-w-4xl space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-medium text-gray-100">
+                  <ListTodo size={15} className="text-indigo-300" />
+                  Plans for Task #{task.id}
+                </div>
+                <p className="mt-0.5 text-[11px] text-gray-500">
+                  Plans run independently. Approval does not wake this session;
+                  selected Plans are applied only with your next real message.
+                </p>
+              </div>
+              <button
+                onClick={() => setPlansOpen(false)}
+                className="text-gray-500 hover:text-gray-300"
+                aria-label="Close Plans"
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            <div className="flex items-end gap-2">
+              <textarea
+                value={planInput}
+                onChange={(event) => setPlanInput(event.target.value)}
+                placeholder="What should this independent Plan investigate?"
+                rows={2}
+                maxLength={200000}
+                className="min-h-[58px] flex-1 resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+              />
+              <button
+                onClick={() => void createRelatedPlan()}
+                disabled={!planInput.trim() || planCreating}
+                className="flex h-9 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+              >
+                {planCreating
+                  ? <Loader2 size={13} className="animate-spin" />
+                  : <ListPlus size={13} />}
+                Create Plan
+              </button>
+            </div>
+
+            {planError && (
+              <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                {planError}
+              </div>
+            )}
+
+            {plansLoading && relatedPlans.length === 0 && (
+              <div className="flex items-center justify-center gap-2 py-5 text-xs text-gray-500">
+                <Loader2 size={13} className="animate-spin" />
+                Loading Plan history…
+              </div>
+            )}
+            {!plansLoading && relatedPlans.length === 0 && (
+              <div className="rounded-lg border border-dashed border-gray-700 px-3 py-5 text-center text-xs text-gray-500">
+                No Plans yet. Creating one will not interrupt the current session.
+              </div>
+            )}
+
+            <div className="max-h-[42vh] space-y-2 overflow-y-auto">
+              {relatedPlans.map((plan) => {
+                const active = ['pending', 'in_progress', 'executing'].includes(plan.status);
+                const ready = plan.status === 'plan_review';
+                const attachable = (
+                  plan.status === 'completed'
+                  && plan.plan_approved === true
+                  && plan.plan_applied_at == null
+                );
+                const selected = selectedPlanIds.includes(plan.id);
+                return (
+                  <div
+                    key={plan.id}
+                    className={`rounded-lg border px-3 py-2.5 ${
+                      selected
+                        ? 'border-indigo-500/60 bg-indigo-500/10'
+                        : 'border-gray-700 bg-gray-800/70'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="truncate text-xs font-medium text-gray-200">
+                            {plan.title}
+                          </span>
+                          <span className="text-[10px] text-gray-500">#{plan.id}</span>
+                          <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400">
+                            {plan.status}
+                          </span>
+                          <span className="text-[10px] text-gray-600">
+                            {plan.provider} · {plan.model || 'default'}
+                          </span>
+                          {planStaleIds.has(plan.id) && (
+                            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
+                              stale
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-1 line-clamp-2 whitespace-pre-wrap text-[11px] text-gray-500">
+                          {plan.description}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        {active && (
+                          <>
+                            <Loader2 size={13} className="animate-spin text-indigo-300" />
+                            <button
+                              onClick={() => void cancelRelatedPlan(plan.id)}
+                              disabled={planBusyId === plan.id}
+                              className="rounded px-2 py-1 text-[10px] text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        )}
+                        {ready && (
+                          <>
+                            <button
+                              onClick={() => void approveRelatedPlan(plan)}
+                              disabled={planBusyId === plan.id}
+                              className="flex items-center gap-1 rounded bg-green-600 px-2 py-1 text-[10px] font-medium text-white hover:bg-green-500 disabled:opacity-40"
+                            >
+                              {planBusyId === plan.id
+                                ? <Loader2 size={11} className="animate-spin" />
+                                : <Check size={11} />}
+                              Approve
+                            </button>
+                            <button
+                              onClick={() => void rejectRelatedPlan(plan.id)}
+                              disabled={planBusyId === plan.id}
+                              className="rounded px-2 py-1 text-[10px] text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+                            >
+                              Reject
+                            </button>
+                            <button
+                              onClick={() => void reviseRelatedPlan(plan)}
+                              disabled={planBusyId === plan.id}
+                              className="rounded px-2 py-1 text-[10px] text-gray-400 hover:bg-gray-700 disabled:opacity-40"
+                            >
+                              Revise
+                            </button>
+                          </>
+                        )}
+                        {attachable && (
+                          <button
+                            onClick={() => togglePlanAttachment(plan.id)}
+                            className={`flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium ${
+                              selected
+                                ? 'bg-indigo-600 text-white'
+                                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                            }`}
+                          >
+                            {selected ? <Check size={11} /> : <ListPlus size={11} />}
+                            {selected ? 'Attached' : 'Attach'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {plan.plan_content && (
+                      <details className="mt-2">
+                        <summary className="cursor-pointer text-[11px] text-indigo-300 hover:text-indigo-200">
+                          View Plan
+                        </summary>
+                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-gray-950/70 p-2 text-[11px] text-gray-300">
+                          {plan.plan_content}
+                        </pre>
+                      </details>
+                    )}
+                    {plan.metadata_?.plan_review_exhausted && (
+                      <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-300">
+                        Reviewer revision limit reached: {plan.metadata_.plan_review_feedback || 'unresolved feedback remains'}
+                      </div>
+                    )}
+                    {plan.plan_applied_at && (
+                      <div className="mt-1.5 text-[10px] text-gray-600">
+                        Applied to a user message
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1980,7 +2543,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   Merge
                 </button>
                 <button
-                  onClick={() => setMessageQueue([])}
+                  onClick={clearMessageQueue}
                   className="text-xs text-gray-500 hover:text-red-400 transition-colors"
                 >
                   Clear all
@@ -1992,6 +2555,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <div key={idx} className="flex items-center gap-1.5 group/q">
                   <span className="text-[10px] text-gray-600 w-4 text-right shrink-0">{idx + 1}</span>
                   <div className="flex-1 min-w-0 bg-gray-800/60 rounded px-2.5 py-1 text-xs text-gray-300 truncate flex items-center gap-1.5">
+                    {item.planTaskIds && item.planTaskIds.length > 0 && (
+                      <span
+                        className="inline-flex shrink-0 items-center gap-0.5 text-indigo-300"
+                        title={`Plans: ${item.planTaskIds.map((id) => `#${id}`).join(', ')}`}
+                      >
+                        <ListTodo size={10} />
+                        <span className="text-[10px]">{item.planTaskIds.length}</span>
+                      </span>
+                    )}
                     {item.uploadResults && item.uploadResults.length > 0 && (
                       <span className="inline-flex items-center gap-0.5 text-amber-400 shrink-0" title={item.uploadResults.map(r => r.filename).join(', ')}>
                         <Paperclip size={10} />
@@ -2042,6 +2614,39 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       {/* Input */}
       <div className="border-t border-gray-800 bg-gray-900 p-3">
         <div className="flex flex-col gap-2 max-w-3xl mx-auto">
+          {selectedPlanIds.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-indigo-300">
+                <ListTodo size={11} />
+                Next message
+              </span>
+              {selectedPlanIds.map((planId) => {
+                const plan = relatedPlans.find((item) => item.id === planId);
+                return (
+                  <span
+                    key={planId}
+                    className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-indigo-500/40 bg-indigo-500/10 px-2 py-1 text-[11px] text-indigo-200"
+                    title={plan?.title || `Plan #${planId}`}
+                  >
+                    <span className="truncate">
+                      Plan #{planId}{plan?.title ? ` · ${plan.title}` : ''}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => togglePlanAttachment(planId)}
+                      className="shrink-0 text-indigo-300 hover:text-white"
+                      aria-label={`Detach Plan #${planId}`}
+                    >
+                      <X size={10} />
+                    </button>
+                  </span>
+                );
+              })}
+              <span className="text-[10px] text-gray-500">
+                applied only when this message is sent
+              </span>
+            </div>
+          )}
           {/* File preview strip */}
           {(forkSeedUploads.length > 0 || fileUpload.uploads.length > 0) && (
             <div className="flex gap-2 flex-wrap">

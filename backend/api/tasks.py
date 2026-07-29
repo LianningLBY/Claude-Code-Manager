@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -17,6 +17,7 @@ from backend.models.task import Task
 from backend.models.instance import Instance
 from backend.schemas.task import (
     TaskActionRequest,
+    PlanApprovalRequest,
     TaskCreate,
     TaskMigrationImport,
     TaskResponse,
@@ -146,6 +147,15 @@ def _validate_task_service_tier_configuration(
     """Validate every model request hidden behind one Task configuration."""
 
     validate_codex_service_tier(provider, model, codex_service_tier)
+    if (
+        (provider or "claude").lower() == "codex"
+        and (codex_service_tier or "default") == "priority"
+        and mode == "plan"
+    ):
+        raise ValueError(
+            "Codex Fast is not supported for read-only Plan Agent tasks; "
+            "use Standard"
+        )
     if not (
         (provider or "claude").lower() == "codex"
         and (codex_service_tier or "default") == "priority"
@@ -520,6 +530,106 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     if meta:
         data["metadata_"] = meta
 
+    if data.get("plan_target_task_id") is not None:
+        if data.get("mode") != "plan":
+            raise HTTPException(422, "plan_target_task_id requires mode='plan'")
+        target = await db.get(Task, data["plan_target_task_id"])
+        if target is None:
+            raise HTTPException(404, "Plan target Task not found")
+        await require_task_control(request, target, db)
+        if not target.session_id:
+            raise HTTPException(
+                400,
+                "Run the target Task before creating a session Plan",
+            )
+        if target.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Shared shadow tasks cannot own Plan Tasks",
+            )
+        if (
+            data.get("worker_id") != target.worker_id
+            or data.get("project_id") != target.project_id
+        ):
+            raise HTTPException(
+                422,
+                "Related Plan must use the target Task's Project and Worker",
+            )
+        from backend.services.plan_tasks import (
+            ACTIVE_PLAN_STATUSES,
+            MAX_ACTIVE_PLANS_PER_TASK,
+        )
+
+        active_count = await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.plan_target_task_id == target.id,
+                Task.mode == "plan",
+                Task.status.in_(ACTIVE_PLAN_STATUSES),
+            )
+        )
+        if int(active_count or 0) >= MAX_ACTIVE_PLANS_PER_TASK:
+            raise HTTPException(
+                429,
+                f"Task already has {MAX_ACTIVE_PLANS_PER_TASK} active Plans",
+            )
+        supersedes_id = data.get("supersedes_plan_task_id")
+        if supersedes_id is not None:
+            supersedes = await db.get(Task, supersedes_id)
+            if (
+                supersedes is None
+                or supersedes.mode != "plan"
+                or supersedes.plan_target_task_id != target.id
+            ):
+                raise HTTPException(
+                    400,
+                    "Superseded Plan does not belong to this Task",
+                )
+            await require_task_control(request, supersedes, db)
+        # The execution node owns its LogEntry ids and repository. Re-capture
+        # the same target boundary locally instead of trusting a Manager-side
+        # watermark whose integer id has no cross-database meaning.
+        from backend.services.plan_tasks import capture_task_context, latest_task_log_id
+
+        local_context_log_id = await latest_task_log_id(db, target.id)
+        data["plan_context_session_id"] = target.session_id
+        data["plan_context_log_id"] = local_context_log_id
+        data["plan_context_snapshot"] = await capture_task_context(
+            db,
+            target.id,
+            through_log_id=local_context_log_id,
+            max_chars=settings.plan_transcript_max_chars,
+        )
+        from backend.services.plan_tasks import capture_repo_revision
+
+        data["plan_repo_revision"] = await capture_repo_revision(
+            target.last_cwd or target.target_repo
+        )
+    elif data.get("mode") != "plan":
+        for plan_only_field in (
+            "plan_context_session_id",
+            "plan_context_log_id",
+            "plan_context_snapshot",
+            "plan_repo_revision",
+            "supersedes_plan_task_id",
+        ):
+            if data.get(plan_only_field) is not None:
+                raise HTTPException(
+                    422,
+                    f"{plan_only_field} requires mode='plan'",
+                )
+    elif data.get("supersedes_plan_task_id") is not None:
+        supersedes = await db.get(Task, data["supersedes_plan_task_id"])
+        if (
+            supersedes is None
+            or supersedes.mode != "plan"
+            or supersedes.plan_target_task_id is not None
+        ):
+            raise HTTPException(
+                400,
+                "Standalone Plan can only supersede another standalone Plan",
+            )
+        await require_task_control(request, supersedes, db)
+
     if clone_from_task_id:
         source = await db.get(Task, clone_from_task_id)
         if source is None:
@@ -540,6 +650,13 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         )
     if not data.get("effort_level"):
         data["effort_level"] = app_settings.default_effort
+    if data.get("mode") == "plan" and data.get("plan_repo_revision") is None:
+        from backend.services.plan_tasks import capture_repo_revision
+
+        if data.get("worker_id") is None:
+            data["plan_repo_revision"] = await capture_repo_revision(
+                data.get("last_cwd") or data.get("target_repo")
+            )
     validation_skills = dict(data.get("enabled_skills") or {})
     validation_skills.update(
         _explicit_command_skills(data.get("description"))
@@ -2693,7 +2810,7 @@ async def _stop_task_session_local_impl(
 ) -> dict:
     """Cancellation-safe local core for ``POST /stop-session``."""
 
-    from backend.main import dispatcher, instance_manager
+    from backend.main import dispatcher, instance_manager, ralph_loop
 
     await db.rollback()
     try:
@@ -2726,8 +2843,29 @@ async def _stop_task_session_local_impl(
             "Task execution location changed while stopping its session",
         )
     probe_instance_id = probe.instance_id
+    probe_is_active_plan = (
+        probe.mode == "plan"
+        and probe.status in {"in_progress", "executing"}
+    )
     await db.rollback()
     await _settle_task_launch_barrier(task_id, probe_instance_id)
+    if probe_is_active_plan:
+        try:
+            stopped = await dispatcher.stop_plan_agent_lifecycle(
+                task_id,
+                probe_instance_id,
+            )
+            if not stopped:
+                stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
+            if not stopped:
+                raise RuntimeError(
+                    f"No exact Plan lifecycle owns Task {task_id}"
+                )
+        except Exception as exc:
+            raise HTTPException(
+                409,
+                "Plan Agent process cleanup could not be confirmed",
+            ) from exc
 
     db.expire_all()
     active_task = (
@@ -3117,7 +3255,7 @@ async def _cancel_local_task_impl(
 ) -> Task:
     """Cancellation-safe local core for ``POST /cancel``."""
 
-    from backend.main import dispatcher
+    from backend.main import dispatcher, ralph_loop
 
     await db.rollback()
     try:
@@ -3149,8 +3287,24 @@ async def _cancel_local_task_impl(
             "Task execution location changed while cancellation was starting",
         )
     probe_instance_id = probe.instance_id
+    probe_is_active_plan = (
+        probe.mode == "plan"
+        and probe.status in {"in_progress", "executing"}
+    )
     await db.rollback()
     await _settle_task_launch_barrier(task_id, probe_instance_id)
+    if probe_is_active_plan:
+        stopped = await dispatcher.stop_plan_agent_lifecycle(
+            task_id,
+            probe_instance_id,
+        )
+        if not stopped:
+            stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
+        if not stopped:
+            raise HTTPException(
+                409,
+                "Plan Agent process cleanup could not be confirmed",
+            )
 
     db.expire_all()
     active_task = (
@@ -3589,11 +3743,11 @@ async def get_queue(
 async def approve_plan(
     task_id: int,
     request: Request,
-    body: TaskActionRequest | None = None,
+    body: PlanApprovalRequest | None = None,
     queue: TaskQueue = Depends(_get_queue),
     db: AsyncSession = Depends(get_db),
 ):
-    """Approve a plan-mode task's plan and queue it for execution."""
+    """Approve an independent Plan without starting an Agent turn."""
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -3613,7 +3767,15 @@ async def approve_plan(
         if current.mode != "plan" or current.status != "plan_review":
             raise HTTPException(400, "Task is not in plan review state")
 
+        target = None
+        if current.plan_target_task_id is not None:
+            target = await db.get(Task, current.plan_target_task_id)
+            if target is None:
+                raise HTTPException(409, "Plan target no longer exists")
+            await require_task_control(request, target, db)
+
         if current.worker_id is not None:
+            approving_user_id = get_current_user_id(request)
             await _ensure_worker_routing_ready(
                 current,
                 operation_lock_held=True,
@@ -3621,23 +3783,6 @@ async def approve_plan(
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
-            await _sync_worker_skill_selection_before_execution(current)
-            await db.rollback()
-            db.expire_all()
-            current = await db.get(Task, task_id)
-            if (
-                current is None
-                or worker_task_generation(
-                    current,
-                    expected_worker_id=observed.worker_id,
-                )
-                != observed
-            ):
-                raise HTTPException(
-                    409,
-                    "Task Worker generation changed while Skill selection was "
-                    "being synchronized",
-                )
             result = await _proxy(
                 current,
                 "POST",
@@ -3645,19 +3790,43 @@ async def approve_plan(
                 body=body.model_dump(mode="json") if body is not None else None,
                 operation_lock_held=True,
             )
-            # worker 上回到 pending 由 worker 自己的 Dispatcher 接力执行
-            return await _sync_task_from_worker_response(
-                queue.db,
+            approved = await _sync_task_from_worker_response(
+                db,
                 current,
                 result,
                 observed=observed,
             )
+            # Worker authentication identifies the Manager service, not the
+            # human who made this decision. Keep this Manager-local audit field
+            # authoritative and never mirror a Worker-local user id.
+            approved.plan_approved_by = approving_user_id
+            await db.commit()
+            await db.refresh(approved)
+            return approved
 
         _require_no_pending_worker_routing(current)
+        from backend.services.plan_tasks import plan_staleness
+
+        stale = await plan_staleness(db, current, current_target=target)
+        if stale["stale"] and not (body and body.confirm_stale):
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "Plan context changed; confirm stale approval",
+                    "staleness": stale,
+                },
+            )
+        approved_at = datetime.utcnow()
         changed = await db.execute(
             sa_update(Task)
             .where(*_task_generation_fence(task_id, current))
-            .values(plan_approved=True, status="pending")
+            .values(
+                plan_approved=True,
+                plan_approved_at=approved_at,
+                plan_approved_by=get_current_user_id(request),
+                status="completed",
+                completed_at=approved_at,
+            )
         )
         if changed.rowcount != 1:
             await db.rollback()
@@ -3670,14 +3839,8 @@ async def approve_plan(
         approved = await db.get(Task, task_id)
         if approved is None:
             raise HTTPException(409, "Task disappeared while approving the plan")
-        try:
-            from backend.main import dispatcher
-            if dispatcher:
-                dispatcher.wake()
-        except Exception:
-            pass
         from backend.services.task_events import broadcast_status_change
-        await broadcast_status_change(task_id, "pending")
+        await broadcast_status_change(task_id, "completed")
         return approved
 
 
@@ -3718,7 +3881,11 @@ async def reject_plan(task_id: int, request: Request, queue: TaskQueue = Depends
         changed = await db.execute(
             sa_update(Task)
             .where(*_task_generation_fence(task_id, current))
-            .values(plan_approved=False, status="cancelled")
+            .values(
+                plan_approved=False,
+                status="cancelled",
+                completed_at=datetime.utcnow(),
+            )
         )
         if changed.rowcount != 1:
             await db.rollback()

@@ -307,14 +307,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   // Fast is Codex-only and model-gated. Wait for the capability response before
   // normalizing persisted defaults so a slow config request cannot erase them.
   useEffect(() => {
-    if (provider !== 'codex') {
+    if (provider !== 'codex' || mode === 'plan') {
       if (codexServiceTier !== 'default') setCodexServiceTier('default');
       return;
     }
     if (codexCapabilitiesLoaded && codexServiceTier === 'priority' && !activeCodexModelSupportsFast) {
       setCodexServiceTier('default');
     }
-  }, [provider, codexServiceTier, codexCapabilitiesLoaded, activeCodexModelSupportsFast]);
+  }, [provider, mode, codexServiceTier, codexCapabilitiesLoaded, activeCodexModelSupportsFast]);
 
   const handleProjectChange = (val: string) => {
     if (val === NEW_PROJECT_VALUE) {
@@ -759,7 +759,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   ))}
                 </select>
 
-                {provider === 'codex' && (
+                {provider === 'codex' && mode !== 'plan' && (
                   <>
                     <span className="text-gray-400">Speed</span>
                     <select

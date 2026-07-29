@@ -23,6 +23,7 @@ describe('PlanPanel', () => {
     const task = {
       id: 41,
       title: 'Fast plan',
+      mode: 'plan',
       status: 'plan_review',
       plan_content: 'Do the work',
       provider: 'codex',

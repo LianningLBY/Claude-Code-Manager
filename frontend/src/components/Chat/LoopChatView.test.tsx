@@ -21,6 +21,10 @@ vi.mock('../../api/client', () => ({
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
     cancelTask: vi.fn().mockResolvedValue({}),
+    downloadTaskArtifact: vi.fn().mockResolvedValue({
+      blob: new Blob(['loop artifact']),
+      filename: 'loop-report.md',
+    }),
   },
 }));
 
@@ -139,6 +143,38 @@ describe('LoopChatView', () => {
         await screen.findByText('Loop reply after agent wait'),
       ).toBeInTheDocument();
       expect(screen.getAllByText('— completed —')).toHaveLength(1);
+    });
+
+    it('downloads task file links with the loop task context', async () => {
+      const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+        .mockImplementation(() => {});
+      const createObjectUrl = vi.fn().mockReturnValue('blob:loop-artifact');
+      const NativeURL = URL;
+      class MockURL extends NativeURL {
+        static createObjectURL = createObjectUrl;
+        static revokeObjectURL = vi.fn();
+      }
+      vi.stubGlobal('URL', MockURL);
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({
+          id: 904,
+          content: '[loop-report.md](reports/loop-report.md)',
+        }),
+      ]);
+
+      render(<LoopChatView task={makeTask({ id: 42 })} onBack={onBack} />);
+      const link = await screen.findByRole('link', { name: /loop-report\.md/ });
+      fireEvent.click(link);
+
+      await waitFor(() => {
+        expect(api.downloadTaskArtifact).toHaveBeenCalledWith(
+          42,
+          'reports/loop-report.md',
+        );
+      });
+      expect(createObjectUrl).toHaveBeenCalled();
+      clickSpy.mockRestore();
+      vi.unstubAllGlobals();
     });
   });
 

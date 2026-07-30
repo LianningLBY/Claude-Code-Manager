@@ -27,6 +27,7 @@ from backend.api.uploads import router as uploads_router
 from backend.api.secrets import router as secrets_router
 from backend.api.tags import router as tags_router
 from backend.api.files import router as files_router
+from backend.api.task_artifacts import router as task_artifacts_router
 from backend.api.pool import router as pool_router
 from backend.api.codex_pool import (
     recover_pending_codex_login_transactions,
@@ -740,7 +741,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Refreshed-Token"],
+    expose_headers=["X-Refreshed-Token", "Content-Disposition"],
 )
 
 app.include_router(tasks_router)
@@ -758,6 +759,7 @@ app.include_router(uploads_router)
 app.include_router(secrets_router)
 app.include_router(tags_router)
 app.include_router(files_router)
+app.include_router(task_artifacts_router)
 app.include_router(pool_router)
 app.include_router(codex_pool_router)
 app.include_router(cloudrouter_accounts_router)

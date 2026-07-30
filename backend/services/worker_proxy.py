@@ -14,6 +14,8 @@ from weakref import WeakKeyDictionary
 
 import httpx
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from backend.config import settings
 from backend.models.project import Project
@@ -421,6 +423,91 @@ class WorkerProxy:
         ssh = self._ssh(worker)
         for path in paths:
             await ssh.copy_file(path, path)
+
+    async def stream_task_artifact(
+        self,
+        task: Task,
+        artifact_path: str,
+    ) -> StreamingResponse:
+        """Stream a task-scoped file from its Worker without buffering it."""
+
+        worker = await self.require_ready_worker(task.worker_id)
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=None, write=30, pool=10),
+        )
+        try:
+            request = client.build_request(
+                "GET",
+                self._api(
+                    worker,
+                    f"/api/tasks/{task.id}/artifacts/download",
+                ),
+                headers=self._headers(worker),
+                params={"path": artifact_path},
+            )
+            response = await client.send(request, stream=True)
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            await client.aclose()
+            raise HTTPException(
+                503,
+                f"Worker {worker.name} artifact request timed out",
+            ) from exc
+        except (httpx.RequestError, OSError) as exc:
+            await client.aclose()
+            raise HTTPException(
+                502,
+                f"Unable to reach Worker {worker.name}",
+            ) from exc
+
+        if not 200 <= response.status_code < 300:
+            try:
+                payload = await response.aread()
+            finally:
+                await response.aclose()
+                await client.aclose()
+            if response.status_code == 401:
+                raise HTTPException(
+                    502,
+                    f"Worker {worker.name} rejected its internal credential",
+                )
+            status_code = (
+                response.status_code
+                if response.status_code in {400, 403, 404, 413}
+                else 502
+            )
+            detail = "Worker artifact download failed"
+            try:
+                decoded = response.json()
+                if isinstance(decoded, dict) and isinstance(decoded.get("detail"), str):
+                    detail = decoded["detail"]
+            except Exception:
+                if payload:
+                    detail = payload[:300].decode(errors="replace")
+            raise HTTPException(status_code, detail)
+
+        forwarded_headers = {}
+        for header in ("content-disposition", "content-length", "content-type"):
+            value = response.headers.get(header)
+            if value:
+                forwarded_headers[header] = value
+
+        async def close_upstream() -> None:
+            await response.aclose()
+            await client.aclose()
+
+        async def body():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await close_upstream()
+
+        return StreamingResponse(
+            body(),
+            status_code=response.status_code,
+            headers=forwarded_headers,
+            background=BackgroundTask(close_upstream),
+        )
 
     # ------------------------------------------------------------------
     # 通用操作代理（设计 §6.4）

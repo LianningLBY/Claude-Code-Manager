@@ -20,6 +20,7 @@ import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
 } from './messageMerge';
+import { TaskArtifactLink } from './TaskArtifactLink';
 
 interface ChatViewProps {
   task: Task;
@@ -2586,12 +2587,26 @@ const markdownComponents: Components = {
   },
 };
 
-const MarkdownContent = memo(function MarkdownContent({ content, className }: { content: string; className?: string }) {
+const MarkdownContent = memo(function MarkdownContent({
+  content,
+  taskId,
+  className,
+}: {
+  content: string;
+  taskId: number;
+  className?: string;
+}) {
+  const taskComponents = useMemo<Components>(() => ({
+    ...markdownComponents,
+    a({ href, children }) {
+      return <TaskArtifactLink taskId={taskId} href={href}>{children}</TaskArtifactLink>;
+    },
+  }), [taskId]);
   return (
     <div className={`markdown-body ${className || ''}`}>
     <ReactMarkdown
       remarkPlugins={remarkPlugins}
-      components={markdownComponents}
+      components={taskComponents}
     >
       {content}
     </ReactMarkdown>
@@ -2850,7 +2865,7 @@ const MessageBubble = memo(function MessageBubble({
   onAskUserResolved,
 }: {
   message: ChatMessage;
-  taskId?: number;
+  taskId: number;
   onAskUserResolved?: (requestId: string, status: 'answered' | 'expired') => void;
 }) {
   const isUser = message.role === 'user';
@@ -3029,7 +3044,7 @@ const MessageBubble = memo(function MessageBubble({
               {message.content && message.content !== '(files attached)' && message.content !== '(images attached)' ? message.content : !message.attachments?.length && !message.image_urls?.length ? message.content || '' : null}
             </>
           ) : (
-            <MarkdownContent content={message.content || ''} />
+            <MarkdownContent content={message.content || ''} taskId={taskId} />
           )}
         </div>
         <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end pr-1' : 'pl-1'}`}>

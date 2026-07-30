@@ -13,7 +13,13 @@ import { FastModeBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { ExpandableText } from '../ExpandableText';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
-import { useFileUpload } from '../../hooks/useFileUpload';
+import {
+  dedupeUploadResults,
+  isUploadResult,
+  MAX_FILES,
+  sameUploadResult,
+  useFileUpload,
+} from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
 import {
@@ -34,6 +40,16 @@ interface ChatViewProps {
 interface QueuedMessage {
   text: string;
   uploadResults?: UploadResult[];
+}
+
+function loadStoredUploadResults(key: string): UploadResult[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return dedupeUploadResults(parsed.filter(isUploadResult)).slice(0, MAX_FILES);
+  } catch {
+    return [];
+  }
 }
 
 type MessageGroup =
@@ -161,6 +177,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
   const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
   const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
+  const draftUploadsKey = `ccm-chat-draft-uploads-${task.id}`;
   const [forkSeedUploads, setForkSeedUploads] = useState<UploadResult[]>(() => {
     try {
       if (localStorage.getItem(forkSeedUploadsConsumedKey)) return [];
@@ -224,7 +241,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [stillRunning, setStillRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
-  const fileUpload = useFileUpload();
+  const initialDraftUploads = useMemo(
+    () => loadStoredUploadResults(draftUploadsKey),
+    [draftUploadsKey],
+  );
+  const fileUpload = useFileUpload(initialDraftUploads);
+  const consumeForkSeedUploads = useCallback(() => {
+    if (forkSeedUploads.length === 0) return;
+    try {
+      localStorage.setItem(forkSeedUploadsConsumedKey, '1');
+      localStorage.removeItem(forkSeedUploadsKey);
+    } catch { /* storage may be unavailable */ }
+    setForkSeedUploads([]);
+  }, [
+    forkSeedUploads.length,
+    forkSeedUploadsConsumedKey,
+    forkSeedUploadsKey,
+  ]);
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(task.context_window_usage ?? null);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -348,13 +381,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         current.trim() === text ? '' : current
       ));
       fileUpload.clear();
-      if (forkSeedUploads.length > 0) {
-        try {
-          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
-          localStorage.removeItem(forkSeedUploadsKey);
-        } catch { /* storage may be unavailable */ }
-        setForkSeedUploads([]);
-      }
+      consumeForkSeedUploads();
     } catch (e) {
       setError(
         `未收到注入成功确认，消息和附件已保留；请先查看聊天记录或运行日志，再决定是否重试：${
@@ -376,6 +403,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       else localStorage.removeItem(`ccm-chat-draft-${task.id}`);
     } catch { /* storage may be unavailable */ }
   }, [input, task.id]);
+  useEffect(() => {
+    try {
+      if (fileUpload.uploadedResults.length > 0) {
+        localStorage.setItem(
+          draftUploadsKey,
+          JSON.stringify(fileUpload.uploadedResults),
+        );
+      } else {
+        localStorage.removeItem(draftUploadsKey);
+      }
+    } catch { /* storage may be unavailable */ }
+  }, [draftUploadsKey, fileUpload.uploadedResults]);
   useEffect(() => {
     try {
       if (localStorage.getItem(forkSeedUploadsConsumedKey)) {
@@ -449,7 +488,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
         return (parsed as string[]).map(text => ({ text }));
       }
-      return parsed;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((item): QueuedMessage[] => {
+        if (!item || typeof item !== 'object') return [];
+        const candidate = item as Partial<QueuedMessage>;
+        if (typeof candidate.text !== 'string') return [];
+        const uploadResults = Array.isArray(candidate.uploadResults)
+          ? dedupeUploadResults(candidate.uploadResults.filter(isUploadResult))
+          : undefined;
+        return [{
+          text: candidate.text,
+          uploadResults: uploadResults?.length ? uploadResults : undefined,
+        }];
+      });
     } catch { return []; }
   });
   const messageQueueRef = useRef(messageQueue);
@@ -466,17 +517,54 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setMessageQueue(prev => prev.filter((_, i) => i !== index));
   }, []);
 
+  const restoreQueuedUploads = useCallback((items: QueuedMessage[]): boolean => {
+    const queuedUploads = dedupeUploadResults(
+      items.flatMap((item) => item.uploadResults || []),
+    );
+    const existingUploaded = dedupeUploadResults([
+      ...forkSeedUploads,
+      ...fileUpload.uploadedResults,
+    ]);
+    const additions = queuedUploads.filter(
+      (upload) => !existingUploaded.some(
+        (existing) => sameUploadResult(existing, upload),
+      ),
+    );
+    const uploadsWithoutResults = (
+      fileUpload.uploads.length - fileUpload.uploadedResults.length
+    );
+    const projectedCount = (
+      existingUploaded.length + uploadsWithoutResults + additions.length
+    );
+    if (projectedCount > MAX_FILES) {
+      setError(
+        `合并后将有 ${projectedCount} 个附件，单条消息最多支持 ${MAX_FILES} 个；`
+        + '请先删除部分附件或队列消息。',
+      );
+      return false;
+    }
+    if (!fileUpload.addUploadedResults(additions)) {
+      setError(
+        `合并后附件超过 ${MAX_FILES} 个，队列已保持原样；请先删除部分附件。`,
+      );
+      return false;
+    }
+    return true;
+  }, [fileUpload, forkSeedUploads]);
+
   const editQueueItem = useCallback((index: number) => {
     const item = messageQueueRef.current[index];
     if (!item) return;
+    if (!restoreQueuedUploads([item])) return;
     setInput(prev => prev.trim() ? `${prev.trim()}\n\n${item.text}` : item.text);
     setMessageQueue(prev => prev.filter((_, i) => i !== index));
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  }, [restoreQueuedUploads]);
 
   const mergeQueueToInput = useCallback(() => {
     const queued = messageQueueRef.current;
     if (queued.length === 0) return;
+    if (!restoreQueuedUploads(queued)) return;
     setInput(prev => {
       const current = prev.trim();
       const merged = queued.map(q => q.text).join('\n\n');
@@ -484,7 +572,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     });
     setMessageQueue([]);
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  }, [restoreQueuedUploads]);
 
   const moveQueueItem = useCallback((index: number, direction: 'up' | 'down') => {
     setMessageQueue(prev => {
@@ -1303,9 +1391,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
     const text = (overrideText ?? input).trim();
-    const sendableAttachmentCount = fromQueue
-      ? (preUploadedResults?.length || 0)
-      : fileUpload.uploadedResults.length + forkSeedUploads.length;
+    const fileUploadResultsForTurn = dedupeUploadResults(
+      fileUpload.uploadedResults,
+    );
+    const uploadedResultsForTurn = fromQueue
+      ? dedupeUploadResults(preUploadedResults || [])
+      : dedupeUploadResults([
+        ...forkSeedUploads,
+        ...fileUploadResultsForTurn,
+      ]);
+    const sendableAttachmentCount = uploadedResultsForTurn.length;
     if (!text && sendableAttachmentCount === 0) return;
 
     if (!fromQueue && fileUpload.isUploading) {
@@ -1324,18 +1419,21 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       await handleInject(
         text,
-        [...forkSeedUploads, ...fileUpload.uploadedResults],
+        uploadedResultsForTurn,
       );
       return;
     }
 
     // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
     if (isProcessing && !fromQueue) {
-      if (text || fileUpload.uploads.length > 0) {
-        const results = fileUpload.uploadedResults.length > 0 ? [...fileUpload.uploadedResults] : undefined;
-        addToQueue(text, results);
+      if (text || sendableAttachmentCount > 0) {
+        addToQueue(
+          text,
+          uploadedResultsForTurn.length > 0 ? uploadedResultsForTurn : undefined,
+        );
         setInput('');
         fileUpload.clear();
+        consumeForkSeedUploads();
       }
       return;
     }
@@ -1349,15 +1447,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     let optimisticMessageId: number | null = null;
     try {
       let uploadedPaths: string[] | undefined;
-      let uploadedResults: UploadResult[] = [];
-      if (preUploadedResults && preUploadedResults.length > 0) {
-        uploadedResults = preUploadedResults;
-      } else if (fileUpload.uploadedResults.length > 0) {
-        uploadedResults = fileUpload.uploadedResults;
-      }
-      if (!fromQueue && forkSeedUploads.length > 0) {
-        uploadedResults = [...forkSeedUploads, ...uploadedResults];
-      }
+      const uploadedResults = uploadedResultsForTurn;
       if (uploadedResults.length > 0) uploadedPaths = uploadedResults.map((r) => r.path);
       if (!fromQueue) fileUpload.clear();
 
@@ -1394,11 +1484,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         },
       );
       if (!fromQueue) {
-        try {
-          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
-          localStorage.removeItem(forkSeedUploadsKey);
-        } catch { /* storage may be unavailable */ }
-        setForkSeedUploads([]);
+        consumeForkSeedUploads();
       }
       setModelOverride(null);
     } catch (e) {
@@ -1416,6 +1502,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       setError(errMsg);
       if (!fromQueue && text) setInput(text);
+      if (!fromQueue && fileUploadResultsForTurn.length > 0) {
+        fileUpload.addUploadedResults(fileUploadResultsForTurn);
+      }
       if (fromQueue && (text || preUploadedResults?.length)) {
         setMessageQueue(prev => [{ text, uploadResults: preUploadedResults }, ...prev]);
       }
@@ -2069,16 +2158,28 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   </button>
                 </div>
               ))}
-              {fileUpload.uploads.map((upload) => (
+              {fileUpload.uploads.map((upload) => {
+                const preview = upload.preview || (
+                  upload.result?.is_image
+                    ? resolveAssetUrl(upload.result.url)
+                    : ''
+                );
+                const filename = (
+                  upload.file?.name
+                  || upload.result?.filename
+                  || upload.result?.url.split('/').pop()
+                  || 'attachment'
+                );
+                return (
                 <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
-                  {upload.preview ? (
+                  {preview ? (
                     <div className="w-14 h-14">
-                      <img src={upload.preview} alt="" className="w-full h-full object-cover" />
+                      <img src={preview} alt={filename} className="w-full h-full object-cover" />
                     </div>
                   ) : (
                     <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-800 text-xs text-gray-300 max-w-[150px]">
                       <Paperclip size={12} className="shrink-0" />
-                      <span className="truncate">{upload.file.name}</span>
+                      <span className="truncate">{filename}</span>
                     </div>
                   )}
                   {upload.status === 'uploading' && (
@@ -2099,6 +2200,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   )}
                   <button
                     type="button"
+                    aria-label={`Remove ${filename}`}
                     onClick={() => fileUpload.removeFile(upload.id)}
                     disabled={injecting}
                     className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
@@ -2106,7 +2208,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     <X size={10} />
                   </button>
                 </div>
-              ))}
+              );
+              })}
             </div>
           )}
           <div className="space-y-1.5">
@@ -2123,7 +2226,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={injecting || (!task.session_id && !task.shared_from_id) || fileUpload.uploads.length >= 10}
+              disabled={
+                injecting
+                || (!task.session_id && !task.shared_from_id)
+                || fileUpload.uploads.length + forkSeedUploads.length >= MAX_FILES
+              }
               className="p-2 text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed"
               title="Attach files"
             >

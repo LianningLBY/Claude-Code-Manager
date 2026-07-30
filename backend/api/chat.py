@@ -26,6 +26,7 @@ from backend.api.uploads import (
     validate_upload_attachments,
 )
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
+from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.task_queue import task_is_pr_review_superseded
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import (
@@ -592,14 +593,14 @@ async def send_chat_message(
     # Broadcast user message to task channel
     from backend.main import broadcaster
     image_urls = [a["url"] for a in attachments if a.get("is_image")]
-    broadcast_data = {
+    broadcast_data = persisted_chat_event(user_log, {
         "event_type": "user_message",
         "role": "user",
         "content": display_content,
         "raw_content": model_message,
         "image_urls": image_urls,
         "attachments": attachments,
-    }
+    })
     if sender_display_name:
         broadcast_data["sender_name"] = sender_display_name
     await broadcaster.broadcast(f"task:{task_id}", broadcast_data)
@@ -984,13 +985,13 @@ async def _send_shared_chat(
     await db.commit()
 
     # Broadcast to local frontend WITH prefix
-    await broadcaster.broadcast(f"task:{task.id}", {
+    await broadcaster.broadcast(f"task:{task.id}", persisted_chat_event(user_log, {
         "event_type": "user_message",
         "role": "user",
         "content": prefixed,
         "raw_content": body.message,
         "sender_name": sender_name,
-    })
+    }))
 
     # Proxy to sharer
     try:
@@ -1101,7 +1102,7 @@ async def _send_worker_chat(
             log_metadata["file_paths"] = all_paths
         if sender_display_name:
             log_metadata["sender_name"] = sender_display_name
-        db.add(LogEntry(
+        user_log = LogEntry(
             instance_id=None,
             task_id=current.id,
             event_type="user_message",
@@ -1109,17 +1110,18 @@ async def _send_worker_chat(
             content=display_content,
             raw_json=json.dumps(log_metadata) if log_metadata else None,
             is_error=False,
-        ))
+        )
+        db.add(user_log)
         await db.commit()
 
         # 2. Broadcast to the Manager frontend.
-        broadcast_data = {
+        broadcast_data = persisted_chat_event(user_log, {
             "event_type": "user_message",
             "role": "user",
             "content": display_content,
             "raw_content": model_message,
             "image_paths": body.image_paths or [],
-        }
+        })
         if sender_display_name:
             broadcast_data["sender_name"] = sender_display_name
         await broadcaster.broadcast(f"task:{current.id}", broadcast_data)
@@ -1559,7 +1561,7 @@ async def _store_injected_message(
         })
     if sender_display_name:
         raw_metadata["sender_name"] = sender_display_name
-    db.add(LogEntry(
+    entry = LogEntry(
         instance_id=instance_id,
         task_id=task.id,
         event_type="user_message",
@@ -1567,10 +1569,11 @@ async def _store_injected_message(
         content=display_content,
         raw_json=json.dumps(raw_metadata, ensure_ascii=False),
         is_error=False,
-    ))
+    )
+    db.add(entry)
     await db.commit()
 
-    event: dict[str, Any] = {
+    event: dict[str, Any] = persisted_chat_event(entry, {
         "event_type": "user_message",
         "role": "user",
         "content": display_content,
@@ -1582,7 +1585,7 @@ async def _store_injected_message(
             for attachment in attachments
             if attachment["is_image"]
         ],
-    }
+    })
     if sender_display_name:
         event["sender_name"] = sender_display_name
     await broadcaster.broadcast(f"task:{task.id}", event)

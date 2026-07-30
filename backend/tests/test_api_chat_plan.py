@@ -1164,7 +1164,63 @@ async def test_shared_chat_sender_prefix_is_display_only(client, session_factory
         )).scalar_one()
     assert stored.content == "[Remote Alice] [TODO] keep the tag"
     assert json.loads(stored.raw_json)["raw_content"] == "[TODO] keep the tag"
-    assert mock_broadcaster.broadcast.call_args.args[1]["content"] == stored.content
+    event = mock_broadcaster.broadcast.call_args.args[1]
+    assert event["content"] == stored.content
+    assert event["id"] == stored.id
+    assert event["task_id"] == task_id
+    assert event["timestamp"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
+    client,
+    session_factory,
+):
+    """A shadow Task must never expose the sharer's database id as local."""
+    from types import SimpleNamespace
+
+    from backend.services.shared_relay import SharedRelay
+
+    created = await client.post("/api/tasks", json={
+        "title": "Shadow",
+        "description": "shared relay",
+        "target_repo": "/tmp",
+    })
+    task_id = created.json()["id"]
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    relay = SharedRelay(session_factory, broadcaster)
+
+    await relay._handle(
+        {
+            "data": {
+                "id": 987654,
+                "task_id": 44,
+                "event_type": "message",
+                "role": "assistant",
+                "content": "remote answer",
+                "timestamp": "2026-07-30T01:02:03Z",
+            },
+        },
+        SimpleNamespace(local_task_id=task_id),
+    )
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "message",
+                )
+            )
+        ).scalar_one()
+
+    event = broadcaster.broadcast.call_args.args[1]
+    assert event["id"] == stored.id
+    assert event["id"] != 987654
+    assert event["task_id"] == task_id
+    assert event["timestamp"].endswith("Z")
+    assert event["content"] == "remote answer"
 
 
 @pytest.mark.asyncio
@@ -2212,7 +2268,23 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     casts = [c for c in mock_broadcaster.broadcast.call_args_list
              if c[0][1].get("source") == "inject"]
     assert len(casts) == 1
-    assert casts[0][0][1]["raw_content"] == "focus on tests"
+    event = casts[0][0][1]
+    assert event["raw_content"] == "focus on tests"
+    assert event["task_id"] == task_id
+    assert isinstance(event["id"], int)
+    assert event["id"] > 0
+    assert event["timestamp"].endswith("Z")
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    assert event["id"] == stored.id
 
 
 @pytest.mark.asyncio
@@ -2287,6 +2359,9 @@ async def test_inject_delivers_uploaded_image_to_pty_and_persists_metadata(
             )
         ).scalar_one()
     metadata = json.loads(stored.raw_json)
+    assert events[0]["id"] == stored.id
+    assert events[0]["task_id"] == task_id
+    assert events[0]["timestamp"].endswith("Z")
     assert metadata["source"] == "inject"
     assert metadata["raw_content"] == ""
     assert metadata["file_paths"] == [str(upload_path)]
@@ -2346,6 +2421,19 @@ async def test_codex_inject_steers_without_pty_mode(
         if call.args[1].get("source") == "inject"
     ]
     assert len(injected) == 1
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    event = injected[0].args[1]
+    assert event["id"] == stored.id
+    assert event["task_id"] == task_id
+    assert event["timestamp"].endswith("Z")
 
 
 @pytest.mark.asyncio

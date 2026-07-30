@@ -404,6 +404,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const historyCursorRef = useRef<{
+    taskId: number;
+    beforeId: number | null;
+  }>({
+    taskId: task.id,
+    beforeId: null,
+  });
+  if (historyCursorRef.current.taskId !== task.id) {
+    historyCursorRef.current = {
+      taskId: task.id,
+      beforeId: null,
+    };
+  }
   const HISTORY_PAGE_SIZE = 200;
 
   const navigateUserMessage = useCallback((direction: 'up' | 'down') => {
@@ -821,46 +834,67 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const persistedId = Number(msg.data.id);
       const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
       const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
+      const entry: ChatMessage = {
+        id: isPersisted ? persistedId : Date.now() + Math.random(),
+        role: 'user',
+        event_type: 'user_message',
+        content,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: eventTimestamp,
+        image_urls: imageUrls,
+        attachments,
+        source,
+        raw_content: rawContent,
+        persisted: isPersisted,
+      };
       setSending(true);
       setMessages((prev) => {
+        if (isPersisted) {
+          return mergeChatHistory([entry], prev);
+        }
+
         // Reconcile the optimistic bubble with the authoritative broadcast.
         // The optimistic content can be raw text while the server content is
         // prefixed with the sender name, so display content alone is not a
         // stable identity. raw_content is the canonical user input.
-        const last = prev[prev.length - 1];
-        const matchesOptimistic = Boolean(
-          last
-          && last.role === 'user'
-          && last.event_type === 'user_message'
-          && (
-            last.content === content
-            || (
-              rawContent !== null
-              && last.raw_content === rawContent
+        let optimisticIndex = -1;
+        for (let index = prev.length - 1; index >= 0; index -= 1) {
+          const candidate = prev[index];
+          if (
+            !candidate.persisted
+            && candidate.role === 'user'
+            && candidate.event_type === 'user_message'
+            && (
+              candidate.content === content
+              || (
+                rawContent !== null
+                && candidate.raw_content === rawContent
+              )
             )
-          )
-        );
-        if (last && matchesOptimistic) {
-          return [...prev.slice(0, -1), {
-            ...last,
-            id: isPersisted ? persistedId : last.id,
+          ) {
+            optimisticIndex = index;
+            break;
+          }
+        }
+        if (optimisticIndex >= 0) {
+          const optimistic = prev[optimisticIndex];
+          const next = [...prev];
+          next[optimisticIndex] = {
+            ...optimistic,
             content,
             source,
-            raw_content: rawContent ?? last.raw_content,
+            raw_content: rawContent ?? optimistic.raw_content,
             timestamp: eventTimestamp,
-            image_urls: imageUrls?.length ? imageUrls : last.image_urls,
-            attachments: attachments?.length ? attachments : last.attachments,
-            persisted: isPersisted || last.persisted,
-          }];
+            image_urls: imageUrls?.length ? imageUrls : optimistic.image_urls,
+            attachments: attachments?.length ? attachments : optimistic.attachments,
+          };
+          return next;
         }
-        return [...prev, {
-          id: isPersisted ? persistedId : Date.now() + Math.random(), role: 'user', event_type: 'user_message',
-          content, tool_name: null, tool_input: null, tool_output: null,
-          is_error: false, loop_iteration: null,
-          timestamp: eventTimestamp,
-          image_urls: imageUrls, attachments: attachments, source, raw_content: rawContent,
-          persisted: isPersisted,
-        }];
+        return [...prev, entry];
       });
       return;
     }
@@ -934,20 +968,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       persisted: isPersisted,
     };
     setMessages((prev) => {
+      const current = isPersisted
+        ? prev.filter((candidate) => !candidate.pty_cold_start)
+        : prev;
+      if (isPersisted) {
+        return mergeChatHistory([entry], current);
+      }
       if (itemId) {
-        const index = prev.findIndex((candidate) => candidate.stream_item_id === itemId);
+        const index = current.findIndex((candidate) => candidate.stream_item_id === itemId);
         if (index >= 0) {
-          const next = [...prev];
+          const next = [...current];
           next[index] = entry;
           return next;
         }
       }
-      // A PTY recovery notice describes only the active reconnect interval.
-      // The first durable event proves recovery progressed, so retire the
-      // notice instead of allowing later history merges to move it downward.
-      const current = isPersisted
-        ? prev.filter((candidate) => !candidate.pty_cold_start)
-        : prev;
       return [...current, entry];
     });
   }, [markAskUserResolved, task.id, task.worker_id]);
@@ -964,6 +998,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((m) => ({ ...m, persisted: true }));
+      const pageOldestId = filtered.reduce<number | null>(
+        (oldest, message) => (
+          oldest === null ? message.id : Math.min(oldest, message.id)
+        ),
+        null,
+      );
+      if (
+        pageOldestId !== null
+        && historyCursorRef.current.taskId === task.id
+      ) {
+        historyCursorRef.current.beforeId = (
+          historyCursorRef.current.beforeId === null
+            ? pageOldestId
+            : Math.min(historyCursorRef.current.beforeId, pageOldestId)
+        );
+      }
       setHasMoreHistory(msgs.length >= HISTORY_PAGE_SIZE);
       const existingIds = new Set(
         filtered.filter((m) => m.event_type === 'ask_user_question').map((m) => m.request_id)
@@ -1002,12 +1052,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   const loadMoreHistory = useCallback(() => {
     if (loadingMore || !hasMoreHistory || messages.length === 0) return;
-    const oldestId = messages[0]?.id;
-    if (!oldestId) return;
+    const oldestHistoryId = (
+      historyCursorRef.current.taskId === task.id
+        ? historyCursorRef.current.beforeId
+        : null
+    );
+    if (oldestHistoryId === null) return;
     const container = messagesContainerRef.current;
     if (container) scrollRestorationRef.current = container.scrollHeight;
     setLoadingMore(true);
-    api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, oldestId).then((msgs) => {
+    api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, oldestHistoryId).then((msgs) => {
       const filtered = msgs
         .filter((m) =>
           !isLegacyCodexCollabCompleted(m) &&
@@ -1015,7 +1069,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         )
         .map((m) => ({ ...m, persisted: true }));
       if (filtered.length > 0) {
-        setMessages((prev) => [...filtered, ...prev]);
+        const pageOldestId = filtered.reduce(
+          (oldest, message) => Math.min(oldest, message.id),
+          filtered[0].id,
+        );
+        if (historyCursorRef.current.taskId === task.id) {
+          historyCursorRef.current.beforeId = pageOldestId;
+        }
+        setMessages((prev) => mergeChatHistory(filtered, prev));
       }
       setHasMoreHistory(msgs.length >= HISTORY_PAGE_SIZE);
     }).catch(() => {}).finally(() => setLoadingMore(false));

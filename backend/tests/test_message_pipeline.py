@@ -9,6 +9,8 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
 
+from sqlalchemy import select
+
 from backend.services.stream_parser import StreamParser
 from backend.services.instance_manager import InstanceManager
 from backend.models.instance import Instance
@@ -991,7 +993,35 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
         if c[0][0] == f"task:{task_id}" and c[0][1].get("event_type") == "user_message"
     ]
     assert len(task_broadcasts) == 1
-    assert task_broadcasts[0][0][1]["content"] == "hello"
+    event = task_broadcasts[0][0][1]
+    assert event["content"] == "hello"
+    assert event["task_id"] == task_id
+    assert isinstance(event["id"], int)
+    assert event["id"] > 0
+    assert event["timestamp"].endswith("Z")
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    assert event["id"] == stored.id
+
+    history_response = await client.get(
+        f"/api/tasks/{task_id}/chat/history?compact=true&limit=200"
+    )
+    assert history_response.status_code == 200
+    history_row = next(
+        row
+        for row in history_response.json()
+        if row["event_type"] == "user_message"
+    )
+    assert history_row["id"] == stored.id
+    assert history_row["timestamp"] == event["timestamp"]
 
 
 @pytest.mark.asyncio

@@ -5147,6 +5147,31 @@ async def test_queued_codex_busy_launch_rolls_back_status_and_temp_skills(
         assert task.status == "completed"
         assert task.enabled_skills == {"base": True}
     assert msg.source_logged is True
+    from backend.models.log_entry import LogEntry
+
+    async with db_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    user_events = [
+        call.args[1]
+        for call in d.broadcaster.broadcast.await_args_list
+        if (
+            len(call.args) >= 2
+            and call.args[0] == f"task:{task_id}"
+            and call.args[1].get("event_type") == "user_message"
+        )
+    ]
+    assert len(user_events) == 1
+    assert user_events[0]["source"] == "monitor"
+    assert user_events[0]["id"] == stored.id
+    assert user_events[0]["task_id"] == task_id
+    assert user_events[0]["timestamp"].endswith("Z")
     assert not d._launching_instances
 
 

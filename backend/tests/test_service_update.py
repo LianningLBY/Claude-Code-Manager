@@ -224,9 +224,8 @@ async def test_live_auxiliary_generations_block_restart_without_active_task(
     tmp_path, db_factory,
 ):
     dispatcher = _make_gate_dispatcher(db_factory)
-    # A sleeping scheduled Monitor has no process and does not block restart.
-    # Only an exact claimed/running turn handle is runtime evidence.
-    dispatcher._monitor_turn_handles[7] = MagicMock()
+    monitor_lifecycle = asyncio.create_task(asyncio.sleep(60))
+    dispatcher._monitor_tasks[7] = monitor_lifecycle
     dispatcher._sub_agent_processes[9] = MagicMock(returncode=None)
     service = _make_service(
         tmp_path,
@@ -234,9 +233,15 @@ async def test_live_auxiliary_generations_block_restart_without_active_task(
         dispatcher=dispatcher,
     )
 
-    blockers = await service._get_blocking_tasks(
-        pending_task_ids=set()
-    )
+    try:
+        blockers = await service._get_blocking_tasks(
+            pending_task_ids=set()
+        )
+    finally:
+        monitor_lifecycle.cancel()
+        await asyncio.gather(
+            monitor_lifecycle, return_exceptions=True
+        )
 
     assert blockers == [
         {

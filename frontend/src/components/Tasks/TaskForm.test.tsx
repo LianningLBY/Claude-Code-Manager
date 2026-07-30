@@ -582,31 +582,6 @@ describe('Codex Fast speed configuration', () => {
     ));
   });
 
-  it('forces read-only Plan tasks back to Standard', async () => {
-    const speedSelect = await switchToCodexFastForm();
-    await userEvent.selectOptions(speedSelect, 'priority');
-    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'plan');
-
-    await waitFor(() => {
-      expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
-    });
-    await selectProject();
-    await userEvent.type(
-      screen.getByPlaceholderText(
-        'Prompt / Description (this will be sent to Codex)',
-      ),
-      'standard plan',
-    );
-    await userEvent.click(screen.getByRole('button', { name: /create/i }));
-
-    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mode: 'plan',
-        codex_service_tier: 'default',
-      }),
-    ));
-  });
-
   it('atomically resets Fast when switching to an unsupported model', async () => {
     const speedSelect = await switchToCodexFastForm();
     await userEvent.selectOptions(speedSelect, 'priority');

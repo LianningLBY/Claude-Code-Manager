@@ -2,7 +2,6 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -203,47 +202,6 @@ async def test_authoritative_worker_apply_preserves_supersede_marker(
             "pr_review_id": 37,
             "pr_review_superseded": True,
         }
-
-
-async def test_worker_plan_mirror_preserves_manager_local_audit_ids(
-    session_factory,
-):
-    worker = await _mk_worker(session_factory)
-    task = await _mk_task(
-        session_factory,
-        worker_id=worker.id,
-        status="completed",
-        mode="plan",
-        plan_approved=True,
-        plan_approved_by=42,
-        plan_applied_log_id=314,
-        plan_execution_task_id=2718,
-    )
-    observed = worker_relay_module.worker_task_generation(task)
-    assert observed is not None
-
-    async with session_factory() as db:
-        resulting = await (
-            worker_relay_module.apply_authoritative_worker_task(
-                db,
-                observed,
-                _remote_task(
-                    task,
-                    # These ids belong to the Worker's database/user namespace
-                    # and must never overwrite Manager-local audit links.
-                    plan_approved_by=9001,
-                    plan_applied_log_id=9002,
-                    plan_execution_task_id=9003,
-                ),
-            )
-        )
-
-    assert resulting is not None
-    async with session_factory() as db:
-        current = await db.get(Task, task.id)
-    assert current.plan_approved_by == 42
-    assert current.plan_applied_log_id == 314
-    assert current.plan_execution_task_id == 2718
 
 
 @pytest.mark.parametrize(
@@ -3230,12 +3188,7 @@ async def test_worker_pending_marker_blocks_direct_retry_chat_and_plan_approve(
     )
     staged_plan = await client.post(
         f"/api/tasks/{plan.id}/routing-config/stage",
-        json={
-            **payload,
-            "op_id": "block-plan-approve",
-            "model": "gpt-5.5",
-            "codex_service_tier": "default",
-        },
+        json={**payload, "op_id": "block-plan-approve"},
     )
     assert staged_plan.status_code == 200
     approve = await client.post(f"/api/tasks/{plan.id}/plan/approve")
@@ -3686,20 +3639,13 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
             return _routing_snapshot(current)
         assert method == "POST"
         assert path.endswith(f"/{action_path}")
-        if mode == "plan":
-            # Approval is a control-plane decision now. It must not synchronize
-            # execution Skills or start another Agent turn.
-            assert admission_order == []
-        else:
-            assert admission_order[-1] == "skills"
+        assert admission_order[-1] == "skills"
         admission_order.append(action_path)
         return _remote_task(
             current,
-            status="completed" if mode == "plan" else "pending",
+            status="pending",
             retry_count=current.retry_count + retry_delta,
-            completed_at=(
-                datetime.utcnow().isoformat() if mode == "plan" else None
-            ),
+            completed_at=None,
             plan_approved=True if mode == "plan" else current.plan_approved,
         )
 
@@ -3724,26 +3670,21 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
     response = await client.post(f"/api/tasks/{task.id}/{action_path}")
 
     assert response.status_code == 200, response.text
-    if mode == "plan":
-        assert response.json()["status"] == "completed"
-        assert admission_order == [action_path]
-        assert worker_skill_payloads == []
-    else:
-        assert response.json()["status"] == "pending"
-        assert admission_order == ["skills", action_path]
-        assert len(worker_skill_payloads) == 1
-        assert worker_skill_payloads[0]["enabled_skills"] == {
-            "code-review": True,
-        }
-        assert worker_skill_payloads[0]["selected_user_skills"] == [
-            user_skill_id,
-        ]
-        assert worker_skill_payloads[0]["user_skill_snapshots"] == [{
-            "id": user_skill_id,
-            "name": f"Final {action_path} skill",
-            "description": "Manager-authoritative description",
-            "content": "Manager-authoritative content",
-        }]
+    assert response.json()["status"] == "pending"
+    assert admission_order == ["skills", action_path]
+    assert len(worker_skill_payloads) == 1
+    assert worker_skill_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
+    assert worker_skill_payloads[0]["selected_user_skills"] == [
+        user_skill_id,
+    ]
+    assert worker_skill_payloads[0]["user_skill_snapshots"] == [{
+        "id": user_skill_id,
+        "name": f"Final {action_path} skill",
+        "description": "Manager-authoritative description",
+        "content": "Manager-authoritative content",
+    }]
 
 
 @pytest.mark.parametrize(
@@ -3865,12 +3806,12 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
         if action_path == "plan/approve":
             assert path.endswith("/plan/approve")
             assert remote["status"] == "plan_review"
-            remote.update(status="completed", instance_id=None)
+            remote.update(status="pending", instance_id=None)
             return _remote_task(
                 current,
-                status="completed",
+                status="pending",
                 retry_count=remote["retry_count"],
-                completed_at=datetime.utcnow().isoformat(),
+                completed_at=None,
                 plan_approved=True,
             )
         assert path.endswith("/chat")
@@ -3921,17 +3862,12 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
             f"/api/tasks/{task.id}/{action_path}",
         )
         assert response.status_code == 200, response.text
-        assert response.json()["status"] == (
-            "completed" if action_path == "plan/approve" else "pending"
-        )
+        assert response.json()["status"] == "pending"
 
-    if action_path == "plan/approve":
-        assert skill_payloads == []
-    else:
-        assert len(skill_payloads) == 1
-        assert skill_payloads[0]["enabled_skills"] == {
-            "code-review": True,
-        }
+    assert len(skill_payloads) == 1
+    assert skill_payloads[0]["enabled_skills"] == {
+        "code-review": True,
+    }
 
 
 @pytest.mark.parametrize("status", ["pending", "completed"])

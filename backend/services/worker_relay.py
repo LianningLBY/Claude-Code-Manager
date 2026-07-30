@@ -227,21 +227,11 @@ def authoritative_worker_task_values(
         "loop_progress",
         "session_id",
         "plan_content",
-        "plan_applied_to_session_id",
         "goal_turns_used",
         "goal_last_reason",
     ):
         if field in remote_task:
             values[field] = remote_task[field]
-
-    for field in (
-        "plan_approved_at",
-        "plan_applied_at",
-    ):
-        if field in remote_task:
-            parsed = _remote_datetime(remote_task[field])
-            if remote_task[field] is None or parsed is not None:
-                values[field] = parsed
 
     if "started_at" in remote_task:
         started_at = _remote_datetime(remote_task["started_at"])
@@ -302,17 +292,6 @@ async def apply_authoritative_worker_task(
         # Worker→Manager path, including a normal relay GET after the hidden
         # termination response was lost.
         merged_metadata_updates[PR_REVIEW_SUPERSEDED_METADATA_KEY] = True
-    if isinstance(remote_metadata, dict):
-        # Plan audit summaries are safe Worker-authoritative lifecycle data.
-        # Do not replace unrelated Manager-owned metadata wholesale.
-        for key in (
-            "plan_agent_run_id",
-            "plan_review_verdict",
-            "plan_review_feedback",
-            "plan_review_exhausted",
-        ):
-            if key in remote_metadata:
-                merged_metadata_updates[key] = remote_metadata[key]
     if merged_metadata_updates:
         # Lock the exact mirror before merging JSON in Python. PostgreSQL JSON
         # has no equality operator, so comparing the whole document in the CAS

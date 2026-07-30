@@ -846,23 +846,16 @@ async def test_plan_phase(db_factory):
         inst_id = inst.id
         task_obj = task
 
-    plan_result = SimpleNamespace(
-        plan_content="read-only plan",
-        verdict="approve",
-        feedback="",
-        review_exhausted=False,
-        run_id=11,
-    )
-    with patch(
-        "backend.services.plan_agent_runner.PlanAgentRunner.run",
-        AsyncMock(return_value=plan_result),
-    ):
-        await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.wait = AsyncMock(return_value=0)
+    d.instance_manager.processes = {inst_id: mock_proc}
+
+    await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
 
     async with db_factory() as db:
         t = await db.get(Task, task_obj.id)
         assert t.status == "plan_review"
-        assert t.plan_content == "read-only plan"
 
 
 # === Prompt construction with image_paths ===
@@ -6099,6 +6092,60 @@ async def test_queued_busy_detects_terminal_parent_consumer_and_fresh_lifecycle(
         if not consumer.done():
             consumer.cancel()
             await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_queued_busy_ignores_stale_consumer_after_instance_reassignment(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        old_task = Task(
+            title="completed owner",
+            description="d",
+            status="completed",
+            session_id="old-session",
+        )
+        new_task = Task(
+            title="new owner",
+            description="d",
+            status="executing",
+            session_id="new-session",
+        )
+        db.add_all([old_task, new_task])
+        await db.flush()
+        instance = Instance(
+            name="reused-slot",
+            status="running",
+            pid=99124,
+            current_task_id=new_task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        old_task.instance_id = instance.id
+        new_task.instance_id = instance.id
+        await db.commit()
+        old_task_id, instance_id = old_task.id, instance.id
+
+    live_new_process = MagicMock(returncode=None)
+    stale_old_consumer = asyncio.create_task(asyncio.Event().wait())
+    d.instance_manager.processes[instance_id] = live_new_process
+    d.instance_manager._tasks[instance_id] = stale_old_consumer
+    d.instance_manager._consumer_records = {
+        instance_id: MagicMock(
+            process=MagicMock(returncode=0),
+            task=stale_old_consumer,
+            task_id=old_task_id,
+        )
+    }
+    try:
+        async with db_factory() as db:
+            assert not await d._queued_task_has_live_generation(
+                db, old_task_id
+            )
+    finally:
+        stale_old_consumer.cancel()
+        await asyncio.gather(stale_old_consumer, return_exceptions=True)
 
 
 @pytest.mark.asyncio

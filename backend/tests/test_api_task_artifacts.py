@@ -160,6 +160,81 @@ async def test_rejects_external_links_traversal_and_outside_symlinks(
 
 
 @pytest.mark.asyncio
+async def test_rejects_final_file_swap_after_resolution(
+    artifact_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, session_factory = artifact_client
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "report.md"
+    artifact.write_text("safe report", encoding="utf-8")
+    outside = tmp_path / "private.txt"
+    outside.write_text("outside secret", encoding="utf-8")
+    task_id = await _create_local_task(session_factory, workspace)
+
+    original_resolver = task_artifacts._resolve_artifact_parts
+
+    def resolve_then_swap(task, root, reference):
+        resolved = original_resolver(task, root, reference)
+        artifact.unlink()
+        artifact.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(
+        task_artifacts,
+        "_resolve_artifact_parts",
+        resolve_then_swap,
+    )
+    response = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": "report.md"},
+    )
+
+    assert response.status_code == 403
+    assert b"outside secret" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_rejects_intermediate_directory_swap_after_resolution(
+    artifact_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, session_factory = artifact_client
+    workspace = tmp_path / "workspace"
+    reports = workspace / "reports"
+    reports.mkdir(parents=True)
+    (reports / "report.md").write_text("safe report", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "report.md").write_text("outside secret", encoding="utf-8")
+    task_id = await _create_local_task(session_factory, workspace)
+
+    original_resolver = task_artifacts._resolve_artifact_parts
+
+    def resolve_then_swap(task, root, reference):
+        resolved = original_resolver(task, root, reference)
+        reports.rename(workspace / "reports-original")
+        reports.symlink_to(outside, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(
+        task_artifacts,
+        "_resolve_artifact_parts",
+        resolve_then_swap,
+    )
+    response = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": "reports/report.md"},
+    )
+
+    assert response.status_code == 403
+    assert b"outside secret" not in response.content
+
+
+@pytest.mark.asyncio
 async def test_enforces_artifact_size_limit(
     artifact_client,
     tmp_path,
@@ -178,6 +253,41 @@ async def test_enforces_artifact_size_limit(
     )
 
     assert response.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_caps_stream_when_file_grows_after_descriptor_validation(
+    artifact_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, session_factory = artifact_client
+    artifact = tmp_path / "growing.bin"
+    artifact.write_bytes(b"safe")
+    task_id = await _create_local_task(session_factory, tmp_path)
+    monkeypatch.setattr(task_artifacts, "MAX_ARTIFACT_DOWNLOAD_SIZE", 4)
+
+    original_response = task_artifacts._artifact_response
+
+    def grow_then_respond(opened):
+        with artifact.open("ab") as handle:
+            handle.write(b"outside-limit")
+        return original_response(opened)
+
+    monkeypatch.setattr(
+        task_artifacts,
+        "_artifact_response",
+        grow_then_respond,
+    )
+    response = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": "growing.bin"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-length"] == "4"
+    assert response.content == b"safe"
+    assert b"outside-limit" not in response.content
 
 
 @pytest.mark.asyncio

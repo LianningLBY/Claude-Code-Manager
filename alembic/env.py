@@ -37,7 +37,6 @@ from backend.models.task_share import TaskShare, ProjectShare, SharedTaskReceive
 from backend.models.user import User  # noqa: F401
 from backend.models.team_share import TeamProjectShare, TeamTaskShare  # noqa: F401
 from backend.models.user_group import UserGroup, UserGroupMember  # noqa: F401
-from backend.models.plan_agent import PlanAgentRun, PlanAgentStep  # noqa: F401
 from backend.database import Base, _async_url_to_sync, _is_sqlite
 
 target_metadata = Base.metadata

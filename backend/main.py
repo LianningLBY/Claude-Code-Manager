@@ -45,7 +45,6 @@ from backend.api.org import router as org_router
 from backend.api.ask_user import router as ask_user_router
 from backend.api.user_skills import router as user_skills_router
 from backend.api.team_sharing import router as team_sharing_router
-from backend.api.plans import router as plans_router
 from backend.middleware.auth import TokenAuthMiddleware
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 from backend.services.instance_manager import InstanceManager
@@ -775,7 +774,6 @@ app.include_router(org_router)
 app.include_router(ask_user_router)
 app.include_router(user_skills_router)
 app.include_router(team_sharing_router)
-app.include_router(plans_router)
 
 # Serve frontend static files in production
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

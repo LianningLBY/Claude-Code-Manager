@@ -39,7 +39,6 @@ class RalphLoop:
         self.instance_manager = instance_manager
         self.broadcaster = broadcaster
         self._loops: dict[int, asyncio.Task] = {}
-        self._plan_lifecycles: dict[int, tuple[int, asyncio.Task]] = {}
         self._shutting_down = False
 
     async def start(self, instance_id: int):
@@ -114,57 +113,6 @@ class RalphLoop:
     def is_running(self, instance_id: int) -> bool:
         task = self._loops.get(instance_id)
         return task is not None and not task.done()
-
-    async def stop_plan_agent_lifecycle(
-        self,
-        task_id: int,
-        *,
-        timeout: float = DEFAULT_RALPH_STOP_TIMEOUT,
-    ) -> bool:
-        """Cancel one exact Plan child and settle its Ralph producer."""
-
-        registered = self._plan_lifecycles.get(task_id)
-        if registered is None:
-            return False
-        instance_id, lifecycle = registered
-        if lifecycle.done():
-            return False
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        lifecycle.cancel()
-        done, pending = await asyncio.wait(
-            {lifecycle},
-            timeout=max(0.0, deadline - loop.time()),
-        )
-        if pending:
-            return False
-        await asyncio.gather(*done, return_exceptions=True)
-        # Awaiting the cancelled child propagates cancellation into the legacy
-        # producer. Settle it too so it cannot reclaim the still-active DB row
-        # before the API publishes the terminal generation.
-        producer = self._loops.get(instance_id)
-        if producer is not None and not producer.done():
-            producer.cancel()
-            done, pending = await asyncio.wait(
-                {producer},
-                timeout=max(0.0, deadline - loop.time()),
-            )
-            if pending:
-                return False
-            await asyncio.gather(*done, return_exceptions=True)
-        if (
-            producer is not None
-            and self._loops.get(instance_id) is producer
-            and producer.done()
-        ):
-            self._loops.pop(instance_id, None)
-        from backend.services.plan_agent_runner import (
-            has_unreaped_plan_agent_for_task,
-        )
-
-        if has_unreaped_plan_agent_for_task(task_id):
-            return False
-        return True
 
     async def _launch_task_on_bound_account(
         self,
@@ -491,8 +439,6 @@ class RalphLoop:
         instance_id: int,
         task: Task,
         plan_content: str,
-        *,
-        metadata_updates: dict | None = None,
     ) -> bool:
         """Publish a plan only while this Ralph generation owns the task."""
 
@@ -506,24 +452,13 @@ class RalphLoop:
             task_generation_fence(task),
         )
         async with self.db_factory() as db:
-            current = (
-                await db.execute(
-                    select(Task)
-                    .where(*predicates)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if current is None:
-                await db.rollback()
-                return False
-            metadata = dict(current.metadata_ or {})
-            metadata.update(metadata_updates or {})
-            current.plan_content = plan_content
-            current.status = "plan_review"
-            current.metadata_ = metadata
-            current.error_message = None
+            result = await db.execute(
+                update(Task)
+                .where(*predicates)
+                .values(plan_content=plan_content, status="plan_review")
+            )
             await db.commit()
-        return True
+        return bool(result.rowcount)
 
     async def _record_cancel_cleanup_failure(
         self,
@@ -1064,43 +999,38 @@ class RalphLoop:
 
                 # Plan mode handling
                 if task.mode == "plan" and not task.plan_approved:
-                    logger.info(
-                        "Task %s is in Plan mode, running read-only pipeline",
-                        task.id,
+                    logger.info(f"Task {task.id} is in plan mode, running plan phase")
+                    plan_prompt = f"Please analyze the following task and create a detailed plan. Do NOT execute any changes, only describe what you would do:\n\n{task.description}"
+                    await self._launch_task_on_bound_account(
+                        instance_id,
+                        task,
+                        plan_prompt,
+                        cwd,
                     )
-                    from backend.services.plan_agent_runner import (
-                        PlanAgentRunner,
+                    process = self.instance_manager.processes.get(instance_id)
+                    await self._wait_for_turn(
+                        instance_id,
+                        task,
+                        process,
+                        label="Plan phase",
                     )
-                    runner = PlanAgentRunner(
-                        db_factory=self.db_factory,
-                        instance_manager=self.instance_manager,
-                        claude_pool=dispatcher.pool,
-                        codex_pool=dispatcher.codex_pool,
-                        cloudrouter_store=dispatcher.cloudrouter_store,
-                    )
-                    plan_lifecycle = asyncio.create_task(
-                        runner.run(task, cwd=cwd)
-                    )
-                    registered_plan = (instance_id, plan_lifecycle)
-                    self._plan_lifecycles[task.id] = registered_plan
-                    try:
-                        plan_result = await plan_lifecycle
-                    finally:
-                        if self._plan_lifecycles.get(task.id) == registered_plan:
-                            self._plan_lifecycles.pop(task.id, None)
+
+                    # Collect plan content from logs
+                    async with self.db_factory() as db:
+                        from sqlalchemy import select
+                        from backend.models.log_entry import LogEntry
+                        result = await db.execute(
+                            select(LogEntry.content)
+                            .where(LogEntry.task_id == task.id, LogEntry.event_type == "message", LogEntry.role == "assistant")
+                            .order_by(LogEntry.id)
+                        )
+                        plan_texts = [r[0] for r in result.all() if r[0]]
+                        plan_content = "\n".join(plan_texts)
 
                     stored = await self._store_plan_if_owned(
                         instance_id,
                         task,
-                        plan_result.plan_content,
-                        metadata_updates={
-                            "plan_agent_run_id": plan_result.run_id,
-                            "plan_review_verdict": plan_result.verdict,
-                            "plan_review_feedback": plan_result.feedback,
-                            "plan_review_exhausted": (
-                                plan_result.review_exhausted
-                            ),
-                        },
+                        plan_content,
                     )
                     if stored:
                         await self._broadcast_generation_event(

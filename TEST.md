@@ -148,23 +148,11 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_chat_send_cwd_not_found` | 工作目录不存在返回 400 |
 | `test_plan_approve_not_plan_review` | 非 plan_review 状态 approve 返回 400 |
 | `test_plan_reject_not_plan_review` | 非 plan_review 状态 reject 返回 400 |
-| `test_plan_approve_success` | plan_review 状态 approve → status=completed、plan_approved=True，且不启动执行 turn |
+| `test_plan_approve_success` | plan_review 状态 approve → status=pending, plan_approved=True |
 | `test_plan_reject_success` | plan_review 状态 reject → status=cancelled, plan_approved=False |
 | `test_plan_approve_not_found` | 不存在的 task approve 返回 404 |
 | `test_plan_reject_not_found` | 不存在的 task reject 返回 404 |
 | `test_codex_fast_rejects_unsupported_chat_model_before_logging` | Fast Task 的一次性模型覆盖若不支持 `priority`，在消息落库和执行前拒绝 |
-
-#### `test_plan_tasks.py` / `test_plan_agent_runner.py` — 独立 Plan Task
-
-| 测试 | 验证内容 |
-|------|---------|
-| `test_related_plans_are_independent_and_limited` | 同一 session 的 Plan 是独立 Task；有界上下文快照只持久化、不进入 Task 列表 payload；第 4 个 active Plan 返回 429 |
-| `test_related_plan_approval_requires_stale_confirmation_and_no_turn` | 对话/repo 已变化时 approve 先 409，确认后只完成 Plan，不 wake/enqueue 或改变目标 Task |
-| `test_approved_plan_is_applied_only_with_selected_user_message` | 只有显式 `plan_task_ids` 才把已批准方案与真实 user message 同 turn 入队，并以 Manager-local log id 一次性审计 |
-| `test_standalone_plan_creates_one_idempotent_execution_task` | standalone approve 后创建新的 auto Task，重复调用返回同一执行 Task |
-| `test_claude_plan_command_is_read_only` / `test_codex_plan_command_is_read_only` | Claude 禁 Bash/MCP/子 agent，Codex 强制 ephemeral/read-only sandbox/空 MCP/禁 multi-agent，均不使用危险 bypass |
-| `test_pipeline_revises_then_persists_audited_approval` | Planner → Reviewer revise → Planner → approve 的 run/step、模型与 feedback 全量审计 |
-| `test_pipeline_rejects_unknown_planner_provider` | 非 claude/codex 的损坏路由 fail closed，不误走另一 provider |
 
 #### `test_api_system.py` — 系统 API
 
@@ -632,10 +620,8 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_worker_relay_proxy.py::test_worker_proxy_uses_authoritative_user_skill_snapshots` | Worker 转发在 Manager snapshot 对应的本地 User Skill 缺失或同 ID 内容碰撞时都坚持使用 metadata 权威正文 |
 | `test_worker_relay_proxy.py` / `test_task_migrator.py` 的 Skill snapshot 用例 | Worker 初次转发、续聊同步和迁移 payload 保留选择与正文 snapshot |
 | `test_worker_relay_proxy.py::test_worker_skill_selection_sync_*` | Worker Skill 同步必须读回并确认完整普通/User Skill 元组与权威 snapshot；确认缺失或陈旧时 fail closed |
-| `test_worker_relay_proxy.py::test_worker_execution_admission_syncs_latest_manager_skills` | Retry 仍先同步最终 Skills；Plan Approve 是纯控制面操作，不同步执行 Skills、不进入 pending |
-| `test_worker_relay_proxy.py::test_migrated_inert_task_can_start_its_next_worker_turn` | Retry/chat 可启动下一轮；Plan Approve 保持同一 Worker generation，但只进入 completed，不启动 turn |
-| `test_worker_relay_proxy.py::test_worker_plan_mirror_preserves_manager_local_audit_ids` | Worker 的本地 user/log/task id 不能覆盖 Manager 的 `plan_approved_by`、`plan_applied_log_id`、`plan_execution_task_id` |
-| `test_task_migrator.py::test_target_migration_blocks_actionable_related_plans` / `test_related_plan_cannot_migrate_independently` | active、待审批、待应用 Plan 阻止目标迁移；关联 Plan 不可脱离目标单独迁移 |
+| `test_worker_relay_proxy.py::test_worker_execution_admission_syncs_latest_manager_skills` | 已转发 Task 在 Manager 保存最新普通/User Skills 后，Retry 与 Plan Approve 都先同步并确认最终元组/snapshot，再允许 Worker 进入 pending |
+| `test_worker_relay_proxy.py::test_migrated_inert_task_can_start_its_next_worker_turn` | 本地 completed/plan-review Task 经真实迁移流程导入 Worker 后，即使 Manager/Worker `instance_id` 不同，Retry、chat 与 Plan Approve 仍使用同一 status/retry generation 完成 Skill 同步并启动下一轮 |
 | `test_worker_relay_proxy.py::test_worker_forward_reloads_authoritative_skills_after_lock_wait` / `test_worker_forward_rejects_generation_change_after_lock_wait` | WorkerProxy 等锁后重新加载 Manager 权威 Skill 元组；generation 已变化时在远端创建前 fail closed |
 | `test_worker_relay_proxy.py::test_initial_worker_forward_uses_skill_update_that_wins_claim_lock` / `test_initial_worker_forward_rejects_skill_update_after_claim` | 确定性覆盖首次 dispatch 的两个锁顺序：先完成的 pending Skill 保存进入远端创建 payload；claim 先完成后活跃 Skill 修改返回 409，Manager/Worker 不分叉 |
 | `test_worker_relay_proxy.py::test_worker_skill_update_shares_execution_admission_lock` | Worker Skill 保存与执行准入共用 task operation lock；pending/终态仍允许保存，不允许保存提交穿过正在进行的 Retry/Approve 准入窗口 |
@@ -1020,9 +1006,7 @@ python -m pytest \
 | 步骤 | 谁 | 做什么 |
 |------|-----|--------|
 | 1 | 人 | 创建一个 Plan Mode 任务 → 确认进入 plan_review（紫色） |
-| 2 | 人 | 点击 Approve → 确认 Plan 进入 completed，且没有新 Agent turn |
-| 3 | 人 | standalone Plan 点击 Create execution Task → 确认跳转到新 auto Task |
-| 4 | 人 | 在已有 Chat 创建关联 Plan，Approve 后刷新 → 确认附件仍在；发送普通消息时显式携带并只应用一次 |
+| 2 | 人 | 点击 Approve → 确认任务重新入队执行 |
 | 3 | 人 | 任务完成后点 Chat 按钮 → 发送追问消息 |
 | 4 | AI | 查 DB 确认 task.session_id 存在，`--resume` 会被使用 |
 | 5 | 人 | 测试语音按钮 → 确认录音转文字填入输入框 |

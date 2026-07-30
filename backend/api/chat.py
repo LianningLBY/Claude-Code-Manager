@@ -69,10 +69,6 @@ class ChatMessage(BaseModel):
     # The route rendered by the caller. A mismatch is rejected before the
     # user row is persisted, so a stale Fast tab cannot launch Standard.
     expected_routing: TaskRoutingExpectation | None = None
-    # Approved independent Plan Tasks explicitly attached to this real user
-    # turn. Approval alone never starts a model turn.
-    plan_task_ids: list[int] | None = None
-    confirmed_stale_plan_task_ids: list[int] | None = None
 
 
 class ForkAnchor(BaseModel):
@@ -474,11 +470,6 @@ async def send_chat_message(
         )
     command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
-        if body.plan_task_ids:
-            raise HTTPException(
-                400,
-                "Shared shadow tasks do not support Plan attachments",
-            )
         return await _send_shared_chat(
             task,
             body,
@@ -497,8 +488,6 @@ async def send_chat_message(
         from backend.api.deps import require_admin
 
         require_admin(request)
-
-    approved_plans: list[Task] = []
 
     # Worker-local stage/ack/reconcile and direct chat admission share this
     # process-wide lock.  A stage that wins first returns 409 here; a stage
@@ -534,29 +523,6 @@ async def send_chat_message(
                 "No previous session on this task. Run the task first.",
             )
         await _validate_chat_command_admission(task, command, db)
-        from backend.services.plan_tasks import approved_plans_for_message
-
-        try:
-            approved_plans = await approved_plans_for_message(
-                db,
-                task,
-                body.plan_task_ids,
-                confirmed_stale_plan_task_ids=(
-                    body.confirmed_stale_plan_task_ids
-                ),
-            )
-        except ValueError as exc:
-            staleness = getattr(exc, "staleness", None)
-            if staleness is not None:
-                raise HTTPException(
-                    409,
-                    detail={
-                        "message": str(exc),
-                        "plan_task_id": getattr(exc, "plan_task_id", None),
-                        "staleness": staleness,
-                    },
-                ) from exc
-            raise HTTPException(400, str(exc)) from exc
 
     command_skills: dict | None = None
 
@@ -589,10 +555,6 @@ async def send_chat_message(
         file_list = "\n".join(f"- {p}" for p in all_paths)
         prompt_parts.append(f"请用 Read 工具查看以下文件：\n{file_list}")
     prompt = "\n\n".join(prompt_parts)
-    if approved_plans:
-        from backend.services.plan_tasks import build_approved_plan_prompt
-
-        prompt = build_approved_plan_prompt(approved_plans, prompt)
 
     # Build file attachment metadata for storage and display
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -625,34 +587,6 @@ async def send_chat_message(
         is_error=False,
     )
     db.add(user_log)
-    await db.flush()
-    if approved_plans:
-        from sqlalchemy import update as sa_update
-
-        applied_at = datetime.utcnow()
-        for plan in approved_plans:
-            applied = await db.execute(
-                sa_update(Task)
-                .where(
-                    Task.id == plan.id,
-                    Task.mode == "plan",
-                    Task.plan_target_task_id == task_id,
-                    Task.plan_approved.is_(True),
-                    Task.status == "completed",
-                    Task.plan_applied_at.is_(None),
-                )
-                .values(
-                    plan_applied_at=applied_at,
-                    plan_applied_to_session_id=task.session_id,
-                    plan_applied_log_id=user_log.id,
-                )
-            )
-            if applied.rowcount != 1:
-                await db.rollback()
-                raise HTTPException(
-                    409,
-                    f"Plan Task #{plan.id} was applied concurrently",
-                )
     await db.commit()
 
     # Broadcast user message to task channel
@@ -684,37 +618,13 @@ async def send_chat_message(
             expected_task_routing=admitted_routing,
             source_log_id=user_log.id,
         )
-    except (TaskStartPausedError, RuntimeError) as exc:
-        if approved_plans:
-            # Both failures happen before queue admission can publish an item.
-            # Restore the exact application rows so a shutdown race cannot
-            # permanently consume a Plan that the model never received.
-            async with get_task_operation_lock(task_id):
-                for plan in approved_plans:
-                    await db.execute(
-                        sa_update(Task)
-                        .where(
-                            Task.id == plan.id,
-                            Task.plan_applied_log_id == user_log.id,
-                        )
-                        .values(
-                            plan_applied_at=None,
-                            plan_applied_to_session_id=None,
-                            plan_applied_log_id=None,
-                        )
-                    )
-                await db.commit()
+    except TaskStartPausedError as exc:
         raise HTTPException(
             status_code=409,
             detail="服务即将重启，消息未进入执行队列，请重连后重试",
         ) from exc
 
-    return {
-        "ok": True,
-        "queued": True,
-        "session_id": task.session_id,
-        "applied_plan_task_ids": [plan.id for plan in approved_plans],
-    }
+    return {"ok": True, "queued": True, "session_id": task.session_id}
 
 
 @router.get("/{task_id}/fork-anchors")
@@ -1191,7 +1101,7 @@ async def _send_worker_chat(
             log_metadata["file_paths"] = all_paths
         if sender_display_name:
             log_metadata["sender_name"] = sender_display_name
-        manager_user_log = LogEntry(
+        db.add(LogEntry(
             instance_id=None,
             task_id=current.id,
             event_type="user_message",
@@ -1199,8 +1109,7 @@ async def _send_worker_chat(
             content=display_content,
             raw_json=json.dumps(log_metadata) if log_metadata else None,
             is_error=False,
-        )
-        db.add(manager_user_log)
+        ))
         await db.commit()
 
         # 2. Broadcast to the Manager frontend.
@@ -1237,10 +1146,6 @@ async def _send_worker_chat(
                 "image_paths": body.image_paths,
                 "file_paths": body.file_paths,
                 "model": body.model,
-                "plan_task_ids": body.plan_task_ids,
-                "confirmed_stale_plan_task_ids": (
-                    body.confirmed_stale_plan_task_ids
-                ),
                 "expected_routing": (
                     body.expected_routing.model_dump(mode="json")
                     if body.expected_routing is not None
@@ -1267,39 +1172,6 @@ async def _send_worker_chat(
                 409,
                 "Task Worker assignment or generation changed while chat was in flight",
             )
-        applied_plan_ids = (
-            result.get("applied_plan_task_ids")
-            if isinstance(result, dict)
-            else None
-        )
-        if isinstance(applied_plan_ids, list):
-            applied_at = datetime.utcnow()
-            for plan_id in applied_plan_ids:
-                if isinstance(plan_id, bool) or not isinstance(plan_id, int):
-                    continue
-                local_applied = await db.execute(
-                    sa_update(Task)
-                    .where(
-                        Task.id == plan_id,
-                        Task.mode == "plan",
-                        Task.plan_target_task_id == current.id,
-                        Task.plan_approved.is_(True),
-                        Task.plan_applied_at.is_(None),
-                    )
-                    .values(
-                        plan_applied_at=applied_at,
-                        plan_applied_to_session_id=(
-                            result.get("session_id") or current.session_id
-                        ),
-                        plan_applied_log_id=manager_user_log.id,
-                    )
-                )
-                if local_applied.rowcount != 1:
-                    logger.warning(
-                        "Worker applied Plan Task %s but Manager mirror could "
-                        "not claim its local application row",
-                        plan_id,
-                    )
         await db.commit()
 
         if isinstance(result, dict):

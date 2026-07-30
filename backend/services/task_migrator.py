@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 import httpx
-from sqlalchemy import JSON, and_, or_, select, update
+from sqlalchemy import JSON, select, update
 
 from backend.config import settings
 from backend.models.project import Project
@@ -290,35 +290,6 @@ class TaskMigrator:
             if task.pty_background_generation is not None:
                 raise MigrationError(
                     "Claude PTY 后台活动仍在输出，结束后再迁移"
-                )
-            if task.plan_target_task_id is not None:
-                raise MigrationError(
-                    "关联 Plan 不能脱离目标 Task 单独迁移"
-                )
-            from backend.services.plan_tasks import ACTIVE_PLAN_STATUSES
-
-            blocking_plan_id = await db.scalar(
-                select(Task.id)
-                .where(
-                    Task.plan_target_task_id == task_id,
-                    Task.mode == "plan",
-                    or_(
-                        Task.status.in_(
-                            (*ACTIVE_PLAN_STATUSES, "plan_review")
-                        ),
-                        and_(
-                            Task.status == "completed",
-                            Task.plan_approved.is_(True),
-                            Task.plan_applied_at.is_(None),
-                        ),
-                    ),
-                )
-                .limit(1)
-            )
-            if blocking_plan_id is not None:
-                raise MigrationError(
-                    f"关联 Plan #{blocking_plan_id} 仍在运行、待审批或待应用，"
-                    "完成处置后再迁移"
                 )
             observed = migration_task_generation(task)
             prev_status = observed.status

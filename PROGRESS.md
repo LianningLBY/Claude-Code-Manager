@@ -964,3 +964,12 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：`skill_context.py` 集中计算 Codex Monitor capability：主 MCP 开启、`worker_id/shared_from_id` 均为空且 metadata 没有 Worker 管理标记或 User Skill snapshot 时才开放。Task 创建/更新/迁移导入、chat `$monitor`、Monitor API、MCP discovery/read/enable、主 MCP spec 与 Instance launch 共用该判定；Monitor API 在路由写屏障后再次检查，关闭迁移竞态。Runtime Settings 增加只读派生 capability，TaskForm/徽章/Chat/面板结合精确任务范围展示；capability 未知时隐藏/禁用但保留所有现有 key，后续请求可恢复。
 - **预防**：部署级 capability 只回答“服务是否具备能力”，不能代替 Task scope；所有产生持久化、远端代理或进程副作用的入口必须在副作用前校验，并在可能改变路由的写屏障后复核。跨 Worker snapshot 的“存在”本身就是远端管理证据，不能因 `worker_id` 暂时为空而猜成本地任务。
 - **验证**：Linux 容器聚焦后端共 `118 passed`，覆盖 Task/Chat/Monitor API、Runtime Settings、Skill context、MCP server/spec、Instance launch 及 PR7B1 的多轮/恢复/关机/停止/清理不变量；前端五个聚焦文件 `127 passed`，production build 通过。真实本地 Codex 手测验证 5 轮普通/重要报告后自动完成，以及活动 Monitor Stop 后清空调度、删除精确 thread 且不终止共享 app-server；未运行全量测试。
+
+### 2026-07-30 — Coding Agent 前沿调研 + main 测试基线清零（commit 4f72c7b / 5bfc36e）
+
+- **调研**：五路并行（Claude Code 生态 / Codex 生态 / 竞品产品 / 学术与基准 / harness 实践与同类项目）交叉整合成 `docs/coding-agent-frontier-2026H1.md`（commit 5bfc36e），全部条目附一手来源与日期，含对 CCM 分优先级（P0 验证与完成判定 / P1 官方原语迁移与 best-of-n / P2 沙箱与记忆蒸馏）的机会点分析与定位判断。
+- **基线清零（commit 4f72c7b）**：调研前基线 8 failed，三个根因全部修复至 `3041 passed`：
+  1. **系统 bug**——`update_migrate.sh` 的 same-uid 不可探查进程白名单用 `command.endswith('systemd --user')` 匹配，systemd re-exec 后 cmdline 变成 `systemd --user --deserialize=N` 即失配 → `restore_database` 永远失败（**本机生产回滚同样会挂**，不只是测试问题）。改为 token 匹配，cgroup `init.scope` 锚点不变。
+  2. **过时断言**——7-29 monitor 重构（544c128）确立「睡眠中的 Monitor 不阻塞更新」，7-24 写的 blocker 测试仍断言纯 `_monitor_tasks` lifecycle 应阻塞；改为 `_monitor_active_turns` 作运行证据并反向断言睡眠 lifecycle 不阻塞。
+  3. **密闭性缺陷**×2——start guard 测试默认读机器全局 `/tmp/ccm-update-status-8000.json`（撞宿主 7-19 真实部署残留）；WS identity 测试隐式依赖 `.env` 的 `AUTH_TOKEN` 非空（空则 `_ws_identity` 短路 super_admin，JWT 分支根本没被执行）。均改为测试内显式注入。
+- **预防**：涉及扫描 `/proc`、`/tmp` 全局路径或 `settings.*` 环境值的测试必须显式注入被测状态，不能假设宿主干净；同类先例已写进 CLAUDE.md「pytest 外部状态隔离」，本次是该规则的两个漏网点。

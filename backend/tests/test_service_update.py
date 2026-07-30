@@ -224,8 +224,11 @@ async def test_live_auxiliary_generations_block_restart_without_active_task(
     tmp_path, db_factory,
 ):
     dispatcher = _make_gate_dispatcher(db_factory)
+    # A sleeping scheduled monitor owns no process, so its asyncio lifecycle
+    # alone must not block a restart; only a claimed/running turn is evidence.
     monitor_lifecycle = asyncio.create_task(asyncio.sleep(60))
-    dispatcher._monitor_tasks[7] = monitor_lifecycle
+    dispatcher._monitor_tasks[6] = monitor_lifecycle
+    dispatcher._monitor_active_turns = {7}
     dispatcher._sub_agent_processes[9] = MagicMock(returncode=None)
     service = _make_service(
         tmp_path,

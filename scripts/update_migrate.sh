@@ -1133,11 +1133,15 @@ for pid, command, cgroup, error in uninspectable:
     in_user_manager_init = (
         f"/user-{own_uid}.slice/user@{own_uid}.service/init.scope" in cgroup
     )
+    # After a daemon-reexec the user manager's cmdline gains extra arguments
+    # (e.g. "systemd --user --deserialize=19"), so match tokens, not a suffix.
+    command_tokens = command.split()
     fixed_system_helper = (
         command == "(sd-pam)"
         or (
-            command.endswith("systemd --user")
-            and Path(command.split()[0]).name == "systemd"
+            bool(command_tokens)
+            and Path(command_tokens[0]).name == "systemd"
+            and "--user" in command_tokens[1:]
         )
     )
     fixed_ssh_agent = (

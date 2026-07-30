@@ -20,8 +20,14 @@ def _write(path: Path, payload: dict) -> None:
 
 
 def test_no_deployment_record_allows_normal_start(tmp_path):
+    # The default legacy status path /tmp/ccm-update-status-{port}.json is
+    # machine-global; point it into tmp so a real deployment's leftover on
+    # the host cannot leak into this hermetic "no record" scenario.
     result = assess_deployment_start(
-        tmp_path, port=8000, running_commit="a" * 40
+        tmp_path,
+        port=8000,
+        running_commit="a" * 40,
+        status_file=tmp_path / "ccm-update-status.json",
     )
     assert result.action == "normal"
 

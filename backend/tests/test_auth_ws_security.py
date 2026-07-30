@@ -340,6 +340,21 @@ class _IdentityWebSocket:
 @pytest.mark.asyncio
 async def test_ws_identity_uses_current_role_and_active_state(db_factory):
     from backend.api.ws import _current_ws_identity, _revalidate_ws_identity
+    from backend.config import settings
+
+    # An empty AUTH_TOKEN short-circuits _ws_identity into a super_admin
+    # "none" identity before the JWT path; pin a token so the test exercises
+    # JWT revalidation regardless of the host environment's .env.
+    original_token = settings.auth_token
+    settings.auth_token = "ws-identity-service-token"
+    try:
+        await _run_ws_identity_current_role_checks(db_factory)
+    finally:
+        settings.auth_token = original_token
+
+
+async def _run_ws_identity_current_role_checks(db_factory):
+    from backend.api.ws import _current_ws_identity, _revalidate_ws_identity
 
     async with db_factory() as db:
         user = User(

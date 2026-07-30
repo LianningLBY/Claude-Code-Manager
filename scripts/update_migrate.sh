@@ -1012,6 +1012,7 @@ svc_start() {
 assert_database_unheld() {
     "$PYTHON_BIN" - "$DB_FILE" "$$" "$SERVER_PID" <<'PY'
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1128,6 +1129,19 @@ if result.returncode != 1:
 # The only inaccessible same-user processes ignored here are fixed systemd
 # helpers that cannot load CCM or its database. ssh-agent deliberately disables
 # dumpability on some hosts, so even its same-UID /proc/fd is unreadable.
+def fixed_systemd_user_manager(command):
+    argv = command.split()
+    return (
+        len(argv) in {2, 3}
+        and Path(argv[0]).name == "systemd"
+        and argv[1] == "--user"
+        and (
+            len(argv) == 2
+            or re.fullmatch(r"--deserialize=[0-9]+", argv[2]) is not None
+        )
+    )
+
+
 unsafe_uninspectable = []
 for pid, command, cgroup, error in uninspectable:
     in_user_manager_init = (
@@ -1135,10 +1149,7 @@ for pid, command, cgroup, error in uninspectable:
     )
     fixed_system_helper = (
         command == "(sd-pam)"
-        or (
-            command.endswith("systemd --user")
-            and Path(command.split()[0]).name == "systemd"
-        )
+        or fixed_systemd_user_manager(command)
     )
     fixed_ssh_agent = (
         f"/user-{own_uid}.slice/user@{own_uid}.service/"

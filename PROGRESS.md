@@ -971,3 +971,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：`skill_context.py` 集中计算 Codex Monitor capability：主 MCP 开启、`worker_id/shared_from_id` 均为空且 metadata 没有 Worker 管理标记或 User Skill snapshot 时才开放。Task 创建/更新/迁移导入、chat `$monitor`、Monitor API、MCP discovery/read/enable、主 MCP spec 与 Instance launch 共用该判定；Monitor API 在路由写屏障后再次检查，关闭迁移竞态。Runtime Settings 增加只读派生 capability，TaskForm/徽章/Chat/面板结合精确任务范围展示；capability 未知时隐藏/禁用但保留所有现有 key，后续请求可恢复。
 - **预防**：部署级 capability 只回答“服务是否具备能力”，不能代替 Task scope；所有产生持久化、远端代理或进程副作用的入口必须在副作用前校验，并在可能改变路由的写屏障后复核。跨 Worker snapshot 的“存在”本身就是远端管理证据，不能因 `worker_id` 暂时为空而猜成本地任务。
 - **验证**：Linux 容器聚焦后端共 `118 passed`，覆盖 Task/Chat/Monitor API、Runtime Settings、Skill context、MCP server/spec、Instance launch 及 PR7B1 的多轮/恢复/关机/停止/清理不变量；前端五个聚焦文件 `127 passed`，production build 通过。真实本地 Codex 手测验证 5 轮普通/重要报告后自动完成，以及活动 Monitor Stop 后清空调度、删除精确 thread 且不终止共享 app-server；未运行全量测试。
+
+### 2026-07-30 — 跨版本更新放行真实 systemd user-manager
+
+- **问题**：SQLite 停服独占检查本意只忽略固定的 systemd user-manager，但匹配条件要求命令行以 `systemd --user` 结尾；真实宿主 PID 1 拉起的进程是 `systemd --user --deserialize=19`，同 UID `/proc/<pid>/fd` 因内核保护不可读，导致每次迁移都误判无法证明独占并回滚。
+- **解决**：把允许项收窄为 basename 精确等于 `systemd`、首参数精确 `--user`，并且只允许无额外参数或单个数字形式 `--deserialize=N`；仍要求进程位于该 UID 的 `init.scope`，任何额外/非数字参数继续 fail closed。
+- **验证**：新增正反例分类回归并运行 `test_update_migrate_hardening.py`，`27 passed`；Shell 语法检查通过。

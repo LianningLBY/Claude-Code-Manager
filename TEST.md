@@ -762,7 +762,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_main_deployment_start.py` | guard 在 `init_db` 前执行；maintenance-only 不访问数据库、不启动 Dispatcher/Worker；受控 handoff 跳过重复 mutation |
 | `test_deployment_maintenance_auth.py` | 维护模式只开放 health/status/repair/rollback/restart；legacy recovery token 与已签名 admin JWT 无 DB 可恢复，member JWT 和密码登录被拒绝 |
 | `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
-| `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障 |
+| `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障；仅对白名单内的 `systemd --user [--deserialize=N]` user-manager 进程放行不可读 FD |
 | `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
 | `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
 

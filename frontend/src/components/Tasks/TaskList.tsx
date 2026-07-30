@@ -8,6 +8,7 @@ import { TAG_COLOR_OPTIONS } from '../TagColors';
 import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
 import { useTaskReorder } from '../../hooks/useTaskReorder';
+import { getTaskStatusLabel } from './taskStatus';
 
 interface TaskListProps {
   tasks: Task[];
@@ -182,8 +183,12 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
               {t.priority > 0 && (
                 <span className="text-xs bg-indigo-600/30 text-indigo-300 px-1.5 rounded">P{t.priority}</span>
               )}
-              <span className="hidden sm:inline text-xs text-gray-500 capitalize">
-                {t.background_active ? 'background' : t.status.replace('_', ' ')}
+              <span className={`text-xs text-gray-500 ${
+                t.mode === 'plan' && ['in_progress', 'executing'].includes(t.status)
+                  ? ''
+                  : 'hidden sm:inline'
+              }`}>
+                {getTaskStatusLabel(t)}
               </span>
               <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
                 {t.provider === 'codex' ? 'Codex' : 'Claude'}

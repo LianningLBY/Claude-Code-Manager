@@ -724,12 +724,41 @@ class PlanAgentRunner:
         claude_pool=None,
         codex_pool=None,
         cloudrouter_store=None,
+        broadcaster=None,
     ):
         self.db_factory = db_factory
         self.instance_manager = instance_manager
         self.claude_pool = claude_pool
         self.codex_pool = codex_pool
         self.cloudrouter_store = cloudrouter_store
+        self.broadcaster = broadcaster
+
+    async def _broadcast_stage(
+        self,
+        *,
+        task_id: int,
+        stage: str,
+        round_number: int,
+    ) -> None:
+        """Publish best-effort UI detail; DB polling remains authoritative."""
+
+        if self.broadcaster is None:
+            return
+        try:
+            await self.broadcaster.broadcast(
+                "tasks",
+                {
+                    "event": "plan_stage_change",
+                    "task_id": task_id,
+                    "plan_stage": stage,
+                    "plan_stage_round": round_number,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to broadcast Plan stage for task %s",
+                task_id,
+            )
 
     async def _target_context(self, task: Task) -> str:
         if task.plan_target_task_id is None:
@@ -1361,7 +1390,13 @@ class PlanAgentRunner:
             db.add(run)
             await db.commit()
             await db.refresh(run)
-            return run.id
+            run_id = run.id
+        await self._broadcast_stage(
+            task_id=task.id,
+            stage="planning",
+            round_number=1,
+        )
+        return run_id
 
     async def _start_step(
         self,
@@ -1411,14 +1446,32 @@ class PlanAgentRunner:
             await db.commit()
 
     async def _update_run(self, run_id: int, **values) -> None:
+        stage_change: tuple[int, str, int] | None = None
         async with self.db_factory() as db:
             run = await db.get(PlanAgentRun, run_id)
             if run is None:
                 return
+            previous_stage = run.status
+            previous_round = run.round
             for key, value in values.items():
                 setattr(run, key, value)
             run.updated_at = datetime.utcnow()
+            if (
+                run.status != previous_stage
+                or run.round != previous_round
+            ):
+                stage_change = (
+                    run.plan_task_id,
+                    run.status,
+                    run.round,
+                )
             await db.commit()
+        if stage_change is not None:
+            await self._broadcast_stage(
+                task_id=stage_change[0],
+                stage=stage_change[1],
+                round_number=stage_change[2],
+            )
 
     async def run(self, task: Task, *, cwd: str) -> PlanPipelineResult:
         legacy_provider = (task.provider or "").lower()

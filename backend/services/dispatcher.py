@@ -7093,6 +7093,7 @@ class GlobalDispatcher:
             claude_pool=self.pool,
             codex_pool=self.codex_pool,
             cloudrouter_store=self.cloudrouter_store,
+            broadcaster=self.broadcaster,
         )
         try:
             result = await runner.run(task, cwd=cwd)

@@ -2134,6 +2134,47 @@ describe('independent Plan attachments', () => {
     ));
   });
 
+  it('updates an associated Plan stage and ready state in real time', async () => {
+    const plan = makeTask({
+      id: 80,
+      title: 'Live Plan',
+      mode: 'plan',
+      status: 'executing',
+      plan_stage: 'planning',
+      plan_stage_round: 1,
+      plan_target_task_id: 1,
+    });
+    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    expect(await screen.findByText('Planning')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'tasks',
+        data: {
+          event: 'plan_stage_change',
+          task_id: 80,
+          plan_stage: 'reviewing',
+          plan_stage_round: 2,
+        },
+      });
+    });
+    expect(await screen.findByText('Reviewing · Round 2')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'tasks',
+        data: {
+          event: 'plan_ready',
+          task_id: 80,
+        },
+      });
+    });
+    expect(await screen.findByRole('button', { name: 'Approve' })).toBeInTheDocument();
+  });
+
   it('persists an approved Plan in the composer and sends its explicit id', async () => {
     const plan = makeTask({
       id: 81,

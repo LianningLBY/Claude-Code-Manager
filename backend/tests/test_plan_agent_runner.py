@@ -228,9 +228,12 @@ async def test_pipeline_revises_then_persists_audited_approval(
         await db.refresh(task)
         task_id = task.id
 
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
     runner = PlanAgentRunner(
         db_factory=db_factory,
         instance_manager=MagicMock(),
+        broadcaster=broadcaster,
     )
     runner._run_route = AsyncMock(side_effect=[
         ({"plan": "Plan v1"}, '{"plan":"Plan v1"}', "claude-1"),
@@ -281,8 +284,11 @@ async def test_pipeline_revises_then_persists_audited_approval(
                 )
             ).scalars().all()
         )
+        task_state = await db.get(Task, task_id)
     assert run.status == "completed"
     assert run.round == 2
+    assert task_state.plan_stage == "completed"
+    assert task_state.plan_stage_round == 2
     assert run.review_verdict == "approve"
     assert [step.step_type for step in steps] == [
         "planner",
@@ -299,6 +305,21 @@ async def test_pipeline_revises_then_persists_audited_approval(
         "codex",
     ]
     assert run.pipeline_config == pipeline.model_dump(mode="json")
+    stage_events = [
+        call.args[1]
+        for call in broadcaster.broadcast.await_args_list
+        if call.args[1]["event"] == "plan_stage_change"
+    ]
+    assert [
+        (event["plan_stage"], event["plan_stage_round"])
+        for event in stage_events
+    ] == [
+        ("planning", 1),
+        ("reviewing", 1),
+        ("planning", 2),
+        ("reviewing", 2),
+        ("completed", 2),
+    ]
 
 
 @pytest.mark.asyncio

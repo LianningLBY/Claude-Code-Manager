@@ -152,12 +152,34 @@ class Task(Base):
 
 def _configure_task_properties():
     from backend.models.monitor_session import MonitorSession
+    from backend.models.plan_agent import PlanAgentRun
+
     ms = MonitorSession.__table__
+    plan_runs = PlanAgentRun.__table__
     # Always show real running sub-agent count — background agents can
     # outlive the main turn, so even completed tasks may have active sub-agents.
     Task.active_sub_agents = column_property(
         select(func.count(ms.c.id))
         .where(ms.c.task_id == Task.id, ms.c.status == "running")
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    # PlanAgentRun is the durable authority for the currently executing
+    # Planner/Reviewer phase. Keep this as a read-only projection rather than
+    # duplicating mutable pipeline state on Task.
+    Task.plan_stage = column_property(
+        select(plan_runs.c.status)
+        .where(plan_runs.c.plan_task_id == Task.id)
+        .order_by(plan_runs.c.id.desc())
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    Task.plan_stage_round = column_property(
+        select(plan_runs.c.round)
+        .where(plan_runs.c.plan_task_id == Task.id)
+        .order_by(plan_runs.c.id.desc())
+        .limit(1)
         .correlate(Task.__table__)
         .scalar_subquery()
     )

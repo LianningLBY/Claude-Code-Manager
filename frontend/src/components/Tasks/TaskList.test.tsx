@@ -80,6 +80,32 @@ describe('TaskList', () => {
     expect(screen.getByText('The prompt')).toBeInTheDocument();
   });
 
+  it.each([
+    ['planning', 1, 'Planning'],
+    ['reviewing', 1, 'Reviewing'],
+    ['planning', 2, 'Planning · Round 2'],
+    ['reviewing', 2, 'Reviewing · Round 2'],
+  ])(
+    'shows the active Plan stage %s round %s',
+    (planStage, planStageRound, expected) => {
+      render(
+        <TaskList
+          tasks={[makeTask({
+            mode: 'plan',
+            status: 'executing',
+            plan_stage: planStage,
+            plan_stage_round: planStageRound,
+          })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      expect(screen.getByText(expected)).toBeInTheDocument();
+    },
+  );
+
   it('shows empty state when no tasks', () => {
     render(<TaskList tasks={[]} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('No tasks yet')).toBeInTheDocument();

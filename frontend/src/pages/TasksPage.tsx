@@ -15,6 +15,7 @@ import { TAG_COLOR_OPTIONS } from '../components/TagColors';
 import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
 import { useTaskSearch } from '../hooks/useTaskSearch';
 import { TeamShareModal } from '../components/TeamShareModal';
+import { getTaskStatusLabel } from '../components/Tasks/taskStatus';
 
 const PAGE_SIZE = 20;
 
@@ -80,19 +81,44 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     // status until the chat is closed).
     const data = msg.data;
     const event = msg.channel === 'tasks' ? data?.event : undefined;
-    if (data && (event === 'status_change' || event === 'background_activity')) {
+    if (
+      data
+      && (
+        event === 'status_change'
+        || event === 'background_activity'
+        || event === 'plan_stage_change'
+        || event === 'plan_ready'
+      )
+    ) {
       const taskId = Number(data.task_id);
       if (!Number.isSafeInteger(taskId) || taskId <= 0) return;
 
-      const newStatus = (
-        event === 'status_change'
-        && typeof data.new_status === 'string'
-        && data.new_status
-      ) ? data.new_status : undefined;
+      const newStatus = event === 'plan_ready'
+        ? 'plan_review'
+        : (
+          event === 'status_change'
+          && typeof data.new_status === 'string'
+          && data.new_status
+            ? data.new_status
+            : undefined
+        );
       const backgroundActive = typeof data.background_active === 'boolean'
         ? data.background_active
         : undefined;
-      if (newStatus === undefined && backgroundActive === undefined) return;
+      const planStage = event === 'plan_stage_change'
+        && typeof data.plan_stage === 'string'
+        ? data.plan_stage
+        : undefined;
+      const planStageRound = event === 'plan_stage_change'
+        && Number.isSafeInteger(Number(data.plan_stage_round))
+        ? Number(data.plan_stage_round)
+        : undefined;
+      if (
+        newStatus === undefined
+        && backgroundActive === undefined
+        && planStage === undefined
+        && planStageRound === undefined
+      ) return;
 
       const patchTask = (task: Task): Task => {
         if (task.id !== taskId) return task;
@@ -101,11 +127,26 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           backgroundActive !== undefined
           && task.background_active !== backgroundActive
         );
-        if (!statusChanged && !backgroundChanged) return task;
+        const planStageChanged = (
+          planStage !== undefined
+          && task.plan_stage !== planStage
+        );
+        const planStageRoundChanged = (
+          planStageRound !== undefined
+          && task.plan_stage_round !== planStageRound
+        );
+        if (
+          !statusChanged
+          && !backgroundChanged
+          && !planStageChanged
+          && !planStageRoundChanged
+        ) return task;
         return {
           ...task,
           ...(newStatus !== undefined ? { status: newStatus } : {}),
           ...(backgroundActive !== undefined ? { background_active: backgroundActive } : {}),
+          ...(planStage !== undefined ? { plan_stage: planStage } : {}),
+          ...(planStageRound !== undefined ? { plan_stage_round: planStageRound } : {}),
         };
       };
       const patchList = (list: Task[]) => {
@@ -623,7 +664,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     {/* 状态只靠圆点颜色表达（绿=完成 红=失败 蓝=运行 黄=等待） */}
                     <span
                       className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`}
-                      title={t.background_active ? 'background' : t.status}
+                      title={getTaskStatusLabel(t)}
                     />
                     <span className={`text-xs truncate flex-1 ${chatTask?.id === t.id ? 'text-foreground font-medium' : 'text-gray-300'}`}>
                       {t.title || t.description?.slice(0, 50) || `Task #${t.id}`}
@@ -632,6 +673,11 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                   </div>
                   <div className="flex items-center gap-1.5 mt-1 ml-4 flex-wrap">
                     <span className="text-[10px] text-gray-500">#{t.id}</span>
+                    {t.mode === 'plan' && ['in_progress', 'executing'].includes(t.status) && (
+                      <span className="text-[10px] text-indigo-300">
+                        {getTaskStatusLabel(t)}
+                      </span>
+                    )}
                     {proj && (
                       <span className={`text-[10px] px-1 rounded font-medium whitespace-nowrap ${colorDef ? `${colorDef.bg} ${colorDef.text}` : 'bg-emerald-600/30 text-emerald-300'}`}>
                         {proj.name}

@@ -1077,6 +1077,7 @@ class RalphLoop:
                         claude_pool=dispatcher.pool,
                         codex_pool=dispatcher.codex_pool,
                         cloudrouter_store=dispatcher.cloudrouter_store,
+                        broadcaster=self.broadcaster,
                     )
                     plan_lifecycle = asyncio.create_task(
                         runner.run(task, cwd=cwd)

@@ -37,6 +37,7 @@ import { PlanPipelineFields } from '../PlanReview/PlanPipelineFields';
 import {
   FALLBACK_PLAN_PIPELINE_CONFIG,
 } from '../PlanReview/planPipelineDefaults';
+import { getTaskStatusLabel } from '../Tasks/taskStatus';
 
 interface ChatViewProps {
   task: Task;
@@ -856,6 +857,36 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         if (typeof msg.data.codex_monitor_enabled === 'boolean') {
           setCodexMonitorEnabled(msg.data.codex_monitor_enabled);
         }
+      }
+      return;
+    }
+    if (
+      msg.channel === 'tasks'
+      && (
+        msg.data?.event === 'plan_stage_change'
+        || msg.data?.event === 'plan_ready'
+      )
+    ) {
+      const planTaskId = Number(msg.data.task_id);
+      const planStage = typeof msg.data.plan_stage === 'string'
+        ? msg.data.plan_stage
+        : undefined;
+      const planStageRound = Number(msg.data.plan_stage_round);
+      if (Number.isSafeInteger(planTaskId) && planTaskId > 0) {
+        setRelatedPlans((plans) => plans.map((plan) =>
+          plan.id === planTaskId
+            ? {
+                ...plan,
+                ...(msg.data?.event === 'plan_ready'
+                  ? { status: 'plan_review' }
+                  : {}),
+                ...(planStage !== undefined ? { plan_stage: planStage } : {}),
+                ...(Number.isSafeInteger(planStageRound)
+                  ? { plan_stage_round: planStageRound }
+                  : {}),
+              }
+            : plan
+        ));
       }
       return;
     }
@@ -2217,7 +2248,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                           </span>
                           <span className="text-[10px] text-gray-500">#{plan.id}</span>
                           <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400">
-                            {plan.status}
+                            {getTaskStatusLabel(plan)}
                           </span>
                           <span className="text-[10px] text-gray-600">
                             {plan.plan_pipeline_config

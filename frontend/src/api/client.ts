@@ -147,6 +147,48 @@ export interface ProjectTodo {
 
 export type CodexServiceTier = 'default' | 'priority';
 
+export interface PlanModelRoute {
+  provider: 'claude' | 'codex';
+  model: string;
+  effort: string | null;
+}
+
+export interface PlanStageRoutes {
+  primary: PlanModelRoute;
+  fallback: PlanModelRoute;
+}
+
+export interface PlanReviewerRoutes extends PlanStageRoutes {
+  enabled: boolean;
+}
+
+export interface PlanPipelineConfig {
+  version: 1;
+  planner: PlanStageRoutes;
+  reviewer: PlanReviewerRoutes;
+  max_revision_cycles: number;
+}
+
+export interface SystemConfig {
+  default_provider: string;
+  provider_options: string[];
+  default_model: string;
+  model_options: string[];
+  default_codex_model: string;
+  codex_model_options: string[];
+  default_effort: string;
+  effort_options: string[];
+  claude_model_efforts: Record<string, string[]>;
+  claude_model_context_windows: Record<string, number>;
+  codex_effort_options: string[];
+  codex_model_efforts: Record<string, string[]>;
+  default_codex_service_tier?: CodexServiceTier;
+  codex_service_tier_options?: CodexServiceTier[];
+  codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+  /** Absent when the UI is connected to an older Manager/Worker. */
+  plan_pipeline_defaults?: PlanPipelineConfig;
+}
+
 export interface TaskRoutingExpectation {
   provider: string;
   model: string | null;
@@ -188,6 +230,7 @@ export interface Task {
   plan_applied_at: string | null;
   plan_applied_to_session_id: string | null;
   plan_execution_task_id: number | null;
+  plan_pipeline_config: PlanPipelineConfig | null;
   starred: boolean;
   archived: boolean;
   has_unread: boolean;
@@ -322,6 +365,7 @@ export interface PlanAgentStep {
   provider: string;
   model: string | null;
   effort: string | null;
+  route_slot: 'primary' | 'fallback' | null;
   status: string;
   output: string | null;
   error: string | null;
@@ -340,6 +384,7 @@ export interface PlanAgentRun {
   reviewer_provider: string | null;
   reviewer_model: string | null;
   reviewer_effort: string | null;
+  pipeline_config: PlanPipelineConfig | null;
   round: number;
   review_verdict: string | null;
   review_feedback: string | null;
@@ -1208,7 +1253,7 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
   updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -1236,6 +1281,7 @@ export const api = {
       provider?: string;
       model?: string;
       effort_level?: string;
+      pipeline_config?: PlanPipelineConfig;
       supersedes_plan_task_id?: number;
     },
   ) =>
@@ -1646,7 +1692,7 @@ export const api = {
   // System
   health: () => request<{ status: string; commit?: string }>('/api/system/health'),
   stats: () => request<{ tasks: Record<string, number>; running_instances: number }>('/api/system/stats'),
-  config: () => request<{ default_provider: string; provider_options: string[]; default_model: string; model_options: string[]; default_codex_model: string; codex_model_options: string[]; default_effort: string; effort_options: string[]; claude_model_efforts: Record<string, string[]>; claude_model_context_windows: Record<string, number>; codex_effort_options: string[]; codex_model_efforts: Record<string, string[]>; default_codex_service_tier?: CodexServiceTier; codex_service_tier_options?: CodexServiceTier[]; codex_model_service_tiers: Record<string, CodexServiceTier[]> }>('/api/system/config'),
+  config: () => request<SystemConfig>('/api/system/config'),
   listSkills: () => request<{ key: string; label: string; description: string; always: boolean; priority: number; tags: string[] }[]>('/api/system/skills'),
   listSkillsCached: () => listSkillsCached(),
   listUserSkillsCached: () => listUserSkillsCached(),

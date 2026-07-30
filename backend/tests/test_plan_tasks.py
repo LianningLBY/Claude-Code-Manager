@@ -74,6 +74,18 @@ async def test_related_plans_are_independent_and_limited(
         plan_ids.append(data["id"])
         assert data["mode"] == "plan"
         assert data["plan_target_task_id"] == target_id
+        assert data["provider"] == "claude"
+        assert data["model"] == "claude-fable-5"
+        assert data["plan_pipeline_config"]["planner"]["primary"] == {
+            "provider": "claude",
+            "model": "claude-fable-5",
+            "effort": "high",
+        }
+        assert data["plan_pipeline_config"]["reviewer"]["primary"] == {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+        }
         assert "plan_context_snapshot" not in data
         # The immutable transcript is deliberately not exposed in Task list
         # payloads; verify its durable capture directly.
@@ -108,6 +120,58 @@ async def test_related_plans_are_independent_and_limited(
         target = await db.get(Task, target_id)
     assert target.status == "completed"
     assert target.session_id == session_id
+
+
+@pytest.mark.asyncio
+async def test_related_plan_snapshots_custom_primary_and_fallback_routes(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    pipeline = {
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-luna",
+                "effort": "max",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "ultra",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 3,
+    }
+
+    response = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={
+            "input": "Use explicit two-stage routes",
+            "pipeline_config": pipeline,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    data = response.json()
+    assert data["provider"] == "codex"
+    assert data["model"] == "gpt-5.6-luna"
+    assert data["effort_level"] == "max"
+    assert data["plan_pipeline_config"] == pipeline
 
 
 @pytest.mark.asyncio

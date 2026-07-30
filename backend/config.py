@@ -46,12 +46,21 @@ class Settings(BaseSettings):
     default_goal_evaluator_model: str = "claude-haiku-4-5"
     goal_evaluation_timeout: int = 120
     # --- Independent Plan Agent pipeline ---
-    # Planner inherits the Plan Task provider/model/effort. Reviewer is an
-    # independent read-only run so its route can be tuned separately.
+    # Both stages have an explicit primary/fallback route. A Plan Task stores
+    # the resolved snapshot so queued work cannot drift with later defaults.
+    plan_planner_provider: str = "claude"
+    plan_planner_model: str = "claude-fable-5"
+    plan_planner_effort: str = "high"
+    plan_planner_fallback_provider: str = "codex"
+    plan_planner_fallback_model: str = "gpt-5.6-terra"
+    plan_planner_fallback_effort: str = "xhigh"
     plan_reviewer_enabled: bool = True
     plan_reviewer_provider: str = "codex"
     plan_reviewer_model: str = "gpt-5.6-sol"
     plan_reviewer_effort: str = "xhigh"
+    plan_reviewer_fallback_provider: str = "claude"
+    plan_reviewer_fallback_model: str = "claude-sonnet-5"
+    plan_reviewer_fallback_effort: str = "high"
     plan_max_revision_cycles: int = 2
     plan_planner_timeout: int = 1800
     plan_reviewer_timeout: int = 900

@@ -1,6 +1,6 @@
 # 独立 Plan Task 与 Plan Agent 设计
 
-> 状态：已实施，待生产环境手工验收。
+> 状态：已实施（含 Planner/Reviewer 独立 primary/fallback 路由），待生产环境手工验收。
 >
 > 2026-07-29 决策：Plan 永远是独立制品。Plan 完成或批准都不会自动唤醒目标
 > session；用户必须通过下一条真实消息携带方案，或显式创建执行 Task。
@@ -23,6 +23,8 @@ Plan 统一建模为 `mode="plan"` 的独立 Task：
 - reject 只终止 Plan，不取消目标 Task；重新规划创建新的独立 Plan，可记录
   `supersedes_plan_task_id`；
 - 不自动注入，不需要 ACK turn，也不需要 `QueuedMessage.readonly_turn`。
+- Plan Task 是持久制品和生命周期容器，不是 Claude/Codex 原生 session；每个模型步骤由
+  `PlanAgentRunner` 临时启动，完成后不保留可续聊的 Plan session。
 
 ## 1. 为什么不在 approve 时直接“回填 session”
 
@@ -84,6 +86,7 @@ Plan B approve ───────────────► approved / pendi
 | `plan_context_snapshot` | 有界且不可变的对话快照，供跨 Worker 的 Planner 使用 |
 | `plan_repo_revision` | 创建时 HEAD + dirty 指纹 JSON |
 | `supersedes_plan_task_id` | 用户要求重做时指向上一 Plan |
+| `plan_pipeline_config` | 版本化 Planner/Reviewer primary/fallback 路由快照 |
 | `plan_approved_at/by` | 审批审计 |
 | `plan_applied_at` | 首次绑定到真实用户消息的时间 |
 | `plan_applied_to_session_id` | 应用时目标 session 快照 |
@@ -98,6 +101,7 @@ Plan B approve ───────────────► approved / pendi
 
 - `id`, `plan_task_id`, `status`, `combo_used`, `round`;
 - Planner/Reviewer provider/model/effort 快照；
+- 完整 `pipeline_config` 快照；
 - 最终 verdict、feedback、`review_exhausted`、error；
 - `created_at`, `updated_at`, `finished_at`。
 
@@ -106,6 +110,7 @@ Plan B approve ───────────────► approved / pendi
 每次模型步骤一行：
 
 - `run_id`, `step_type`, `round`, provider/model/effort；
+- `route_slot`（primary/fallback）与实际 `account_id`；
 - `status`, 截断后的 output/error；
 - `started_at`, `finished_at`。
 
@@ -135,15 +140,17 @@ Plan 创建时记录：
 
 ### 5.1 Planner
 
-- 一次性、无 session 持久化；
+- 一次性、无 Plan session 持久化；
 - cwd 指向 Plan Task 的 repo；
 - 输入为 Plan description、目标 Task 截止 `plan_context_log_id` 的对话摘要、repo 状态；
 - 输出结构化实施方案。
+- 默认 primary 为 `Claude / claude-fable-5 / high`，fallback 为
+  `Codex / gpt-5.6-terra / xhigh`。
 
 ### 5.2 Reviewer
 
-- 默认开启，可在全局设置关闭；
-- 独立一次性进程；
+- 默认开启，可按 Plan 配置关闭；
+- 独立一次性模型 turn；
 - 审查方案与 repo 现状的一致性；
 - verdict：`approve` / `revise`；
 - revise 反馈回 Planner，默认最多 2 个 revision cycle；
@@ -152,17 +159,39 @@ Plan 创建时记录：
 Reviewer 不直接重写最终方案。需要修改时统一由 Planner 根据 feedback 产出新版本，保持
 作者责任和审计链清晰。
 
-### 5.3 结构化输出
+默认 primary 为 `Codex / gpt-5.6-sol / xhigh`，fallback 为
+`Claude / claude-sonnet-5 / high`。Planner 与 Reviewer 的模型、provider、effort
+完全独立，不从主 Task 的执行模型隐式继承。
+
+### 5.3 路由、选号与 fallback
+
+每层配置一个 primary 和一个 fallback，route 是完整的
+`{provider, model, effort}`，而不只是 model 字符串：
+
+1. 对 primary 调用现有 `ClaudePool.select()` / `CodexPool.select()`；
+2. 只选择声明支持该模型、当前可用且满足 Standard tier 的账号；
+3. 已证明的 usage limit、auth、capacity/transient 失败会排除当前账号并尝试同 route
+   的下一个兼容账号；
+4. primary 的兼容账号耗尽后才尝试 fallback；
+5. fallback 也耗尽时 Plan 直接 failed，不进入普通 Task 的通用重试/重新排队链。
+
+因此不新增一套“选号逻辑”。Plan runner 只封装辅助模型步骤的 route fallback，账号可用性、
+模型兼容、CloudRouter/Apex 投影、冷却与轮询仍由现有号池负责。每次尝试写入
+`plan_agent_steps`，run 同时保留请求配置和实际成功组合，便于解释为什么发生 fallback。
+部署默认值由 `.env` 的 `PLAN_PLANNER_*` / `PLAN_REVIEWER_*` 配置；TaskForm 和 ChatView
+允许按 Plan 覆盖，创建后固化快照，之后修改全局默认不会漂移已排队或历史 Plan。
+
+### 5.4 结构化输出
 
 优先使用当前 CLI 的原生 schema：
 
 - Claude：`--json-schema`；
-- Codex：`--output-schema`；
+- Codex app-server：`turn/start.outputSchema`；
 - 服务端解包 provider 原生 envelope 后仍做严格字段校验；
 - 当前 pinned CLI 的 schema 能力是运行前提；结构化输出不可用或不合法时显式失败，
   不降级为可能误判的自由文本协议。
 
-### 5.4 真正只读
+### 5.5 真正只读
 
 “禁用 Edit/Write”不是硬只读，因为 Bash 仍可写文件。
 
@@ -176,25 +205,32 @@ Claude：
 
 Codex：
 
-- `codex exec --ephemeral --sandbox read-only`；
-- 禁用项目本地 MCP/hooks 与非必要用户配置；
-- 不使用 `--dangerously-bypass-approvals-and-sandbox`；
-- 显式关闭多 Agent fanout。
+- 复用按 `CODEX_HOME` 分片的常驻 Codex App Server，而不是另起 `codex exec`；
+- 每个 Planner/Reviewer 步骤创建一个全新 disposable native thread，绝不 resume 主
+  Task thread，终态后 `thread/delete` 并删除 rollout；
+- `sandbox=read-only`，turn 层重复 `sandboxPolicy=readOnly` 且禁网络；
+- whole-map `mcp_servers={}`，项目 trust 强制 untrusted；
+- 显式关闭 Apps、MCP Apps、多 Agent fanout、memories 和其他 autonomous features。
+
+Codex App Server 是 CCM 为每个账号 `CODEX_HOME` 维护的常驻 `codex app-server --stdio`
+传输进程。它可以并发承载多个相互隔离的 native thread，省去每步重新启动 CLI 的成本；
+这里复用的是 transport 和账号登录态，不是主 session/thread。
 
 两者都必须经过安全的辅助进程执行器，具有：
 
-- provider/账号池与 CloudRouter 路由；
+- provider/model route、现有账号池与 CloudRouter 路由；
 - timeout；
 - transient retry；
-- 进程组 SIGINT → SIGTERM → SIGKILL 清理；
+- Claude 进程组 SIGINT → SIGTERM → SIGKILL 清理；
+- Codex exact turn interrupt + disposable thread 删除；
 - shutdown admission 和 exact process evidence；
 - Dispatcher Instance 容量形成全局并发上限，目标 Task 另有最多三个 active Plan 的限制。
 
 不能直接拿旧 GoalEvaluator 充当 Planner：GoalEvaluator 只读对话摘要并返回
 `achieved/reason`，不看仓库也不产出方案。实现使用独立 `PlanAgentRunner`，但沿用
-GoalEvaluator 已验证的账号路由、CloudRouter admission、Codex exec guard、进程组注册、
+GoalEvaluator 已验证的账号路由、CloudRouter admission、Codex home guard、生命周期注册、
 取消与 shutdown 回收原则。CloudRouter 在这里仅负责 API 账号投影的并发/凭据准入，不参与
-Plan 的语义判断。
+Plan 的语义判断。`GoalEvaluator` 仍只服务 Goal 模式，不参与 Planner/Reviewer 决策。
 
 ## 6. Approve 与应用协议
 
@@ -286,6 +322,8 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 - 新增 Plans 按钮/抽屉；
 - 展示关联 Plan 历史、独立进度、模型、过期状态和审批按钮；
 - 输入框可创建新的 Plan；
+- “Models” 展开项可分别配置 Planner/Reviewer 的 primary/fallback provider、model、
+  effort，以及 Reviewer 开关和 revision cycles；
 - 已批准未应用 Plan 显示为持久 composer attachments；
 - 发送时显式提交 `plan_task_ids`；
 - 当前主 turn 运行中也可创建/审批 Plan，但应用只发生在 approve 之后新提交的消息。
@@ -300,7 +338,8 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 
 - 关联 Plan 默认创建到目标 Task 当前 Worker，保证能读取同一 repo；
 - Plan Task 使用 Manager 分配的全局 Task id，并携带 `plan_target_task_id`；
-- 模型策略随请求发送候选配置，实际账号/model/tier 可用性由执行地 Worker 解析；
+- 完整 `plan_pipeline_config` 随 Task 复制到 Worker；实际账号可用性由执行地 Worker
+  解析，但不得改写模型 route 快照；
 - 待审批或待应用的 Plan 会阻止目标 Task 迁移，关联 Plan 不能单独迁移，避免两者分居
   不同 Worker；
 - Plan 内容通过持久 API/任务同步复制，WebSocket 只作失效通知；
@@ -322,7 +361,9 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 - session 压缩/换号后应用到当前 session；
 - standalone Plan 创建执行 Task 幂等；
 - Planner/Reviewer schema、revision、非法结构化输出、timeout、cancel；
-- Claude/Codex 命令只读参数与 repo 零写入；
+- Planner/Reviewer 每层 primary/fallback、同 route 多账号耗尽、两路耗尽 terminal fail；
+- Claude 只读命令、Codex disposable read-only App Server thread 与 repo 零写入；
+- 配置 API 默认组合、Task/Worker 配置快照与 run/step route/account 审计；
 - Worker route、断连、迁移 fence、ACL。
 
 ### 10.2 前端
@@ -334,6 +375,7 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 - 发送 payload 含显式 Plan ids；
 - standalone 创建执行 Task 后跳转新 Task；
 - stale warning 二次确认。
+- standalone TaskForm 和 ChatView Models 面板均提交完整两层 primary/fallback 配置。
 
 ### 10.3 手工验收
 
@@ -347,13 +389,16 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 8. Claude/Codex 各跑一次，并验证规划前后 repo 状态完全一致；
 9. 对话和 HEAD 变化后验证 stale warning；
 10. Worker Task 重复以上关键路径。
+11. 临时令 Planner primary 不可用，确认尝试 fallback；再令两路都不可用，确认 Plan
+    直接 failed 且不会重新排队。
 
 ## 11. 已落地模块
 
 1. Task 字段、run/step 表、migration、状态机和 API；
-2. 受限 `PlanAgentRunner` 与 Planner/Reviewer；
-3. dispatcher Plan lifecycle，删除旧 `_run_plan_phase` 和 ralph_loop 复制逻辑；
-4. approve/reject/revise、Plan attachment、创建执行 Task；
-5. ChatView Plans UI 与 TasksPage PlanPanel；
-6. Worker、恢复、并发和 staleness；
-7. TEST.md、README、CLAUDE.md/AGENTS.md 同步与 Plan 相关回归。
+2. 受限 `PlanAgentRunner`、两层独立 primary/fallback route 与账号耗尽语义；
+3. Claude 一次性只读进程、Codex App Server disposable read-only thread；
+4. dispatcher Plan lifecycle，删除旧 `_run_plan_phase` 和 ralph_loop 复制逻辑；
+5. approve/reject/revise、Plan attachment、创建执行 Task；
+6. TaskForm/ChatView 两层模型配置、Plans UI 与 TasksPage PlanPanel；
+7. Worker、恢复、并发和 staleness；
+8. TEST.md、README、CLAUDE.md/AGENTS.md 同步与 Plan 相关回归。

@@ -159,11 +159,15 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | 测试 | 验证内容 |
 |------|---------|
 | `test_related_plans_are_independent_and_limited` | 同一 session 的 Plan 是独立 Task；有界上下文快照只持久化、不进入 Task 列表 payload；第 4 个 active Plan 返回 429 |
+| `test_related_plan_snapshots_custom_primary_and_fallback_routes` | Planner/Reviewer 两层 primary/fallback route 作为不可变配置写入 Plan Task，并以 Planner primary 镜像兼容字段 |
 | `test_related_plan_approval_requires_stale_confirmation_and_no_turn` | 对话/repo 已变化时 approve 先 409，确认后只完成 Plan，不 wake/enqueue 或改变目标 Task |
 | `test_approved_plan_is_applied_only_with_selected_user_message` | 只有显式 `plan_task_ids` 才把已批准方案与真实 user message 同 turn 入队，并以 Manager-local log id 一次性审计 |
 | `test_standalone_plan_creates_one_idempotent_execution_task` | standalone approve 后创建新的 auto Task，重复调用返回同一执行 Task |
-| `test_claude_plan_command_is_read_only` / `test_codex_plan_command_is_read_only` | Claude 禁 Bash/MCP/子 agent，Codex 强制 ephemeral/read-only sandbox/空 MCP/禁 multi-agent，均不使用危险 bypass |
+| `test_claude_plan_command_is_read_only` / `test_codex_plan_uses_disposable_read_only_app_server_thread` | Claude 禁 Bash/MCP/子 agent；Codex 复用 App Server 但使用 disposable read-only thread、空 MCP/禁 autonomous features，终态删除 thread |
 | `test_pipeline_revises_then_persists_audited_approval` | Planner → Reviewer revise → Planner → approve 的 run/step、模型与 feedback 全量审计 |
+| `test_stage_uses_fallback_only_after_primary_route_is_unavailable` | primary 不可用后才尝试 fallback，并审计 route slot 与实际成功模型 |
+| `test_route_exhausts_quota_limited_accounts_before_model_fallback` | 额度/认证失败先标记并轮换同 route 的兼容账号，不提前切模型 |
+| `test_stage_fails_after_primary_and_fallback_are_unavailable` | 两条 route 均不可用时保留双失败审计并终止 Plan |
 | `test_pipeline_rejects_unknown_planner_provider` | 非 claude/codex 的损坏路由 fail closed，不误走另一 provider |
 
 #### `test_api_system.py` — 系统 API
@@ -171,6 +175,7 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | 测试 | 验证内容 |
 |------|---------|
 | `test_health` | GET /api/system/health → {"status": "ok"} |
+| `test_config_returns_two_stage_plan_pipeline_defaults` | 下发 Planner/Reviewer 两层 primary/fallback 默认组合 |
 | `test_stats_empty` | 无数据时所有计数为 0 |
 | `test_stats_with_tasks` | 不同状态 task 计数正确 |
 | `test_stats_running_instances` | running 实例计数正确 |

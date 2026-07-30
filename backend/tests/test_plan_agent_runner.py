@@ -8,11 +8,13 @@ from sqlalchemy import select
 from backend.config import settings
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
+from backend.schemas.plan import PlanPipelineConfig
+from backend.services.codex_app_server import CodexTurnProcess
 from backend.services.plan_agent_runner import (
     PLANNER_SCHEMA,
-    REVIEWER_SCHEMA,
     PlanAgentError,
     PlanAgentRunner,
+    PlanRouteUnavailable,
     _build_command,
     _extract_provider_content,
     _validate_structured,
@@ -25,8 +27,6 @@ def test_claude_plan_command_is_read_only():
         model="claude-opus-4-6",
         effort="high",
         schema=PLANNER_SCHEMA,
-        cloudrouter_api=False,
-        cwd="/repo",
     )
 
     assert command[0] == settings.claude_binary
@@ -36,25 +36,6 @@ def test_claude_plan_command_is_read_only():
     assert command[command.index("--tools") + 1] == "Read,Grep,Glob"
     assert "Bash" in command[command.index("--disallowed-tools") + 1]
     assert "--dangerously-skip-permissions" not in command
-
-
-def test_codex_plan_command_is_read_only():
-    command = _build_command(
-        provider="codex",
-        model="gpt-5.6-sol",
-        effort="ultra",
-        schema=REVIEWER_SCHEMA,
-        cloudrouter_api=False,
-        cwd="/repo",
-    )
-
-    assert command[:2] == [settings.codex_binary, "exec"]
-    assert command[command.index("--sandbox") + 1] == "read-only"
-    assert "--ephemeral" in command
-    assert "--ignore-user-config" in command
-    assert "--output-schema" in command
-    assert "features.multi_agent=false" in command
-    assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
 def test_structured_output_parsers_accept_native_provider_envelopes():
@@ -102,29 +83,76 @@ async def test_pipeline_rejects_unknown_planner_provider(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_native_codex_plan_uses_default_home_exec_guard(db_factory):
+async def test_codex_plan_uses_disposable_read_only_app_server_thread(
+    db_factory,
+):
     calls: list[str | None] = []
+    deleted: list[tuple[str, str]] = []
+    interrupted = AsyncMock()
+    process = CodexTurnProcess(
+        123,
+        interrupted,
+        thread_id="plan-thread",
+    )
+    process.feed({
+        "type": "item.completed",
+        "item": {
+            "type": "agent_message",
+            "text": '{"plan":"safe plan"}',
+        },
+    })
+    process.finish(0)
+
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(return_value=(process, "plan-thread"))
+
+    async def delete_thread(home, thread_id):
+        deleted.append((home, thread_id))
+
+    registry.delete_thread = delete_thread
 
     class Manager:
         @asynccontextmanager
-        async def codex_home_exec_guard(self, home):
+        async def codex_home_app_server_guard(self, home):
             calls.append(home)
-            yield "/canonical/default-codex-home"
+            yield home
+
+        def _ensure_codex_app_server_registry(self):
+            return registry
 
     runner = PlanAgentRunner(
         db_factory=db_factory,
         instance_manager=Manager(),
     )
 
-    async with runner._runtime_admission(
-        provider="codex",
-        home=None,
+    stdout, stderr, returncode = await runner._run_codex_turn(
+        task_id=7,
+        home="/canonical/default-codex-home",
         model="gpt-5.6-sol",
-    ) as (admitted_home, cloudrouter_api):
-        assert admitted_home == "/canonical/default-codex-home"
-        assert cloudrouter_api is False
+        effort="xhigh",
+        cwd="/tmp",
+        prompt="plan safely",
+        schema=PLANNER_SCHEMA,
+        timeout=10,
+    )
 
-    assert calls == [None]
+    assert returncode == 0
+    assert stderr == b""
+    assert b"safe plan" in stdout
+    assert calls == [
+        "/canonical/default-codex-home",
+        "/canonical/default-codex-home",
+    ]
+    assert deleted == [
+        ("/canonical/default-codex-home", "plan-thread")
+    ]
+    kwargs = registry.start_turn.await_args.kwargs
+    assert kwargs["sandbox_mode"] == "read-only"
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_user_mcp"] is True
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["output_schema"] == PLANNER_SCHEMA
+    assert kwargs["resume_session_id"] is None
 
 
 def test_retained_plan_agent_is_exposed_as_update_blocker(monkeypatch):
@@ -153,13 +181,36 @@ def test_retained_plan_agent_is_exposed_as_update_blocker(monkeypatch):
 @pytest.mark.asyncio
 async def test_pipeline_revises_then_persists_audited_approval(
     db_factory,
-    monkeypatch,
 ):
-    monkeypatch.setattr(settings, "plan_reviewer_enabled", True)
-    monkeypatch.setattr(settings, "plan_reviewer_provider", "codex")
-    monkeypatch.setattr(settings, "plan_reviewer_model", "gpt-5.6-sol")
-    monkeypatch.setattr(settings, "plan_reviewer_effort", "xhigh")
-    monkeypatch.setattr(settings, "plan_max_revision_cycles", 2)
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 2,
+    })
 
     async with db_factory() as db:
         task = Task(
@@ -167,9 +218,10 @@ async def test_pipeline_revises_then_persists_audited_approval(
             description="Design the change",
             target_repo="/tmp",
             mode="plan",
-            provider="codex",
-            model="gpt-5.6-sol",
+            provider="claude",
+            model="claude-fable-5",
             effort_level="high",
+            plan_pipeline_config=pipeline.model_dump(mode="json"),
         )
         db.add(task)
         await db.commit()
@@ -180,16 +232,22 @@ async def test_pipeline_revises_then_persists_audited_approval(
         db_factory=db_factory,
         instance_manager=MagicMock(),
     )
-    runner._run_step_with_retry = AsyncMock(side_effect=[
-        ({"plan": "Plan v1"}, '{"plan":"Plan v1"}'),
+    runner._run_route = AsyncMock(side_effect=[
+        ({"plan": "Plan v1"}, '{"plan":"Plan v1"}', "claude-1"),
         (
             {"verdict": "revise", "feedback": "Add rollback"},
             '{"verdict":"revise","feedback":"Add rollback"}',
+            "codex-1",
         ),
-        ({"plan": "Plan v2 with rollback"}, '{"plan":"Plan v2 with rollback"}'),
+        (
+            {"plan": "Plan v2 with rollback"},
+            '{"plan":"Plan v2 with rollback"}',
+            "claude-1",
+        ),
         (
             {"verdict": "approve", "feedback": "Complete"},
             '{"verdict":"approve","feedback":"Complete"}',
+            "codex-1",
         ),
     ])
 
@@ -200,9 +258,9 @@ async def test_pipeline_revises_then_persists_audited_approval(
     assert result.plan_content == "Plan v2 with rollback"
     assert result.verdict == "approve"
     assert result.review_exhausted is False
-    assert runner._run_step_with_retry.await_count == 4
+    assert runner._run_route.await_count == 4
     second_planner_prompt = (
-        runner._run_step_with_retry.await_args_list[2].kwargs["prompt"]
+        runner._run_route.await_args_list[2].kwargs["prompt"]
     )
     assert "Add rollback" in second_planner_prompt
 
@@ -233,3 +291,252 @@ async def test_pipeline_revises_then_persists_audited_approval(
         "reviewer",
     ]
     assert all(step.status == "completed" for step in steps)
+    assert [step.route_slot for step in steps] == ["primary"] * 4
+    assert [step.provider for step in steps] == [
+        "claude",
+        "codex",
+        "claude",
+        "codex",
+    ]
+    assert run.pipeline_config == pipeline.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_stage_uses_fallback_only_after_primary_route_is_unavailable(
+    db_factory,
+):
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": False,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 0,
+    })
+    async with db_factory() as db:
+        task = Task(
+            title="Fallback Plan",
+            description="Plan with fallback",
+            target_repo="/tmp",
+            mode="plan",
+            provider="claude",
+            model="claude-fable-5",
+            effort_level="high",
+            plan_pipeline_config=pipeline.model_dump(mode="json"),
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._run_route = AsyncMock(side_effect=[
+        PlanRouteUnavailable(
+            "Fable unavailable",
+            provider="claude",
+        ),
+        (
+            {"plan": "Fallback plan"},
+            '{"plan":"Fallback plan"}',
+            "codex-1",
+        ),
+    ])
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    result = await runner.run(task, cwd="/tmp")
+
+    assert result.plan_content == "Fallback plan"
+    async with db_factory() as db:
+        run = (
+            await db.execute(
+                select(PlanAgentRun).where(
+                    PlanAgentRun.plan_task_id == task_id
+                )
+            )
+        ).scalar_one()
+        steps = list(
+            (
+                await db.execute(
+                    select(PlanAgentStep)
+                    .where(PlanAgentStep.run_id == run.id)
+                    .order_by(PlanAgentStep.id)
+                )
+            ).scalars().all()
+        )
+    assert [step.route_slot for step in steps] == [
+        "primary",
+        "fallback",
+    ]
+    assert [step.status for step in steps] == ["failed", "completed"]
+    assert run.planner_provider == "codex"
+    assert run.planner_model == "gpt-5.6-terra"
+
+
+@pytest.mark.asyncio
+async def test_route_exhausts_quota_limited_accounts_before_model_fallback(
+    db_factory,
+):
+    pool = MagicMock()
+    pool.select.side_effect = ["/codex/one", "/codex/two"]
+    pool.canonical_home.side_effect = lambda home: home
+    pool.account_id_for_home.side_effect = {
+        "/codex/one": "one",
+        "/codex/two": "two",
+    }.get
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+        codex_pool=pool,
+    )
+    runner._run_fixed_route_with_retry = AsyncMock(side_effect=[
+        PlanAgentError(
+            "quota",
+            provider="codex",
+            stderr="You have hit your usage limit",
+        ),
+        ({"plan": "second account"}, '{"plan":"second account"}'),
+    ])
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+        },
+        "reviewer": {
+            "enabled": False,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 0,
+    })
+
+    result, _raw, account_id = await runner._run_route(
+        task_id=19,
+        route=pipeline.planner.primary,
+        cwd="/tmp",
+        prompt="plan",
+        schema=PLANNER_SCHEMA,
+        timeout=30,
+    )
+
+    assert result == {"plan": "second account"}
+    assert account_id == "two"
+    assert pool.select.call_args_list[1].kwargs["exclude"] == {"one"}
+    pool.mark_rate_limited.assert_called_once_with("/codex/one")
+
+
+@pytest.mark.asyncio
+async def test_stage_fails_after_primary_and_fallback_are_unavailable(
+    db_factory,
+):
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._run_route = AsyncMock(side_effect=[
+        PlanRouteUnavailable("primary unavailable", provider="claude"),
+        PlanRouteUnavailable("fallback unavailable", provider="codex"),
+    ])
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": False,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 0,
+    })
+    task = Task(
+        id=23,
+        title="terminal fallback",
+        description="plan",
+        mode="plan",
+    )
+    run_id = await runner._create_run(task=task, pipeline=pipeline)
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="primary and fallback routes are unavailable",
+    ):
+        await runner._run_stage(
+            run_id=run_id,
+            task_id=task.id,
+            step_type="planner",
+            round_number=1,
+            routes=pipeline.planner,
+            cwd="/tmp",
+            prompt="plan",
+            schema=PLANNER_SCHEMA,
+            timeout=30,
+        )
+
+    async with db_factory() as db:
+        steps = (
+            await db.execute(
+                select(PlanAgentStep)
+                .where(PlanAgentStep.run_id == run_id)
+                .order_by(PlanAgentStep.id)
+            )
+        ).scalars().all()
+    assert [step.route_slot for step in steps] == ["primary", "fallback"]
+    assert [step.status for step in steps] == ["failed", "failed"]

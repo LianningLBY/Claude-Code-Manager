@@ -1545,10 +1545,12 @@ class CodexAppServer:
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
         disable_project_config: bool = False,
+        disable_user_mcp: bool = False,
         skill_context: str = "",
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
+        output_schema: dict[str, Any] | None = None,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -1589,6 +1591,11 @@ class CodexAppServer:
                     f"Invalid required Codex MCP configuration: {exc}"
                 ) from exc
             raise
+        if disable_user_mcp:
+            # This is a whole-map thread override. Plan/other read-only
+            # auxiliary turns must not inherit user or project MCP servers
+            # from the shared account process.
+            thread_config["mcp_servers"] = {}
         if self._actual_tier_proxy_route is not None:
             # A thread-scoped ``features`` table can outrank the app-server's
             # process-level ``--disable enable_request_compression`` override
@@ -1904,6 +1911,8 @@ class CodexAppServer:
             # between thread admission and this turn.
             "serviceTier": rpc_service_tier,
         }
+        if output_schema is not None:
+            turn_params["outputSchema"] = output_schema
         if sandbox_mode == "read-only":
             # Repeat the policy at turn/start.  This is a schema-backed field
             # and prevents a resumed thread's sticky/default settings from

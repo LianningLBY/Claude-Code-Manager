@@ -7073,6 +7073,7 @@ class GlobalDispatcher:
         from backend.services.plan_agent_runner import (
             PlanAgentCleanupError,
             PlanAgentRunner,
+            PlanRouteUnavailable,
         )
         from backend.services.plan_tasks import capture_repo_revision
 
@@ -7107,6 +7108,17 @@ class GlobalDispatcher:
                 generation,
                 "Plan Agent cleanup could not be confirmed",
             )
+            return
+        except PlanRouteUnavailable as exc:
+            # Primary and fallback routes already exhausted every compatible
+            # account. The product contract is terminal failure, not another
+            # generic Task retry that repeats the same unavailable routes.
+            logger.warning(
+                "Plan Agent routes unavailable for task %s: %s",
+                task.id,
+                exc,
+            )
+            await self._fail_owned_task(generation, str(exc))
             return
         except Exception as exc:
             logger.exception("Plan Agent pipeline failed for task %s", task.id)

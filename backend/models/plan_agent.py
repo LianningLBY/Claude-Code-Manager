@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -25,6 +25,7 @@ class PlanAgentRun(Base):
     reviewer_provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
     reviewer_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     reviewer_effort: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    pipeline_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     round: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     review_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True)
     review_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -53,6 +54,8 @@ class PlanAgentStep(Base):
     provider: Mapped[str] = mapped_column(String(20), nullable=False)
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     effort: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    route_slot: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="running"
     )

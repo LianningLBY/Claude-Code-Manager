@@ -375,12 +375,16 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 Plan 始终是独立 `mode="plan"` Task：
 
 1. 在 New Task 创建 standalone Plan，或在已有 Chat 的 **Plans** 面板创建一个或多个关联 Plan
-2. Planner 以严格只读方式检查仓库，Reviewer 独立审查并可要求 Planner 修订；完成后进入 `plan_review`
+2. Planner 以严格只读方式检查仓库，Reviewer 独立审查并可要求 Planner 修订；两层都可分别配置 primary/fallback provider、model 和 effort，完成后进入 `plan_review`
 3. Approve/Reject 只更新该 Plan，不唤醒或改变原 Task/session
 4. 关联 Plan 批准后作为持久 composer attachment；用户发送下一条真实消息时可显式选择一个或多个方案，同一 turn 才把方案交给主 Agent
 5. standalone Plan 批准后点击 **Create execution Task**，创建新的普通 Task 实施方案
 
 若对话或仓库在规划后变化，审批/应用会要求 stale 二次确认。待审批或待应用的关联 Plan 会阻止目标 Task 迁移，避免跨 Worker 后方案与 session 分离。
+
+默认组合是 Planner `Claude Fable 5`（fallback `Codex GPT-5.6 Terra`），Reviewer
+`Codex GPT-5.6 Sol`（fallback `Claude Sonnet 5`）。Codex 步骤复用账号的常驻 App
+Server transport，但使用终态即删除的一次性只读 thread，不会把 Plan 变成可续聊 session。
 
 ### Goal Mode
 

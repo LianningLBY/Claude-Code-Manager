@@ -2085,6 +2085,55 @@ describe('independent Plan attachments', () => {
     });
   });
 
+  it('creates an associated Plan with both Planner and Reviewer routes', async () => {
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.type(
+      await screen.findByPlaceholderText(
+        'What should this independent Plan investigate?',
+      ),
+      'Design the migration',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Create Plan' }));
+
+    await waitFor(() => expect(api.createRelatedPlan).toHaveBeenCalledWith(
+      1,
+      {
+        input: 'Design the migration',
+        pipeline_config: {
+          version: 1,
+          planner: {
+            primary: {
+              provider: 'claude',
+              model: 'claude-fable-5',
+              effort: 'high',
+            },
+            fallback: {
+              provider: 'codex',
+              model: 'gpt-5.6-terra',
+              effort: 'xhigh',
+            },
+          },
+          reviewer: {
+            enabled: true,
+            primary: {
+              provider: 'codex',
+              model: 'gpt-5.6-sol',
+              effort: 'xhigh',
+            },
+            fallback: {
+              provider: 'claude',
+              model: 'claude-sonnet-5',
+              effort: 'high',
+            },
+          },
+          max_revision_cycles: 2,
+        },
+      },
+    ));
+  });
+
   it('persists an approved Plan in the composer and sends its explicit id', async () => {
     const plan = makeTask({
       id: 81,

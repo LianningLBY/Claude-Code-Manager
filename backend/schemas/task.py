@@ -11,6 +11,7 @@ from pydantic import (
 )
 
 from backend.config import settings
+from backend.schemas.plan import PlanPipelineConfig
 
 
 class UserSkillSnapshotPayload(BaseModel):
@@ -86,6 +87,7 @@ class TaskCreate(BaseModel):
     plan_context_snapshot: str | None = Field(default=None, max_length=60_000)
     plan_repo_revision: dict | None = None
     supersedes_plan_task_id: int | None = None
+    plan_pipeline_config: PlanPipelineConfig | None = None
     starred: bool = False
 
     @field_validator("provider", mode="before")
@@ -279,6 +281,7 @@ class TaskResponse(BaseModel):
     plan_applied_at: datetime | None = None
     plan_applied_to_session_id: str | None = None
     plan_execution_task_id: int | None = None
+    plan_pipeline_config: PlanPipelineConfig | None = None
     session_id: str | None
     provider: str
     model: str | None

@@ -475,6 +475,36 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
+    if data.get("mode") == "plan":
+        from backend.schemas.plan import resolve_plan_pipeline_config
+
+        pipeline = resolve_plan_pipeline_config(
+            data.get("plan_pipeline_config"),
+            legacy_provider=(
+                data.get("provider")
+                if "provider" in body.model_fields_set
+                else None
+            ),
+            legacy_model=(
+                data.get("model")
+                if "model" in body.model_fields_set
+                else None
+            ),
+            legacy_effort=(
+                data.get("effort_level")
+                if "effort_level" in body.model_fields_set
+                else None
+            ),
+        )
+        data["plan_pipeline_config"] = pipeline.model_dump(mode="json")
+        data["provider"] = pipeline.planner.primary.provider
+        data["model"] = pipeline.planner.primary.model
+        data["effort_level"] = pipeline.planner.primary.effort
+    elif data.get("plan_pipeline_config") is not None:
+        raise HTTPException(
+            422,
+            "plan_pipeline_config requires mode='plan'",
+        )
 
     # Resolve the exact execution target before persisting anything.  A member
     # owning Worker A must not be able to name Worker B (or the Manager) merely
@@ -679,6 +709,25 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
             mode=data.get("mode"),
             goal_evaluator_model=data.get("goal_evaluator_model"),
         )
+        if data.get("mode") == "plan":
+            from backend.schemas.plan import PlanPipelineConfig
+
+            pipeline = PlanPipelineConfig.model_validate(
+                data["plan_pipeline_config"]
+            )
+            for route in (
+                pipeline.planner.primary,
+                pipeline.planner.fallback,
+                pipeline.reviewer.primary,
+                pipeline.reviewer.fallback,
+            ):
+                _validate_task_service_tier_configuration(
+                    provider=route.provider,
+                    model=route.model,
+                    codex_service_tier="default",
+                    mode="plan",
+                    goal_evaluator_model=None,
+                )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 

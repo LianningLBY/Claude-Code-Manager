@@ -154,6 +154,25 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
               )}
             </div>
           </div>
+          {task.plan_pipeline_config && (
+            <div className="text-[11px] text-gray-500">
+              Planner: {task.plan_pipeline_config.planner.primary.provider}
+              {' / '}{task.plan_pipeline_config.planner.primary.model}
+              {' (fallback: '}
+              {task.plan_pipeline_config.planner.fallback.provider}
+              {' / '}{task.plan_pipeline_config.planner.fallback.model})
+              {task.plan_pipeline_config.reviewer.enabled && (
+                <>
+                  {' · Reviewer: '}
+                  {task.plan_pipeline_config.reviewer.primary.provider}
+                  {' / '}{task.plan_pipeline_config.reviewer.primary.model}
+                  {' (fallback: '}
+                  {task.plan_pipeline_config.reviewer.fallback.provider}
+                  {' / '}{task.plan_pipeline_config.reviewer.fallback.model})
+                </>
+              )}
+            </div>
+          )}
           {task.metadata_?.plan_review_exhausted && (
             <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
               Reviewer still requested changes after the revision limit:

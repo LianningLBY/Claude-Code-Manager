@@ -56,6 +56,8 @@ async def stats(db: AsyncSession = Depends(get_db)):
 
 @router.get("/config")
 async def get_config():
+    from backend.schemas.plan import default_plan_pipeline_config
+
     return {
         "default_model": settings.default_model,
         "model_options": [m.strip() for m in settings.model_options.split(",") if m.strip()],
@@ -73,6 +75,9 @@ async def get_config():
         "default_codex_service_tier": DEFAULT_CODEX_SERVICE_TIER,
         "codex_service_tier_options": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
+        "plan_pipeline_defaults": (
+            default_plan_pipeline_config().model_dump(mode="json")
+        ),
     }
 
 

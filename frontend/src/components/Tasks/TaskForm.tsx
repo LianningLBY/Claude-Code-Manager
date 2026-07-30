@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../../api/client';
-import type { CodexServiceTier, Project, TagItem, Task } from '../../api/client';
+import type {
+  CodexServiceTier,
+  PlanPipelineConfig,
+  Project,
+  SystemConfig,
+  TagItem,
+  Task,
+} from '../../api/client';
 import { Plus, Paperclip, X, Star, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
 import { ProjectSelect } from '../ProjectSelect';
 import { VoiceButton } from '../Voice/VoiceButton';
@@ -8,6 +15,10 @@ import { SecretPicker } from '../Secrets/SecretPicker';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { skillSupportedByProvider } from '../../config/skillCapabilities';
+import { PlanPipelineFields } from '../PlanReview/PlanPipelineFields';
+import {
+  FALLBACK_PLAN_PIPELINE_CONFIG,
+} from '../PlanReview/planPipelineDefaults';
 
 interface TaskFormProps {
   onCreated: () => void;
@@ -26,6 +37,7 @@ interface StoredTaskDefaults {
   thinkingBudget?: string;
   timeoutHours?: string;
   systemPromptMode?: string;
+  planPipelineConfig?: PlanPipelineConfig;
 }
 
 function readStoredTaskDefaults(): StoredTaskDefaults | null {
@@ -71,6 +83,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [codexCapabilitiesLoaded, setCodexCapabilitiesLoaded] = useState(false);
   const [codexServiceTier, setCodexServiceTier] = useState<CodexServiceTier>('default');
   const [defaultEffort, setDefaultEffort] = useState('medium');
+  const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
+  const [planPipelineConfig, setPlanPipelineConfig] = useState<PlanPipelineConfig>(
+    FALLBACK_PLAN_PIPELINE_CONFIG,
+  );
   const [todoFilePath, setTodoFilePath] = useState('');
   const [maxIterations, setMaxIterations] = useState('50');
   const [mustComplete, setMustComplete] = useState(false);
@@ -113,6 +129,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     setThinkingBudget(stored?.thinkingBudget || '');
     setTimeoutHours(stored?.timeoutHours || '');
     setSystemPromptMode(stored?.systemPromptMode || '');
+    if (stored?.planPipelineConfig) {
+      setPlanPipelineConfig(stored.planPipelineConfig);
+    }
   };
 
   const loadProjects = () => {
@@ -127,6 +146,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     // A slow or unavailable backend must not make local defaults disappear.
     applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     api.config().then((c) => {
+      setSystemConfig(c);
       const configuredProvider = c.default_provider || 'codex';
       setDefaultProvider(configuredProvider);
       setProviderOptions(c.provider_options.length ? c.provider_options : ['claude', 'codex']);
@@ -140,6 +160,12 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexModelEfforts(c.codex_model_efforts || {});
       setCodexModelServiceTiers(c.codex_model_service_tiers || {});
       setCodexCapabilitiesLoaded(true);
+      const savedPlanConfig = readStoredTaskDefaults()?.planPipelineConfig;
+      setPlanPipelineConfig(
+        savedPlanConfig
+        || c.plan_pipeline_defaults
+        || FALLBACK_PLAN_PIPELINE_CONFIG,
+      );
       // Re-read after the async request so a default saved while it was in
       // flight still wins over the server defaults.
       applyStoredDefaults(readStoredTaskDefaults(), configuredProvider);
@@ -271,7 +297,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   }, [showPluginsDropdown, showConfigPanel, showSkillsDropdown]);
 
   const saveAsDefault = () => {
-    const cfg = { priority, mode, provider, model, effort, codexServiceTier, thinkingBudget, timeoutHours, systemPromptMode };
+    const cfg = {
+      priority,
+      mode,
+      provider,
+      model,
+      effort,
+      codexServiceTier,
+      thinkingBudget,
+      timeoutHours,
+      systemPromptMode,
+      planPipelineConfig,
+    };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
     setDefaultSaved(true);
     setTimeout(() => setDefaultSaved(false), 2000);
@@ -424,9 +461,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
         ...(workerId ? { worker_id: parseInt(workerId) } : {}),
-        provider,
-        model: model || activeDefaultModel,
-        ...(effort ? { effort_level: effort } : {}),
+        provider: mode === 'plan'
+          ? planPipelineConfig.planner.primary.provider
+          : provider,
+        model: mode === 'plan'
+          ? planPipelineConfig.planner.primary.model
+          : model || activeDefaultModel,
+        ...(mode === 'plan'
+          ? {
+            effort_level: planPipelineConfig.planner.primary.effort || undefined,
+            plan_pipeline_config: planPipelineConfig,
+          }
+          : effort ? { effort_level: effort } : {}),
         ...(provider === 'codex' ? { codex_service_tier: codexServiceTier } : {}),
         ...(thinkingBudget ? { thinking_budget: parseInt(thinkingBudget) || null } : {}),
         ...(systemPromptMode ? { system_prompt_mode: systemPromptMode } : {}),
@@ -697,6 +743,16 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   <option value="goal">Goal</option>
                 </select>
 
+                {mode === 'plan' && (
+                  <div className="col-span-2 w-[36rem] max-w-[calc(100vw-2rem)]">
+                    <PlanPipelineFields
+                      value={planPipelineConfig}
+                      onChange={setPlanPipelineConfig}
+                      systemConfig={systemConfig}
+                    />
+                  </div>
+                )}
+
                 {false && (
                   <>
                     {/* Run on removed — Task inherits from Project */}
@@ -706,8 +762,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   </>
                 )}
 
-                <span className="text-gray-400">CLI</span>
-                <select
+                {mode !== 'plan' && (
+                  <>
+                    <span className="text-gray-400">CLI</span>
+                    <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={provider}
                   onChange={(e) => {
@@ -721,10 +779,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   {providerOptions.map((p) => (
                     <option key={p} value={p}>{p === 'claude' ? 'Claude' : p === 'codex' ? 'Codex' : p}</option>
                   ))}
-                </select>
+                    </select>
 
-                <span className="text-gray-400">Model</span>
-                <select
+                    <span className="text-gray-400">Model</span>
+                    <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={model}
                   onChange={(e) => {
@@ -745,10 +803,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   {activeModelOptions.map((m) => (
                     <option key={m} value={m}>{m}</option>
                   ))}
-                </select>
+                    </select>
 
-                <span className="text-gray-400">Effort</span>
-                <select
+                    <span className="text-gray-400">Effort</span>
+                    <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={effort}
                   onChange={(e) => setEffort(e.target.value)}
@@ -757,7 +815,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   {activeEffortOptions.filter((e) => e !== defaultEffort).map((e) => (
                     <option key={e} value={e}>{e}</option>
                   ))}
-                </select>
+                    </select>
+                  </>
+                )}
 
                 {provider === 'codex' && mode !== 'plan' && (
                   <>

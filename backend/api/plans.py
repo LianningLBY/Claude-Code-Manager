@@ -13,6 +13,10 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
+from backend.schemas.plan import (
+    PlanPipelineConfig,
+    resolve_plan_pipeline_config,
+)
 from backend.schemas.task import TaskResponse
 from backend.services.plan_tasks import (
     ACTIVE_PLAN_STATUSES,
@@ -35,12 +39,14 @@ class RelatedPlanCreate(BaseModel):
     provider: str | None = None
     model: str | None = None
     effort_level: str | None = None
+    pipeline_config: PlanPipelineConfig | None = None
     supersedes_plan_task_id: int | None = None
 
 
 class PlanRevisionRequest(BaseModel):
     feedback: str = Field(min_length=1, max_length=50_000)
     title: str | None = Field(default=None, max_length=200)
+    pipeline_config: PlanPipelineConfig | None = None
 
 
 class PlanExecutionResponse(BaseModel):
@@ -55,6 +61,7 @@ class PlanAgentStepResponse(BaseModel):
     provider: str
     model: str | None
     effort: str | None
+    route_slot: str | None
     status: str
     output: str | None
     error: str | None
@@ -75,6 +82,7 @@ class PlanAgentRunResponse(BaseModel):
     reviewer_provider: str | None
     reviewer_model: str | None
     reviewer_effort: str | None
+    pipeline_config: dict | None
     round: int
     review_verdict: str | None
     review_feedback: str | None
@@ -131,27 +139,35 @@ async def _create_related_plan(
             raise HTTPException(400, "Superseded Plan does not belong to this Task")
         await require_task_control(request, supersedes, db)
 
-    provider = (body.provider or target.provider or settings.default_provider).lower()
-    if provider not in {"claude", "codex"}:
-        raise HTTPException(422, "provider must be 'claude' or 'codex'")
-    model = body.model or (
-        settings.default_codex_model
-        if provider == "codex"
-        else settings.default_model
+    pipeline = resolve_plan_pipeline_config(
+        body.pipeline_config,
+        legacy_provider=body.provider,
+        legacy_model=body.model,
+        legacy_effort=body.effort_level,
     )
-    # Plan Agents use isolated ephemeral/read-only exec. Fast requires the
-    # app-server proxy proof chain and must never be silently downgraded.
+    provider = pipeline.planner.primary.provider
+    model = pipeline.planner.primary.model
+    effort = pipeline.planner.primary.effort
+    # Plan Agents use isolated read-only turns. Fast requires the app-server
+    # proof chain and must never be silently downgraded.
     codex_service_tier = "default"
     from backend.api.tasks import _validate_task_service_tier_configuration
 
     try:
-        _validate_task_service_tier_configuration(
-            provider=provider,
-            model=model,
-            codex_service_tier=codex_service_tier,
-            mode="plan",
-            goal_evaluator_model=None,
+        routes = (
+            pipeline.planner.primary,
+            pipeline.planner.fallback,
+            pipeline.reviewer.primary,
+            pipeline.reviewer.fallback,
         )
+        for route in routes:
+            _validate_task_service_tier_configuration(
+                provider=route.provider,
+                model=route.model,
+                codex_service_tier=codex_service_tier,
+                mode="plan",
+                goal_evaluator_model=None,
+            )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     context_log_id = await latest_task_log_id(db, target.id)
@@ -186,7 +202,7 @@ async def _create_related_plan(
         provider=provider,
         model=model,
         codex_service_tier=codex_service_tier,
-        effort_level=body.effort_level or target.effort_level or settings.default_effort,
+        effort_level=effort,
         thinking_budget=None,
         timeout_hours=target.timeout_hours,
         enable_workflows=False,
@@ -201,6 +217,7 @@ async def _create_related_plan(
         supersedes_plan_task_id=(
             supersedes.id if supersedes is not None else None
         ),
+        plan_pipeline_config=pipeline.model_dump(mode="json"),
     )
     db.add(plan)
     await db.commit()
@@ -371,6 +388,7 @@ async def list_plan_runs(
                     "reviewer_provider",
                     "reviewer_model",
                     "reviewer_effort",
+                    "pipeline_config",
                     "round",
                     "review_verdict",
                     "review_feedback",
@@ -419,6 +437,12 @@ async def revise_plan(
         "User revision feedback:\n"
         f"{body.feedback.strip()}"
     )
+    revision_pipeline = resolve_plan_pipeline_config(
+        body.pipeline_config or source.plan_pipeline_config,
+        legacy_provider=source.provider,
+        legacy_model=source.model,
+        legacy_effort=source.effort_level,
+    )
     if source.plan_target_task_id is None:
         revision = Task(
             title=(
@@ -437,10 +461,13 @@ async def revise_plan(
             created_by=get_current_user_id(request),
             max_retries=source.max_retries,
             mode="plan",
-            provider=source.provider,
-            model=source.model,
+            provider=revision_pipeline.planner.primary.provider,
+            model=revision_pipeline.planner.primary.model,
             codex_service_tier=source.codex_service_tier,
-            effort_level=source.effort_level,
+            effort_level=revision_pipeline.planner.primary.effort,
+            plan_pipeline_config=(
+                revision_pipeline.model_dump(mode="json")
+            ),
             timeout_hours=source.timeout_hours,
             enable_workflows=False,
             enabled_skills={},
@@ -483,6 +510,7 @@ async def revise_plan(
                 provider=current_source.provider,
                 model=current_source.model,
                 effort_level=current_source.effort_level,
+                pipeline_config=revision_pipeline,
                 supersedes_plan_task_id=current_source.id,
             ),
         )

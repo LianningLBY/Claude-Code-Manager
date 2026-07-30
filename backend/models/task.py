@@ -94,6 +94,12 @@ class Task(Base):
     plan_execution_task_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )
+    # Versioned Planner/Reviewer primary+fallback routing snapshot. Generic
+    # provider/model/effort mirror the Planner primary route for compatibility
+    # with existing Task lists and Worker routing.
+    plan_pipeline_config: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True
+    )
     session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # Exact Claude PTY background epoch.  A persistent session can
     # finish foreground turn A, start turn B, and only then deliver A's late

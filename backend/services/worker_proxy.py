@@ -302,6 +302,7 @@ class WorkerProxy:
             "plan_context_snapshot": task.plan_context_snapshot,
             "plan_repo_revision": task.plan_repo_revision,
             "supersedes_plan_task_id": task.supersedes_plan_task_id,
+            "plan_pipeline_config": task.plan_pipeline_config,
             "provider": task.provider,
             "model": task.model,
             "codex_service_tier": task.codex_service_tier,

@@ -474,6 +474,12 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
         codex_service_tier="default",
         sandbox_mode="read-only",
         disable_autonomous_features=True,
+        disable_user_mcp=True,
+        output_schema={
+            "type": "object",
+            "required": ["plan"],
+            "properties": {"plan": {"type": "string"}},
+        },
         on_thread_started=bind_thread,
         on_turn_prepared=publish_turn,
     )
@@ -481,6 +487,7 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
     thread_call, turn_call = server._request.await_args_list
     params = thread_call.args[1]
     assert params["sandbox"] == "read-only"
+    assert params["config"]["mcp_servers"] == {}
     assert params["config"]["features"] == {
         "enable_request_compression": False,
         "apps": False,
@@ -508,6 +515,11 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
     assert turn_call.args[1]["sandboxPolicy"] == {
         "type": "readOnly",
         "networkAccess": False,
+    }
+    assert turn_call.args[1]["outputSchema"] == {
+        "type": "object",
+        "required": ["plan"],
+        "properties": {"plan": {"type": "string"}},
     }
     assert ownership_events == [
         ("thread", "thread-read-only-monitor"),

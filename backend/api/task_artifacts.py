@@ -395,7 +395,6 @@ def _artifact_response(artifact: OpenedTaskArtifact) -> StreamingResponse:
         media_type="application/octet-stream",
         headers={
             "Content-Disposition": content_disposition,
-            "Content-Length": str(artifact.size),
         },
         background=BackgroundTask(artifact.close),
     )

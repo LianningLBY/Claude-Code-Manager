@@ -741,7 +741,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Refreshed-Token", "Content-Disposition", "Content-Length"],
+    expose_headers=["X-Refreshed-Token", "Content-Disposition"],
 )
 
 app.include_router(tasks_router)

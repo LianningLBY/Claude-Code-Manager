@@ -453,9 +453,41 @@ async def test_caps_stream_when_file_grows_after_descriptor_validation(
     )
 
     assert response.status_code == 200
-    assert response.headers["content-length"] == "4"
+    assert "content-length" not in response.headers
     assert response.content == b"safe"
     assert b"outside-limit" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_stream_remains_valid_when_file_shrinks_after_validation(
+    artifact_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, session_factory = artifact_client
+    artifact = tmp_path / "shrinking.bin"
+    artifact.write_bytes(b"original")
+    task_id = await _create_local_task(session_factory, tmp_path)
+
+    original_response = task_artifacts._artifact_response
+
+    def shrink_then_respond(opened):
+        artifact.write_bytes(b"new")
+        return original_response(opened)
+
+    monkeypatch.setattr(
+        task_artifacts,
+        "_artifact_response",
+        shrink_then_respond,
+    )
+    response = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": "shrinking.bin"},
+    )
+
+    assert response.status_code == 200
+    assert "content-length" not in response.headers
+    assert response.content == b"new"
 
 
 @pytest.mark.asyncio

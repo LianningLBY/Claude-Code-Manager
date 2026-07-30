@@ -58,6 +58,10 @@ vi.mock('../../api/client', () => ({
     rejectPlan: vi.fn().mockResolvedValue({}),
     revisePlan: vi.fn().mockResolvedValue({}),
     cancelTask: vi.fn().mockResolvedValue({}),
+    downloadTaskArtifact: vi.fn().mockResolvedValue({
+      blob: new Blob(['artifact']),
+      filename: '汇报稿.md',
+    }),
   },
 }));
 
@@ -2001,6 +2005,55 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
     const img = document.querySelector('img[src*="/api/uploads/init.png"]');
     expect(img).not.toBeNull();
+  });
+
+  it('助手消息里的任务文件链接一键下载，外部链接保持原行为', async () => {
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {});
+    const createObjectUrl = vi.fn().mockReturnValue('blob:artifact');
+    const revokeObjectUrl = vi.fn();
+    const NativeURL = URL;
+    class MockURL extends NativeURL {
+      static createObjectURL = createObjectUrl;
+      static revokeObjectURL = revokeObjectUrl;
+    }
+    vi.stubGlobal('URL', MockURL);
+    vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+      {
+        id: 501,
+        role: 'assistant',
+        event_type: 'message',
+        content: '[汇报稿.md](输出/汇报稿.md) [官网](https://example.com)',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      },
+    ]);
+    const task = makeTask({ id: 88 });
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    const artifactLink = await screen.findByRole('link', { name: /汇报稿\.md/ });
+    const externalLink = screen.getByRole('link', { name: '官网' });
+
+    expect(externalLink).toHaveAttribute('href', 'https://example.com');
+    expect(externalLink).toHaveAttribute('target', '_blank');
+    fireEvent.click(artifactLink);
+
+    await waitFor(() => {
+      expect(api.downloadTaskArtifact).toHaveBeenCalledWith(
+        88,
+        '%E8%BE%93%E5%87%BA/%E6%B1%87%E6%8A%A5%E7%A8%BF.md',
+      );
+    });
+    expect(createObjectUrl).toHaveBeenCalled();
+    expect(clickSpy).toHaveBeenCalled();
+    clickSpy.mockRestore();
+    vi.unstubAllGlobals();
   });
 });
 

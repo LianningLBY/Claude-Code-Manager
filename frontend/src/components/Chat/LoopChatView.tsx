@@ -9,6 +9,7 @@ import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
 } from './messageMerge';
+import { TaskArtifactLink } from './TaskArtifactLink';
 
 interface LoopChatViewProps {
   task: Task;
@@ -256,12 +257,18 @@ const markdownComponents: Components = {
   },
 };
 
-const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
+const MarkdownContent = memo(function MarkdownContent({ content, taskId }: { content: string; taskId: number }) {
+  const taskComponents = useMemo<Components>(() => ({
+    ...markdownComponents,
+    a({ href, children }) {
+      return <TaskArtifactLink taskId={taskId} href={href}>{children}</TaskArtifactLink>;
+    },
+  }), [taskId]);
   return (
     <div className="markdown-body">
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
-        components={markdownComponents}
+        components={taskComponents}
       >
         {content}
       </ReactMarkdown>
@@ -269,7 +276,7 @@ const MarkdownContent = memo(function MarkdownContent({ content }: { content: st
   );
 });
 
-const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMessage }) {
+const MessageBubble = memo(function MessageBubble({ message, taskId }: { message: ChatMessage; taskId: number }) {
   if (message.event_type === 'thinking') {
     return (
       <div className="mx-4 px-3 py-2 bg-gray-800/30 rounded text-xs border border-gray-700/30">
@@ -294,7 +301,7 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMe
   return (
     <div className="flex justify-start">
       <div className="max-w-[85%] rounded-2xl rounded-bl-md px-4 py-2.5 text-sm bg-gray-800 text-gray-200">
-        <MarkdownContent content={message.content || ''} />
+        <MarkdownContent content={message.content || ''} taskId={taskId} />
       </div>
     </div>
   );
@@ -345,7 +352,7 @@ function IterationPanel({ iteration, messages, meta, isActive, defaultOpen, task
             group.type === 'tool-group' ? (
               <ToolGroup key={i} messages={group.messages} taskId={taskId} />
             ) : (
-              <MessageBubble key={group.message.id} message={group.message} />
+              <MessageBubble key={group.message.id} message={group.message} taskId={taskId} />
             )
           )}
           {isActive && (

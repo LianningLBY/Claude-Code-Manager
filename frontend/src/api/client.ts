@@ -5,6 +5,11 @@ export interface ApiRequestError extends Error {
   detail: unknown;
 }
 
+export interface TaskArtifactDownload {
+  blob: Blob;
+  filename: string;
+}
+
 export function isApiRequestError(error: unknown): error is ApiRequestError {
   return error instanceof Error
     && typeof (error as { status?: unknown }).status === 'number';
@@ -12,6 +17,29 @@ export function isApiRequestError(error: unknown): error is ApiRequestError {
 
 function getBase(): string {
   return getApiBase();
+}
+
+function downloadFilename(
+  contentDisposition: string | null,
+  artifactPath: string,
+): string {
+  if (contentDisposition) {
+    const encoded = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+    if (encoded) {
+      try {
+        return decodeURIComponent(encoded);
+      } catch { /* fall through to the plain filename */ }
+    }
+    const plain = contentDisposition.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1];
+    if (plain) return plain;
+  }
+  const withoutSuffix = artifactPath.split(/[?#]/, 1)[0];
+  const basename = withoutSuffix.split(/[\\/]/).pop();
+  try {
+    return decodeURIComponent(basename || '') || 'download';
+  } catch {
+    return basename || 'download';
+  }
 }
 
 export function getToken(): string {
@@ -1393,6 +1421,39 @@ export const api = {
   // Files (download)
   downloadFileUrl: (path: string) =>
     `${getBase()}/api/files/download?path=${encodeURIComponent(path)}`,
+  downloadTaskArtifact: async (
+    taskId: number,
+    artifactPath: string,
+  ): Promise<TaskArtifactDownload> => {
+    const token = getToken();
+    const query = new URLSearchParams({ path: artifactPath });
+    const res = await fetch(
+      `${getBase()}/api/tasks/${taskId}/artifacts/download?${query}`,
+      {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      },
+    );
+    if (res.status === 401) {
+      clearToken();
+      window.location.reload();
+      throw new Error('Unauthorized');
+    }
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(
+        typeof error.detail === 'string' ? error.detail : res.statusText,
+      );
+    }
+    const refreshedToken = res.headers.get('X-Refreshed-Token');
+    if (refreshedToken) setToken(refreshedToken);
+    return {
+      blob: await res.blob(),
+      filename: downloadFilename(
+        res.headers.get('Content-Disposition'),
+        artifactPath,
+      ),
+    };
+  },
 
   // Files (SSH)
   sshListDir: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>

@@ -28,6 +28,7 @@ claude-manager/
 │   │   ├── tasks.py             # 任务 CRUD + plan 审批 + conflict 解决
 │   │   ├── plans.py             # 关联 Plan 历史/stale/revision/执行 Task
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
+│   │   ├── task_artifacts.py    # Task 工作区内安全文件下载 + Worker 分流
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop 控制 + Dispatcher 端点
 │   │   ├── projects.py          # Project CRUD + git clone
 │   │   ├── project_todos.py     # 项目 Todo 清单 CRUD (prompt 模板 → 一键建 task)
@@ -93,6 +94,7 @@ claude-manager/
 │       ├── pages/               # Dashboard, TasksPage, LoginPage, ServerConfigPage
 │       ├── components/
 │       │   ├── Chat/ChatView.tsx              # 多轮对话 UI (基于 task, 含 monitor 消息渲染)
+│       │   ├── Chat/TaskArtifactLink.tsx       # Markdown 任务文件链接一键下载
 │       │   ├── Chat/SubSessionIndicator.tsx   # 子 session 计数指示器
 │       │   ├── Chat/MonitorPanel.tsx          # Monitor 面板 (活跃 monitor 列表 + 历史 checks)
 │       │   ├── Instances/              # InstanceGrid, InstanceLog
@@ -122,6 +124,7 @@ claude-manager/
 
 - **优先级**: 数字越小优先级越高 (P0 > P1 > P2)，排序用 `.asc()`
 - **Session 绑定**: `session_id` 和 `last_cwd` 在 **Task** 上（不是 Instance），因为 instance 是轮换执行不同 task 的 worker
+- **Task 产物下载**: 聊天 Markdown 的文件链接统一走 `/api/tasks/{id}/artifacts/download`；相对路径按 `last_cwd`、容器 `/workspace` 按项目根映射，解析后必须仍在 `target_repo`/Project 根内且受 Task ACL 保护。Worker 文件只经 Manager 流式代理，绝不能退回管理员级任意绝对路径下载接口
 - **Instance 并发容量**: `max_concurrent_instances` 约束所有仍有运行证据的实例：正常 `idle/running` 会占槽，`error/stopped` 仅在 PID 与反向 owner 证据都已清除后才是免费历史。API 创建与 Dispatcher 补槽共用 `instance_capacity_lock`，idle 选择到 launch 之间用 owner reservation；运行时下调 cap 不强杀现有 turn，但在占用降到 cap 以下前禁止新领取。物理删除仍走 `DELETE /api/instances/cleanup`
 - **Claude Code 调用**: `claude -p [prompt] --dangerously-skip-permissions --output-format stream-json --verbose`
 - **Resume**: `claude -p [follow-up] --resume [session_id]` — 必须使用和原始 session 相同的 cwd

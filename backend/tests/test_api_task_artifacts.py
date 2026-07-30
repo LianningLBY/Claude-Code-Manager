@@ -129,11 +129,44 @@ async def test_supports_container_workspace_links(
         f"/api/tasks/{task_id}/artifacts/download",
         params={"path": "/workspace/dist/report.pdf"},
     )
+    host_absolute = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": str(artifact)},
+    )
 
     assert relative.status_code == 200
     assert relative.content == b"%PDF-test"
     assert absolute.status_code == 200
     assert absolute.content == b"%PDF-test"
+    assert host_absolute.status_code == 200
+    assert host_absolute.content == b"%PDF-test"
+
+
+@pytest.mark.asyncio
+async def test_relative_parent_segments_can_remain_inside_workspace(
+    artifact_client,
+    tmp_path,
+):
+    client, session_factory = artifact_client
+    drafts = tmp_path / "reports" / "drafts"
+    final = tmp_path / "reports" / "final"
+    drafts.mkdir(parents=True)
+    final.mkdir()
+    artifact = final / "report.md"
+    artifact.write_text("final report", encoding="utf-8")
+    task_id = await _create_local_task(
+        session_factory,
+        tmp_path,
+        last_cwd=str(drafts),
+    )
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": "../final/report.md"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"final report"
 
 
 @pytest.mark.asyncio
@@ -160,6 +193,141 @@ async def test_rejects_external_links_traversal_and_outside_symlinks(
 
 
 @pytest.mark.asyncio
+async def test_rejects_symlinked_workspace_root(
+    artifact_client,
+    tmp_path,
+):
+    client, session_factory = artifact_client
+    actual_workspace = tmp_path / "actual-workspace"
+    actual_workspace.mkdir()
+    (actual_workspace / "report.md").write_text(
+        "outside-by-alias",
+        encoding="utf-8",
+    )
+    workspace_alias = tmp_path / "workspace-alias"
+    workspace_alias.symlink_to(actual_workspace, target_is_directory=True)
+    task_id = await _create_local_task(session_factory, workspace_alias)
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": "report.md"},
+    )
+
+    assert response.status_code == 403
+    assert b"outside-by-alias" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_rejects_workspace_parent_symlink_swap_during_root_open(
+    artifact_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, session_factory = artifact_client
+    workspace_parent = tmp_path / "artifact-anchor-parent"
+    workspace = workspace_parent / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "report.md").write_text("safe report", encoding="utf-8")
+    outside_parent = tmp_path / "outside-parent"
+    outside_workspace = outside_parent / "workspace"
+    outside_workspace.mkdir(parents=True)
+    (outside_workspace / "report.md").write_text(
+        "outside secret",
+        encoding="utf-8",
+    )
+    saved_parent = tmp_path / "artifact-anchor-parent-safe"
+    task_id = await _create_local_task(session_factory, workspace)
+
+    original_open = task_artifacts._open_directory_component
+    attacked = False
+
+    def swap_parent_while_opening(parent_fd, component):
+        nonlocal attacked
+        if component != workspace_parent.name or attacked:
+            return original_open(parent_fd, component)
+        attacked = True
+        workspace_parent.rename(saved_parent)
+        workspace_parent.symlink_to(outside_parent, target_is_directory=True)
+        try:
+            return original_open(parent_fd, component)
+        finally:
+            workspace_parent.unlink()
+            saved_parent.rename(workspace_parent)
+
+    monkeypatch.setattr(
+        task_artifacts,
+        "_open_directory_component",
+        swap_parent_while_opening,
+    )
+    response = await client.get(
+        f"/api/tasks/{task_id}/artifacts/download",
+        params={"path": "report.md"},
+    )
+
+    assert attacked is True
+    assert response.status_code == 403
+    assert b"outside secret" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_workspace_parent_fd_stays_anchored_after_path_swap(
+    artifact_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, session_factory = artifact_client
+    workspace_parent = tmp_path / "artifact-open-parent"
+    workspace = workspace_parent / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "report.md").write_text("safe report", encoding="utf-8")
+    outside_parent = tmp_path / "outside-open-parent"
+    outside_workspace = outside_parent / "workspace"
+    outside_workspace.mkdir(parents=True)
+    (outside_workspace / "report.md").write_text(
+        "outside secret",
+        encoding="utf-8",
+    )
+    saved_parent = tmp_path / "artifact-open-parent-safe"
+    task_id = await _create_local_task(session_factory, workspace)
+
+    original_open = task_artifacts._open_directory_component
+    attacked = False
+
+    def swap_parent_after_open(parent_fd, component):
+        nonlocal attacked
+        opened_fd = original_open(parent_fd, component)
+        if component == workspace_parent.name and not attacked:
+            attacked = True
+            workspace_parent.rename(saved_parent)
+            workspace_parent.symlink_to(
+                outside_parent,
+                target_is_directory=True,
+            )
+        return opened_fd
+
+    monkeypatch.setattr(
+        task_artifacts,
+        "_open_directory_component",
+        swap_parent_after_open,
+    )
+    try:
+        response = await client.get(
+            f"/api/tasks/{task_id}/artifacts/download",
+            params={"path": "report.md"},
+        )
+    finally:
+        if workspace_parent.is_symlink():
+            workspace_parent.unlink()
+        if saved_parent.exists():
+            saved_parent.rename(workspace_parent)
+
+    assert attacked is True
+    assert response.status_code == 200
+    assert response.content == b"safe report"
+    assert b"outside secret" not in response.content
+
+
+@pytest.mark.asyncio
 async def test_rejects_final_file_swap_after_resolution(
     artifact_client,
     tmp_path,
@@ -174,7 +342,7 @@ async def test_rejects_final_file_swap_after_resolution(
     outside.write_text("outside secret", encoding="utf-8")
     task_id = await _create_local_task(session_factory, workspace)
 
-    original_resolver = task_artifacts._resolve_artifact_parts
+    original_resolver = task_artifacts._lexical_artifact_parts
 
     def resolve_then_swap(task, root, reference):
         resolved = original_resolver(task, root, reference)
@@ -184,7 +352,7 @@ async def test_rejects_final_file_swap_after_resolution(
 
     monkeypatch.setattr(
         task_artifacts,
-        "_resolve_artifact_parts",
+        "_lexical_artifact_parts",
         resolve_then_swap,
     )
     response = await client.get(
@@ -212,7 +380,7 @@ async def test_rejects_intermediate_directory_swap_after_resolution(
     (outside / "report.md").write_text("outside secret", encoding="utf-8")
     task_id = await _create_local_task(session_factory, workspace)
 
-    original_resolver = task_artifacts._resolve_artifact_parts
+    original_resolver = task_artifacts._lexical_artifact_parts
 
     def resolve_then_swap(task, root, reference):
         resolved = original_resolver(task, root, reference)
@@ -222,7 +390,7 @@ async def test_rejects_intermediate_directory_swap_after_resolution(
 
     monkeypatch.setattr(
         task_artifacts,
-        "_resolve_artifact_parts",
+        "_lexical_artifact_parts",
         resolve_then_swap,
     )
     response = await client.get(

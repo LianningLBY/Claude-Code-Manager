@@ -7,7 +7,7 @@ import os
 import stat
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 from urllib.parse import quote, unquote, urlsplit
 
@@ -88,91 +88,141 @@ def _decode_artifact_reference(reference: str) -> str:
     return decoded_path
 
 
-async def _task_workspace_root(task: Task, db: AsyncSession) -> Path:
-    """Resolve the authoritative project root for a task on this node."""
+def _configured_workspace_root(raw_root: str) -> Path:
+    """Return a normalized absolute root without following any symlinks."""
 
-    candidates: list[str] = []
-    if task.target_repo:
-        candidates.append(task.target_repo)
-    if task.project_id:
+    if not raw_root or "\x00" in raw_root:
+        raise ValueError("invalid workspace root")
+    try:
+        root = Path(raw_root).expanduser()
+    except RuntimeError as exc:
+        raise ValueError("invalid workspace root") from exc
+    if not root.is_absolute() or root.anchor != os.path.sep:
+        raise ValueError("workspace root must be an absolute POSIX path")
+
+    components = []
+    for component in root.parts[1:]:
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            raise ValueError("workspace root cannot contain parent traversal")
+        components.append(component)
+    if not components:
+        raise ValueError("filesystem root cannot be a task workspace")
+    return Path(os.path.sep, *components)
+
+
+async def _task_workspace_root(task: Task, db: AsyncSession) -> Path:
+    """Load the authoritative lexical project root for a task on this node."""
+
+    raw_root = task.target_repo
+    if not raw_root and task.project_id:
         project = await db.get(Project, task.project_id)
         if project and project.local_path:
-            candidates.append(project.local_path)
+            raw_root = project.local_path
 
-    for raw_root in candidates:
-        try:
-            root = Path(raw_root).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError):
+    try:
+        return _configured_workspace_root(raw_root or "")
+    except ValueError as exc:
+        raise HTTPException(404, "Task workspace is unavailable") from exc
+
+
+def _normalize_relative_parts(
+    base: tuple[str, ...],
+    components: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Apply relative components without allowing escape above the root."""
+
+    normalized = list(base)
+    for component in components:
+        if component in {"", "."}:
             continue
-        if root.is_dir():
-            return root
+        if component == os.path.sep:
+            raise HTTPException(400, "Invalid artifact path")
+        if component == "..":
+            if not normalized:
+                raise HTTPException(
+                    403,
+                    "Artifact path is outside the task workspace",
+                )
+            normalized.pop()
+            continue
+        normalized.append(component)
+    return tuple(normalized)
 
-    raise HTTPException(404, "Task workspace is unavailable")
+
+def _container_relative_parts(value: str) -> tuple[str, ...] | None:
+    path = PurePosixPath(value)
+    if path.parts[:2] != (os.path.sep, CONTAINER_WORKSPACE.name):
+        return None
+    return _normalize_relative_parts((), path.parts[2:])
 
 
-def _task_execution_base(task: Task, root: Path) -> Path:
-    """Resolve last_cwd while keeping it inside the task workspace."""
+def _absolute_parts(value: str) -> tuple[str, ...]:
+    path = PurePosixPath(value)
+    if not path.is_absolute() or path.anchor != os.path.sep:
+        raise HTTPException(400, "Invalid artifact path")
+    return _normalize_relative_parts((), path.parts[1:])
+
+
+def _parts_beneath_root(
+    absolute_parts: tuple[str, ...],
+    root: Path,
+) -> tuple[str, ...]:
+    root_parts = root.parts[1:]
+    if absolute_parts[:len(root_parts)] != root_parts:
+        raise HTTPException(403, "Artifact path is outside the task workspace")
+    return absolute_parts[len(root_parts):]
+
+
+def _task_execution_base_parts(
+    task: Task,
+    root: Path,
+) -> tuple[str, ...]:
+    """Map last_cwd to lexical components beneath the configured root."""
 
     raw_cwd = task.last_cwd
     if not raw_cwd:
-        return root
+        return ()
 
-    if raw_cwd == str(CONTAINER_WORKSPACE):
-        return root
-    container_prefix = f"{CONTAINER_WORKSPACE}{os.sep}"
-    if raw_cwd.startswith(container_prefix):
-        candidate = root / raw_cwd[len(container_prefix):]
-    else:
-        candidate = Path(raw_cwd).expanduser()
+    container_parts = _container_relative_parts(raw_cwd)
+    if container_parts is not None:
+        return container_parts
 
     try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, RuntimeError, ValueError):
-        return root
-    return resolved if resolved.is_dir() else root
+        expanded = Path(raw_cwd).expanduser()
+    except RuntimeError:
+        return ()
+    if not expanded.is_absolute():
+        return ()
+    try:
+        return _parts_beneath_root(_absolute_parts(str(expanded)), root)
+    except HTTPException:
+        return ()
 
 
-def _resolve_artifact_parts(
+def _lexical_artifact_parts(
     task: Task,
     root: Path,
     reference: str,
 ) -> tuple[tuple[str, ...], str]:
-    """Resolve a link to canonical workspace-relative components.
-
-    The returned pathname is not trusted for opening.  Callers must traverse
-    the components from an already-open workspace descriptor with no-follow
-    semantics so a task process cannot swap in a symlink after this check.
-    """
+    """Convert one link to lexical components beneath the anchored workspace."""
 
     artifact_path = _decode_artifact_reference(reference)
-
-    container_prefix = f"{CONTAINER_WORKSPACE}{os.sep}"
-    if artifact_path == str(CONTAINER_WORKSPACE):
-        candidate = root
-    elif artifact_path.startswith(container_prefix):
-        candidate = root / artifact_path[len(container_prefix):]
-    elif os.path.isabs(artifact_path):
-        candidate = Path(artifact_path)
+    container_parts = _container_relative_parts(artifact_path)
+    if container_parts is not None:
+        parts = container_parts
+    elif PurePosixPath(artifact_path).is_absolute():
+        parts = _parts_beneath_root(_absolute_parts(artifact_path), root)
     else:
-        candidate = _task_execution_base(task, root) / artifact_path
+        parts = _normalize_relative_parts(
+            _task_execution_base_parts(task, root),
+            PurePosixPath(artifact_path).parts,
+        )
 
-    try:
-        resolved = candidate.resolve(strict=True)
-    except (FileNotFoundError, NotADirectoryError):
-        raise HTTPException(404, "Artifact file not found")
-    except (OSError, RuntimeError) as exc:
-        raise HTTPException(400, "Invalid artifact path") from exc
-
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        raise HTTPException(403, "Artifact path is outside the task workspace")
-
-    parts = resolved.relative_to(root).parts
-    if not parts or any(part in {"", ".", ".."} for part in parts):
+    if not parts:
         raise HTTPException(400, "Invalid artifact path")
-    return parts, resolved.name
+    return parts, parts[-1]
 
 
 def _raise_artifact_open_error(exc: OSError) -> NoReturn:
@@ -209,29 +259,53 @@ def _secure_open_flags(*, directory: bool) -> int:
     return flags
 
 
+def _open_directory_component(parent_fd: int, component: str) -> int:
+    """Open one directory component relative to an already-anchored parent."""
+
+    return os.open(
+        component,
+        _secure_open_flags(directory=True),
+        dir_fd=parent_fd,
+    )
+
+
 def _open_workspace_root(root: Path) -> int:
-    root_fd: int | None = None
+    """Open every root component from the stable filesystem root descriptor."""
+
+    current_fd: int | None = None
     try:
-        root_fd = os.open(root, _secure_open_flags(directory=True))
-        root_stat = os.fstat(root_fd)
+        current_fd = os.open(
+            os.path.sep,
+            _secure_open_flags(directory=True),
+        )
+        for component in root.parts[1:]:
+            next_fd = _open_directory_component(current_fd, component)
+            previous_fd = current_fd
+            current_fd = next_fd
+            os.close(previous_fd)
+        root_stat = os.fstat(current_fd)
     except OSError as exc:
-        if root_fd is not None:
-            os.close(root_fd)
+        if current_fd is not None:
+            os.close(current_fd)
         _raise_artifact_open_error(exc)
+    except Exception:
+        if current_fd is not None:
+            os.close(current_fd)
+        raise
 
-    assert root_fd is not None
+    assert current_fd is not None
     if not stat.S_ISDIR(root_stat.st_mode):
-        os.close(root_fd)
+        os.close(current_fd)
         raise HTTPException(404, "Task workspace is unavailable")
-    return root_fd
+    return current_fd
 
 
-def _open_resolved_artifact(
+def _open_anchored_artifact(
     root_fd: int,
     parts: tuple[str, ...],
     filename: str,
 ) -> OpenedTaskArtifact:
-    """Open canonical parts beneath root_fd without following raced symlinks."""
+    """Open validated lexical parts beneath root_fd without following symlinks."""
 
     try:
         current_fd = os.dup(root_fd)
@@ -240,13 +314,10 @@ def _open_resolved_artifact(
     artifact_fd: int | None = None
     try:
         for component in parts[:-1]:
-            next_fd = os.open(
-                component,
-                _secure_open_flags(directory=True),
-                dir_fd=current_fd,
-            )
-            os.close(current_fd)
+            next_fd = _open_directory_component(current_fd, component)
+            previous_fd = current_fd
             current_fd = next_fd
+            os.close(previous_fd)
 
         artifact_fd = os.open(
             parts[-1],
@@ -288,8 +359,8 @@ def _open_task_artifact(
 
     root_fd = _open_workspace_root(root)
     try:
-        parts, filename = _resolve_artifact_parts(task, root, reference)
-        return _open_resolved_artifact(root_fd, parts, filename)
+        parts, filename = _lexical_artifact_parts(task, root, reference)
+        return _open_anchored_artifact(root_fd, parts, filename)
     finally:
         os.close(root_fd)
 

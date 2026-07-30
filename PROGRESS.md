@@ -972,7 +972,7 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **预防**：部署级 capability 只回答“服务是否具备能力”，不能代替 Task scope；所有产生持久化、远端代理或进程副作用的入口必须在副作用前校验，并在可能改变路由的写屏障后复核。跨 Worker snapshot 的“存在”本身就是远端管理证据，不能因 `worker_id` 暂时为空而猜成本地任务。
 - **验证**：Linux 容器聚焦后端共 `118 passed`，覆盖 Task/Chat/Monitor API、Runtime Settings、Skill context、MCP server/spec、Instance launch 及 PR7B1 的多轮/恢复/关机/停止/清理不变量；前端五个聚焦文件 `127 passed`，production build 通过。真实本地 Codex 手测验证 5 轮普通/重要报告后自动完成，以及活动 Monitor Stop 后清空调度、删除精确 thread 且不终止共享 app-server；未运行全量测试。
 
-### 2026-07-30 — 跨版本更新放行真实 systemd user-manager
+### 2026-07-30 — 跨版本更新放行真实 systemd user-manager（commit 752890e）
 
 - **问题**：SQLite 停服独占检查本意只忽略固定的 systemd user-manager，但匹配条件要求命令行以 `systemd --user` 结尾；真实宿主 PID 1 拉起的进程是 `systemd --user --deserialize=19`，同 UID `/proc/<pid>/fd` 因内核保护不可读，导致每次迁移都误判无法证明独占并回滚。
 - **解决**：把允许项收窄为 basename 精确等于 `systemd`、首参数精确 `--user`，并且只允许无额外参数或单个数字形式 `--deserialize=N`；仍要求进程位于该 UID 的 `init.scope`，任何额外/非数字参数继续 fail closed。

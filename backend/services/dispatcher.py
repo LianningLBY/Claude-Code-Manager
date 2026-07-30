@@ -10550,6 +10550,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             return False
         instance_id = task.instance_id
 
+        instance = await db.get(Instance, instance_id, populate_existing=True)
+        if (
+            instance is not None
+            and instance.current_task_id is not None
+            and instance.current_task_id != task_id
+        ):
+            # The instance has been durably reassigned.  Consumer records and
+            # launch params are in-memory terminal bookkeeping and can briefly
+            # retain the previous task id after the slot is reused.  Combining
+            # one of those stale records with the new generation's live
+            # process would otherwise keep chat for the completed task queued
+            # forever.
+            return False
+
         lifecycle = self._running_tasks.get(instance_id)
         if lifecycle is not None and not lifecycle.done():
             # Fresh lifecycle preparation precedes Instance.current_task_id/PID
@@ -10580,7 +10594,6 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # stronger identity during that terminal window.
             return True
 
-        instance = await db.get(Instance, instance_id, populate_existing=True)
         if instance is None or instance.current_task_id != task_id:
             return False
 

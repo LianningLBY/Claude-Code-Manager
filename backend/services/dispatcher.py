@@ -33,6 +33,7 @@ from backend.services.context_compaction import (
     context_tokens_used,
     is_context_window_exceeded,
 )
+from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.instance_capacity import (
     active_capacity_predicate,
     instance_capacity_lock,
@@ -11399,6 +11400,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if monitor_log is not None:
                     msg.source_log_id = monitor_log.id
                     launch_kwargs["source_log_id"] = monitor_log.id
+                    if broadcast_data is not None:
+                        broadcast_data = persisted_chat_event(
+                            monitor_log,
+                            broadcast_data,
+                        )
             if broadcast_data is not None:
                 await self.broadcaster.broadcast(
                     f"task:{task_id}", broadcast_data

@@ -729,8 +729,13 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
 
     await relay._handle({
         "channel": f"task:{t.id}",
-        "data": {"event_type": "message", "role": "assistant", "content": "hi",
-                 "instance_id": 7},
+        "data": {
+            "id": 987654,
+            "event_type": "message",
+            "role": "assistant",
+            "content": "hi",
+            "instance_id": 7,
+        },
     }, w)
 
     async with session_factory() as db:
@@ -740,8 +745,19 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
     assert logs[0].instance_id is None
     assert logs[0].content == "hi"
     assert task.has_unread is True
-    # 镜像广播到同名 channel，且剥掉 worker 的 instance_id
-    assert broadcaster.sent == [(f"task:{t.id}", {"event_type": "message", "role": "assistant", "content": "hi"})]
+    # 镜像广播到同名 channel，剥掉 worker 的 instance_id，并以 Manager
+    # 本地 LogEntry 身份覆盖远端数据库 id。
+    assert len(broadcaster.sent) == 1
+    channel, event = broadcaster.sent[0]
+    assert channel == f"task:{t.id}"
+    assert event["event_type"] == "message"
+    assert event["role"] == "assistant"
+    assert event["content"] == "hi"
+    assert "instance_id" not in event
+    assert event["id"] == logs[0].id
+    assert event["id"] != 987654
+    assert event["task_id"] == t.id
+    assert event["timestamp"].endswith("Z")
 
 
 async def test_relay_skips_user_message_and_unsubscribed(relay, broadcaster, session_factory):
@@ -4814,7 +4830,11 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
         )).scalar_one()
     assert stored.content == "[Worker Alice] [FIX] preserve this tag"
     assert json.loads(stored.raw_json)["raw_content"] == "[FIX] preserve this tag"
-    assert broadcaster.sent[0][1]["content"] == stored.content
+    event = broadcaster.sent[0][1]
+    assert event["content"] == stored.content
+    assert event["id"] == stored.id
+    assert event["task_id"] == t.id
+    assert event["timestamp"].endswith("Z")
 
 
 async def test_chat_proxy_rejects_secrets(client, session_factory, monkeypatch):

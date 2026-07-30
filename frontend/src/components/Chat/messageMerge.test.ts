@@ -104,3 +104,47 @@ describe('mergeChatHistory ephemeral events', () => {
     ]);
   });
 });
+
+describe('mergeChatHistory persisted identity', () => {
+  it('keeps a persisted injected message outside the latest page in id order', () => {
+    const injected = message({
+      id: 10,
+      role: 'user',
+      event_type: 'user_message',
+      content: '[Admin] steer the active turn',
+      raw_content: 'steer the active turn',
+      source: 'inject',
+      persisted: true,
+    });
+    const latest = [
+      message({ id: 210, content: 'tool output', persisted: true }),
+      message({ id: 211, content: 'final answer', persisted: true }),
+    ];
+
+    expect(
+      mergeChatHistory(latest, [injected, ...latest]).map((entry) => entry.id),
+    ).toEqual([10, 210, 211]);
+  });
+
+  it('deduplicates an older page by id without collapsing equal text at different ids', () => {
+    const first = message({
+      id: 20,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'same text',
+      persisted: true,
+    });
+    const second = message({
+      id: 21,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'same text',
+      persisted: true,
+    });
+
+    const merged = mergeChatHistory([first], [first, second]);
+
+    expect(merged.map((entry) => entry.id)).toEqual([20, 21]);
+    expect(merged.filter((entry) => entry.content === 'same text')).toHaveLength(2);
+  });
+});

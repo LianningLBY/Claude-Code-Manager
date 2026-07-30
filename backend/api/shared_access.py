@@ -16,6 +16,7 @@ from backend.database import get_db
 from backend.models.task import Task
 from backend.models.task_share import TaskShare
 from backend.models.log_entry import LogEntry
+from backend.services.chat_event_identity import persisted_chat_event
 
 logger = logging.getLogger(__name__)
 
@@ -178,13 +179,13 @@ async def shared_chat(
 
     # Broadcast
     from backend.main import broadcaster
-    await broadcaster.broadcast(f"task:{task_id}", {
+    await broadcaster.broadcast(f"task:{task_id}", persisted_chat_event(user_log, {
         "event_type": "user_message",
         "role": "user",
         "content": prefixed,
         "sender_name": sender,
         "raw_content": body.message,
-    })
+    }))
 
     # Enqueue
     from backend.main import dispatcher

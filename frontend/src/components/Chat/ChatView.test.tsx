@@ -1429,6 +1429,81 @@ describe('ChatView', () => {
       expect(screen.getByText('live while snapshot is in flight')).toBeInTheDocument();
     });
 
+    it('pages from the HTTP boundary when an older persisted WS row is retained', async () => {
+      const latest = Array.from({ length: 200 }, (_, index): ChatMessage => ({
+        id: 210 + index,
+        role: 'assistant',
+        event_type: 'message',
+        content: `latest-${index}`,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: `2026-07-30T10:${String(index % 60).padStart(2, '0')}:00Z`,
+        image_urls: null,
+        attachments: null,
+      }));
+      const injected: ChatMessage = {
+        id: 10,
+        role: 'user',
+        event_type: 'user_message',
+        content: '[Admin] early steer',
+        raw_content: 'early steer',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-07-30T09:00:00Z',
+        image_urls: null,
+        attachments: null,
+        source: 'inject',
+      };
+      vi.mocked(api.getTaskChatHistory)
+        .mockResolvedValueOnce(latest)
+        .mockResolvedValueOnce([injected]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 16, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      await screen.findByText('latest-199');
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:16',
+          data: {
+            ...injected,
+            task_id: 16,
+          },
+        });
+      });
+      expect(screen.getAllByText('[Admin] early steer')).toHaveLength(1);
+
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Load older messages' }),
+      );
+
+      await waitFor(() => {
+        expect(api.getTaskChatHistory).toHaveBeenNthCalledWith(
+          2,
+          16,
+          true,
+          200,
+          210,
+        );
+      });
+      await waitFor(() => {
+        expect(screen.getAllByText('[Admin] early steer')).toHaveLength(1);
+      });
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
     it('backfills again after the task-channel subscription is acknowledged', async () => {
       const task = makeTask({ id: 13 });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
@@ -1953,6 +2028,70 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
 
     expect(screen.getByText('[Admin] 检查训练状态')).toBeInTheDocument();
     expect(screen.queryByText('检查训练状态')).not.toBeInTheDocument();
+  });
+
+  it('权威用户消息即使不是最后一条，也会替换此前的实时气泡', async () => {
+    const task = makeTask({ id: 120, description: null });
+    render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    await act(async () => {
+      wsUserMessage(120, {
+        content: '检查训练状态',
+        raw_content: '检查训练状态',
+      });
+      capturedOnMessage!({
+        channel: 'task:120',
+        data: {
+          id: 700,
+          event_type: 'message',
+          role: 'assistant',
+          content: '正在检查',
+          timestamp: '2026-07-30T10:00:01Z',
+        },
+      });
+      wsUserMessage(120, {
+        id: 699,
+        content: '[Admin] 检查训练状态',
+        raw_content: '检查训练状态',
+        timestamp: '2026-07-30T10:00:00Z',
+      });
+    });
+
+    expect(screen.getByText('[Admin] 检查训练状态')).toBeInTheDocument();
+    expect(screen.queryByText('检查训练状态')).not.toBeInTheDocument();
+    expect(screen.getByText('正在检查')).toBeInTheDocument();
+  });
+
+  it('同一个持久化用户消息重放时按 id 原位更新而不追加', async () => {
+    const task = makeTask({ id: 121, description: null });
+    render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    await act(async () => {
+      wsUserMessage(121, {
+        id: 801,
+        content: '[Admin] 只显示一次',
+        raw_content: '只显示一次',
+      });
+      capturedOnMessage!({
+        channel: 'task:121',
+        data: {
+          id: 802,
+          event_type: 'message',
+          role: 'assistant',
+          content: '中间输出',
+        },
+      });
+      wsUserMessage(121, {
+        id: 801,
+        content: '[Admin] 只显示一次',
+        raw_content: '只显示一次',
+      });
+    });
+
+    expect(screen.getAllByText('[Admin] 只显示一次')).toHaveLength(1);
+    expect(screen.getByText('中间输出')).toBeInTheDocument();
   });
 
   it('Capacitor（手机 App）下附件相对 URL 必须拼上远程服务器地址', async () => {

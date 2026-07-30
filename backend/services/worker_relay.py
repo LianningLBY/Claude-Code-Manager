@@ -30,6 +30,7 @@ from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.task_queue import PR_REVIEW_SUPERSEDED_METADATA_KEY
 
 _TASK_STATUSES = frozenset(
@@ -802,6 +803,7 @@ class WorkerRelay:
             return
 
         # 2) chat 事件双写 LogEntry（instance_id=None；广播 payload 无 raw_json，存 None）
+        persisted_forward = None
         if event_type in CHAT_EVENT_TYPES:
             async with self.db_factory() as db:
                 guard_values = {"status": observed.status}
@@ -818,7 +820,7 @@ class WorkerRelay:
                 if guarded.rowcount != 1:
                     await db.rollback()
                     return
-                db.add(LogEntry(
+                entry = LogEntry(
                     instance_id=None,
                     task_id=task_id,
                     event_type=event_type,
@@ -830,8 +832,17 @@ class WorkerRelay:
                     raw_json=data.get("raw_json"),
                     is_error=data.get("is_error", False),
                     loop_iteration=data.get("loop_iteration"),
-                ))
+                )
+                db.add(entry)
                 await db.commit()
+                persisted_forward = persisted_chat_event(
+                    entry,
+                    {
+                        key: value
+                        for key, value in data.items()
+                        if key not in ("instance_id", "raw_json")
+                    },
+                )
             # session_id 同步：worker 广播前 pop 了 session_id，首条事件到达时从 Worker 拉取
             if event_type == "system_init":
                 session_observed = await self._observe_task_generation(
@@ -1087,7 +1098,9 @@ class WorkerRelay:
                 await db.commit()
 
         # 4) 镜像广播到来源同名 channel（剥 worker 的 instance_id，对 Manager 无意义）
-        forward = {k: v for k, v in data.items() if k != "instance_id"}
+        forward = persisted_forward or {
+            k: v for k, v in data.items() if k != "instance_id"
+        }
         if channel.startswith("task:"):
             await self.broadcaster.broadcast(f"task:{task_id}", forward)
         elif channel == "tasks":

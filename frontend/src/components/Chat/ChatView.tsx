@@ -10,15 +10,13 @@ import type {
   FileAttachment,
   InjectTaskAttachments,
   MonitorSession,
-  PlanPipelineConfig,
   Project,
-  SystemConfig,
   Task,
   UploadResult,
 } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Settings } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -33,10 +31,6 @@ import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
 } from './messageMerge';
-import { PlanPipelineFields } from '../PlanReview/PlanPipelineFields';
-import {
-  FALLBACK_PLAN_PIPELINE_CONFIG,
-} from '../PlanReview/planPipelineDefaults';
 import { getTaskStatusLabel } from '../Tasks/taskStatus';
 
 interface ChatViewProps {
@@ -415,24 +409,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [planCreating, setPlanCreating] = useState(false);
   const [planBusyId, setPlanBusyId] = useState<number | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
-  const [planSettingsOpen, setPlanSettingsOpen] = useState(false);
-  const [planSystemConfig, setPlanSystemConfig] = useState<SystemConfig | null>(null);
-  const [planPipelineConfig, setPlanPipelineConfig] = useState<PlanPipelineConfig>(
-    FALLBACK_PLAN_PIPELINE_CONFIG,
-  );
   const [selectedPlanIds, setSelectedPlanIds] = useState<number[]>([]);
   const [planStaleIds, setPlanStaleIds] = useState<Set<number>>(new Set());
   const queuedPlanIdsRef = useRef<Set<number>>(new Set());
   const planDismissedKey = `ccm-plan-dismissed-${task.id}`;
-
-  useEffect(() => {
-    api.config().then((config) => {
-      setPlanSystemConfig(config);
-      setPlanPipelineConfig(
-        config.plan_pipeline_defaults || FALLBACK_PLAN_PIPELINE_CONFIG,
-      );
-    }).catch(() => {});
-  }, []);
 
   const readDismissedPlans = useCallback((): Set<number> => {
     try {
@@ -587,10 +567,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setPlanCreating(true);
     setPlanError(null);
     try {
-      await api.createRelatedPlan(task.id, {
-        input: request,
-        pipeline_config: planPipelineConfig,
-      });
+      await api.createRelatedPlan(task.id, { input: request });
       setPlanInput('');
       await refreshPlans();
       onTaskUpdated?.();
@@ -2171,18 +2148,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 className="min-h-[58px] flex-1 resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
               />
               <button
-                onClick={() => setPlanSettingsOpen((open) => !open)}
-                className={`flex h-9 items-center gap-1 rounded-lg border px-2.5 text-xs ${
-                  planSettingsOpen
-                    ? 'border-indigo-500/60 bg-indigo-500/15 text-indigo-200'
-                    : 'border-gray-700 bg-gray-800 text-gray-400 hover:text-gray-200'
-                }`}
-                aria-label="Plan pipeline settings"
-              >
-                <Settings size={13} />
-                Models
-              </button>
-              <button
                 onClick={() => void createRelatedPlan()}
                 disabled={!planInput.trim() || planCreating}
                 className="flex h-9 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
@@ -2193,15 +2158,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 Create Plan
               </button>
             </div>
-
-            {planSettingsOpen && (
-              <PlanPipelineFields
-                value={planPipelineConfig}
-                onChange={setPlanPipelineConfig}
-                systemConfig={planSystemConfig}
-                compact
-              />
-            )}
 
             {planError && (
               <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">

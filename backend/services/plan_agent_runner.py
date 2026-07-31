@@ -1491,11 +1491,13 @@ class PlanAgentRunner:
         )
         run_id = await self._create_run(task=task, pipeline=pipeline)
         context = await self._target_context(task)
-        max_revisions = pipeline.max_revision_cycles
+        # The wire field keeps its original name for compatibility, but its
+        # value is the maximum number of complete Planner/Reviewer rounds.
+        max_rounds = max(1, pipeline.max_revision_cycles)
         feedback = None
         latest_plan = ""
         try:
-            for round_number in range(1, max_revisions + 2):
+            for round_number in range(1, max_rounds + 1):
                 await self._update_run(
                     run_id,
                     status="planning",
@@ -1599,7 +1601,7 @@ class PlanAgentRunner:
                         review_exhausted=False,
                         run_id=run_id,
                     )
-                if round_number > max_revisions:
+                if round_number >= max_rounds:
                     await self._update_run(
                         run_id,
                         status="completed",

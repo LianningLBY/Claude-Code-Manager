@@ -582,7 +582,7 @@ describe('Codex Fast speed configuration', () => {
     ));
   });
 
-  it('forces read-only Plan tasks back to Standard', async () => {
+  it('uses the global Plan pipeline instead of per-create routing', async () => {
     const speedSelect = await switchToCodexFastForm();
     await userEvent.selectOptions(speedSelect, 'priority');
     await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'plan');
@@ -599,43 +599,14 @@ describe('Codex Fast speed configuration', () => {
     );
     await userEvent.click(screen.getByRole('button', { name: /create/i }));
 
-    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mode: 'plan',
-        codex_service_tier: 'default',
-        provider: 'claude',
-        model: 'claude-fable-5',
-        plan_pipeline_config: {
-          version: 1,
-          planner: {
-            primary: {
-              provider: 'claude',
-              model: 'claude-fable-5',
-              effort: 'high',
-            },
-            fallback: {
-              provider: 'codex',
-              model: 'gpt-5.6-terra',
-              effort: 'xhigh',
-            },
-          },
-          reviewer: {
-            enabled: true,
-            primary: {
-              provider: 'codex',
-              model: 'gpt-5.6-sol',
-              effort: 'xhigh',
-            },
-            fallback: {
-              provider: 'claude',
-              model: 'claude-sonnet-5',
-              effort: 'high',
-            },
-          },
-          max_revision_cycles: 2,
-        },
-      }),
-    ));
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    const payload = vi.mocked(api.createTask).mock.calls.at(-1)?.[0];
+    expect(payload).toEqual(expect.objectContaining({ mode: 'plan' }));
+    expect(payload).not.toHaveProperty('provider');
+    expect(payload).not.toHaveProperty('model');
+    expect(payload).not.toHaveProperty('effort_level');
+    expect(payload).not.toHaveProperty('codex_service_tier');
+    expect(payload).not.toHaveProperty('plan_pipeline_config');
   });
 
   it('atomically resets Fast when switching to an unsupported model', async () => {

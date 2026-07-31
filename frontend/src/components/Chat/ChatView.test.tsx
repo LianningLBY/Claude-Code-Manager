@@ -2085,7 +2085,7 @@ describe('independent Plan attachments', () => {
     });
   });
 
-  it('creates an associated Plan with both Planner and Reviewer routes', async () => {
+  it('creates an associated Plan using the global pipeline settings', async () => {
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
@@ -2099,39 +2099,9 @@ describe('independent Plan attachments', () => {
 
     await waitFor(() => expect(api.createRelatedPlan).toHaveBeenCalledWith(
       1,
-      {
-        input: 'Design the migration',
-        pipeline_config: {
-          version: 1,
-          planner: {
-            primary: {
-              provider: 'claude',
-              model: 'claude-fable-5',
-              effort: 'high',
-            },
-            fallback: {
-              provider: 'codex',
-              model: 'gpt-5.6-terra',
-              effort: 'xhigh',
-            },
-          },
-          reviewer: {
-            enabled: true,
-            primary: {
-              provider: 'codex',
-              model: 'gpt-5.6-sol',
-              effort: 'xhigh',
-            },
-            fallback: {
-              provider: 'claude',
-              model: 'claude-sonnet-5',
-              effort: 'high',
-            },
-          },
-          max_revision_cycles: 2,
-        },
-      },
+      { input: 'Design the migration' },
     ));
+    expect(screen.queryByRole('button', { name: 'Models' })).not.toBeInTheDocument();
   });
 
   it('updates an associated Plan stage and ready state in real time', async () => {

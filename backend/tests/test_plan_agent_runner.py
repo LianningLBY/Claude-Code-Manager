@@ -323,6 +323,79 @@ async def test_pipeline_revises_then_persists_audited_approval(
 
 
 @pytest.mark.asyncio
+async def test_maximum_two_rounds_never_starts_a_third_planner(db_factory):
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 2,
+    })
+    async with db_factory() as db:
+        task = Task(
+            title="Bounded Plan",
+            description="Plan twice only",
+            target_repo="/tmp",
+            mode="plan",
+            provider="claude",
+            plan_pipeline_config=pipeline.model_dump(mode="json"),
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._run_route = AsyncMock(side_effect=[
+        ({"plan": "Plan v1"}, '{"plan":"Plan v1"}', "claude-1"),
+        (
+            {"verdict": "revise", "feedback": "Revise once"},
+            '{"verdict":"revise","feedback":"Revise once"}',
+            "codex-1",
+        ),
+        ({"plan": "Plan v2"}, '{"plan":"Plan v2"}', "claude-1"),
+        (
+            {"verdict": "revise", "feedback": "Still revise"},
+            '{"verdict":"revise","feedback":"Still revise"}',
+            "codex-1",
+        ),
+    ])
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    result = await runner.run(task, cwd="/tmp")
+
+    assert result.plan_content == "Plan v2"
+    assert result.review_exhausted is True
+    assert runner._run_route.await_count == 4
+
+
+@pytest.mark.asyncio
 async def test_stage_uses_fallback_only_after_primary_route_is_unavailable(
     db_factory,
 ):

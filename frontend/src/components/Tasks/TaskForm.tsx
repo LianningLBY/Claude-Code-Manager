@@ -2,9 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { api } from '../../api/client';
 import type {
   CodexServiceTier,
-  PlanPipelineConfig,
   Project,
-  SystemConfig,
   TagItem,
   Task,
 } from '../../api/client';
@@ -15,10 +13,6 @@ import { SecretPicker } from '../Secrets/SecretPicker';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { skillSupportedByProvider } from '../../config/skillCapabilities';
-import { PlanPipelineFields } from '../PlanReview/PlanPipelineFields';
-import {
-  FALLBACK_PLAN_PIPELINE_CONFIG,
-} from '../PlanReview/planPipelineDefaults';
 
 interface TaskFormProps {
   onCreated: () => void;
@@ -37,7 +31,6 @@ interface StoredTaskDefaults {
   thinkingBudget?: string;
   timeoutHours?: string;
   systemPromptMode?: string;
-  planPipelineConfig?: PlanPipelineConfig;
 }
 
 function readStoredTaskDefaults(): StoredTaskDefaults | null {
@@ -83,10 +76,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [codexCapabilitiesLoaded, setCodexCapabilitiesLoaded] = useState(false);
   const [codexServiceTier, setCodexServiceTier] = useState<CodexServiceTier>('default');
   const [defaultEffort, setDefaultEffort] = useState('medium');
-  const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
-  const [planPipelineConfig, setPlanPipelineConfig] = useState<PlanPipelineConfig>(
-    FALLBACK_PLAN_PIPELINE_CONFIG,
-  );
   const [todoFilePath, setTodoFilePath] = useState('');
   const [maxIterations, setMaxIterations] = useState('50');
   const [mustComplete, setMustComplete] = useState(false);
@@ -129,9 +118,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     setThinkingBudget(stored?.thinkingBudget || '');
     setTimeoutHours(stored?.timeoutHours || '');
     setSystemPromptMode(stored?.systemPromptMode || '');
-    if (stored?.planPipelineConfig) {
-      setPlanPipelineConfig(stored.planPipelineConfig);
-    }
   };
 
   const loadProjects = () => {
@@ -146,7 +132,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     // A slow or unavailable backend must not make local defaults disappear.
     applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     api.config().then((c) => {
-      setSystemConfig(c);
       const configuredProvider = c.default_provider || 'codex';
       setDefaultProvider(configuredProvider);
       setProviderOptions(c.provider_options.length ? c.provider_options : ['claude', 'codex']);
@@ -160,12 +145,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexModelEfforts(c.codex_model_efforts || {});
       setCodexModelServiceTiers(c.codex_model_service_tiers || {});
       setCodexCapabilitiesLoaded(true);
-      const savedPlanConfig = readStoredTaskDefaults()?.planPipelineConfig;
-      setPlanPipelineConfig(
-        savedPlanConfig
-        || c.plan_pipeline_defaults
-        || FALLBACK_PLAN_PIPELINE_CONFIG,
-      );
       // Re-read after the async request so a default saved while it was in
       // flight still wins over the server defaults.
       applyStoredDefaults(readStoredTaskDefaults(), configuredProvider);
@@ -307,7 +286,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       thinkingBudget,
       timeoutHours,
       systemPromptMode,
-      planPipelineConfig,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
     setDefaultSaved(true);
@@ -461,19 +439,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
         ...(workerId ? { worker_id: parseInt(workerId) } : {}),
-        provider: mode === 'plan'
-          ? planPipelineConfig.planner.primary.provider
-          : provider,
-        model: mode === 'plan'
-          ? planPipelineConfig.planner.primary.model
-          : model || activeDefaultModel,
-        ...(mode === 'plan'
-          ? {
-            effort_level: planPipelineConfig.planner.primary.effort || undefined,
-            plan_pipeline_config: planPipelineConfig,
-          }
-          : effort ? { effort_level: effort } : {}),
-        ...(provider === 'codex' ? { codex_service_tier: codexServiceTier } : {}),
+        ...(mode !== 'plan' ? {
+          provider,
+          model: model || activeDefaultModel,
+          ...(effort ? { effort_level: effort } : {}),
+          ...(provider === 'codex'
+            ? { codex_service_tier: codexServiceTier }
+            : {}),
+        } : {}),
         ...(thinkingBudget ? { thinking_budget: parseInt(thinkingBudget) || null } : {}),
         ...(systemPromptMode ? { system_prompt_mode: systemPromptMode } : {}),
         ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
@@ -742,16 +715,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
                 </select>
-
-                {mode === 'plan' && (
-                  <div className="col-span-2 w-[36rem] max-w-[calc(100vw-2rem)]">
-                    <PlanPipelineFields
-                      value={planPipelineConfig}
-                      onChange={setPlanPipelineConfig}
-                      systemConfig={systemConfig}
-                    />
-                  </div>
-                )}
 
                 {false && (
                   <>

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import {
   Bot, Menu, X, PanelLeftClose, PanelLeftOpen, LayoutDashboard, ListTodo, FolderGit2, KeyRound,
   FolderOpen, MessagesSquare, GitPullRequest, Server, Sparkles, Users, Globe,
+  Settings,
 } from '../icons';
 import type { ComponentType } from 'react';
 import { api } from '../../api/client';
@@ -123,6 +124,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
     { key: 'workers', label: 'Workers', icon: Server, show: isAdmin || hasWorker },
     { key: 'skills', label: 'Skills', icon: Sparkles, show: true },
     { key: 'team', label: 'Team', icon: Users, show: true },
+    { key: 'settings', label: 'Settings', icon: Settings, show: isAdmin },
     ...(isCapacitor() ? [{ key: 'server', label: 'Server', icon: Globe, show: true }] : []),
   ];
   const pages = allPages.filter(p => p.show);

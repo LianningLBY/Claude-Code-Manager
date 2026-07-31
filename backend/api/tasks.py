@@ -477,9 +477,15 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     data["created_by"] = user_id
     if data.get("mode") == "plan":
         from backend.schemas.plan import resolve_plan_pipeline_config
+        from backend.services.plan_pipeline_settings import (
+            effective_plan_pipeline_config,
+        )
+
+        base_pipeline = await effective_plan_pipeline_config(db)
 
         pipeline = resolve_plan_pipeline_config(
             data.get("plan_pipeline_config"),
+            base_config=base_pipeline,
             legacy_provider=(
                 data.get("provider")
                 if "provider" in body.model_fields_set

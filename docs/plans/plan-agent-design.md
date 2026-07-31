@@ -149,11 +149,11 @@ Plan 创建时记录：
 
 ### 5.2 Reviewer
 
-- 默认开启，可按 Plan 配置关闭；
+- 默认开启，可在全局 Plan Pipeline 设置中关闭；
 - 独立一次性模型 turn；
 - 审查方案与 repo 现状的一致性；
 - verdict：`approve` / `revise`；
-- revise 反馈回 Planner，默认最多 2 个 revision cycle；
+- revise 反馈回 Planner，默认总计最多 2 个完整 Planning/Reviewing round；
 - 达上限后保留最新方案和 Reviewer 未解决意见，仍交用户审批，不自动失败。
 
 Reviewer 不直接重写最终方案。需要修改时统一由 Planner 根据 feedback 产出新版本，保持
@@ -178,8 +178,10 @@ Reviewer 不直接重写最终方案。需要修改时统一由 Planner 根据 f
 因此不新增一套“选号逻辑”。Plan runner 只封装辅助模型步骤的 route fallback，账号可用性、
 模型兼容、CloudRouter/Apex 投影、冷却与轮询仍由现有号池负责。每次尝试写入
 `plan_agent_steps`，run 同时保留请求配置和实际成功组合，便于解释为什么发生 fallback。
-部署默认值由 `.env` 的 `PLAN_PLANNER_*` / `PLAN_REVIEWER_*` 配置；TaskForm 和 ChatView
-允许按 Plan 覆盖，创建后固化快照，之后修改全局默认不会漂移已排队或历史 Plan。
+Admin Settings 的 Plan Pipeline 区域将全局配置持久化到数据库；`.env` 的
+`PLAN_PLANNER_*` / `PLAN_REVIEWER_*` 仅在尚未保存设置时提供部署回退。TaskForm 和
+ChatView 不提供逐 Plan 覆盖，后端创建时固化全局设置快照，之后修改设置不会漂移已排队
+或历史 Plan。API 暂时保留显式覆盖字段用于兼容已有客户端。
 
 ### 5.4 结构化输出
 
@@ -308,6 +310,8 @@ POST /api/tasks/{plan_task_id}/plan/revise      创建独立修订 Plan
 POST /api/tasks/{plan_task_id}/plan/create-execution-task
 GET  /api/tasks/{plan_task_id}/plan/runs
 POST /api/tasks/{plan_task_id}/cancel            取消 active Plan
+GET  /api/settings/plan-pipeline                  读取全局 Plan Pipeline 设置
+PUT  /api/settings/plan-pipeline                  保存全局 Plan Pipeline 设置
 ```
 
 TaskForm 的 standalone Plan 创建继续走普通 Task create API，后端使用同一 Plan lifecycle。
@@ -322,8 +326,6 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 - 新增 Plans 按钮/抽屉；
 - 展示关联 Plan 历史、独立进度、模型、过期状态和审批按钮；
 - 输入框可创建新的 Plan；
-- “Models” 展开项可分别配置 Planner/Reviewer 的 primary/fallback provider、model、
-  effort，以及 Reviewer 开关和 revision cycles；
 - 已批准未应用 Plan 显示为持久 composer attachments；
 - 发送时显式提交 `plan_task_ids`；
 - 当前主 turn 运行中也可创建/审批 Plan，但应用只发生在 approve 之后新提交的消息。
@@ -333,6 +335,12 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 - PlanPanel 处理全局待审批项和 standalone “创建执行 Task”；
 - ChatView 的 Plans 面板处理关联历史、revision、附件选择和 stale 状态；
 - 两处 approve 都采用相同的 stale 二次确认协议。
+
+### 8.3 Settings
+
+- 独立 Admin Settings 页面配置 Planner/Reviewer 的 primary/fallback provider、model、
+  effort、Reviewer 开关和最大总轮数；
+- 新建 standalone/关联 Plan 均使用同一份全局设置，创建表单不再展示模型配置。
 
 ## 9. Worker
 
@@ -375,7 +383,8 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 - 发送 payload 含显式 Plan ids；
 - standalone 创建执行 Task 后跳转新 Task；
 - stale warning 二次确认。
-- standalone TaskForm 和 ChatView Models 面板均提交完整两层 primary/fallback 配置。
+- Settings 保存两层 primary/fallback 后，standalone TaskForm 和 ChatView 创建的新 Plan
+  均固化同一份配置，且最大 2 轮不会出现第三次 Planning。
 
 ### 10.3 手工验收
 
@@ -399,6 +408,6 @@ WebSocket 事件只携带 id、状态、版本/摘要，不携带完整 plan_con
 3. Claude 一次性只读进程、Codex App Server disposable read-only thread；
 4. dispatcher Plan lifecycle，删除旧 `_run_plan_phase` 和 ralph_loop 复制逻辑；
 5. approve/reject/revise、Plan attachment、创建执行 Task；
-6. TaskForm/ChatView 两层模型配置、Plans UI 与 TasksPage PlanPanel；
+6. 独立 Settings 页两层模型配置、ChatView Plans UI 与 TasksPage PlanPanel；
 7. Worker、恢复、并发和 staleness；
 8. TEST.md、README、CLAUDE.md/AGENTS.md 同步与 Plan 相关回归。

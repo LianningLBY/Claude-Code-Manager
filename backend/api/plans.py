@@ -26,6 +26,7 @@ from backend.services.plan_tasks import (
     latest_task_log_id,
     plan_staleness,
 )
+from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
 from backend.services.task_queue import TaskQueue
 from backend.services.worker_proxy import get_task_operation_lock
 
@@ -141,6 +142,7 @@ async def _create_related_plan(
 
     pipeline = resolve_plan_pipeline_config(
         body.pipeline_config,
+        base_config=await effective_plan_pipeline_config(db),
         legacy_provider=body.provider,
         legacy_model=body.model,
         legacy_effort=body.effort_level,

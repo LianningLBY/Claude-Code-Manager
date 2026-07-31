@@ -99,6 +99,7 @@ def default_plan_pipeline_config() -> PlanPipelineConfig:
 def resolve_plan_pipeline_config(
     value: PlanPipelineConfig | dict | None,
     *,
+    base_config: PlanPipelineConfig | None = None,
     legacy_provider: str | None = None,
     legacy_model: str | None = None,
     legacy_effort: str | None = None,
@@ -110,7 +111,7 @@ def resolve_plan_pipeline_config(
             return value
         return PlanPipelineConfig.model_validate(value)
 
-    config = default_plan_pipeline_config()
+    config = base_config or default_plan_pipeline_config()
     if legacy_provider or legacy_model or legacy_effort:
         payload = config.model_dump(mode="json")
         payload["planner"]["primary"] = {

@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import func, select, update
 
 from backend.models.log_entry import LogEntry
+from backend.models.global_settings import GlobalSettings
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
 from backend.services.plan_tasks import capture_repo_revision
@@ -172,6 +173,68 @@ async def test_related_plan_snapshots_custom_primary_and_fallback_routes(
     assert data["model"] == "gpt-5.6-luna"
     assert data["effort_level"] == "max"
     assert data["plan_pipeline_config"] == pipeline
+
+
+@pytest.mark.asyncio
+async def test_new_plans_snapshot_the_global_pipeline_settings(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    pipeline = {
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "ultra",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+        },
+        "max_revision_cycles": 2,
+    }
+    async with session_factory() as db:
+        db.add(GlobalSettings(id=1, plan_pipeline_config=pipeline))
+        await db.commit()
+
+    related = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={"input": "Use global settings"},
+    )
+    standalone = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Standalone global Plan",
+            "description": "Use global settings",
+            "target_repo": "/tmp",
+            "mode": "plan",
+        },
+    )
+
+    assert related.status_code == 201, related.text
+    assert standalone.status_code == 201, standalone.text
+    for response in (related, standalone):
+        data = response.json()
+        assert data["provider"] == "codex"
+        assert data["model"] == "gpt-5.6-terra"
+        assert data["plan_pipeline_config"] == pipeline
 
 
 @pytest.mark.asyncio

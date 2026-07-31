@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 import type {
   PlanModelRoute,
   PlanPipelineConfig,
@@ -25,6 +27,10 @@ export function PlanPipelineFields({
   systemConfig,
   compact = false,
 }: PlanPipelineFieldsProps) {
+  const [roundsInput, setRoundsInput] = useState(
+    String(Math.max(1, value.max_revision_cycles)),
+  );
+
   const updateRoute = (
     stage: StageName,
     slot: RouteSlot,
@@ -172,20 +178,24 @@ export function PlanPipelineFields({
       </div>
 
       <label className="flex items-center justify-between border-t border-gray-700 pt-2 text-[11px] text-gray-400">
-        Revision cycles
+        Maximum rounds
         <input
-          aria-label="Plan revision cycles"
+          aria-label="Plan maximum rounds"
           type="number"
-          min={0}
+          min={1}
           max={10}
-          value={value.max_revision_cycles}
-          onChange={(event) => onChange({
-            ...value,
-            max_revision_cycles: Math.max(
-              0,
-              Math.min(10, Number(event.target.value) || 0),
-            ),
-          })}
+          value={roundsInput}
+          onChange={(event) => {
+            const next = event.target.value;
+            setRoundsInput(next);
+            const parsed = Number(next);
+            if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 10) {
+              onChange({ ...value, max_revision_cycles: parsed });
+            }
+          }}
+          onBlur={() => setRoundsInput(
+            String(Math.max(1, Math.min(10, value.max_revision_cycles))),
+          )}
           className="w-16 rounded border border-gray-600 bg-gray-700 px-2 py-1 text-xs text-gray-100"
         />
       </label>

@@ -973,3 +973,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
   2. **过时断言**——7-29 monitor 重构（544c128）确立「睡眠中的 Monitor 不阻塞更新」，7-24 写的 blocker 测试仍断言纯 `_monitor_tasks` lifecycle 应阻塞；改为 `_monitor_active_turns` 作运行证据并反向断言睡眠 lifecycle 不阻塞。
   3. **密闭性缺陷**×2——start guard 测试默认读机器全局 `/tmp/ccm-update-status-8000.json`（撞宿主 7-19 真实部署残留）；WS identity 测试隐式依赖 `.env` 的 `AUTH_TOKEN` 非空（空则 `_ws_identity` 短路 super_admin，JWT 分支根本没被执行）。均改为测试内显式注入。
 - **预防**：涉及扫描 `/proc`、`/tmp` 全局路径或 `settings.*` 环境值的测试必须显式注入被测状态，不能假设宿主干净；同类先例已写进 CLAUDE.md「pytest 外部状态隔离」，本次是该规则的两个漏网点。
+
+### 2026-07-31 — PR Monitor 按 base 项目约定审核与持久发布（开发环境未提交）
+
+- **需求与风险**：PR Agent 每次审核都应读取项目根目录的 `CLAUDE.md`、可选 `PROGRESS.md`，但不能误读 PR head 或 CCM/Worker 本地副本。PR 内容本身不可信；仅靠 prompt 禁止 `gh` 写操作仍会让恶意 diff 接触宿主工具、凭据，并且进程在 review/merge 返回前崩溃会造成重复外部写。
+- **实现**：Webhook 固定并去重 exact `(base_sha, head_sha)`；后端在任何 Task/旧代终止前通过 Git Data API 校验并注入 base 根文档，再在双 snapshot guard 中注入 bounded metadata/完整 patch。Claude PR turn 使用私有中性 cwd、空 setting sources、strict MCP、禁用 slash skills及 `--tools ""`；Codex 强制 app-server read-only/network false，禁用 native shell/browser/web/apps/plugins/hooks，并先 `config/read` 枚举后逐个关闭 inherited MCP。Worker 用 capability version fail closed。`opened`/`synchronize`/删除共用 repo 写屏障与数据库行锁并在最终写入前复查远端 snapshot；PR Review Task 的公共编辑、对话、注入、重试、取消、停止和删除入口全部冻结。
+- **发布与代次**：Agent 只产出严格 body/result block；exact `task_retry_count` 从本地/Worker live/backfill 日志贯穿到完成回调。后端先把 recommendation、随机 nonce、GitHub actor、Task generation 持久化为 `publishing` outbox，再执行 head-pinned review/merge；自审 fallback 为 `COMMENT` review。重启先按 nonce/actor/time/commit evidence 对账，已成功不重写；`synchronize` 保留在途 outbox并为新 head 另建审核。
+- **验证**：PR Monitor API/service 定向矩阵 `156 passed`，受影响后端矩阵 `989 passed`，最终 Claude/Codex 隔离全文件复跑 `410 passed`；前端 `502 passed` 且 production build 通过；Alembic upgrade/downgrade/re-upgrade、startup recovery 与 publishing synchronize 均有回归。最终后端全量 `3184 passed, 1 failed`；唯一失败为本分支修改前已可独立复现的 `login_runtime` stale-socket 既有断言，单独复跑仍同样失败。

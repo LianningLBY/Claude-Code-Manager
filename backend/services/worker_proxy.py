@@ -21,6 +21,10 @@ from backend.config import settings
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.services.pr_review_runtime import (
+    PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
+    is_pr_review_task,
+)
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
 from backend.services.worker_relay import worker_task_generation
 
@@ -193,16 +197,19 @@ class WorkerProxy:
         worker: Worker,
         task: Task,
     ) -> None:
-        """Fail before remote task creation when a Worker cannot prove Fast.
+        """Fail before creation when a Worker cannot prove required features.
 
         Older Workers ignore unknown Task fields, which would otherwise let a
-        Manager display Fast while the remote turn runs as Standard.
+        Manager display Fast while the remote turn runs as Standard, or run a
+        PR review from the Worker's CCM checkout without snapshot isolation.
         """
 
-        if (
-            (task.provider or "claude").lower() != "codex"
-            or (task.codex_service_tier or "default") != "priority"
-        ):
+        needs_fast = (
+            (task.provider or "claude").lower() == "codex"
+            and (task.codex_service_tier or "default") == "priority"
+        )
+        needs_pr_snapshot_context = is_pr_review_task(task)
+        if not needs_fast and not needs_pr_snapshot_context:
             return
 
         async with httpx.AsyncClient(timeout=30) as c:
@@ -215,12 +222,25 @@ class WorkerProxy:
             config = response.json()
         except Exception as exc:
             raise RuntimeError(
-                f"Worker {worker.name} 无法确认 Codex Fast 能力，任务未转发"
+                f"Worker {worker.name} 无法确认任务所需能力，任务未转发"
             ) from exc
         if not isinstance(config, dict):
             raise RuntimeError(
-                f"Worker {worker.name} 无法确认 Codex Fast 能力，任务未转发"
+                f"Worker {worker.name} 无法确认任务所需能力，任务未转发"
             )
+
+        if (
+            needs_pr_snapshot_context
+            and config.get("pr_review_snapshot_context_version")
+            != PR_REVIEW_SNAPSHOT_CONTEXT_VERSION
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 PR 审核快照隔离能力 v"
+                f"{PR_REVIEW_SNAPSHOT_CONTEXT_VERSION}，任务未转发"
+            )
+
+        if not needs_fast:
+            return
 
         model = task.model
         if not model or model == "default":
@@ -277,7 +297,15 @@ class WorkerProxy:
             )
 
         await self.require_worker_fast_support(worker, task)
-        worker_project_id = await self.ensure_worker_project(worker, task)
+        # PR reviews use only the remote GitHub snapshot named in their prompt.
+        # Mapping the Manager's synthetic PR-Monitor project would either fail
+        # (it has no repository) or make the Worker load unrelated local agent
+        # docs.  Tags survive Manager→Worker forwarding, unlike metadata.
+        worker_project_id = (
+            None
+            if is_pr_review_task(task)
+            else await self.ensure_worker_project(worker, task)
+        )
 
         # 先订阅 relay 再创建：worker Dispatcher 可能创建后立即执行，后订阅丢初始事件
         await self.relay.subscribe_task(worker, task.id)

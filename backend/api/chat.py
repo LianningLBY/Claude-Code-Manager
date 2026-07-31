@@ -469,6 +469,17 @@ async def send_chat_message(
             409,
             "This PR review task was superseded by a newer push",
         )
+    from backend.api.tasks import (
+        _require_no_pr_review_publication,
+        _require_not_pr_review_task_mutation,
+    )
+
+    await _require_no_pr_review_publication(db, task_id)
+    await _require_not_pr_review_task_mutation(
+        db,
+        task_id,
+        action="continued by chat",
+    )
     command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
         return await _send_shared_chat(
@@ -512,6 +523,12 @@ async def send_chat_message(
         )
 
         _require_no_pending_worker_routing(task)
+        await _require_no_pr_review_publication(db, task_id)
+        await _require_not_pr_review_task_mutation(
+            db,
+            task_id,
+            action="continued by chat",
+        )
         admitted_routing = _require_expected_task_routing(
             task,
             body.expected_routing,
@@ -1244,7 +1261,7 @@ async def get_chat_history(
         LogEntry.id, LogEntry.role, LogEntry.event_type, LogEntry.content,
         LogEntry.tool_name, LogEntry.tool_input, LogEntry.tool_output,
         LogEntry.is_error, LogEntry.loop_iteration, LogEntry.timestamp,
-        LogEntry.raw_json,
+        LogEntry.raw_json, LogEntry.task_retry_count,
     ]
     conditions = [
         LogEntry.task_id == task_id,
@@ -1398,6 +1415,7 @@ async def get_chat_history(
             "tool_output": tool_output,
             "is_error": row.is_error,
             "loop_iteration": row.loop_iteration,
+            "task_retry_count": row.task_retry_count,
             "timestamp": (row.timestamp.isoformat() + "Z") if row.timestamp else None,
             "image_urls": image_urls or None,
             "attachments": attachments,
@@ -1637,7 +1655,9 @@ async def inject_message(
 
         from backend.api.tasks import (
             _require_expected_task_routing,
+            _require_no_pr_review_publication,
             _require_no_pending_worker_routing,
+            _require_not_pr_review_task_mutation,
         )
 
         if task.worker_id is not None:
@@ -1646,6 +1666,12 @@ async def inject_message(
                 "Worker task 暂不支持执行中注入",
             )
         _require_no_pending_worker_routing(task)
+        await _require_no_pr_review_publication(db, task_id)
+        await _require_not_pr_review_task_mutation(
+            db,
+            task_id,
+            action="steered by message injection",
+        )
 
         _require_expected_task_routing(
             task,

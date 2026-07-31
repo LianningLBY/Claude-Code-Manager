@@ -59,7 +59,7 @@ async def shared_history(
         LogEntry.id, LogEntry.role, LogEntry.event_type, LogEntry.content,
         LogEntry.tool_name, LogEntry.tool_input, LogEntry.tool_output,
         LogEntry.is_error, LogEntry.loop_iteration, LogEntry.timestamp,
-        LogEntry.raw_json,
+        LogEntry.raw_json, LogEntry.task_retry_count,
     ]
     conditions = [
         LogEntry.task_id == task_id,
@@ -117,6 +117,7 @@ async def shared_history(
             "tool_output": tool_output,
             "is_error": row.is_error,
             "loop_iteration": row.loop_iteration,
+            "task_retry_count": row.task_retry_count,
             "timestamp": row.timestamp.isoformat() if row.timestamp else None,
         }
         if row.raw_json:
@@ -155,6 +156,17 @@ async def shared_chat(
         raise HTTPException(404, "Task not found")
     if not task.session_id:
         raise HTTPException(400, "Task has no active session")
+    from backend.api.tasks import (
+        _require_no_pr_review_publication,
+        _require_not_pr_review_task_mutation,
+    )
+
+    await _require_no_pr_review_publication(db, task_id)
+    await _require_not_pr_review_task_mutation(
+        db,
+        task_id,
+        action="continued by shared chat",
+    )
 
     # Sender identity is display metadata only.  Keep it in the persisted/UI
     # copy, while the model receives the caller's original message verbatim.

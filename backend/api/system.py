@@ -22,6 +22,9 @@ from backend.services.claude_models import (
     CLAUDE_MODEL_EFFORTS,
 )
 from backend.services.git_info import git_head_commit
+from backend.services.pr_review_runtime import (
+    PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
+)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -73,6 +76,12 @@ async def get_config():
         "default_codex_service_tier": DEFAULT_CODEX_SERVICE_TIER,
         "codex_service_tier_options": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
+        # Manager must see this exact capability before forwarding a PR review
+        # to a Worker. Older Workers would run it from their CCM checkout and
+        # silently load unrelated CLAUDE.md/AGENTS.md instructions.
+        "pr_review_snapshot_context_version": (
+            PR_REVIEW_SNAPSHOT_CONTEXT_VERSION
+        ),
     }
 
 

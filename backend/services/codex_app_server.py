@@ -69,6 +69,92 @@ _DESCENDANT_INTERRUPT_POLL_INTERVAL = 0.1
 # fence is an explicit failure, never permission to publish a false success.
 _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
 
+# Codex has no public "core tool allow-list" in app-server 0.144.6.  An
+# explicit empty environment removes every environment-backed tool, while a
+# deny-all permission profile remains the execution boundary if a future
+# version accidentally reintroduces one.  The response audit below proves that
+# this exact profile, rather than an inherited :read-only profile, was selected
+# before any model turn is admitted.
+_TOOL_FREE_PERMISSION_PROFILE = "ccm_pr_review_no_access_v1"
+_TOOL_FREE_DISABLED_FEATURES = frozenset({
+    "apps",
+    "artifact",
+    "auth_elicitation",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "code_mode",
+    "code_mode_host",
+    "computer_use",
+    "current_time_reminder",
+    "default_mode_request_user_input",
+    "deferred_executor",
+    "enable_fanout",
+    "enable_mcp_apps",
+    "goals",
+    "guardian_approval",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "plugin_sharing",
+    "realtime_conversation",
+    "remote_compaction_v2",
+    "remote_plugin",
+    "request_permissions_tool",
+    "shell_snapshot",
+    "shell_tool",
+    "skill_mcp_dependency_install",
+    "standalone_web_search",
+    "token_budget",
+    "tool_call_mcp_elicitation",
+    "tool_suggest",
+    "unified_exec",
+    "workspace_dependencies",
+})
+_TOOL_FREE_PASSIVE_ITEM_TYPES = frozenset({
+    "agentMessage",
+    "contextCompaction",
+    "reasoning",
+    "userMessage",
+})
+_TOOL_FREE_PASSIVE_NOTIFICATION_METHODS = frozenset({
+    "configWarning",
+    "deprecationNotice",
+    "error",
+    "guardianWarning",
+    "item/agentMessage/delta",
+    "item/completed",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
+    "item/started",
+    "model/rerouted",
+    "model/safetyBuffering/updated",
+    "model/verification",
+    "thread/tokenUsage/updated",
+    "turn/completed",
+    "turn/moderationMetadata",
+    "turn/started",
+    "warning",
+})
+_TOOL_FREE_FORBIDDEN_NOTIFICATION_PREFIXES = (
+    "command/",
+    "hook/",
+    "item/autoApprovalReview/",
+    "item/commandExecution/",
+    "item/fileChange/",
+    "item/mcpToolCall/",
+    "item/plan/",
+    "process/",
+    "thread/goal/",
+    "thread/realtime/",
+    "turn/diff/",
+    "turn/plan/",
+)
+
 
 async def _settle_registry_cleanup(awaitable):
     """Complete registry bookkeeping before propagating caller cancellation."""
@@ -199,6 +285,76 @@ def _require_idle_thread_status(
             str(status_type or "unknown"),
             operation=operation,
         )
+
+
+def _audit_tool_free_thread_response(response: Any) -> None:
+    """Prove the deny-all runtime selected before sending model input."""
+
+    if not isinstance(response, dict):
+        raise ValueError("thread response is not an object")
+    permission_profile = response.get("activePermissionProfile")
+    if (
+        not isinstance(permission_profile, dict)
+        or permission_profile.get("id") != _TOOL_FREE_PERMISSION_PROFILE
+        or permission_profile.get("extends") is not None
+    ):
+        raise ValueError("deny-all permission profile was not selected")
+    if response.get("runtimeWorkspaceRoots") != []:
+        raise ValueError("runtime workspace roots were not cleared")
+    if response.get("instructionSources") != []:
+        raise ValueError("ambient instruction sources were loaded")
+    if response.get("sandbox") != {
+        "type": "readOnly",
+        "networkAccess": False,
+    }:
+        raise ValueError(
+            "deny-all profile did not resolve to restricted sandbox"
+        )
+
+
+def _tool_free_disabled_skill_config(
+    response: Any,
+    *,
+    cwd: str,
+) -> list[dict[str, Any]]:
+    """Turn a forced skills inventory into an exact path deny-list."""
+
+    data = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(data, list) or len(data) != 1:
+        raise ValueError("skills inventory has an unexpected shape")
+    entry = data[0]
+    if not isinstance(entry, dict):
+        raise ValueError("skills inventory entry is malformed")
+    entry_cwd = entry.get("cwd")
+    if (
+        not isinstance(entry_cwd, str)
+        or _canonical_path(entry_cwd) != _canonical_path(cwd)
+    ):
+        raise ValueError("skills inventory cwd does not match")
+    if entry.get("errors") != []:
+        raise ValueError("skills inventory contains discovery errors")
+    skills = entry.get("skills")
+    if not isinstance(skills, list):
+        raise ValueError("skills inventory list is malformed")
+    disabled: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for skill in skills:
+        if not isinstance(skill, dict):
+            raise ValueError("skills inventory item is malformed")
+        path = skill.get("path")
+        enabled = skill.get("enabled")
+        if (
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or type(enabled) is not bool
+        ):
+            raise ValueError("skills inventory identity is malformed")
+        canonical = str(_canonical_path(path))
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        disabled.append({"path": canonical, "enabled": False})
+    return disabled
 
 
 def _canonical_app_server_service_tier(value: Any) -> str | None:
@@ -404,6 +560,9 @@ class _TurnContext:
     descendant_interrupt_lock: asyncio.Lock | None = None
     descendant_guard_task: asyncio.Task | None = None
     deferred_terminal_notification: dict[str, Any] | None = None
+    tools_disabled: bool = False
+    tool_policy_violation: str | None = None
+    tool_policy_abort_task: asyncio.Task | None = None
 
 
 @dataclass
@@ -455,6 +614,7 @@ class CodexAppServer:
         self._thread_runtime: dict[str, _ThreadRuntimeState] = {}
         self._stderr_lines: deque[str] = deque(maxlen=100)
         self._request_id = 0
+        self._skills_revision = 0
         self._write_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._shutdown_requested = False
@@ -507,6 +667,14 @@ class CodexAppServer:
             and not guard_task.done()
         ):
             guard_task.cancel()
+        policy_task = getattr(context, "tool_policy_abort_task", None)
+        context.tool_policy_abort_task = None
+        if (
+            policy_task is not None
+            and policy_task is not current_task
+            and not policy_task.done()
+        ):
+            policy_task.cancel()
         state_changed = getattr(context, "descendant_state_changed", None)
         if state_changed is not None:
             state_changed.set()
@@ -611,6 +779,80 @@ class CodexAppServer:
                 return str(turn["id"])
         turn_id = params.get("turnId")
         return str(turn_id) if turn_id else None
+
+    def _tool_free_context_for_params(
+        self,
+        params: Any,
+    ) -> _TurnContext | None:
+        """Resolve an exact tool-free generation from v1 or v2 identities."""
+
+        if not isinstance(params, dict):
+            return None
+        turn_id = params.get("turnId")
+        if turn_id:
+            context = self._contexts_by_turn.get(str(turn_id))
+            if context is not None and context.tools_disabled:
+                return context
+        thread_id = params.get("threadId") or params.get("conversationId")
+        if thread_id:
+            context = self._contexts_by_thread.get(str(thread_id))
+            if context is not None and context.tools_disabled:
+                return context
+        return None
+
+    async def _abort_tool_free_violation(
+        self,
+        context: _TurnContext,
+        reason: str,
+    ) -> None:
+        """Interrupt one violating turn before publishing a hard failure."""
+
+        try:
+            await self._interrupt_turn_context(context)
+        except BaseException:
+            # Do not detach or claim failure while the native generation may
+            # still execute. Its terminal notification (or transport shutdown)
+            # remains responsible for closing the adapter.
+            logger.exception(
+                "Codex tool-free policy interrupt failed task=%s thread=%s",
+                context.task_id,
+                context.thread_id,
+            )
+            return
+        if not self._context_is_current(context):
+            return
+        context.process.feed({
+            "type": "turn.failed",
+            "error": {
+                "message": reason,
+                "code": "ccm_tool_policy_violation",
+            },
+            "turn_id": context.turn_id,
+        })
+        self._detach_turn_context(context)
+        context.process.finish(1, reason)
+
+    def _schedule_tool_free_violation(
+        self,
+        context: _TurnContext,
+        source: str,
+    ) -> None:
+        """Record the first unexpected capability use and fail it once."""
+
+        if (
+            not context.tools_disabled
+            or context.process.returncode is not None
+            or context.tool_policy_violation is not None
+        ):
+            return
+        reason = (
+            "Codex PR review attempted a forbidden tool or autonomous "
+            f"capability: {source}"
+        )
+        context.tool_policy_violation = reason
+        context.tool_policy_abort_task = asyncio.create_task(
+            self._abort_tool_free_violation(context, reason),
+        )
 
     @staticmethod
     def _thread_status_type(status: Any) -> str | None:
@@ -1256,7 +1498,18 @@ class CodexAppServer:
         turn = params.get("turn") or {}
         status = turn.get("status") or "completed"
         error = turn.get("error")
-        if status == "completed":
+        if context.tool_policy_violation is not None:
+            normalized_error = {
+                "message": context.tool_policy_violation,
+                "code": "ccm_tool_policy_violation",
+            }
+            context.process.feed(
+                {"type": "turn.failed", "error": normalized_error}
+            )
+            status = "toolPolicyViolation"
+            exit_code = 1
+            stderr = context.tool_policy_violation
+        elif status == "completed":
             context.process.feed(
                 {
                     "type": "turn.completed",
@@ -1441,6 +1694,7 @@ class CodexAppServer:
 
     async def _start(self) -> None:
         self._stderr_lines.clear()
+        self._skills_revision = 0
         # These facts belong to one app-server process generation.  Persisted
         # thread ownership is kept separately in ``_known_threads``.
         self._contexts_by_descendant.clear()
@@ -1549,6 +1803,7 @@ class CodexAppServer:
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
+        tools_disabled: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -1562,6 +1817,39 @@ class CodexAppServer:
             "read-only",
         }:
             raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
+        if tools_disabled:
+            if os.name != "posix":
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex tool-free profile currently requires POSIX "
+                    "deny-all filesystem permissions"
+                )
+            if sandbox_mode != "read-only":
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex tool-free profile requires read-only admission"
+                )
+            if mcp_specs or skill_context.strip() or git_env:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex tool-free profile forbids MCP, injected skill "
+                    "context, and per-project environment credentials"
+                )
+            if not disable_autonomous_features:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex tool-free profile requires autonomous features "
+                    "to be disabled"
+                )
+            if resume_session_id:
+                # Dynamic tools are persisted in rollout metadata.  Codex
+                # 0.144.6 restores them when a resumed thread receives an
+                # empty dynamic-tools list, and thread/resume has no field
+                # that can authoritatively clear them.  A review prompt is a
+                # complete immutable snapshot, so start a fresh provably empty
+                # thread instead of trusting an older thread's capabilities.
+                logger.info(
+                    "Ignoring Codex PR-review resume thread %s; tool-free "
+                    "admission requires a fresh native thread",
+                    resume_session_id,
+                )
+                resume_session_id = None
         service_tier = normalize_codex_service_tier(codex_service_tier)
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -1579,6 +1867,7 @@ class CodexAppServer:
         )
         required_mcp = any(spec.required for spec in mcp_specs)
         required_context = bool(skill_context.strip())
+        tool_free_skills_revision: int | None = None
         try:
             thread_config: dict[str, Any] = (
                 render_codex_mcp_config(mcp_specs) if mcp_specs else {}
@@ -1656,6 +1945,54 @@ class CodexAppServer:
                     },
                 },
             )
+        if tools_disabled:
+            # PR-review turns receive a complete backend-snapshotted prompt.
+            # ``environments=[]`` below removes environment-backed tool specs.
+            # The named profile denies every filesystem path and all network,
+            # so even an accidentally reintroduced tool cannot read local
+            # credentials before the event-level audit interrupts the turn.
+            _deep_merge_config(
+                thread_config,
+                {
+                    "web_search": "disabled",
+                    "features": {
+                        feature: False
+                        for feature in _TOOL_FREE_DISABLED_FEATURES
+                    },
+                    "tools": {
+                        "experimental_request_user_input": {
+                            "enabled": False,
+                        },
+                    },
+                    "orchestrator": {
+                        "skills": {"enabled": False},
+                        "mcp": {"enabled": False},
+                    },
+                    "skills": {
+                        "include_instructions": False,
+                        "bundled": {"enabled": False},
+                        "config": [],
+                    },
+                    "default_permissions": _TOOL_FREE_PERMISSION_PROFILE,
+                    "permissions": {
+                        _TOOL_FREE_PERMISSION_PROFILE: {
+                            "filesystem": {
+                                "/": "deny",
+                            },
+                            "network": {
+                                "enabled": False,
+                                "allow_local_binding": False,
+                            },
+                        },
+                    },
+                    "shell_environment_policy": {
+                        "inherit": "none",
+                        "set": {},
+                    },
+                    "project_doc_max_bytes": 0,
+                    "project_doc_fallback_filenames": [],
+                },
+            )
         try:
             await self.ensure_started()
         except CodexAppServerBusyError:
@@ -1680,6 +2017,68 @@ class CodexAppServer:
                     + str(exc)
                 ) from exc
             raise
+        if tools_disabled:
+            try:
+                effective = await self._request(
+                    "config/read",
+                    {
+                        "cwd": os.path.abspath(cwd),
+                        "includeLayers": False,
+                    },
+                )
+                effective_config = (
+                    effective.get("config")
+                    if isinstance(effective, dict)
+                    else None
+                )
+                if not isinstance(effective_config, dict):
+                    raise ValueError("effective Codex configuration is malformed")
+                for instruction_key in (
+                    "developer_instructions",
+                    "instructions",
+                    "model_instructions_file",
+                ):
+                    if effective_config.get(instruction_key) not in {
+                        None,
+                        "",
+                    }:
+                        raise ValueError(
+                            "ambient Codex instructions are configured"
+                        )
+                inherited_mcp = effective_config.get("mcp_servers", {})
+                if not isinstance(inherited_mcp, dict) or any(
+                    not isinstance(name, str) or not name
+                    for name in inherited_mcp
+                ):
+                    raise ValueError(
+                        "effective MCP server configuration is malformed"
+                    )
+                # An empty higher-level table does not erase lower config
+                # layers in Codex. Disable every effective inherited server
+                # explicitly; this was verified against CLI 0.144.6.
+                thread_config["mcp_servers"] = {
+                    name: {"enabled": False}
+                    for name in inherited_mcp
+                }
+                skills_inventory = await self._request(
+                    "skills/list",
+                    {
+                        "cwds": [os.path.abspath(cwd)],
+                        "forceReload": True,
+                    },
+                )
+                thread_config["skills"]["config"] = (
+                    _tool_free_disabled_skill_config(
+                        skills_inventory,
+                        cwd=cwd,
+                    )
+                )
+                tool_free_skills_revision = self._skills_revision
+            except Exception as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex tool-free profile could not audit ambient "
+                    "instructions and inherited MCP servers"
+                ) from exc
         actual_tier_proxy = self._actual_tier_proxy
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -1715,11 +2114,19 @@ class CodexAppServer:
             # through the guardian subagent, which would create hidden model
             # work outside the root turn.
             "approvalsReviewer": "user",
-            "sandbox": sandbox_mode,
             # This field is intentionally present even for Standard.  JSON null
             # clears a sticky service tier inherited from a resumed thread.
             "serviceTier": rpc_service_tier,
         }
+        if tools_disabled:
+            # Clear config-level developer instructions. Project/user
+            # instruction files are independently proven absent through
+            # ``instructionSources`` in the thread response.
+            common["baseInstructions"] = ""
+            common["developerInstructions"] = ""
+            common["permissions"] = _TOOL_FREE_PERMISSION_PROFILE
+        else:
+            common["sandbox"] = sandbox_mode
         if model and model != "default":
             common["model"] = model
         if thread_config:
@@ -1731,6 +2138,17 @@ class CodexAppServer:
             if resume_session_id
             else common
         )
+        if tools_disabled and not resume_session_id:
+            # These fields are gated by the experimentalApi capability that
+            # CCM enables during initialization. Explicit empty values are
+            # materially different from omission: omission selects the local
+            # default environment and re-adds exec/apply_patch/view_image.
+            thread_params.update({
+                "environments": [],
+                "runtimeWorkspaceRoots": [],
+                "selectedCapabilityRoots": [],
+                "dynamicTools": [],
+            })
         try:
             response = await self._request(thread_method, thread_params)
         except Exception as exc:
@@ -1761,6 +2179,25 @@ class CodexAppServer:
                     + message
                 )
             raise CodexAppServerError(message)
+        if tools_disabled:
+            try:
+                _audit_tool_free_thread_response(response)
+                # Drain notifications already queued behind thread/start. A
+                # changed inventory invalidates the exact path deny-list and
+                # must fail before turn/start sends model input.
+                await asyncio.sleep(0)
+                if (
+                    tool_free_skills_revision is None
+                    or self._skills_revision != tool_free_skills_revision
+                ):
+                    raise ValueError(
+                        "skills inventory changed during admission"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex tool-free profile was not proven by the "
+                    f"{thread_method} response"
+                ) from exc
         thread_id = str(thread_id)
         self._known_threads.add(thread_id)
         if on_thread_started is not None:
@@ -1848,6 +2285,7 @@ class CodexAppServer:
             process=turn_process,
             launch_started=launch_started,
             task_id=task_id,
+            tools_disabled=tools_disabled,
             descendant_state_changed=asyncio.Event(),
             descendant_interrupt_lock=asyncio.Lock(),
             admission_observed_future=(
@@ -1881,6 +2319,23 @@ class CodexAppServer:
                 )
                 raise
 
+        if (
+            tools_disabled
+            and (
+                tool_free_skills_revision is None
+                or self._skills_revision != tool_free_skills_revision
+            )
+        ):
+            # The ownership hook above may await durable state. Recheck the
+            # inventory generation at the final boundary before model input
+            # goes on the wire.
+            reason = (
+                "Codex tool-free skills inventory changed before turn/start"
+            )
+            self._detach_turn_context(context)
+            turn_process.finish(1, reason)
+            raise CodexRequiredMcpPreTurnError(reason)
+
         model_prompt = prompt
         if required_context:
             from backend.services.skill_context import wrap_skill_context
@@ -1904,7 +2359,14 @@ class CodexAppServer:
             # between thread admission and this turn.
             "serviceTier": rpc_service_tier,
         }
-        if sandbox_mode == "read-only":
+        if tools_disabled:
+            # A turn-level cwd without an explicit empty environment causes
+            # Codex to silently restore its default local environment. Repeat
+            # both empty selections and the deny-all profile on every turn.
+            turn_params["environments"] = []
+            turn_params["runtimeWorkspaceRoots"] = []
+            turn_params["permissions"] = _TOOL_FREE_PERMISSION_PROFILE
+        elif sandbox_mode == "read-only":
             # Repeat the policy at turn/start.  This is a schema-backed field
             # and prevents a resumed thread's sticky/default settings from
             # widening a Monitor turn after thread admission.
@@ -2939,6 +3401,43 @@ class CodexAppServer:
     async def _handle_server_request(self, message: dict[str, Any]) -> None:
         method = str(message.get("method") or "")
         request_id = message.get("id")
+        params = message.get("params") or {}
+        tool_free_context = self._tool_free_context_for_params(params)
+        if (
+            tool_free_context is not None
+            and (
+                method.startswith(("item/", "mcpServer/"))
+                or method in {
+                    "applyPatchApproval",
+                    "currentTime/read",
+                    "execCommandApproval",
+                }
+            )
+        ):
+            # Respond first so the app-server reader can continue processing
+            # the interrupt RPC scheduled below. Awaiting that RPC from inside
+            # this request handler would deadlock the shared stdio reader.
+            if method in {
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+            }:
+                response = {"id": request_id, "result": {"decision": "decline"}}
+            elif method in {"applyPatchApproval", "execCommandApproval"}:
+                response = {"id": request_id, "result": {"decision": "denied"}}
+            else:
+                response = {
+                    "id": request_id,
+                    "error": {
+                        "code": -32600,
+                        "message": "Tool calls are disabled for PR review",
+                    },
+                }
+            await self._write(response)
+            self._schedule_tool_free_violation(
+                tool_free_context,
+                f"server request {method}",
+            )
+            return
         if method in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
@@ -2951,7 +3450,6 @@ class CodexAppServer:
         if method == "item/permissions/requestApproval":
             # This newer API has a different response schema: grant the exact
             # requested profile for this turn, matching danger-full-access.
-            params = message.get("params") or {}
             await self._write({
                 "id": request_id,
                 "result": {
@@ -2981,6 +3479,17 @@ class CodexAppServer:
         )
 
     def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
+        if method == "skills/changed":
+            # Skill discovery is process-global. Any change invalidates the
+            # exact path inventory captured for every active tool-free turn.
+            self._skills_revision += 1
+            for context in list(self._contexts_by_thread.values()):
+                if context.tools_disabled:
+                    self._schedule_tool_free_violation(
+                        context,
+                        "skills inventory changed",
+                    )
+            return
         if method == "thread/started":
             thread = params.get("thread")
             if isinstance(thread, dict):
@@ -3010,6 +3519,11 @@ class CodexAppServer:
                                 else None
                             ),
                         )
+                        if lineage_context.tools_disabled:
+                            self._schedule_tool_free_violation(
+                                lineage_context,
+                                f"native child thread {child_id}",
+                            )
                 proxy = self._actual_tier_proxy
                 if (
                     proxy is not None
@@ -3143,6 +3657,36 @@ class CodexAppServer:
                 (method, dict(params)),
             )
             return
+        if context.tools_disabled:
+            if method in {"item/started", "item/completed"}:
+                item = params.get("item")
+                item_type = (
+                    item.get("type")
+                    if isinstance(item, dict)
+                    else None
+                )
+                if item_type not in _TOOL_FREE_PASSIVE_ITEM_TYPES:
+                    self._schedule_tool_free_violation(
+                        context,
+                        f"{method} item type {item_type!r}",
+                    )
+                    return
+            elif method.startswith(
+                _TOOL_FREE_FORBIDDEN_NOTIFICATION_PREFIXES
+            ):
+                self._schedule_tool_free_violation(
+                    context,
+                    f"notification {method}",
+                )
+                return
+            elif method not in _TOOL_FREE_PASSIVE_NOTIFICATION_METHODS:
+                # Treat new protocol surface as executable until explicitly
+                # audited and added to the passive allow-list.
+                self._schedule_tool_free_violation(
+                    context,
+                    f"unexpected notification {method}",
+                )
+                return
         if method == "turn/completed" and context.admitted_turn_id is None:
             # Notifications may race ahead of the turn/start RPC response.
             # Keep the adapter open until the response supplies a real turn id

@@ -878,6 +878,7 @@ class InstanceManager:
         task_retry_count: int | None = None
         task_skill_context = ""
         codex_monitor_enabled = False
+        pr_review_task = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -903,6 +904,11 @@ class InstanceManager:
                     raise LaunchSupersededError(
                         f"Task {task_id} disappeared before launch"
                     )
+                from backend.services.pr_review_runtime import (
+                    is_pr_review_task,
+                )
+
+                pr_review_task = is_pr_review_task(task)
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -929,6 +935,12 @@ class InstanceManager:
                         project_dir=cwd,
                         enabled_skills=enabled_skills,
                     )
+                if pr_review_task:
+                    # PR input is already snapshotted into the fixed prompt.
+                    # No ambient skills or monitor capability may reintroduce
+                    # filesystem/network tools.
+                    task_skill_context = ""
+                    codex_monitor_enabled = False
         if provider == "codex":
             # A Codex turn is not reusable when its process adapter reaches a
             # terminal returncode: the output consumer may still be migrating
@@ -977,13 +989,13 @@ class InstanceManager:
         self._effective_exit_codes.pop(instance_id, None)
 
         mcp_config_path = None
-        if provider == "claude" and task_id:
+        if provider == "claude" and task_id and not pr_review_task:
             from backend.services.mcp_config import generate_mcp_config
             mcp_config_path = generate_mcp_config(task_id, enabled_skills or {})
 
         # ask_user：把 AskUserQuestion 拦截 hook 注入本次使用的 config_dir（-p 与 PTY 统一）。
         # config_dir 为空时落到默认 ~/.claude。失败不阻断 launch。
-        if provider == "claude":
+        if provider == "claude" and not pr_review_task:
             from backend.services.ask_user_settings import ensure_ask_user_hook
             ensure_ask_user_hook(config_dir or os.path.expanduser("~/.claude"))
 
@@ -1043,12 +1055,14 @@ class InstanceManager:
             provider == "codex"
             and task_id is not None
             and settings.codex_main_mcp_enabled
+            and not pr_review_task
         )
         codex_sub_agent_mcp_required = bool(
             provider == "codex"
             and task_id is not None
             and enabled_skills
             and enabled_skills.get("sub-agent")
+            and not pr_review_task
         )
         codex_mcp_required = (
             codex_main_mcp_required or codex_sub_agent_mcp_required
@@ -1099,6 +1113,16 @@ class InstanceManager:
                 "the app-server transport is disabled"
             )
 
+        if (
+            provider == "codex"
+            and pr_review_task
+            and not settings.codex_app_server_enabled
+        ):
+            raise CodexRequiredMcpError(
+                "Codex PR review isolation requires the app-server read-only "
+                "sandbox; exec fallback is disabled"
+            )
+
         if provider == "codex" and settings.codex_app_server_enabled:
             async with self.codex_home_app_server_guard(config_dir):
                 try:
@@ -1122,8 +1146,18 @@ class InstanceManager:
                         source_log_id=source_log_id,
                         current_message=current_message,
                         queue_timestamp=queue_timestamp,
-                        disable_project_config=cloudrouter_account is not None,
+                        disable_project_config=(
+                            cloudrouter_account is not None
+                            or pr_review_task
+                        ),
                         codex_service_tier=codex_service_tier,
+                        sandbox_mode=(
+                            "read-only"
+                            if pr_review_task
+                            else "danger-full-access"
+                        ),
+                        disable_autonomous_features=pr_review_task,
+                        tools_disabled=pr_review_task,
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -1135,6 +1169,11 @@ class InstanceManager:
                     )
                     return pid
                 except CodexRequiredMcpPreTurnError as exc:
+                    if pr_review_task:
+                        raise CodexRequiredMcpError(
+                            "Codex PR review read-only sandbox could not be "
+                            "confirmed before turn/start"
+                        ) from exc
                     if codex_service_tier == "priority":
                         raise CodexServiceTierUnavailableError(
                             "Codex Fast could not be confirmed before "
@@ -1187,6 +1226,15 @@ class InstanceManager:
                     )
                     raise
                 except Exception as exc:
+                    if pr_review_task:
+                        logger.exception(
+                            "Codex PR review app-server failed; refusing "
+                            "unsandboxed exec fallback task_id=%s",
+                            task_id,
+                        )
+                        raise CodexRequiredMcpError(
+                            "Codex PR review isolation could not be guaranteed"
+                        ) from exc
                     if codex_service_tier == "priority":
                         # exec --json does not expose an accepted/effective
                         # service tier before it executes the prompt.  A
@@ -1226,7 +1274,11 @@ class InstanceManager:
                         config_dir,
                     )
 
-        if provider == "claude" and self.pty_mode_enabled:
+        if (
+            provider == "claude"
+            and self.pty_mode_enabled
+            and not pr_review_task
+        ):
             return await self._launch_pty(
                 instance_id=instance_id,
                 prompt=prompt,
@@ -1253,6 +1305,11 @@ class InstanceManager:
                 queue_timestamp=queue_timestamp,
             )
 
+        if provider == "codex" and pr_review_task:
+            raise CodexRequiredMcpError(
+                "Codex PR review isolation forbids exec fallback"
+            )
+
         cmd = self._build_command(
             provider=provider,
             prompt=prompt,
@@ -1271,6 +1328,7 @@ class InstanceManager:
             ),
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
+            tools_disabled=pr_review_task,
         )
         if provider == "codex":
             logger.info(
@@ -1904,6 +1962,9 @@ class InstanceManager:
         queue_timestamp: float | None = None,
         disable_project_config: bool = False,
         codex_service_tier: str = "default",
+        sandbox_mode: str = "danger-full-access",
+        disable_autonomous_features: bool = False,
+        tools_disabled: bool = False,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -1923,6 +1984,9 @@ class InstanceManager:
             disable_project_config=disable_project_config,
             skill_context=skill_context,
             codex_service_tier=codex_service_tier,
+            sandbox_mode=sandbox_mode,
+            disable_autonomous_features=disable_autonomous_features,
+            tools_disabled=tools_disabled,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -4904,6 +4968,7 @@ class InstanceManager:
                     failure_notice = LogEntry(
                         instance_id=instance_id,
                         task_id=task_id,
+                        task_retry_count=expected_retry_count,
                         event_type="system_event",
                         role="system",
                         content=(
@@ -5045,6 +5110,7 @@ class InstanceManager:
         codex_mcp_specs: Sequence["McpServerSpec"] = (),
         codex_api_account: bool = False,
         codex_service_tier: str = "default",
+        tools_disabled: bool = False,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -5061,6 +5127,25 @@ class InstanceManager:
                 cmd.extend(["--model", model])
             if effort_level:
                 cmd.extend(["--effort", effort_level])
+            if tools_disabled:
+                # PR review prompts contain the complete backend-snapshotted
+                # input. An empty allow-list is the actual credential/tool
+                # boundary; the prompt's "do not write" sentence is only
+                # defense in depth.
+                cmd.extend([
+                    "--tools",
+                    "",
+                    # Ignore user/project/local settings (including hooks and
+                    # CLAUDE.md discovery) while retaining the account's normal
+                    # OAuth/keychain authentication path; ``--bare`` cannot be
+                    # used because it intentionally disables that auth path.
+                    "--setting-sources",
+                    "",
+                    "--strict-mcp-config",
+                    "--disable-slash-commands",
+                    "--exclude-dynamic-system-prompt-sections",
+                ])
+                return cmd
             from backend.services.skill_loader import (
                 discover_skills,
                 get_skill_disallowed_tools,
@@ -6109,6 +6194,9 @@ class InstanceManager:
                         failure_notice = LogEntry(
                             instance_id=instance_id,
                             task_id=task_id,
+                            task_retry_count=(
+                                current_task_generation.retry_count
+                            ),
                             event_type="system_event",
                             role="system",
                             content=(
@@ -8140,9 +8228,32 @@ class InstanceManager:
                     task_id,
                 )
                 return
+            persisted_task_retry_count = None
+            if task_id is not None:
+                if event_record is not None:
+                    persisted_task_retry_count = (
+                        event_record.task_retry_count
+                    )
+                elif detached_autonomous:
+                    persisted_task_retry_count = (
+                        await db.execute(
+                            select(Task.retry_count).where(
+                                *task_event_predicates()
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if persisted_task_retry_count is None:
+                        await db.rollback()
+                        logger.info(
+                            "Dropping autonomous event without an exact retry "
+                            "generation for task %s",
+                            task_id,
+                        )
+                        return
             entry = LogEntry(
                 instance_id=instance_id,
                 task_id=task_id,
+                task_retry_count=persisted_task_retry_count,
                 event_type=event["event_type"],
                 role=event.get("role"),
                 content=event.get("content"),
@@ -8311,6 +8422,8 @@ class InstanceManager:
             task_id=task_id,
             timestamp=(entry.timestamp or datetime.utcnow()).isoformat(),
         )
+        if entry.task_retry_count is not None:
+            broadcast_data["task_retry_count"] = entry.task_retry_count
         if loop_iteration is not None:
             broadcast_data["loop_iteration"] = loop_iteration
         if not detached_autonomous:

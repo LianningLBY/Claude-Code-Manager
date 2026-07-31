@@ -1526,6 +1526,232 @@ async def test_launch_with_effort_level(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_claude_pr_review_disables_all_tools_and_bypasses_pty(
+    db_factory,
+    tmp_path,
+):
+    """A PR snapshot turn must not inherit Claude tools, MCP, hooks, or PTY."""
+
+    async with db_factory() as db:
+        inst = Instance(name="claude-pr-review-isolated")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    process = _make_mock_process(returncode=None)
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._pty_enabled = True
+    im._pty_backend = MagicMock()
+    im._launch_pty = AsyncMock(
+        side_effect=AssertionError("PR review must not enter PTY")
+    )
+    im._consume_output = AsyncMock()
+
+    with (
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as exec_mock,
+        patch(
+            "backend.services.mcp_config.generate_mcp_config"
+        ) as generate_mcp,
+        patch(
+            "backend.services.ask_user_settings.ensure_ask_user_hook"
+        ) as ensure_ask_user,
+        patch(
+            "backend.services.skill_loader.discover_skills"
+        ) as discover_skills,
+    ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="review the backend-snapshotted input",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="claude",
+            config_dir=str(tmp_path / "claude-home"),
+            enabled_skills={"monitor": True, "sub-agent": True},
+            system_prompt_mode="append",
+        )
+
+    argv = list(exec_mock.await_args.args)
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--disable-slash-commands" in argv
+    assert "--exclude-dynamic-system-prompt-sections" in argv
+    assert "--mcp-config" not in argv
+    assert "--append-system-prompt-file" not in argv
+    assert "--system-prompt-file" not in argv
+    im._launch_pty.assert_not_awaited()
+    generate_mcp.assert_not_called()
+    ensure_ask_user.assert_not_called()
+    discover_skills.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_pr_review_uses_only_isolated_app_server_route(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """PR reviews pin Codex to read-only app-server with no ambient config."""
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-pr-review-isolated")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(return_value=43_210)
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        pid = await im.launch(
+            instance_id=inst.id,
+            prompt="review the backend-snapshotted input",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            enabled_skills={"monitor": True, "sub-agent": True},
+        )
+
+    assert pid == 43_210
+    kwargs = im._launch_codex_app_server.await_args.kwargs
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["sandbox_mode"] == "read-only"
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["tools_disabled"] is True
+    assert kwargs["mcp_specs"] == ()
+    assert kwargs["skill_context"] == ""
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        (
+            CodexRequiredMcpPreTurnError("sandbox could not be confirmed"),
+            CodexRequiredMcpError,
+        ),
+        (RuntimeError("app-server protocol failed"), CodexRequiredMcpError),
+        (asyncio.TimeoutError(), asyncio.TimeoutError),
+    ],
+)
+async def test_codex_pr_review_app_server_failure_never_falls_back_to_exec(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    failure,
+    expected_error,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name=f"codex-pr-no-fallback-{type(failure).__name__}")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(side_effect=failure)
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(expected_error):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must fail closed",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_pr_review_rejects_disabled_app_server_before_exec(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-pr-app-server-required")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="requires the app-server read-only sandbox",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must not use exec",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_launch_codex_provider_command(db_factory, monkeypatch, tmp_path):
     """launch(provider='codex') constructs codex exec command."""
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
@@ -1770,6 +1996,16 @@ async def test_launch_codex_prefers_persistent_app_server(
     assert (
         im._launch_codex_app_server.await_args.kwargs[
             "disable_project_config"
+        ]
+        is False
+    )
+    assert (
+        im._launch_codex_app_server.await_args.kwargs["sandbox_mode"]
+        == "danger-full-access"
+    )
+    assert (
+        im._launch_codex_app_server.await_args.kwargs[
+            "disable_autonomous_features"
         ]
         is False
     )
@@ -9176,11 +9412,24 @@ async def test_process_event_reactivates_completed_task(db_factory):
 
         async with db_factory() as db:
             t = await db.get(Task, task_id)
+            stored_log = (
+                await db.execute(
+                    select(LogEntry).where(LogEntry.task_id == task_id)
+                )
+            ).scalar_one()
             assert t.status == "executing"
+            assert stored_log.task_retry_count == retry_count
         assert any(
             p.get("new_status") == "executing"
             for p in _status_change_payloads(broadcaster)
         )
+        task_events = [
+            call.args[1]
+            for call in broadcaster.broadcast.await_args_list
+            if call.args[0] == f"task:{task_id}"
+            and call.args[1].get("event_type") == "message"
+        ]
+        assert task_events[0]["task_retry_count"] == retry_count
     finally:
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)

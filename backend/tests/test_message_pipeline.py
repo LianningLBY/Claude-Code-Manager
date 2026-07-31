@@ -542,7 +542,8 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
         ))
         db.add(LogEntry(
             instance_id=1, task_id=task_id,
-            event_type="message", role="assistant", content="Hello", is_error=False,
+            task_retry_count=7, event_type="message", role="assistant",
+            content="Hello", is_error=False,
         ))
         await db.commit()
 
@@ -550,6 +551,7 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
     msgs = resp.json()
     assert len(msgs) == 1
     assert msgs[0]["content"] == "Hello"
+    assert msgs[0]["task_retry_count"] == 7
 
 
 @pytest.mark.asyncio

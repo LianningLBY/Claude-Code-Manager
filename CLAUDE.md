@@ -319,6 +319,8 @@ uv run python scripts/transfer_db.py \
 使用 **Alembic** 管理 schema 版本。`init_db()` 在启动时自动执行 `alembic upgrade head`，无需手动操作。
 
 > **严禁手动修改数据库 schema**（如直接执行 `ALTER TABLE`、`DROP COLUMN` 等）。所有 schema 变更必须且只能通过 Alembic migration 文件管理，否则会导致 migration 状态不一致、其他环境部署失败。
+>
+> **已发布的 revision 永久保留**：只要 migration 曾进入可部署分支，就不得删除、改 ID 或改写既有 `upgrade`/`downgrade`。功能回滚也必须保留原 migration，并新增一个以它为 `down_revision` 的前向清理 migration；否则已经记录该 revision 的生产数据库会在 `alembic current` 阶段无法启动或更新。
 
 **Schema 变更流程**（详见 [DATABASE.md](./DATABASE.md)）：
 1. 修改 `backend/models/` 中的模型

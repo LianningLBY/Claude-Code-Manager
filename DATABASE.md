@@ -128,6 +128,7 @@ uv run alembic stamp head
 
 - **文件位置**：`alembic/versions/`
 - **命名格式**：`<revision_id>_<描述>.py`（由 Alembic 自动生成）
+- **已发布 revision 不可删除或改写**：曾进入可部署分支的 migration 必须永久保留。回滚功能时新增一个以旧 revision 为 `down_revision` 的前向清理 migration，禁止删除旧文件、改 revision ID 或手动 `stamp` 绕过历史。
 - **必须包含 downgrade**：`downgrade()` 函数必须实现，能够回滚所有 `upgrade()` 的变更
 - **SQLite 的 ALTER 限制**：修改已有列（改类型、改 nullable）必须使用 batch 模式：
 
@@ -146,3 +147,5 @@ uv run alembic stamp head
 |------------------|-----------------------------------|------------|
 | `6b3f8a1c2d9e`   | Initial schema（所有初始表）       | 2025-01-01 |
 | `c4d7e2f9a0b1`   | Loop task 字段（todo_file_path 等）| 2026-03-07 |
+| `b6e1f4a2c9d7`   | Independent Plan schema（历史 revision，永久保留） | 2026-07-29 |
+| `f7a1c3d9e5b2`   | 清理已撤回的 Independent Plan schema | 2026-07-31 |

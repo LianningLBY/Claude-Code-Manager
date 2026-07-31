@@ -605,6 +605,47 @@ class TestSchemaConsistency:
         engine.dispose()
 
 
+class TestPublishedMigrationHistory:
+    """Previously deployed revision IDs remain upgradeable after a revert."""
+
+    def test_reverted_plan_revision_upgrades_and_downgrades_cleanly(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "reverted_plan.db")
+        cfg = _alembic_cfg(db_path)
+
+        # Simulate a production database that deployed PR #81 before its
+        # application code was reverted.
+        _run_alembic(cfg, command.upgrade, "b6e1f4a2c9d7")
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_runs" in _get_all_tables(engine)
+        assert "plan_target_task_id" in _get_table_columns(engine, "tasks")
+        engine.dispose()
+
+        # The follow-up revision removes the reverted schema without deleting
+        # the already-published b6 revision from Alembic's history.
+        _run_alembic(cfg, command.upgrade, "head")
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_runs" not in _get_all_tables(engine)
+        assert "plan_agent_steps" not in _get_all_tables(engine)
+        assert "plan_target_task_id" not in _get_table_columns(engine, "tasks")
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar() == _get_head_revision(cfg)
+        engine.dispose()
+
+        # Downgrade remains reversible, then the cleanup can be applied again.
+        _run_alembic(cfg, command.downgrade, "b6e1f4a2c9d7")
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_runs" in _get_all_tables(engine)
+        assert "plan_target_task_id" in _get_table_columns(engine, "tasks")
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+
 class TestInitDbLogic:
     """Test the init_db() branching logic from database.py."""
 

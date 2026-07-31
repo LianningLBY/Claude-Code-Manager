@@ -973,3 +973,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
   2. **过时断言**——7-29 monitor 重构（544c128）确立「睡眠中的 Monitor 不阻塞更新」，7-24 写的 blocker 测试仍断言纯 `_monitor_tasks` lifecycle 应阻塞；改为 `_monitor_active_turns` 作运行证据并反向断言睡眠 lifecycle 不阻塞。
   3. **密闭性缺陷**×2——start guard 测试默认读机器全局 `/tmp/ccm-update-status-8000.json`（撞宿主 7-19 真实部署残留）；WS identity 测试隐式依赖 `.env` 的 `AUTH_TOKEN` 非空（空则 `_ws_identity` 短路 super_admin，JWT 分支根本没被执行）。均改为测试内显式注入。
 - **预防**：涉及扫描 `/proc`、`/tmp` 全局路径或 `settings.*` 环境值的测试必须显式注入被测状态，不能假设宿主干净；同类先例已写进 CLAUDE.md「pytest 外部状态隔离」，本次是该规则的两个漏网点。
+
+### 2026-07-31 — 恢复已发布 Alembic revision，修复生产更新失败（commit e69e11a）
+
+- **事故**：生产数据库已经记录 `b6e1f4a2c9d7`，功能回滚却直接删除了对应 migration；新代码执行 `alembic current` 时无法定位该 revision，事务化更新只能回滚到旧版本。
+- **修复**：原样恢复 `b6e1f4a2c9d7`，新增以它为父 revision 的 `f7a1c3d9e5b2` 前向清理 migration，移除已回滚 Plan 功能的表、索引和字段。这样既保留不可变的部署历史，又让旧生产库和全新数据库最终收敛到当前 ORM schema。
+- **预防与验证**：CLAUDE.md、DATABASE.md 明确已发布 revision 永久保留；新增从 `b6e1f4a2c9d7` 升级到 head、降级恢复、再次升级的回归。`backend/tests/test_alembic_migrations.py` 共 `15 passed`，`alembic heads` 仅有 `f7a1c3d9e5b2`，`git diff --check` 通过。

@@ -2398,6 +2398,66 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     clickSpy.mockRestore();
     vi.unstubAllGlobals();
   });
+
+  it.each(['claude', 'codex'] as const)(
+    '%s 助手返回裸绝对文件路径时自动显示任务下载链接',
+    async (provider) => {
+      const artifactPath = '/home/ubuntu/Projects/调研coding agent/test-download.txt';
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        {
+          id: 502,
+          role: 'assistant',
+          event_type: 'message',
+          content: `测试下载文件已生成：${artifactPath}\n\n文件约 1 KB。`,
+          tool_name: null,
+          tool_input: null,
+          tool_output: null,
+          is_error: false,
+          loop_iteration: null,
+          timestamp: null,
+          image_urls: null,
+          attachments: null,
+        },
+      ]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 89, provider })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const link = await screen.findByRole('link', { name: /test-download\.txt/ });
+      expect(decodeURI(link.getAttribute('href') || '')).toBe(artifactPath);
+      expect(link).toHaveAttribute('title', '下载任务文件');
+    },
+  );
+
+  it('不把代码中的绝对文件路径兜底改写为下载链接', async () => {
+    vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+      {
+        id: 503,
+        role: 'assistant',
+        event_type: 'message',
+        content: '示例：`/home/ubuntu/report.txt`\n\n```text\n/home/ubuntu/output.txt\n```',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      },
+    ]);
+
+    render(<ChatView task={makeTask({ id: 90 })} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('/home/ubuntu/report.txt')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'report.txt' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'output.txt' })).not.toBeInTheDocument();
+  });
 });
 
 describe('Codex app-server 增量消息', () => {

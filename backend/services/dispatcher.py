@@ -138,6 +138,12 @@ _DOC_SYNC_NOTE = (
     "若两者是 symlink 关系则改一处即可，无需额外操作）。"
 )
 
+_TASK_ARTIFACT_LINK_NOTE = (
+    "如果在任务工作区创建或修改了供用户查看、下载的产物文件，最终回复必须把每个产物写成 "
+    "Markdown 链接，不要只输出裸文件路径。链接目标优先使用相对当前工作目录的路径；"
+    "路径包含空格时用尖括号包裹，例如 `[下载报告](<reports/final report.pdf>)`。"
+)
+
 
 def _agent_doc_preamble(provider: str | None) -> str:
     """First-line prompt preamble pointing the agent at the project doc.
@@ -148,9 +154,9 @@ def _agent_doc_preamble(provider: str | None) -> str:
     Claude still needs the explicit CLAUDE.md workflow reminder.
     """
     if (provider or "claude").lower() == "codex":
-        return _DOC_SYNC_NOTE
+        return f"{_DOC_SYNC_NOTE}\n{_TASK_ARTIFACT_LINK_NOTE}"
     read_line = "请阅读项目根目录的 CLAUDE.md 了解项目规范和任务完成后的 git 流程。"
-    return f"{read_line}\n{_DOC_SYNC_NOTE}"
+    return f"{read_line}\n{_DOC_SYNC_NOTE}\n{_TASK_ARTIFACT_LINK_NOTE}"
 
 
 # Priority levels for the per-task message queue

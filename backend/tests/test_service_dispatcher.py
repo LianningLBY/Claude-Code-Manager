@@ -8072,6 +8072,19 @@ async def test_build_task_prompt_carries_doc_sync_note(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_build_task_prompt_requires_downloadable_artifact_links(db_factory):
+    """Claude/Codex 都不能只报告无法点击的裸产物路径。"""
+    d = _make_dispatcher(db_factory)
+    for provider in ("claude", "codex"):
+        prompt = await d._build_task_prompt(
+            Task(title="t", description="create report", provider=provider)
+        )
+        assert "Markdown 链接" in prompt
+        assert "不要只输出裸文件路径" in prompt
+        assert "[下载报告](<reports/final report.pdf>)" in prompt
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider", "ordinary_preamble"),
     [

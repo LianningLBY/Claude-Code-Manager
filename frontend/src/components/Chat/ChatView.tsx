@@ -27,6 +27,7 @@ import {
   mergeChatHistory,
 } from './messageMerge';
 import { TaskArtifactLink } from './TaskArtifactLink';
+import { remarkTaskArtifactPaths } from './taskArtifactMarkdown';
 
 interface ChatViewProps {
   task: Task;
@@ -2719,6 +2720,7 @@ function stripSenderPrefix(text: string): string {
 }
 
 const remarkPlugins = [remarkGfm];
+const taskRemarkPlugins = [remarkGfm, remarkTaskArtifactPaths];
 
 const markdownComponents: Components = {
   pre({ children }) {
@@ -2773,7 +2775,7 @@ const MarkdownContent = memo(function MarkdownContent({
   return (
     <div className={`markdown-body ${className || ''}`}>
     <ReactMarkdown
-      remarkPlugins={remarkPlugins}
+      remarkPlugins={taskRemarkPlugins}
       components={taskComponents}
     >
       {content}

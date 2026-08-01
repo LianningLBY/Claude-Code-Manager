@@ -10,6 +10,7 @@ import {
   mergeChatHistory,
 } from './messageMerge';
 import { TaskArtifactLink } from './TaskArtifactLink';
+import { remarkTaskArtifactPaths } from './taskArtifactMarkdown';
 
 interface LoopChatViewProps {
   task: Task;
@@ -232,7 +233,7 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-const remarkPlugins = [remarkGfm];
+const remarkPlugins = [remarkGfm, remarkTaskArtifactPaths];
 
 const markdownComponents: Components = {
   pre({ children }) {

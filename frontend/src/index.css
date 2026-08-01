@@ -825,6 +825,19 @@ html[data-theme='rose'] {
   font-style: italic;
 }
 
+.markdown-body .katex-display,
+.prose .katex-display {
+  margin: 0.75em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.15em 0;
+}
+
+.markdown-body .katex,
+.prose .katex {
+  font-size: 1.05em;
+}
+
 /* 抽屉 / 遮罩入场动画 */
 @keyframes ccm-slide-in-left {
   from { transform: translateX(-100%); }

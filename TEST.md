@@ -1077,6 +1077,12 @@ curl -X POST http://localhost:8000/api/github/webhook \
 
 ### 前端测试
 
+Markdown 数学公式回归：
+
+| 文件 | 覆盖内容 |
+|------|----------|
+| `frontend/src/components/Markdown/MarkdownRenderer.test.tsx` | Codex `\\[...\\]` display math、`\\(...\\)` inline math、原生 dollar 分隔符、代码块保护和未闭合分隔符回退 |
+
 1. 导航到 PR Monitor 页面
 2. 添加仓库 → 验证表格显示
 3. 点击仓库 → 验证详情页、Webhook 配置、复制按钮

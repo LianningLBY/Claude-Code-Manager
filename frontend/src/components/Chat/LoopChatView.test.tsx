@@ -176,6 +176,22 @@ describe('LoopChatView', () => {
       clickSpy.mockRestore();
       vi.unstubAllGlobals();
     });
+
+    it('renders a bare absolute artifact path as a task download link', async () => {
+      const artifactPath = '/home/ubuntu/loop output/final-report.md';
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({
+          id: 905,
+          content: `产物已生成：${artifactPath}`,
+        }),
+      ]);
+
+      render(<LoopChatView task={makeTask({ id: 42 })} onBack={onBack} />);
+
+      const link = await screen.findByRole('link', { name: /final-report\.md/ });
+      expect(decodeURI(link.getAttribute('href') || '')).toBe(artifactPath);
+      expect(link).toHaveAttribute('title', '下载任务文件');
+    });
   });
 
   describe('WebSocket message uses loop_iteration from backend', () => {

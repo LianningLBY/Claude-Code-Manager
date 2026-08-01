@@ -120,7 +120,7 @@ claude-manager/
 
 - **优先级**: 数字越小优先级越高 (P0 > P1 > P2)，排序用 `.asc()`
 - **Session 绑定**: `session_id` 和 `last_cwd` 在 **Task** 上（不是 Instance），因为 instance 是轮换执行不同 task 的 worker
-- **Task 产物下载**: 聊天 Markdown 的文件链接统一走 `/api/tasks/{id}/artifacts/download`；相对路径按 `last_cwd`、容器 `/workspace` 按项目根映射，且受 Task ACL 保护。本地工作区根必须是无符号链接的绝对路径，并从稳定的 `/` 目录 FD 逐级 `O_NOFOLLOW` 锚定；产物路径只做基于该锚点的词法相对化，再逐级 no-follow 打开，以 `fstat` 校验同一文件描述符并按校验时大小限量流式返回，禁止混用路径解析与目录 FD 或“先查路径、后重开路径”的 TOCTOU。Worker 文件只经 Manager 流式代理，绝不能退回管理员级任意绝对路径下载接口
+- **Task 产物下载**: Claude/Codex 的任务前导统一要求产物使用 Markdown 文件链接；聊天渲染还会把普通文本中带扩展名的绝对 POSIX 文件路径兜底转为链接（既有链接、代码和 HTML 不改写）。文件链接统一走 `/api/tasks/{id}/artifacts/download`；相对路径按 `last_cwd`、容器 `/workspace` 按项目根映射，且受 Task ACL 保护。本地工作区根必须是无符号链接的绝对路径，并从稳定的 `/` 目录 FD 逐级 `O_NOFOLLOW` 锚定；产物路径只做基于该锚点的词法相对化，再逐级 no-follow 打开，以 `fstat` 校验同一文件描述符并按校验时大小限量流式返回，禁止混用路径解析与目录 FD 或“先查路径、后重开路径”的 TOCTOU。Worker 文件只经 Manager 流式代理，绝不能退回管理员级任意绝对路径下载接口
 - **Instance 并发容量**: `max_concurrent_instances` 约束所有仍有运行证据的实例：正常 `idle/running` 会占槽，`error/stopped` 仅在 PID 与反向 owner 证据都已清除后才是免费历史。API 创建与 Dispatcher 补槽共用 `instance_capacity_lock`，idle 选择到 launch 之间用 owner reservation；运行时下调 cap 不强杀现有 turn，但在占用降到 cap 以下前禁止新领取。物理删除仍走 `DELETE /api/instances/cleanup`
 - **Claude Code 调用**: `claude -p [prompt] --dangerously-skip-permissions --output-format stream-json --verbose`
 - **Resume**: `claude -p [follow-up] --resume [session_id]` — 必须使用和原始 session 相同的 cwd

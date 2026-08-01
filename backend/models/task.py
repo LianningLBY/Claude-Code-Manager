@@ -10,7 +10,6 @@ from sqlalchemy import (
     JSON,
     select,
     func,
-    case,
 )
 from sqlalchemy.orm import Mapped, mapped_column, column_property
 
@@ -152,10 +151,11 @@ class Task(Base):
 
 def _configure_task_properties():
     from backend.models.monitor_session import MonitorSession
-    from backend.models.plan_agent import PlanAgentRun
+    from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 
     ms = MonitorSession.__table__
     plan_runs = PlanAgentRun.__table__
+    plan_steps = PlanAgentStep.__table__
     # Always show real running sub-agent count — background agents can
     # outlive the main turn, so even completed tasks may have active sub-agents.
     Task.active_sub_agents = column_property(
@@ -182,6 +182,41 @@ def _configure_task_properties():
         .limit(1)
         .correlate(Task.__table__)
         .scalar_subquery()
+    )
+
+    latest_plan_run_id = (
+        select(plan_runs.c.id)
+        .where(plan_runs.c.plan_task_id == Task.id)
+        .order_by(plan_runs.c.id.desc())
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+
+    def latest_plan_step_value(column):
+        return (
+            select(column)
+            .where(plan_steps.c.run_id == latest_plan_run_id)
+            .order_by(plan_steps.c.id.desc())
+            .limit(1)
+            .correlate(Task.__table__)
+            .scalar_subquery()
+        )
+
+    # The latest step records the concrete route being attempted, including a
+    # fallback route. These projections let task lists show what is actually
+    # running without issuing one Plan-runs request per card.
+    Task.plan_stage_provider = column_property(
+        latest_plan_step_value(plan_steps.c.provider)
+    )
+    Task.plan_stage_model = column_property(
+        latest_plan_step_value(plan_steps.c.model)
+    )
+    Task.plan_stage_effort = column_property(
+        latest_plan_step_value(plan_steps.c.effort)
+    )
+    Task.plan_stage_route_slot = column_property(
+        latest_plan_step_value(plan_steps.c.route_slot)
     )
 
 _configure_task_properties()

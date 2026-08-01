@@ -20,7 +20,7 @@ import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, C
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
-import { FastModeBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { ExpandableText } from '../ExpandableText';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
@@ -849,6 +849,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         ? msg.data.plan_stage
         : undefined;
       const planStageRound = Number(msg.data.plan_stage_round);
+      const planStageProvider = typeof msg.data.plan_stage_provider === 'string'
+        ? msg.data.plan_stage_provider
+        : undefined;
+      const planStageModel = typeof msg.data.plan_stage_model === 'string'
+        || msg.data.plan_stage_model === null
+        ? msg.data.plan_stage_model
+        : undefined;
+      const planStageEffort = typeof msg.data.plan_stage_effort === 'string'
+        || msg.data.plan_stage_effort === null
+        ? msg.data.plan_stage_effort
+        : undefined;
+      const planStageRouteSlot = msg.data.plan_stage_route_slot === 'primary'
+        || msg.data.plan_stage_route_slot === 'fallback'
+        || msg.data.plan_stage_route_slot === null
+        ? msg.data.plan_stage_route_slot
+        : undefined;
       if (Number.isSafeInteger(planTaskId) && planTaskId > 0) {
         setRelatedPlans((plans) => plans.map((plan) =>
           plan.id === planTaskId
@@ -860,6 +876,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 ...(planStage !== undefined ? { plan_stage: planStage } : {}),
                 ...(Number.isSafeInteger(planStageRound)
                   ? { plan_stage_round: planStageRound }
+                  : {}),
+                ...(planStageProvider !== undefined
+                  ? { plan_stage_provider: planStageProvider }
+                  : {}),
+                ...(planStageModel !== undefined
+                  ? { plan_stage_model: planStageModel }
+                  : {}),
+                ...(planStageEffort !== undefined
+                  ? { plan_stage_effort: planStageEffort }
+                  : {}),
+                ...(planStageRouteSlot !== undefined
+                  ? { plan_stage_route_slot: planStageRouteSlot }
                   : {}),
               }
             : plan
@@ -1826,16 +1854,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           </button>
           <div className="flex items-center gap-1.5 min-w-0 flex-1">
             <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
-            <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
-              {providerLabel}
-            </span>
-            <FastModeBadge task={task} />
+            {task.mode === 'plan' ? (
+              <PlanPipelineBadge task={task} />
+            ) : (
+              <>
+                <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
+                  {providerLabel}
+                </span>
+                <FastModeBadge task={task} />
+              </>
+            )}
             {backgroundActive && (
               <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
                 后台运行中
               </span>
             )}
-            {task.provider === 'codex' && codexMainMcpEnabled !== null && (
+            {task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
                 className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
@@ -1896,7 +1930,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 )}
               </button>
             )}
-            <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
+            {task.mode !== 'plan' && (
+              <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
+            )}
             <button
               onClick={() => {
                 setDistillOpen(true);
@@ -2206,25 +2242,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                           <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400">
                             {getTaskStatusLabel(plan)}
                           </span>
-                          <span className="text-[10px] text-gray-600">
-                            {plan.plan_pipeline_config
-                              ? (
-                                <>
-                                  {plan.plan_pipeline_config.planner.primary.provider}
-                                  {' · '}
-                                  {plan.plan_pipeline_config.planner.primary.model}
-                                  {plan.plan_pipeline_config.reviewer.enabled && (
-                                    <>
-                                      {' → '}
-                                      {plan.plan_pipeline_config.reviewer.primary.provider}
-                                      {' · '}
-                                      {plan.plan_pipeline_config.reviewer.primary.model}
-                                    </>
-                                  )}
-                                </>
-                              )
-                              : `${plan.provider} · ${plan.model || 'default'}`}
-                          </span>
+                          <PlanPipelineBadge task={plan} />
                           {planStaleIds.has(plan.id) && (
                             <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
                               stale

@@ -65,6 +65,9 @@ vi.mock('../components/Tasks/TaskList', () => ({
       background_active?: boolean;
       plan_stage?: string | null;
       plan_stage_round?: number | null;
+      plan_stage_provider?: string | null;
+      plan_stage_model?: string | null;
+      plan_stage_route_slot?: string | null;
     }>;
   }) => (
     <div data-testid="task-snapshots">
@@ -75,6 +78,9 @@ vi.mock('../components/Tasks/TaskList', () => ({
           </span>
           <span data-testid={`plan-stage-${task.id}`}>
             {task.plan_stage || 'none'}:{task.plan_stage_round ?? 'none'}
+          </span>
+          <span data-testid={`plan-route-${task.id}`}>
+            {task.plan_stage_provider || 'none'}:{task.plan_stage_model || 'none'}:{task.plan_stage_route_slot || 'none'}
           </span>
         </div>
       ))}
@@ -205,12 +211,19 @@ describe('TasksPage realtime reconciliation', () => {
           task_id: 7,
           plan_stage: 'reviewing',
           plan_stage_round: 2,
+          plan_stage_provider: 'codex',
+          plan_stage_model: 'gpt-5.6-terra',
+          plan_stage_effort: 'xhigh',
+          plan_stage_route_slot: 'fallback',
         },
       });
     });
 
     expect(await screen.findByTestId('plan-stage-7')).toHaveTextContent(
       'reviewing:2',
+    );
+    expect(await screen.findByTestId('plan-route-7')).toHaveTextContent(
+      'codex:gpt-5.6-terra:fallback',
     );
     expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
 

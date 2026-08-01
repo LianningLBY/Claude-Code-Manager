@@ -233,6 +233,10 @@ export interface Task {
   plan_pipeline_config: PlanPipelineConfig | null;
   plan_stage?: string | null;
   plan_stage_round?: number | null;
+  plan_stage_provider?: string | null;
+  plan_stage_model?: string | null;
+  plan_stage_effort?: string | null;
+  plan_stage_route_slot?: 'primary' | 'fallback' | null;
   starred: boolean;
   archived: boolean;
   has_unread: boolean;

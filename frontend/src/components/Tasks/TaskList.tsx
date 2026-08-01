@@ -3,7 +3,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { api } from '../../api/client';
 import type { Task, Project } from '../../api/client';
 import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus } from '../icons';
-import { FastModeBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
+import { FastModeBadge, PlanPipelineBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
 import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
@@ -190,13 +190,19 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
               }`}>
                 {getTaskStatusLabel(t)}
               </span>
-              <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
-                {t.provider === 'codex' ? 'Codex' : 'Claude'}
-              </span>
-              <FastModeBadge task={t} />
-              <TaskConfigBadge task={t} onRefresh={onRefresh} />
-              <PluginsBadge task={t} onRefresh={onRefresh} />
-              <SubAgentsBadge task={t} />
+              {t.mode === 'plan' ? (
+                <PlanPipelineBadge task={t} />
+              ) : (
+                <>
+                  <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
+                    {t.provider === 'codex' ? 'Codex' : 'Claude'}
+                  </span>
+                  <FastModeBadge task={t} />
+                  <TaskConfigBadge task={t} onRefresh={onRefresh} />
+                  <PluginsBadge task={t} onRefresh={onRefresh} />
+                  <SubAgentsBadge task={t} />
+                </>
+              )}
             </div>
             {/* Action buttons — always top-right aligned */}
             <div className="flex gap-1 shrink-0 items-center">

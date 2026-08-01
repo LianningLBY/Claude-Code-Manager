@@ -2128,10 +2128,18 @@ describe('independent Plan attachments', () => {
           task_id: 80,
           plan_stage: 'reviewing',
           plan_stage_round: 2,
+          plan_stage_provider: 'codex',
+          plan_stage_model: 'gpt-5.6-terra',
+          plan_stage_effort: 'xhigh',
+          plan_stage_route_slot: 'fallback',
         },
       });
     });
     expect(await screen.findByText('Reviewing · Round 2')).toBeInTheDocument();
+    expect(await screen.findByTestId('plan-pipeline-badge')).toHaveTextContent(
+      'Reviewer · gpt-5.6-terra',
+    );
+    expect(screen.getByTestId('plan-pipeline-badge')).toHaveTextContent('fallback');
 
     act(() => {
       capturedOnMessage?.({

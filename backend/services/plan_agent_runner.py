@@ -739,21 +739,30 @@ class PlanAgentRunner:
         task_id: int,
         stage: str,
         round_number: int,
+        provider: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        route_slot: str | None = None,
     ) -> None:
         """Publish best-effort UI detail; DB polling remains authoritative."""
 
         if self.broadcaster is None:
             return
         try:
-            await self.broadcaster.broadcast(
-                "tasks",
-                {
-                    "event": "plan_stage_change",
-                    "task_id": task_id,
-                    "plan_stage": stage,
-                    "plan_stage_round": round_number,
-                },
-            )
+            event = {
+                "event": "plan_stage_change",
+                "task_id": task_id,
+                "plan_stage": stage,
+                "plan_stage_round": round_number,
+            }
+            if provider is not None:
+                event.update({
+                    "plan_stage_provider": provider,
+                    "plan_stage_model": model,
+                    "plan_stage_effort": effort,
+                    "plan_stage_route_slot": route_slot,
+                })
+            await self.broadcaster.broadcast("tasks", event)
         except Exception:
             logger.exception(
                 "Failed to broadcast Plan stage for task %s",
@@ -1321,6 +1330,7 @@ class PlanAgentRunner:
         ):
             step_id = await self._start_step(
                 run_id=run_id,
+                task_id=task_id,
                 step_type=step_type,
                 round_number=round_number,
                 provider=route.provider,
@@ -1391,17 +1401,13 @@ class PlanAgentRunner:
             await db.commit()
             await db.refresh(run)
             run_id = run.id
-        await self._broadcast_stage(
-            task_id=task.id,
-            stage="planning",
-            round_number=1,
-        )
         return run_id
 
     async def _start_step(
         self,
         *,
         run_id: int,
+        task_id: int,
         step_type: str,
         round_number: int,
         provider: str,
@@ -1423,7 +1429,17 @@ class PlanAgentRunner:
             db.add(step)
             await db.commit()
             await db.refresh(step)
-            return step.id
+            step_id = step.id
+        await self._broadcast_stage(
+            task_id=task_id,
+            stage="planning" if step_type == "planner" else "reviewing",
+            round_number=round_number,
+            provider=provider,
+            model=model,
+            effort=effort,
+            route_slot=route_slot,
+        )
+        return step_id
 
     async def _finish_step(
         self,
@@ -1459,7 +1475,7 @@ class PlanAgentRunner:
             if (
                 run.status != previous_stage
                 or run.round != previous_round
-            ):
+            ) and run.status not in {"planning", "reviewing"}:
                 stage_change = (
                     run.plan_task_id,
                     run.status,

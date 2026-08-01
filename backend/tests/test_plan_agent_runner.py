@@ -289,6 +289,10 @@ async def test_pipeline_revises_then_persists_audited_approval(
     assert run.round == 2
     assert task_state.plan_stage == "completed"
     assert task_state.plan_stage_round == 2
+    assert task_state.plan_stage_provider == "codex"
+    assert task_state.plan_stage_model == "gpt-5.6-sol"
+    assert task_state.plan_stage_effort == "xhigh"
+    assert task_state.plan_stage_route_slot == "primary"
     assert run.review_verdict == "approve"
     assert [step.step_type for step in steps] == [
         "planner",
@@ -319,6 +323,19 @@ async def test_pipeline_revises_then_persists_audited_approval(
         ("planning", 2),
         ("reviewing", 2),
         ("completed", 2),
+    ]
+    assert [
+        (
+            event.get("plan_stage_provider"),
+            event.get("plan_stage_model"),
+            event.get("plan_stage_route_slot"),
+        )
+        for event in stage_events[:-1]
+    ] == [
+        ("claude", "claude-fable-5", "primary"),
+        ("codex", "gpt-5.6-sol", "primary"),
+        ("claude", "claude-fable-5", "primary"),
+        ("codex", "gpt-5.6-sol", "primary"),
     ]
 
 
@@ -481,6 +498,7 @@ async def test_stage_uses_fallback_only_after_primary_route_is_unavailable(
                 )
             ).scalars().all()
         )
+        task_state = await db.get(Task, task_id)
     assert [step.route_slot for step in steps] == [
         "primary",
         "fallback",
@@ -488,6 +506,9 @@ async def test_stage_uses_fallback_only_after_primary_route_is_unavailable(
     assert [step.status for step in steps] == ["failed", "completed"]
     assert run.planner_provider == "codex"
     assert run.planner_model == "gpt-5.6-terra"
+    assert task_state.plan_stage_provider == "codex"
+    assert task_state.plan_stage_model == "gpt-5.6-terra"
+    assert task_state.plan_stage_route_slot == "fallback"
 
 
 @pytest.mark.asyncio

@@ -113,11 +113,33 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         && Number.isSafeInteger(Number(data.plan_stage_round))
         ? Number(data.plan_stage_round)
         : undefined;
+      const planStageProvider = event === 'plan_stage_change'
+        && typeof data.plan_stage_provider === 'string'
+        ? data.plan_stage_provider
+        : undefined;
+      const planStageModel = event === 'plan_stage_change'
+        && (typeof data.plan_stage_model === 'string' || data.plan_stage_model === null)
+        ? data.plan_stage_model
+        : undefined;
+      const planStageEffort = event === 'plan_stage_change'
+        && (typeof data.plan_stage_effort === 'string' || data.plan_stage_effort === null)
+        ? data.plan_stage_effort
+        : undefined;
+      const planStageRouteSlot = event === 'plan_stage_change'
+        && (data.plan_stage_route_slot === 'primary'
+          || data.plan_stage_route_slot === 'fallback'
+          || data.plan_stage_route_slot === null)
+        ? data.plan_stage_route_slot
+        : undefined;
       if (
         newStatus === undefined
         && backgroundActive === undefined
         && planStage === undefined
         && planStageRound === undefined
+        && planStageProvider === undefined
+        && planStageModel === undefined
+        && planStageEffort === undefined
+        && planStageRouteSlot === undefined
       ) return;
 
       const patchTask = (task: Task): Task => {
@@ -135,11 +157,18 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           planStageRound !== undefined
           && task.plan_stage_round !== planStageRound
         );
+        const planRouteChanged = (
+          (planStageProvider !== undefined && task.plan_stage_provider !== planStageProvider)
+          || (planStageModel !== undefined && task.plan_stage_model !== planStageModel)
+          || (planStageEffort !== undefined && task.plan_stage_effort !== planStageEffort)
+          || (planStageRouteSlot !== undefined && task.plan_stage_route_slot !== planStageRouteSlot)
+        );
         if (
           !statusChanged
           && !backgroundChanged
           && !planStageChanged
           && !planStageRoundChanged
+          && !planRouteChanged
         ) return task;
         return {
           ...task,
@@ -147,6 +176,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           ...(backgroundActive !== undefined ? { background_active: backgroundActive } : {}),
           ...(planStage !== undefined ? { plan_stage: planStage } : {}),
           ...(planStageRound !== undefined ? { plan_stage_round: planStageRound } : {}),
+          ...(planStageProvider !== undefined ? { plan_stage_provider: planStageProvider } : {}),
+          ...(planStageModel !== undefined ? { plan_stage_model: planStageModel } : {}),
+          ...(planStageEffort !== undefined ? { plan_stage_effort: planStageEffort } : {}),
+          ...(planStageRouteSlot !== undefined ? { plan_stage_route_slot: planStageRouteSlot } : {}),
         };
       };
       const patchList = (list: Task[]) => {

@@ -4,6 +4,91 @@ import { api } from '../../api/client';
 import type { CodexServiceTier, Task, SubAgentSummary } from '../../api/client';
 import { skillSupportedByProvider } from '../../config/skillCapabilities';
 
+const ACTIVE_PLAN_STATUSES = new Set(['in_progress', 'executing']);
+
+function routeDescription(
+  label: string,
+  route: { provider: string; model: string; effort: string | null },
+): string {
+  return `${label}: ${route.provider} / ${route.model}${route.effort ? ` / ${route.effort}` : ''}`;
+}
+
+/** Read-only Plan routing badge. A running Plan shows the concrete current
+ * route (including fallback); an idle Plan shows its frozen pipeline. */
+export function PlanPipelineBadge({ task }: { task: Task }) {
+  if (task.mode !== 'plan') return null;
+
+  const config = task.plan_pipeline_config;
+  const active = ACTIVE_PLAN_STATUSES.has(task.status);
+  const reviewing = task.plan_stage === 'reviewing';
+  const configuredRoute = reviewing
+    ? config?.reviewer.primary
+    : config?.planner.primary;
+  const provider = task.plan_stage_provider || configuredRoute?.provider;
+  const model = task.plan_stage_model || configuredRoute?.model;
+  const effort = task.plan_stage_effort ?? configuredRoute?.effort;
+  const routeSlot = task.plan_stage_route_slot;
+
+  if (active && provider && model) {
+    const stage = reviewing ? 'Reviewer' : 'Planner';
+    const round = Math.max(1, task.plan_stage_round || 1);
+    const fallback = routeSlot === 'fallback';
+    return (
+      <span
+        data-testid="plan-pipeline-badge"
+        className={`flex max-w-[280px] items-center gap-1 rounded px-1.5 text-xs font-medium ${
+          fallback
+            ? 'bg-amber-600/25 text-amber-300'
+            : provider === 'codex'
+              ? 'bg-green-600/25 text-green-300'
+              : 'bg-blue-600/25 text-blue-300'
+        }`}
+        title={`${stage}, round ${round}: ${provider} / ${model}${effort ? ` / ${effort}` : ''}${fallback ? ' (fallback)' : ''}`}
+      >
+        <span className="truncate">{stage} · {model}</span>
+        {fallback && <span className="shrink-0 text-[10px] uppercase">fallback</span>}
+      </span>
+    );
+  }
+
+  if (!config) {
+    return (
+      <span
+        data-testid="plan-pipeline-badge"
+        className="max-w-[240px] truncate rounded bg-purple-600/20 px-1.5 text-xs font-medium text-purple-300"
+        title={`Planner: ${task.provider} / ${task.model || 'default'}`}
+      >
+        Planner · {task.model || 'default'}
+      </span>
+    );
+  }
+
+  const summary = config.reviewer.enabled
+    ? `${config.planner.primary.model} → ${config.reviewer.primary.model}`
+    : config.planner.primary.model;
+  const details = [
+    routeDescription('Planner primary', config.planner.primary),
+    routeDescription('Planner fallback', config.planner.fallback),
+    ...(config.reviewer.enabled
+      ? [
+          routeDescription('Reviewer primary', config.reviewer.primary),
+          routeDescription('Reviewer fallback', config.reviewer.fallback),
+        ]
+      : ['Reviewer: disabled']),
+    `Maximum rounds: ${Math.max(1, config.max_revision_cycles)}`,
+  ].join('\n');
+
+  return (
+    <span
+      data-testid="plan-pipeline-badge"
+      className="max-w-[280px] truncate rounded bg-purple-600/20 px-1.5 text-xs font-medium text-purple-300"
+      title={details}
+    >
+      {summary}
+    </span>
+  );
+}
+
 // Plugins (SKILL.md-based) loaded from API at page load, cached globally
 let _pluginsCache: { key: string; label: string }[] | null = null;
 interface CodexTaskSkillsCapability {

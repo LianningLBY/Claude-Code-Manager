@@ -286,6 +286,10 @@ class TaskResponse(BaseModel):
     # stable scheduler lifecycle (for example ``executing``).
     plan_stage: str | None = None
     plan_stage_round: int | None = None
+    plan_stage_provider: str | None = None
+    plan_stage_model: str | None = None
+    plan_stage_effort: str | None = None
+    plan_stage_route_slot: Literal["primary", "fallback"] | None = None
     session_id: str | None
     provider: str
     model: str | None

@@ -106,6 +106,73 @@ describe('TaskList', () => {
     },
   );
 
+  it('shows the concrete running Plan route and fallback state without generic Config', () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          mode: 'plan',
+          status: 'executing',
+          provider: 'claude',
+          model: 'claude-fable-5',
+          plan_stage: 'reviewing',
+          plan_stage_round: 2,
+          plan_stage_provider: 'codex',
+          plan_stage_model: 'gpt-5.6-terra',
+          plan_stage_effort: 'xhigh',
+          plan_stage_route_slot: 'fallback',
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    const badge = screen.getByTestId('plan-pipeline-badge');
+    expect(badge).toHaveTextContent('Reviewer · gpt-5.6-terra');
+    expect(badge).toHaveTextContent('fallback');
+    expect(badge).toHaveAttribute(
+      'title',
+      'Reviewer, round 2: codex / gpt-5.6-terra / xhigh (fallback)',
+    );
+    expect(screen.queryByText('Config')).not.toBeInTheDocument();
+  });
+
+  it('shows the frozen Planner to Reviewer pipeline when a Plan is not running', () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          mode: 'plan',
+          status: 'plan_review',
+          provider: 'claude',
+          model: 'claude-fable-5',
+          plan_pipeline_config: {
+            version: 1,
+            planner: {
+              primary: { provider: 'claude', model: 'claude-fable-5', effort: 'high' },
+              fallback: { provider: 'codex', model: 'gpt-5.6-terra', effort: 'xhigh' },
+            },
+            reviewer: {
+              enabled: true,
+              primary: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh' },
+              fallback: { provider: 'claude', model: 'claude-sonnet-5', effort: 'high' },
+            },
+            max_revision_cycles: 2,
+          },
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    const badge = screen.getByTestId('plan-pipeline-badge');
+    expect(badge).toHaveTextContent('claude-fable-5 → gpt-5.6-sol');
+    expect(badge).toHaveAttribute(
+      'title',
+      expect.stringContaining('Planner fallback: codex / gpt-5.6-terra / xhigh'),
+    );
+  });
+
   it('shows empty state when no tasks', () => {
     render(<TaskList tasks={[]} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('No tasks yet')).toBeInTheDocument();

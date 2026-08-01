@@ -1,8 +1,11 @@
 import { useState } from 'react';
+
 import { api, isApiRequestError } from '../../api/client';
 import type { Task } from '../../api/client';
-import { Check, Loader2, Play, X } from '../icons';
+import { Check, ChevronDown, Loader2, Play, X } from '../icons';
 import { PlanRevisionBadge } from '../Tasks/TaskBadges';
+import { PlanProgress } from './PlanProgress';
+import { getPlanStatusMeta } from './planStatus';
 
 interface PlanPanelProps {
   tasks: Task[];
@@ -12,6 +15,8 @@ interface PlanPanelProps {
 export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [revisionDrafts, setRevisionDrafts] = useState<Record<number, string>>({});
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
   const planTasks = tasks.filter((task) =>
     task.mode === 'plan'
     && (
@@ -27,7 +32,10 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
 
   if (planTasks.length === 0) return null;
 
-  const handleApprove = async (task: Task) => {
+  const approve = async (
+    task: Task,
+    action: 'approve-only' | 'create-execution' | 'attach-to-target',
+  ) => {
     const routing = {
       provider: task.provider,
       model: task.model,
@@ -35,27 +43,47 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
     };
     setBusyId(task.id);
     setError(null);
+    let approved = task.status === 'completed' && task.plan_approved === true;
     try {
-      await api.approvePlan(task.id, routing);
-    } catch (error) {
-      const detail = isApiRequestError(error) ? error.detail : null;
-      const stale = detail && typeof detail === 'object'
-        && 'staleness' in detail;
-      if (!stale || !window.confirm(
-        'This Plan was created from older conversation or repository state. Approve it anyway?',
-      )) {
-        setError(error instanceof Error ? error.message : String(error));
-        return;
+      if (!approved) {
+        try {
+          await api.approvePlan(task.id, routing);
+          approved = true;
+        } catch (approvalError) {
+          const detail = isApiRequestError(approvalError) ? approvalError.detail : null;
+          const stale = detail && typeof detail === 'object' && 'staleness' in detail;
+          if (!stale || !window.confirm(
+            'This Plan was created from older conversation or repository state. Approve it anyway?',
+          )) {
+            throw approvalError;
+          }
+          await api.approvePlan(task.id, routing, true);
+          approved = true;
+        }
       }
-      try {
-        await api.approvePlan(task.id, routing, true);
-      } catch (confirmedError) {
-        setError(
-          confirmedError instanceof Error
-            ? confirmedError.message
-            : String(confirmedError),
-        );
+      if (approved && action === 'create-execution') {
+        const result = await api.createPlanExecutionTask(task.id);
+        window.location.hash = `#/tasks/chat/${result.execution_task.id}`;
+      } else if (approved && task.plan_target_task_id != null) {
+        const storageKey = `ccm-plan-dismissed-${task.plan_target_task_id}`;
+        let dismissed = new Set<number>();
+        try {
+          const parsed = JSON.parse(localStorage.getItem(storageKey) || '[]');
+          if (Array.isArray(parsed)) {
+            dismissed = new Set(parsed.filter((value): value is number => Number.isInteger(value)));
+          }
+        } catch { /* unavailable or malformed storage starts from an empty set */ }
+        if (action === 'attach-to-target') dismissed.delete(task.id);
+        else dismissed.add(task.id);
+        try {
+          localStorage.setItem(storageKey, JSON.stringify([...dismissed]));
+        } catch { /* the server-side approval remains valid without local preferences */ }
+        if (action === 'attach-to-target') {
+          window.location.hash = `#/tasks/chat/${task.plan_target_task_id}`;
+        }
       }
+    } catch (approvalError) {
+      setError(approvalError instanceof Error ? approvalError.message : String(approvalError));
     } finally {
       setBusyId(null);
       onRefresh();
@@ -68,11 +96,7 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
     try {
       await api.rejectPlan(id);
     } catch (rejectError) {
-      setError(
-        rejectError instanceof Error
-          ? rejectError.message
-          : String(rejectError),
-      );
+      setError(rejectError instanceof Error ? rejectError.message : String(rejectError));
     } finally {
       setBusyId(null);
       onRefresh();
@@ -80,146 +104,164 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
   };
 
   const handleRevise = async (task: Task) => {
-    const feedback = window.prompt(
-      'What should the revised Plan change?',
-      task.metadata_?.plan_review_feedback || '',
-    )?.trim();
+    const feedback = (revisionDrafts[task.id] || '').trim();
     if (!feedback) return;
     setBusyId(task.id);
     setError(null);
     try {
       await api.revisePlan(task.id, feedback);
+      setRevisionDrafts((current) => ({ ...current, [task.id]: '' }));
     } catch (revisionError) {
-      setError(
-        revisionError instanceof Error
-          ? revisionError.message
-          : String(revisionError),
-      );
+      setError(revisionError instanceof Error ? revisionError.message : String(revisionError));
     } finally {
       setBusyId(null);
       onRefresh();
     }
   };
 
-  const handleCreateExecution = async (id: number) => {
-    setBusyId(id);
-    setError(null);
-    try {
-      const result = await api.createPlanExecutionTask(id);
-      window.location.hash = `#/tasks/chat/${result.execution_task.id}`;
-    } catch (executionError) {
-      setError(
-        executionError instanceof Error
-          ? executionError.message
-          : String(executionError),
-      );
-    } finally {
-      setBusyId(null);
-      onRefresh();
-    }
+  const toggleExpanded = (id: number) => {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
 
   return (
-    <div className="space-y-3">
-      <h2 className="text-foreground font-semibold flex items-center gap-2">
-        Plans Awaiting Review
-        <span className="bg-yellow-500 text-black text-xs px-2 py-0.5 rounded-full font-bold">{planTasks.length}</span>
-      </h2>
+    <section className="space-y-3" aria-label="Plans awaiting review">
+      <div className="flex items-center gap-2">
+        <h2 className="font-semibold text-foreground">Plans Awaiting Review</h2>
+        <span className="rounded-full bg-indigo-600 px-2 py-0.5 text-xs font-bold text-white">{planTasks.length}</span>
+      </div>
       {error && (
-        <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
           {error}
         </div>
       )}
-      {planTasks.map((task) => (
-        <div key={task.id} className="bg-gray-800 rounded-lg p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <span className="text-foreground font-medium text-sm">{task.title}</span>
-              <span className="text-gray-500 text-xs ml-2">#{task.id}</span>
-              {task.plan_target_task_id != null && (
-                <span className="text-indigo-300 text-xs ml-2">
-                  for Task #{task.plan_target_task_id}
+      {planTasks.map((task) => {
+        const ready = task.status === 'plan_review';
+        const standalone = task.plan_target_task_id == null;
+        const expanded = expandedIds.has(task.id);
+        const status = getPlanStatusMeta(task);
+        return (
+          <article key={task.id} className="overflow-hidden rounded-xl border border-gray-700/70 bg-gray-800 shadow-sm">
+            <div className="space-y-3 px-4 pt-4 sm:px-5">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-sm font-semibold text-foreground">
+                  #{task.id} {task.title || 'Untitled Plan'}
+                </h3>
+                <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${status.className}`}>
+                  {status.label}
                 </span>
+                {task.plan_target_task_id != null && (
+                  <span className="text-xs text-indigo-300">for Task #{task.plan_target_task_id}</span>
+                )}
+                <PlanRevisionBadge task={task} />
+              </div>
+              <PlanProgress task={task} />
+              {task.metadata_?.plan_review_exhausted && (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-300">
+                  <span className="font-medium">Reviewer revision limit reached:</span>{' '}
+                  {task.metadata_.plan_review_feedback || 'Review the Plan carefully before approval.'}
+                </div>
               )}
-              {(task.supersedes_plan_task_id
-                || task.metadata_?.plan_superseded_by_task_id) && (
-                <span className="ml-2 inline-flex gap-1">
-                  <PlanRevisionBadge task={task} />
-                </span>
-              )}
-            </div>
-            <div className="flex gap-2">
-              {task.status === 'plan_review' ? (
-                <>
-                  <button
-                    onClick={() => handleApprove(task)}
-                    disabled={busyId === task.id}
-                    className="flex items-center gap-1 bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
-                  >
-                    {busyId === task.id
-                      ? <Loader2 size={14} className="animate-spin" />
-                      : <Check size={14} />}
-                    Approve
-                  </button>
-                  <button
-                    onClick={() => handleReject(task.id)}
-                    disabled={busyId === task.id}
-                    className="flex items-center gap-1 bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
-                  >
-                    <X size={14} /> Reject
-                  </button>
-                  <button
-                    onClick={() => void handleRevise(task)}
-                    disabled={busyId === task.id}
-                    className="rounded bg-gray-700 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-gray-600 disabled:opacity-50"
-                  >
-                    Revise
-                  </button>
-                </>
-              ) : (
+              <div className="relative rounded-xl border border-gray-700/70 bg-gray-950/55">
+                <pre className={`whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-gray-300 ${expanded ? 'max-h-[55vh]' : 'max-h-48'} overflow-y-auto`}>
+                  {task.plan_content}
+                </pre>
                 <button
-                  onClick={() => handleCreateExecution(task.id)}
-                  disabled={busyId === task.id}
-                  className="flex items-center gap-1 bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
+                  type="button"
+                  onClick={() => toggleExpanded(task.id)}
+                  className="flex w-full items-center justify-center gap-1 border-t border-gray-800 py-2 text-xs text-indigo-300 hover:bg-gray-900/70"
                 >
-                  {busyId === task.id
-                    ? <Loader2 size={14} className="animate-spin" />
-                    : <Play size={14} />}
-                  Create execution Task
+                  {expanded ? 'Collapse Plan' : 'View full Plan'}
+                  <ChevronDown size={13} className={expanded ? 'rotate-180' : ''} />
                 </button>
+              </div>
+            </div>
+
+            <div className="mt-3 border-t border-gray-700/70 bg-gray-900/35 px-4 py-3 sm:px-5">
+              {ready ? (
+                <div className="space-y-2.5">
+                  <div className="flex gap-2">
+                    <input
+                      value={revisionDrafts[task.id] || ''}
+                      onChange={(event) => setRevisionDrafts((current) => ({
+                        ...current,
+                        [task.id]: event.target.value,
+                      }))}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                          event.preventDefault();
+                          void handleRevise(task);
+                        }
+                      }}
+                      placeholder="Describe changes for a new revision…"
+                      className="min-w-0 flex-1 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void handleRevise(task)}
+                      disabled={!revisionDrafts[task.id]?.trim() || busyId === task.id}
+                      className="rounded-lg border border-gray-600 px-3 py-2 text-xs font-medium text-gray-300 hover:bg-gray-700 disabled:opacity-40"
+                    >
+                      Revise
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleReject(task.id)}
+                      disabled={busyId === task.id}
+                      className="flex items-center gap-1 rounded-lg border border-red-500/40 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+                    >
+                      <X size={12} /> Reject
+                    </button>
+                    <span className="flex-1" />
+                    <button
+                      type="button"
+                      onClick={() => void approve(task, 'approve-only')}
+                      disabled={busyId === task.id}
+                      className="flex items-center gap-1 rounded-lg border border-green-500/40 px-3 py-2 text-xs font-medium text-green-300 hover:bg-green-500/10 disabled:opacity-40"
+                    >
+                      <Check size={12} /> Approve only
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void approve(
+                        task,
+                        standalone ? 'create-execution' : 'attach-to-target',
+                      )}
+                      disabled={busyId === task.id}
+                      className="flex items-center gap-1.5 rounded-lg bg-green-600 px-3 py-2 text-xs font-medium text-white hover:bg-green-500 disabled:opacity-40"
+                    >
+                      {busyId === task.id
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : standalone ? <Play size={12} /> : <Check size={12} />}
+                      {standalone
+                        ? 'Approve & create execution Task'
+                        : `Approve & open Task #${task.plan_target_task_id}`}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => void approve(task, 'create-execution')}
+                    disabled={busyId === task.id}
+                    className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+                  >
+                    {busyId === task.id ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+                    Create execution Task
+                  </button>
+                </div>
               )}
             </div>
-          </div>
-          {task.plan_pipeline_config && (
-            <div className="text-[11px] text-gray-500">
-              Planner: {task.plan_pipeline_config.planner.primary.provider}
-              {' / '}{task.plan_pipeline_config.planner.primary.model}
-              {' (fallback: '}
-              {task.plan_pipeline_config.planner.fallback.provider}
-              {' / '}{task.plan_pipeline_config.planner.fallback.model})
-              {task.plan_pipeline_config.reviewer.enabled && (
-                <>
-                  {' · Reviewer: '}
-                  {task.plan_pipeline_config.reviewer.primary.provider}
-                  {' / '}{task.plan_pipeline_config.reviewer.primary.model}
-                  {' (fallback: '}
-                  {task.plan_pipeline_config.reviewer.fallback.provider}
-                  {' / '}{task.plan_pipeline_config.reviewer.fallback.model})
-                </>
-              )}
-            </div>
-          )}
-          {task.metadata_?.plan_review_exhausted && (
-            <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
-              Reviewer still requested changes after the revision limit:
-              {' '}{task.metadata_.plan_review_feedback || 'Review the Plan carefully before approval.'}
-            </div>
-          )}
-          <div className="text-xs text-gray-400 bg-gray-900 rounded p-3 max-h-60 overflow-y-auto whitespace-pre-wrap font-mono">
-            {task.plan_content}
-          </div>
-        </div>
-      ))}
-    </div>
+          </article>
+        );
+      })}
+    </section>
   );
 }

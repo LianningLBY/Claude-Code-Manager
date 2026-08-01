@@ -20,7 +20,8 @@ import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, C
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
-import { FastModeBadge, PlanPipelineBadge, PlanRevisionBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import { RelatedPlansDialog } from '../PlanReview/RelatedPlansDialog';
 import { ExpandableText } from '../ExpandableText';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
@@ -31,7 +32,6 @@ import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
 } from './messageMerge';
-import { getTaskStatusLabel } from '../Tasks/taskStatus';
 
 interface ChatViewProps {
   task: Task;
@@ -509,7 +509,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     });
   }, [readDismissedPlans, writeDismissedPlans]);
 
-  const approveRelatedPlan = async (plan: Task) => {
+  const approveRelatedPlan = async (plan: Task, attach: boolean) => {
     const routing = {
       provider: plan.provider,
       model: plan.model,
@@ -517,8 +517,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     };
     setPlanBusyId(plan.id);
     setPlanError(null);
+    let approved = false;
     try {
       await api.approvePlan(plan.id, routing);
+      approved = true;
     } catch (error) {
       const detail = isApiRequestError(error) ? error.detail : null;
       const stale = detail && typeof detail === 'object'
@@ -531,6 +533,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       try {
         await api.approvePlan(plan.id, routing, true);
+        approved = true;
       } catch (confirmedError) {
         setPlanError(
           confirmedError instanceof Error
@@ -542,8 +545,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     } finally {
       setPlanBusyId(null);
     }
+    if (!approved) return;
+    const dismissed = readDismissedPlans();
+    if (attach) dismissed.delete(plan.id);
+    else dismissed.add(plan.id);
+    writeDismissedPlans(dismissed);
     await refreshPlans();
     onTaskUpdated?.();
+    if (attach) setPlansOpen(false);
   };
 
   const rejectRelatedPlan = async (planId: number) => {
@@ -578,20 +587,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   };
 
-  const reviseRelatedPlan = async (plan: Task) => {
-    const feedback = window.prompt(
-      'What should the revised Plan change?',
-      plan.metadata_?.plan_review_feedback || '',
-    )?.trim();
-    if (!feedback) return;
+  const reviseRelatedPlan = async (
+    plan: Task,
+    feedbackInput: string,
+  ): Promise<number | null> => {
+    const feedback = feedbackInput.trim();
+    if (!feedback) return null;
     setPlanBusyId(plan.id);
     setPlanError(null);
     try {
-      await api.revisePlan(plan.id, feedback);
+      const revisedPlan = await api.revisePlan(plan.id, feedback);
       await refreshPlans();
       onTaskUpdated?.();
+      return revisedPlan.id;
     } catch (error) {
       setPlanError(error instanceof Error ? error.message : String(error));
+      return null;
     } finally {
       setPlanBusyId(null);
     }
@@ -625,6 +636,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
+  const planAttentionCount = relatedPlans.filter((plan) =>
+    ['pending', 'in_progress', 'executing', 'plan_review'].includes(plan.status)
+    || (
+      plan.status === 'completed'
+      && plan.plan_approved === true
+      && plan.plan_applied_at == null
+    )
+  ).length;
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const HISTORY_PAGE_SIZE = 200;
@@ -1914,32 +1933,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             {task.session_id && task.shared_from_id == null && (
               <button
                 onClick={() => setPlansOpen((open) => !open)}
-                className={`relative p-1.5 transition-colors ${
+                className={`flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors ${
                   plansOpen
-                    ? 'text-indigo-300 bg-indigo-500/15 rounded'
-                    : 'text-gray-600 hover:text-indigo-300'
+                    ? 'bg-indigo-500/15 text-indigo-300'
+                    : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'
                 }`}
                 title="Independent Plans"
                 aria-label="Plans"
               >
-                <ListTodo size={18} />
-                {relatedPlans.filter((plan) =>
-                  ['pending', 'in_progress', 'executing', 'plan_review'].includes(plan.status)
-                  || (
-                    plan.status === 'completed'
-                    && plan.plan_approved === true
-                    && plan.plan_applied_at == null
-                  )
-                ).length > 0 && (
-                  <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-indigo-500 px-1 text-[9px] font-bold leading-4 text-white">
-                    {relatedPlans.filter((plan) =>
-                      ['pending', 'in_progress', 'executing', 'plan_review'].includes(plan.status)
-                      || (
-                        plan.status === 'completed'
-                        && plan.plan_approved === true
-                        && plan.plan_applied_at == null
-                      )
-                    ).length}
+                <ListTodo size={16} />
+                <span>Plans</span>
+                {planAttentionCount > 0 && (
+                  <span className="min-w-4 rounded-full bg-indigo-500 px-1 text-center text-[9px] font-bold leading-4 text-white">
+                    {planAttentionCount}
                   </span>
                 )}
               </button>
@@ -2165,192 +2171,26 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       )}
 
-      {plansOpen && (
-        <div className="border-b border-gray-800 bg-gray-900/70 px-4 py-3">
-          <div className="mx-auto max-w-4xl space-y-3">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="flex items-center gap-2 text-sm font-medium text-gray-100">
-                  <ListTodo size={15} className="text-indigo-300" />
-                  Plans for Task #{task.id}
-                </div>
-                <p className="mt-0.5 text-[11px] text-gray-500">
-                  Plans run independently. Approval does not wake this session;
-                  selected Plans are applied only with your next real message.
-                </p>
-              </div>
-              <button
-                onClick={() => setPlansOpen(false)}
-                className="text-gray-500 hover:text-gray-300"
-                aria-label="Close Plans"
-              >
-                <X size={15} />
-              </button>
-            </div>
-
-            <div className="flex items-end gap-2">
-              <textarea
-                value={planInput}
-                onChange={(event) => setPlanInput(event.target.value)}
-                placeholder="What should this independent Plan investigate?"
-                rows={2}
-                maxLength={200000}
-                className="min-h-[58px] flex-1 resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
-              />
-              <button
-                onClick={() => void createRelatedPlan()}
-                disabled={!planInput.trim() || planCreating}
-                className="flex h-9 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
-              >
-                {planCreating
-                  ? <Loader2 size={13} className="animate-spin" />
-                  : <ListPlus size={13} />}
-                Create Plan
-              </button>
-            </div>
-
-            {planError && (
-              <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
-                {planError}
-              </div>
-            )}
-
-            {plansLoading && relatedPlans.length === 0 && (
-              <div className="flex items-center justify-center gap-2 py-5 text-xs text-gray-500">
-                <Loader2 size={13} className="animate-spin" />
-                Loading Plan history…
-              </div>
-            )}
-            {!plansLoading && relatedPlans.length === 0 && (
-              <div className="rounded-lg border border-dashed border-gray-700 px-3 py-5 text-center text-xs text-gray-500">
-                No Plans yet. Creating one will not interrupt the current session.
-              </div>
-            )}
-
-            <div className="max-h-[42vh] space-y-2 overflow-y-auto">
-              {relatedPlans.map((plan) => {
-                const active = ['pending', 'in_progress', 'executing'].includes(plan.status);
-                const ready = plan.status === 'plan_review';
-                const attachable = (
-                  plan.status === 'completed'
-                  && plan.plan_approved === true
-                  && plan.plan_applied_at == null
-                );
-                const selected = selectedPlanIds.includes(plan.id);
-                return (
-                  <div
-                    key={plan.id}
-                    className={`rounded-lg border px-3 py-2.5 ${
-                      selected
-                        ? 'border-indigo-500/60 bg-indigo-500/10'
-                        : 'border-gray-700 bg-gray-800/70'
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="truncate text-xs font-medium text-gray-200">
-                            {plan.title}
-                          </span>
-                          <span className="text-[10px] text-gray-500">#{plan.id}</span>
-                          <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400">
-                            {getTaskStatusLabel(plan)}
-                          </span>
-                          <PlanPipelineBadge task={plan} />
-                          <PlanRevisionBadge task={plan} />
-                          {planStaleIds.has(plan.id) && (
-                            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
-                              stale
-                            </span>
-                          )}
-                        </div>
-                        <p className="mt-1 line-clamp-2 whitespace-pre-wrap text-[11px] text-gray-500">
-                          {plan.description}
-                        </p>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-1.5">
-                        {active && (
-                          <>
-                            <Loader2 size={13} className="animate-spin text-indigo-300" />
-                            <button
-                              onClick={() => void cancelRelatedPlan(plan.id)}
-                              disabled={planBusyId === plan.id}
-                              className="rounded px-2 py-1 text-[10px] text-red-300 hover:bg-red-500/10 disabled:opacity-40"
-                            >
-                              Cancel
-                            </button>
-                          </>
-                        )}
-                        {ready && (
-                          <>
-                            <button
-                              onClick={() => void approveRelatedPlan(plan)}
-                              disabled={planBusyId === plan.id}
-                              className="flex items-center gap-1 rounded bg-green-600 px-2 py-1 text-[10px] font-medium text-white hover:bg-green-500 disabled:opacity-40"
-                            >
-                              {planBusyId === plan.id
-                                ? <Loader2 size={11} className="animate-spin" />
-                                : <Check size={11} />}
-                              Approve
-                            </button>
-                            <button
-                              onClick={() => void rejectRelatedPlan(plan.id)}
-                              disabled={planBusyId === plan.id}
-                              className="rounded px-2 py-1 text-[10px] text-red-300 hover:bg-red-500/10 disabled:opacity-40"
-                            >
-                              Reject
-                            </button>
-                            <button
-                              onClick={() => void reviseRelatedPlan(plan)}
-                              disabled={planBusyId === plan.id}
-                              className="rounded px-2 py-1 text-[10px] text-gray-400 hover:bg-gray-700 disabled:opacity-40"
-                            >
-                              Revise
-                            </button>
-                          </>
-                        )}
-                        {attachable && (
-                          <button
-                            onClick={() => togglePlanAttachment(plan.id)}
-                            className={`flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium ${
-                              selected
-                                ? 'bg-indigo-600 text-white'
-                                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                            }`}
-                          >
-                            {selected ? <Check size={11} /> : <ListPlus size={11} />}
-                            {selected ? 'Attached' : 'Attach'}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    {plan.plan_content && (
-                      <details className="mt-2">
-                        <summary className="cursor-pointer text-[11px] text-indigo-300 hover:text-indigo-200">
-                          View Plan
-                        </summary>
-                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-gray-950/70 p-2 text-[11px] text-gray-300">
-                          {plan.plan_content}
-                        </pre>
-                      </details>
-                    )}
-                    {plan.metadata_?.plan_review_exhausted && (
-                      <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-300">
-                        Reviewer revision limit reached: {plan.metadata_.plan_review_feedback || 'unresolved feedback remains'}
-                      </div>
-                    )}
-                    {plan.plan_applied_at && (
-                      <div className="mt-1.5 text-[10px] text-gray-600">
-                        Applied to a user message
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
+      {plansOpen && <RelatedPlansDialog
+        open={plansOpen}
+        taskId={task.id}
+        plans={relatedPlans}
+        loading={plansLoading}
+        error={planError}
+        creating={planCreating}
+        busyId={planBusyId}
+        selectedPlanIds={selectedPlanIds}
+        staleIds={planStaleIds}
+        createInput={planInput}
+        onCreateInputChange={setPlanInput}
+        onCreate={createRelatedPlan}
+        onApprove={approveRelatedPlan}
+        onReject={rejectRelatedPlan}
+        onRevise={reviseRelatedPlan}
+        onCancel={cancelRelatedPlan}
+        onToggleAttachment={togglePlanAttachment}
+        onClose={() => setPlansOpen(false)}
+      />}
 
       {/* Distill modal */}
       {distillOpen && (

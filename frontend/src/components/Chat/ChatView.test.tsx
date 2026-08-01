@@ -2091,7 +2091,7 @@ describe('independent Plan attachments', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
     await userEvent.type(
       await screen.findByPlaceholderText(
-        'What should this independent Plan investigate?',
+        'Create an independent Plan…',
       ),
       'Design the migration',
     );
@@ -2118,7 +2118,7 @@ describe('independent Plan attachments', () => {
 
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
-    expect(await screen.findByText('Planning')).toBeInTheDocument();
+    expect((await screen.findAllByText('Planning')).length).toBeGreaterThan(0);
 
     act(() => {
       capturedOnMessage?.({
@@ -2135,7 +2135,7 @@ describe('independent Plan attachments', () => {
         },
       });
     });
-    expect(await screen.findByText('Reviewing · Round 2')).toBeInTheDocument();
+    expect((await screen.findAllByText('Reviewing · Round 2')).length).toBeGreaterThan(0);
     expect(await screen.findByTestId('plan-pipeline-badge')).toHaveTextContent(
       'Reviewer · gpt-5.6-terra',
     );
@@ -2150,7 +2150,7 @@ describe('independent Plan attachments', () => {
         },
       });
     });
-    expect(await screen.findByRole('button', { name: 'Approve' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Approve & attach' })).toBeInTheDocument();
 
     act(() => {
       capturedOnMessage?.({
@@ -2162,8 +2162,8 @@ describe('independent Plan attachments', () => {
         },
       });
     });
-    expect(await screen.findByText('Superseded')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+    expect((await screen.findAllByText('Superseded')).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: 'Approve & attach' })).not.toBeInTheDocument();
   });
 
   it('persists an approved Plan in the composer and sends its explicit id', async () => {
@@ -2223,7 +2223,7 @@ describe('independent Plan attachments', () => {
 
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
-    await userEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve only' }));
 
     await waitFor(() => expect(api.approvePlan).toHaveBeenCalledWith(
       82,
@@ -2233,7 +2233,38 @@ describe('independent Plan attachments', () => {
         codex_service_tier: 'default',
       },
     ));
+    expect(JSON.parse(localStorage.getItem('ccm-plan-dismissed-1') || '[]')).toContain(82);
     expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+
+  it('approves and explicitly attaches a Plan to the next message', async () => {
+    const plan = makeTask({
+      id: 84,
+      title: 'Attach me',
+      mode: 'plan',
+      status: 'plan_review',
+      plan_content: 'A candidate Plan',
+      plan_approved: null,
+      plan_target_task_id: 1,
+    });
+    const approved = {
+      ...plan,
+      status: 'completed',
+      plan_approved: true,
+      plan_applied_at: null,
+    };
+    (api.listRelatedPlans as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce([plan])
+      .mockResolvedValue([approved]);
+    (api.approvePlan as ReturnType<typeof vi.fn>).mockResolvedValue(approved);
+
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve & attach' }));
+
+    expect(await screen.findByText('Plan #84 · Attach me')).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Plans for Task #1' })).not.toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem('ccm-plan-dismissed-1') || '[]')).not.toContain(84);
   });
 
   it('creates a new related Plan when the user requests a revision', async () => {
@@ -2247,18 +2278,17 @@ describe('independent Plan attachments', () => {
       plan_target_task_id: 1,
     });
     (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
-    const prompt = vi.spyOn(window, 'prompt').mockReturnValue(
-      'Preserve backwards compatibility',
-    );
-
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.type(
+      await screen.findByPlaceholderText('Describe changes for a new revision…'),
+      'Preserve backwards compatibility',
+    );
     await userEvent.click(await screen.findByRole('button', { name: 'Revise' }));
 
     await waitFor(() => expect(api.revisePlan).toHaveBeenCalledWith(
       83,
       'Preserve backwards compatibility',
     ));
-    prompt.mockRestore();
   });
 });

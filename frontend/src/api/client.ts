@@ -274,6 +274,8 @@ export interface Task {
     plan_review_verdict?: 'approve' | 'revise';
     plan_review_feedback?: string;
     plan_review_exhausted?: boolean;
+    revised_from_plan_task_id?: number;
+    plan_superseded_by_task_id?: number;
     ccm_worker_managed_task?: boolean;
     ccm_user_skill_snapshots?: unknown[];
   } | null;

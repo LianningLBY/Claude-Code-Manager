@@ -1,6 +1,7 @@
 """Independent Plan Task creation, history, revision, and execution APIs."""
 
 from copy import deepcopy
+from contextlib import AsyncExitStack
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -24,6 +25,7 @@ from backend.services.plan_tasks import (
     capture_task_context,
     capture_repo_revision,
     latest_task_log_id,
+    mark_plan_superseded,
     plan_staleness,
 )
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
@@ -109,6 +111,21 @@ async def _wake_dispatcher() -> None:
         pass
 
 
+def _require_revisable_plan(plan: Task) -> None:
+    if plan.mode != "plan":
+        raise HTTPException(400, "Task is not a Plan")
+    if plan.status == "superseded":
+        successor_id = (plan.metadata_ or {}).get(
+            "plan_superseded_by_task_id"
+        )
+        detail = "Plan has been superseded"
+        if isinstance(successor_id, int):
+            detail += f" by Plan #{successor_id}"
+        raise HTTPException(409, detail)
+    if plan.status != "plan_review":
+        raise HTTPException(400, "Task is not in plan review state")
+
+
 async def _create_related_plan(
     *,
     db: AsyncSession,
@@ -139,6 +156,8 @@ async def _create_related_plan(
         ):
             raise HTTPException(400, "Superseded Plan does not belong to this Task")
         await require_task_control(request, supersedes, db)
+        _require_revisable_plan(supersedes)
+    superseded_id = supersedes.id if supersedes is not None else None
 
     pipeline = resolve_plan_pipeline_config(
         body.pipeline_config,
@@ -210,7 +229,14 @@ async def _create_related_plan(
         enable_workflows=False,
         enabled_skills={},
         selected_user_skills=[],
-        metadata_={"created_from_plan_target_task_id": target.id},
+        metadata_={
+            "created_from_plan_target_task_id": target.id,
+            **(
+                {"revised_from_plan_task_id": supersedes.id}
+                if supersedes is not None
+                else {}
+            ),
+        },
         plan_target_task_id=target.id,
         plan_context_session_id=target.session_id,
         plan_context_log_id=context_log_id,
@@ -222,8 +248,23 @@ async def _create_related_plan(
         plan_pipeline_config=pipeline.model_dump(mode="json"),
     )
     db.add(plan)
+    await db.flush()
+    if supersedes is not None and not await mark_plan_superseded(
+        db,
+        supersedes,
+        successor_id=plan.id,
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Plan changed while its revision was being created",
+        )
     await db.commit()
     await db.refresh(plan)
+    if superseded_id is not None:
+        from backend.services.task_events import broadcast_status_change
+
+        await broadcast_status_change(superseded_id, "superseded")
     if plan.project_id:
         try:
             from backend.services.task_sharing import auto_share_new_task
@@ -254,7 +295,12 @@ async def create_related_plan(
         raise HTTPException(400, "Run the target Task before creating a session Plan")
     if target.shared_from_id is not None:
         raise HTTPException(409, "Shared shadow tasks cannot own Plan Tasks")
-    async with get_task_operation_lock(target_task_id):
+    lock_ids = {target_task_id}
+    if body.supersedes_plan_task_id is not None:
+        lock_ids.add(body.supersedes_plan_task_id)
+    async with AsyncExitStack() as stack:
+        for task_id in sorted(lock_ids):
+            await stack.enter_async_context(get_task_operation_lock(task_id))
         db.expire_all()
         target = await db.get(Task, target_task_id)
         if target is None:
@@ -422,86 +468,111 @@ async def revise_plan(
     if source is None:
         raise HTTPException(404, "Plan Task not found")
     await require_task_control(request, source, db)
-    if source.mode != "plan":
-        raise HTTPException(400, "Task is not a Plan")
-    target = (
-        await db.get(Task, source.plan_target_task_id)
-        if source.plan_target_task_id is not None
-        else source
-    )
-    if target is None:
-        raise HTTPException(409, "Plan target no longer exists")
-    await require_task_control(request, target, db)
-    prompt = (
-        f"{source.description or ''}\n\n"
-        "Previous Plan:\n"
-        f"{source.plan_content or '(no completed plan)'}\n\n"
-        "User revision feedback:\n"
-        f"{body.feedback.strip()}"
-    )
-    revision_pipeline = resolve_plan_pipeline_config(
-        body.pipeline_config or source.plan_pipeline_config,
-        legacy_provider=source.provider,
-        legacy_model=source.model,
-        legacy_effort=source.effort_level,
-    )
-    if source.plan_target_task_id is None:
-        revision = Task(
-            title=(
-                body.title.strip()
-                if body.title and body.title.strip()
-                else f"Revision of Plan #{source.id}"
-            )[:200],
-            description=prompt,
-            status="pending",
-            priority=source.priority,
-            project_id=source.project_id,
-            target_repo=source.target_repo,
-            target_branch=source.target_branch,
-            merge_status="pending",
-            worker_id=source.worker_id,
-            created_by=get_current_user_id(request),
-            max_retries=source.max_retries,
-            mode="plan",
-            provider=revision_pipeline.planner.primary.provider,
-            model=revision_pipeline.planner.primary.model,
-            codex_service_tier=source.codex_service_tier,
-            effort_level=revision_pipeline.planner.primary.effort,
-            plan_pipeline_config=(
-                revision_pipeline.model_dump(mode="json")
-            ),
-            timeout_hours=source.timeout_hours,
-            enable_workflows=False,
-            enabled_skills={},
-            selected_user_skills=[],
-            metadata_={"revised_from_plan_task_id": source.id},
-            plan_context_session_id=None,
-            plan_context_log_id=None,
-            plan_repo_revision=await capture_repo_revision(
-                source.last_cwd or source.target_repo
-            ),
-            supersedes_plan_task_id=source.id,
-        )
-        db.add(revision)
-        await db.commit()
-        await db.refresh(revision)
-        if revision.project_id:
-            try:
-                from backend.services.task_sharing import auto_share_new_task
-
-                await auto_share_new_task(db, revision.id, revision.project_id)
-            except Exception:
-                pass
-        await _wake_dispatcher()
-        return revision
-    async with get_task_operation_lock(target.id):
+    _require_revisable_plan(source)
+    target_id = source.plan_target_task_id or source.id
+    async with AsyncExitStack() as stack:
+        for task_id in sorted({source.id, target_id}):
+            await stack.enter_async_context(get_task_operation_lock(task_id))
         db.expire_all()
-        current_target = await db.get(Task, target.id)
-        current_source = await db.get(Task, source.id)
-        if current_target is None or current_source is None:
+        current_source = await db.get(Task, plan_task_id)
+        current_target = (
+            await db.get(Task, current_source.plan_target_task_id)
+            if current_source is not None
+            and current_source.plan_target_task_id is not None
+            else current_source
+        )
+        if current_source is None or current_target is None:
             raise HTTPException(409, "Plan or target disappeared during revision")
         await require_task_control(request, current_target, db)
         await require_task_control(request, current_source, db)
+        _require_revisable_plan(current_source)
+
+        prompt = (
+            f"{current_source.description or ''}\n\n"
+            "Previous Plan:\n"
+            f"{current_source.plan_content or '(no completed plan)'}\n\n"
+            "User revision feedback:\n"
+            f"{body.feedback.strip()}"
+        )
+        revision_pipeline = resolve_plan_pipeline_config(
+            body.pipeline_config or current_source.plan_pipeline_config,
+            legacy_provider=current_source.provider,
+            legacy_model=current_source.model,
+            legacy_effort=current_source.effort_level,
+        )
+        if current_source.plan_target_task_id is None:
+            revision = Task(
+                title=(
+                    body.title.strip()
+                    if body.title and body.title.strip()
+                    else f"Revision of Plan #{current_source.id}"
+                )[:200],
+                description=prompt,
+                status="pending",
+                priority=current_source.priority,
+                project_id=current_source.project_id,
+                target_repo=current_source.target_repo,
+                target_branch=current_source.target_branch,
+                merge_status="pending",
+                worker_id=current_source.worker_id,
+                created_by=get_current_user_id(request),
+                max_retries=current_source.max_retries,
+                mode="plan",
+                provider=revision_pipeline.planner.primary.provider,
+                model=revision_pipeline.planner.primary.model,
+                codex_service_tier=current_source.codex_service_tier,
+                effort_level=revision_pipeline.planner.primary.effort,
+                plan_pipeline_config=(
+                    revision_pipeline.model_dump(mode="json")
+                ),
+                timeout_hours=current_source.timeout_hours,
+                enable_workflows=False,
+                enabled_skills={},
+                selected_user_skills=[],
+                metadata_={
+                    "revised_from_plan_task_id": current_source.id
+                },
+                plan_context_session_id=None,
+                plan_context_log_id=None,
+                plan_repo_revision=await capture_repo_revision(
+                    current_source.last_cwd or current_source.target_repo
+                ),
+                supersedes_plan_task_id=current_source.id,
+            )
+            db.add(revision)
+            await db.flush()
+            if not await mark_plan_superseded(
+                db,
+                current_source,
+                successor_id=revision.id,
+            ):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Plan changed while its revision was being created",
+                )
+            await db.commit()
+            await db.refresh(revision)
+            from backend.services.task_events import broadcast_status_change
+
+            await broadcast_status_change(
+                plan_task_id,
+                "superseded",
+            )
+            if revision.project_id:
+                try:
+                    from backend.services.task_sharing import auto_share_new_task
+
+                    await auto_share_new_task(
+                        db,
+                        revision.id,
+                        revision.project_id,
+                    )
+                except Exception:
+                    pass
+            await _wake_dispatcher()
+            return revision
+
         return await _create_related_plan(
             db=db,
             request=request,

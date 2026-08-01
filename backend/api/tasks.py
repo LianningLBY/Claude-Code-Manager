@@ -475,6 +475,7 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
+    supersedes: Task | None = None
     if data.get("mode") == "plan":
         from backend.schemas.plan import resolve_plan_pipeline_config
         from backend.services.plan_pipeline_settings import (
@@ -621,6 +622,11 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
                     "Superseded Plan does not belong to this Task",
                 )
             await require_task_control(request, supersedes, db)
+            if supersedes.status != "plan_review":
+                raise HTTPException(
+                    409,
+                    "Only a Plan awaiting review can be superseded",
+                )
         # The execution node owns its LogEntry ids and repository. Re-capture
         # the same target boundary locally instead of trusting a Manager-side
         # watermark whose integer id has no cross-database meaning.
@@ -665,6 +671,11 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
                 "Standalone Plan can only supersede another standalone Plan",
             )
         await require_task_control(request, supersedes, db)
+        if supersedes.status != "plan_review":
+            raise HTTPException(
+                409,
+                "Only a Plan awaiting review can be superseded",
+            )
 
     if clone_from_task_id:
         source = await db.get(Task, clone_from_task_id)
@@ -737,7 +748,33 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    task = await queue.create(**data)
+    if supersedes is None:
+        task = await queue.create(**data)
+    else:
+        superseded_id = supersedes.id
+        metadata = dict(data.get("metadata_") or {})
+        metadata["revised_from_plan_task_id"] = superseded_id
+        data["metadata_"] = metadata
+        task = Task(**data)
+        db.add(task)
+        await db.flush()
+        from backend.services.plan_tasks import mark_plan_superseded
+
+        if not await mark_plan_superseded(
+            db,
+            supersedes,
+            successor_id=task.id,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Plan changed while its revision was being created",
+            )
+        await db.commit()
+        await db.refresh(task)
+        from backend.services.task_events import broadcast_status_change
+
+        await broadcast_status_change(superseded_id, "superseded")
     # Eliminate the dispatcher's historical 0-2s polling delay.  Importing
     # here avoids a module cycle during application construction.
     try:
@@ -3794,6 +3831,19 @@ async def get_queue(
     )
 
 
+def _require_plan_review_operation(task: Task) -> None:
+    if task.mode == "plan" and task.status == "superseded":
+        successor_id = (task.metadata_ or {}).get(
+            "plan_superseded_by_task_id"
+        )
+        detail = "Plan has been superseded"
+        if isinstance(successor_id, int):
+            detail += f" by Plan #{successor_id}"
+        raise HTTPException(409, detail)
+    if task.mode != "plan" or task.status != "plan_review":
+        raise HTTPException(400, "Task is not in plan review state")
+
+
 @router.post("/{task_id}/plan/approve", response_model=TaskResponse)
 async def approve_plan(
     task_id: int,
@@ -3819,8 +3869,7 @@ async def approve_plan(
             body.expected_routing if body is not None else None,
             effective_model=current.model,
         )
-        if current.mode != "plan" or current.status != "plan_review":
-            raise HTTPException(400, "Task is not in plan review state")
+        _require_plan_review_operation(current)
 
         target = None
         if current.plan_target_task_id is not None:
@@ -3913,8 +3962,7 @@ async def reject_plan(task_id: int, request: Request, queue: TaskQueue = Depends
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
-        if current.mode != "plan" or current.status != "plan_review":
-            raise HTTPException(400, "Task is not in plan review state")
+        _require_plan_review_operation(current)
 
         if current.worker_id is not None:
             observed = worker_task_generation(current)

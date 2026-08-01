@@ -173,6 +173,28 @@ describe('TaskList', () => {
     );
   });
 
+  it('shows both sides of an immutable Plan revision chain', () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          id: 12,
+          mode: 'plan',
+          status: 'superseded',
+          supersedes_plan_task_id: 9,
+          metadata_: { plan_superseded_by_task_id: 15 },
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    expect(screen.getByText('Superseded')).toBeInTheDocument();
+    expect(screen.getByText('Revision of #9')).toBeInTheDocument();
+    expect(screen.getByText('Superseded by #15')).toBeInTheDocument();
+    expect(screen.queryByText('Config')).not.toBeInTheDocument();
+  });
+
   it('shows empty state when no tasks', () => {
     render(<TaskList tasks={[]} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('No tasks yet')).toBeInTheDocument();

@@ -20,7 +20,7 @@ import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, C
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
-import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import { FastModeBadge, PlanPipelineBadge, PlanRevisionBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { ExpandableText } from '../ExpandableText';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
@@ -836,6 +836,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         }
       }
       return;
+    }
+    if (
+      msg.channel === 'tasks'
+      && msg.data?.event === 'status_change'
+      && typeof msg.data.new_status === 'string'
+    ) {
+      const changedTaskId = Number(msg.data.task_id);
+      if (Number.isSafeInteger(changedTaskId) && changedTaskId > 0) {
+        setRelatedPlans((plans) => plans.map((plan) => (
+          plan.id === changedTaskId
+            ? { ...plan, status: msg.data!.new_status as string }
+            : plan
+        )));
+      }
     }
     if (
       msg.channel === 'tasks'
@@ -2243,6 +2257,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                             {getTaskStatusLabel(plan)}
                           </span>
                           <PlanPipelineBadge task={plan} />
+                          <PlanRevisionBadge task={plan} />
                           {planStaleIds.has(plan.id) && (
                             <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
                               stale

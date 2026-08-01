@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api, isApiRequestError } from '../../api/client';
 import type { Task } from '../../api/client';
 import { Check, Loader2, Play, X } from '../icons';
+import { PlanRevisionBadge } from '../Tasks/TaskBadges';
 
 interface PlanPanelProps {
   tasks: Task[];
@@ -78,6 +79,28 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
     }
   };
 
+  const handleRevise = async (task: Task) => {
+    const feedback = window.prompt(
+      'What should the revised Plan change?',
+      task.metadata_?.plan_review_feedback || '',
+    )?.trim();
+    if (!feedback) return;
+    setBusyId(task.id);
+    setError(null);
+    try {
+      await api.revisePlan(task.id, feedback);
+    } catch (revisionError) {
+      setError(
+        revisionError instanceof Error
+          ? revisionError.message
+          : String(revisionError),
+      );
+    } finally {
+      setBusyId(null);
+      onRefresh();
+    }
+  };
+
   const handleCreateExecution = async (id: number) => {
     setBusyId(id);
     setError(null);
@@ -118,6 +141,12 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
                   for Task #{task.plan_target_task_id}
                 </span>
               )}
+              {(task.supersedes_plan_task_id
+                || task.metadata_?.plan_superseded_by_task_id) && (
+                <span className="ml-2 inline-flex gap-1">
+                  <PlanRevisionBadge task={task} />
+                </span>
+              )}
             </div>
             <div className="flex gap-2">
               {task.status === 'plan_review' ? (
@@ -138,6 +167,13 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
                     className="flex items-center gap-1 bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
                   >
                     <X size={14} /> Reject
+                  </button>
+                  <button
+                    onClick={() => void handleRevise(task)}
+                    disabled={busyId === task.id}
+                    className="rounded bg-gray-700 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-gray-600 disabled:opacity-50"
+                  >
+                    Revise
                   </button>
                 </>
               ) : (

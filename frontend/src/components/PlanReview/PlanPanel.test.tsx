@@ -9,6 +9,7 @@ vi.mock('../../api/client', () => ({
   api: {
     approvePlan: vi.fn().mockResolvedValue({}),
     rejectPlan: vi.fn().mockResolvedValue({}),
+    revisePlan: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -41,5 +42,33 @@ describe('PlanPanel', () => {
       codex_service_tier: 'priority',
     });
     await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+  });
+
+  it('creates a standalone revision and shows its predecessor', async () => {
+    const task = {
+      id: 42,
+      title: 'Standalone revision',
+      mode: 'plan',
+      status: 'plan_review',
+      plan_content: 'Version two',
+      plan_target_task_id: null,
+      supersedes_plan_task_id: 41,
+      provider: 'claude',
+      model: 'claude-fable-5',
+      codex_service_tier: 'default',
+      metadata_: {},
+    } as Task;
+    const onRefresh = vi.fn();
+    const prompt = vi.spyOn(window, 'prompt').mockReturnValue(
+      'Add a rollback phase',
+    );
+
+    render(<PlanPanel tasks={[task]} onRefresh={onRefresh} />);
+    expect(screen.getByText('Revision of #41')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Revise' }));
+
+    expect(api.revisePlan).toHaveBeenCalledWith(42, 'Add a rollback phase');
+    await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+    prompt.mockRestore();
   });
 });

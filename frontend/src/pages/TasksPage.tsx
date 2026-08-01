@@ -288,7 +288,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter]);
 
-  const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'failed'];
+  const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'superseded', 'failed'];
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
   const filterDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -309,6 +309,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     executing: 'Executing',
     plan_review: 'Plan Review',
     completed: 'Completed',
+    superseded: 'Superseded',
     failed: 'Failed',
   };
 
@@ -318,6 +319,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     executing: 'bg-blue-400',
     plan_review: 'bg-purple-500',
     completed: 'bg-green-500',
+    superseded: 'bg-gray-500',
     failed: 'bg-red-500',
   };
 
@@ -654,6 +656,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       executing: 'bg-blue-400 animate-pulse',
       background: 'bg-teal-400 animate-pulse',
       plan_review: 'bg-purple-500',
+      superseded: 'bg-gray-500',
       completed: 'bg-green-500',
       failed: 'bg-red-500',
       cancelled: 'bg-gray-500',

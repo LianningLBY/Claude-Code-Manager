@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.log_entry import LogEntry
@@ -17,6 +18,39 @@ from backend.models.task import Task
 ACTIVE_PLAN_STATUSES = frozenset({"pending", "in_progress", "executing"})
 MAX_ACTIVE_PLANS_PER_TASK = 3
 PLAN_CONTEXT_SNAPSHOT_MAX_CHARS = 60_000
+
+
+async def mark_plan_superseded(
+    db: AsyncSession,
+    source: Task,
+    *,
+    successor_id: int,
+    completed_at: datetime | None = None,
+) -> bool:
+    """Atomically retire one reviewable Plan in favor of its successor.
+
+    The status predicate is the durable race fence against a concurrent
+    approve, reject, or second revision. The caller commits this update in the
+    same transaction that creates ``successor_id``.
+    """
+
+    metadata = dict(source.metadata_ or {})
+    metadata["plan_superseded_by_task_id"] = successor_id
+    changed = await db.execute(
+        update(Task)
+        .where(
+            Task.id == source.id,
+            Task.mode == "plan",
+            Task.status == "plan_review",
+        )
+        .values(
+            status="superseded",
+            completed_at=completed_at or datetime.utcnow(),
+            metadata_=metadata,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return changed.rowcount == 1
 
 
 def _worktree_stat_fingerprint(cwd: Path, status_raw: bytes) -> bytes:

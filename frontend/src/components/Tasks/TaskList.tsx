@@ -3,7 +3,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { api } from '../../api/client';
 import type { Task, Project } from '../../api/client';
 import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus } from '../icons';
-import { FastModeBadge, PlanPipelineBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
+import { FastModeBadge, PlanPipelineBadge, PlanRevisionBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
 import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
@@ -27,6 +27,7 @@ const statusColors: Record<string, string> = {
   executing: 'bg-blue-400 animate-pulse',
   background: 'bg-teal-400 animate-pulse',
   plan_review: 'bg-purple-500',
+  superseded: 'bg-gray-500',
   completed: 'bg-green-500',
   failed: 'bg-red-500',
   cancelled: 'bg-gray-500',
@@ -191,7 +192,10 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
                 {getTaskStatusLabel(t)}
               </span>
               {t.mode === 'plan' ? (
-                <PlanPipelineBadge task={t} />
+                <>
+                  <PlanPipelineBadge task={t} />
+                  <PlanRevisionBadge task={t} />
+                </>
               ) : (
                 <>
                   <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>

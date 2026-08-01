@@ -89,6 +89,35 @@ export function PlanPipelineBadge({ task }: { task: Task }) {
   );
 }
 
+/** Immutable Plan revision lineage. Middle versions can show both links. */
+export function PlanRevisionBadge({ task }: { task: Task }) {
+  if (task.mode !== 'plan') return null;
+  const predecessorId = task.supersedes_plan_task_id;
+  const successorId = task.metadata_?.plan_superseded_by_task_id;
+  if (!predecessorId && !successorId) return null;
+
+  return (
+    <>
+      {predecessorId && (
+        <span
+          className="rounded bg-indigo-600/15 px-1.5 text-[10px] font-medium text-indigo-300"
+          title={`This Plan is a revision of Plan #${predecessorId}`}
+        >
+          Revision of #{predecessorId}
+        </span>
+      )}
+      {successorId && (
+        <span
+          className="rounded bg-gray-700 px-1.5 text-[10px] font-medium text-gray-400"
+          title={`A newer revision is available as Plan #${successorId}`}
+        >
+          Superseded by #{successorId}
+        </span>
+      )}
+    </>
+  );
+}
+
 // Plugins (SKILL.md-based) loaded from API at page load, cached globally
 let _pluginsCache: { key: string; label: string }[] | null = null;
 interface CodexTaskSkillsCapability {

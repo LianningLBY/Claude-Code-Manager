@@ -2151,6 +2151,19 @@ describe('independent Plan attachments', () => {
       });
     });
     expect(await screen.findByRole('button', { name: 'Approve' })).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'tasks',
+        data: {
+          event: 'status_change',
+          task_id: 80,
+          new_status: 'superseded',
+        },
+      });
+    });
+    expect(await screen.findByText('Superseded')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
   });
 
   it('persists an approved Plan in the composer and sends its explicit id', async () => {
@@ -2221,5 +2234,31 @@ describe('independent Plan attachments', () => {
       },
     ));
     expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+
+  it('creates a new related Plan when the user requests a revision', async () => {
+    const plan = makeTask({
+      id: 83,
+      title: 'Revise me',
+      mode: 'plan',
+      status: 'plan_review',
+      plan_content: 'A candidate Plan',
+      plan_approved: null,
+      plan_target_task_id: 1,
+    });
+    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+    const prompt = vi.spyOn(window, 'prompt').mockReturnValue(
+      'Preserve backwards compatibility',
+    );
+
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Revise' }));
+
+    await waitFor(() => expect(api.revisePlan).toHaveBeenCalledWith(
+      83,
+      'Preserve backwards compatibility',
+    ));
+    prompt.mockRestore();
   });
 });

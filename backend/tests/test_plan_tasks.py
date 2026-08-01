@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -235,6 +236,192 @@ async def test_new_plans_snapshot_the_global_pipeline_settings(
         assert data["provider"] == "codex"
         assert data["model"] == "gpt-5.6-terra"
         assert data["plan_pipeline_config"] == pipeline
+
+
+@pytest.mark.asyncio
+async def test_related_plan_revision_creates_successor_and_retires_source(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    created = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={"input": "Design the first version"},
+    )
+    source_id = created.json()["id"]
+    source_pipeline = created.json()["plan_pipeline_config"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == source_id)
+            .values(status="plan_review", plan_content="Original proposal")
+        )
+        await db.commit()
+
+    revised = await client.post(
+        f"/api/tasks/{source_id}/plan/revise",
+        json={"feedback": "Keep the API backwards compatible"},
+    )
+
+    assert revised.status_code == 201, revised.text
+    successor = revised.json()
+    assert successor["id"] != source_id
+    assert successor["status"] == "pending"
+    assert successor["plan_target_task_id"] == target_id
+    assert successor["supersedes_plan_task_id"] == source_id
+    assert successor["plan_pipeline_config"] == source_pipeline
+    assert successor["metadata_"]["revised_from_plan_task_id"] == source_id
+    assert "Original proposal" in successor["description"]
+    assert "Keep the API backwards compatible" in successor["description"]
+
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+    assert source.status == "superseded"
+    assert source.completed_at is not None
+    assert source.metadata_["plan_superseded_by_task_id"] == successor["id"]
+
+    stale_approval = await client.post(f"/api/tasks/{source_id}/plan/approve")
+    stale_rejection = await client.post(f"/api/tasks/{source_id}/plan/reject")
+    assert stale_approval.status_code == 409
+    assert stale_rejection.status_code == 409
+    assert f"Plan #{successor['id']}" in stale_approval.json()["detail"]
+    assert f"Plan #{successor['id']}" in stale_rejection.json()["detail"]
+    stale_revision = await client.post(
+        f"/api/tasks/{source_id}/plan/revise",
+        json={"feedback": "Try a third direction"},
+    )
+    assert stale_revision.status_code == 409
+    assert f"Plan #{successor['id']}" in stale_revision.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_plan_revision_preserves_independent_version_history(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Standalone v1",
+            "description": "Plan the migration",
+            "target_repo": "/tmp",
+            "mode": "plan",
+        },
+    )
+    source_id = created.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == source_id)
+            .values(status="plan_review", plan_content="Migration v1")
+        )
+        await db.commit()
+
+    revised = await client.post(
+        f"/api/tasks/{source_id}/plan/revise",
+        json={"feedback": "Add a rollback phase"},
+    )
+
+    assert revised.status_code == 201, revised.text
+    successor = revised.json()
+    assert successor["plan_target_task_id"] is None
+    assert successor["supersedes_plan_task_id"] == source_id
+    assert successor["metadata_"]["revised_from_plan_task_id"] == source_id
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+    assert source.status == "superseded"
+    assert source.metadata_["plan_superseded_by_task_id"] == successor["id"]
+
+
+@pytest.mark.asyncio
+async def test_generic_plan_create_supersedes_worker_side_source_atomically(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Worker source",
+            "description": "Plan on a Worker",
+            "target_repo": "/tmp",
+            "mode": "plan",
+        },
+    )
+    source_id = created.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == source_id)
+            .values(status="plan_review", plan_content="Worker proposal")
+        )
+        await db.commit()
+
+    successor = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Worker successor",
+            "description": "Revise on the execution node",
+            "target_repo": "/tmp",
+            "mode": "plan",
+            "supersedes_plan_task_id": source_id,
+        },
+    )
+
+    assert successor.status_code == 201, successor.text
+    successor_id = successor.json()["id"]
+    assert successor.json()["supersedes_plan_task_id"] == source_id
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+    assert source.status == "superseded"
+    assert source.metadata_["plan_superseded_by_task_id"] == successor_id
+
+
+@pytest.mark.asyncio
+async def test_plan_approval_and_revision_are_serialized(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Racing Plan",
+            "description": "Choose one terminal decision",
+            "target_repo": "/tmp",
+            "mode": "plan",
+        },
+    )
+    source_id = created.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == source_id)
+            .values(status="plan_review", plan_content="Race-safe proposal")
+        )
+        await db.commit()
+
+    approved, revised = await asyncio.gather(
+        client.post(f"/api/tasks/{source_id}/plan/approve"),
+        client.post(
+            f"/api/tasks/{source_id}/plan/revise",
+            json={"feedback": "Create a successor"},
+        ),
+    )
+
+    assert (approved.status_code == 200) != (revised.status_code == 201)
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+        successor_count = await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.supersedes_plan_task_id == source_id
+            )
+        )
+    if revised.status_code == 201:
+        assert source.status == "superseded"
+        assert successor_count == 1
+    else:
+        assert source.status == "completed"
+        assert source.plan_approved is True
+        assert successor_count == 0
 
 
 @pytest.mark.asyncio

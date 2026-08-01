@@ -72,7 +72,10 @@ Plan B approve ───────────────► approved / pendi
 
 - reject：`plan_approved=False, status="cancelled"`；
 - “根据反馈重新规划”不是复活原 Plan，而是创建新 Plan Task；
-- 新 Plan 记录 `supersedes_plan_task_id`，旧方案及审查历史保持不变。
+- 新 Plan 记录 `supersedes_plan_task_id`，旧方案内容及审查历史保持不变；
+- 新 Plan 与旧 Plan 的 `status="superseded"` 必须在同一事务提交；旧 Plan 记录
+  `metadata.plan_superseded_by_task_id`，此后 approve/reject/revise 均由后端拒绝；
+- 前端展示 `Revision of #…` / `Superseded by #…` 版本链，不能只隐藏旧版操作按钮。
 
 ## 3. 数据模型
 

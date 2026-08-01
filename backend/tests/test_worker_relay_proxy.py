@@ -2952,6 +2952,88 @@ async def test_generic_worker_proxy_can_require_json_confirmation(
     assert "invalid confirmation" in caught.value.detail
 
 
+async def test_worker_proxy_marks_manager_confirmed_terminal_pr_chat(
+    session_factory,
+    monkeypatch,
+):
+    from backend.services.pr_review_runtime import (
+        PR_REVIEW_TERMINAL_CHAT_HEADER,
+        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    )
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        tags=["pr-review"],
+    )
+    requests = _install_proxy_transport(
+        monkeypatch,
+        _ProxyResponse(200, {"ok": True}),
+    )
+    proxy = WorkerProxy(session_factory, AsyncMock())
+
+    await proxy.proxy_to_worker(
+        task,
+        "POST",
+        f"/api/tasks/{task.id}/chat",
+        pr_review_terminal_chat=True,
+    )
+
+    assert requests[0][2]["headers"] == {
+        "Authorization": "Bearer wtoken",
+        PR_REVIEW_TERMINAL_CHAT_HEADER:
+        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    }
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_status"),
+    [
+        ({"pr_review_terminal_chat_version": 1}, None),
+        ({}, 409),
+    ],
+)
+async def test_worker_terminal_pr_chat_capability_preflight(
+    session_factory,
+    monkeypatch,
+    config,
+    expected_status,
+):
+    worker = await _mk_worker(session_factory)
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return config
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(session_factory, AsyncMock())
+
+    if expected_status is None:
+        await proxy.require_terminal_pr_review_chat_support(worker)
+    else:
+        with pytest.raises(HTTPException) as caught:
+            await proxy.require_terminal_pr_review_chat_support(worker)
+        assert caught.value.status_code == expected_status
+        assert "升级" in caught.value.detail
+
+
 async def test_generic_worker_proxy_can_confirm_task_already_absent(
     session_factory,
     monkeypatch,

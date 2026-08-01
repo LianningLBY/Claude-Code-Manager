@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.database import Base, get_db
+from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import MonitoredRepo, PRReview
 from backend.models.task import Task
 from backend.models.worker import Worker
@@ -683,6 +684,143 @@ async def test_publishing_review_freezes_task_retry_chat_and_delete(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", [
+    "approved",
+    "merged",
+    "commented",
+    "error",
+])
+async def test_terminal_pr_review_task_allows_follow_up_chat(
+    client,
+    session_factory,
+    terminal_status,
+):
+    repo = await _create_repo(client, f"owner/chat-{terminal_status}")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(f"owner/chat-{terminal_status}"),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, opened.json()["review_id"])
+        task = await db.get(Task, review.task_id)
+        task_id = task.id
+        task.status = "completed"
+        task.session_id = f"terminal-{terminal_status}-session"
+        review.status = terminal_status
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+
+    dispatcher = MagicMock(enqueue_message=AsyncMock())
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "explain the review"},
+        )
+
+    assert response.status_code == 200, response.text
+    dispatcher.enqueue_message.assert_awaited_once()
+    async with session_factory() as db:
+        stored_review = await db.get(PRReview, opened.json()["review_id"])
+        messages = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert stored_review.status == terminal_status
+    assert len(messages) == 1
+    assert json.loads(messages[0].raw_json)["raw_content"] == (
+        "explain the review"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_status", [
+    "pending",
+    "reviewing",
+    "publishing",
+    "superseding",
+    "superseded",
+])
+async def test_nonterminal_or_superseded_pr_review_blocks_follow_up_chat(
+    client,
+    session_factory,
+    active_status,
+):
+    repo = await _create_repo(client, f"owner/chat-block-{active_status}")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(f"owner/chat-block-{active_status}"),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, opened.json()["review_id"])
+        task = await db.get(Task, review.task_id)
+        task_id = task.id
+        task.status = "completed"
+        task.session_id = f"blocked-{active_status}-session"
+        review.status = active_status
+        await db.commit()
+
+    dispatcher = MagicMock(enqueue_message=AsyncMock())
+    with patch("backend.main.dispatcher", dispatcher):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "change the review"},
+        )
+
+    assert response.status_code == 409
+    dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_pr_review_task_allows_live_injection(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/terminal-inject")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/terminal-inject"),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, opened.json()["review_id"])
+        task = await db.get(Task, review.task_id)
+        task_id = task.id
+        task.status = "executing"
+        task.session_id = "terminal-review-live-session"
+        task.provider = "claude"
+        review.status = "commented"
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+
+    instance_manager = MagicMock()
+    instance_manager.pty_mode_enabled = True
+    instance_manager.has_pty_session = MagicMock(return_value=True)
+    instance_manager.inject_pty_message = AsyncMock(return_value=True)
+    with patch("backend.main.instance_manager", instance_manager), patch(
+        "backend.main.broadcaster",
+        MagicMock(broadcast=AsyncMock()),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "clarify this finding"},
+        )
+
+    assert response.status_code == 200, response.text
+    instance_manager.inject_pty_message.assert_awaited_once_with(
+        "terminal-review-live-session",
+        "clarify this finding",
+    )
+
+
+@pytest.mark.asyncio
 async def test_terminal_pr_review_task_cannot_be_retried_without_new_snapshot(
     client,
     session_factory,
@@ -789,6 +927,115 @@ async def test_pr_review_tag_alone_freezes_worker_side_task_mutations(
     assert delete.status_code == 409
     async with session_factory() as db:
         assert await db.get(Task, task_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_worker_tag_only_pr_review_chat_requires_internal_terminal_header(
+    client,
+    session_factory,
+):
+    from backend.services.pr_review_runtime import (
+        PR_REVIEW_TERMINAL_CHAT_HEADER,
+        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="Worker terminal PR review mirror",
+            description="immutable snapshot",
+            status="completed",
+            tags=["pr-review"],
+            session_id="worker-terminal-review-session",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    dispatcher = MagicMock(enqueue_message=AsyncMock())
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    internal_auth = MagicMock()
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ), patch(
+        "backend.api.chat.require_internal_service",
+        internal_auth,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            headers={
+                PR_REVIEW_TERMINAL_CHAT_HEADER:
+                PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+            },
+            json={"message": "discuss the completed review"},
+        )
+
+    assert response.status_code == 200, response.text
+    internal_auth.assert_called_once()
+    dispatcher.enqueue_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_old_worker_terminal_chat_before_local_log(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/old-worker-chat")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/old-worker-chat"),
+    )
+    async with session_factory() as db:
+        worker = Worker(
+            name="old-worker",
+            status="ready",
+            private_ip="10.0.0.44",
+            auth_token="worker-token",
+        )
+        db.add(worker)
+        await db.flush()
+        review = await db.get(PRReview, opened.json()["review_id"])
+        task = await db.get(Task, review.task_id)
+        task_id = task.id
+        task.worker_id = worker.id
+        task.status = "completed"
+        task.session_id = "old-worker-review-session"
+        review.status = "commented"
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+
+    from fastapi import HTTPException
+
+    worker_proxy = MagicMock()
+    worker_proxy.require_ready_worker = AsyncMock(return_value=worker)
+    worker_proxy.proxy_to_worker = AsyncMock()
+    worker_proxy.require_terminal_pr_review_chat_support = AsyncMock(
+        side_effect=HTTPException(409, "Worker version is too old"),
+    )
+    with patch("backend.main.worker_proxy", worker_proxy), patch(
+        "backend.api.tasks._ensure_worker_routing_ready",
+        AsyncMock(),
+    ), patch(
+        "backend.main.broadcaster",
+        MagicMock(broadcast=AsyncMock()),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "explain the completed review"},
+        )
+
+    assert response.status_code == 409
+    worker_proxy.require_terminal_pr_review_chat_support.assert_awaited_once()
+    worker_proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        messages = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert messages == []
 
 
 @pytest.mark.asyncio

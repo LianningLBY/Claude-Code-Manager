@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api } from '../../api/client';
+import { api, isApiRequestError } from '../../api/client';
 import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
@@ -1559,9 +1559,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       onTaskUpdated?.();
       fetchHistory();
       const errMsg = String(e);
-      if (errMsg.includes('409') || errMsg.toLowerCase().includes('currently being processed')) {
-        setStillRunning(true);
-      }
+      const conflictDetail = (
+        isApiRequestError(e) && typeof e.detail === 'string'
+          ? e.detail
+          : errMsg
+      ).toLowerCase();
+      const isBusyConflict = (
+        (!isApiRequestError(e) || e.status === 409)
+        && (
+          conflictDetail.includes('currently being processed')
+          || conflictDetail.includes('still running')
+          || conflictDetail.includes('current turn to finish')
+        )
+      );
+      setStillRunning(isBusyConflict);
       setError(errMsg);
       if (!fromQueue && text) setInput(text);
       if (!fromQueue && fileUploadResultsForTurn.length > 0) {

@@ -6,6 +6,10 @@ import type { Task, Project, ChatMessage, UploadResult } from '../../api/client'
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
+  isApiRequestError: (error: unknown) => (
+    error instanceof Error
+    && typeof (error as { status?: unknown }).status === 'number'
+  ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
     sendTaskChat: vi.fn().mockResolvedValue({}),
@@ -167,6 +171,50 @@ describe('ChatView', () => {
     (api.injectTaskMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       injected: true,
+    });
+    (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  });
+
+  describe('chat conflict state', () => {
+    it('does not show Interrupt for a non-busy 409 rejection', async () => {
+      const rejection = Object.assign(
+        new Error('PR review workflow is not terminal'),
+        { status: 409, detail: 'PR review workflow is not terminal' },
+      );
+      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(rejection);
+      render(
+        <ChatView
+          task={makeTask({ status: 'completed', tags: ['pr-review'] })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      await userEvent.type(screen.getByRole('textbox'), 'follow up');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      await screen.findByText(/PR review workflow is not terminal/);
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    });
+
+    it('still shows Interrupt for a genuine busy conflict', async () => {
+      const rejection = Object.assign(
+        new Error('The preceding Codex turn is still running'),
+        { status: 409, detail: 'The preceding Codex turn is still running' },
+      );
+      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(rejection);
+      render(
+        <ChatView
+          task={makeTask({ status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      await userEvent.type(screen.getByRole('textbox'), 'follow up');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      expect(await screen.findByTitle('Interrupt session')).toBeInTheDocument();
     });
   });
 

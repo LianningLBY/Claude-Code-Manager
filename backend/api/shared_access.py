@@ -17,6 +17,7 @@ from backend.models.task import Task
 from backend.models.task_share import TaskShare
 from backend.models.log_entry import LogEntry
 from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.worker_proxy import get_task_operation_lock
 
 logger = logging.getLogger(__name__)
 
@@ -149,72 +150,73 @@ async def shared_chat(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a message to a shared task — injected via the dispatcher queue."""
-    share = await _validate_token(task_id, token, db)
+    # The PR completion consumer uses this same lock for its exact
+    # reviewing->publishing->terminal transition.  Whichever side wins makes
+    # one complete admission decision before a user row can be persisted.
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        share = await _validate_token(task_id, token, db)
+        task = await db.get(Task, task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        if not task.session_id:
+            raise HTTPException(400, "Task has no active session")
+        from backend.api.tasks import _require_pr_review_chat_allowed
 
-    task = await db.get(Task, task_id)
-    if not task:
-        raise HTTPException(404, "Task not found")
-    if not task.session_id:
-        raise HTTPException(400, "Task has no active session")
-    from backend.api.tasks import (
-        _require_no_pr_review_publication,
-        _require_not_pr_review_task_mutation,
-    )
+        await _require_pr_review_chat_allowed(db, task_id)
 
-    await _require_no_pr_review_publication(db, task_id)
-    await _require_not_pr_review_task_mutation(
-        db,
-        task_id,
-        action="continued by shared chat",
-    )
-
-    # Sender identity is display metadata only.  Keep it in the persisted/UI
-    # copy, while the model receives the caller's original message verbatim.
-    sender = body.sender_name or share.shared_to_name or "Anonymous"
-    prefixed = f"[{sender}] {body.message}"
-
-    # Store user message
-    user_log = LogEntry(
-        instance_id=1,
-        task_id=task_id,
-        event_type="user_message",
-        role="user",
-        content=prefixed,
-        raw_json=json.dumps({
-            "sender_name": sender,
-            "raw_content": body.message,
-        }),
-        is_error=False,
-    )
-    db.add(user_log)
-    await db.commit()
-
-    # Broadcast
-    from backend.main import broadcaster
-    await broadcaster.broadcast(f"task:{task_id}", persisted_chat_event(user_log, {
-        "event_type": "user_message",
-        "role": "user",
-        "content": prefixed,
-        "sender_name": sender,
-        "raw_content": body.message,
-    }))
-
-    # Enqueue
-    from backend.main import dispatcher
-    from backend.services.dispatcher import PRIORITY_USER, TaskStartPausedError
-    try:
-        await dispatcher.enqueue_message(
+        # Sender identity is display metadata only.  Keep it in the
+        # persisted/UI copy, while the model receives the caller's original
+        # message verbatim.
+        sender = body.sender_name or share.shared_to_name or "Anonymous"
+        prefixed = f"[{sender}] {body.message}"
+        user_log = LogEntry(
+            instance_id=1,
             task_id=task_id,
-            prompt=body.message,
-            priority=PRIORITY_USER,
-            source="shared",
-            source_log_id=user_log.id,
+            event_type="user_message",
+            role="user",
+            content=prefixed,
+            raw_json=json.dumps({
+                "sender_name": sender,
+                "raw_content": body.message,
+            }),
+            is_error=False,
         )
-    except TaskStartPausedError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="服务即将重启，消息未进入执行队列，请重连后重试",
-        ) from exc
+        db.add(user_log)
+        await db.commit()
+
+        from backend.main import broadcaster
+        await broadcaster.broadcast(
+            f"task:{task_id}",
+            persisted_chat_event(user_log, {
+                "event_type": "user_message",
+                "role": "user",
+                "content": prefixed,
+                "sender_name": sender,
+                "raw_content": body.message,
+            }),
+        )
+
+        from backend.main import dispatcher
+        from backend.services.dispatcher import (
+            PRIORITY_USER,
+            TaskStartPausedError,
+        )
+
+        try:
+            await dispatcher.enqueue_message(
+                task_id=task_id,
+                prompt=body.message,
+                priority=PRIORITY_USER,
+                source="shared",
+                source_log_id=user_log.id,
+            )
+        except TaskStartPausedError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="服务即将重启，消息未进入执行队列，请重连后重试",
+            ) from exc
 
     return {"ok": True, "queued": True}
 

@@ -24,6 +24,7 @@ from backend.services.claude_models import (
 from backend.services.git_info import git_head_commit
 from backend.services.pr_review_runtime import (
     PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
+    PR_REVIEW_TERMINAL_CHAT_VERSION,
 )
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -82,6 +83,9 @@ async def get_config():
         "pr_review_snapshot_context_version": (
             PR_REVIEW_SNAPSHOT_CONTEXT_VERSION
         ),
+        # A Manager must confirm this before persisting a terminal PR-review
+        # follow-up for a Worker. Older Workers still freeze every PR chat.
+        "pr_review_terminal_chat_version": PR_REVIEW_TERMINAL_CHAT_VERSION,
     }
 
 

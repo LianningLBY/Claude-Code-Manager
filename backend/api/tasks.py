@@ -94,6 +94,9 @@ _LOCAL_ROUTING_EDITABLE_STATUSES = (
 _WORKER_SKILL_EDITABLE_STATUSES = (
     WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 )
+_PR_REVIEW_CHAT_TERMINAL_STATUSES = frozenset(
+    {"approved", "merged", "commented", "error"}
+)
 
 
 async def _require_no_pr_review_publication(
@@ -153,6 +156,76 @@ async def _require_not_pr_review_task_mutation(
             f"Automated PR review Tasks cannot be manually {action}; wait for "
             "the review outcome or a new PR snapshot",
         )
+
+
+async def _require_pr_review_chat_allowed(
+    db: AsyncSession,
+    task_id: int,
+    *,
+    trusted_unlinked_terminal: bool = False,
+) -> bool:
+    """Allow discussion only after the automated review is durably terminal.
+
+    ``reviewing`` must remain immutable until its exact completed Task
+    generation has been claimed by the GitHub publication outbox.  A chat turn
+    admitted in that window could otherwise replace the generation before the
+    completion consumer verifies it.  Once publication is terminal, later
+    turns cannot change the already-recorded GitHub action and are safe.
+
+    Worker mirrors deliberately retain only the ``pr-review`` tag, not the
+    Manager's PRReview row.  ``trusted_unlinked_terminal`` is therefore
+    reserved for an internally authenticated Manager -> Worker request whose
+    Manager-side terminal check ran while holding the Task operation lock.
+
+    Returns ``True`` for a PR review Task and ``False`` for an ordinary Task.
+    """
+
+    from backend.models.pr_monitor import PRReview
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        return False
+    metadata = task.metadata_ or {}
+    metadata_marker = type(metadata.get("pr_review_id")) is int
+    tags = task.tags
+    tag_marker = (
+        isinstance(tags, (list, tuple, set, dict))
+        and "pr-review" in tags
+    )
+    task_marker = metadata_marker or tag_marker
+
+    linked = list((await db.execute(
+        select(PRReview.status).where(PRReview.task_id == task_id)
+    )).scalars().all())
+    if linked:
+        # One Task belongs to exactly one immutable review snapshot.  Multiple
+        # links or an unknown state indicate corrupt/partially migrated state
+        # and must fail closed rather than guessing which review is current.
+        if (
+            len(linked) == 1
+            and linked[0] in _PR_REVIEW_CHAT_TERMINAL_STATUSES
+            and metadata.get("pr_review_superseded") is not True
+        ):
+            return True
+        raise HTTPException(
+            409,
+            "Automated PR review discussion is available only after its "
+            "GitHub review workflow is terminal",
+        )
+
+    if not task_marker:
+        return False
+    if (
+        trusted_unlinked_terminal
+        and tag_marker
+        and metadata.get("pr_review_superseded") is not True
+    ):
+        return True
+    raise HTTPException(
+        409,
+        "Automated PR review Task has no locally verified terminal review "
+        "state",
+    )
 
 
 async def _require_pr_review_retryable(

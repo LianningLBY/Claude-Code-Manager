@@ -23,6 +23,9 @@ from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.pr_review_runtime import (
     PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
+    PR_REVIEW_TERMINAL_CHAT_HEADER,
+    PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    PR_REVIEW_TERMINAL_CHAT_VERSION,
     is_pr_review_task,
 )
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
@@ -255,6 +258,35 @@ class WorkerProxy:
             raise RuntimeError(
                 f"Worker {worker.name} 未声明模型 {model or 'default'} "
                 "支持 Codex Fast，任务未转发"
+            )
+
+    async def require_terminal_pr_review_chat_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Reject mixed-version PR follow-ups before Manager-side logging."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                f"无法确认 Worker {worker.name} 的 PR 审核续聊能力",
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("pr_review_terminal_chat_version")
+            != PR_REVIEW_TERMINAL_CHAT_VERSION
+        ):
+            raise HTTPException(
+                409,
+                f"Worker {worker.name} 版本过旧，升级后才能继续 PR 审核对话",
             )
 
     async def forward_task_to_worker(
@@ -552,7 +584,12 @@ class WorkerProxy:
         allow_task_absent: bool = False,
         surface_endpoint_not_found: bool = False,
         operation_lock_held: bool = False,
+        pr_review_terminal_chat: bool = False,
     ):
+        if pr_review_terminal_chat and not is_pr_review_task(task):
+            raise ValueError(
+                "Terminal PR review chat authorization requires a PR review Task"
+            )
         if operation_lock_held:
             return await self._proxy_to_worker_locked(
                 task,
@@ -562,6 +599,7 @@ class WorkerProxy:
                 require_json=require_json,
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
+                pr_review_terminal_chat=pr_review_terminal_chat,
             )
         async with self.task_operation_lock(task.id):
             return await self._proxy_to_worker_locked(
@@ -572,6 +610,7 @@ class WorkerProxy:
                 require_json=require_json,
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
+                pr_review_terminal_chat=pr_review_terminal_chat,
             )
 
     async def _proxy_to_worker_locked(
@@ -584,14 +623,20 @@ class WorkerProxy:
         require_json: bool,
         allow_task_absent: bool,
         surface_endpoint_not_found: bool,
+        pr_review_terminal_chat: bool,
     ):
         worker = await self.require_ready_worker(task.worker_id)
         await self.relay.subscribe_task(worker, task.id)
+        headers = self._headers(worker)
+        if pr_review_terminal_chat:
+            headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
+                PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
+            )
         async with httpx.AsyncClient(timeout=60) as c:
             try:
                 r = await c.request(
                     method, self._api(worker, path),
-                    headers=self._headers(worker), json=body,
+                    headers=headers, json=body,
                 )
             except (httpx.TimeoutException, TimeoutError) as exc:
                 raise HTTPException(

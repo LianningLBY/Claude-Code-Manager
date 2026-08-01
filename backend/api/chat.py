@@ -9,6 +9,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from backend.api.deps import (
     get_current_user_id,
+    require_internal_service,
     require_task_access,
     require_task_control,
 )
@@ -28,6 +29,10 @@ from backend.api.uploads import (
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.task_queue import task_is_pr_review_superseded
+from backend.services.pr_review_runtime import (
+    PR_REVIEW_TERMINAL_CHAT_HEADER,
+    PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+)
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import (
     worker_task_generation,
@@ -37,6 +42,26 @@ from backend.services.worker_relay import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
+
+
+def _trusted_terminal_pr_review_chat(request: Request) -> bool:
+    """Validate the Manager-only assertion used by Worker PR chat mirrors."""
+
+    headers = getattr(request, "headers", None)
+    value = (
+        headers.get(PR_REVIEW_TERMINAL_CHAT_HEADER)
+        if headers is not None
+        else None
+    )
+    if value is None:
+        return False
+    require_internal_service(request)
+    if value != PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE:
+        raise HTTPException(
+            403,
+            "Invalid internal PR review chat authorization",
+        )
+    return True
 
 
 async def _sender_display_name(
@@ -469,17 +494,6 @@ async def send_chat_message(
             409,
             "This PR review task was superseded by a newer push",
         )
-    from backend.api.tasks import (
-        _require_no_pr_review_publication,
-        _require_not_pr_review_task_mutation,
-    )
-
-    await _require_no_pr_review_publication(db, task_id)
-    await _require_not_pr_review_task_mutation(
-        db,
-        task_id,
-        action="continued by chat",
-    )
     command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
         return await _send_shared_chat(
@@ -520,14 +534,16 @@ async def send_chat_message(
         from backend.api.tasks import (
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
+            _require_pr_review_chat_allowed,
         )
 
         _require_no_pending_worker_routing(task)
-        await _require_no_pr_review_publication(db, task_id)
-        await _require_not_pr_review_task_mutation(
+        await _require_pr_review_chat_allowed(
             db,
             task_id,
-            action="continued by chat",
+            trusted_unlinked_terminal=_trusted_terminal_pr_review_chat(
+                request
+            ),
         )
         admitted_routing = _require_expected_task_routing(
             task,
@@ -976,6 +992,9 @@ async def _send_shared_chat(
     shared = result.scalar_one_or_none()
     if not shared:
         raise HTTPException(400, "Shared task record not found")
+    owner_ccm_url = shared.owner_ccm_url
+    remote_task_id = shared.remote_task_id
+    share_token = shared.share_token
 
     # Get sender name for prefix
     from backend.models.feishu_binding import FeishuUserBinding
@@ -987,6 +1006,34 @@ async def _send_shared_chat(
     log_metadata: dict = {"raw_content": body.message}
     if sender_name:
         log_metadata["sender_name"] = sender_name
+
+    async def proxy_to_owner() -> None:
+        try:
+            await proxy_chat(
+                owner_ccm_url,
+                remote_task_id,
+                share_token,
+                message=body.message,
+                sender_name=sender_name,
+            )
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            if getattr(response, "status_code", None) == 409:
+                try:
+                    detail = response.json().get("detail")
+                except Exception:
+                    detail = None
+                raise HTTPException(
+                    409,
+                    detail or "Sharer rejected the chat generation",
+                ) from exc
+            raise HTTPException(502, f"Cannot reach sharer CCM: {exc}") from exc
+
+    # The receiver is never authoritative for admission (and its shadow does
+    # not carry every owner-only marker such as PRReview state).  Let the owner
+    # accept first, before creating a local message, so any 4xx/5xx rejection
+    # cannot leave a ghost bubble on the shadow.
+    await proxy_to_owner()
 
     # Store user message locally WITH prefix (same as what sharer sees)
     user_log = LogEntry(
@@ -1009,15 +1056,6 @@ async def _send_shared_chat(
         "raw_content": body.message,
         "sender_name": sender_name,
     }))
-
-    # Proxy to sharer
-    try:
-        await proxy_chat(
-            shared.owner_ccm_url, shared.remote_task_id, shared.share_token,
-            message=body.message, sender_name=sender_name,
-        )
-    except Exception as e:
-        raise HTTPException(502, f"Cannot reach sharer CCM: {e}")
 
     return {"ok": True, "queued": True}
 
@@ -1062,7 +1100,10 @@ async def _send_worker_chat(
         if command is None:
             command, _command_args = _parse_chat_command(body.message)
         from backend.api.tasks import _ensure_worker_routing_ready
-        from backend.api.tasks import _require_expected_task_routing
+        from backend.api.tasks import (
+            _require_expected_task_routing,
+            _require_pr_review_chat_allowed,
+        )
 
         _require_expected_task_routing(
             current,
@@ -1070,6 +1111,10 @@ async def _send_worker_chat(
             effective_model=body.model or current.model,
         )
         _validate_chat_service_tier(current, body.model)
+        terminal_pr_review_chat = await _require_pr_review_chat_allowed(
+            db,
+            task_id,
+        )
         await _validate_chat_command_admission(current, command, db)
         await _ensure_worker_routing_ready(
             current,
@@ -1087,6 +1132,11 @@ async def _send_worker_chat(
                 display_content = f"[{sender_display_name}] {model_message}"
 
         worker = await worker_proxy.require_ready_worker(observed.worker_id)
+        if terminal_pr_review_chat:
+            # Old Workers permanently freeze pr-review chat. Confirm the
+            # matching endpoint contract before the Manager stores a user
+            # bubble, otherwise a mixed-version rollout leaves a ghost row.
+            await worker_proxy.require_terminal_pr_review_chat_support(worker)
 
         all_paths = body.file_paths or body.image_paths or []
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -1152,7 +1202,11 @@ async def _send_worker_chat(
 
         # 4. Ensure relay subscription before the remote turn can emit events.
         await worker_proxy.relay.subscribe_task(worker, current.id)
-        await worker_proxy.sync_task_skill_selection(worker, current)
+        if not terminal_pr_review_chat:
+            await worker_proxy.sync_task_skill_selection(worker, current)
+        # PR review mirrors stay permanently tool-free.  Their Worker-side
+        # configuration is intentionally immutable and therefore needs no
+        # Skill synchronization before a terminal discussion turn.
 
         # 5. The common operation lock is already held; asking WorkerProxy to
         # acquire it again would deadlock.
@@ -1172,6 +1226,7 @@ async def _send_worker_chat(
                 ),
             },
             operation_lock_held=True,
+            pr_review_terminal_chat=terminal_pr_review_chat,
         )
 
         # 6. A delayed response can only update the generation that issued the
@@ -1655,9 +1710,8 @@ async def inject_message(
 
         from backend.api.tasks import (
             _require_expected_task_routing,
-            _require_no_pr_review_publication,
             _require_no_pending_worker_routing,
-            _require_not_pr_review_task_mutation,
+            _require_pr_review_chat_allowed,
         )
 
         if task.worker_id is not None:
@@ -1666,11 +1720,9 @@ async def inject_message(
                 "Worker task 暂不支持执行中注入",
             )
         _require_no_pending_worker_routing(task)
-        await _require_no_pr_review_publication(db, task_id)
-        await _require_not_pr_review_task_mutation(
+        await _require_pr_review_chat_allowed(
             db,
             task_id,
-            action="steered by message injection",
         )
 
         _require_expected_task_routing(

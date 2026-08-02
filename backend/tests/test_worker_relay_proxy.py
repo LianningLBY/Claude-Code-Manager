@@ -472,6 +472,88 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
     assert not hasattr(parsed_on_worker, "metadata_")
 
 
+async def test_worker_forward_syncs_related_plan_uploads(monkeypatch):
+    captured_payload = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return captured_payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            captured_payload.update(json)
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    relay = AsyncMock()
+    proxy = WorkerProxy(None, relay)
+    worker = Worker(
+        id=78,
+        name="worker",
+        status="ready",
+        private_ip="10.0.0.78",
+        auth_token="token",
+    )
+    task = Task(
+        id=902,
+        title="Plan for #44",
+        description="Use the attached references",
+        worker_id=worker.id,
+        project_id=12,
+        mode="plan",
+        provider="claude",
+        plan_target_task_id=44,
+        metadata_={
+            "created_from_plan_target_task_id": 44,
+            "file_paths": [
+                "/srv/uploads/mockup.png",
+                "/srv/uploads/notes.txt",
+            ],
+            "attachments": [
+                {
+                    "url": "/api/uploads/mockup.png",
+                    "name": "mockup.png",
+                    "is_image": True,
+                },
+                {
+                    "url": "/api/uploads/notes.txt",
+                    "name": "notes.txt",
+                    "is_image": False,
+                },
+            ],
+        },
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=34)
+    proxy.push_files = AsyncMock()
+    proxy._user_skill_snapshots = AsyncMock(return_value=[])
+
+    await proxy._forward_task_to_worker_locked(task)
+
+    assert captured_payload["file_paths"] == [
+        "/srv/uploads/mockup.png",
+        "/srv/uploads/notes.txt",
+    ]
+    assert captured_payload["image_paths"] == ["/srv/uploads/mockup.png"]
+    assert captured_payload["attachments"] == task.metadata_["attachments"]
+    proxy.push_files.assert_awaited_once_with(
+        worker,
+        ["/srv/uploads/mockup.png", "/srv/uploads/notes.txt"],
+    )
+
+
 async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
     captured_payload = {}
 

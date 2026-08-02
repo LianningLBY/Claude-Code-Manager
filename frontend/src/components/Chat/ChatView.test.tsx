@@ -2122,6 +2122,46 @@ describe('independent Plan attachments', () => {
     expect(screen.queryByRole('button', { name: 'Models' })).not.toBeInTheDocument();
   });
 
+  it('creates an associated Plan with uploaded files from the modal composer', async () => {
+    (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      id: 'plan-upload',
+      filename: 'design-notes.txt',
+      path: '/srv/uploads/design-notes.txt',
+      url: '/api/uploads/design-notes.txt',
+      is_image: false,
+    }]);
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Plans for Task #1' });
+    const picker = dialog.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(
+      picker,
+      new File(['notes'], 'design-notes.txt', { type: 'text/plain' }),
+    );
+    await screen.findByText('design-notes.txt');
+    await userEvent.type(
+      screen.getByPlaceholderText('Create an independent Plan…'),
+      'Use the attached design notes',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Create Plan' }));
+
+    await waitFor(() => expect(api.createRelatedPlan).toHaveBeenCalledWith(1, {
+      input: 'Use the attached design notes',
+      file_paths: ['/srv/uploads/design-notes.txt'],
+      image_paths: [],
+      attachments: [{
+        url: '/api/uploads/design-notes.txt',
+        name: 'design-notes.txt',
+        is_image: false,
+      }],
+    }));
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText('Create an independent Plan…')).toHaveValue('');
+      expect(screen.queryByText('design-notes.txt')).not.toBeInTheDocument();
+    });
+  });
+
   it('updates an associated Plan stage and ready state in real time', async () => {
     const plan = makeTask({
       id: 80,

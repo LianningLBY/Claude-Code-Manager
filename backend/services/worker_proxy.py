@@ -277,6 +277,37 @@ class WorkerProxy:
         await self.require_worker_fast_support(worker, task)
         worker_project_id = await self.ensure_worker_project(worker, task)
 
+        metadata = task.metadata_ or {}
+        # Related-Plan uploads are validated and marked by the Manager API.
+        # Do not copy arbitrary legacy metadata paths to another machine.
+        has_related_plan_uploads = (
+            task.mode == "plan"
+            and task.plan_target_task_id is not None
+            and metadata.get("created_from_plan_target_task_id")
+            == task.plan_target_task_id
+        )
+        attachment_paths = (
+            metadata.get("file_paths") or metadata.get("image_paths") or []
+            if has_related_plan_uploads
+            else []
+        )
+        attachment_records = (
+            metadata.get("attachments") or []
+            if has_related_plan_uploads
+            else []
+        )
+        if attachment_paths:
+            await self.push_files(worker, attachment_paths)
+        image_paths = [
+            path
+            for index, path in enumerate(attachment_paths)
+            if (
+                index < len(attachment_records)
+                and isinstance(attachment_records[index], dict)
+                and attachment_records[index].get("is_image") is True
+            )
+        ]
+
         # 先订阅 relay 再创建：worker Dispatcher 可能创建后立即执行，后订阅丢初始事件
         await self.relay.subscribe_task(worker, task.id)
         user_skill_snapshots = await self._user_skill_snapshots(task)
@@ -314,6 +345,9 @@ class WorkerProxy:
             "selected_user_skills": task.selected_user_skills,
             "user_skill_snapshots": user_skill_snapshots,
             "tags": list(task.tags) if task.tags else None,
+            "file_paths": attachment_paths or None,
+            "image_paths": image_paths or None,
+            "attachments": attachment_records or None,
         }
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(

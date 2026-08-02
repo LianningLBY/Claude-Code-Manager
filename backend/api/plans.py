@@ -10,6 +10,10 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_user_id, require_task_access, require_task_control
+from backend.api.uploads import (
+    UploadAttachmentValidationError,
+    validate_upload_attachments,
+)
 from backend.config import settings
 from backend.database import get_db
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
@@ -39,6 +43,9 @@ router = APIRouter(prefix="/api/tasks", tags=["plans"])
 class RelatedPlanCreate(BaseModel):
     input: str = Field(min_length=1, max_length=200_000)
     title: str | None = Field(default=None, max_length=200)
+    file_paths: list[str] | None = None
+    image_paths: list[str] | None = None
+    attachments: list[dict] | None = None
     provider: str | None = None
     model: str | None = None
     effort_level: str | None = None
@@ -126,6 +133,29 @@ def _require_revisable_plan(plan: Task) -> None:
         raise HTTPException(400, "Task is not in plan review state")
 
 
+def _plan_upload_fields(
+    task: Task,
+) -> tuple[list[str] | None, list[str] | None, list[dict] | None]:
+    """Normalize both current and legacy Task attachment metadata."""
+
+    metadata = task.metadata_ or {}
+    file_paths = metadata.get("file_paths") or metadata.get("image_paths")
+    attachments = metadata.get("attachments")
+    if not file_paths:
+        return None, None, attachments
+    if metadata.get("file_paths") is not None:
+        return file_paths, metadata.get("image_paths") or [], attachments
+    if isinstance(attachments, list) and len(attachments) == len(file_paths):
+        image_paths = [
+            path
+            for path, attachment in zip(file_paths, attachments, strict=True)
+            if isinstance(attachment, dict)
+            and attachment.get("is_image") is True
+        ]
+        return file_paths, image_paths, attachments
+    return file_paths, file_paths, attachments
+
+
 async def _create_related_plan(
     *,
     db: AsyncSession,
@@ -158,6 +188,15 @@ async def _create_related_plan(
         await require_task_control(request, supersedes, db)
         _require_revisable_plan(supersedes)
     superseded_id = supersedes.id if supersedes is not None else None
+
+    try:
+        uploads = validate_upload_attachments(
+            file_paths=body.file_paths,
+            image_paths=body.image_paths,
+            attachments=body.attachments,
+        )
+    except UploadAttachmentValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     pipeline = resolve_plan_pipeline_config(
         body.pipeline_config,
@@ -235,6 +274,19 @@ async def _create_related_plan(
         selected_user_skills=[],
         metadata_={
             "created_from_plan_target_task_id": target.id,
+            **(
+                {
+                    "file_paths": [upload.path for upload in uploads],
+                    "image_paths": [
+                        upload.path for upload in uploads if upload.is_image
+                    ],
+                    "attachments": [
+                        upload.public_dict() for upload in uploads
+                    ],
+                }
+                if uploads
+                else {}
+            ),
             **(
                 {"revised_from_plan_task_id": supersedes.id}
                 if supersedes is not None
@@ -577,6 +629,9 @@ async def revise_plan(
             await _wake_dispatcher()
             return revision
 
+        revision_files, revision_images, revision_attachments = (
+            _plan_upload_fields(current_source)
+        )
         return await _create_related_plan(
             db=db,
             request=request,
@@ -584,6 +639,9 @@ async def revise_plan(
             body=RelatedPlanCreate(
                 input=prompt,
                 title=body.title or f"Revision of Plan #{current_source.id}",
+                file_paths=revision_files,
+                image_paths=revision_images,
+                attachments=revision_attachments,
                 provider=current_source.provider,
                 model=current_source.model,
                 effort_level=current_source.effort_level,

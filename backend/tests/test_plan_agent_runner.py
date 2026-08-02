@@ -18,6 +18,7 @@ from backend.services.plan_agent_runner import (
     PlanRouteUnavailable,
     _build_command,
     _extract_provider_content,
+    _plan_request_with_attachments,
     _validate_structured,
 )
 
@@ -64,6 +65,26 @@ def test_structured_output_parsers_accept_native_provider_envelopes():
         "verdict": "approve",
         "feedback": "Looks good",
     }
+
+
+def test_plan_request_includes_user_attachment_paths_and_names():
+    task = Task(
+        description="Review the proposed UI",
+        metadata_={
+            "file_paths": ["/srv/uploads/mockup.png", "/srv/uploads/notes.txt"],
+            "attachments": [
+                {"name": "modal mockup.png", "is_image": True},
+                {"name": "interaction notes.txt", "is_image": False},
+            ],
+        },
+    )
+
+    request = _plan_request_with_attachments(task)
+
+    assert "Review the proposed UI" in request
+    assert "modal mockup.png: /srv/uploads/mockup.png" in request
+    assert "interaction notes.txt: /srv/uploads/notes.txt" in request
+    assert "untrusted reference data" in request
 
 
 @pytest.mark.asyncio

@@ -259,6 +259,7 @@ export interface Task {
   background_active?: boolean;
   tags: string[] | null;
   metadata_: {
+    file_paths?: string[];
     image_paths?: string[];
     attachments?: FileAttachment[];
     secret_ids?: number[];
@@ -1298,6 +1299,9 @@ export const api = {
       effort_level?: string;
       pipeline_config?: PlanPipelineConfig;
       supersedes_plan_task_id?: number;
+      file_paths?: string[];
+      image_paths?: string[];
+      attachments?: FileAttachment[];
     },
   ) =>
     request<Task>(`/api/tasks/${targetTaskId}/plans`, {

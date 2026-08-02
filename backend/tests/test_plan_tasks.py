@@ -6,11 +6,30 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import func, select, update
 
+from backend.api.plans import _plan_upload_fields
 from backend.models.log_entry import LogEntry
 from backend.models.global_settings import GlobalSettings
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
 from backend.services.plan_tasks import capture_repo_revision
+
+
+def test_plan_upload_fields_recovers_image_subset_from_worker_metadata():
+    task = Task(
+        metadata_={
+            "image_paths": ["/uploads/mockup.png", "/uploads/notes.txt"],
+            "attachments": [
+                {"name": "mockup.png", "is_image": True},
+                {"name": "notes.txt", "is_image": False},
+            ],
+        },
+    )
+
+    files, images, attachments = _plan_upload_fields(task)
+
+    assert files == ["/uploads/mockup.png", "/uploads/notes.txt"]
+    assert images == ["/uploads/mockup.png"]
+    assert attachments == task.metadata_["attachments"]
 
 
 async def _target_with_session(client, session_factory) -> tuple[int, str]:
@@ -143,6 +162,79 @@ async def test_related_plan_title_does_not_expose_empty_target_placeholder(
 
     assert response.status_code == 201
     assert response.json()["title"] == f"Plan for #{target_id}"
+
+
+@pytest.mark.asyncio
+async def test_related_plan_preserves_validated_uploads(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    uploaded = await client.post(
+        "/api/uploads",
+        files={"files": ("design notes.txt", b"reference", "text/plain")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    upload = uploaded.json()[0]
+
+    response = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={
+            "input": "Use the attached design notes",
+            "file_paths": [upload["path"]],
+            "image_paths": [],
+            "attachments": [{
+                "url": upload["url"],
+                "name": upload["filename"],
+                "is_image": False,
+            }],
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    metadata = response.json()["metadata_"]
+    assert metadata["file_paths"] == [upload["path"]]
+    assert metadata["image_paths"] == []
+    assert metadata["attachments"] == [{
+        "url": upload["url"],
+        "name": "design notes.txt",
+        "is_image": False,
+    }]
+
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == response.json()["id"])
+            .values(status="plan_review", plan_content="First draft")
+        )
+        await db.commit()
+    revision = await client.post(
+        f"/api/tasks/{response.json()['id']}/plan/revise",
+        json={"feedback": "Add rollback details"},
+    )
+    assert revision.status_code == 201, revision.text
+    revised_metadata = revision.json()["metadata_"]
+    assert revised_metadata["file_paths"] == [upload["path"]]
+    assert revised_metadata["attachments"] == metadata["attachments"]
+
+
+@pytest.mark.asyncio
+async def test_related_plan_rejects_unmanaged_attachment_paths(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+
+    response = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={
+            "input": "Read this file",
+            "file_paths": ["/tmp/not-a-managed-upload.txt"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "CCM upload directory" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

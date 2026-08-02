@@ -33,7 +33,7 @@ function renderDialog(overrides: Partial<Parameters<typeof RelatedPlansDialog>[0
     staleIds={new Set()}
     createInput=""
     onCreateInputChange={vi.fn()}
-    onCreate={vi.fn().mockResolvedValue(undefined)}
+    onCreate={vi.fn().mockResolvedValue(true)}
     onApprove={vi.fn().mockResolvedValue(undefined)}
     onReject={vi.fn().mockResolvedValue(undefined)}
     onRevise={vi.fn().mockResolvedValue(null)}
@@ -68,6 +68,15 @@ describe('RelatedPlansDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Close Plans' }));
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('uses a New Task-style multiline Plan composer', () => {
+    renderDialog({ plans: [] });
+
+    const composer = screen.getByPlaceholderText('Create an independent Plan…');
+    expect(composer.tagName).toBe('TEXTAREA');
+    expect(composer).toHaveAttribute('rows', '3');
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeInTheDocument();
   });
 
   it('offers deletion from the selected Plan detail', async () => {

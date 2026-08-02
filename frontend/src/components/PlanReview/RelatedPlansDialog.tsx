@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
-import type { Task } from '../../api/client';
+import type { Task, UploadResult } from '../../api/client';
+import { resolveAssetUrl } from '../../config/server';
+import { useFileUpload } from '../../hooks/useFileUpload';
 import {
+  AlertCircle,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -30,7 +33,7 @@ interface RelatedPlansDialogProps {
   staleIds: Set<number>;
   createInput: string;
   onCreateInputChange: (value: string) => void;
-  onCreate: () => Promise<void>;
+  onCreate: (uploads: UploadResult[]) => Promise<boolean>;
   onApprove: (plan: Task, attach: boolean) => Promise<void>;
   onReject: (planId: number) => Promise<void>;
   onRevise: (plan: Task, feedback: string) => Promise<number | null>;
@@ -140,6 +143,9 @@ export function RelatedPlansDialog({
   const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
   const [filter, setFilter] = useState<PlanFilter>('all');
   const [reviseText, setReviseText] = useState('');
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileUpload = useFileUpload();
 
   useEffect(() => {
     if (!open) return;
@@ -176,6 +182,28 @@ export function RelatedPlansDialog({
       setSelectedPlanId(null);
       setReviseText('');
     }
+  };
+
+  const createPlan = async () => {
+    if (
+      !createInput.trim()
+      || creating
+      || fileUpload.isUploading
+      || fileUpload.hasFailed
+    ) return;
+    if (await onCreate(fileUpload.uploadedResults)) {
+      fileUpload.clear();
+      setUploadError(null);
+    }
+  };
+
+  const selectFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length > 0) {
+      setUploadError(null);
+      fileUpload.addFiles(files, setUploadError);
+    }
+    event.target.value = '';
   };
 
   if (!open) return null;
@@ -221,28 +249,123 @@ export function RelatedPlansDialog({
               <span className="text-xs text-gray-500">Task #{taskId}</span>
             </div>
             <form
-              className="mt-3 flex gap-2"
+              className="mt-3 space-y-2"
               onSubmit={(event) => {
                 event.preventDefault();
-                void onCreate();
+                void createPlan();
               }}
             >
-              <input
+              <textarea
                 value={createInput}
                 onChange={(event) => onCreateInputChange(event.target.value)}
+                onKeyDown={(event) => {
+                  if (
+                    event.key === 'Enter'
+                    && (event.ctrlKey || event.metaKey)
+                    && !event.nativeEvent.isComposing
+                  ) {
+                    event.preventDefault();
+                    void createPlan();
+                  }
+                }}
                 placeholder="Create an independent Plan…"
                 maxLength={200000}
-                className="min-w-0 flex-1 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
+                rows={3}
+                className="h-24 w-full resize-none rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none transition-colors focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25"
               />
-              <button
-                type="submit"
-                disabled={!createInput.trim() || creating}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-40"
-                aria-label="Create Plan"
-                title="Create Plan"
-              >
-                {creating ? <Loader2 size={13} className="animate-spin" /> : <ListPlus size={14} />}
-              </button>
+              {fileUpload.uploads.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {fileUpload.uploads.map((upload) => (
+                    <div key={upload.id} className="relative overflow-hidden rounded border border-gray-600">
+                      {upload.preview ? (
+                        <div className="h-12 w-12">
+                          <img src={upload.preview} alt="" className="h-full w-full object-cover" />
+                        </div>
+                      ) : (
+                        <div className="flex max-w-[180px] items-center gap-1.5 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-300">
+                          <Paperclip size={12} className="shrink-0" />
+                          <span className="truncate">{upload.file.name}</span>
+                        </div>
+                      )}
+                      {upload.status === 'uploading' && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                          <Loader2 size={16} className="animate-spin text-white" />
+                        </div>
+                      )}
+                      {upload.status === 'failed' && (
+                        <button
+                          type="button"
+                          className="absolute inset-0 flex cursor-pointer items-center justify-center bg-red-900/60"
+                          onClick={() => {
+                            setUploadError(null);
+                            fileUpload.retryFile(upload.id);
+                          }}
+                          aria-label={`Retry ${upload.file.name}`}
+                          title="Click to retry"
+                        >
+                          <AlertCircle size={16} className="text-red-300" />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setUploadError(null);
+                          fileUpload.removeFile(upload.id);
+                        }}
+                        className="absolute right-0 top-0 rounded-bl bg-gray-900/80 p-0.5 text-gray-300 hover:text-white"
+                        aria-label={`Remove ${upload.file.name}`}
+                      >
+                        <X size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {uploadError && (
+                <div className="rounded border border-red-500/30 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-300">
+                  {uploadError}
+                </div>
+              )}
+              <div className="flex items-center gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={selectFiles}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={creating || fileUpload.uploads.length >= 10}
+                  className="flex items-center gap-1 rounded border border-gray-600 bg-gray-800 px-2 py-1.5 text-xs text-gray-400 transition-colors hover:bg-gray-700 hover:text-gray-200 disabled:opacity-40"
+                >
+                  <Paperclip size={13} />
+                  {fileUpload.uploads.length > 0
+                    ? `${fileUpload.uploads.length}/10 files`
+                    : 'Attach files'}
+                </button>
+                <span className="flex-1" />
+                <button
+                  type="submit"
+                  disabled={
+                    !createInput.trim()
+                    || creating
+                    || fileUpload.isUploading
+                    || fileUpload.hasFailed
+                  }
+                  className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+                  aria-label="Create Plan"
+                  title={fileUpload.hasFailed
+                    ? 'Retry or remove failed attachments before creating the Plan'
+                    : 'Create Plan (Ctrl+Enter)'}
+                >
+                  {creating
+                    ? <Loader2 size={13} className="animate-spin" />
+                    : <ListPlus size={14} />}
+                  Create Plan
+                </button>
+              </div>
             </form>
           </div>
 
@@ -372,6 +495,23 @@ export function RelatedPlansDialog({
                   <div className="mb-3 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2">
                     <div className="text-[10px] font-medium uppercase tracking-wide text-gray-600">Planning request</div>
                     <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-gray-400">{selectedPlan.description}</p>
+                    {selectedPlan.metadata_?.attachments
+                      && selectedPlan.metadata_.attachments.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {selectedPlan.metadata_.attachments.map((attachment, index) => (
+                          <a
+                            key={`${attachment.url}-${index}`}
+                            href={resolveAssetUrl(attachment.url)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex max-w-[220px] items-center gap-1 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[11px] text-gray-300 hover:border-indigo-500/60 hover:text-indigo-200"
+                          >
+                            <Paperclip size={11} className="shrink-0" />
+                            <span className="truncate">{attachment.name}</span>
+                          </a>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
                 <div className="min-h-48 rounded-xl border border-gray-800 bg-gray-950/55 p-4">

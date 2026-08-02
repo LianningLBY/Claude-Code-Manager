@@ -570,18 +570,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     onTaskUpdated?.();
   };
 
-  const createRelatedPlan = async () => {
+  const createRelatedPlan = async (uploads: UploadResult[]): Promise<boolean> => {
     const request = planInput.trim();
-    if (!request || planCreating) return;
+    if (!request || planCreating) return false;
     setPlanCreating(true);
     setPlanError(null);
     try {
-      await api.createRelatedPlan(task.id, { input: request });
+      await api.createRelatedPlan(task.id, {
+        input: request,
+        ...(uploads.length > 0 ? injectAttachments(uploads) : {}),
+      });
       setPlanInput('');
       await refreshPlans();
       onTaskUpdated?.();
+      return true;
     } catch (error) {
       setPlanError(error instanceof Error ? error.message : String(error));
+      return false;
     } finally {
       setPlanCreating(false);
     }

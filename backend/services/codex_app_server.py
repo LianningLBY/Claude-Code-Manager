@@ -69,6 +69,21 @@ _DESCENDANT_INTERRUPT_POLL_INTERVAL = 0.1
 # fence is an explicit failure, never permission to publish a false success.
 _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
 
+
+def _format_process_exit(returncode: int | None) -> str:
+    """Describe a subprocess exit without mistaking stderr noise for cause."""
+
+    if returncode is None:
+        return "unknown exit status"
+    if returncode < 0:
+        signal_number = -returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"signal {signal_number}"
+        return f"killed by {signal_name} ({signal_number})"
+    return f"exit code {returncode}"
+
 # Codex has no public "core tool allow-list" in app-server 0.144.6.  An
 # explicit empty environment removes every environment-backed tool, while a
 # deny-all permission profile remains the execution boundary if a future
@@ -3367,10 +3382,12 @@ class CodexAppServer:
         except Exception:
             logger.exception("Codex app-server reader failed")
         finally:
-            await process.wait()
+            returncode = await process.wait()
             detail = "\n".join(self._stderr_lines)[-4000:]
             error = CodexAppServerError(
-                f"Codex app-server exited unexpectedly: {detail or 'no stderr'}"
+                "Codex app-server exited unexpectedly "
+                f"({_format_process_exit(returncode)}): "
+                f"{detail or 'no stderr'}"
             )
             for future in list(self._pending.values()):
                 if not future.done():

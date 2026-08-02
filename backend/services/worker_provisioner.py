@@ -1191,6 +1191,9 @@ EnvironmentFile={remote_dir}/.env
 ExecStart={remote_dir}/.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port {worker.ccm_port}
 Restart=always
 RestartSec=5
+# Let the manager record and retry a model subprocess killed under memory
+# pressure instead of systemd stopping the entire worker cgroup.
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

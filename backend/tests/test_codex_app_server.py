@@ -24,6 +24,7 @@ from backend.services.codex_app_server import (
     CodexThreadHomeMismatchError,
     CodexThreadNotIdleError,
     CodexTurnProcess,
+    _format_process_exit,
     codex_project_trust_target,
     codex_untrusted_project_config,
     codex_untrusted_project_override,
@@ -4110,8 +4111,25 @@ async def test_reader_exit_fails_pending_requests_and_active_turns():
     assert not server._contexts_by_descendant
     assert context.descendant_guard_task is None
     assert not server._pending
-    with pytest.raises(CodexAppServerError, match="exited unexpectedly"):
+    with pytest.raises(
+        CodexAppServerError,
+        match=r"exited unexpectedly \(exit code 1\)",
+    ):
         await pending
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [
+        (0, "exit code 0"),
+        (1, "exit code 1"),
+        (-9, "killed by SIGKILL (9)"),
+        (-999, "killed by signal 999 (999)"),
+        (None, "unknown exit status"),
+    ],
+)
+def test_format_process_exit(returncode, expected):
+    assert _format_process_exit(returncode) == expected
 
 
 def test_normalize_app_server_command_item():

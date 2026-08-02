@@ -167,6 +167,7 @@ export interface PlanPipelineConfig {
   planner: PlanStageRoutes;
   reviewer: PlanReviewerRoutes;
   max_revision_cycles: number;
+  max_interactions: number;
 }
 
 export interface SystemConfig {
@@ -376,6 +377,9 @@ export interface CodexForkAnchor {
 export interface PlanStaleness {
   stale: boolean;
   reasons: string[];
+  hard_conflict?: boolean;
+  hard_conflicts?: string[];
+  can_confirm?: boolean;
   current_log_id: number | null;
   current_repo_revision: Record<string, unknown> | null;
 }
@@ -461,12 +465,15 @@ export interface PlanVersion {
   version_number: number;
   parent_version_id: number | null;
   produced_by_run_id: number | null;
+  produced_by_step_id: number | null;
   content: string;
   context_session_id: string | null;
   context_log_id: number | null;
   repo_revision: Record<string, unknown> | null;
+  reviewer_repo_revision: Record<string, unknown> | null;
   review_verdict: 'approve' | 'revise' | 'disabled' | 'exhausted' | null;
   review_feedback: string | null;
+  reviewed_by_step_id: number | null;
   review_exhausted: boolean;
   reviewed_at: string | null;
   human_decision: 'pending' | 'approved' | 'rejected';
@@ -484,6 +491,7 @@ export interface PlanRun {
   status: 'queued' | 'running' | 'waiting_user' | 'completed' | 'failed' | 'cancelled';
   current_stage: string;
   base_version_id: number | null;
+  source_run_id: number | null;
   result_version_id: number | null;
   request_text: string | null;
   round: number;
@@ -531,9 +539,24 @@ export interface PlanResource {
   legacy: boolean;
   latest_run_status: string | null;
   latest_run_error: string | null;
+  pipeline_config: PlanPipelineConfig;
+  application: PlanApplication | null;
+  applications: PlanApplication[];
   current_version: PlanVersion | null;
   active_run: PlanRun | null;
   open_input_request: PlanInputRequest | null;
+}
+
+export interface PlanApplication {
+  id: number;
+  plan_id: number;
+  plan_version_id: number;
+  application_type: 'chat_message' | 'execution_task';
+  target_task_id: number | null;
+  target_session_id: string | null;
+  user_log_id: number | null;
+  execution_task_id: number | null;
+  created_at: string;
 }
 
 export interface AskUserOption {
@@ -1407,51 +1430,6 @@ export const api = {
     request<Task>(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   retryTask: (id: number, expectedRouting?: TaskRoutingExpectation) =>
     request<Task>(`/api/tasks/${id}/retry`, { method: 'POST', body: JSON.stringify({ expected_routing: expectedRouting }) }),
-  approvePlan: (id: number, expectedRouting?: TaskRoutingExpectation, confirmStale = false) =>
-    request<Task>(`/api/tasks/${id}/plan/approve`, {
-      method: 'POST',
-      body: JSON.stringify({
-        expected_routing: expectedRouting,
-        confirm_stale: confirmStale,
-      }),
-    }),
-  rejectPlan: (id: number) =>
-    request<Task>(`/api/tasks/${id}/plan/reject`, { method: 'POST' }),
-  createRelatedPlan: (
-    targetTaskId: number,
-    data: {
-      input: string;
-      title?: string;
-      provider?: string;
-      model?: string;
-      effort_level?: string;
-      pipeline_config?: PlanPipelineConfig;
-      supersedes_plan_task_id?: number;
-      file_paths?: string[];
-      image_paths?: string[];
-      attachments?: FileAttachment[];
-    },
-  ) =>
-    request<Task>(`/api/tasks/${targetTaskId}/plans`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
-  listRelatedPlans: (targetTaskId: number) =>
-    request<Task[]>(`/api/tasks/${targetTaskId}/plans`),
-  getPlanStaleness: (planTaskId: number) =>
-    request<PlanStaleness>(`/api/tasks/${planTaskId}/plan/staleness`),
-  revisePlan: (planTaskId: number, feedback: string, title?: string) =>
-    request<Task>(`/api/tasks/${planTaskId}/plan/revise`, {
-      method: 'POST',
-      body: JSON.stringify({ feedback, title }),
-    }),
-  getPlanRuns: (planTaskId: number) =>
-    request<PlanAgentRun[]>(`/api/tasks/${planTaskId}/plan/runs`),
-  createPlanExecutionTask: (planTaskId: number) =>
-    request<PlanExecutionResult>(
-      `/api/tasks/${planTaskId}/plan/create-execution-task`,
-      { method: 'POST' },
-    ),
   createPlan: (data: {
     input: string;
     title?: string;
@@ -1521,6 +1499,7 @@ export const api = {
     request: string;
     base_version_id?: number;
     expected_current_version_id?: number;
+    source_run_id?: number;
     file_paths?: string[];
     image_paths?: string[];
     attachments?: FileAttachment[];
@@ -1568,10 +1547,22 @@ export const api = {
     `/api/plan-runs/${runId}/input-requests/${requestId}/answer`,
     { method: 'POST', body: JSON.stringify(data) },
   ),
-  createVersionExecutionTask: (versionId: number) =>
+  createVersionExecutionTask: (
+    versionId: number,
+    expectedCurrentVersionId: number,
+    confirmStale = false,
+    approveIfPending = false,
+  ) =>
     request<{ plan: PlanResource; version: PlanVersion; execution_task_id: number }>(
       `/api/plan-versions/${versionId}/create-execution-task`,
-      { method: 'POST' },
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_current_version_id: expectedCurrentVersionId,
+          confirm_stale: confirmStale,
+          approve_if_pending: approveIfPending,
+        }),
+      },
     ),
   // Instances
   listInstances: () => request<Instance[]>('/api/instances'),

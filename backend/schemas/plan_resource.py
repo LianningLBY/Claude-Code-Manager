@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.schemas.plan import PlanPipelineConfig
 
@@ -54,7 +54,13 @@ class PlanCreateRequest(BaseModel):
     file_paths: list[str] | None = None
     image_paths: list[str] | None = None
     attachments: list[dict] | None = None
-    pipeline_config: PlanPipelineConfig | None = None
+
+    @field_validator("input")
+    @classmethod
+    def require_nonblank_input(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Plan input cannot be blank")
+        return value
 
 
 class PlanPatchRequest(BaseModel):
@@ -64,6 +70,13 @@ class PlanPatchRequest(BaseModel):
     archived: bool | None = None
     expected_lock_version: int
 
+    @field_validator("title")
+    @classmethod
+    def require_nonblank_title(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("Plan title cannot be blank")
+        return value
+
 
 class PlanRunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -72,9 +85,17 @@ class PlanRunCreateRequest(BaseModel):
     request: str = Field(min_length=1, max_length=50_000)
     base_version_id: int | None = None
     expected_current_version_id: int | None = None
+    source_run_id: int | None = Field(default=None, gt=0)
     file_paths: list[str] | None = None
     image_paths: list[str] | None = None
     attachments: list[dict] | None = None
+
+    @field_validator("request")
+    @classmethod
+    def require_nonblank_request(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Plan Run request cannot be blank")
+        return value
 
 
 class PlanForkRequest(BaseModel):
@@ -84,12 +105,27 @@ class PlanForkRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     request: str | None = Field(default=None, max_length=50_000)
 
+    @field_validator("request")
+    @classmethod
+    def normalize_optional_request(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value if value.strip() else None
+
 
 class PlanDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_current_version_id: int
     confirm_stale: bool = False
+
+
+class PlanExecutionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_current_version_id: int
+    confirm_stale: bool = False
+    approve_if_pending: bool = False
 
 
 class PlanInputAnswer(BaseModel):
@@ -109,6 +145,7 @@ class PlanInputAnswerRequest(BaseModel):
     file_paths: list[str] | None = None
     image_paths: list[str] | None = None
     attachments: list[dict] | None = None
+    attachment_manifest: list[dict] | None = None
 
 
 class WorkerPlanVersionSeed(BaseModel):
@@ -123,6 +160,7 @@ class WorkerPlanVersionSeed(BaseModel):
     context_log_id: int | None = None
     context_snapshot: str | None = None
     repo_revision: dict | None = None
+    reviewer_repo_revision: dict | None = None
     review_verdict: str | None = Field(default=None, max_length=20)
     review_feedback: str | None = None
     review_exhausted: bool = False
@@ -148,6 +186,7 @@ class WorkerPlanRunImportRequest(BaseModel):
     timeout_hours: float | None = Field(default=None, ge=0)
     pipeline_config: PlanPipelineConfig
     run_type: str = Field(min_length=1, max_length=30)
+    source_run_id: int | None = Field(default=None, gt=0)
     request_text: str = Field(min_length=1, max_length=200_000)
     context_session_id: str | None = Field(default=None, max_length=200)
     context_log_id: int | None = None
@@ -158,6 +197,7 @@ class WorkerPlanRunImportRequest(BaseModel):
     file_paths: list[str] | None = None
     image_paths: list[str] | None = None
     attachments: list[dict] | None = None
+    attachment_manifest: list[dict] | None = None
 
 
 class WorkerPlanVersionImportRequest(BaseModel):
@@ -226,6 +266,7 @@ class PlanRunResource(BaseModel):
     id: int
     plan_id: int | None
     run_type: str
+    source_run_id: int | None = None
     status: str
     current_stage: str
     base_version_id: int | None
@@ -264,6 +305,7 @@ class PlanVersionResource(BaseModel):
     context_session_id: str | None
     context_log_id: int | None
     repo_revision: dict | None
+    reviewer_repo_revision: dict | None = None
     review_verdict: str | None
     review_feedback: str | None
     reviewed_by_step_id: int | None
@@ -304,6 +346,9 @@ class PlanResource(BaseModel):
     legacy: bool = False
     latest_run_status: str | None = None
     latest_run_error: str | None = None
+    pipeline_config: PlanPipelineConfig
+    application: "PlanApplicationResource | None" = None
+    applications: list["PlanApplicationResource"] = Field(default_factory=list)
     current_version: PlanVersionResource | None = None
     active_run: PlanRunResource | None = None
     open_input_request: PlanInputRequestResponse | None = None
@@ -313,3 +358,20 @@ class PlanExecutionResource(BaseModel):
     plan: PlanResource
     version: PlanVersionResource
     execution_task_id: int
+
+
+class PlanApplicationResource(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    plan_id: int
+    plan_version_id: int
+    application_type: str
+    target_task_id: int | None
+    target_session_id: str | None
+    user_log_id: int | None
+    execution_task_id: int | None
+    created_at: datetime
+
+
+PlanResource.model_rebuild()

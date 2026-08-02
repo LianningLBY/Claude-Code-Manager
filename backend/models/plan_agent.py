@@ -18,6 +18,7 @@ class PlanAgentRun(Base):
     plan_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     run_type: Mapped[str] = mapped_column(String(30), nullable=False, default="legacy")
+    source_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     result_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     request_text: Mapped[str | None] = mapped_column(Text, nullable=True)

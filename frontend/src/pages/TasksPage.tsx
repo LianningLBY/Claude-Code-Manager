@@ -4,7 +4,6 @@ import type { Task, Project, TagItem, PlanResource } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { TaskForm } from '../components/Tasks/TaskForm';
 import { TaskList } from '../components/Tasks/TaskList';
-import { PlanPanel } from '../components/PlanReview/PlanPanel';
 import { PlanNeedsInputPanel } from '../components/PlanReview/PlanNeedsInputPanel';
 import { VersionedPlanPanel } from '../components/PlanReview/VersionedPlanPanel';
 import { PlanCatalog } from '../components/PlanReview/PlanCatalog';
@@ -42,7 +41,7 @@ interface TasksPageProps {
 export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [plans, setPlans] = useState<PlanResource[]>([]);
-  const [allTasks, setAllTasks] = useState<Task[]>([]);
+  const [, setAllTasks] = useState<Task[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(1);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -624,10 +623,11 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     <>
       <TaskForm onCreated={refresh} />
 
-      <PlanNeedsInputPanel />
-      <VersionedPlanPanel />
-      <PlanPanel tasks={allTasks} onRefresh={refresh} />
-
+      <section className="space-y-4" aria-label="Plans requiring action">
+        <h2 className="font-semibold text-foreground">Plans requiring action</h2>
+        <PlanNeedsInputPanel />
+        <VersionedPlanPanel />
+      </section>
       {filterControls}
 
       {taskKindFilter === 'standalone_plan' || taskKindFilter === 'related_plan' ? (

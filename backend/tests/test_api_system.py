@@ -2,9 +2,7 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import update
 
-from backend.models.task import Task
 from backend.models.instance import Instance
 
 
@@ -230,6 +228,7 @@ async def test_config_returns_two_stage_plan_pipeline_defaults(client):
             },
         },
         "max_revision_cycles": 2,
+        "max_interactions": 3,
     }
 
 

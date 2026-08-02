@@ -584,12 +584,21 @@ describe('Codex Fast speed configuration', () => {
   });
 
   it('uses the global Plan pipeline instead of per-create routing', async () => {
+    vi.mocked(api.listSecrets).mockResolvedValueOnce([{
+      id: 7,
+      name: 'deploy-token',
+      content: 'masked',
+      created_at: '2026-08-02T00:00:00Z',
+      updated_at: '2026-08-02T00:00:00Z',
+    }]);
     const speedSelect = await switchToCodexFastForm();
+    expect(await screen.findByRole('button', { name: 'Secrets' })).toBeInTheDocument();
     await userEvent.selectOptions(speedSelect, 'priority');
     await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'plan');
 
     await waitFor(() => {
       expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Secrets' })).not.toBeInTheDocument();
     });
     await selectProject();
     await userEvent.type(

@@ -2,8 +2,11 @@
 
 from copy import deepcopy
 from datetime import datetime
+import hashlib
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,7 +27,13 @@ from backend.api.uploads import (
 )
 from backend.config import settings
 from backend.database import get_db
-from backend.models.plan import Plan, PlanApplication, PlanInputRequest, PlanVersion
+from backend.models.plan import (
+    Plan,
+    PlanApplication,
+    PlanApplicationReceipt,
+    PlanInputRequest,
+    PlanVersion,
+)
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.instance import Instance
 from backend.models.task import Task
@@ -33,6 +42,7 @@ from backend.schemas.plan import resolve_plan_pipeline_config
 from backend.schemas.plan_resource import (
     PlanCreateRequest,
     PlanDecisionRequest,
+    PlanExecutionCreateRequest,
     PlanExecutionResource,
     PlanForkRequest,
     PlanInputAnswerRequest,
@@ -67,9 +77,26 @@ from backend.services.plan_tasks import (
     capture_task_context,
     latest_task_log_id,
 )
+from backend.services.plan_staleness import version_staleness
+from backend.services.plan_events import broadcast_plan_event
+from backend.services.plan_input_safety import contains_high_confidence_secret
 
 
 router = APIRouter(tags=["plan-resources"])
+
+
+class _WorkerRepoRevisionRequest(BaseModel):
+    project_id: int | None = None
+    target_task_id: int | None = None
+
+
+def _reject_durable_plan_secrets(*values: object) -> None:
+    if contains_high_confidence_secret(values):
+        raise HTTPException(
+            422,
+            "Plan text cannot store API keys or access tokens. "
+            "Save the credential in Settings → Secrets and refer to it by name.",
+        )
 
 
 async def _wake_dispatcher() -> None:
@@ -107,6 +134,7 @@ async def _materialize_worker_version(
             context_log_id=seed.context_log_id,
             context_snapshot=seed.context_snapshot,
             repo_revision=seed.repo_revision,
+            reviewer_repo_revision=seed.reviewer_repo_revision,
             review_verdict=seed.review_verdict,
             review_feedback=seed.review_feedback,
             review_exhausted=seed.review_exhausted,
@@ -131,6 +159,7 @@ async def _materialize_worker_version(
     version.review_feedback = seed.review_feedback
     version.review_exhausted = seed.review_exhausted
     version.reviewed_at = seed.reviewed_at
+    version.reviewer_repo_revision = seed.reviewer_repo_revision
     plan.current_version_id = version.id
     plan.updated_at = datetime.utcnow()
     return version
@@ -149,6 +178,35 @@ def _validated_uploads(body) -> list[dict] | None:
         {**item.public_dict(), "path": item.path}
         for item in uploads
     ] or None
+
+
+def _validate_attachment_manifest(
+    uploads: list[dict] | None,
+    manifest: list[dict] | None,
+) -> list[dict]:
+    expected = manifest or []
+    paths = [item["path"] for item in (uploads or [])]
+    if len(expected) != len(paths):
+        raise HTTPException(409, "Plan attachment manifest count does not match uploads")
+    receipt: list[dict] = []
+    for index, path in enumerate(paths):
+        item = expected[index]
+        if not isinstance(item, dict) or os.path.abspath(path) != item.get("path"):
+            raise HTTPException(409, "Plan attachment manifest path/order mismatch")
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with open(path, "rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    size += len(chunk)
+                    digest.update(chunk)
+        except OSError as exc:
+            raise HTTPException(409, "Plan attachment is unavailable on Worker") from exc
+        row = {"path": os.path.abspath(path), "size": size, "sha256": digest.hexdigest()}
+        if row != item:
+            raise HTTPException(409, "Plan attachment digest/size mismatch")
+        receipt.append(row)
+    return receipt
 
 
 async def _has_plan_access(
@@ -239,33 +297,54 @@ async def _capture_context_for_plan(
 async def _version_staleness(
     db: AsyncSession, plan: Plan, version: PlanVersion
 ) -> dict:
-    reasons: list[str] = []
-    current_log_id = None
-    current_session_id = None
-    if plan.target_task_id is not None:
-        target = await db.get(Task, plan.target_task_id)
-        if target is None:
-            return {"stale": True, "reasons": ["target_task_missing"]}
-        current_log_id = await latest_task_log_id(db, target.id)
-        current_session_id = target.session_id
-        if current_session_id != version.context_session_id:
-            reasons.append("session_changed")
-        if (current_log_id or 0) > (version.context_log_id or 0):
-            reasons.append("conversation_advanced")
-    current_repo = None
-    if plan.worker_id is None:
-        current_repo = await capture_repo_revision(plan.target_repo)
-        if version.repo_revision is not None and current_repo != version.repo_revision:
-            reasons.append("repository_changed")
+    return await version_staleness(db, plan, version)
+
+
+@router.post("/api/plans/worker-repo-revision")
+async def worker_repo_revision(
+    body: _WorkerRepoRevisionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a Worker-local fingerprint without exposing repository content."""
+
+    require_internal_service(request)
+    target = await db.get(Task, body.target_task_id) if body.target_task_id else None
+    if body.target_task_id is not None and target is None:
+        raise HTTPException(409, "Worker target Task is missing")
+    project = await db.get(Project, body.project_id) if body.project_id else None
+    if body.project_id is not None and project is None:
+        raise HTTPException(409, "Worker Project is missing")
+    path = (
+        target.last_cwd or target.target_repo
+        if target is not None
+        else project.local_path if project is not None else None
+    )
+    return {"repo_revision": await capture_repo_revision(path)}
+
+
+@router.get("/api/plans/worker-application-receipts/{receipt_key}")
+async def worker_application_receipt(
+    receipt_key: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    require_internal_service(request)
+    receipt = (
+        await db.execute(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+    ).scalar_one_or_none()
+    if receipt is None:
+        raise HTTPException(404, "Plan application receipt not found")
     return {
-        "stale": bool(reasons),
-        "reasons": reasons,
-        "captured_session_id": version.context_session_id,
-        "current_session_id": current_session_id,
-        "captured_log_id": version.context_log_id,
-        "current_log_id": current_log_id,
-        "captured_repo_revision": version.repo_revision,
-        "current_repo_revision": current_repo,
+        "receipt_key": receipt.receipt_key,
+        "target_task_id": receipt.target_task_id,
+        "plan_version_ids": receipt.plan_version_ids,
+        "status": receipt.status,
+        "response": receipt.response,
     }
 
 
@@ -275,6 +354,7 @@ async def create_plan(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    _reject_durable_plan_secrets(body.input, body.title)
     target = None
     if body.target_task_id is not None:
         target = await db.get(Task, body.target_task_id)
@@ -315,16 +395,24 @@ async def create_plan(
             project = await db.get(Project, project_id)
             if project is None:
                 raise HTTPException(404, "Project not found")
-            target_repo = target_repo or project.local_path
-            worker_id = worker_id if worker_id is not None else project.worker_id
+            if body.worker_id is not None and body.worker_id != project.worker_id:
+                raise HTTPException(
+                    400,
+                    "Plan Worker must match the selected Project location",
+                )
+            # A Project is the authorization boundary for its checkout. Never
+            # let a member pair shared Project access with an arbitrary path.
+            target_repo = project.local_path
+            worker_id = project.worker_id
         if settings.auth_token:
             if project_id is not None:
                 await require_project_access(request, project_id, db)
-            await require_worker_target_access(request, worker_id, db)
+            else:
+                await require_worker_target_access(request, worker_id, db)
 
     uploads = _validated_uploads(body)
     pipeline = resolve_plan_pipeline_config(
-        body.pipeline_config,
+        None,
         base_config=await effective_plan_pipeline_config(db),
     )
     context = await _capture_context_for_plan(
@@ -357,6 +445,9 @@ async def create_plan(
         repo_revision=context[3],
     )
     await _wake_dispatcher()
+    await broadcast_plan_event(
+        event="plan_created", plan_id=plan.id, target_task_id=plan.target_task_id
+    )
     return await plan_resource(db, plan, include_audit=True)
 
 
@@ -370,6 +461,9 @@ async def import_worker_plan_run(
 
     require_internal_service(request)
     uploads = _validated_uploads(body)
+    attachment_receipt = _validate_attachment_manifest(
+        uploads, body.attachment_manifest
+    )
     project = await db.get(Project, body.project_id) if body.project_id is not None else None
     if body.project_id is not None and project is None:
         raise HTTPException(409, "Worker Plan project is missing")
@@ -427,6 +521,7 @@ async def import_worker_plan_run(
         return {
             "protocol": 1,
             "base_worker_version_id": existing.base_version_id,
+            "attachment_receipt": attachment_receipt,
             "run": (await run_resource(db, existing)).model_dump(mode="json"),
         }
     if plan.active_run_id is not None:
@@ -445,6 +540,7 @@ async def import_worker_plan_run(
         plan_id=plan.id,
         plan_task_id=None,
         run_type=body.run_type,
+        source_run_id=body.source_run_id,
         base_version_id=base_version.id if base_version is not None else None,
         request_text=body.request_text,
         attachments=uploads,
@@ -474,6 +570,7 @@ async def import_worker_plan_run(
     return {
         "protocol": 1,
         "base_worker_version_id": run.base_version_id,
+        "attachment_receipt": attachment_receipt,
         "run": (await run_resource(db, run)).model_dump(mode="json"),
     }
 
@@ -651,6 +748,7 @@ async def patch_plan(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    _reject_durable_plan_secrets(body.title)
     async with plan_operation_lock(plan_id):
         plan = await _require_plan(request, db, plan_id, control=True)
         if body.archived is True and plan.active_run_id is not None:
@@ -673,7 +771,14 @@ async def patch_plan(
             raise HTTPException(409, "Plan changed concurrently")
         await db.commit()
         plan = await db.get(Plan, plan_id)
-        return await plan_resource(db, plan, include_audit=True)
+        resource = await plan_resource(db, plan, include_audit=True)
+    await broadcast_plan_event(
+        event="plan_archived" if plan.archived_at else "plan_restored",
+        plan_id=plan.id,
+        target_task_id=plan.target_task_id,
+        archived=plan.archived_at is not None,
+    )
+    return resource
 
 
 @router.post("/api/plans/{plan_id}/runs", response_model=PlanRunResource, status_code=201)
@@ -683,6 +788,7 @@ async def create_run(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    _reject_durable_plan_secrets(body.request)
     uploads = _validated_uploads(body)
     async with plan_operation_lock(plan_id):
         plan = await _require_plan(request, db, plan_id, control=True)
@@ -695,6 +801,22 @@ async def create_run(
             # Inactive Plan history is Manager-owned. A new Run follows the
             # target's current Worker and rehydrates its exact base Version.
             plan.worker_id = target.worker_id
+        source_run = None
+        if body.run_type == "retry":
+            if not is_admin(request):
+                raise HTTPException(403, "Only administrators can retry failed Plan Runs")
+            if body.source_run_id is None:
+                raise HTTPException(422, "retry requires source_run_id")
+            source_run = await db.get(PlanAgentRun, body.source_run_id)
+            if (
+                source_run is None
+                or source_run.plan_id != plan.id
+                or source_run.status != "failed"
+                or source_run.finished_at is None
+            ):
+                raise HTTPException(409, "Retry source must be a terminal failed Run")
+        elif body.source_run_id is not None:
+            raise HTTPException(422, "source_run_id is only valid for retry")
         context = await _capture_context_for_plan(
             db, target=target, target_repo=plan.target_repo, worker_id=plan.worker_id
         )
@@ -710,8 +832,16 @@ async def create_run(
             context_log_id=context[1],
             context_snapshot=context[2],
             repo_revision=context[3],
+            source_run_id=source_run.id if source_run is not None else None,
         )
     await _wake_dispatcher()
+    await broadcast_plan_event(
+        event="plan_run_created",
+        plan_id=plan_id,
+        target_task_id=plan.target_task_id,
+        run_id=run.id,
+        status=run.status,
+    )
     return await run_resource(db, run)
 
 
@@ -722,6 +852,7 @@ async def fork_plan(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    _reject_durable_plan_secrets(body.title, body.request)
     source = await _require_plan(request, db, plan_id, control=True)
     version = await db.get(PlanVersion, body.base_version_id)
     if version is None or version.plan_id != source.id:
@@ -757,6 +888,12 @@ async def fork_plan(
         run_type="fork",
     )
     await _wake_dispatcher()
+    await broadcast_plan_event(
+        event="plan_created",
+        plan_id=fork.id,
+        target_task_id=fork.target_task_id,
+        forked_from_plan_id=source.id,
+    )
     return await plan_resource(db, fork, include_audit=True)
 
 
@@ -797,13 +934,25 @@ async def _decide(
     async with plan_operation_lock(plan.id):
         plan, version = await _require_version(request, db, version_id, control=True)
         stale = await _version_staleness(db, plan, version)
-        if stale["stale"] and not body.confirm_stale:
+        if stale["hard_conflict"]:
+            raise HTTPException(
+                409,
+                {"code": "plan_hard_conflict", "message": "Plan Version cannot be decided", **stale},
+            )
+        if decision == "approved" and stale["stale"] and not body.confirm_stale:
             raise HTTPException(409, {"message": "Plan Version context is stale", **stale})
         version = await decide_version(
             db, plan=plan, version=version, decision=decision,
             decided_by=get_current_user_id(request),
             expected_current_version_id=body.expected_current_version_id,
         )
+    await broadcast_plan_event(
+        event="plan_version_decided",
+        plan_id=plan.id,
+        target_task_id=plan.target_task_id,
+        version_id=version.id,
+        decision=decision,
+    )
     return await version_resource(db, version)
 
 
@@ -910,6 +1059,13 @@ async def cancel_plan_run(
             409,
             f"Plan Run was cancelled, but runtime cleanup is not confirmed: {exc}",
         ) from exc
+    await broadcast_plan_event(
+        event="plan_run_status_changed",
+        plan_id=plan.id,
+        target_task_id=plan.target_task_id,
+        run_id=run.id,
+        status=run.status,
+    )
     return await run_resource(db, run)
 
 
@@ -928,6 +1084,8 @@ async def answer_plan_input(
     if run is None or run.plan_id is None:
         raise HTTPException(404, "Plan Run not found")
     uploads = _validated_uploads(body)
+    if body.attachment_manifest is not None:
+        _validate_attachment_manifest(uploads, body.attachment_manifest)
     async with plan_operation_lock(run.plan_id):
         plan = await _require_plan(request, db, run.plan_id, control=True)
         run = await db.get(PlanAgentRun, run_id)
@@ -947,6 +1105,13 @@ async def answer_plan_input(
             answered_by=get_current_user_id(request),
         )
     await _wake_dispatcher()
+    await broadcast_plan_event(
+        event="plan_input_answered",
+        plan_id=plan.id,
+        target_task_id=plan.target_task_id,
+        run_id=run.id,
+        input_request_id=answered.id,
+    )
     return input_request_resource(answered)
 
 
@@ -957,6 +1122,7 @@ async def answer_plan_input(
 )
 async def create_execution_task(
     version_id: int,
+    body: PlanExecutionCreateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
@@ -965,6 +1131,37 @@ async def create_execution_task(
         plan, version = await _require_version(request, db, version_id, control=True)
         if plan.target_task_id is not None:
             raise HTTPException(400, "Only standalone Plans create execution Tasks")
+        if plan.current_version_id != body.expected_current_version_id or version.id != body.expected_current_version_id:
+            raise HTTPException(
+                409,
+                {
+                    "code": "plan_version_changed",
+                    "message": "Plan current Version changed",
+                    "plan_id": plan.id,
+                    "current_version_id": plan.current_version_id,
+                    "active_run_id": plan.active_run_id,
+                },
+            )
+        stale = await _version_staleness(db, plan, version)
+        if stale["hard_conflict"]:
+            raise HTTPException(
+                409,
+                {"code": "plan_hard_conflict", "message": "Execution target is unavailable", **stale},
+            )
+        if stale["stale"] and not body.confirm_stale:
+            raise HTTPException(
+                409,
+                {"code": "plan_stale", "message": "Plan Version context is stale", **stale},
+            )
+        if version.human_decision == "pending" and body.approve_if_pending:
+            version = await decide_version(
+                db,
+                plan=plan,
+                version=version,
+                decision="approved",
+                decided_by=get_current_user_id(request),
+                expected_current_version_id=body.expected_current_version_id,
+            )
         if version.human_decision != "approved":
             raise HTTPException(409, "Plan Version must be approved")
         existing = (
@@ -1018,6 +1215,13 @@ async def create_execution_task(
     await _wake_dispatcher()
     refreshed_plan = await db.get(Plan, plan.id)
     refreshed_version = await db.get(PlanVersion, version.id)
+    await broadcast_plan_event(
+        event="plan_version_applied",
+        plan_id=plan.id,
+        target_task_id=plan.target_task_id,
+        version_id=version.id,
+        execution_task_id=execution_id,
+    )
     return PlanExecutionResource(
         plan=await plan_resource(db, refreshed_plan, include_audit=True),
         version=await version_resource(db, refreshed_version),

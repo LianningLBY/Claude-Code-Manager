@@ -157,13 +157,18 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 #### `test_plan_resources.py` / `test_plan_tasks.py` / `test_plan_agent_runner.py` — 交互式版本化 Plan
 
 覆盖稳定 Plan 身份、不可变 Version、Planner/Reviewer 多轮 request-input、单次请求不限制
-问题数量、同 Run 恢复、精确 Version approve/apply、附件路径脱敏、Instance owner XOR、
-legacy revision chain Alembic backfill，以及 Manager/Worker mirror、generation 和审计映射。
+问题数量、独立 `0–5` interaction 设置、同 Run 恢复、精确 Version approve/apply、凭据防持久化、
+附件 digest/路径脱敏、Instance owner XOR、legacy revision chain Alembic backfill，以及
+Manager/Worker mirror、application receipt、generation 和审计映射。`test_plan_tasks.py` 中以
+Task 为载体的用例只验证 contract 期 legacy API；新产品路径以 `test_plan_resources.py` 为准。
 
 | 测试 | 验证内容 |
 |------|---------|
-| `test_related_plans_are_independent_and_limited` | 同一 session 的 Plan 是独立 Task；有界上下文快照只持久化、不进入 Task 列表 payload；第 4 个 active Plan 返回 429 |
-| `test_related_plan_snapshots_custom_primary_and_fallback_routes` | Planner/Reviewer 两层 primary/fallback route 作为不可变配置写入 Plan Task，并以 Planner primary 镜像兼容字段 |
+| `test_public_plan_routes_are_global_only_and_frozen` | canonical 创建只接受全局 Planner/Reviewer 配置，并把含 `0–5` interaction 设置的完整快照冻结到 Plan/Run |
+| `test_canonical_create_and_revision_keep_stable_plan_identity` | related/standalone 都创建一等 Plan；Revise 保持 Plan id 并产生新的 Run/Version |
+| `test_plan_input_rejects_high_confidence_credentials` | Plan 创建/Revise/回答拒绝高置信 API key/token；失败时不写入 Plan 状态且 InputRequest 保持 open |
+| `test_worker_import_requires_exact_attachment_digest` | Worker 导入必须匹配附件 path/size/SHA-256 manifest |
+| `test_worker_plan_application_recovers_lost_http_ack` | Worker 已提交但 HTTP ACK 丢失时按 durable receipt 收敛，不重复应用 |
 | `test_related_plan_approval_requires_stale_confirmation_and_no_turn` | 对话/repo 已变化时 approve 先 409，确认后只完成 Plan，不 wake/enqueue 或改变目标 Task |
 | `test_approved_plan_is_applied_only_with_selected_user_message` | 只有显式 `plan_task_ids` 才把已批准方案与真实 user message 同 turn 入队，并以 Manager-local log id 一次性审计 |
 | `test_standalone_plan_creates_one_idempotent_execution_task` | standalone approve 后创建新的 auto Task，重复调用返回同一执行 Task |
@@ -1024,17 +1029,18 @@ python -m pytest \
 | 4 | 人 | 选 "+ New project" → 确认展开项目名称和 Remote URL 输入框 |
 | 5 | 人 | 观察 TaskList 各状态颜色：pending 黄、executing 蓝闪、completed 绿、failed 红 |
 
-### 测试 8：兼容性
+### 测试 8：交互式版本化 Plan
 
 | 步骤 | 谁 | 做什么 |
 |------|-----|--------|
-| 1 | 人 | 创建一个 Plan Mode 任务 → 确认进入 plan_review（紫色） |
-| 2 | 人 | 点击 Approve → 确认 Plan 进入 completed，且没有新 Agent turn |
-| 3 | 人 | standalone Plan 点击 Create execution Task → 确认跳转到新 auto Task |
-| 4 | 人 | 在已有 Chat 创建关联 Plan，Approve 后刷新 → 确认附件仍在；发送普通消息时显式携带并只应用一次 |
-| 3 | 人 | 任务完成后点 Chat 按钮 → 发送追问消息 |
-| 4 | AI | 查 DB 确认 task.session_id 存在，`--resume` 会被使用 |
-| 5 | 人 | 测试语音按钮 → 确认录音转文字填入输入框 |
+| 1 | 人 | 创建 standalone 和 related Plan → 确认出现独立 Plan id，未创建 `Task(mode=plan)` |
+| 2 | 人 | Planner/Reviewer 请求多项输入 → 刷新后问题/草稿仍在，提交后恢复同一 Run |
+| 3 | 人 | Approve exact Version → 确认没有新 Agent turn；related 需显式附到下一条消息才应用 |
+| 4 | 人 | standalone Version 点击 Create execution Task → 确认跳转且历史仍保留执行 Task 链接 |
+| 5 | 人 | v1 已应用后 Revise 生成 v2 → 确认同时显示 v1 applied 与 v2 awaiting review |
+| 6 | 人 | 任务完成后点 Chat 按钮 → 发送追问消息 |
+| 7 | AI | 查 DB 确认 task.session_id 存在，`--resume` 会被使用 |
+| 8 | 人 | 测试语音按钮 → 确认录音转文字填入输入框 |
 
 ### AI 验证命令速查
 

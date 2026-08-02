@@ -343,6 +343,16 @@ async def create_related_plan(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    if {
+        "pipeline_config",
+        "provider",
+        "model",
+        "effort_level",
+    } & body.model_fields_set:
+        raise HTTPException(
+            422,
+            "Planner and Reviewer routes are configured globally",
+        )
     target = await db.get(Task, target_task_id)
     if target is None:
         raise HTTPException(404, "Task not found")

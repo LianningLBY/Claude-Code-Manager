@@ -55,13 +55,6 @@ vi.mock('../hooks/useTaskReorder', () => ({
 vi.mock('../components/Tasks/TaskForm', () => ({
   TaskForm: () => null,
 }));
-vi.mock('../components/PlanReview/PlanPanel', () => ({
-  PlanPanel: ({ tasks }: { tasks: Array<{ id: number }> }) => (
-    <div data-testid="plan-panel-tasks">
-      {tasks.map((plan) => plan.id).join(',')}
-    </div>
-  ),
-}));
 vi.mock('../components/PlanReview/PlanNeedsInputPanel', () => ({
   PlanNeedsInputPanel: () => <div data-testid="needs-input-panel" />,
 }));
@@ -297,7 +290,7 @@ describe('TasksPage realtime reconciliation', () => {
     }));
     expect(await screen.findByTestId('plan-catalog')).toHaveTextContent('30');
     expect(screen.queryByTestId('task-snapshots')).not.toBeInTheDocument();
-    expect(screen.getByTestId('plan-panel-tasks')).toHaveTextContent('1,2,3');
+    expect(screen.getByRole('region', { name: 'Plans requiring action' })).toBeInTheDocument();
     expect(screen.getByTestId('needs-input-panel')).toBeInTheDocument();
     expect(screen.getByTestId('versioned-review-panel')).toBeInTheDocument();
   });

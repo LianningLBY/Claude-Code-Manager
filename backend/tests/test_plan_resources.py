@@ -1,4 +1,5 @@
 from datetime import datetime
+import hashlib
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.global_settings import GlobalSettings
 from backend.models.plan import Plan, PlanApplication, PlanInputRequest, PlanVersion
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
@@ -44,6 +46,373 @@ async def _target(client, session_factory) -> Task:
         return task
 
 
+async def _finish_current_run_with_version(
+    session_factory,
+    *,
+    plan_id: int,
+    content: str = "# Ready Plan",
+) -> int:
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        run = await db.get(PlanAgentRun, plan.active_run_id)
+        version = PlanVersion(
+            plan_id=plan.id,
+            version_number=1,
+            produced_by_run_id=run.id,
+            content=content,
+            context_session_id=run.context_session_id,
+            context_log_id=run.context_log_id,
+            repo_revision=run.repo_revision,
+            reviewer_repo_revision=run.repo_revision,
+            review_verdict="approve",
+            reviewed_at=datetime.utcnow(),
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        plan.active_run_id = None
+        run.status = "completed"
+        run.current_stage = "complete"
+        run.result_version_id = version.id
+        run.finished_at = datetime.utcnow()
+        await db.commit()
+        return version.id
+
+
+@pytest.mark.asyncio
+async def test_public_plan_routes_are_global_only_and_frozen(
+    client, session_factory
+):
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    pipeline["max_interactions"] = 5
+    pipeline["planner"]["primary"] = {
+        "provider": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "ultra",
+    }
+    async with session_factory() as db:
+        db.add(GlobalSettings(id=1, plan_pipeline_config=pipeline))
+        await db.commit()
+
+    overridden = await client.post(
+        "/api/plans",
+        json={
+            "input": "Attempt a per-Plan route",
+            "target_repo": "/tmp",
+            "pipeline_config": default_plan_pipeline_config().model_dump(mode="json"),
+        },
+    )
+    assert overridden.status_code == 422
+    assert "extra_forbidden" in overridden.text
+
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Use the global route", "target_repo": "/tmp"},
+    )
+    assert created.status_code == 201, created.text
+    payload = created.json()
+    assert payload["pipeline_config"] == pipeline
+    assert payload["active_run"]["max_interactions"] == 5
+
+    async with session_factory() as db:
+        settings_row = await db.get(GlobalSettings, 1)
+        changed = default_plan_pipeline_config().model_dump(mode="json")
+        changed["max_interactions"] = 0
+        settings_row.plan_pipeline_config = changed
+        await db.commit()
+
+    frozen = await client.get(f"/api/plans/{payload['id']}")
+    assert frozen.json()["pipeline_config"] == pipeline
+
+
+@pytest.mark.asyncio
+async def test_plan_and_run_requests_reject_blank_text(client, session_factory):
+    blank_plan = await client.post("/api/plans", json={"input": "   \n  "})
+    assert blank_plan.status_code == 422
+
+    created = await client.post("/api/plans", json={"input": "Valid request"})
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        run = await db.get(PlanAgentRun, plan.active_run_id)
+        run.status = "failed"
+        run.current_stage = "failed"
+        run.finished_at = datetime.utcnow()
+        plan.active_run_id = None
+        await db.commit()
+
+    blank_run = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={"run_type": "user_revision", "request": "   "},
+    )
+    assert blank_run.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_retry_requires_exact_terminal_failed_source(client, session_factory):
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Retry safely", "target_repo": "/tmp"},
+    )
+    plan_id = created.json()["id"]
+    source_run_id = created.json()["active_run"]["id"]
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        source = await db.get(PlanAgentRun, source_run_id)
+        source.status = "failed"
+        source.current_stage = "failed"
+        source.error = "transient worker failure"
+        source.finished_at = datetime.utcnow()
+        plan.active_run_id = None
+        await db.commit()
+
+    missing = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={"run_type": "retry", "request": "Retry"},
+    )
+    assert missing.status_code == 422
+    wrong_type = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={
+            "run_type": "refresh_context",
+            "request": "Refresh",
+            "source_run_id": source_run_id,
+        },
+    )
+    assert wrong_type.status_code == 422
+    retry = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={
+            "run_type": "retry",
+            "request": "Retry",
+            "source_run_id": source_run_id,
+        },
+    )
+    assert retry.status_code == 201, retry.text
+    assert retry.json()["source_run_id"] == source_run_id
+
+
+@pytest.mark.asyncio
+async def test_plan_input_rejects_high_confidence_credentials(
+    client, session_factory
+):
+    rejected_create = await client.post(
+        "/api/plans",
+        json={
+            "input": (
+                "Use ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD directly"
+            )
+        },
+    )
+    assert rejected_create.status_code == 422
+    assert "Settings" in rejected_create.text
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Plan.id))) == 0
+
+    target = await _target(client, session_factory)
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Need a safe reference", "target_task_id": target.id},
+    )
+    plan_id = created.json()["id"]
+    run_id = created.json()["active_run"]["id"]
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        run.status = "waiting_user"
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan_id,
+            step_type="planner",
+            round=1,
+            generation=run.generation,
+            provider="claude",
+            status="completed",
+        )
+        db.add(step)
+        await db.flush()
+        input_request = PlanInputRequest(
+            plan_id=plan_id,
+            run_id=run.id,
+            source_step_id=step.id,
+            requested_by="planner",
+            questions=[{
+                "id": "credential_reference",
+                "header": "Credential",
+                "question": "Name the configured credential reference",
+                "response_type": "text",
+                "options": [],
+                "required": True,
+            }],
+            status="open",
+            idempotency_key=f"secret-guard:{run.id}",
+            opened_at=datetime.utcnow(),
+        )
+        db.add(input_request)
+        await db.flush()
+        run.open_input_request_id = input_request.id
+        await db.commit()
+        request_id = input_request.id
+        generation = run.generation
+
+    rejected = await client.post(
+        f"/api/plan-runs/{run_id}/input-requests/{request_id}/answer",
+        json={
+            "expected_run_generation": generation,
+            "idempotency_key": "credential-answer",
+            "answers": [{
+                "question_id": "credential_reference",
+                "value": "ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+            }],
+        },
+    )
+    assert rejected.status_code == 422
+    assert "Settings" in rejected.text
+    async with session_factory() as db:
+        request_row = await db.get(PlanInputRequest, request_id)
+        run = await db.get(PlanAgentRun, run_id)
+        assert request_row.status == "open"
+        assert request_row.answers is None
+        assert run.status == "waiting_user"
+
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        plan = await db.get(Plan, plan_id)
+        run.status = "failed"
+        run.current_stage = "failed"
+        run.finished_at = datetime.utcnow()
+        plan.active_run_id = None
+        await db.commit()
+
+    rejected_revision = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={
+            "run_type": "user_revision",
+            "request": (
+                "Use ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD directly"
+            ),
+        },
+    )
+    assert rejected_revision.status_code == 422
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(PlanAgentRun.id)).where(
+                PlanAgentRun.plan_id == plan_id
+            )
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_confirmation_and_missing_target_hard_conflict(
+    client, session_factory
+):
+    target = await _target(client, session_factory)
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Approve exact context", "target_task_id": target.id},
+    )
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    async with session_factory() as db:
+        db.add(LogEntry(
+            instance_id=1,
+            task_id=target.id,
+            event_type="user_message",
+            role="user",
+            content="Context changed after planning",
+        ))
+        await db.commit()
+
+    stale = await client.post(
+        f"/api/plan-versions/{version_id}/approve",
+        json={"expected_current_version_id": version_id},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["can_confirm"] is True
+    approved = await client.post(
+        f"/api/plan-versions/{version_id}/approve",
+        json={
+            "expected_current_version_id": version_id,
+            "confirm_stale": True,
+        },
+    )
+    assert approved.status_code == 200, approved.text
+
+    second = await client.post(
+        "/api/plans",
+        json={"input": "Do not approve a missing target", "target_task_id": target.id},
+    )
+    second_plan_id = second.json()["id"]
+    second_version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=second_plan_id,
+    )
+    async with session_factory() as db:
+        target_row = await db.get(Task, target.id)
+        await db.delete(target_row)
+        await db.commit()
+    hard = await client.post(
+        f"/api/plan-versions/{second_version_id}/approve",
+        json={
+            "expected_current_version_id": second_version_id,
+            "confirm_stale": True,
+        },
+    )
+    assert hard.status_code == 409
+    assert hard.json()["detail"]["hard_conflict"] is True
+    assert "target_task_missing" in hard.json()["detail"]["hard_conflicts"]
+
+
+@pytest.mark.asyncio
+async def test_approve_and_create_execution_is_atomic_and_history_stays_linked(
+    client, session_factory
+):
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Create an execution task", "target_repo": "/tmp"},
+    )
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    executed = await client.post(
+        f"/api/plan-versions/{version_id}/create-execution-task",
+        json={
+            "expected_current_version_id": version_id,
+            "approve_if_pending": True,
+        },
+    )
+    assert executed.status_code == 201, executed.text
+    execution_task_id = executed.json()["execution_task_id"]
+    assert executed.json()["version"]["human_decision"] == "approved"
+
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        version2 = PlanVersion(
+            plan_id=plan.id,
+            version_number=2,
+            parent_version_id=version_id,
+            content="# New current version",
+            repo_revision={"available": False, "reason": "not_git"},
+            review_verdict="approve",
+        )
+        db.add(version2)
+        await db.flush()
+        plan.current_version_id = version2.id
+        await db.commit()
+
+    resource = await client.get(f"/api/plans/{plan_id}")
+    assert resource.status_code == 200, resource.text
+    payload = resource.json()
+    assert payload["application"] is None
+    assert payload["applications"][0]["plan_version_id"] == version_id
+    assert payload["applications"][0]["execution_task_id"] == execution_task_id
+
+
 @pytest.mark.asyncio
 async def test_worker_import_creates_idempotent_inert_mirror(client, session_factory):
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
@@ -76,6 +445,52 @@ async def test_worker_import_creates_idempotent_inert_mirror(client, session_fac
         assert run.generation == 4
         assert await db.scalar(select(func.count(Plan.id))) == 1
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_import_requires_exact_attachment_digest(client):
+    uploaded = await client.post(
+        "/api/uploads",
+        files={"files": ("requirements.txt", b"exact bytes", "text/plain")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    item = uploaded.json()[0]
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    body = {
+        "protocol": 1,
+        "plan_id": 5151,
+        "run_id": 5251,
+        "run_generation": 0,
+        "title": "Attachment Plan",
+        "initial_request": "Use the attachment",
+        "priority": 0,
+        "pipeline_config": pipeline,
+        "run_type": "initial",
+        "request_text": "Use the attachment",
+        "max_interactions": 3,
+        "file_paths": [item["path"]],
+        "image_paths": [],
+        "attachments": [{
+            "url": item["url"],
+            "name": item["filename"],
+            "is_image": False,
+        }],
+        "attachment_manifest": [{
+            "path": item["path"],
+            "size": len(b"exact bytes"),
+            "sha256": "0" * 64,
+        }],
+    }
+    rejected = await client.post("/api/plans/worker-import", json=body)
+    assert rejected.status_code == 409
+    assert "digest/size" in rejected.text
+
+    body["attachment_manifest"][0]["sha256"] = hashlib.sha256(
+        b"exact bytes"
+    ).hexdigest()
+    accepted = await client.post("/api/plans/worker-import", json=body)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["attachment_receipt"] == body["attachment_manifest"]
 
 
 @pytest.mark.asyncio
@@ -589,6 +1004,19 @@ async def test_instance_capacity_owner_is_task_xor_plan_run(db_session):
         status="running",
         current_task_id=3,
         current_plan_run_id=4,
+    ))
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_plan_application_target_shape_is_database_enforced(db_session):
+    db_session.add(PlanApplication(
+        plan_id=1,
+        plan_version_id=1,
+        application_type="chat_message",
+        execution_task_id=99,
     ))
     with pytest.raises(IntegrityError):
         await db_session.commit()

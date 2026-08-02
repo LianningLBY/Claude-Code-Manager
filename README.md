@@ -182,7 +182,7 @@ claude-manager/
 │       │   ├── Instances/                 # InstanceGrid, InstanceLog
 │       │   ├── Tasks/                     # TaskForm, TaskList, TaskConfigBadge
 │       │   ├── Layout/PoolDrawer.tsx      # Pool 额度抽屉
-│       │   ├── PlanReview/PlanPanel.tsx    # Plan 审批
+│       │   ├── PlanReview/                 # 一等 Plan action/history/detail/input UI
 │       │   ├── System/                    # UpdatePanel
 │       │   └── Voice/VoiceButton.tsx      # 语音录入
 │       └── hooks/useWebSocket.ts
@@ -373,21 +373,24 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 3. 点击任务的 **Chat** 按钮，可以对已完成的任务继续追问
 4. 启用 Monitor 的任务中，Agent 可自主创建持久监控子 Agent，Task 列表显示活跃子 Agent 数量
 
-### Plan Mode
+### Interactive Plans
 
-Plan 始终是独立 `mode="plan"` Task：
+Plan 是独立于 Task 的一等、版本化制品：
 
-1. 在 New Task 创建 standalone Plan，或在已有 Chat 的 **Plans** 面板创建一个或多个关联 Plan
-2. Planner 以严格只读方式检查仓库，Reviewer 独立审查并可要求 Planner 修订；两层都可分别配置 primary/fallback provider、model 和 effort，完成后进入 `plan_review`
-3. Approve/Reject 只更新该 Plan，不唤醒或改变原 Task/session
-4. 关联 Plan 批准后作为持久 composer attachment；用户发送下一条真实消息时可显式选择一个或多个方案，同一 turn 才把方案交给主 Agent
-5. standalone Plan 批准后点击 **Create execution Task**，创建新的普通 Task 实施方案
+1. 在 New Task 选择 Plan 创建 standalone Plan，或在已有 Chat 的 **Plans** 面板创建多个互相独立的 related Plan。
+2. Planner/Reviewer 路由只在全局 Settings 配置；每个新 Plan 冻结当时的 primary/fallback provider、model、effort 和轮数设置。
+3. Planner 和 Reviewer 都可暂停同一个 Run 请求必要输入；单轮问题数量没有业务上限，每 Run 可暂停次数是独立的 `0–5` 全局设置。
+4. 每次完整方案写入不可变 Version。Revise 在同一 Plan 下创建新 Run/Version，只有 Fork 才创建新 Plan。
+5. Approve/Reject 绑定用户看到的 exact Version，不唤醒或改变原 Task/session。关联 Version 只有显式附到下一条真实消息时才应用一次；standalone Version 可显式创建普通 execution Task。
 
-若对话或仓库在规划后变化，审批/应用会要求 stale 二次确认。待审批或待应用的关联 Plan 会阻止目标 Task 迁移，避免跨 Worker 后方案与 session 分离。
+首页用 **Plans requiring action** 汇总待输入、待审批和待执行动作；Plans 详情保留 Version
+切换/比较、完整 Q&A/Run/route/repository 审计，以及旧 Version 已应用而新 Version 待审的双状态。
+若对话、仓库或目标发生变化，操作会要求 stale 确认或因 hard conflict 明确阻断。
 
-默认组合是 Planner `Claude Fable 5`（fallback `Codex GPT-5.6 Terra`），Reviewer
-`Codex GPT-5.6 Sol`（fallback `Claude Sonnet 5`）。Codex 步骤复用账号的常驻 App
-Server transport，但使用终态即删除的一次性只读 thread，不会把 Plan 变成可续聊 session。
+Planner/Reviewer 使用严格只读 transport。Codex 步骤复用账号的常驻 App Server，但使用终态即
+删除的一次性只读 thread。Plan 创建请求、标题、Revise/Fork 请求和回答都会持久化，因此
+API key、access token 和 private key 等高置信凭据必须存入 Settings → Secrets，Plan 文本中
+只写引用名称。
 
 ### Goal Mode
 

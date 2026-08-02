@@ -9,6 +9,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     Index,
@@ -86,6 +87,7 @@ class PlanVersion(Base):
     context_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     repo_revision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    reviewer_repo_revision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     review_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True)
     review_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
     reviewed_by_step_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -145,6 +147,13 @@ class PlanApplication(Base):
     __tablename__ = "plan_applications"
     __table_args__ = (
         UniqueConstraint("plan_version_id", name="uq_plan_application_version"),
+        CheckConstraint(
+            "(application_type = 'chat_message' AND user_log_id IS NOT NULL "
+            "AND execution_task_id IS NULL) OR "
+            "(application_type = 'execution_task' AND execution_task_id IS NOT NULL "
+            "AND user_log_id IS NULL)",
+            name="ck_plan_application_target",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -156,6 +165,9 @@ class PlanApplication(Base):
     user_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     execution_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     applied_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    application_receipt_key: Mapped[str | None] = mapped_column(
+        String(200), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -167,6 +179,28 @@ class PlanLegacyTaskLink(Base):
     legacy_task_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     plan_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     plan_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+
+class PlanApplicationReceipt(Base):
+    """Durable Manager/Worker handoff used to reconcile a lost HTTP ACK."""
+
+    __tablename__ = "plan_application_receipts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    receipt_key: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
+    target_task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    worker_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    manager_user_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_version_ids: Mapped[list] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="prepared")
+    response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )

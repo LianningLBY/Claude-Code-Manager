@@ -9,7 +9,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import os
+import stat
 from weakref import WeakKeyDictionary
 
 import httpx
@@ -116,6 +119,90 @@ class WorkerProxy:
                 f"Worker {worker.name} does not support versioned Plan protocol 1"
             )
 
+    async def get_plan_repo_revision(
+        self,
+        *,
+        worker: Worker,
+        manager_project_id: int | None,
+        target_task_id: int | None,
+    ) -> dict | None:
+        """Read the execution node's repository fingerprint for staleness."""
+
+        await self._require_versioned_plan_protocol(worker)
+        worker_project_id = None
+        if manager_project_id is not None:
+            async with self.db_factory() as db:
+                current = await db.get(Worker, worker.id)
+                mapping = dict(current.project_mapping or {}) if current else {}
+            worker_project_id = mapping.get(str(manager_project_id))
+            if worker_project_id is None:
+                raise RuntimeError("Worker Project mapping is missing")
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self._api(worker, "/api/plans/worker-repo-revision"),
+                headers=self._headers(worker),
+                json={
+                    "project_id": worker_project_id,
+                    "target_task_id": target_task_id,
+                },
+            )
+            response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Worker returned an invalid repository receipt")
+        revision = payload.get("repo_revision")
+        if revision is not None and not isinstance(revision, dict):
+            raise RuntimeError("Worker returned an invalid repository fingerprint")
+        return revision
+
+    async def get_plan_application_receipt(
+        self, worker: Worker, receipt_key: str
+    ) -> dict | None:
+        await self._require_versioned_plan_protocol(worker)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(
+                    worker,
+                    f"/api/plans/worker-application-receipts/{receipt_key}",
+                ),
+                headers=self._headers(worker),
+            )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("receipt_key") != receipt_key:
+            raise RuntimeError("Worker returned an invalid Plan application receipt")
+        return payload
+
+    @staticmethod
+    def _attachment_manifest(paths: list[str]) -> list[dict]:
+        manifest = []
+        for path in paths:
+            absolute = os.path.abspath(path)
+            if path != absolute:
+                raise RuntimeError("Plan attachment path must be absolute")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(absolute, flags)
+            digest = hashlib.sha256()
+            size = 0
+            with os.fdopen(fd, "rb") as handle:
+                metadata = os.fstat(handle.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise RuntimeError("Plan attachment must be a regular file")
+                if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+                    raise RuntimeError("Plan attachment owner does not match CCM")
+                while chunk := handle.read(1024 * 1024):
+                    size += len(chunk)
+                    digest.update(chunk)
+            manifest.append({
+                "path": absolute,
+                "size": size,
+                "sha256": digest.hexdigest(),
+            })
+        return manifest
+
     @staticmethod
     def _plan_attachment_payload(
         items: list[dict] | None,
@@ -145,6 +232,7 @@ class WorkerProxy:
             "context_log_id": version.context_log_id,
             "context_snapshot": version.context_snapshot,
             "repo_revision": version.repo_revision,
+            "reviewer_repo_revision": version.reviewer_repo_revision,
             "review_verdict": version.review_verdict,
             "review_feedback": version.review_feedback,
             "review_exhausted": version.review_exhausted,
@@ -179,6 +267,20 @@ class WorkerProxy:
             run.attachments
         )
         paths = list(dict.fromkeys([*plan_paths, *run_paths]))
+        image_paths = [
+            path
+            for path in paths
+            if path in {*plan_images, *run_images}
+        ]
+        attachment_by_path = {
+            path: attachment
+            for path, attachment in [
+                *zip(plan_paths, plan_attachments, strict=True),
+                *zip(run_paths, run_attachments, strict=True),
+            ]
+        }
+        attachments = [attachment_by_path[path] for path in paths]
+        attachment_manifest = self._attachment_manifest(paths)
         if paths:
             await self.push_files(worker, paths)
 
@@ -213,6 +315,7 @@ class WorkerProxy:
             "timeout_hours": plan.timeout_hours,
             "pipeline_config": run.pipeline_config or plan.pipeline_config,
             "run_type": run.run_type,
+            "source_run_id": run.source_run_id,
             "request_text": request_text,
             "context_session_id": run.context_session_id,
             "context_log_id": run.context_log_id,
@@ -220,9 +323,10 @@ class WorkerProxy:
             "repo_revision": run.repo_revision,
             "max_interactions": run.max_interactions,
             "base_version": base_seed,
-            "file_paths": run_paths or plan_paths or None,
-            "image_paths": run_images or plan_images or None,
-            "attachments": run_attachments or plan_attachments or None,
+            "file_paths": paths or None,
+            "image_paths": image_paths or None,
+            "attachments": attachments or None,
+            "attachment_manifest": attachment_manifest or None,
         }
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -240,6 +344,8 @@ class WorkerProxy:
         )
         if not isinstance(remote_run, dict) or remote_run.get("id") != run.id:
             raise RuntimeError("Worker returned an invalid Plan Run import receipt")
+        if imported.get("attachment_receipt") != attachment_manifest:
+            raise RuntimeError("Worker Plan attachment receipt does not match the manifest")
 
         if remote_run.get("status") == "waiting_user":
             remote_input_id = remote_run.get("open_input_request_id")
@@ -263,6 +369,7 @@ class WorkerProxy:
                 )
                 if answer_paths:
                     await self.push_files(worker, answer_paths)
+                answer_manifest = self._attachment_manifest(answer_paths)
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.post(
                         self._api(
@@ -278,6 +385,7 @@ class WorkerProxy:
                             "file_paths": answer_paths or None,
                             "image_paths": answer_images or None,
                             "attachments": answer_attachments or None,
+                            "attachment_manifest": answer_manifest or None,
                         },
                     )
                     response.raise_for_status()

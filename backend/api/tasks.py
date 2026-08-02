@@ -480,6 +480,11 @@ async def list_tasks(
 @router.post("", response_model=TaskResponse, status_code=201)
 async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
     user_id = get_current_user_id(request)
+    if body.mode == "plan":
+        raise HTTPException(
+            410,
+            "Legacy mode=plan Task creation is closed; use POST /api/plans",
+        )
     if body.secret_ids:
         require_admin(request)
     data = body.model_dump()
@@ -3429,7 +3434,6 @@ async def _cancel_local_task_impl(
         await db.rollback()
         raise HTTPException(400, "Cannot cancel task")
 
-    observed_status = active_task.status
     observed_retry_count = active_task.retry_count
     observed_instance_id = active_task.instance_id
     observed_started_at = active_task.started_at

@@ -44,6 +44,85 @@ def _datetime_value(value, fallback):
     return value
 
 
+def _legacy_attachments(metadata_value):
+    metadata = _json_value(metadata_value, {})
+    if not isinstance(metadata, dict):
+        raise RuntimeError("legacy Plan metadata must be a JSON object")
+    records = metadata.get("attachments") or []
+    paths = metadata.get("file_paths") or metadata.get("image_paths") or []
+    if not isinstance(records, list) or not isinstance(paths, list):
+        raise RuntimeError("legacy Plan attachment metadata is malformed")
+    if not records and not paths:
+        return None
+    if records and len(records) != len(paths):
+        raise RuntimeError("legacy Plan attachment records/paths do not match")
+    result = []
+    for index, path in enumerate(paths):
+        if not isinstance(path, str) or not path:
+            raise RuntimeError("legacy Plan attachment path is invalid")
+        record = records[index] if records else {}
+        if not isinstance(record, dict):
+            raise RuntimeError("legacy Plan attachment record is invalid")
+        result.append({
+            "url": record.get("url"),
+            "name": record.get("name") or path.rsplit("/", 1)[-1],
+            "is_image": bool(record.get("is_image")),
+            "path": path,
+        })
+    return result
+
+
+def _legacy_pipeline_config(bind, value):
+    """Return a complete frozen route snapshot for pre-route carrier rows."""
+
+    parsed = _json_value(value, None)
+    if isinstance(parsed, dict) and parsed.get("planner") and parsed.get("reviewer"):
+        return parsed
+    global_value = bind.execute(
+        sa.text(
+            "SELECT plan_pipeline_config FROM global_settings "
+            "WHERE plan_pipeline_config IS NOT NULL ORDER BY id LIMIT 1"
+        )
+    ).scalar_one_or_none()
+    parsed_global = _json_value(global_value, None)
+    if (
+        isinstance(parsed_global, dict)
+        and parsed_global.get("planner")
+        and parsed_global.get("reviewer")
+    ):
+        return parsed_global
+    return {
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 2,
+        "max_interactions": 3,
+    }
+
+
 def _create_tables() -> None:
     op.create_table(
         "plans",
@@ -252,12 +331,39 @@ def _backfill_legacy_plans() -> None:
     metadata = sa.MetaData()
     plans_table = sa.Table("plans", metadata, autoload_with=bind)
     versions_table = sa.Table("plan_versions", metadata, autoload_with=bind)
+    runs_table = sa.Table("plan_agent_runs", metadata, autoload_with=bind)
+    active_evidence = list(bind.execute(sa.text(
+        """SELECT i.id, i.current_task_id, i.pid
+        FROM instances i JOIN tasks t ON t.id = i.current_task_id
+        WHERE t.mode = 'plan' AND (i.pid IS NOT NULL OR i.status = 'running')"""
+    )).mappings())
+    if active_evidence:
+        raise RuntimeError(
+            "cannot migrate legacy Plans while an Instance has active process evidence"
+        )
+    active_task_evidence = list(bind.execute(sa.text(
+        """SELECT id, status, instance_id, worker_id FROM tasks
+        WHERE mode = 'plan' AND status IN ('in_progress', 'executing')"""
+    )).mappings())
+    if active_task_evidence:
+        raise RuntimeError(
+            "cannot migrate legacy Plans while a Plan Task has active state evidence"
+        )
+    active_run_evidence = list(bind.execute(sa.text(
+        """SELECT r.id, r.plan_task_id, r.status FROM plan_agent_runs r
+        JOIN tasks t ON t.id = r.plan_task_id
+        WHERE t.mode = 'plan' AND r.status IN ('planning', 'reviewing')"""
+    )).mappings())
+    if active_run_evidence:
+        raise RuntimeError(
+            "cannot migrate legacy Plans while a Pipeline Run has active state evidence"
+        )
     rows = list(
         bind.execute(
             sa.text(
                 """SELECT id, title, description, status, priority, project_id,
                 target_repo, target_branch, worker_id, timeout_hours, created_by,
-                metadata, plan_target_task_id, plan_context_session_id,
+                metadata, instance_id, plan_target_task_id, plan_context_session_id,
                 plan_context_log_id, plan_context_snapshot, plan_repo_revision,
                 supersedes_plan_task_id, plan_content, plan_approved,
                 plan_approved_at, plan_approved_by, plan_applied_at,
@@ -314,7 +420,7 @@ def _backfill_legacy_plans() -> None:
             plans_table.insert().values({
                 "title": root["title"] or f"Plan #{root_id}",
                 "initial_request": root["description"] or "Legacy Plan",
-                "initial_attachments": None,
+                "initial_attachments": _legacy_attachments(root["metadata"]),
                 "target_task_id": root["plan_target_task_id"],
                 "project_id": root["project_id"],
                 "target_repo": root["target_repo"],
@@ -323,7 +429,9 @@ def _backfill_legacy_plans() -> None:
                 "priority": root["priority"] or 0,
                 "timeout_hours": root["timeout_hours"],
                 "created_by": root["created_by"],
-                "pipeline_config": _json_value(root["plan_pipeline_config"], {}),
+                "pipeline_config": _legacy_pipeline_config(
+                    bind, root["plan_pipeline_config"]
+                ),
                 "current_version_id": None,
                 "active_run_id": None,
                 "forked_from_version_id": None,
@@ -389,6 +497,29 @@ def _backfill_legacy_plans() -> None:
                 version_by_task[task_id] = version_id
 
                 if row["plan_applied_at"] is not None or row["plan_execution_task_id"] is not None:
+                    is_execution = row["plan_execution_task_id"] is not None
+                    if not is_execution and row["plan_applied_log_id"] is None:
+                        raise RuntimeError(
+                            f"legacy Plan Task {task_id} has an incomplete chat application"
+                        )
+                    if is_execution:
+                        execution_exists = bind.execute(
+                            sa.text("SELECT id FROM tasks WHERE id=:id"),
+                            {"id": row["plan_execution_task_id"]},
+                        ).first()
+                        if execution_exists is None:
+                            raise RuntimeError(
+                                f"legacy Plan Task {task_id} references a missing execution Task"
+                            )
+                    else:
+                        log_exists = bind.execute(
+                            sa.text("SELECT id FROM log_entries WHERE id=:id"),
+                            {"id": row["plan_applied_log_id"]},
+                        ).first()
+                        if log_exists is None:
+                            raise RuntimeError(
+                                f"legacy Plan Task {task_id} references a missing application log"
+                            )
                     bind.execute(
                         sa.text(
                             """INSERT INTO plan_applications
@@ -403,13 +534,11 @@ def _backfill_legacy_plans() -> None:
                             "plan_id": plan_id,
                             "version_id": version_id,
                             "kind": (
-                                "execution_task"
-                                if row["plan_execution_task_id"] is not None
-                                else "chat_message"
+                                "execution_task" if is_execution else "chat_message"
                             ),
                             "target_task_id": row["plan_target_task_id"],
                             "session_id": row["plan_applied_to_session_id"],
-                            "log_id": row["plan_applied_log_id"],
+                            "log_id": None if is_execution else row["plan_applied_log_id"],
                             "execution_task_id": row["plan_execution_task_id"],
                             "applied_by": row["plan_approved_by"],
                             "created_at": _datetime_value(
@@ -417,6 +546,88 @@ def _backfill_legacy_plans() -> None:
                             ),
                         },
                     )
+
+            legacy_runs = list(bind.execute(
+                sa.text(
+                    "SELECT id, status FROM plan_agent_runs "
+                    "WHERE plan_task_id=:task_id ORDER BY id"
+                ),
+                {"task_id": task_id},
+            ).mappings())
+            queued = row["status"] == "pending"
+            if queued:
+                # The first-class Run takes over the durable queue item. Keep
+                # historical attempts as audit, but never let the old carrier
+                # Task and the canonical Run both dispatch after restart.
+                run_result = bind.execute(runs_table.insert().values({
+                    "plan_task_id": task_id,
+                    "plan_id": plan_id,
+                    "run_type": "legacy_migration",
+                    "base_version_id": current_version_id,
+                    "result_version_id": None,
+                    "request_text": row["description"] or "Legacy Plan",
+                    "context_session_id": row["plan_context_session_id"],
+                    "context_log_id": row["plan_context_log_id"],
+                    "context_snapshot": row["plan_context_snapshot"],
+                    "repo_revision": _json_value(row["plan_repo_revision"], None),
+                    "current_stage": "planner",
+                    "generation": 0,
+                    "worker_id": row["worker_id"],
+                    "interaction_count": 0,
+                    "max_interactions": 3,
+                    "execution_seconds": 0,
+                    "status": "queued",
+                    "round": 1,
+                    "review_exhausted": False,
+                    "created_at": _datetime_value(row["created_at"], now),
+                    "updated_at": _datetime_value(row["completed_at"] or row["created_at"], now),
+                    "pipeline_config": _legacy_pipeline_config(
+                        bind, row["plan_pipeline_config"]
+                    ),
+                }))
+                legacy_run_id = int(run_result.inserted_primary_key[0])
+            elif len(legacy_runs) > 1:
+                # Multiple historical attempts remain valid audit records, but
+                # the link points to the latest exact Run.
+                legacy_run_id = int(legacy_runs[-1]["id"])
+            elif legacy_runs:
+                legacy_run_id = int(legacy_runs[0]["id"])
+            else:
+                terminal = row["status"] in {"failed", "cancelled", "superseded"}
+                run_status = "failed" if terminal else "completed"
+                error = (
+                    "Legacy Plan had no persisted Pipeline Run"
+                    if run_status == "failed"
+                    else None
+                )
+                run_result = bind.execute(runs_table.insert().values({
+                    "plan_task_id": task_id,
+                    "plan_id": plan_id,
+                    "run_type": "legacy",
+                    "result_version_id": version_by_task.get(task_id),
+                    "request_text": row["description"] or "Legacy Plan",
+                    "context_session_id": row["plan_context_session_id"],
+                    "context_log_id": row["plan_context_log_id"],
+                    "context_snapshot": row["plan_context_snapshot"],
+                    "repo_revision": _json_value(row["plan_repo_revision"], None),
+                    "current_stage": "complete",
+                    "generation": 0,
+                    "worker_id": row["worker_id"],
+                    "interaction_count": 0,
+                    "max_interactions": 3,
+                    "execution_seconds": 0,
+                    "status": run_status,
+                    "round": 1,
+                    "review_exhausted": False,
+                    "error": error,
+                    "created_at": _datetime_value(row["created_at"], now),
+                    "updated_at": _datetime_value(row["completed_at"] or row["created_at"], now),
+                    "finished_at": _datetime_value(row["completed_at"], now),
+                    "pipeline_config": _legacy_pipeline_config(
+                        bind, row["plan_pipeline_config"]
+                    ),
+                }))
+                legacy_run_id = int(run_result.inserted_primary_key[0])
 
             bind.execute(
                 sa.text(
@@ -434,14 +645,48 @@ def _backfill_legacy_plans() -> None:
             bind.execute(
                 sa.text(
                     "UPDATE plan_agent_runs SET plan_id=:plan_id, "
-                    "result_version_id=:version_id WHERE plan_task_id=:task_id"
+                    "result_version_id=:version_id, "
+                    "status=CASE WHEN status IN ('planning','reviewing') THEN 'failed' "
+                    "WHEN status='completed' THEN 'completed' ELSE status END, "
+                    "current_stage=CASE WHEN status IN ('planning','reviewing') "
+                    "THEN 'complete' ELSE current_stage END, "
+                    "error=CASE WHEN status IN ('planning','reviewing') AND error IS NULL "
+                    "THEN 'Legacy active Run interrupted by versioned Plan migration' "
+                    "ELSE error END, "
+                    "finished_at=CASE WHEN status IN ('planning','reviewing') "
+                    "THEN COALESCE(finished_at, updated_at) ELSE finished_at END "
+                    "WHERE plan_task_id=:task_id "
+                    "AND (:canonical_run_id IS NULL OR id <> :canonical_run_id)"
                 ),
                 {
                     "plan_id": plan_id,
                     "version_id": version_by_task.get(task_id),
                     "task_id": task_id,
+                    "canonical_run_id": legacy_run_id if queued else None,
                 },
             )
+            if queued:
+                bind.execute(
+                    sa.text(
+                        "UPDATE plans SET active_run_id=:run_id WHERE id=:plan_id"
+                    ),
+                    {"run_id": legacy_run_id, "plan_id": plan_id},
+                )
+                bind.execute(
+                    sa.text(
+                        "UPDATE tasks SET status='superseded', "
+                        "completed_at=COALESCE(completed_at, :completed_at), "
+                        "error_message=:message WHERE id=:task_id AND status='pending'"
+                    ),
+                    {
+                        "completed_at": now,
+                        "message": (
+                            f"Migrated to first-class Plan #{plan_id}; "
+                            "the canonical Run owns execution"
+                        ),
+                        "task_id": task_id,
+                    },
+                )
 
         bind.execute(
             sa.text("UPDATE plans SET current_version_id=:version_id WHERE id=:plan_id"),

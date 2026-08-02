@@ -403,78 +403,25 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
 
-  // Independent Plans associated with this Task. Approved, unapplied Plans
-  // become persistent composer attachments; a user can dismiss/reselect them.
+  // Canonical first-class Plans associated with this Task. Legacy carrier
+  // Task ids remain queue-readable only so drafts from an older release can
+  // still be delivered after migration.
   const [plansOpen, setPlansOpen] = useState(false);
-  const [relatedPlans, setRelatedPlans] = useState<Task[]>([]);
   const [selectedPlanIds, setSelectedPlanIds] = useState<number[]>([]);
   const [versionedPlans, setVersionedPlans] = useState<PlanResource[]>([]);
   const [planRefreshGeneration, setPlanRefreshGeneration] = useState(0);
   const [selectedPlanVersionIds, setSelectedPlanVersionIds] = useState<number[]>([]);
-  const queuedPlanIdsRef = useRef<Set<number>>(new Set());
-  const planDismissedKey = `ccm-plan-dismissed-${task.id}`;
-
-  const readDismissedPlans = useCallback((): Set<number> => {
-    try {
-      const raw = localStorage.getItem(planDismissedKey);
-      const parsed = raw ? JSON.parse(raw) : [];
-      return new Set(
-        Array.isArray(parsed)
-          ? parsed.filter((value): value is number => Number.isInteger(value))
-          : [],
-      );
-    } catch {
-      return new Set();
-    }
-  }, [planDismissedKey]);
-
-  const writeDismissedPlans = useCallback((ids: Set<number>) => {
-    try {
-      localStorage.setItem(planDismissedKey, JSON.stringify([...ids]));
-    } catch { /* storage may be unavailable */ }
-  }, [planDismissedKey]);
-
-  const refreshPlans = useCallback(async () => {
-    if (!task.session_id || task.shared_from_id != null) {
-      setRelatedPlans([]);
-      setSelectedPlanIds([]);
-      return;
-    }
-    try {
-      const plans = await api.listRelatedPlans(task.id);
-      setRelatedPlans(plans);
-      const dismissed = readDismissedPlans();
-      const reserved = queuedPlanIdsRef.current;
-      setSelectedPlanIds(
-        plans
-          .filter((plan) =>
-            plan.status === 'completed'
-            && plan.plan_approved === true
-            && plan.plan_applied_at == null
-            && !dismissed.has(plan.id)
-            && !reserved.has(plan.id)
-          )
-          .map((plan) => plan.id),
-      );
-    } catch { /* legacy Plan polling is best-effort */ }
-  }, [readDismissedPlans, task.id, task.session_id, task.shared_from_id]);
-
   useEffect(() => {
     setPlansOpen(false);
-    setRelatedPlans([]);
     setSelectedPlanIds([]);
     setVersionedPlans([]);
     setSelectedPlanVersionIds([]);
-    void refreshPlans();
-    const timer = window.setInterval(() => void refreshPlans(), 5000);
-    return () => window.clearInterval(timer);
-  }, [refreshPlans]);
+  }, [task.id]);
 
   const refreshVersionedPlans = useCallback(async () => {
     if (!task.session_id || task.shared_from_id != null) return;
     try {
-      const rows = (await api.listPlans({ target_task_id: task.id }))
-        .filter((plan) => !plan.legacy);
+      const rows = await api.listPlans({ target_task_id: task.id });
       setVersionedPlans(rows);
       const attachable = new Set(
         rows
@@ -490,19 +437,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const timer = window.setInterval(() => void refreshVersionedPlans(), 5000);
     return () => window.clearInterval(timer);
   }, [refreshVersionedPlans]);
-
-  const togglePlanAttachment = useCallback((planId: number) => {
-    setSelectedPlanIds((current) => {
-      const selected = current.includes(planId);
-      const dismissed = readDismissedPlans();
-      if (selected) dismissed.add(planId);
-      else dismissed.delete(planId);
-      writeDismissedPlans(dismissed);
-      return selected
-        ? current.filter((id) => id !== planId)
-        : [...current, planId];
-    });
-  }, [readDismissedPlans, writeDismissedPlans]);
 
   const togglePlanVersionAttachment = useCallback((versionId: number) => {
     setSelectedPlanVersionIds((current) => current.includes(versionId)
@@ -524,18 +458,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
-  const legacyPlanAttentionCount = relatedPlans.filter((plan) =>
-    ['pending', 'in_progress', 'executing', 'plan_review'].includes(plan.status)
-    || (
-      plan.status === 'completed'
-      && plan.plan_approved === true
-      && plan.plan_applied_at == null
-    )
-  ).length;
   const planAttentionCount = versionedPlans.filter((plan) =>
     ['waiting_user', 'awaiting_review', 'planner', 'reviewer', 'queued', 'running'].includes(plan.display_state)
     || (plan.display_state === 'approved' && Boolean(plan.current_version && !plan.current_version.applied))
-  ).length || legacyPlanAttentionCount;
+  ).length;
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const HISTORY_PAGE_SIZE = 200;
@@ -589,9 +515,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const messageQueueRef = useRef(messageQueue);
   useEffect(() => {
     messageQueueRef.current = messageQueue;
-    queuedPlanIdsRef.current = new Set(
-      messageQueue.flatMap((item) => item.planTaskIds || []),
-    );
     localStorage.setItem(`ccm-chat-queue-${task.id}`, JSON.stringify(messageQueue));
   }, [messageQueue, task.id]);
 
@@ -772,7 +695,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
     if (
       msg.channel === 'plans'
-      && msg.data?.event === 'plan_run_change'
+      && typeof msg.data?.event === 'string'
+      && msg.data.event.startsWith('plan_')
       && Number(msg.data.plan_id) > 0
     ) {
       setPlanRefreshGeneration((generation) => generation + 1);
@@ -794,78 +718,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         if (typeof msg.data.codex_monitor_enabled === 'boolean') {
           setCodexMonitorEnabled(msg.data.codex_monitor_enabled);
         }
-      }
-      return;
-    }
-    if (
-      msg.channel === 'tasks'
-      && msg.data?.event === 'status_change'
-      && typeof msg.data.new_status === 'string'
-    ) {
-      const changedTaskId = Number(msg.data.task_id);
-      if (Number.isSafeInteger(changedTaskId) && changedTaskId > 0) {
-        setRelatedPlans((plans) => plans.map((plan) => (
-          plan.id === changedTaskId
-            ? { ...plan, status: msg.data!.new_status as string }
-            : plan
-        )));
-      }
-    }
-    if (
-      msg.channel === 'tasks'
-      && (
-        msg.data?.event === 'plan_stage_change'
-        || msg.data?.event === 'plan_ready'
-      )
-    ) {
-      const planTaskId = Number(msg.data.task_id);
-      const planStage = typeof msg.data.plan_stage === 'string'
-        ? msg.data.plan_stage
-        : undefined;
-      const planStageRound = Number(msg.data.plan_stage_round);
-      const planStageProvider = typeof msg.data.plan_stage_provider === 'string'
-        ? msg.data.plan_stage_provider
-        : undefined;
-      const planStageModel = typeof msg.data.plan_stage_model === 'string'
-        || msg.data.plan_stage_model === null
-        ? msg.data.plan_stage_model
-        : undefined;
-      const planStageEffort = typeof msg.data.plan_stage_effort === 'string'
-        || msg.data.plan_stage_effort === null
-        ? msg.data.plan_stage_effort
-        : undefined;
-      const planStageRouteSlot = msg.data.plan_stage_route_slot === 'primary'
-        || msg.data.plan_stage_route_slot === 'fallback'
-        || msg.data.plan_stage_route_slot === null
-        ? msg.data.plan_stage_route_slot
-        : undefined;
-      if (Number.isSafeInteger(planTaskId) && planTaskId > 0) {
-        setRelatedPlans((plans) => plans.map((plan) =>
-          plan.id === planTaskId
-            ? {
-                ...plan,
-                ...(msg.data?.event === 'plan_ready'
-                  ? { status: 'plan_review' }
-                  : {}),
-                ...(planStage !== undefined ? { plan_stage: planStage } : {}),
-                ...(Number.isSafeInteger(planStageRound)
-                  ? { plan_stage_round: planStageRound }
-                  : {}),
-                ...(planStageProvider !== undefined
-                  ? { plan_stage_provider: planStageProvider }
-                  : {}),
-                ...(planStageModel !== undefined
-                  ? { plan_stage_model: planStageModel }
-                  : {}),
-                ...(planStageEffort !== undefined
-                  ? { plan_stage_effort: planStageEffort }
-                  : {}),
-                ...(planStageRouteSlot !== undefined
-                  ? { plan_stage_route_slot: planStageRouteSlot }
-                  : {}),
-              }
-            : plan
-        ));
       }
       return;
     }
@@ -1707,14 +1559,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           : null;
         const ccU = JSON.parse(localStorage.getItem('cc_user') || '{}');
         const displayText = ccU.name ? `[${ccU.name}] ${text}` : text;
-        const optimisticAppliedPlans: AppliedPlanSnapshot[] = planIdsForTurn
-          .map((planId) => relatedPlans.find((plan) => plan.id === planId))
-          .filter((plan): plan is Task => Boolean(plan?.plan_content))
-          .map((plan) => ({
-            id: plan.id,
-            title: plan.title || `Plan #${plan.id}`,
-            content: plan.plan_content || '',
-          }));
+        const optimisticAppliedPlans: AppliedPlanSnapshot[] = [];
         const versionSnapshots: AppliedPlanSnapshot[] = [];
         planVersionIdsForTurn.forEach((selectedVersionId) => {
           const plan = versionedPlans.find((item) => item.current_version?.id === selectedVersionId);
@@ -1808,10 +1653,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           const selectedIdsForStale = planVersionIdsForTurn.length > 0
             ? planVersionIdsForTurn
             : planIdsForTurn;
+          const staleState = (
+            detail
+            && typeof detail === 'object'
+            && 'staleness' in detail
+            && detail.staleness
+            && typeof detail.staleness === 'object'
+          ) ? detail.staleness as Record<string, unknown> : null;
           if (
             stalePlanId == null
             || !selectedIdsForStale.includes(stalePlanId)
             || confirmedStalePlanIds.includes(stalePlanId)
+            || staleState?.stale !== true
+            || staleState.hard_conflict === true
+            || staleState.can_confirm === false
             || !window.confirm(
               `Plan #${stalePlanId} is based on older conversation or repository state. Apply it to this message anyway?`,
             )
@@ -1825,7 +1680,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         setSelectedPlanIds((current) =>
           current.filter((id) => !planIdsForTurn.includes(id))
         );
-        void refreshPlans();
         // Replace the optimistic bubble with the durable user-message row,
         // including the exact approved Plan snapshots used by the backend.
         fetchHistory();
@@ -1859,7 +1713,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       onTaskUpdated?.();
       fetchHistory();
       const errMsg = String(e);
-      if (errMsg.includes('409') || errMsg.toLowerCase().includes('currently being processed')) {
+      const conflictDetail = isApiRequestError(e) && typeof e.detail === 'string'
+        ? e.detail.toLowerCase()
+        : '';
+      if (
+        isApiRequestError(e)
+        && e.status === 409
+        && (
+          conflictDetail.includes('preceding codex turn is still running')
+          || conflictDetail.includes('currently being processed')
+        )
+      ) {
         setStillRunning(true);
       }
       setError(errMsg);
@@ -2568,39 +2432,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 );
               })}
               <span className="text-[10px] text-gray-500">applied only when this message is sent</span>
-            </div>
-          )}
-          {selectedPlanIds.length > 0 && (
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-indigo-300">
-                <ListTodo size={11} />
-                Next message
-              </span>
-              {selectedPlanIds.map((planId) => {
-                const plan = relatedPlans.find((item) => item.id === planId);
-                return (
-                  <span
-                    key={planId}
-                    className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-indigo-500/40 bg-indigo-500/10 px-2 py-1 text-[11px] text-indigo-200"
-                    title={plan?.title || `Plan #${planId}`}
-                  >
-                    <span className="truncate">
-                      Plan #{planId}{plan?.title ? ` · ${plan.title}` : ''}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => togglePlanAttachment(planId)}
-                      className="shrink-0 text-indigo-300 hover:text-white"
-                      aria-label={`Detach Plan #${planId}`}
-                    >
-                      <X size={10} />
-                    </button>
-                  </span>
-                );
-              })}
-              <span className="text-[10px] text-gray-500">
-                applied only when this message is sent
-              </span>
             </div>
           )}
           {/* File preview strip */}

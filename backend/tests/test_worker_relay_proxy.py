@@ -19,7 +19,12 @@ from backend.models.log_entry import LogEntry
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.project import Project
-from backend.models.plan import Plan, PlanApplication, PlanVersion
+from backend.models.plan import (
+    Plan,
+    PlanApplication,
+    PlanApplicationReceipt,
+    PlanVersion,
+)
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.user_skill import UserSkill
@@ -5100,6 +5105,7 @@ async def test_worker_chat_applies_exact_mirrored_plan_version(
             context_log_id=None,
             review_verdict="approve",
             human_decision="approved",
+            repo_revision={"available": False, "reason": "not_git"},
         )
         db.add(version)
         await db.flush()
@@ -5109,6 +5115,10 @@ async def test_worker_chat_applies_exact_mirrored_plan_version(
 
     proxy = AsyncMock()
     proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
     proxy.materialize_plan_version.return_value = 811
     proxy.relay = AsyncMock()
 
@@ -5159,6 +5169,246 @@ async def test_worker_chat_applies_exact_mirrored_plan_version(
         snapshot = json.loads(log.raw_json)["applied_plans"][0]
         assert snapshot["version_id"] == local_version_id
         assert snapshot["content"] == "# Exact Worker Plan"
+
+
+async def _approved_worker_plan_version(session_factory):
+    from backend.schemas.plan import default_plan_pipeline_config
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        session_id="worker-receipt-session",
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Receipt Plan",
+            initial_request="Plan this",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            worker_version_id=912,
+            version_number=1,
+            content="# Receipt-safe Plan",
+            context_session_id=task.session_id,
+            review_verdict="approve",
+            human_decision="approved",
+            repo_revision={"available": False, "reason": "not_git"},
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        await db.commit()
+        return worker, task, version.id
+
+
+async def test_worker_plan_application_recovers_lost_http_ack(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        raise httpx.ReadTimeout("response was lost after Worker commit")
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    proxy.get_plan_application_receipt.return_value = {
+        "status": "committed",
+        "response": {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [912],
+        },
+    }
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        result = await _send_worker_chat(
+            current,
+            ChatMessage(
+                message="Implement once",
+                plan_version_ids=[version_id],
+            ),
+            db,
+            request,
+        )
+
+    assert result["applied_plan_version_ids"] == [version_id]
+    assert sum(
+        call.args[1] == "POST"
+        for call in proxy.proxy_to_worker.await_args_list
+    ) == 1
+    assert proxy.get_plan_application_receipt.await_count == 1
+    async with session_factory() as db:
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.target_task_id == task.id
+            )
+        )
+        assert application is not None
+        assert receipt.status == "committed"
+
+
+async def test_worker_plan_receipt_cannot_reconcile_a_different_message(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    async with session_factory() as db:
+        prior_log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement the original request",
+            raw_json=json.dumps({"raw_content": "Implement the original request"}),
+            is_error=False,
+        )
+        db.add(prior_log)
+        await db.flush()
+        db.add(PlanApplicationReceipt(
+            receipt_key="receipt-for-original-message",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            manager_user_log_id=prior_log.id,
+            plan_version_ids=[version_id],
+            status="prepared",
+        ))
+        await db.commit()
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        raise AssertionError("A different message must not reach the Worker")
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        with pytest.raises(HTTPException, match="different message") as exc_info:
+            await _send_worker_chat(
+                current,
+                ChatMessage(
+                    message="This is a new and different request",
+                    plan_version_ids=[version_id],
+                    confirmed_stale_plan_version_ids=[version_id],
+                ),
+                db,
+                request,
+            )
+
+    assert exc_info.value.status_code == 409
+    proxy.get_plan_application_receipt.assert_not_awaited()
+    proxy.materialize_plan_version.assert_not_awaited()
+
+
+async def test_worker_plan_preflight_failure_does_not_leave_blocking_receipt(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.proxy_to_worker.side_effect = (
+        lambda _task, method, _path, *_args, **_kwargs:
+        _routing_snapshot(task)
+        if method == "GET"
+        else None
+    )
+    proxy.relay.subscribe_task.side_effect = RuntimeError("relay unavailable")
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        with pytest.raises(RuntimeError, match="relay unavailable"):
+            await _send_worker_chat(
+                current,
+                ChatMessage(
+                    message="Do not consume the Plan",
+                    plan_version_ids=[version_id],
+                ),
+                db,
+                request,
+            )
+
+    async with session_factory() as db:
+        assert await db.scalar(select(PlanApplicationReceipt.id)) is None
+        assert await db.scalar(select(PlanApplication.id)) is None
 
 
 async def test_chat_proxy_rejects_secrets(client, session_factory, monkeypatch):

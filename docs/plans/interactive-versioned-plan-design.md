@@ -8,8 +8,15 @@
 > 方案上请求 Revise 时创建新 Run 和新 Version，但不创建新 Plan。
 >
 > 代码已切换到本文的一等 Plan/Version/Run/Input/Application 架构；旧
-> `Task(mode="plan")` 数据只保留迁移后的只读兼容映射。生产行为仍取决于是否已部署本提交。
+> `Task(mode="plan")` 数据在迁移后通过 legacy link 解析，前端和所有新产品写入只使用 canonical
+> Plan API。通用 `POST /api/tasks` 已拒绝 `mode=plan`，窄化的旧读写 API 仅在 contract
+> 观察期服务历史客户端。生产行为仍取决于是否已部署本提交。
 > 首页沿用现有 New Task Mode 下拉，不新增“执行 Task / Plan 先行”切换。
+
+> 2026-08-02 实施复核：全局行动区统一命名为 `Plans requiring action`；Planner/Reviewer
+> 只能在全局 Settings 配置，新 Plan 冻结完整路由快照；每 Run 的用户交互轮数是独立的
+> `0–5` 全局设置，单轮问题数量仍无业务上限。Plan 创建请求、标题、Revise/Fork 请求和
+> 回答因持久化而拒绝高置信 API key/token/private-key 文本，并引导使用 Secrets 引用。
 
 ## 0. 决策摘要
 
@@ -208,7 +215,7 @@ Planner 返回 `request_input` 后：
 3. 生命周期清理 disposable thread/process；
 4. cleanup 被精确确认后，在同一事务发布 `open` request、把 Run 置为 `waiting_user` 并释放
    Instance owner；
-5. 前端显示 `Needs your input`；
+5. 前端在 `Plans requiring action` 的 `Input needed` 分组显示请求；
 6. 用户回答后 Run 原子地回到 `queued`；
 7. 新 Planner Step 使用原请求、冻结上下文、全部既有问答和已有 Version 继续规划。
 
@@ -302,7 +309,7 @@ Version 内容不可变，两个正交维度分别记录：
 
 新 Version 成为 `plans.current_version_id` 时，旧 current Version 写
 `superseded_by_version_id`，但旧 decision/application 不改变。只有 current Version 能进入
-全局 `Plans Awaiting Review`。
+全局 `Plans requiring action` 的 review/execute 分组。
 
 ### 4.3 Plan 展示状态
 
@@ -706,8 +713,9 @@ POST   /api/plan-runs/{run_id}/cancel
 POST   /api/plan-runs/{run_id}/input-requests/{request_id}/answer
 ```
 
-`POST /api/plans` 同时支持 standalone 和 related；
-`POST /api/tasks/{task_id}/plans` 可保留为只填充 `target_task_id` 的便利别名。
+`POST /api/plans` 同时支持 standalone 和 related，并且始终冻结当时的全局 Pipeline 配置；
+前端不再调用旧 `POST /api/tasks/{task_id}/plans`，通用 `POST /api/tasks` 的
+`mode=plan` 创建入口明确返回 410。旧 Task 形态的窄化 API 只用于发布 contract 期兼容。
 
 ### 12.2 Chat API
 
@@ -743,16 +751,18 @@ snapshot 新增 `plan_id/version_id/version_number`，继续兼容旧 `id/title/
 新增小 payload 失效通知：
 
 - `plan_created`；
+- `plan_run_created`；
 - `plan_run_status_changed`；
 - `plan_input_requested` / `plan_input_answered`；
 - `plan_version_created`；
 - `plan_version_decided`；
 - `plan_version_applied`；
-- `plan_archived`。
+- `plan_archived` / `plan_restored`。
 
 事件只带 `plan_id/run_id/version_id/display_state/updated_at` 等摘要，不携带完整 Markdown、
 questions answer 或附件。前端收到事件后 refetch canonical API；断线重连同样全量对账，不能把
-WebSocket 当权威状态。
+WebSocket 当权威状态。管理员可订阅全局 `plans`；普通成员只可订阅通过 Plan/Task ACL 的
+`plan:{id}` / `task:{id}`，并由 15 秒 HTTP 轮询覆盖新 Plan 尚无 scoped subscription 的窗口。
 
 ## 14. 前端交互
 
@@ -766,9 +776,10 @@ WebSocket 当权威状态。
 - 用户 Revise 后留在同一 Plan 页面，显示新的 Run 进度，不产生新卡片；
 - 显式 `Fork as new Plan` 才创建另一张 Plan 卡片。
 
-### 14.2 Needs your input
+### 14.2 Plans requiring action / Input needed
 
-- Plans modal 和首页增加独立 `Needs your input` 分组/徽标；
+- 首页以 `Plans requiring action` 统一包裹 `Input needed` 与 review/execute 两类动作；
+- Plans modal 使用 `Input` 过滤器和 attention badge；
 - InputRequest 使用专用表单渲染 text/single/multi choice；
 - 表单按响应中的完整 questions 数组渲染，不截断、不分页丢题，也不因问题数量拒绝提交；
 - 支持附件上传、预览、失败重试、移除；
@@ -779,7 +790,8 @@ WebSocket 当权威状态。
 
 ### 14.3 Review 与 Apply
 
-- `Plans Awaiting Review` 只展示 current Version decision=pending；
+- `Plans requiring action` 的 review/execute 分组只展示 current Version decision=pending，
+  或已批准但尚未创建 execution Task 的 standalone Version；
 - TasksPage 的 Normal/Standalone/Related 类型筛选不影响该区域；
 - Approve/Reject 文案带 Version，例如 `Approve v3`；
 - composer attachment 显示 `Plan #12 · v3`；
@@ -837,9 +849,12 @@ Plan 不再依赖普通 Task list response：
 7. `cancelled + plan_approved=False` → rejected；
 8. `superseded` → 历史 Version，并链接下一 Version；
 9. `plan_applied_*` / `plan_execution_task_id` → PlanApplication；
-10. pending 且没有 content 的 Task → queued Run；failed 且没有 content 的 Task → failed Run；
-11. 理论上不应存在 planning/reviewing 的活 Run；发现仍有运行证据时 migration fail closed；
-12. 每个旧 Task 写 legacy link，不改变旧 id/URL 可解析性。
+10. pending carrier（无论是否存在历史 attempt）→ 新建唯一 queued canonical Run，并把旧
+    Task 标为 superseded，避免部署后 Task 与 Run 双重领取；failed 且没有 content 的 Task →
+    failed Run；
+11. 理论上不应存在 in_progress/executing Task 或 planning/reviewing Run；任一 Task、Run、
+    Instance/进程 active 证据都使 migration fail closed，包括远端 Worker 状态；
+12. 每个旧 Task 写 legacy link，不改变旧 id/URL 可解析性；superseded carrier 只读保留。
 
 若链分叉、target 冲突、应用字段不完整或多个 Task 声称同一 application，migration 必须 fail
 closed 并输出脱敏的 task ids；不能猜测链顺序。
@@ -857,8 +872,8 @@ closed 并输出脱敏的 task ids；不能猜测链顺序。
 - 前端全部切换 Plan/Version API；
 - Dispatcher 只 claim PlanRun；
 - 旧 Plan Task 标记只读 legacy，不再入队或出现在普通 Task count；
-- 观察至少一个发布周期后移除旧 mutation endpoints、Worker legacy payload、`Task.plan_*`
-  字段和 `mode=plan` 创建入口；保留只读 legacy resolver/link；
+- `mode=plan` 通用创建入口已关闭；观察至少一个发布周期后移除剩余窄化旧 mutation
+  endpoints、Worker legacy payload 和 `Task.plan_*` 字段；保留只读 legacy resolver/link；
 - downgrade 只保证 schema 可回退，不承诺把多 Version/交互 Run 无损压回单 Task 模型；发布
   前必须依赖现有 SQLite 快照/外部数据库人工备份策略。
 
@@ -1098,6 +1113,8 @@ thread、Instance owner 或部署 blocker。
 - 所有审批和应用绑定 exact Version；
 - 旧 Plan Task 历史迁移无丢失且 legacy URL 可解析；
 - 本机与 Worker 行为对等；
+- Worker protocol v1 先握手，再以 attachment size/SHA-256 manifest、generation CAS 和 durable
+  application receipt 验证导入/回答/应用；丢失 HTTP ACK 可按 receipt 查询恢复，不能重复应用；
 - 后端全量测试、前端全量测试、生产构建、Ruff、ESLint、Alembic current/head 通过；
 - SQLite 自动迁移在备份副本完成，PostgreSQL/MySQL 依项目部署规范人工演练；
 - 完成本文 20 节手工验收；

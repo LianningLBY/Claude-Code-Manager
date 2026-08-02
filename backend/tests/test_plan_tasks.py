@@ -12,6 +12,7 @@ from backend.models.log_entry import LogEntry
 from backend.models.global_settings import GlobalSettings
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
+from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_tasks import capture_repo_revision
 
 
@@ -76,6 +77,30 @@ async def _target_with_session(client, session_factory) -> tuple[int, str]:
     return task_id, session_id
 
 
+async def _legacy_plan_task(session_factory, **values) -> int:
+    """Create a historical carrier row without reopening its public write path."""
+
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    fields = {
+        "title": "Legacy Plan",
+        "description": "Historical planning request",
+        "target_repo": "/tmp",
+        "mode": "plan",
+        "provider": pipeline["planner"]["primary"]["provider"],
+        "model": pipeline["planner"]["primary"]["model"],
+        "effort_level": pipeline["planner"]["primary"]["effort"],
+        "plan_pipeline_config": pipeline,
+        "plan_repo_revision": await capture_repo_revision("/tmp"),
+    }
+    fields.update(values)
+    async with session_factory() as db:
+        task = Task(**fields)
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        return task.id
+
+
 @pytest.mark.asyncio
 async def test_related_plans_are_independent_and_limited(
     client,
@@ -132,7 +157,8 @@ async def test_related_plans_are_independent_and_limited(
             "plan_target_task_id": target_id,
         },
     )
-    assert generic_bypass.status_code == 429
+    assert generic_bypass.status_code == 410
+    assert "POST /api/plans" in generic_bypass.text
 
     history = await client.get(f"/api/tasks/{target_id}/plans")
     assert history.status_code == 200
@@ -282,12 +308,8 @@ async def test_related_plan_snapshots_custom_primary_and_fallback_routes(
         },
     )
 
-    assert response.status_code == 201, response.text
-    data = response.json()
-    assert data["provider"] == "codex"
-    assert data["model"] == "gpt-5.6-luna"
-    assert data["effort_level"] == "max"
-    assert data["plan_pipeline_config"] == pipeline
+    assert response.status_code == 422, response.text
+    assert "configured globally" in response.text
 
 
 @pytest.mark.asyncio
@@ -334,22 +356,22 @@ async def test_new_plans_snapshot_the_global_pipeline_settings(
         json={"input": "Use global settings"},
     )
     standalone = await client.post(
-        "/api/tasks",
+        "/api/plans",
         json={
+            "input": "Use global settings",
             "title": "Standalone global Plan",
-            "description": "Use global settings",
             "target_repo": "/tmp",
-            "mode": "plan",
         },
     )
 
     assert related.status_code == 201, related.text
     assert standalone.status_code == 201, standalone.text
-    for response in (related, standalone):
-        data = response.json()
-        assert data["provider"] == "codex"
-        assert data["model"] == "gpt-5.6-terra"
-        assert data["plan_pipeline_config"] == pipeline
+    expected = {**pipeline, "max_interactions": 3}
+    related_data = related.json()
+    assert related_data["provider"] == "codex"
+    assert related_data["model"] == "gpt-5.6-terra"
+    assert related_data["plan_pipeline_config"] == expected
+    assert standalone.json()["pipeline_config"] == expected
 
 
 @pytest.mark.asyncio
@@ -413,16 +435,11 @@ async def test_standalone_plan_revision_preserves_independent_version_history(
     client,
     session_factory,
 ):
-    created = await client.post(
-        "/api/tasks",
-        json={
-            "title": "Standalone v1",
-            "description": "Plan the migration",
-            "target_repo": "/tmp",
-            "mode": "plan",
-        },
+    source_id = await _legacy_plan_task(
+        session_factory,
+        title="Standalone v1",
+        description="Plan the migration",
     )
-    source_id = created.json()["id"]
     async with session_factory() as db:
         await db.execute(
             update(Task)
@@ -452,23 +469,13 @@ async def test_generic_plan_create_supersedes_worker_side_source_atomically(
     client,
     session_factory,
 ):
-    created = await client.post(
-        "/api/tasks",
-        json={
-            "title": "Worker source",
-            "description": "Plan on a Worker",
-            "target_repo": "/tmp",
-            "mode": "plan",
-        },
+    source_id = await _legacy_plan_task(
+        session_factory,
+        title="Worker source",
+        description="Plan on a Worker",
+        status="plan_review",
+        plan_content="Worker proposal",
     )
-    source_id = created.json()["id"]
-    async with session_factory() as db:
-        await db.execute(
-            update(Task)
-            .where(Task.id == source_id)
-            .values(status="plan_review", plan_content="Worker proposal")
-        )
-        await db.commit()
 
     successor = await client.post(
         "/api/tasks",
@@ -481,13 +488,11 @@ async def test_generic_plan_create_supersedes_worker_side_source_atomically(
         },
     )
 
-    assert successor.status_code == 201, successor.text
-    successor_id = successor.json()["id"]
-    assert successor.json()["supersedes_plan_task_id"] == source_id
+    assert successor.status_code == 410, successor.text
     async with session_factory() as db:
         source = await db.get(Task, source_id)
-    assert source.status == "superseded"
-    assert source.metadata_["plan_superseded_by_task_id"] == successor_id
+    assert source.status == "plan_review"
+    assert not source.metadata_ or source.metadata_.get("plan_superseded_by_task_id") is None
 
 
 @pytest.mark.asyncio
@@ -495,23 +500,13 @@ async def test_plan_approval_and_revision_are_serialized(
     client,
     session_factory,
 ):
-    created = await client.post(
-        "/api/tasks",
-        json={
-            "title": "Racing Plan",
-            "description": "Choose one terminal decision",
-            "target_repo": "/tmp",
-            "mode": "plan",
-        },
+    source_id = await _legacy_plan_task(
+        session_factory,
+        title="Racing Plan",
+        description="Choose one terminal decision",
+        status="plan_review",
+        plan_content="Race-safe proposal",
     )
-    source_id = created.json()["id"]
-    async with session_factory() as db:
-        await db.execute(
-            update(Task)
-            .where(Task.id == source_id)
-            .values(status="plan_review", plan_content="Race-safe proposal")
-        )
-        await db.commit()
 
     approved, revised = await asyncio.gather(
         client.post(f"/api/tasks/{source_id}/plan/approve"),
@@ -564,18 +559,17 @@ async def test_plan_tasks_never_silently_downgrade_codex_fast(
     assert related.json()["codex_service_tier"] == "default"
 
     standalone = await client.post(
-        "/api/tasks",
+        "/api/plans",
         json={
+            "input": "Plan it",
             "title": "No hidden Fast downgrade",
-            "description": "Plan it",
-            "mode": "plan",
             "provider": "codex",
             "model": "gpt-5.6-sol",
             "codex_service_tier": "priority",
         },
     )
     assert standalone.status_code == 422
-    assert "Fast is not supported" in standalone.text
+    assert "extra_forbidden" in standalone.text
 
 
 @pytest.mark.asyncio
@@ -824,16 +818,11 @@ async def test_cancel_active_plan_reaps_legacy_ralph_lifecycle_first(
 ):
     import backend.main
 
-    created = await client.post(
-        "/api/tasks",
-        json={
-            "title": "Cancellable Plan",
-            "description": "Plan safely",
-            "target_repo": "/tmp",
-            "mode": "plan",
-        },
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Cancellable Plan",
+        description="Plan safely",
     )
-    plan_id = created.json()["id"]
     async with session_factory() as db:
         await db.execute(
             update(Task)
@@ -879,16 +868,11 @@ async def test_standalone_plan_creates_one_idempotent_execution_task(
     client,
     session_factory,
 ):
-    created = await client.post(
-        "/api/tasks",
-        json={
-            "title": "Standalone",
-            "description": "Plan a migration",
-            "target_repo": "/tmp",
-            "mode": "plan",
-        },
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Standalone",
+        description="Plan a migration",
     )
-    plan_id = created.json()["id"]
     async with session_factory() as db:
         await db.execute(
             update(Task)
@@ -919,16 +903,11 @@ async def test_plan_run_history_returns_steps(
     client,
     session_factory,
 ):
-    created = await client.post(
-        "/api/tasks",
-        json={
-            "title": "Audited Plan",
-            "description": "Plan it",
-            "target_repo": "/tmp",
-            "mode": "plan",
-        },
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Audited Plan",
+        description="Plan it",
     )
-    plan_id = created.json()["id"]
     async with session_factory() as db:
         run = PlanAgentRun(
             plan_task_id=plan_id,

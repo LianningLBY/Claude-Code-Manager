@@ -5,13 +5,17 @@ Ensures:
 2. A fresh database can be created from scratch via migrations.
 3. The final migrated schema matches the ORM models (no drift).
 """
+import json
 from pathlib import Path
 from unittest.mock import patch
 
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.schema import CreateTable
 
 # All ORM models must be imported so Base.metadata is complete.
 from backend.database import Base
@@ -409,7 +413,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_legacy_task_links"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_legacy_task_links"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -569,6 +573,13 @@ class TestVersionedPlanBackfill:
                  '{{"planner": {{"provider": "claude"}}}}',
                  '2026-08-01 12:30:00')
             """))
+            conn.execute(text("""
+                INSERT INTO log_entries (
+                    id, task_id, event_type, content, timestamp, is_error
+                ) VALUES (
+                    11, 1, 'user', 'Applied Plan', '2026-08-01 11:00:00', 0
+                )
+            """))
             run_id = conn.execute(text("""
                 INSERT INTO plan_agent_runs (
                     plan_task_id, status, round, review_exhausted,
@@ -597,7 +608,11 @@ class TestVersionedPlanBackfill:
                 FROM plans
             """)).mappings().one()
             assert plan["title"] == "Plan root"
-            assert plan["pipeline_config"] == '{"planner": {"provider": "claude"}}'
+            pipeline = plan["pipeline_config"]
+            if isinstance(pipeline, str):
+                pipeline = json.loads(pipeline)
+            assert pipeline["planner"]["primary"]["provider"] == "claude"
+            assert pipeline["max_interactions"] == 3
 
             versions = conn.execute(text("""
                 SELECT id, version_number, parent_version_id,
@@ -644,6 +659,134 @@ class TestVersionedPlanBackfill:
             """), {"run_id": run_id}).scalar_one() == plan["id"]
         engine.dispose()
 
+    def test_pending_failed_and_attachments_are_backfilled(self, tmp_path):
+        db_path = str(tmp_path / "legacy_plan_states.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, metadata,
+                    created_at
+                ) VALUES
+                (21, 'Pending legacy Plan', 'Wait to run', 'pending', 0,
+                 'main', 'pending', 0, 2, 'plan', :metadata,
+                 '2026-08-01 10:00:00')
+            """), {"metadata": json.dumps({
+                "file_paths": ["/uploads/requirements.txt"],
+                "attachments": [{
+                    "url": "/api/uploads/requirements.txt",
+                    "name": "requirements.txt",
+                    "is_image": False,
+                }],
+            })})
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, metadata,
+                    created_at
+                ) VALUES
+                (22, 'Failed legacy Plan', 'Failed before output', 'failed', 0,
+                 'main', 'pending', 0, 2, 'plan', NULL,
+                 '2026-08-01 11:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT l.legacy_task_id, l.plan_run_id, r.status,
+                       p.active_run_id, p.initial_attachments, t.status AS task_status,
+                       p.pipeline_config
+                FROM plan_legacy_task_links l
+                JOIN plan_agent_runs r ON r.id = l.plan_run_id
+                JOIN plans p ON p.id = l.plan_id
+                JOIN tasks t ON t.id = l.legacy_task_id
+                ORDER BY l.legacy_task_id
+            """)).mappings().all()
+            assert [row["status"] for row in rows] == ["queued", "failed"]
+            assert rows[0]["active_run_id"] == rows[0]["plan_run_id"]
+            assert rows[1]["active_run_id"] is None
+            assert [row["task_status"] for row in rows] == ["superseded", "failed"]
+            attachments = rows[0]["initial_attachments"]
+            if isinstance(attachments, str):
+                attachments = json.loads(attachments)
+            assert attachments == [{
+                "url": "/api/uploads/requirements.txt",
+                "name": "requirements.txt",
+                "is_image": False,
+                "path": "/uploads/requirements.txt",
+            }]
+            pipeline = rows[0]["pipeline_config"]
+            if isinstance(pipeline, str):
+                pipeline = json.loads(pipeline)
+            assert pipeline["planner"]["primary"]["provider"] == "claude"
+            assert pipeline["max_interactions"] == 3
+        engine.dispose()
+
+    def test_active_legacy_plan_process_blocks_backfill(self, tmp_path):
+        db_path = str(tmp_path / "active_legacy_plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                ) VALUES (
+                    31, 'Active legacy Plan', 'Still running', 'executing', 0,
+                    'main', 'pending', 0, 2, 'plan', '2026-08-01 10:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO instances (
+                    id, name, pid, status, current_task_id, provider, model,
+                    total_tasks_completed, total_cost_usd
+                ) VALUES (
+                    41, 'legacy-owner', 12345, 'running', 31, 'claude',
+                    'default', 0, 0
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="active process evidence",
+        ):
+            _run_alembic(cfg, command.upgrade, "head")
+
+    def test_active_legacy_plan_task_state_blocks_without_instance(self, tmp_path):
+        db_path = str(tmp_path / "active_legacy_plan_without_instance.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                ) VALUES (
+                    32, 'Unowned active Plan', 'State is still authoritative',
+                    'in_progress', 0, 'main', 'pending', 0, 2, 'plan',
+                    '2026-08-01 10:00:00'
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="active state evidence",
+        ):
+            _run_alembic(cfg, command.upgrade, "head")
+
 
 class TestSchemaConsistency:
     """The schema produced by Alembic migrations matches the ORM models.
@@ -651,6 +794,13 @@ class TestSchemaConsistency:
     This is the critical test: if someone adds a column to an ORM model
     but forgets to create an Alembic migration, this test will catch it.
     """
+
+    def test_plan_application_integrity_constraint_compiles_on_all_dialects(self):
+        table = backend.models.plan.PlanApplication.__table__
+        for dialect in (sqlite.dialect(), postgresql.dialect(), mysql.dialect()):
+            ddl = str(CreateTable(table).compile(dialect=dialect))
+            assert "ck_plan_application_target" in ddl
+            assert "execution_task" in ddl
 
     def test_migrated_schema_matches_orm(self, tmp_path):
         """Compare columns from Alembic-migrated DB vs ORM metadata.create_all."""

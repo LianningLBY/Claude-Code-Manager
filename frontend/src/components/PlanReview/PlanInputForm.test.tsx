@@ -6,6 +6,7 @@ import { api, type PlanInputRequest, type PlanRun } from '../../api/client';
 import { PlanInputForm } from './PlanInputForm';
 
 vi.mock('../../api/client', () => ({
+  isApiRequestError: () => false,
   api: { answerPlanInput: vi.fn().mockResolvedValue({}) },
 }));
 

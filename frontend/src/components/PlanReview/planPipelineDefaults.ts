@@ -28,4 +28,5 @@ export const FALLBACK_PLAN_PIPELINE_CONFIG: PlanPipelineConfig = {
     },
   },
   max_revision_cycles: 2,
+  max_interactions: 3,
 };

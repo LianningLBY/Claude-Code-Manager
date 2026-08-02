@@ -12,7 +12,6 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.config import settings
 from backend.models.plan import (
     Plan,
     PlanApplication,
@@ -160,7 +159,7 @@ async def create_plan_with_run(
         pipeline_config=pipeline_config,
         round=1,
         generation=0,
-        max_interactions=max(0, min(5, settings.plan_max_interactions)),
+        max_interactions=pipeline_config.get("max_interactions", 3),
         updated_at=now,
     )
     db.add(run)
@@ -185,6 +184,7 @@ async def create_plan_run(
     context_log_id: int | None,
     context_snapshot: str | None,
     repo_revision: dict | None,
+    source_run_id: int | None = None,
 ) -> PlanAgentRun:
     """Create one Run under the Plan's durable active-run fence."""
 
@@ -210,6 +210,7 @@ async def create_plan_run(
         plan_id=plan.id,
         plan_task_id=None,
         run_type=run_type,
+        source_run_id=source_run_id,
         status="queued",
         current_stage="planner",
         base_version_id=base_version_id,
@@ -223,7 +224,7 @@ async def create_plan_run(
         pipeline_config=plan.pipeline_config,
         round=1,
         generation=0,
-        max_interactions=max(0, min(5, settings.plan_max_interactions)),
+        max_interactions=dict(plan.pipeline_config).get("max_interactions", 3),
         updated_at=now,
     )
     db.add(run)
@@ -409,6 +410,16 @@ async def answer_input_request(
     if run.open_input_request_id != input_request.id or input_request.status != "open":
         raise HTTPException(409, "Input request is no longer open")
     normalized = validate_input_answers(input_request.questions, answers)
+    from backend.services.plan_input_safety import contains_high_confidence_secret
+
+    if contains_high_confidence_secret(
+        [response_text, *[item.get("value") for item in normalized]]
+    ):
+        raise HTTPException(
+            422,
+            "Plan answers cannot store API keys or access tokens. "
+            "Save the credential in Settings → Secrets and answer with its name/reference.",
+        )
     now = datetime.utcnow()
     updated = await db.execute(
         update(PlanInputRequest)
@@ -589,9 +600,8 @@ async def approved_versions_for_message(
         ).scalars()
     }
     confirmed = set(confirmed_stale_version_ids or [])
-    from backend.services.plan_tasks import capture_repo_revision, latest_task_log_id
+    from backend.services.plan_staleness import version_staleness
 
-    current_log_id = await latest_task_log_id(db, target.id)
     result: list[tuple[Plan, PlanVersion]] = []
     for version_id in ids:
         version = versions.get(version_id)
@@ -611,23 +621,15 @@ async def approved_versions_for_message(
         )
         if applied is not None:
             raise ValueError(f"Plan Version #{version_id} has already been applied")
-        reasons: list[str] = []
-        if version.context_session_id != target.session_id:
-            reasons.append("session_changed")
-        if (current_log_id or 0) > (version.context_log_id or 0):
-            reasons.append("conversation_advanced")
-        current_repo = None
-        if plan.worker_id is None:
-            current_repo = await capture_repo_revision(target.last_cwd or plan.target_repo)
-            if version.repo_revision is not None and current_repo != version.repo_revision:
-                reasons.append("repository_changed")
-        if reasons and version.id not in confirmed:
-            staleness = {
-                "stale": True,
-                "reasons": reasons,
-                "current_log_id": current_log_id,
-                "current_repo_revision": current_repo,
-            }
+        staleness = await version_staleness(db, plan, version)
+        if staleness["hard_conflict"]:
+            error = ValueError(
+                f"Plan Version #{version.id} has a non-bypassable target conflict"
+            )
+            setattr(error, "staleness", staleness)
+            setattr(error, "plan_version_id", version.id)
+            raise error
+        if staleness["stale"] and version.id not in confirmed:
             error = ValueError(
                 f"Plan Version #{version.id} context changed; confirm stale application"
             )
@@ -753,16 +755,27 @@ async def plan_resource(
     if active is not None and active.open_input_request_id is not None:
         open_input = await db.get(PlanInputRequest, active.open_input_request_id)
 
+    applications = list(
+        (
+            await db.execute(
+                select(PlanApplication)
+                .where(PlanApplication.plan_id == plan.id)
+                .order_by(PlanApplication.created_at, PlanApplication.id)
+            )
+        ).scalars()
+    )
+    application = None
     applied = False
     if current is not None:
-        applied = (
-            await db.scalar(
-                select(PlanApplication.id).where(
-                    PlanApplication.plan_version_id == current.id
-                ).limit(1)
-            )
-            is not None
+        application = next(
+            (
+                item
+                for item in applications
+                if item.plan_version_id == current.id
+            ),
+            None,
         )
+        applied = application is not None
     if plan.archived_at is not None:
         display_state = "archived"
     elif active is not None and active.status == "waiting_user":
@@ -791,6 +804,7 @@ async def plan_resource(
             "id", "title", "initial_request", "initial_attachments",
             "target_task_id", "project_id", "target_repo", "target_branch",
             "worker_id", "priority", "timeout_hours", "created_by",
+            "pipeline_config",
             "current_version_id", "active_run_id", "forked_from_version_id",
             "archived_at", "closed_at", "lock_version", "created_at", "updated_at",
         )
@@ -810,6 +824,8 @@ async def plan_resource(
         legacy=legacy,
         latest_run_status=latest.status if latest else None,
         latest_run_error=latest.error if latest else None,
+        application=application,
+        applications=applications,
         current_version=await _version_resource(db, current),
         active_run=await _run_resource(db, active, include_audit=include_audit),
         open_input_request=(
@@ -970,6 +986,7 @@ async def apply_worker_plan_outcome(
                 # not exposed by the public Version resource protocol.
                 context_snapshot=run.context_snapshot,
                 repo_revision=item.repo_revision,
+                reviewer_repo_revision=item.reviewer_repo_revision,
                 human_decision="pending",
                 created_at=item.created_at,
             )
@@ -993,6 +1010,7 @@ async def apply_worker_plan_outcome(
         version.reviewed_by_step_id = reviewed.id if reviewed is not None else None
         version.review_exhausted = item.review_exhausted
         version.reviewed_at = item.reviewed_at
+        version.reviewer_repo_revision = item.reviewer_repo_revision
         version_by_remote[item.id] = version
         if produced is not None:
             produced.plan_version_id = version.id

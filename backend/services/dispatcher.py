@@ -3406,16 +3406,24 @@ class GlobalDispatcher:
         round_number: int,
     ) -> None:
         try:
-            await self.broadcaster.broadcast(
-                "plans",
-                {
-                    "event": "plan_run_change",
-                    "plan_id": plan_id,
-                    "run_id": run_id,
-                    "status": status,
-                    "stage": stage,
-                    "round": round_number,
-                },
+            async with self.db_factory() as db:
+                plan = await db.get(Plan, plan_id)
+                target_task_id = plan.target_task_id if plan is not None else None
+            from backend.services.plan_events import broadcast_plan_event
+
+            await broadcast_plan_event(
+                event=(
+                    "plan_input_requested"
+                    if status == "waiting_user"
+                    else "plan_run_status_changed"
+                ),
+                plan_id=plan_id,
+                target_task_id=target_task_id,
+                broadcaster=self.broadcaster,
+                run_id=run_id,
+                status=status,
+                stage=stage,
+                round=round_number,
             )
         except Exception:
             logger.exception("Failed to broadcast Worker Plan Run %s", run_id)

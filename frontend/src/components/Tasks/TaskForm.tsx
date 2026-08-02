@@ -537,7 +537,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           className="hidden"
           onChange={handleFileSelect}
         />
-        <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />
+        {mode !== 'plan' && <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />}
         {fileUpload.uploads.map((upload) => (
           <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
             {upload.preview ? (

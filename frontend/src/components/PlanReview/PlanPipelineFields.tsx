@@ -30,6 +30,9 @@ export function PlanPipelineFields({
   const [roundsInput, setRoundsInput] = useState(
     String(Math.max(1, value.max_revision_cycles)),
   );
+  const [interactionsInput, setInteractionsInput] = useState(
+    String(Math.max(0, value.max_interactions ?? 3)),
+  );
 
   const updateRoute = (
     stage: StageName,
@@ -195,6 +198,28 @@ export function PlanPipelineFields({
           }}
           onBlur={() => setRoundsInput(
             String(Math.max(1, Math.min(10, value.max_revision_cycles))),
+          )}
+          className="w-16 rounded border border-gray-600 bg-gray-700 px-2 py-1 text-xs text-gray-100"
+        />
+      </label>
+      <label className="flex items-center justify-between text-[11px] text-gray-400">
+        User-input pauses per Run
+        <input
+          aria-label="Plan maximum user-input pauses"
+          type="number"
+          min={0}
+          max={5}
+          value={interactionsInput}
+          onChange={(event) => {
+            const next = event.target.value;
+            setInteractionsInput(next);
+            const parsed = Number(next);
+            if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 5) {
+              onChange({ ...value, max_interactions: parsed });
+            }
+          }}
+          onBlur={() => setInteractionsInput(
+            String(Math.max(0, Math.min(5, value.max_interactions ?? 3))),
           )}
           className="w-16 rounded border border-gray-600 bg-gray-700 px-2 py-1 text-xs text-gray-100"
         />

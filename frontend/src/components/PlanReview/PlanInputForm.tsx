@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 
-import { api, type PlanInputRequest, type PlanRun } from '../../api/client';
+import { api, isApiRequestError, type PlanInputRequest, type PlanRun } from '../../api/client';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { Loader2, Paperclip, X } from '../icons';
 
@@ -21,7 +21,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
   const inputRef = useRef<HTMLInputElement>(null);
   const uploads = useFileUpload();
   const answerIdempotencyKey = useMemo(
-    () => crypto.randomUUID(),
+    () => `${request.id}:${crypto.randomUUID()}`,
     [request.id],
   );
 
@@ -64,6 +64,9 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       await onAnswered();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : String(submitError));
+      if (isApiRequestError(submitError) && submitError.status === 409) {
+        await onAnswered();
+      }
     } finally {
       setSubmitting(false);
     }
@@ -74,6 +77,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       className={`space-y-4 ${compact ? '' : 'rounded-xl border border-amber-500/25 bg-amber-500/5 p-4'}`}
       onSubmit={(event) => { event.preventDefault(); void submit(); }}
     >
+      <fieldset disabled={submitting} className="contents">
       <div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="rounded-full bg-amber-500/15 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
@@ -151,6 +155,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         <div className="flex flex-wrap gap-2">
           {uploads.uploads.map((upload) => (
             <span key={upload.id} className="flex max-w-full items-center gap-1 rounded-lg border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-300">
+              {upload.preview && <img src={upload.preview} alt="" className="h-8 w-8 rounded object-cover" />}
               <span className="max-w-40 truncate">{upload.file.name}</span>
               {upload.status === 'uploading' && <Loader2 size={11} className="animate-spin" />}
               {upload.status === 'failed' && (
@@ -187,6 +192,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
           Submit answers
         </button>
       </div>
+      </fieldset>
     </form>
   );
 }

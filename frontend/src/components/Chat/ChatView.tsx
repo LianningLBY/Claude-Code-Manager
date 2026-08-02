@@ -3,6 +3,7 @@ import { api, isApiRequestError } from '../../api/client';
 import type {
   AskUserAnswer,
   AskUserQuestion,
+  AppliedPlanSnapshot,
   ChatMessage,
   CodexForkAnchor,
   FileAttachment,
@@ -1231,6 +1232,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const rawContent = typeof msg.data.raw_content === 'string' ? msg.data.raw_content : null;
       const imageUrls = (msg.data.image_urls as string[]) || null;
       const attachments = (msg.data.attachments as { url: string; name: string; is_image: boolean }[]) || null;
+      const appliedPlans = (msg.data.applied_plans as AppliedPlanSnapshot[]) || null;
       const persistedId = Number(msg.data.id);
       const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
       const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
@@ -1263,6 +1265,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             timestamp: eventTimestamp,
             image_urls: imageUrls?.length ? imageUrls : last.image_urls,
             attachments: attachments?.length ? attachments : last.attachments,
+            applied_plans: appliedPlans?.length ? appliedPlans : last.applied_plans,
             persisted: isPersisted || last.persisted,
           }];
         }
@@ -1272,6 +1275,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           is_error: false, loop_iteration: null,
           timestamp: eventTimestamp,
           image_urls: imageUrls, attachments: attachments, source, raw_content: rawContent,
+          applied_plans: appliedPlans,
           persisted: isPersisted,
         }];
       });
@@ -1795,6 +1799,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           : null;
         const ccU = JSON.parse(localStorage.getItem('cc_user') || '{}');
         const displayText = ccU.name ? `[${ccU.name}] ${text}` : text;
+        const optimisticAppliedPlans = planIdsForTurn
+          .map((planId) => relatedPlans.find((plan) => plan.id === planId))
+          .filter((plan): plan is Task => Boolean(plan?.plan_content))
+          .map((plan) => ({
+            id: plan.id,
+            title: plan.title || `Plan #${plan.id}`,
+            content: plan.plan_content || '',
+          }));
         setMessages(prev => [...prev, {
           id: optimisticMessageId!, role: 'user', event_type: 'user_message',
           content: displayText, tool_name: null, tool_input: null, tool_output: null,
@@ -1802,6 +1814,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           image_urls: optimisticAttachments?.filter((a) => a.is_image).map((a) => a.url) || null,
           attachments: optimisticAttachments,
           raw_content: text,
+          applied_plans: optimisticAppliedPlans.length > 0
+            ? optimisticAppliedPlans
+            : null,
         }]);
         setSending(true);
       }
@@ -1865,6 +1880,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           current.filter((id) => !planIdsForTurn.includes(id))
         );
         void refreshPlans();
+        // Replace the optimistic bubble with the durable user-message row,
+        // including the exact approved Plan snapshots used by the backend.
+        fetchHistory();
       }
       if (!fromQueue) {
         try {
@@ -3091,6 +3109,29 @@ function MessageTimestamp({ timestamp, className }: { timestamp: string | null; 
   );
 }
 
+function AppliedPlansInMessage({ plans }: { plans: AppliedPlanSnapshot[] }) {
+  return (
+    <div className="mt-2 space-y-1.5 border-t border-indigo-300/25 pt-2">
+      {plans.map((plan) => (
+        <details
+          key={plan.id}
+          className="rounded-lg border border-indigo-200/25 bg-indigo-950/25 px-2.5 py-1.5"
+        >
+          <summary className="cursor-pointer select-none text-xs font-medium text-indigo-100 marker:text-indigo-200">
+            Applied Plan #{plan.id}: {plan.title}
+          </summary>
+          <div className="mt-2 max-h-80 overflow-y-auto rounded-md bg-gray-950/45 p-2.5">
+            <MarkdownContent
+              content={plan.content}
+              className="text-xs text-indigo-50"
+            />
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
 function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center" onClick={onClose}>
@@ -3506,6 +3547,9 @@ const MessageBubble = memo(function MessageBubble({
                 </div>
               )}
               {message.content && message.content !== '(files attached)' && message.content !== '(images attached)' ? message.content : !message.attachments?.length && !message.image_urls?.length ? message.content || '' : null}
+              {message.applied_plans && message.applied_plans.length > 0 && (
+                <AppliedPlansInMessage plans={message.applied_plans} />
+              )}
             </>
           ) : (
             <MarkdownContent content={message.content || ''} />

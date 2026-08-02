@@ -317,6 +317,12 @@ export interface FileAttachment {
   is_image: boolean;
 }
 
+export interface AppliedPlanSnapshot {
+  id: number;
+  title: string;
+  content: string;
+}
+
 export interface ChatMessage {
   id: number;
   role: string;
@@ -334,6 +340,8 @@ export interface ChatMessage {
   source?: string | null;
   /** Original user text without the display-only sender prefix. */
   raw_content?: string | null;
+  /** Exact approved Plan versions prepended to this user turn. */
+  applied_plans?: AppliedPlanSnapshot[] | null;
   /** Live-only app-server item id used to merge streamed deltas into the final message. */
   stream_item_id?: string | null;
   /** Native Codex ids used to resolve a safe thread/fork boundary. */
@@ -1226,23 +1234,25 @@ export const api = {
   // Tasks
   getTask: (id: number) =>
     request<Task>(`/api/tasks/${id}`),
-  listTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, limit?: number, offset?: number, archivedOnly?: boolean, hasUnread?: boolean) =>
+  listTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, limit?: number, offset?: number, archivedOnly?: boolean, hasUnread?: boolean, taskKind?: 'standalone_plan' | 'related_plan' | 'main') =>
     request<Task[]>(`/api/tasks?${new URLSearchParams({
       ...(status ? { status } : {}),
       ...(archivedOnly ? { archived_only: 'true' } : includeArchived ? { include_archived: 'true' } : {}),
       ...(projectId != null ? { project_id: String(projectId) } : {}),
       ...(starred != null ? { starred: String(starred) } : {}),
       ...(hasUnread != null ? { has_unread: String(hasUnread) } : {}),
+      ...(taskKind ? { task_kind: taskKind } : {}),
       ...(limit != null ? { limit: String(limit) } : {}),
       ...(offset != null ? { offset: String(offset) } : {}),
     })}`),
-  countTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, archivedOnly?: boolean, hasUnread?: boolean) =>
+  countTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, archivedOnly?: boolean, hasUnread?: boolean, taskKind?: 'standalone_plan' | 'related_plan' | 'main') =>
     request<{ total: number }>(`/api/tasks/count?${new URLSearchParams({
       ...(status ? { status } : {}),
       ...(archivedOnly ? { archived_only: 'true' } : includeArchived ? { include_archived: 'true' } : {}),
       ...(projectId != null ? { project_id: String(projectId) } : {}),
       ...(starred != null ? { starred: String(starred) } : {}),
       ...(hasUnread != null ? { has_unread: String(hasUnread) } : {}),
+      ...(taskKind ? { task_kind: taskKind } : {}),
     })}`),
   starTask: (id: number) =>
     request<Task>(`/api/tasks/${id}/star`, { method: 'POST' }),

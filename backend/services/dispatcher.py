@@ -2510,6 +2510,11 @@ class GlobalDispatcher:
                         lifecycle = asyncio.create_task(
                             self._run_task_lifecycle(instance.id, task, git_env)
                         )
+                        # Task.instance_id remains as historical execution
+                        # metadata after a turn, while Instances are reusable.
+                        # Bind this lifecycle to its exact Task so a later Plan
+                        # on the same slot cannot block the old Task's chat.
+                        setattr(lifecycle, "_ccm_task_id", task.id)
                         self._running_tasks[instance.id] = lifecycle
                         lifecycle_registered = True
                     except TaskStartPausedError:
@@ -10652,9 +10657,23 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         lifecycle = self._running_tasks.get(instance_id)
         if lifecycle is not None and not lifecycle.done():
-            # Fresh lifecycle preparation precedes Instance.current_task_id/PID
-            # persistence, so Task.instance_id is its exact durable owner link.
-            return True
+            lifecycle_task_id = getattr(lifecycle, "_ccm_task_id", None)
+            if lifecycle_task_id == task_id:
+                # Fresh lifecycle preparation precedes
+                # Instance.current_task_id/PID persistence, so the explicit
+                # in-memory binding is authoritative in that launch window.
+                return True
+            if lifecycle_task_id is None:
+                # Compatibility for older embedders/tests: require the current
+                # reverse owner instead of trusting a stale Task.instance_id.
+                lifecycle_instance = await db.get(
+                    Instance, instance_id, populate_existing=True
+                )
+                if (
+                    lifecycle_instance is not None
+                    and lifecycle_instance.current_task_id == task_id
+                ):
+                    return True
 
         records = getattr(self.instance_manager, "_consumer_records", {})
         record = (

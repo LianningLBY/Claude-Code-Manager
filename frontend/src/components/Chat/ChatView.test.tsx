@@ -2122,6 +2122,39 @@ describe('independent Plan attachments', () => {
     expect(screen.queryByRole('button', { name: 'Models' })).not.toBeInTheDocument();
   });
 
+  it('shows the exact applied Plan snapshot on its persisted user message', async () => {
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([{
+      id: 901,
+      role: 'user',
+      event_type: 'user_message',
+      content: 'Implement the approved plan',
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      loop_iteration: null,
+      timestamp: '2026-08-02T08:36:21Z',
+      image_urls: null,
+      attachments: null,
+      raw_content: 'Implement the approved plan',
+      applied_plans: [{
+        id: 81,
+        title: 'Schema migration',
+        content: '# Migration\n\nUse the **safe path**.',
+      }],
+    } satisfies ChatMessage]);
+
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+
+    const applied = await screen.findByText(
+      'Applied Plan #81: Schema migration',
+    );
+    await userEvent.click(applied);
+    expect(screen.getByRole('heading', { level: 1, name: 'Migration' }))
+      .toBeInTheDocument();
+    expect(screen.getByText('safe path').tagName).toBe('STRONG');
+  });
+
   it('creates an associated Plan with uploaded files from the modal composer', async () => {
     (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
       id: 'plan-upload',

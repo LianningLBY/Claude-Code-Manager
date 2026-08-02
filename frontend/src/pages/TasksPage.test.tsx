@@ -1,4 +1,5 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TasksPage } from './TasksPage';
 import { api } from '../api/client';
@@ -53,7 +54,11 @@ vi.mock('../components/Tasks/TaskForm', () => ({
   TaskForm: () => null,
 }));
 vi.mock('../components/PlanReview/PlanPanel', () => ({
-  PlanPanel: () => null,
+  PlanPanel: ({ tasks }: { tasks: Array<{ id: number }> }) => (
+    <div data-testid="plan-panel-tasks">
+      {tasks.map((plan) => plan.id).join(',')}
+    </div>
+  ),
 }));
 vi.mock('../components/Tasks/TaskList', () => ({
   TaskList: ({
@@ -239,5 +244,52 @@ describe('TasksPage realtime reconciliation', () => {
 
     expect(await screen.findByText('7:plan_review:false')).toBeInTheDocument();
     expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
+  });
+
+  it('filters related Plans in TaskList without filtering PlanPanel', async () => {
+    const main = { ...task, id: 1, mode: 'auto' };
+    const standalone = {
+      ...task,
+      id: 2,
+      mode: 'plan',
+      plan_target_task_id: null,
+    };
+    const related = {
+      ...task,
+      id: 3,
+      mode: 'plan',
+      plan_target_task_id: 1,
+    };
+    vi.mocked(api.listTasks).mockImplementation((...args) => (
+      args[8] === 'related_plan'
+        ? Promise.resolve([related] as never)
+        : Promise.resolve([main, standalone, related] as never)
+    ));
+    vi.mocked(api.countTasks).mockResolvedValue({ total: 1 });
+
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: /Filter/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Related Plans' }));
+
+    await waitFor(() => expect(api.listTasks).toHaveBeenCalledWith(
+      undefined,
+      false,
+      undefined,
+      undefined,
+      20,
+      0,
+      false,
+      undefined,
+      'related_plan',
+    ));
+    expect(await screen.findByText('3:pending:false')).toBeInTheDocument();
+    expect(screen.queryByText('1:pending:false')).not.toBeInTheDocument();
+    expect(screen.getByTestId('plan-panel-tasks')).toHaveTextContent('1,2,3');
   });
 });

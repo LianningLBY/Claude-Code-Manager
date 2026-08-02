@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -735,6 +736,27 @@ async def test_approved_plan_is_applied_only_with_selected_user_message(
     assert plan.plan_applied_at is not None
     assert plan.plan_applied_to_session_id == session_id
     assert applied_log.content.endswith("Please implement it")
+    metadata = json.loads(applied_log.raw_json)
+    assert metadata["applied_plans"] == [{
+        "id": plan_id,
+        "title": f"Plan for #{target_id}: Target",
+        "content": "1. Change API\n2. Add tests",
+    }]
+
+    # Historical applied messages did not persist the Plan snapshot. They are
+    # reconstructed from plan_applied_log_id while the Plan row still exists.
+    async with session_factory() as db:
+        legacy_log = await db.get(LogEntry, applied_log.id)
+        legacy_log.raw_json = json.dumps({"raw_content": "Please implement it"})
+        await db.commit()
+
+    history = await client.get(f"/api/tasks/{target_id}/chat/history")
+    applied_message = next(
+        message
+        for message in history.json()
+        if message["id"] == applied_log.id
+    )
+    assert applied_message["applied_plans"] == metadata["applied_plans"]
 
     second = await client.post(
         f"/api/tasks/{target_id}/chat",

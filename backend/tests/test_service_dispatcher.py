@@ -6102,6 +6102,56 @@ async def test_queued_busy_detects_terminal_parent_consumer_and_fresh_lifecycle(
 
 
 @pytest.mark.asyncio
+async def test_queued_busy_ignores_lifecycle_that_reused_historical_instance(
+    db_factory,
+):
+    """A related Plan on the last-used slot must not block the main Task."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        main_task = Task(
+            title="main session",
+            description="d",
+            status="completed",
+            session_id="main-session",
+        )
+        plan_task = Task(
+            title="related plan",
+            description="d",
+            mode="plan",
+            status="executing",
+        )
+        db.add_all([main_task, plan_task])
+        await db.flush()
+        instance = Instance(
+            name="reused-slot",
+            status="running",
+            current_task_id=plan_task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        main_task.instance_id = instance.id
+        plan_task.instance_id = instance.id
+        await db.commit()
+        main_task_id = main_task.id
+        plan_task_id = plan_task.id
+        instance_id = instance.id
+
+    lifecycle = asyncio.create_task(asyncio.Event().wait())
+    setattr(lifecycle, "_ccm_task_id", plan_task_id)
+    d._running_tasks[instance_id] = lifecycle
+    try:
+        async with db_factory() as db:
+            assert not await d._queued_task_has_live_generation(
+                db, main_task_id
+            )
+            assert await d._queued_task_has_live_generation(db, plan_task_id)
+    finally:
+        lifecycle.cancel()
+        await asyncio.gather(lifecycle, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_queued_busy_detects_detached_pty_background_epoch(
     db_factory,
 ):

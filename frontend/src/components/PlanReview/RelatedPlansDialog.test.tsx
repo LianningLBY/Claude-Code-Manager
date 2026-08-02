@@ -107,6 +107,51 @@ describe('RelatedPlansDialog', () => {
     expect(screen.queryByText('# Implementation heading')).not.toBeInTheDocument();
   });
 
+  it('collapses a long Planning request to 200px and toggles it', async () => {
+    const height = vi.spyOn(
+      HTMLElement.prototype,
+      'scrollHeight',
+      'get',
+    ).mockReturnValue(320);
+    try {
+      renderDialog({
+        plans: [{
+          ...readyPlan(),
+          description: 'A long planning request\n'.repeat(30),
+        }],
+      });
+
+      const showMore = screen.getByRole('button', { name: 'Show more' });
+      expect(showMore).toHaveAttribute('aria-expanded', 'false');
+      expect(document.getElementById(
+        showMore.getAttribute('aria-controls') || '',
+      )).toHaveClass('max-h-[200px]', 'overflow-hidden');
+
+      await userEvent.click(showMore);
+      expect(screen.getByRole('button', { name: 'Show less' }))
+        .toHaveAttribute('aria-expanded', 'true');
+    } finally {
+      height.mockRestore();
+    }
+  });
+
+  it('shows an applied Plan as Applied and does not offer re-attachment', () => {
+    renderDialog({
+      plans: [{
+        ...readyPlan(),
+        status: 'completed',
+        plan_approved: true,
+        plan_applied_at: '2026-08-02T08:36:21Z',
+      }],
+    });
+
+    expect(screen.getAllByText('Applied').length).toBeGreaterThan(0);
+    expect(screen.getByText('Applied to a user message.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', {
+      name: 'Attach to next message',
+    })).not.toBeInTheDocument();
+  });
+
   it('offers deletion from the selected Plan detail', async () => {
     const { onDelete } = renderDialog();
 

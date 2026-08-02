@@ -2,7 +2,7 @@ import errno
 import os
 from datetime import datetime
 
-from sqlalchemy import Float, case, delete as sa_delete, func, select, update
+from sqlalchemy import Float, and_, case, delete as sa_delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
@@ -24,6 +24,19 @@ PLAN_DELETABLE_TASK_STATUSES = BASE_DELETABLE_TASK_STATUSES | {
     "plan_review",
     "superseded",
 }
+TASK_KIND_STANDALONE_PLAN = "standalone_plan"
+TASK_KIND_RELATED_PLAN = "related_plan"
+TASK_KIND_MAIN = "main"
+
+
+def _task_kind_predicate(task_kind: str):
+    if task_kind == TASK_KIND_STANDALONE_PLAN:
+        return and_(Task.mode == "plan", Task.plan_target_task_id.is_(None))
+    if task_kind == TASK_KIND_RELATED_PLAN:
+        return and_(Task.mode == "plan", Task.plan_target_task_id.is_not(None))
+    if task_kind == TASK_KIND_MAIN:
+        return Task.mode != "plan"
+    raise ValueError(f"Unsupported task kind: {task_kind}")
 
 
 def is_task_status_deletable(*, mode: str, status: str) -> bool:
@@ -239,6 +252,7 @@ class TaskQueue:
         archived_only: bool = False,
         project_id: int | None = None, starred: bool | None = None,
         has_unread: bool | None = None,
+        task_kind: str | None = None,
         limit: int = 50, offset: int = 0,
         user_id: int | None = None,
     ) -> list[Task]:
@@ -258,6 +272,8 @@ class TaskQueue:
             stmt = stmt.where(Task.starred == starred)
         if has_unread is not None:
             stmt = stmt.where(Task.has_unread == has_unread)
+        if task_kind is not None:
+            stmt = stmt.where(_task_kind_predicate(task_kind))
         # Team CCM: member sees tasks on own Workers, created by them, or shared to them
         if user_id is not None:
             from backend.models.worker import Worker
@@ -288,6 +304,7 @@ class TaskQueue:
         archived_only: bool = False,
         project_id: int | None = None, starred: bool | None = None,
         has_unread: bool | None = None,
+        task_kind: str | None = None,
         user_id: int | None = None,
     ) -> int:
         stmt = select(func.count(Task.id)).where(Task.shared_from_id.is_(None))
@@ -304,6 +321,8 @@ class TaskQueue:
             stmt = stmt.where(Task.starred == starred)
         if has_unread is not None:
             stmt = stmt.where(Task.has_unread == has_unread)
+        if task_kind is not None:
+            stmt = stmt.where(_task_kind_predicate(task_kind))
         if user_id is not None:
             from backend.models.worker import Worker
             from backend.models.team_share import TeamTaskShare, TeamProjectShare

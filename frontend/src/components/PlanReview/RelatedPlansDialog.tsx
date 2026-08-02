@@ -4,6 +4,7 @@ import type { Task, UploadResult } from '../../api/client';
 import { resolveAssetUrl } from '../../config/server';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { MarkdownContent } from '../MarkdownContent';
+import { CollapsiblePlanningRequest } from './CollapsiblePlanningRequest';
 import {
   AlertCircle,
   Check,
@@ -493,9 +494,10 @@ export function RelatedPlansDialog({
                   </div>
                 )}
                 {selectedPlan.description && (
-                  <div className="mb-3 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2">
-                    <div className="text-[10px] font-medium uppercase tracking-wide text-gray-600">Planning request</div>
-                    <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-gray-400">{selectedPlan.description}</p>
+                  <CollapsiblePlanningRequest
+                    key={selectedPlan.id}
+                    content={selectedPlan.description}
+                  >
                     {selectedPlan.metadata_?.attachments
                       && selectedPlan.metadata_.attachments.length > 0 && (
                       <div className="mt-2 flex flex-wrap gap-1.5">
@@ -513,7 +515,7 @@ export function RelatedPlansDialog({
                         ))}
                       </div>
                     )}
-                  </div>
+                  </CollapsiblePlanningRequest>
                 )}
                 <div className="min-h-48 rounded-xl border border-gray-800 bg-gray-950/55 p-4">
                   {RUNNING_STATUSES.has(selectedPlan.status) && !selectedPlan.plan_content ? (

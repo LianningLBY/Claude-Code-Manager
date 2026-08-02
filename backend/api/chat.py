@@ -606,6 +606,12 @@ async def send_chat_message(
             "is_image": ext in _IMAGE_EXTS,
         })
 
+    applied_plan_data: list[dict[str, object]] = []
+    if approved_plans:
+        from backend.services.plan_tasks import applied_plan_snapshots
+
+        applied_plan_data = applied_plan_snapshots(approved_plans)
+
     # Store user message as a log entry (use instance_id=1 as placeholder)
     log_metadata: dict = {"raw_content": model_message}
     if attachments:
@@ -615,6 +621,11 @@ async def send_chat_message(
         # Model-facing history rebuilds must use this exact original text,
         # never guess by regex (the user's real message may start with [BUG]).
         log_metadata["sender_name"] = sender_display_name
+    if applied_plan_data:
+        # Persist the exact approved version that was prepended to this turn.
+        # The Plan row may later be revised or deleted, but chat history must
+        # still explain what context the model actually received.
+        log_metadata["applied_plans"] = applied_plan_data
     user_log = LogEntry(
         instance_id=1,
         task_id=task_id,
@@ -665,6 +676,7 @@ async def send_chat_message(
         "raw_content": model_message,
         "image_urls": image_urls,
         "attachments": attachments,
+        "applied_plans": applied_plan_data,
     }
     if sender_display_name:
         broadcast_data["sender_name"] = sender_display_name
@@ -703,6 +715,8 @@ async def send_chat_message(
                             plan_applied_log_id=None,
                         )
                     )
+                log_metadata.pop("applied_plans", None)
+                user_log.raw_json = json.dumps(log_metadata)
                 await db.commit()
         raise HTTPException(
             status_code=409,
@@ -1274,9 +1288,11 @@ async def _send_worker_chat(
         )
         if isinstance(applied_plan_ids, list):
             applied_at = datetime.utcnow()
+            normalized_applied_ids: list[int] = []
             for plan_id in applied_plan_ids:
                 if isinstance(plan_id, bool) or not isinstance(plan_id, int):
                     continue
+                normalized_applied_ids.append(plan_id)
                 local_applied = await db.execute(
                     sa_update(Task)
                     .where(
@@ -1300,6 +1316,23 @@ async def _send_worker_chat(
                         "not claim its local application row",
                         plan_id,
                     )
+            if normalized_applied_ids:
+                from backend.services.plan_tasks import applied_plan_snapshots
+
+                rows = await db.execute(
+                    select(Task).where(Task.id.in_(normalized_applied_ids))
+                )
+                plans_by_id = {plan.id: plan for plan in rows.scalars().all()}
+                snapshot_plans = [
+                    plans_by_id[plan_id]
+                    for plan_id in normalized_applied_ids
+                    if plan_id in plans_by_id
+                ]
+                manager_metadata = _raw_log_metadata(manager_user_log)
+                manager_metadata["applied_plans"] = applied_plan_snapshots(
+                    snapshot_plans
+                )
+                manager_user_log.raw_json = json.dumps(manager_metadata)
         await db.commit()
 
         if isinstance(result, dict):
@@ -1430,6 +1463,33 @@ async def get_chat_history(
 
     _TRUNCATE = 20_000  # chars; tool outputs can be huge (file reads, bash output)
 
+    # Older application rows predate message-level Plan snapshots. Reconstruct
+    # them while the Plan still exists so already-applied production history is
+    # upgraded on read; new rows keep an immutable copy in raw_json and remain
+    # explainable even if the Plan is later deleted.
+    historical_applied_plans: dict[int, list[dict[str, object]]] = {}
+    history_log_ids = [
+        row.id for row in rows if row.event_type == "user_message"
+    ]
+    if history_log_ids:
+        from backend.services.plan_tasks import applied_plan_snapshots
+
+        historical_rows = await db.execute(
+            select(Task)
+            .where(
+                Task.mode == "plan",
+                Task.plan_applied_log_id.in_(history_log_ids),
+            )
+            .order_by(Task.id.asc())
+        )
+        for historical_plan in historical_rows.scalars().all():
+            log_id = historical_plan.plan_applied_log_id
+            if log_id is None:
+                continue
+            historical_applied_plans.setdefault(log_id, []).extend(
+                applied_plan_snapshots([historical_plan])
+            )
+
     messages = []
     current_source = None  # track monitor context
     for row in rows:
@@ -1456,6 +1516,7 @@ async def get_chat_history(
         image_urls = None
         source = None
         raw_content = None
+        applied_plans = None
         item_id = None
         turn_id = None
         native_item_type = None
@@ -1499,8 +1560,12 @@ async def get_chat_history(
                         source = raw["source"]
                     if isinstance(raw.get("raw_content"), str):
                         raw_content = raw["raw_content"]
+                    if isinstance(raw.get("applied_plans"), list):
+                        applied_plans = raw["applied_plans"]
             except (json.JSONDecodeError, TypeError):
                 pass
+        if applied_plans is None:
+            applied_plans = historical_applied_plans.get(row.id)
 
         if row.event_type in ("user_message", "system_event") and source:
             current_source = source
@@ -1529,6 +1594,7 @@ async def get_chat_history(
             "attachments": attachments,
             "source": msg_source,
             "raw_content": raw_content,
+            "applied_plans": applied_plans,
             "item_id": item_id,
             "turn_id": turn_id,
             "native_item_type": native_item_type,

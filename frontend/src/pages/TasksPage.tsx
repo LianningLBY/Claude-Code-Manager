@@ -18,6 +18,18 @@ import { TeamShareModal } from '../components/TeamShareModal';
 import { getTaskStatusLabel } from '../components/Tasks/taskStatus';
 
 const PAGE_SIZE = 20;
+type TaskKindFilter = 'main' | 'standalone_plan' | 'related_plan';
+
+function matchesTaskKind(task: Task, taskKind?: TaskKindFilter): boolean {
+  if (!taskKind) return true;
+  if (taskKind === 'standalone_plan') {
+    return task.mode === 'plan' && task.plan_target_task_id == null;
+  }
+  if (taskKind === 'related_plan') {
+    return task.mode === 'plan' && task.plan_target_task_id != null;
+  }
+  return task.mode !== 'plan';
+}
 
 interface TasksPageProps {
   chatTaskId: number | null;
@@ -35,6 +47,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const [projectFilter, setProjectFilter] = useState<number | undefined>(undefined);
   const [starredFilter, setStarredFilter] = useState(false);
   const [unreadFilter, setUnreadFilter] = useState(false);
+  const [taskKindFilter, setTaskKindFilter] = useState<TaskKindFilter | undefined>();
   const [showArchived, setShowArchived] = useState(false);
   // Regex search over task titles (falls back to plain substring on invalid regex)
   const [showSearch, setShowSearch] = useState(false);
@@ -218,8 +231,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     try {
       const offset = (page - 1) * PAGE_SIZE;
       const [filtered, count, all, projs, tags] = await Promise.all([
-        api.listTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, PAGE_SIZE, offset, showArchived, unreadFilter || undefined),
-        api.countTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, showArchived, unreadFilter || undefined),
+        api.listTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, PAGE_SIZE, offset, showArchived, unreadFilter || undefined, taskKindFilter),
+        api.countTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, showArchived, unreadFilter || undefined, taskKindFilter),
         api.listTasks(undefined, false, undefined, undefined, PAGE_SIZE, 0, showArchived),
         api.listProjects(),
         api.listTags(),
@@ -267,7 +280,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     } catch (e) {
       console.error('Failed to load tasks:', e);
     }
-  }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter, page, setChatTaskWrapped]);
+  }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter, taskKindFilter, page, setChatTaskWrapped]);
 
   refreshRef.current = refresh;
 
@@ -278,15 +291,15 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   }, [refresh]);
 
   // Reset to page 1 when filters change
-  const prevFilter = useRef({ statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter });
+  const prevFilter = useRef({ statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter, taskKindFilter });
   useEffect(() => {
     const prev = prevFilter.current;
-    if (prev.statusFilterParam !== statusFilterParam || prev.showArchived !== showArchived || prev.projectFilter !== projectFilter || prev.starredFilter !== starredFilter || prev.unreadFilter !== unreadFilter) {
+    if (prev.statusFilterParam !== statusFilterParam || prev.showArchived !== showArchived || prev.projectFilter !== projectFilter || prev.starredFilter !== starredFilter || prev.unreadFilter !== unreadFilter || prev.taskKindFilter !== taskKindFilter) {
       setPage(1);
       skipFreezeOnce.current = true;
-      prevFilter.current = { statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter };
+      prevFilter.current = { statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter, taskKindFilter };
     }
-  }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter]);
+  }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter, taskKindFilter]);
 
   const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'superseded', 'failed'];
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
@@ -323,7 +336,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     failed: 'bg-red-500',
   };
 
-  const activeFilterCount = statusFilters.length + (starredFilter ? 1 : 0) + (unreadFilter ? 1 : 0) + (showArchived ? 1 : 0) + tagFilters.length;
+  const activeFilterCount = statusFilters.length + (starredFilter ? 1 : 0) + (unreadFilter ? 1 : 0) + (showArchived ? 1 : 0) + (taskKindFilter ? 1 : 0) + tagFilters.length;
 
   const visibleProjects = projects.filter((p) => p.show_in_selector);
 
@@ -348,9 +361,12 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         return proj ? tagFilters.some((tag) => proj.tags.includes(tag)) : false;
       })
     : tasks;
+  const filteredSearchResults = searchResults?.filter((task) =>
+    matchesTaskKind(task, taskKindFilter)
+  ) ?? null;
 
   // 侧边栏拖拽排序（与主列表同一套逻辑）
-  const sidebarTasks = searchResults ?? filteredTasks;
+  const sidebarTasks = filteredSearchResults ?? filteredTasks;
   const reorderRefresh = useCallback((optimistic?: Task[]) => {
     if (optimistic) {
       setTasks((current) => mergeVisibleTaskOrder(current, optimistic));
@@ -409,6 +425,31 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     </span>
                     <span className={`w-2 h-2 rounded-full ${statusDotColors[f] || ''}`} />
                     {statusLabels[f]}
+                  </button>
+                );
+              })}
+
+              <div className="border-t border-gray-700 my-1" />
+
+              <div className="px-3 py-1 text-[10px] text-gray-500 uppercase tracking-wider">Task type</div>
+              {([
+                ['main', 'Normal tasks'],
+                ['standalone_plan', 'Standalone Plans'],
+                ['related_plan', 'Related Plans'],
+              ] as const).map(([value, label]) => {
+                const checked = taskKindFilter === value;
+                return (
+                  <button
+                    key={value}
+                    onClick={() => setTaskKindFilter(checked ? undefined : value)}
+                    className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left transition-colors ${
+                      checked ? 'bg-indigo-600/20 text-indigo-300' : 'text-gray-300 hover:bg-gray-800'
+                    }`}
+                  >
+                    <span className={`w-3 h-3 rounded-full border flex items-center justify-center ${checked ? 'border-indigo-400' : 'border-gray-600'}`}>
+                      {checked && <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />}
+                    </span>
+                    {label}
                   </button>
                 );
               })}
@@ -492,7 +533,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                 <>
                   <div className="border-t border-gray-700 my-1" />
                   <button
-                    onClick={() => { setStatusFilters([]); setStarredFilter(false); setUnreadFilter(false); setShowArchived(false); setTagFilters([]); }}
+                    onClick={() => { setStatusFilters([]); setStarredFilter(false); setUnreadFilter(false); setShowArchived(false); setTaskKindFilter(undefined); setTagFilters([]); }}
                     className="w-full px-3 py-1.5 text-xs text-red-400 hover:bg-gray-800 text-left"
                   >
                     Clear all filters
@@ -548,8 +589,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
             )}
           </div>
         )}
-        {searchResults !== null && (
-          <span className="text-xs text-gray-500 whitespace-nowrap">{searchResults.length} match{searchResults.length === 1 ? '' : 'es'}</span>
+        {filteredSearchResults !== null && (
+          <span className="text-xs text-gray-500 whitespace-nowrap">{filteredSearchResults.length} match{filteredSearchResults.length === 1 ? '' : 'es'}</span>
         )}
       </div>
   );
@@ -563,7 +604,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       {filterControls}
 
       <TaskList
-        tasks={searchResults ?? filteredTasks}
+        tasks={filteredSearchResults ?? filteredTasks}
         projects={projects}
         onRefresh={refresh}
         onOpenChat={handleOpenChat}

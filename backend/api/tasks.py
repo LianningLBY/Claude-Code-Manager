@@ -6,6 +6,7 @@ import uuid
 from contextlib import AsyncExitStack
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select, update as sa_update
@@ -433,6 +434,7 @@ async def count_tasks(
     project_id: int | None = None,
     starred: bool | None = None,
     has_unread: bool | None = None,
+    task_kind: Literal["standalone_plan", "related_plan", "main"] | None = None,
     queue: TaskQueue = Depends(_get_queue),
 ):
     user_id = get_current_user_id(request)
@@ -442,6 +444,7 @@ async def count_tasks(
         archived_only=archived_only,
         project_id=project_id, starred=starred,
         has_unread=has_unread,
+        task_kind=task_kind,
         user_id=user_id if user_role not in ("admin", "super_admin") else None,
     )
     return {"total": total}
@@ -456,6 +459,7 @@ async def list_tasks(
     project_id: int | None = None,
     starred: bool | None = None,
     has_unread: bool | None = None,
+    task_kind: Literal["standalone_plan", "related_plan", "main"] | None = None,
     limit: int = 50,
     offset: int = 0,
     queue: TaskQueue = Depends(_get_queue),
@@ -467,6 +471,7 @@ async def list_tasks(
         archived_only=archived_only,
         project_id=project_id, starred=starred,
         has_unread=has_unread,
+        task_kind=task_kind,
         limit=limit, offset=offset,
         user_id=user_id if user_role not in ("admin", "super_admin") else None,
     )

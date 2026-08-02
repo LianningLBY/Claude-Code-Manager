@@ -3,6 +3,9 @@ import type { Task } from '../../api/client';
 const ACTIVE_STATUSES = new Set(['pending', 'in_progress', 'executing']);
 
 export function getPlanStatusMeta(task: Task) {
+  if (task.plan_applied_at) {
+    return { label: 'Applied', className: 'bg-teal-500/15 text-teal-300' };
+  }
   if (task.status === 'plan_review') {
     return { label: 'Ready · decision needed', className: 'bg-indigo-600 text-white' };
   }

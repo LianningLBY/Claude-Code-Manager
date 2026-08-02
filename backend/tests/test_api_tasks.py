@@ -1070,6 +1070,53 @@ async def test_list_tasks_filter_status(client):
 
 
 @pytest.mark.asyncio
+async def test_list_and_count_tasks_filter_by_task_kind(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        main = Task(title="Main", description="d", mode="auto")
+        standalone = Task(
+            title="Standalone Plan",
+            description="d",
+            mode="plan",
+        )
+        db.add_all([main, standalone])
+        await db.flush()
+        related = Task(
+            title="Related Plan",
+            description="d",
+            mode="plan",
+            plan_target_task_id=main.id,
+        )
+        db.add(related)
+        await db.commit()
+
+    expected = {
+        "main": "Main",
+        "standalone_plan": "Standalone Plan",
+        "related_plan": "Related Plan",
+    }
+    for task_kind, title in expected.items():
+        response = await client.get(
+            f"/api/tasks?task_kind={task_kind}"
+        )
+        assert response.status_code == 200
+        assert [task["title"] for task in response.json()] == [title]
+
+        count = await client.get(
+            f"/api/tasks/count?task_kind={task_kind}"
+        )
+        assert count.status_code == 200
+        assert count.json() == {"total": 1}
+
+    invalid = await client.get("/api/tasks?task_kind=unknown")
+    assert invalid.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_pagination(client):
     """GET /api/tasks?limit=1&offset=1 returns second task."""
     await client.post("/api/tasks", json={

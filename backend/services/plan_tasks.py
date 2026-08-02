@@ -349,6 +349,19 @@ async def approved_plans_for_message(
     return plans
 
 
+def applied_plan_snapshots(plans: list[Task]) -> list[dict[str, object]]:
+    """Freeze the exact approved Plan content used by one user message."""
+
+    return [
+        {
+            "id": plan.id,
+            "title": plan.title or f"Plan #{plan.id}",
+            "content": plan.plan_content or "",
+        }
+        for plan in plans
+    ]
+
+
 def build_approved_plan_prompt(plans: list[Task], user_prompt: str) -> str:
     if not plans:
         return user_prompt

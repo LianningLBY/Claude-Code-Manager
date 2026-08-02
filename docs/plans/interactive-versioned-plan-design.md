@@ -153,7 +153,8 @@ PlanVersion，不能依赖 step 日志恢复。
 
 ### 2.6 PlanInputRequest
 
-一个持久化的阻塞式用户输入请求，可包含 1–3 个问题。它绑定 exact Run 和来源 Step，保存：
+一个持久化的阻塞式用户输入请求，包含当前阶段已知的全部必要问题。每个请求至少一个问题，
+但不设置问题数量的业务上限；它绑定 exact Run 和来源 Step，保存：
 
 - `requested_by=planner|reviewer`；
 - 问题 schema、请求原因；
@@ -368,10 +369,12 @@ Reviewer verdict：
 
 ### 5.3 问题约束
 
-- 每次 1–3 个问题；
+- 每次至少一个问题，不限制问题数量；Planner/Reviewer 应在一次请求中合并当前已经知道的
+  全部必要问题，不能为了规避数量而拆成多轮；
 - `response_type=text|single_choice|multi_choice`；
 - choice 数量 2–5，value 在同一问题内唯一；
 - header 最长 20、question 最长 2,000、reason 最长 4,000；
+- 仅使用结构化输出总大小、单字段长度和现有模型输出上限保护传输/存储，不以问题条数拒绝；
 - 每个 Run 默认最多 3 次用户交互，可在全局 Pipeline 设置中配置 0–5；
 - 达到上限仍请求输入时 Run 失败并保留最新 Version，不伪装成 reviewable；
 - prompt 明确禁止询问能从 repo 获取的信息、无关偏好、secret 或扩大任务权限的问题。
@@ -766,6 +769,7 @@ WebSocket 当权威状态。
 
 - Plans modal 和首页增加独立 `Needs your input` 分组/徽标；
 - InputRequest 使用专用表单渲染 text/single/multi choice；
+- 表单按响应中的完整 questions 数组渲染，不截断、不分页丢题，也不因问题数量拒绝提交；
 - 支持附件上传、预览、失败重试、移除；
 - 提交中冻结输入，成功后清空草稿；409 时保留草稿并刷新状态；
 - 刷新页面后从 API 恢复 open questions；
@@ -958,7 +962,8 @@ thread、Instance owner 或部署 blocker。
 - answer CAS、idempotency、错误 schema、重复/竞态回答；
 - terminal Run 不可复活；cancel 保留旧 Version；
 - derived display_state 全组合；
-- interaction/revision 上限边界值。
+- 单次 1 个、4 个及更多问题均可通过，且只受整体 payload/字段大小保护；
+- interaction/revision 轮数上限边界值；轮数限制不得被误实现为单轮问题数量限制。
 
 ### 19.2 API/ACL 测试
 

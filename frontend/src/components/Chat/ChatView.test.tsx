@@ -2212,6 +2212,30 @@ describe('independent Plan attachments', () => {
     expect(screen.queryByRole('button', { name: 'Models' })).not.toBeInTheDocument();
   });
 
+  it('highlights the selected Plan in the modal list', async () => {
+    const selectedPlan = makePlan({ id: 80, title: 'Selected Plan' });
+    const otherPlan = makePlan({ id: 81, title: 'Other Plan' });
+    (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([
+      selectedPlan,
+      otherPlan,
+    ]);
+
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+
+    const selectedButton = await screen.findByRole('button', {
+      name: /#80 Selected Plan/,
+    });
+    const otherButton = screen.getByRole('button', { name: /#81 Other Plan/ });
+    expect(selectedButton).not.toHaveAttribute('aria-current');
+
+    await userEvent.click(selectedButton);
+
+    expect(selectedButton).toHaveAttribute('aria-current', 'true');
+    expect(selectedButton).toHaveClass('border-indigo-500/70', 'bg-indigo-500/15');
+    expect(otherButton).not.toHaveAttribute('aria-current');
+  });
+
   it('shows the exact applied Plan snapshot on its persisted user message', async () => {
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([{
       id: 901,

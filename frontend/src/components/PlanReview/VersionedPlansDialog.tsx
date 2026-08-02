@@ -65,7 +65,35 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
         </div>
         <div className="flex gap-1 overflow-x-auto border-b border-gray-800 px-3 py-2">{filters.map((item) => <button key={item.id} type="button" onClick={() => setFilter(item.id)} className={`rounded-full px-2 py-1 text-[10px] ${filter === item.id ? 'bg-indigo-500/20 text-indigo-300' : 'text-gray-500 hover:bg-gray-800'}`}>{item.label} {plans.filter((plan) => filterPlan(plan, item.id)).length}</button>)}</div>
         {error && <div className="m-3 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-300">{error}</div>}
-        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">{loading && <div className="flex justify-center p-6"><Loader2 className="animate-spin text-gray-500" /></div>}{filtered.map((plan) => <button key={plan.id} type="button" onClick={() => setSelectedId(plan.id)} className="w-full rounded-xl border border-gray-700 bg-gray-800/60 p-3 text-left hover:border-gray-600"><div className="flex items-start gap-2"><div className="min-w-0 flex-1"><div className="flex flex-wrap gap-1"><span className="rounded-full bg-gray-700 px-2 py-0.5 text-[10px] text-gray-300">{planDisplayStateLabel(plan.display_state)}</span>{plan.current_version && <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[10px] text-indigo-300">v{plan.current_version.version_number}</span>}{plan.current_version && selectedVersionIds.includes(plan.current_version.id) && <span className="rounded-full bg-teal-500/15 px-2 py-0.5 text-[10px] text-teal-300">Attached</span>}</div><div className="mt-2 truncate text-sm font-medium text-gray-100">#{plan.id} {plan.title}</div><div className="mt-1 line-clamp-2 text-[11px] leading-4 text-gray-500">{plan.initial_request}</div></div><ChevronRight size={14} className="mt-1 text-gray-600" /></div></button>)}</div>
+        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+          {loading && <div className="flex justify-center p-6"><Loader2 className="animate-spin text-gray-500" /></div>}
+          {filtered.map((plan) => {
+            const isSelected = plan.id === selectedId;
+            return <button
+              key={plan.id}
+              type="button"
+              onClick={() => setSelectedId(plan.id)}
+              aria-current={isSelected ? 'true' : undefined}
+              className={`w-full rounded-xl border p-3 text-left transition-colors ${isSelected
+                ? 'border-indigo-500/70 bg-indigo-500/15 ring-1 ring-inset ring-indigo-400/30'
+                : 'border-gray-700 bg-gray-800/60 hover:border-gray-600 hover:bg-gray-800'
+              }`}
+            >
+              <div className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap gap-1">
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] ${isSelected ? 'bg-indigo-400/20 text-indigo-200' : 'bg-gray-700 text-gray-300'}`}>{planDisplayStateLabel(plan.display_state)}</span>
+                    {plan.current_version && <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[10px] text-indigo-300">v{plan.current_version.version_number}</span>}
+                    {plan.current_version && selectedVersionIds.includes(plan.current_version.id) && <span className="rounded-full bg-teal-500/15 px-2 py-0.5 text-[10px] text-teal-300">Attached</span>}
+                  </div>
+                  <div className="mt-2 truncate text-sm font-medium text-gray-100">#{plan.id} {plan.title}</div>
+                  <div className={`mt-1 line-clamp-2 text-[11px] leading-4 ${isSelected ? 'text-gray-300' : 'text-gray-500'}`}>{plan.initial_request}</div>
+                </div>
+                <ChevronRight size={14} className={`mt-1 ${isSelected ? 'text-indigo-300' : 'text-gray-600'}`} />
+              </div>
+            </button>;
+          })}
+        </div>
       </section>
       <section className={`${selected ? 'flex' : 'hidden'} min-w-0 flex-1 flex-col sm:flex`}>{selected ? <><button type="button" onClick={() => setSelectedId(null)} className="absolute left-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 sm:hidden" aria-label="Back to Plans"><ChevronLeft size={16} /></button><PlanDetail plan={selected} onRefresh={refresh} onClose={onClose} selectedVersionIds={selectedVersionIds} onToggleVersion={onToggleVersion} /></> : <div className="m-auto text-sm text-gray-500">Select or create a Plan</div>}</section>
     </div>

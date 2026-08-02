@@ -5,11 +5,9 @@ Ensures:
 2. A fresh database can be created from scratch via migrations.
 3. The final migrated schema matches the ORM models (no drift).
 """
-import re
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -26,6 +24,7 @@ import backend.models.worktree  # noqa: F401
 import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
+import backend.models.plan  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -410,7 +409,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_legacy_task_links"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -529,6 +528,123 @@ class TestAlreadyMigratedDb:
         engine.dispose()
 
 
+class TestVersionedPlanBackfill:
+    def test_legacy_revision_chain_becomes_one_plan_with_versions(self, tmp_path):
+        db_path = str(tmp_path / "legacy_plans.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            required = """
+                id, title, description, status, priority, target_branch,
+                merge_status, retry_count, max_retries, mode, created_at
+            """
+            conn.execute(text(f"""
+                INSERT INTO tasks ({required}) VALUES
+                (1, 'Target', 'Implement feature', 'completed', 0, 'main',
+                 'pending', 0, 2, 'auto', '2026-08-01 09:00:00')
+            """))
+            conn.execute(text(f"""
+                INSERT INTO tasks (
+                    {required}, plan_target_task_id, plan_context_session_id,
+                    plan_context_log_id, plan_context_snapshot,
+                    plan_repo_revision, supersedes_plan_task_id, plan_content,
+                    plan_approved, plan_approved_at, plan_approved_by,
+                    plan_applied_at, plan_applied_to_session_id,
+                    plan_applied_log_id, plan_pipeline_config, completed_at
+                ) VALUES
+                (2, 'Plan root', 'Design it', 'completed', 1, 'main',
+                 'pending', 0, 2, 'plan', '2026-08-01 10:00:00',
+                 1, 'session-1', 10, 'bounded context',
+                 '{{"commit": "abc"}}', NULL, '# Version 1', 1,
+                 '2026-08-01 10:30:00', 7, '2026-08-01 11:00:00',
+                 'session-1', 11, '{{"planner": {{"provider": "claude"}}}}',
+                 '2026-08-01 10:30:00'),
+                (3, 'Plan revision', 'Add rollback', 'completed', 1, 'main',
+                 'pending', 0, 2, 'plan', '2026-08-01 12:00:00',
+                 1, 'session-1', 12, 'new bounded context',
+                 '{{"commit": "def"}}', 2, '# Version 2', NULL,
+                 NULL, NULL, NULL, NULL, NULL,
+                 '{{"planner": {{"provider": "claude"}}}}',
+                 '2026-08-01 12:30:00')
+            """))
+            run_id = conn.execute(text("""
+                INSERT INTO plan_agent_runs (
+                    plan_task_id, status, round, review_exhausted,
+                    created_at, updated_at
+                ) VALUES (
+                    3, 'completed', 1, 0,
+                    '2026-08-01 12:00:00', '2026-08-01 12:30:00'
+                ) RETURNING id
+            """)).scalar_one()
+            conn.execute(text("""
+                INSERT INTO plan_agent_steps (
+                    run_id, step_type, round, provider, status, started_at
+                ) VALUES (
+                    :run_id, 'planner', 1, 'claude', 'completed',
+                    '2026-08-01 12:00:00'
+                )
+            """), {"run_id": run_id})
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            plan = conn.execute(text("""
+                SELECT id, title, current_version_id, pipeline_config
+                FROM plans
+            """)).mappings().one()
+            assert plan["title"] == "Plan root"
+            assert plan["pipeline_config"] == '{"planner": {"provider": "claude"}}'
+
+            versions = conn.execute(text("""
+                SELECT id, version_number, parent_version_id,
+                       superseded_by_version_id, content, repo_revision
+                FROM plan_versions ORDER BY version_number
+            """)).mappings().all()
+            assert [row["content"] for row in versions] == ["# Version 1", "# Version 2"]
+            assert versions[1]["parent_version_id"] == versions[0]["id"]
+            assert versions[0]["superseded_by_version_id"] == versions[1]["id"]
+            assert plan["current_version_id"] == versions[1]["id"]
+            assert versions[0]["repo_revision"] == '{"commit": "abc"}'
+
+            links = conn.execute(text("""
+                SELECT legacy_task_id, plan_id, plan_version_id
+                FROM plan_legacy_task_links ORDER BY legacy_task_id
+            """)).mappings().all()
+            assert [row["legacy_task_id"] for row in links] == [2, 3]
+            assert {row["plan_id"] for row in links} == {plan["id"]}
+            assert [row["plan_version_id"] for row in links] == [
+                versions[0]["id"], versions[1]["id"]
+            ]
+
+            application = conn.execute(text("""
+                SELECT plan_version_id, application_type, target_task_id,
+                       target_session_id, user_log_id
+                FROM plan_applications
+            """)).mappings().one()
+            assert dict(application) == {
+                "plan_version_id": versions[0]["id"],
+                "application_type": "chat_message",
+                "target_task_id": 1,
+                "target_session_id": "session-1",
+                "user_log_id": 11,
+            }
+
+            mapped_run = conn.execute(text("""
+                SELECT plan_id, result_version_id FROM plan_agent_runs
+                WHERE id=:run_id
+            """), {"run_id": run_id}).mappings().one()
+            assert mapped_run["plan_id"] == plan["id"]
+            assert mapped_run["result_version_id"] == versions[1]["id"]
+            assert conn.execute(text("""
+                SELECT plan_id FROM plan_agent_steps WHERE run_id=:run_id
+            """), {"run_id": run_id}).scalar_one() == plan["id"]
+        engine.dispose()
+
+
 class TestSchemaConsistency:
     """The schema produced by Alembic migrations matches the ORM models.
 
@@ -601,7 +717,7 @@ class TestSchemaConsistency:
             ]
 
             assert len(significant_diffs) == 0, (
-                f"Alembic autogenerate found pending changes (need a new migration!):\n"
+                "Alembic autogenerate found pending changes (need a new migration!):\n"
                 + "\n".join(str(d) for d in significant_diffs)
             )
 

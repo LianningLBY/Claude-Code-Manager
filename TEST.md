@@ -154,7 +154,11 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_plan_reject_not_found` | 不存在的 task reject 返回 404 |
 | `test_codex_fast_rejects_unsupported_chat_model_before_logging` | Fast Task 的一次性模型覆盖若不支持 `priority`，在消息落库和执行前拒绝 |
 
-#### `test_plan_tasks.py` / `test_plan_agent_runner.py` — 独立 Plan Task
+#### `test_plan_resources.py` / `test_plan_tasks.py` / `test_plan_agent_runner.py` — 交互式版本化 Plan
+
+覆盖稳定 Plan 身份、不可变 Version、Planner/Reviewer 多轮 request-input、单次请求不限制
+问题数量、同 Run 恢复、精确 Version approve/apply、附件路径脱敏、Instance owner XOR、
+legacy revision chain Alembic backfill，以及 Manager/Worker mirror、generation 和审计映射。
 
 | 测试 | 验证内容 |
 |------|---------|

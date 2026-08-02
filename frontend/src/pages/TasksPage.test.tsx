@@ -15,6 +15,8 @@ vi.mock('../api/client', () => ({
     }),
     listTasks: vi.fn(),
     countTasks: vi.fn(),
+    listPlans: vi.fn().mockResolvedValue([]),
+    countPlans: vi.fn().mockResolvedValue({ total: 0 }),
     listProjects: vi.fn(),
     listTags: vi.fn(),
     getTask: vi.fn(),
@@ -58,6 +60,17 @@ vi.mock('../components/PlanReview/PlanPanel', () => ({
     <div data-testid="plan-panel-tasks">
       {tasks.map((plan) => plan.id).join(',')}
     </div>
+  ),
+}));
+vi.mock('../components/PlanReview/PlanNeedsInputPanel', () => ({
+  PlanNeedsInputPanel: () => <div data-testid="needs-input-panel" />,
+}));
+vi.mock('../components/PlanReview/VersionedPlanPanel', () => ({
+  VersionedPlanPanel: () => <div data-testid="versioned-review-panel" />,
+}));
+vi.mock('../components/PlanReview/PlanCatalog', () => ({
+  PlanCatalog: ({ plans }: { plans: Array<{ id: number }> }) => (
+    <div data-testid="plan-catalog">{plans.map((plan) => plan.id).join(',')}</div>
   ),
 }));
 vi.mock('../components/Tasks/TaskList', () => ({
@@ -246,7 +259,7 @@ describe('TasksPage realtime reconciliation', () => {
     expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
   });
 
-  it('filters related Plans in TaskList without filtering PlanPanel', async () => {
+  it('loads first-class related Plans without filtering review panels', async () => {
     const main = { ...task, id: 1, mode: 'auto' };
     const standalone = {
       ...task,
@@ -260,12 +273,10 @@ describe('TasksPage realtime reconciliation', () => {
       mode: 'plan',
       plan_target_task_id: 1,
     };
-    vi.mocked(api.listTasks).mockImplementation((...args) => (
-      args[8] === 'related_plan'
-        ? Promise.resolve([related] as never)
-        : Promise.resolve([main, standalone, related] as never)
-    ));
+    vi.mocked(api.listTasks).mockResolvedValue([main, standalone, related] as never);
     vi.mocked(api.countTasks).mockResolvedValue({ total: 1 });
+    vi.mocked(api.listPlans).mockResolvedValue([{ id: 30 }] as never);
+    vi.mocked(api.countPlans).mockResolvedValue({ total: 1 });
 
     render(
       <TasksPage
@@ -277,19 +288,17 @@ describe('TasksPage realtime reconciliation', () => {
     await userEvent.click(await screen.findByRole('button', { name: /Filter/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Related Plans' }));
 
-    await waitFor(() => expect(api.listTasks).toHaveBeenCalledWith(
-      undefined,
-      false,
-      undefined,
-      undefined,
-      20,
-      0,
-      false,
-      undefined,
-      'related_plan',
-    ));
-    expect(await screen.findByText('3:pending:false')).toBeInTheDocument();
-    expect(screen.queryByText('1:pending:false')).not.toBeInTheDocument();
+    await waitFor(() => expect(api.listPlans).toHaveBeenCalledWith({
+      kind: 'related',
+      project_id: undefined,
+      include_archived: false,
+      limit: 20,
+      offset: 0,
+    }));
+    expect(await screen.findByTestId('plan-catalog')).toHaveTextContent('30');
+    expect(screen.queryByTestId('task-snapshots')).not.toBeInTheDocument();
     expect(screen.getByTestId('plan-panel-tasks')).toHaveTextContent('1,2,3');
+    expect(screen.getByTestId('needs-input-panel')).toBeInTheDocument();
+    expect(screen.getByTestId('versioned-review-panel')).toBeInTheDocument();
   });
 });

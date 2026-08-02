@@ -1,10 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api/client';
-import type { Task, Project, TagItem } from '../api/client';
+import type { Task, Project, TagItem, PlanResource } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { TaskForm } from '../components/Tasks/TaskForm';
 import { TaskList } from '../components/Tasks/TaskList';
 import { PlanPanel } from '../components/PlanReview/PlanPanel';
+import { PlanNeedsInputPanel } from '../components/PlanReview/PlanNeedsInputPanel';
+import { VersionedPlanPanel } from '../components/PlanReview/VersionedPlanPanel';
+import { PlanCatalog } from '../components/PlanReview/PlanCatalog';
 import { ChatView } from '../components/Chat/ChatView';
 import { LoopChatView } from '../components/Chat/LoopChatView';
 import { ProjectSelect } from '../components/ProjectSelect';
@@ -38,6 +41,7 @@ interface TasksPageProps {
 
 export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [plans, setPlans] = useState<PlanResource[]>([]);
   const [allTasks, setAllTasks] = useState<Task[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(1);
@@ -230,9 +234,23 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const refresh = useCallback(async () => {
     try {
       const offset = (page - 1) * PAGE_SIZE;
-      const [filtered, count, all, projs, tags] = await Promise.all([
-        api.listTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, PAGE_SIZE, offset, showArchived, unreadFilter || undefined, taskKindFilter),
-        api.countTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, showArchived, unreadFilter || undefined, taskKindFilter),
+      const planKind = taskKindFilter === 'standalone_plan'
+        ? 'standalone'
+        : taskKindFilter === 'related_plan' ? 'related' : undefined;
+      const viewingPlans = planKind != null;
+      const [filtered, count, filteredPlans, planCount, all, projs, tags] = await Promise.all([
+        viewingPlans
+          ? Promise.resolve([] as Task[])
+          : api.listTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, PAGE_SIZE, offset, showArchived, unreadFilter || undefined, taskKindFilter),
+        viewingPlans
+          ? Promise.resolve({ total: 0 })
+          : api.countTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, showArchived, unreadFilter || undefined, taskKindFilter),
+        viewingPlans
+          ? api.listPlans({ kind: planKind, project_id: projectFilter, include_archived: showArchived, limit: PAGE_SIZE, offset })
+          : Promise.resolve([] as PlanResource[]),
+        viewingPlans
+          ? api.countPlans({ kind: planKind, project_id: projectFilter, include_archived: showArchived })
+          : Promise.resolve({ total: 0 }),
         api.listTasks(undefined, false, undefined, undefined, PAGE_SIZE, 0, showArchived),
         api.listProjects(),
         api.listTags(),
@@ -257,7 +275,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         skipFreezeOnce.current = false;
         setTasks(filtered);
       }
-      setTotalCount(count.total);
+      setPlans(filteredPlans);
+      setTotalCount(viewingPlans ? planCount.total : count.total);
       setAllTasks(all);
       setProjects(projs);
       setTagItems(tags);
@@ -364,6 +383,12 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const filteredSearchResults = searchResults?.filter((task) =>
     matchesTaskKind(task, taskKindFilter)
   ) ?? null;
+  const visiblePlans = plans.filter((plan) => {
+    if (searchQuery && !plan.title.toLocaleLowerCase().includes(searchQuery.toLocaleLowerCase())) return false;
+    if (tagFilters.length === 0) return true;
+    const project = projects.find((item) => item.id === plan.project_id);
+    return Boolean(project && tagFilters.some((tag) => project.tags.includes(tag)));
+  });
 
   // 侧边栏拖拽排序（与主列表同一套逻辑）
   const sidebarTasks = filteredSearchResults ?? filteredTasks;
@@ -599,20 +624,26 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     <>
       <TaskForm onCreated={refresh} />
 
+      <PlanNeedsInputPanel />
+      <VersionedPlanPanel />
       <PlanPanel tasks={allTasks} onRefresh={refresh} />
 
       {filterControls}
 
-      <TaskList
-        tasks={filteredSearchResults ?? filteredTasks}
-        projects={projects}
-        onRefresh={refresh}
-        onOpenChat={handleOpenChat}
-        activeTaskId={chatTask?.id ?? null}
-        autoSortOnAccess={autoSortOnAccess}
-        onBeforeArchive={() => { skipFreezeOnce.current = true; }}
-        onReorder={reorderRefresh}
-      />
+      {taskKindFilter === 'standalone_plan' || taskKindFilter === 'related_plan' ? (
+        <PlanCatalog plans={visiblePlans} projects={projects} onRefresh={refresh} />
+      ) : (
+        <TaskList
+          tasks={filteredSearchResults ?? filteredTasks}
+          projects={projects}
+          onRefresh={refresh}
+          onOpenChat={handleOpenChat}
+          activeTaskId={chatTask?.id ?? null}
+          autoSortOnAccess={autoSortOnAccess}
+          onBeforeArchive={() => { skipFreezeOnce.current = true; }}
+          onReorder={reorderRefresh}
+        />
+      )}
 
       {totalPages > 1 && searchResults === null && (
         <div className="flex items-center justify-center gap-3 py-2">
@@ -625,7 +656,9 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           </button>
           <span className="text-xs text-gray-400">
             {page} / {totalPages}
-            <span className="ml-2 text-gray-600">({totalCount} tasks)</span>
+            <span className="ml-2 text-gray-600">
+              ({totalCount} {taskKindFilter === 'standalone_plan' || taskKindFilter === 'related_plan' ? 'plans' : 'tasks'})
+            </span>
           </span>
           <button
             onClick={() => setPage((p) => Math.min(totalPages, p + 1))}

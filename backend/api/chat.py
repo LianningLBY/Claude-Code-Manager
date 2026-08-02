@@ -13,7 +13,8 @@ from backend.api.deps import (
     require_task_control,
 )
 from pydantic import BaseModel, model_validator
-from sqlalchemy import and_, not_, select, func, update as sa_update  # still used by chat history
+from sqlalchemy import and_, delete, not_, select, update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
@@ -73,6 +74,14 @@ class ChatMessage(BaseModel):
     # turn. Approval alone never starts a model turn.
     plan_task_ids: list[int] | None = None
     confirmed_stale_plan_task_ids: list[int] | None = None
+    plan_version_ids: list[int] | None = None
+    confirmed_stale_plan_version_ids: list[int] | None = None
+
+    @model_validator(mode="after")
+    def validate_plan_attachment_generation(self):
+        if self.plan_task_ids and self.plan_version_ids:
+            raise ValueError("Use plan_version_ids or legacy plan_task_ids, not both")
+        return self
 
 
 class ForkAnchor(BaseModel):
@@ -474,7 +483,7 @@ async def send_chat_message(
         )
     command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
-        if body.plan_task_ids:
+        if body.plan_task_ids or body.plan_version_ids:
             raise HTTPException(
                 400,
                 "Shared shadow tasks do not support Plan attachments",
@@ -499,6 +508,7 @@ async def send_chat_message(
         require_admin(request)
 
     approved_plans: list[Task] = []
+    approved_versions = []
 
     # Worker-local stage/ack/reconcile and direct chat admission share this
     # process-wide lock.  A stage that wins first returns 409 here; a stage
@@ -537,14 +547,28 @@ async def send_chat_message(
         from backend.services.plan_tasks import approved_plans_for_message
 
         try:
-            approved_plans = await approved_plans_for_message(
-                db,
-                task,
-                body.plan_task_ids,
-                confirmed_stale_plan_task_ids=(
-                    body.confirmed_stale_plan_task_ids
-                ),
-            )
+            if body.plan_version_ids:
+                from backend.services.plan_service import (
+                    approved_versions_for_message,
+                )
+
+                approved_versions = await approved_versions_for_message(
+                    db,
+                    target=task,
+                    version_ids=body.plan_version_ids,
+                    confirmed_stale_version_ids=(
+                        body.confirmed_stale_plan_version_ids
+                    ),
+                )
+            else:
+                approved_plans = await approved_plans_for_message(
+                    db,
+                    task,
+                    body.plan_task_ids,
+                    confirmed_stale_plan_task_ids=(
+                        body.confirmed_stale_plan_task_ids
+                    ),
+                )
         except ValueError as exc:
             staleness = getattr(exc, "staleness", None)
             if staleness is not None:
@@ -553,6 +577,9 @@ async def send_chat_message(
                     detail={
                         "message": str(exc),
                         "plan_task_id": getattr(exc, "plan_task_id", None),
+                        "plan_version_id": getattr(
+                            exc, "plan_version_id", None
+                        ),
                         "staleness": staleness,
                     },
                 ) from exc
@@ -593,6 +620,10 @@ async def send_chat_message(
         from backend.services.plan_tasks import build_approved_plan_prompt
 
         prompt = build_approved_plan_prompt(approved_plans, prompt)
+    elif approved_versions:
+        from backend.services.plan_service import build_versioned_plan_prompt
+
+        prompt = build_versioned_plan_prompt(approved_versions, prompt)
 
     # Build file attachment metadata for storage and display
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -611,6 +642,10 @@ async def send_chat_message(
         from backend.services.plan_tasks import applied_plan_snapshots
 
         applied_plan_data = applied_plan_snapshots(approved_plans)
+    elif approved_versions:
+        from backend.services.plan_service import versioned_plan_snapshots
+
+        applied_plan_data = versioned_plan_snapshots(approved_versions)
 
     # Store user message as a log entry (use instance_id=1 as placeholder)
     log_metadata: dict = {"raw_content": model_message}
@@ -664,6 +699,29 @@ async def send_chat_message(
                     409,
                     f"Plan Task #{plan.id} was applied concurrently",
                 )
+    elif approved_versions:
+        from backend.models.plan import PlanApplication
+
+        for plan, version in approved_versions:
+            db.add(
+                PlanApplication(
+                    plan_id=plan.id,
+                    plan_version_id=version.id,
+                    application_type="chat_message",
+                    target_task_id=task_id,
+                    target_session_id=task.session_id,
+                    user_log_id=user_log.id,
+                    applied_by=get_current_user_id(request),
+                )
+            )
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "A selected Plan Version was applied concurrently",
+            ) from exc
     await db.commit()
 
     # Broadcast user message to task channel
@@ -697,7 +755,7 @@ async def send_chat_message(
             source_log_id=user_log.id,
         )
     except (TaskStartPausedError, RuntimeError) as exc:
-        if approved_plans:
+        if approved_plans or approved_versions:
             # Both failures happen before queue admission can publish an item.
             # Restore the exact application rows so a shutdown race cannot
             # permanently consume a Plan that the model never received.
@@ -715,6 +773,15 @@ async def send_chat_message(
                             plan_applied_log_id=None,
                         )
                     )
+                if approved_versions:
+                    from backend.models.plan import PlanApplication
+
+                    await db.execute(
+                        delete(PlanApplication).where(
+                            PlanApplication.user_log_id == user_log.id,
+                            PlanApplication.application_type == "chat_message",
+                        )
+                    )
                 log_metadata.pop("applied_plans", None)
                 user_log.raw_json = json.dumps(log_metadata)
                 await db.commit()
@@ -728,6 +795,9 @@ async def send_chat_message(
         "queued": True,
         "session_id": task.session_id,
         "applied_plan_task_ids": [plan.id for plan in approved_plans],
+        "applied_plan_version_ids": [
+            version.id for _plan, version in approved_versions
+        ],
     }
 
 
@@ -1162,6 +1232,42 @@ async def _send_worker_chat(
             operation_lock_held=True,
         )
 
+        approved_versions = []
+        remote_version_ids: list[int] = []
+        remote_confirmed_version_ids: list[int] = []
+        if body.plan_version_ids:
+            from backend.services.plan_service import approved_versions_for_message
+
+            try:
+                approved_versions = await approved_versions_for_message(
+                    db,
+                    target=current,
+                    version_ids=body.plan_version_ids,
+                    confirmed_stale_version_ids=(
+                        body.confirmed_stale_plan_version_ids
+                    ),
+                )
+            except ValueError as exc:
+                staleness = getattr(exc, "staleness", None)
+                if staleness is not None:
+                    raise HTTPException(
+                        409,
+                        detail={
+                            "message": str(exc),
+                            "plan_version_id": getattr(
+                                exc, "plan_version_id", None
+                            ),
+                            "staleness": staleness,
+                        },
+                    ) from exc
+                raise HTTPException(400, str(exc)) from exc
+            for plan, version in approved_versions:
+                if plan.target_task_id != current.id:
+                    raise HTTPException(
+                        409,
+                        f"Plan Version #{version.id} no longer targets this Task",
+                    )
+
         # Preserve the sender prefix for the Manager UI, but forward only the
         # raw user text so it never becomes part of the model prompt.
         model_message = body.message
@@ -1173,6 +1279,27 @@ async def _send_worker_chat(
                 display_content = f"[{sender_display_name}] {model_message}"
 
         worker = await worker_proxy.require_ready_worker(observed.worker_id)
+
+        remote_version_ids = []
+        remote_confirmed_version_ids = []
+        for plan, version in approved_versions:
+            try:
+                remote_version_id = await worker_proxy.materialize_plan_version(
+                    worker=worker,
+                    plan=plan,
+                    version=version,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    502,
+                    f"Plan Version #{version.id} could not be materialized on Worker",
+                ) from exc
+            remote_version_ids.append(remote_version_id)
+            # Manager already performed the authoritative staleness check (and
+            # required user confirmation when needed). Worker log ids belong
+            # to a different database namespace, so re-evaluating them could
+            # create a false stale conflict after Task migration.
+            remote_confirmed_version_ids.append(remote_version_id)
 
         all_paths = body.file_paths or body.image_paths or []
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -1252,6 +1379,10 @@ async def _send_worker_chat(
                 "file_paths": body.file_paths,
                 "model": body.model,
                 "plan_task_ids": body.plan_task_ids,
+                "plan_version_ids": remote_version_ids or None,
+                "confirmed_stale_plan_version_ids": (
+                    remote_confirmed_version_ids or None
+                ),
                 "confirmed_stale_plan_task_ids": (
                     body.confirmed_stale_plan_task_ids
                 ),
@@ -1333,10 +1464,59 @@ async def _send_worker_chat(
                     snapshot_plans
                 )
                 manager_user_log.raw_json = json.dumps(manager_metadata)
+        applied_remote_version_ids = (
+            result.get("applied_plan_version_ids")
+            if isinstance(result, dict)
+            else None
+        )
+        if approved_versions:
+            if applied_remote_version_ids != remote_version_ids:
+                await db.rollback()
+                raise HTTPException(
+                    502,
+                    "Worker did not confirm the exact selected Plan Versions",
+                )
+            from backend.models.plan import PlanApplication
+            from backend.services.plan_service import versioned_plan_snapshots
+
+            for plan, version in approved_versions:
+                db.add(
+                    PlanApplication(
+                        plan_id=plan.id,
+                        plan_version_id=version.id,
+                        application_type="chat_message",
+                        target_task_id=current.id,
+                        target_session_id=(
+                            result.get("session_id") or current.session_id
+                        ),
+                        user_log_id=manager_user_log.id,
+                        applied_by=(
+                            get_current_user_id(request)
+                            if request is not None
+                            else None
+                        ),
+                    )
+                )
+            manager_metadata = _raw_log_metadata(manager_user_log)
+            manager_metadata["applied_plans"] = versioned_plan_snapshots(
+                approved_versions
+            )
+            manager_user_log.raw_json = json.dumps(manager_metadata)
+            try:
+                await db.flush()
+            except IntegrityError as exc:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "A selected Plan Version was applied concurrently",
+                ) from exc
         await db.commit()
 
         if isinstance(result, dict):
             result["instance_id"] = None  # Worker instance ids are not Manager ids.
+            result["applied_plan_version_ids"] = [
+                version.id for _plan, version in approved_versions
+            ]
         return result
 
 

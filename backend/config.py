@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     plan_reviewer_fallback_model: str = "claude-sonnet-5"
     plan_reviewer_fallback_effort: str = "high"
     plan_max_revision_cycles: int = 2
+    # Pause/resume rounds per PlanRun. This never limits questions per request.
+    plan_max_interactions: int = 3
     plan_planner_timeout: int = 1800
     plan_reviewer_timeout: int = 900
     plan_transcript_max_chars: int = 60_000

@@ -1097,12 +1097,14 @@ class UpdateService:
                     Instance.name,
                     Instance.status,
                     Instance.current_task_id,
+                    Instance.current_plan_run_id,
                 )
                 .where(
                     or_(
                         Instance.status == "running",
                         Instance.pid.isnot(None),
                         Instance.current_task_id.isnot(None),
+                        Instance.current_plan_run_id.isnot(None),
                     )
                 )
                 .order_by(Instance.id.asc())
@@ -1112,17 +1114,30 @@ class UpdateService:
                 "id": row.id,
                 "instance_id": row.id,
                 "current_task_id": row.current_task_id,
+                **(
+                    {"current_plan_run_id": row.current_plan_run_id}
+                    if row.current_plan_run_id is not None
+                    else {}
+                ),
                 "title": (
                     (
                         f"实例 {row.name}（任务 #{row.current_task_id} 仍有运行进程）"
                         if row.current_task_id is not None
-                        else f"实例 {row.name}（未关联任务）"
+                        else (
+                            f"实例 {row.name}（Plan Run #{row.current_plan_run_id} 仍有运行进程）"
+                            if row.current_plan_run_id is not None
+                            else f"实例 {row.name}（未关联任务）"
+                        )
                     )
                     if row.status == "running"
                     else (
                         f"实例 {row.name}（任务 #{row.current_task_id} 仍有未解除运行证据）"
                         if row.current_task_id is not None
-                        else f"实例 {row.name}（仍有未解除运行证据）"
+                        else (
+                            f"实例 {row.name}（Plan Run #{row.current_plan_run_id} 仍有未解除运行证据）"
+                            if row.current_plan_run_id is not None
+                            else f"实例 {row.name}（仍有未解除运行证据）"
+                        )
                     )
                 ),
                 "status": (

@@ -1,14 +1,15 @@
 # 交互式、版本化 Plan 架构与实施计划
 
-> 状态：已批准设计，待实施。
+> 状态：已实施，待生产环境迁移与手工验收。
 >
 > 2026-08-02 决策：Plan 从 `Task(mode="plan")` 中提升为稳定的一等制品；一个主
 > Task 可以有多个 Plan，一个 Plan 可以有多个不可变 Version，一次实际规划工作是一个
 > 可暂停/恢复的 Pipeline Run。Planner/Reviewer 的必要提问恢复同一个 Run；用户在成品
 > 方案上请求 Revise 时创建新 Run 和新 Version，但不创建新 Plan。
 >
-> 本文描述目标架构和迁移顺序。实施完成前，当前生产行为仍以
-> `docs/plans/plan-agent-design.md` 为准。
+> 代码已切换到本文的一等 Plan/Version/Run/Input/Application 架构；旧
+> `Task(mode="plan")` 数据只保留迁移后的只读兼容映射。生产行为仍取决于是否已部署本提交。
+> 首页沿用现有 New Task Mode 下拉，不新增“执行 Task / Plan 先行”切换。
 
 ## 0. 决策摘要
 

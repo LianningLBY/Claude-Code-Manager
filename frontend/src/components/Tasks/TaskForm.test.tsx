@@ -35,6 +35,7 @@ vi.mock('../../api/client', () => ({
       },
     }),
     createTask: vi.fn().mockResolvedValue({ id: 1 }),
+    createPlan: vi.fn().mockResolvedValue({ id: 1 }),
     createProject: vi.fn().mockResolvedValue({ id: 2 }),
     listWorkers: vi.fn().mockResolvedValue([]),
     listSkillsCached: vi.fn().mockResolvedValue([
@@ -599,14 +600,18 @@ describe('Codex Fast speed configuration', () => {
     );
     await userEvent.click(screen.getByRole('button', { name: /create/i }));
 
-    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
-    const payload = vi.mocked(api.createTask).mock.calls.at(-1)?.[0];
-    expect(payload).toEqual(expect.objectContaining({ mode: 'plan' }));
+    await waitFor(() => expect(api.createPlan).toHaveBeenCalled());
+    const payload = vi.mocked(api.createPlan).mock.calls.at(-1)?.[0];
+    expect(payload).toEqual(expect.objectContaining({
+      input: 'standard plan',
+      project_id: 1,
+    }));
+    expect(api.createTask).not.toHaveBeenCalled();
     expect(payload).not.toHaveProperty('provider');
     expect(payload).not.toHaveProperty('model');
     expect(payload).not.toHaveProperty('effort_level');
     expect(payload).not.toHaveProperty('codex_service_tier');
-    expect(payload).not.toHaveProperty('plan_pipeline_config');
+    expect(payload).not.toHaveProperty('pipeline_config');
   });
 
   it('atomically resets Fast when switching to an unsupported model', async () => {

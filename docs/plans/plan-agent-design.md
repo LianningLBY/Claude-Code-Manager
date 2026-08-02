@@ -1,14 +1,14 @@
 # 独立 Plan Task 与 Plan Agent 设计
 
-> 状态：已实施（含 Planner/Reviewer 独立 primary/fallback 路由），待生产环境手工验收。
+> 状态：Legacy 设计；历史 `Task(mode="plan")` 只读兼容仍保留。
 >
 > 2026-07-29 决策：Plan 永远是独立制品。Plan 完成或批准都不会自动唤醒目标
 > session；用户必须通过下一条真实消息携带方案，或显式创建执行 Task。
 >
-> 2026-08-02 演进说明：本文仍准确描述当前已实现行为，但“Plan 等同
-> `Task(mode="plan")`、Revise 创建新 Plan Task、Pipeline 无用户输入暂停点”已确定由
-> `docs/plans/interactive-versioned-plan-design.md` 取代。新设计实施完成前不要把该目标架构
-> 误写成当前行为；实施时以新文档的 Plan → Version → Run → Step/Input 分层为权威。
+> 2026-08-02 演进说明：本文仅描述旧数据和兼容端点。“Plan 等同
+> `Task(mode="plan")`、Revise 创建新 Plan Task、Pipeline 无用户输入暂停点”已经由
+> `docs/plans/interactive-versioned-plan-design.md` 的 Plan → Version → Run → Step/Input
+> 分层取代；新写入不得回到本文的数据模型。
 
 ## 0. 决策摘要
 

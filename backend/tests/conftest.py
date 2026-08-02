@@ -77,6 +77,7 @@ import backend.models.monitor_session  # noqa: F401
 import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
+import backend.models.plan  # noqa: F401
 
 @pytest.fixture(scope="session")
 def event_loop():

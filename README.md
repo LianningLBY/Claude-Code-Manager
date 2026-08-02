@@ -20,7 +20,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **多 Provider（Claude / Codex）** — Task 级选择执行引擎：OpenAI Codex CLI（默认，`gpt-5.6-sol`）或 Claude Code。Codex 任务支持完整生命周期、多轮对话、Goal 模式评估、Plan 审批、上下文自动压缩、瞬时错误退避重试、账号池与跨 Worker rollout 迁移；指令文件读 `AGENTS.md`（自动注入）。PTY 热会话、ask_user 和 Claude 原生子 Agent 仍为 Claude 专属（Codex 下显式隐藏/拒绝，不静默降级）
 - **PTY 持久会话模式** — 默认模式，Claude Code 以常驻交互会话运行，多轮免冷启动（热 session 复用），首次启动有 Cold Start 指示器
 - **Goal 模式** — `mode="goal"` 使用自然语言完成条件（`goal_condition`），每 turn 后由轻量评估器（默认 Haiku）自动判断是否达成目标
-- **独立 Plan Task** — Planner/Reviewer 只读生成并审查方案；审批不自动执行，关联方案由用户显式附到下一条真实消息，standalone 方案可一键创建独立执行 Task
+- **交互式版本化 Plan** — Plan 是独立于 Task 的一等制品；Planner/Reviewer 可暂停同一个 Run 请求任意数量的必要输入，回答后继续并保留不可变 Version 历史。审批不自动执行，关联 Version 由用户显式附到下一条真实消息，standalone Version 可一键创建执行 Task
 - **Effort Level** — 支持 `low` / `medium` / `high` / `xhigh` / `max` 五档，优先级链：Task → Instance → 全局默认
 - **Model 配置** — 支持全称模型 ID（包括 `claude-opus-5`）；Opus 5 固定为 1M context 并支持 `low/medium/high/xhigh/max` effort，其他兼容模型可用 `[1m]` 后缀开启 1M context
 - **Codex Fast** — Codex Task 可选择 Standard 或 Fast；Fast 使用同一模型的 `priority` service tier，不会换模型或降低 effort。当前支持 GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；账号或模型无法确认 `priority` 时会在执行前明确失败，不会挂着 Fast 徽标偷偷按 Standard 运行
@@ -107,6 +107,7 @@ claude-manager/
 │   ├── api/                     # REST + WebSocket 路由
 │   │   ├── tasks.py             # 任务 CRUD + plan 审批 + conflict 解决
 │   │   ├── plans.py             # 关联 Plan 历史、stale、revision、执行 Task
+│   │   ├── plan_resources.py    # 一等 Plan/Version/Run/Input/Application API
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop + Dispatcher 端点
 │   │   ├── projects.py          # Project CRUD + git clone
@@ -126,7 +127,8 @@ claude-manager/
 │   │   └── ask_user_hook.py     # AskUserQuestion PreToolUse hook 脚本
 │   ├── models/                  # SQLAlchemy ORM 模型
 │   │   ├── task.py              # Task (session_id, last_cwd, project_id, enabled_skills, effort_level...)
-│   │   ├── plan_agent.py        # Planner/Reviewer run + step 审计
+│   │   ├── plan_agent.py        # Planner/Reviewer Run + Step 审计
+│   │   ├── plan.py              # Plan/Version/Input/Application 聚合模型
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── sub_agent.py         # SubAgentSession + SubAgentReport (通用子 agent)
@@ -145,6 +147,7 @@ claude-manager/
 │       ├── goal_evaluator.py    # Goal 条件评估器 (claude -p 子进程)
 │       ├── plan_agent_runner.py # 严格只读 Planner/Reviewer pipeline
 │       ├── plan_tasks.py        # Plan 上下文、repo 指纹、stale 与附件校验
+│       ├── plan_service.py      # 版本状态机、输入、审批、Worker outcome 导入
 │       ├── mcp_config.py        # MCP config 动态生成
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
 │       ├── cloud_provider.py    # AWS EC2 Provider (Worker 实例创建/启停/销毁)

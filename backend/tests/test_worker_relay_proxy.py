@@ -19,6 +19,8 @@ from backend.models.log_entry import LogEntry
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.project import Project
+from backend.models.plan import Plan, PlanApplication, PlanVersion
+from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
@@ -1970,6 +1972,102 @@ async def test_dispatch_worker_tasks_skips_unready_worker(db_factory, session_fa
 
     async with session_factory() as db:
         assert (await db.get(Task, t.id)).status == "pending"  # 留队等 worker 就绪
+
+
+async def test_dispatch_worker_plan_run_imports_terminal_outcome(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Worker-dispatched Plan",
+            initial_request="Plan it",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan it",
+            pipeline_config=pipeline,
+            status="queued",
+            generation=0,
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        plan_id = plan.id
+        run_id = run.id
+        created_at = run.created_at.isoformat()
+        updated_at = run.updated_at.isoformat()
+
+    proxy = AsyncMock()
+    proxy.run_versioned_plan_until_pause.return_value = {
+        "protocol": 1,
+        "run": {
+            "id": run_id,
+            "plan_id": plan_id,
+            "run_type": "initial",
+            "status": "failed",
+            "current_stage": "failed",
+            "base_version_id": None,
+            "result_version_id": None,
+            "request_text": "Plan it",
+            "round": 1,
+            "generation": 0,
+            "instance_id": None,
+            "worker_id": None,
+            "open_input_request_id": None,
+            "interaction_count": 0,
+            "max_interactions": 3,
+            "execution_seconds": 1.0,
+            "last_execution_started_at": None,
+            "review_verdict": None,
+            "review_feedback": None,
+            "review_exhausted": False,
+            "error": "remote failure",
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "finished_at": updated_at,
+            "steps": [],
+            "input_requests": [],
+        },
+        "versions": [],
+    }
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_plan_runs()
+    lifecycle = dispatcher._running_tasks[f"worker-plan-{run_id}"]
+    await lifecycle
+
+    async with session_factory() as db:
+        current_plan = await db.get(Plan, plan_id)
+        current_run = await db.get(PlanAgentRun, run_id)
+        assert current_run.status == "failed"
+        assert current_run.error == "remote failure"
+        assert current_plan.active_run_id is None
+    assert any(
+        channel == "plans"
+        and event.get("run_id") == run_id
+        and event.get("status") == "failed"
+        for channel, event in broadcaster.sent
+    )
 
 
 async def test_dispatch_worker_claim_rejects_same_worker_pending_retry_aba(
@@ -4961,6 +5059,106 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
     assert stored.content == "[Worker Alice] [FIX] preserve this tag"
     assert json.loads(stored.raw_json)["raw_content"] == "[FIX] preserve this tag"
     assert broadcaster.sent[0][1]["content"] == stored.content
+
+
+async def test_worker_chat_applies_exact_mirrored_plan_version(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+    from backend.schemas.plan import default_plan_pipeline_config
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        session_id="worker-plan-session",
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Worker Plan",
+            initial_request="Plan this",
+            target_task_id=task.id,
+            # The Task moved after this Version was produced. Application must
+            # materialize immutable content on the Task's current Worker.
+            worker_id=worker.id + 100,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            worker_id=worker.id + 100,
+            worker_version_id=811,
+            version_number=1,
+            content="# Exact Worker Plan",
+            context_session_id=task.session_id,
+            context_log_id=None,
+            review_verdict="approve",
+            human_decision="approved",
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        await db.commit()
+        local_version_id = version.id
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.materialize_plan_version.return_value = 811
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, path, *_args, **kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        assert kwargs["body"]["plan_version_ids"] == [811]
+        assert kwargs["body"]["confirmed_stale_plan_version_ids"] == [811]
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [811],
+        }
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        result = await _send_worker_chat(
+            current,
+            ChatMessage(
+                message="Implement the selected Version",
+                plan_version_ids=[local_version_id],
+            ),
+            db,
+            request,
+        )
+
+    assert result["applied_plan_version_ids"] == [local_version_id]
+    async with session_factory() as db:
+        application = (
+            await db.execute(
+                select(PlanApplication).where(
+                    PlanApplication.plan_version_id == local_version_id
+                )
+            )
+        ).scalar_one()
+        log = await db.get(LogEntry, application.user_log_id)
+        snapshot = json.loads(log.raw_json)["applied_plans"][0]
+        assert snapshot["version_id"] == local_version_id
+        assert snapshot["content"] == "# Exact Worker Plan"
 
 
 async def test_chat_proxy_rejects_secrets(client, session_factory, monkeypatch):

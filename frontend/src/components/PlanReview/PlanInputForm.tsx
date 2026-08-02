@@ -1,0 +1,192 @@
+import { useMemo, useRef, useState } from 'react';
+
+import { api, type PlanInputRequest, type PlanRun } from '../../api/client';
+import { useFileUpload } from '../../hooks/useFileUpload';
+import { Loader2, Paperclip, X } from '../icons';
+
+interface PlanInputFormProps {
+  run: PlanRun;
+  request: PlanInputRequest;
+  compact?: boolean;
+  onAnswered: () => void | Promise<void>;
+}
+
+type AnswerValue = string | string[];
+
+export function PlanInputForm({ run, request, compact = false, onAnswered }: PlanInputFormProps) {
+  const [answers, setAnswers] = useState<Record<string, AnswerValue>>({});
+  const [additional, setAdditional] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const uploads = useFileUpload();
+  const answerIdempotencyKey = useMemo(
+    () => crypto.randomUUID(),
+    [request.id],
+  );
+
+  const missingRequired = useMemo(
+    () => request.questions.some((question) => {
+      if (!question.required) return false;
+      const value = answers[question.id];
+      return value == null || value === '' || (Array.isArray(value) && value.length === 0);
+    }),
+    [answers, request.questions],
+  );
+
+  const submit = async () => {
+    if (submitting || missingRequired || uploads.isUploading || uploads.hasFailed) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const results = uploads.uploadedResults;
+      await api.answerPlanInput(run.id, request.id, {
+        expected_run_generation: run.generation,
+        idempotency_key: answerIdempotencyKey,
+        answers: request.questions.map((question) => ({
+          question_id: question.id,
+          value: answers[question.id] ?? null,
+        })),
+        ...(additional.trim() ? { response_text: additional.trim() } : {}),
+        ...(results.length ? {
+          file_paths: results.map((item) => item.path),
+          image_paths: results.filter((item) => item.is_image).map((item) => item.path),
+          attachments: results.map((item) => ({
+            url: item.url,
+            name: item.filename || item.url.split('/').pop() || 'file',
+            is_image: item.is_image,
+          })),
+        } : {}),
+      });
+      setAnswers({});
+      setAdditional('');
+      uploads.clear();
+      await onAnswered();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : String(submitError));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <form
+      className={`space-y-4 ${compact ? '' : 'rounded-xl border border-amber-500/25 bg-amber-500/5 p-4'}`}
+      onSubmit={(event) => { event.preventDefault(); void submit(); }}
+    >
+      <div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-full bg-amber-500/15 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+            {request.requested_by} needs input
+          </span>
+          <span className="text-xs text-gray-500">
+            {request.questions.length} {request.questions.length === 1 ? 'question' : 'questions'}
+          </span>
+        </div>
+        {request.reason && <p className="mt-2 text-sm leading-6 text-gray-300">{request.reason}</p>}
+      </div>
+
+      <div className="max-h-[min(52vh,560px)] space-y-4 overflow-y-auto pr-1">
+        {request.questions.map((question, index) => {
+          const value = answers[question.id];
+          return (
+            <fieldset key={question.id} className="rounded-xl border border-gray-700 bg-gray-900/70 p-3.5">
+              <legend className="px-1 text-xs font-semibold text-indigo-300">
+                {index + 1}. {question.header}{question.required ? ' *' : ''}
+              </legend>
+              <p className="mb-3 text-sm leading-6 text-gray-200">{question.question}</p>
+              {question.response_type === 'text' ? (
+                <textarea
+                  value={typeof value === 'string' ? value : ''}
+                  onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
+                  rows={3}
+                  maxLength={50000}
+                  className="w-full resize-y rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+                />
+              ) : (
+                <div className="space-y-2">
+                  {question.options.map((option) => {
+                    const multi = question.response_type === 'multi_choice';
+                    const selected = multi
+                      ? Array.isArray(value) && value.includes(option.value)
+                      : value === option.value;
+                    return (
+                      <label key={option.value} className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 text-sm transition-colors ${selected ? 'border-indigo-500/60 bg-indigo-500/10 text-indigo-100' : 'border-gray-700 text-gray-300 hover:border-gray-600'}`}>
+                        <input
+                          type={multi ? 'checkbox' : 'radio'}
+                          name={`plan-question-${request.id}-${question.id}`}
+                          checked={selected}
+                          onChange={() => setAnswers((current) => {
+                            if (!multi) return { ...current, [question.id]: option.value };
+                            const existing = Array.isArray(current[question.id]) ? current[question.id] as string[] : [];
+                            return {
+                              ...current,
+                              [question.id]: selected
+                                ? existing.filter((item) => item !== option.value)
+                                : [...existing, option.value],
+                            };
+                          })}
+                        />
+                        {option.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </fieldset>
+          );
+        })}
+      </div>
+
+      <textarea
+        value={additional}
+        onChange={(event) => setAdditional(event.target.value)}
+        placeholder="Additional context (optional)"
+        rows={2}
+        maxLength={50000}
+        className="w-full resize-y rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+      />
+
+      {uploads.uploads.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {uploads.uploads.map((upload) => (
+            <span key={upload.id} className="flex max-w-full items-center gap-1 rounded-lg border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-300">
+              <span className="max-w-40 truncate">{upload.file.name}</span>
+              {upload.status === 'uploading' && <Loader2 size={11} className="animate-spin" />}
+              {upload.status === 'failed' && (
+                <button type="button" className="text-red-300" onClick={() => uploads.retryFile(upload.id)}>Retry</button>
+              )}
+              <button type="button" aria-label={`Remove ${upload.file.name}`} onClick={() => uploads.removeFile(upload.id)}><X size={11} /></button>
+            </span>
+          ))}
+        </div>
+      )}
+      {error && <p className="text-xs text-red-400">{error}</p>}
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <input
+            ref={inputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(event) => {
+              uploads.addFiles(Array.from(event.target.files || []), setError);
+              event.target.value = '';
+            }}
+          />
+          <button type="button" onClick={() => inputRef.current?.click()} className="flex items-center gap-1.5 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300 hover:bg-gray-800">
+            <Paperclip size={13} /> Attach files
+          </button>
+        </div>
+        <button
+          type="submit"
+          disabled={submitting || missingRequired || uploads.isUploading || uploads.hasFailed}
+          className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {submitting && <Loader2 size={12} className="animate-spin" />}
+          Submit answers
+        </button>
+      </div>
+    </form>
+  );
+}

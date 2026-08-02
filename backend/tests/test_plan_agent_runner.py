@@ -13,6 +13,7 @@ from backend.schemas.plan import PlanPipelineConfig
 from backend.services.codex_app_server import CodexTurnProcess
 from backend.services.plan_agent_runner import (
     PLANNER_SCHEMA,
+    PLANNER_SCHEMA_V2,
     PlanAgentError,
     PlanAgentRunner,
     PlanRouteUnavailable,
@@ -20,6 +21,7 @@ from backend.services.plan_agent_runner import (
     _extract_provider_content,
     _plan_request_with_attachments,
     _validate_structured,
+    _validate_structured_v2,
 )
 
 
@@ -65,6 +67,28 @@ def test_structured_output_parsers_accept_native_provider_envelopes():
         "verdict": "approve",
         "feedback": "Looks good",
     }
+
+
+def test_interactive_planner_accepts_all_known_questions_without_count_limit():
+    questions = [
+        {
+            "id": f"required_{index}",
+            "header": f"Q{index}",
+            "question": f"Required decision {index}",
+            "response_type": "text",
+            "options": [],
+            "required": True,
+        }
+        for index in range(12)
+    ]
+    payload = {
+        "action": "request_input",
+        "reason": "All decisions materially affect the Plan",
+        "questions": questions,
+    }
+
+    assert "maxItems" not in PLANNER_SCHEMA_V2["oneOf"][1]["properties"]["questions"]
+    assert _validate_structured_v2("planner", json.dumps(payload)) == payload
 
 
 def test_plan_request_includes_user_attachment_paths_and_names():

@@ -185,6 +185,7 @@ export interface SystemConfig {
   default_codex_service_tier?: CodexServiceTier;
   codex_service_tier_options?: CodexServiceTier[];
   codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+  versioned_plan_worker_protocol?: number;
   /** Absent when the UI is connected to an older Manager/Worker. */
   plan_pipeline_defaults?: PlanPipelineConfig;
 }
@@ -299,6 +300,7 @@ export interface Instance {
   pid: number | null;
   status: string;
   current_task_id: number | null;
+  current_plan_run_id: number | null;
   worktree_path: string | null;
   provider: string;
   model: string;
@@ -319,6 +321,9 @@ export interface FileAttachment {
 
 export interface AppliedPlanSnapshot {
   id: number;
+  plan_id?: number;
+  version_id?: number;
+  version_number?: number;
   title: string;
   content: string;
 }
@@ -416,6 +421,119 @@ export interface PlanAgentRun {
 export interface PlanExecutionResult {
   plan_task: Task;
   execution_task: Task;
+}
+
+export interface PlanQuestionOption {
+  value: string;
+  label: string;
+}
+
+export interface PlanQuestion {
+  id: string;
+  header: string;
+  question: string;
+  response_type: 'text' | 'single_choice' | 'multi_choice';
+  options: PlanQuestionOption[];
+  required: boolean;
+}
+
+export interface PlanInputRequest {
+  id: number;
+  plan_id: number;
+  run_id: number;
+  source_step_id: number;
+  requested_by: 'planner' | 'reviewer';
+  reason: string | null;
+  questions: PlanQuestion[];
+  status: 'prepared' | 'open' | 'answered' | 'cancelled';
+  answers: { question_id: string; value: string | string[] | null }[] | null;
+  response_text: string | null;
+  attachments: FileAttachment[] | null;
+  answered_by: number | null;
+  opened_at: string | null;
+  answered_at: string | null;
+  created_at: string;
+}
+
+export interface PlanVersion {
+  id: number;
+  plan_id: number;
+  version_number: number;
+  parent_version_id: number | null;
+  produced_by_run_id: number | null;
+  content: string;
+  context_session_id: string | null;
+  context_log_id: number | null;
+  repo_revision: Record<string, unknown> | null;
+  review_verdict: 'approve' | 'revise' | 'disabled' | 'exhausted' | null;
+  review_feedback: string | null;
+  review_exhausted: boolean;
+  reviewed_at: string | null;
+  human_decision: 'pending' | 'approved' | 'rejected';
+  decided_at: string | null;
+  decided_by: number | null;
+  superseded_by_version_id: number | null;
+  applied: boolean;
+  created_at: string;
+}
+
+export interface PlanRun {
+  id: number;
+  plan_id: number;
+  run_type: string;
+  status: 'queued' | 'running' | 'waiting_user' | 'completed' | 'failed' | 'cancelled';
+  current_stage: string;
+  base_version_id: number | null;
+  result_version_id: number | null;
+  request_text: string | null;
+  round: number;
+  generation: number;
+  instance_id: number | null;
+  worker_id: number | null;
+  open_input_request_id: number | null;
+  interaction_count: number;
+  max_interactions: number;
+  execution_seconds: number;
+  last_execution_started_at: string | null;
+  review_verdict: string | null;
+  review_feedback: string | null;
+  review_exhausted: boolean;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  steps: PlanAgentStep[];
+  input_requests: PlanInputRequest[];
+}
+
+export interface PlanResource {
+  id: number;
+  title: string;
+  initial_request: string;
+  initial_attachments: FileAttachment[] | null;
+  target_task_id: number | null;
+  project_id: number | null;
+  target_repo: string | null;
+  target_branch: string | null;
+  worker_id: number | null;
+  priority: number;
+  timeout_hours: number | null;
+  created_by: number | null;
+  current_version_id: number | null;
+  active_run_id: number | null;
+  forked_from_version_id: number | null;
+  archived_at: string | null;
+  closed_at: string | null;
+  lock_version: number;
+  created_at: string;
+  updated_at: string;
+  display_state: string;
+  legacy: boolean;
+  latest_run_status: string | null;
+  latest_run_error: string | null;
+  current_version: PlanVersion | null;
+  active_run: PlanRun | null;
+  open_input_request: PlanInputRequest | null;
 }
 
 export interface AskUserOption {
@@ -1334,6 +1452,127 @@ export const api = {
       `/api/tasks/${planTaskId}/plan/create-execution-task`,
       { method: 'POST' },
     ),
+  createPlan: (data: {
+    input: string;
+    title?: string;
+    target_task_id?: number;
+    project_id?: number;
+    target_repo?: string;
+    target_branch?: string;
+    worker_id?: number;
+    priority?: number;
+    timeout_hours?: number | null;
+    file_paths?: string[];
+    image_paths?: string[];
+    attachments?: FileAttachment[];
+  }) => request<PlanResource>('/api/plans', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  listPlans: (params?: {
+    target_task_id?: number;
+    kind?: 'standalone' | 'related';
+    display_state?: string;
+    project_id?: number;
+    include_archived?: boolean;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.target_task_id != null) query.set('target_task_id', String(params.target_task_id));
+    if (params?.kind) query.set('kind', params.kind);
+    if (params?.display_state) query.set('display_state', params.display_state);
+    if (params?.project_id != null) query.set('project_id', String(params.project_id));
+    if (params?.include_archived) query.set('include_archived', 'true');
+    if (params?.limit != null) query.set('limit', String(params.limit));
+    if (params?.offset != null) query.set('offset', String(params.offset));
+    return request<PlanResource[]>(`/api/plans${query.size ? `?${query}` : ''}`);
+  },
+  countPlans: (params?: {
+    target_task_id?: number;
+    kind?: 'standalone' | 'related';
+    display_state?: string;
+    project_id?: number;
+    include_archived?: boolean;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.target_task_id != null) query.set('target_task_id', String(params.target_task_id));
+    if (params?.kind) query.set('kind', params.kind);
+    if (params?.display_state) query.set('display_state', params.display_state);
+    if (params?.project_id != null) query.set('project_id', String(params.project_id));
+    if (params?.include_archived) query.set('include_archived', 'true');
+    return request<{ total: number }>(`/api/plans/count${query.size ? `?${query}` : ''}`);
+  },
+  getPlan: (planId: number) => request<PlanResource>(`/api/plans/${planId}`),
+  updatePlan: (planId: number, data: {
+    title?: string;
+    archived?: boolean;
+    expected_lock_version: number;
+  }) => request<PlanResource>(`/api/plans/${planId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  listPlanVersions: (planId: number) =>
+    request<PlanVersion[]>(`/api/plans/${planId}/versions`),
+  listPlanResourceRuns: (planId: number) =>
+    request<PlanRun[]>(`/api/plans/${planId}/runs`),
+  createPlanRun: (planId: number, data: {
+    run_type: 'user_revision' | 'refresh_context' | 'retry';
+    request: string;
+    base_version_id?: number;
+    expected_current_version_id?: number;
+    file_paths?: string[];
+    image_paths?: string[];
+    attachments?: FileAttachment[];
+  }) => request<PlanRun>(`/api/plans/${planId}/runs`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  forkPlan: (planId: number, data: {
+    base_version_id: number;
+    title?: string;
+    request?: string;
+  }) => request<PlanResource>(`/api/plans/${planId}/fork`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  approvePlanVersion: (versionId: number, expectedCurrentVersionId: number, confirmStale = false) =>
+    request<PlanVersion>(`/api/plan-versions/${versionId}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_current_version_id: expectedCurrentVersionId,
+        confirm_stale: confirmStale,
+      }),
+    }),
+  rejectPlanVersion: (versionId: number, expectedCurrentVersionId: number, confirmStale = false) =>
+    request<PlanVersion>(`/api/plan-versions/${versionId}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_current_version_id: expectedCurrentVersionId,
+        confirm_stale: confirmStale,
+      }),
+    }),
+  getPlanVersionStaleness: (versionId: number) =>
+    request<PlanStaleness>(`/api/plan-versions/${versionId}/staleness`),
+  cancelPlanRun: (runId: number) =>
+    request<PlanRun>(`/api/plan-runs/${runId}/cancel`, { method: 'POST' }),
+  answerPlanInput: (runId: number, requestId: number, data: {
+    expected_run_generation: number;
+    idempotency_key: string;
+    answers: { question_id: string; value: string | string[] | null }[];
+    response_text?: string;
+    file_paths?: string[];
+    image_paths?: string[];
+    attachments?: FileAttachment[];
+  }) => request<PlanInputRequest>(
+    `/api/plan-runs/${runId}/input-requests/${requestId}/answer`,
+    { method: 'POST', body: JSON.stringify(data) },
+  ),
+  createVersionExecutionTask: (versionId: number) =>
+    request<{ plan: PlanResource; version: PlanVersion; execution_task_id: number }>(
+      `/api/plan-versions/${versionId}/create-execution-task`,
+      { method: 'POST' },
+    ),
   // Instances
   listInstances: () => request<Instance[]>('/api/instances'),
   createInstance: (data: { name: string }) =>
@@ -1380,6 +1619,8 @@ export const api = {
     expectedRouting?: TaskRoutingExpectation,
     planTaskIds?: number[],
     confirmedStalePlanTaskIds?: number[],
+    planVersionIds?: number[],
+    confirmedStalePlanVersionIds?: number[],
   ) =>
     request<{
       ok: boolean;
@@ -1387,6 +1628,7 @@ export const api = {
       instance_id: number;
       session_id: string;
       applied_plan_task_ids?: number[];
+      applied_plan_version_ids?: number[];
     }>(`/api/tasks/${taskId}/chat`, {
       method: 'POST',
       body: JSON.stringify({
@@ -1398,6 +1640,10 @@ export const api = {
         ...(planTaskIds?.length ? { plan_task_ids: planTaskIds } : {}),
         ...(confirmedStalePlanTaskIds?.length
           ? { confirmed_stale_plan_task_ids: confirmedStalePlanTaskIds }
+          : {}),
+        ...(planVersionIds?.length ? { plan_version_ids: planVersionIds } : {}),
+        ...(confirmedStalePlanVersionIds?.length
+          ? { confirmed_stale_plan_version_ids: confirmedStalePlanVersionIds }
           : {}),
       }),
     }),

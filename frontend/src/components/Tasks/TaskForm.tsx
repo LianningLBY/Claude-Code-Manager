@@ -428,7 +428,17 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         is_image: r.is_image,
       }));
 
-      await api.createTask({
+      if (mode === 'plan') {
+        await api.createPlan({
+          input: description,
+          project_id: pid as number,
+          priority,
+          ...(uploadedPaths.length > 0 ? { file_paths: uploadedPaths } : {}),
+          ...(attachments.length > 0 ? { attachments } : {}),
+          ...(workerId ? { worker_id: parseInt(workerId) } : {}),
+          ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
+        });
+      } else await api.createTask({
         description: description || undefined,
         project_id: pid as number,
         priority,

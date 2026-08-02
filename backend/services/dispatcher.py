@@ -14,7 +14,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import httpx
+from fastapi import HTTPException
 from sqlalchemy import select, update, func, or_
 
 from sqlalchemy import select as sa_select
@@ -23,6 +26,8 @@ from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.plan import Plan
+from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
@@ -63,6 +68,10 @@ from backend.services.worker_routing_config import (
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from backend.services.claude_pool import ClaudePool
+    from backend.services.codex_pool import CodexPool
 
 
 class QueuedMessagePrelaunchError(RuntimeError):
@@ -595,6 +604,9 @@ class GlobalDispatcher:
         # maintenance window. TaskQueue excludes them without consuming retry
         # budget, while unrelated pending tasks can still use idle instances.
         self._account_routing_not_before: dict[int, float] = {}
+        # Alternate local admission when both queues have work so neither
+        # ordinary Tasks nor first-class PlanRuns can starve the other.
+        self._prefer_plan_runs = True
 
         # Pool: initialized lazily on start() if pool_enabled
         self.pool: "ClaudePool | None" = None
@@ -661,6 +673,49 @@ class GlobalDispatcher:
             )
         return True
 
+    async def stop_plan_run_lifecycle(
+        self,
+        run_id: int,
+        instance_id: int | None,
+    ) -> bool:
+        """Cancel and reap one exact first-class PlanRun lifecycle."""
+
+        lifecycle = self._running_tasks.get(instance_id) if instance_id is not None else None
+        if lifecycle is None and instance_id is None:
+            lifecycle = next(
+                (
+                    task
+                    for task in self._running_tasks.values()
+                    if not task.done()
+                    and getattr(task, "_ccm_worker_plan_run_id", None) == run_id
+                ),
+                None,
+            )
+        if (
+            lifecycle is None
+            or lifecycle.done()
+            or (
+                getattr(lifecycle, "_ccm_plan_run_id", None) != run_id
+                and getattr(lifecycle, "_ccm_worker_plan_run_id", None) != run_id
+            )
+        ):
+            return False
+        lifecycle.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(lifecycle, return_exceptions=True)),
+                timeout=AUX_LIFECYCLE_CANCEL_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Plan Run {run_id} ignored cancellation") from exc
+        from backend.services.plan_agent_runner import active_plan_run_ids
+
+        if run_id in active_plan_run_ids():
+            raise RuntimeError(
+                f"Plan Run {run_id} runtime cleanup could not be confirmed"
+            )
+        return True
+
     async def start(self):
         if self._shutting_down:
             raise RuntimeError("GlobalDispatcher is shutting down")
@@ -701,6 +756,7 @@ class GlobalDispatcher:
             # its pre-spawn phase so no child can appear after reconciliation's
             # manager-owned snapshot without being represented in that snapshot.
             async with self._chat_launch_admission_lock:
+                await self._recover_versioned_plan_runs()
                 await self._cleanup_stale_state()
             await self._recover_codex_monitor_cleanups()
             await self._recover_monitor_sessions()
@@ -718,6 +774,99 @@ class GlobalDispatcher:
             logger.exception("GlobalDispatcher failed to start")
             raise
         logger.info("GlobalDispatcher started")
+
+    async def _recover_versioned_plan_runs(self) -> None:
+        """Reconcile durable PlanRun states before generic Instance cleanup."""
+
+        from backend.services.plan_agent_runner import active_plan_run_ids
+
+        live_run_ids = active_plan_run_ids()
+        async with self.db_factory() as db:
+            runs = list(
+                (
+                    await db.execute(
+                        select(PlanAgentRun).where(
+                            PlanAgentRun.plan_id.isnot(None),
+                            PlanAgentRun.status.in_(["queued", "running", "waiting_user"]),
+                        )
+                    )
+                ).scalars()
+            )
+            for run in runs:
+                plan = await db.get(Plan, run.plan_id)
+                if plan is None or plan.active_run_id != run.id:
+                    if run.status != "waiting_user" or plan is None:
+                        run.status = "failed"
+                        run.current_stage = "failed"
+                        run.error = "Plan Run lost its aggregate owner during recovery"
+                        run.finished_at = datetime.utcnow()
+                    run.instance_id = None
+                    continue
+                if run.status == "running" and run.id not in live_run_ids:
+                    if run.last_execution_started_at is not None:
+                        run.execution_seconds = float(run.execution_seconds or 0) + max(
+                            0.0,
+                            (datetime.utcnow() - run.last_execution_started_at).total_seconds(),
+                        )
+                        run.last_execution_started_at = None
+                    if run.instance_id is not None:
+                        owner = await db.get(Instance, run.instance_id)
+                        if (
+                            owner is not None
+                            and owner.current_plan_run_id == run.id
+                            and owner.current_task_id is None
+                            and owner.pid is None
+                        ):
+                            owner.status = "idle"
+                            owner.current_plan_run_id = None
+                    running_steps = list(
+                        (
+                            await db.execute(
+                                select(PlanAgentStep).where(
+                                    PlanAgentStep.run_id == run.id,
+                                    PlanAgentStep.status == "running",
+                                )
+                            )
+                        ).scalars()
+                    )
+                    for step in running_steps:
+                        step.status = "cancelled"
+                        step.error = "Interrupted by CCM restart"
+                        step.finished_at = datetime.utcnow()
+                    run.status = "queued"
+                    run.instance_id = None
+                    run.generation += 1
+                    run.updated_at = datetime.utcnow()
+                elif run.status in {"queued", "waiting_user"} and run.instance_id is not None:
+                    owner = await db.get(Instance, run.instance_id)
+                    if (
+                        owner is not None
+                        and owner.current_plan_run_id == run.id
+                        and owner.current_task_id is None
+                        and owner.pid is None
+                    ):
+                        owner.status = "idle"
+                        owner.current_plan_run_id = None
+                    run.instance_id = None
+                    run.last_execution_started_at = None
+
+            owners = list(
+                (
+                    await db.execute(
+                        select(Instance).where(Instance.current_plan_run_id.isnot(None))
+                    )
+                ).scalars()
+            )
+            for owner in owners:
+                owned = await db.get(PlanAgentRun, owner.current_plan_run_id)
+                if (
+                    (owned is None or owned.instance_id != owner.id or owned.status != "running")
+                    and owner.current_task_id is None
+                    and owner.pid is None
+                ):
+                    owner.status = "idle"
+                    owner.current_plan_run_id = None
+            await db.commit()
 
     def wake(self) -> None:
         """Wake the task dispatcher after a pending task is committed."""
@@ -2141,6 +2290,7 @@ class GlobalDispatcher:
         """Return live CCM-owned auxiliary generations that a restart kills."""
 
         from backend.services.plan_agent_runner import (
+            active_plan_run_ids,
             active_plan_agent_task_ids,
         )
 
@@ -2155,6 +2305,12 @@ class GlobalDispatcher:
                 | set(getattr(self, "_monitor_active_turns", set()))
             )
             if type(session_id) is int
+        }
+        worker_plan_ids = {
+            int(run_id)
+            for task in getattr(self, "_running_tasks", {}).values()
+            if not task.done()
+            and (run_id := getattr(task, "_ccm_worker_plan_run_id", None)) is not None
         }
         return [
             *(
@@ -2183,6 +2339,24 @@ class GlobalDispatcher:
                     "kind": "plan_agent",
                 }
                 for task_id in sorted(active_plan_agent_task_ids())
+            ),
+            *(
+                {
+                    "id": run_id,
+                    "title": f"Plan Run #{run_id}",
+                    "status": "running_auxiliary",
+                    "kind": "plan_run",
+                }
+                for run_id in sorted(active_plan_run_ids())
+            ),
+            *(
+                {
+                    "id": run_id,
+                    "title": f"Worker Plan Run #{run_id}",
+                    "status": "running_auxiliary",
+                    "kind": "worker_plan_run",
+                }
+                for run_id in sorted(worker_plan_ids)
             ),
         ]
 
@@ -2421,6 +2595,195 @@ class GlobalDispatcher:
             except Exception:
                 logger.exception("curator: error in curator loop")
 
+    async def _claim_plan_run(
+        self,
+        db,
+        *,
+        instance: Instance,
+    ) -> tuple[int, int] | None:
+        """Claim one local first-class PlanRun and its exact Instance owner."""
+
+        row = (
+            await db.execute(
+                select(PlanAgentRun, Plan)
+                .join(Plan, Plan.id == PlanAgentRun.plan_id)
+                .where(
+                    PlanAgentRun.status == "queued",
+                    PlanAgentRun.worker_id.is_(None),
+                    Plan.active_run_id == PlanAgentRun.id,
+                    Plan.archived_at.is_(None),
+                )
+                .order_by(
+                    Plan.priority.asc(),
+                    PlanAgentRun.created_at.asc(),
+                    PlanAgentRun.id.asc(),
+                )
+                .limit(1)
+                .with_for_update()
+            )
+        ).first()
+        if row is None:
+            return None
+        run, plan = row
+        now = datetime.utcnow()
+        timeout = self._resolve_timeout(plan)
+        if timeout is not None and float(run.execution_seconds or 0) >= timeout:
+            run.status = "failed"
+            run.current_stage = "failed"
+            run.error = f"Plan Run timed out after {timeout:.0f}s of execution"
+            run.finished_at = now
+            run.updated_at = now
+            plan.active_run_id = None
+            plan.lock_version += 1
+            plan.updated_at = now
+            await db.commit()
+            return None
+        claimed_run = await db.execute(
+            update(PlanAgentRun)
+            .where(
+                PlanAgentRun.id == run.id,
+                PlanAgentRun.plan_id == plan.id,
+                PlanAgentRun.status == "queued",
+                PlanAgentRun.generation == run.generation,
+                PlanAgentRun.instance_id.is_(None),
+            )
+            .values(
+                status="running",
+                instance_id=instance.id,
+                generation=PlanAgentRun.generation + 1,
+                last_execution_started_at=now,
+                updated_at=now,
+            )
+        )
+        claimed_instance = await db.execute(
+            update(Instance)
+            .where(
+                Instance.id == instance.id,
+                reusable_idle_predicate(),
+            )
+            .values(
+                status="running",
+                current_plan_run_id=run.id,
+                current_task_id=None,
+                pid=None,
+                started_at=now,
+            )
+        )
+        if claimed_run.rowcount != 1 or claimed_instance.rowcount != 1:
+            await db.rollback()
+            return None
+        await db.commit()
+        return run.id, run.generation + 1
+
+    async def _cleanup_plan_run_owner(
+        self,
+        *,
+        instance_id: int,
+        run_id: int,
+        generation: int,
+    ) -> None:
+        """Release only the exact PlanRun generation left after its coroutine."""
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+            owner = await db.get(Instance, instance_id, with_for_update=True)
+            if (
+                owner is None
+                or owner.current_plan_run_id != run_id
+                or owner.current_task_id is not None
+                or owner.pid is not None
+            ):
+                await db.rollback()
+                return
+            if run is not None and run.generation == generation:
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (datetime.utcnow() - run.last_execution_started_at).total_seconds(),
+                    )
+                    run.last_execution_started_at = None
+                run.instance_id = None
+                if run.status == "running":
+                    # A path that neither advanced nor recorded failure is not
+                    # safe to replay silently; preserve an explicit terminal.
+                    run.status = "failed"
+                    run.current_stage = "failed"
+                    run.error = "Plan Run lifecycle ended without a durable outcome"
+                    run.finished_at = datetime.utcnow()
+                    if run.plan_id is not None:
+                        plan = await db.get(Plan, run.plan_id, with_for_update=True)
+                        if plan is not None and plan.active_run_id == run.id:
+                            plan.active_run_id = None
+                            plan.lock_version += 1
+                            plan.updated_at = datetime.utcnow()
+            owner.status = "idle"
+            owner.current_plan_run_id = None
+            await db.commit()
+
+    async def _run_plan_run_lifecycle(
+        self,
+        instance_id: int,
+        run_id: int,
+        generation: int,
+    ) -> None:
+        from backend.services.plan_agent_runner import (
+            PlanAgentCleanupError,
+            PlanAgentRunner,
+        )
+
+        lifecycle = asyncio.current_task()
+        runner = PlanAgentRunner(
+            db_factory=self.db_factory,
+            instance_manager=self.instance_manager,
+            claude_pool=self.pool,
+            codex_pool=self.codex_pool,
+            cloudrouter_store=self.cloudrouter_store,
+            broadcaster=self.broadcaster,
+        )
+        try:
+            async with self.db_factory() as db:
+                run = await db.get(PlanAgentRun, run_id)
+                plan = await db.get(Plan, run.plan_id) if run is not None and run.plan_id else None
+                if (
+                    run is None
+                    or plan is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.instance_id != instance_id
+                    or plan.active_run_id != run.id
+                ):
+                    return
+                cwd = plan.target_repo or os.getcwd()
+            result = await runner.advance_versioned(run_id, cwd=cwd)
+            if result == "queued":
+                self.wake()
+        except asyncio.CancelledError:
+            # Maintenance shutdown may cancel the coroutine after its exact
+            # disposable turn is cleaned. Preserve the durable Run for replay;
+            # a user cancellation has already changed its generation/status.
+            try:
+                await runner.defer_versioned_run(run_id, generation)
+            finally:
+                raise
+        except PlanAgentCleanupError as exc:
+            logger.exception("Plan Run %s cleanup could not be confirmed", run_id)
+            await runner.fail_versioned_run(run_id, generation, str(exc))
+        except Exception as exc:
+            logger.exception("Plan Run %s failed", run_id)
+            await runner.fail_versioned_run(run_id, generation, str(exc))
+        finally:
+            try:
+                await _settle_despite_cancellation(
+                    self._cleanup_plan_run_owner(
+                        instance_id=instance_id,
+                        run_id=run_id,
+                        generation=generation,
+                    )
+                )
+            finally:
+                if self._running_tasks.get(instance_id) is lifecycle:
+                    self._running_tasks.pop(instance_id, None)
+
     async def _dispatch_loop(self):
         """Dispatch pending tasks, event-driven with a low-frequency poll fallback."""
         while self._running:
@@ -2439,6 +2802,7 @@ class GlobalDispatcher:
                 try:
                     async with self.task_start_guard():
                         await self._dispatch_worker_tasks()
+                        await self._dispatch_worker_plan_runs()
                 except TaskStartPausedError:
                     pass
 
@@ -2449,6 +2813,7 @@ class GlobalDispatcher:
                     instance = None
                     claim_token = None
                     task = None
+                    plan_run_claim: tuple[int, int] | None = None
                     lifecycle_registered = False
                     try:
                         # The durable pending -> in_progress transition is the
@@ -2468,15 +2833,47 @@ class GlobalDispatcher:
                                     in self._account_routing_not_before.items()
                                     if deadline > now
                                 }
-                                task = await queue.dequeue(
-                                    exclude_ids=set(
-                                        self._account_routing_not_before
-                                    ),
-                                    instance_id=instance.id,
-                                )
+                                if self._prefer_plan_runs:
+                                    plan_run_claim = await self._claim_plan_run(
+                                        db,
+                                        instance=instance,
+                                    )
+                                if plan_run_claim is None:
+                                    task = await queue.dequeue(
+                                        exclude_ids=set(
+                                            self._account_routing_not_before
+                                        ),
+                                        instance_id=instance.id,
+                                    )
+                                if task is None and plan_run_claim is None:
+                                    plan_run_claim = await self._claim_plan_run(
+                                        db,
+                                        instance=instance,
+                                    )
 
-                        if task is None:
+                        if task is None and plan_run_claim is None:
                             break
+
+                        if plan_run_claim is not None:
+                            run_id, run_generation = plan_run_claim
+                            logger.info(
+                                "Dispatching Plan Run %s generation %s to instance %s",
+                                run_id,
+                                run_generation,
+                                instance.id,
+                            )
+                            lifecycle = asyncio.create_task(
+                                self._run_plan_run_lifecycle(
+                                    instance.id,
+                                    run_id,
+                                    run_generation,
+                                )
+                            )
+                            setattr(lifecycle, "_ccm_plan_run_id", run_id)
+                            self._running_tasks[instance.id] = lifecycle
+                            self._prefer_plan_runs = False
+                            lifecycle_registered = True
+                            continue
 
                         # Resolve project -> target_repo + git config
                         merged: dict = {}
@@ -2516,6 +2913,7 @@ class GlobalDispatcher:
                         # on the same slot cannot block the old Task's chat.
                         setattr(lifecycle, "_ccm_task_id", task.id)
                         self._running_tasks[instance.id] = lifecycle
+                        self._prefer_plan_runs = True
                         lifecycle_registered = True
                     except TaskStartPausedError:
                         break
@@ -2527,6 +2925,12 @@ class GlobalDispatcher:
                                     "dispatcher stopped before launch",
                                     instance_id=instance.id,
                                 )
+                        if plan_run_claim is not None and instance is not None:
+                            await self._cleanup_plan_run_owner(
+                                instance_id=instance.id,
+                                run_id=plan_run_claim[0],
+                                generation=plan_run_claim[1],
+                            )
                         raise
                     except Exception as exc:
                         logger.exception("Failed to prepare a claimed task for launch")
@@ -2544,6 +2948,12 @@ class GlobalDispatcher:
                                 await broadcast_status_change(
                                     task.id, "pending", instance.id
                                 )
+                        if plan_run_claim is not None and instance is not None:
+                            await self._cleanup_plan_run_owner(
+                                instance_id=instance.id,
+                                run_id=plan_run_claim[0],
+                                generation=plan_run_claim[1],
+                            )
                     finally:
                         # Once registered, _running_tasks is the admission
                         # guard.  Otherwise this releases a failed/no-task
@@ -2764,6 +3174,251 @@ class GlobalDispatcher:
                             resulting_generation,
                             extra={"old_status": "in_progress"},
                         )
+
+    async def _dispatch_worker_plan_runs(self) -> None:
+        """Claim Manager-owned PlanRuns whose execution belongs to a Worker."""
+
+        from backend.main import worker_proxy
+        from backend.models.worker import Worker
+        from backend.services.plan_service import plan_operation_lock
+
+        if worker_proxy is None:
+            return
+        async with self.db_factory() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(PlanAgentRun.id, PlanAgentRun.plan_id)
+                        .join(Plan, Plan.id == PlanAgentRun.plan_id)
+                        .join(Worker, Worker.id == PlanAgentRun.worker_id)
+                        .where(
+                            PlanAgentRun.status == "queued",
+                            PlanAgentRun.worker_id.isnot(None),
+                            Plan.active_run_id == PlanAgentRun.id,
+                            Plan.archived_at.is_(None),
+                            Plan.worker_id == PlanAgentRun.worker_id,
+                            Worker.status == "ready",
+                        )
+                        .order_by(
+                            Plan.priority.asc(),
+                            PlanAgentRun.created_at.asc(),
+                            PlanAgentRun.id.asc(),
+                        )
+                    )
+                ).all()
+            )
+        for run_id, plan_id in rows:
+            key = f"worker-plan-{run_id}"
+            existing = self._running_tasks.get(key)
+            if existing is not None and not existing.done():
+                continue
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    current = await db.get(PlanAgentRun, run_id)
+                    plan = await db.get(Plan, plan_id)
+                    if (
+                        current is None
+                        or plan is None
+                        or current.status != "queued"
+                        or current.worker_id is None
+                        or plan.worker_id != current.worker_id
+                        or plan.active_run_id != current.id
+                    ):
+                        continue
+                    worker = await db.get(Worker, current.worker_id)
+                    if worker is None or worker.status != "ready":
+                        continue
+                    running_tasks = int(
+                        await db.scalar(
+                            select(func.count(Task.id)).where(
+                                Task.worker_id == worker.id,
+                                Task.status.in_(["in_progress", "executing"]),
+                            )
+                        )
+                        or 0
+                    )
+                    running_plans = int(
+                        await db.scalar(
+                            select(func.count(PlanAgentRun.id)).where(
+                                PlanAgentRun.worker_id == worker.id,
+                                PlanAgentRun.status == "running",
+                            )
+                        )
+                        or 0
+                    )
+                    if running_tasks + running_plans >= worker.max_tasks:
+                        continue
+                    generation = current.generation
+                    worker_id = current.worker_id
+                    claimed = await db.execute(
+                        update(PlanAgentRun)
+                        .where(
+                            PlanAgentRun.id == run_id,
+                            PlanAgentRun.plan_id == plan_id,
+                            PlanAgentRun.worker_id == worker_id,
+                            PlanAgentRun.status == "queued",
+                            PlanAgentRun.generation == generation,
+                        )
+                        .values(status="running", updated_at=datetime.utcnow())
+                    )
+                    if claimed.rowcount != 1:
+                        await db.rollback()
+                        continue
+                    await db.commit()
+            lifecycle = asyncio.create_task(
+                self._run_worker_plan_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                )
+            )
+            setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
+            self._running_tasks[key] = lifecycle
+            lifecycle.add_done_callback(
+                lambda finished, k=key: self._remove_running_task_if_same(k, finished)
+            )
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status="running",
+                stage=current.current_stage,
+                round_number=current.round,
+            )
+
+    @staticmethod
+    def _worker_plan_failure_is_permanent(exc: Exception) -> bool:
+        if isinstance(exc, HTTPException):
+            return exc.status_code < 500 and exc.status_code != 429
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            return status < 500 and status != 429
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "does not support versioned plan protocol",
+                "protocol mismatch",
+                "collides with local data",
+                "invalid plan run",
+                "invalid plan version",
+            )
+        )
+
+    async def _run_worker_plan_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+    ) -> None:
+        from backend.main import worker_proxy
+        from backend.services.plan_service import (
+            apply_worker_plan_outcome,
+            plan_operation_lock,
+        )
+
+        try:
+            async with self.db_factory() as db:
+                plan = await db.get(Plan, plan_id)
+                run = await db.get(PlanAgentRun, run_id)
+                if plan is None or run is None:
+                    return
+            payload = await worker_proxy.run_versioned_plan_until_pause(plan, run)
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    current_plan = await db.get(Plan, plan_id, with_for_update=True)
+                    current_run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+                    if current_plan is None or current_run is None:
+                        return
+                    imported = await apply_worker_plan_outcome(
+                        db,
+                        plan=current_plan,
+                        run=current_run,
+                        worker_id=worker_id,
+                        expected_generation=generation,
+                        payload=payload,
+                    )
+                    status = imported.status
+                    stage = imported.current_stage
+                    round_number = imported.round
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status=status,
+                stage=stage,
+                round_number=round_number,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            permanent = self._worker_plan_failure_is_permanent(exc)
+            logger.exception(
+                "Worker Plan Run %s %s",
+                run_id,
+                "failed" if permanent else "was deferred",
+            )
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+                    plan = await db.get(Plan, plan_id, with_for_update=True)
+                    if (
+                        run is None
+                        or plan is None
+                        or run.status != "running"
+                        or run.generation != generation
+                        or run.worker_id != worker_id
+                        or plan.active_run_id != run.id
+                    ):
+                        return
+                    now = datetime.utcnow()
+                    if permanent:
+                        run.status = "failed"
+                        run.current_stage = "failed"
+                        run.error = str(exc)[:4000]
+                        run.finished_at = now
+                        plan.active_run_id = None
+                    else:
+                        run.status = "queued"
+                    run.updated_at = now
+                    plan.lock_version += 1
+                    plan.updated_at = now
+                    await db.commit()
+                    status = run.status
+                    stage = run.current_stage
+                    round_number = run.round
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status=status,
+                stage=stage,
+                round_number=round_number,
+            )
+
+    async def _broadcast_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        status: str,
+        stage: str,
+        round_number: int,
+    ) -> None:
+        try:
+            await self.broadcaster.broadcast(
+                "plans",
+                {
+                    "event": "plan_run_change",
+                    "plan_id": plan_id,
+                    "run_id": run_id,
+                    "status": status,
+                    "stage": stage,
+                    "round": round_number,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to broadcast Worker Plan Run %s", run_id)
 
     async def _pool_select(
         self,
@@ -6090,7 +6745,6 @@ class GlobalDispatcher:
         telling us whether to continue, stop (done), or give up (abort).
         The backend never parses the todo file — Claude owns that logic entirely.
         """
-        import json
         from pathlib import Path
 
         signal_path = Path(cwd) / ".claude-manager" / f"loop_signal_{task.id}.json"

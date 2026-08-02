@@ -31,6 +31,7 @@ from sqlalchemy import JSON, and_, or_, select, update
 
 from backend.config import settings
 from backend.models.project import Project
+from backend.models.plan import Plan
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
@@ -297,6 +298,21 @@ class TaskMigrator:
                 )
             from backend.services.plan_tasks import ACTIVE_PLAN_STATUSES
 
+            blocking_versioned_plan_id = await db.scalar(
+                select(Plan.id)
+                .where(
+                    Plan.target_task_id == task_id,
+                    Plan.archived_at.is_(None),
+                    Plan.active_run_id.isnot(None),
+                )
+                .limit(1)
+            )
+            if blocking_versioned_plan_id is not None:
+                raise MigrationError(
+                    f"关联 Plan #{blocking_versioned_plan_id} 仍有 active Run，"
+                    "完成或取消后再迁移目标 Task"
+                )
+
             blocking_plan_id = await db.scalar(
                 select(Task.id)
                 .where(
@@ -389,6 +405,18 @@ class TaskMigrator:
         try:
             if claim_cancellation is not None:
                 raise claim_cancellation
+            # The Plan admission path fences on this exact Task row before it
+            # commits an active Run. Recheck after our claim so either commit
+            # ordering is safe: migration-first rejects the Run; Run-first
+            # makes this migration restore its claim before external effects.
+            blocking_versioned_plan_id = await self._active_versioned_plan_id(
+                task_id
+            )
+            if blocking_versioned_plan_id is not None:
+                raise MigrationError(
+                    f"关联 Plan #{blocking_versioned_plan_id} 仍有 active Run，"
+                    "完成或取消后再迁移目标 Task"
+                )
             await self._broadcast_status(task_id, prev_status, "migrating")
 
             # 1. 源是 worker：先把 relay 收不到的字段同步回来（session_id/last_cwd）
@@ -522,6 +550,18 @@ class TaskMigrator:
     async def _get_worker(self, worker_id: int) -> Worker | None:
         async with self.db_factory() as db:
             return await db.get(Worker, worker_id)
+
+    async def _active_versioned_plan_id(self, task_id: int) -> int | None:
+        async with self.db_factory() as db:
+            return await db.scalar(
+                select(Plan.id)
+                .where(
+                    Plan.target_task_id == task_id,
+                    Plan.archived_at.is_(None),
+                    Plan.active_run_id.isnot(None),
+                )
+                .limit(1)
+            )
 
     async def _read_claimed_task(
         self,

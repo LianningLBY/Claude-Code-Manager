@@ -14,9 +14,12 @@ from weakref import WeakKeyDictionary
 
 import httpx
 from fastapi import HTTPException
+from sqlalchemy import select
 
 from backend.config import settings
 from backend.models.project import Project
+from backend.models.plan import Plan, PlanInputRequest, PlanVersion
+from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
@@ -96,6 +99,289 @@ class WorkerProxy:
                 "请等待 Worker 恢复或将 task 切回本机执行。",
             )
         return worker
+
+    async def _require_versioned_plan_protocol(self, worker: Worker) -> None:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(worker, "/api/system/config"),
+                headers=self._headers(worker),
+            )
+            response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("versioned_plan_worker_protocol") != 1
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} does not support versioned Plan protocol 1"
+            )
+
+    @staticmethod
+    def _plan_attachment_payload(
+        items: list[dict] | None,
+    ) -> tuple[list[str], list[str], list[dict]]:
+        rows = [item for item in (items or []) if isinstance(item, dict)]
+        paths = [item["path"] for item in rows if isinstance(item.get("path"), str)]
+        if len(paths) != len(rows):
+            raise RuntimeError("Plan attachment mirror is missing a validated path")
+        images = [
+            item["path"]
+            for item in rows
+            if item.get("is_image") is True
+        ]
+        public = [
+            {key: item[key] for key in ("url", "name", "is_image")}
+            for item in rows
+        ]
+        return paths, images, public
+
+    @staticmethod
+    def _version_seed(version: PlanVersion) -> dict:
+        return {
+            "source_version_id": version.id,
+            "version_number": version.version_number,
+            "content": version.content,
+            "context_session_id": version.context_session_id,
+            "context_log_id": version.context_log_id,
+            "context_snapshot": version.context_snapshot,
+            "repo_revision": version.repo_revision,
+            "review_verdict": version.review_verdict,
+            "review_feedback": version.review_feedback,
+            "review_exhausted": version.review_exhausted,
+            "reviewed_at": (
+                version.reviewed_at.isoformat()
+                if version.reviewed_at is not None
+                else None
+            ),
+            "human_decision": version.human_decision,
+        }
+
+    async def run_versioned_plan_until_pause(
+        self,
+        plan: Plan,
+        run: PlanAgentRun,
+    ) -> dict:
+        """Mirror/resume one Manager PlanRun and return an authoritative pause."""
+
+        if plan.worker_id is None or run.worker_id != plan.worker_id:
+            raise RuntimeError("Plan Run Worker assignment changed before forwarding")
+        worker = await self.require_ready_worker(plan.worker_id)
+        await self._require_versioned_plan_protocol(worker)
+        worker_project_id = (
+            await self.ensure_worker_project(worker, plan)
+            if plan.project_id is not None
+            else None
+        )
+        plan_paths, plan_images, plan_attachments = self._plan_attachment_payload(
+            plan.initial_attachments
+        )
+        run_paths, run_images, run_attachments = self._plan_attachment_payload(
+            run.attachments
+        )
+        paths = list(dict.fromkeys([*plan_paths, *run_paths]))
+        if paths:
+            await self.push_files(worker, paths)
+
+        base_version = None
+        if run.base_version_id is not None:
+            async with self.db_factory() as db:
+                base_version = await db.get(PlanVersion, run.base_version_id)
+            if base_version is None:
+                raise RuntimeError("Plan Run base Version disappeared before forwarding")
+        request_text = run.request_text or plan.initial_request
+        base_seed = self._version_seed(base_version) if base_version is not None else None
+        if run.run_type == "fork" and base_version is not None:
+            request_text = (
+                f"{request_text}\n\n[Base Version selected for this fork]\n"
+                f"{base_version.content}"
+            )
+            # A fork starts a fresh Version sequence; materializing its source
+            # inside the new Plan would incorrectly make the first output vN+1.
+            base_seed = None
+
+        payload = {
+            "protocol": 1,
+            "plan_id": plan.id,
+            "run_id": run.id,
+            "run_generation": run.generation,
+            "title": plan.title,
+            "initial_request": plan.initial_request,
+            "target_task_id": plan.target_task_id,
+            "project_id": worker_project_id,
+            "target_branch": plan.target_branch,
+            "priority": plan.priority,
+            "timeout_hours": plan.timeout_hours,
+            "pipeline_config": run.pipeline_config or plan.pipeline_config,
+            "run_type": run.run_type,
+            "request_text": request_text,
+            "context_session_id": run.context_session_id,
+            "context_log_id": run.context_log_id,
+            "context_snapshot": run.context_snapshot,
+            "repo_revision": run.repo_revision,
+            "max_interactions": run.max_interactions,
+            "base_version": base_seed,
+            "file_paths": run_paths or plan_paths or None,
+            "image_paths": run_images or plan_images or None,
+            "attachments": run_attachments or plan_attachments or None,
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self._api(worker, "/api/plans/worker-import"),
+                headers=self._headers(worker),
+                json=payload,
+            )
+            response.raise_for_status()
+            imported = response.json()
+        remote_run = imported.get("run") if isinstance(imported, dict) else None
+        base_worker_version_id = (
+            imported.get("base_worker_version_id")
+            if isinstance(imported, dict)
+            else None
+        )
+        if not isinstance(remote_run, dict) or remote_run.get("id") != run.id:
+            raise RuntimeError("Worker returned an invalid Plan Run import receipt")
+
+        if remote_run.get("status") == "waiting_user":
+            remote_input_id = remote_run.get("open_input_request_id")
+            async with self.db_factory() as db:
+                answer = (
+                    await db.execute(
+                        select(PlanInputRequest)
+                        .where(
+                            PlanInputRequest.run_id == run.id,
+                            PlanInputRequest.worker_id == worker.id,
+                            PlanInputRequest.worker_input_request_id == remote_input_id,
+                            PlanInputRequest.status == "answered",
+                        )
+                        .order_by(PlanInputRequest.id.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+            if answer is not None:
+                answer_paths, answer_images, answer_attachments = (
+                    self._plan_attachment_payload(answer.attachments)
+                )
+                if answer_paths:
+                    await self.push_files(worker, answer_paths)
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(
+                        self._api(
+                            worker,
+                            f"/api/plan-runs/{run.id}/input-requests/{remote_input_id}/answer",
+                        ),
+                        headers=self._headers(worker),
+                        json={
+                            "expected_run_generation": remote_run["generation"],
+                            "idempotency_key": answer.answer_idempotency_key,
+                            "answers": answer.answers or [],
+                            "response_text": answer.response_text,
+                            "file_paths": answer_paths or None,
+                            "image_paths": answer_images or None,
+                            "attachments": answer_attachments or None,
+                        },
+                    )
+                    response.raise_for_status()
+                remote_run["status"] = "queued"
+
+        timeout_seconds = (
+            plan.timeout_hours * 3600
+            if plan.timeout_hours is not None and plan.timeout_hours > 0
+            else (
+                None
+                if plan.timeout_hours == 0
+                else settings.task_timeout_seconds
+            )
+        )
+        deadline = (
+            asyncio.get_running_loop().time() + max(300.0, timeout_seconds + 300)
+            if timeout_seconds is not None
+            else None
+        )
+        while remote_run.get("status") in {"queued", "running"}:
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError("Worker Plan Run outcome polling timed out")
+            await asyncio.sleep(1)
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, f"/api/plan-runs/{run.id}"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+                remote_run = response.json()
+            if not isinstance(remote_run, dict) or remote_run.get("id") != run.id:
+                raise RuntimeError("Worker returned an invalid Plan Run snapshot")
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(worker, f"/api/plans/{plan.id}/versions"),
+                headers=self._headers(worker),
+            )
+            response.raise_for_status()
+            versions = response.json()
+        if not isinstance(versions, list):
+            raise RuntimeError("Worker returned an invalid Plan Version list")
+        versions = [
+            version
+            for version in versions
+            if isinstance(version, dict)
+            and version.get("produced_by_run_id") == run.id
+        ]
+        return {
+            "protocol": 1,
+            "base_worker_version_id": base_worker_version_id,
+            "run": remote_run,
+            "versions": versions,
+        }
+
+    async def materialize_plan_version(
+        self,
+        *,
+        worker: Worker,
+        plan: Plan,
+        version: PlanVersion,
+    ) -> int:
+        """Ensure an exact immutable Version exists on the target Worker."""
+
+        await self._require_versioned_plan_protocol(worker)
+        worker_project_id = (
+            await self.ensure_worker_project(worker, plan)
+            if plan.project_id is not None
+            else None
+        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self._api(worker, "/api/plans/worker-materialize-version"),
+                headers=self._headers(worker),
+                json={
+                    "protocol": 1,
+                    "plan_id": plan.id,
+                    "title": plan.title,
+                    "initial_request": plan.initial_request,
+                    "target_task_id": plan.target_task_id,
+                    "project_id": worker_project_id,
+                    "target_branch": plan.target_branch,
+                    "priority": plan.priority,
+                    "timeout_hours": plan.timeout_hours,
+                    "pipeline_config": plan.pipeline_config,
+                    "version": self._version_seed(version),
+                },
+            )
+            response.raise_for_status()
+            receipt = response.json()
+        remote_id = receipt.get("id") if isinstance(receipt, dict) else None
+        if isinstance(remote_id, bool) or not isinstance(remote_id, int):
+            raise RuntimeError("Worker returned an invalid Version materialization receipt")
+        return remote_id
+
+    async def cancel_versioned_plan_run(self, worker_id: int, run_id: int) -> None:
+        worker = await self.require_ready_worker(worker_id)
+        await self._require_versioned_plan_protocol(worker)
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                self._api(worker, f"/api/plan-runs/{run_id}/cancel"),
+                headers=self._headers(worker),
+            )
+        response.raise_for_status()
 
     # ------------------------------------------------------------------
     # 项目映射（设计 §8）

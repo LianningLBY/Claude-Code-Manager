@@ -27,6 +27,7 @@ claude-manager/
 │   ├── api/                     # 路由
 │   │   ├── tasks.py             # 任务 CRUD + plan 审批 + conflict 解决
 │   │   ├── plans.py             # 关联 Plan 历史/stale/revision/执行 Task
+│   │   ├── plan_resources.py    # 一等 Plan/Version/Run/Input/Application API
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop 控制 + Dispatcher 端点
 │   │   ├── projects.py          # Project CRUD + git clone
@@ -46,6 +47,7 @@ claude-manager/
 │   ├── models/                  # SQLAlchemy ORM 模型
 │   │   ├── task.py              # Task (含 session_id, last_cwd, project_id, enabled_skills)
 │   │   ├── plan_agent.py        # Planner/Reviewer run + step 审计
+│   │   ├── plan.py              # Plan/Version/Input/Application 聚合模型
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── project_todo.py      # ProjectTodo (per-project prompt 模板/清单, status open/done/archived, created_task_id 溯源)
@@ -70,6 +72,7 @@ claude-manager/
 │       ├── goal_evaluator.py    # Goal 条件评估器 (Claude/Codex provider 分流)
 │       ├── plan_agent_runner.py # 严格只读 Planner/Reviewer pipeline + exact process cleanup
 │       ├── plan_tasks.py        # Plan 上下文快照、repo 指纹、stale/附件校验
+│       ├── plan_service.py      # Version 状态机、输入、审批与 Worker outcome 导入
 │       ├── mcp_config.py        # Provider-neutral MCP specs + Claude/Codex renderers
 │       ├── skill_context.py     # Task-scoped 普通/User Skill 目录与 provider adapter
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
@@ -190,7 +193,7 @@ claude-manager/
 - **Android App**: Capacitor 打包，API/WS 地址通过 `config/server.ts` 动态获取，LoginPage 可展开配置 Server URL
 - **Goal 模式**: `mode="goal"` 任务使用自然语言完成条件（`goal_condition`），每 turn 后由独立评估器判断是否达成，使用 provider 原生 session resume 保持上下文。评估器跟随 Task provider：Claude 走 `claude -p`，Codex 走绑定账号的 ephemeral `codex exec`；Codex evaluator 的 usage-limit/auth 失败会换号后只重试评估，不重复工作 turn
 - **Goal 评估器**: `GoalEvaluator`（`backend/services/goal_evaluator.py`）读取对话日志摘要，发给轻量模型判断条件是否满足。Claude 默认 `claude-haiku-4-5`，Codex 使用 `default_codex_goal_evaluator_model`，均可由 `goal_evaluator_model` 覆盖；进程超时/非零退出属于运行错误，不得误记为“目标未达成”并消耗 turn
-- **独立 Plan Task（2026-07-30）**: Plan 永远是独立 `mode=plan` Task，不是可续聊原生 session；session 内 Plan 用 `plan_target_task_id` 关联目标 Task，可并行最多 3 个，创建时固化有界对话快照与 HEAD/dirty 指纹。Planner/Reviewer 的 primary/fallback `{provider,model,effort}` 与最大总轮数只在独立 Admin Settings 页全局配置，创建 Plan 时从 `GlobalSettings.plan_pipeline_config` 固化快照（环境变量仅作未配置回退），创建表单不得逐次覆盖；默认 Planner `claude-fable-5` → `gpt-5.6-terra`、Reviewer `gpt-5.6-sol` → `claude-sonnet-5`，默认总计最多 2 个 Planning/Reviewing round，不能解释成初始轮加 2 次修订。选号必须复用 ClaudePool/CodexPool：同 route 先耗尽兼容账号，primary 不可用才进 fallback，两路均不可用直接 fail，禁止进入普通 Task 通用重试。Claude 只开放 Read/Grep/Glob 且禁 Bash/MCP/子 agent；Codex 必须复用对应 `CODEX_HOME` 常驻 App Server，但新建 disposable read-only thread，whole-map 空 MCP、untrusted project、禁 autonomous features，终态 `thread/delete`，绝不能 resume 主 Task thread；Plan Agent 只允许显式 Standard，禁止把 Fast Task 静默降级。run/step 必须记录请求配置、实际 route slot 和账号；二者走账号池、CloudRouter admission、transient retry 与 exact lifecycle cleanup，但不复用只判断 goal 的 `GoalEvaluator` 语义。Dispatcher 与 legacy Ralph 都必须注册可按 Task 精确取消的 Plan lifecycle，cancel/stop 在发布终态前先证明进程/turn/thread 已回收。approve/reject 只更新 Plan，绝不 wake/enqueue/自动回填；关联 Plan 经下一条真实 chat 的显式 `plan_task_ids` 绑定并只应用一次，standalone approve 后显式创建新的 auto Task。会话内 Plans UI 使用桌面双栏弹层、移动端列表 Sheet→全屏详情；“Approve & attach”只是 approve 后显式选中 composer chip，“Approve only”不得隐式附加。用户 Revise 必须新建独立 Plan Task，并在同一事务将旧版置为 `superseded`、记录双向版本链；旧版内容/审计保留但后端禁止再 approve/reject/revise。stale 对话/repo 默认 409 二次确认；active/plan_review/approved-but-unapplied Plan 阻止目标迁移，关联 Plan 不可单独迁移。跨 Worker 的 `plan_approved_by`、`plan_applied_log_id`、`plan_execution_task_id` 是 Manager-local ID，严禁 Worker mirror 覆盖。完整设计/验收见 `docs/plans/plan-agent-design.md`
+- **交互式版本化 Plan（2026-08-02）**: 新 Plan 不再创建 `Task(mode=plan)`；`Plan` 是稳定聚合根，完整 Markdown 每次写入不可变 `PlanVersion`，一次规划执行是可暂停/恢复的 `PlanAgentRun`，Planner/Reviewer 的必要问题持久化为 `PlanInputRequest`。同一请求的问题数量没有业务上限；`plan_max_interactions` 只限制一个 Run 的暂停/回答轮数。澄清回答恢复同一 Run，用户 Revise 在同一 Plan 下创建新 Run，Fork 才创建新 Plan。等待用户时必须释放 Instance/process/thread/account 与 update blocker。approve/reject/apply/create-execution-task 都绑定 exact Version；approve 不自动唤醒主 Task，真实 chat 通过 `plan_version_ids` 应用一次并保存 Version 快照。Dispatcher 以 `Instance.current_plan_run_id` 和 generation CAS 直接领取本地 Run；Manager 是 Worker Plan/Version/Input/Application 的权威，Worker protocol v1 只持久镜像并执行，断线时答案留在 Manager，恢复后继续，跨 Worker Apply 会先 materialize exact Version。旧 `Task.plan_*`、`plan_task_ids` 与 `docs/plans/plan-agent-design.md` 只作 legacy 兼容。完整设计/验收见 `docs/plans/interactive-versioned-plan-design.md`
 - **调度器**: `GlobalDispatcher` 只负责分配任务、启动 Claude Code、判断成败。所有 git 操作（worktree、commit、merge、push）全由 Claude Code 自主完成
 - **任务生命周期**: pending → in_progress → executing → completed（失败回 pending 重试）
 - **项目**: `Project` 模型管理 git repo，支持 clone 已有仓库（has_remote=True）和本地 git init（has_remote=False）

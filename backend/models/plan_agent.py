@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -14,7 +14,30 @@ class PlanAgentRun(Base):
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
     )
-    plan_task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # Nullable legacy mapping during cutover. New runs are owned by ``plan_id``.
+    plan_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    run_type: Mapped[str] = mapped_column(String(30), nullable=False, default="legacy")
+    base_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    result_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attachments: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    context_session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    context_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    repo_revision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    current_stage: Mapped[str] = mapped_column(String(30), nullable=False, default="planner")
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    instance_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    worker_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    relay_origin: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    open_input_request_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    interaction_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_interactions: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    execution_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    last_execution_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     status: Mapped[str] = mapped_column(
         String(30), nullable=False, default="planning", index=True
     )
@@ -44,11 +67,22 @@ class PlanAgentRun(Base):
 
 class PlanAgentStep(Base):
     __tablename__ = "plan_agent_steps"
+    __table_args__ = (
+        UniqueConstraint(
+            "worker_id", "worker_step_id", name="uq_plan_steps_worker_id"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
     )
     run_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    worker_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    worker_step_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_request_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     step_type: Mapped[str] = mapped_column(String(20), nullable=False)
     round: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     provider: Mapped[str] = mapped_column(String(20), nullable=False)

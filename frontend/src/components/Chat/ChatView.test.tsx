@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ChatView } from './ChatView';
-import type { Task, Project, ChatMessage } from '../../api/client';
+import type { Task, Project, ChatMessage, PlanResource, PlanVersion } from '../../api/client';
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
@@ -58,6 +58,16 @@ vi.mock('../../api/client', () => ({
     rejectPlan: vi.fn().mockResolvedValue({}),
     revisePlan: vi.fn().mockResolvedValue({}),
     cancelTask: vi.fn().mockResolvedValue({}),
+    listPlans: vi.fn().mockResolvedValue([]),
+    createPlan: vi.fn().mockResolvedValue({}),
+    listPlanVersions: vi.fn().mockResolvedValue([]),
+    listPlanResourceRuns: vi.fn().mockResolvedValue([]),
+    createPlanRun: vi.fn().mockResolvedValue({}),
+    approvePlanVersion: vi.fn().mockResolvedValue({}),
+    rejectPlanVersion: vi.fn().mockResolvedValue({}),
+    forkPlan: vi.fn().mockResolvedValue({}),
+    cancelPlanRun: vi.fn().mockResolvedValue({}),
+    answerPlanInput: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -130,6 +140,65 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   };
 }
 
+function makePlanVersion(overrides: Partial<PlanVersion> = {}): PlanVersion {
+  return {
+    id: 501,
+    plan_id: 80,
+    version_number: 1,
+    parent_version_id: null,
+    produced_by_run_id: 700,
+    content: '# Candidate Plan',
+    context_session_id: 'session-123',
+    context_log_id: 1,
+    repo_revision: null,
+    review_verdict: 'approve',
+    review_feedback: null,
+    review_exhausted: false,
+    reviewed_at: '2026-08-02T08:00:00Z',
+    human_decision: 'pending',
+    decided_at: null,
+    decided_by: null,
+    superseded_by_version_id: null,
+    applied: false,
+    created_at: '2026-08-02T08:00:00Z',
+    ...overrides,
+  };
+}
+
+function makePlan(overrides: Partial<PlanResource> = {}): PlanResource {
+  const version = makePlanVersion();
+  return {
+    id: 80,
+    title: 'Versioned Plan',
+    initial_request: 'Design the change',
+    initial_attachments: null,
+    target_task_id: 1,
+    project_id: null,
+    target_repo: '/tmp',
+    target_branch: 'main',
+    worker_id: null,
+    priority: 0,
+    timeout_hours: null,
+    created_by: null,
+    current_version_id: version.id,
+    active_run_id: null,
+    forked_from_version_id: null,
+    archived_at: null,
+    closed_at: null,
+    lock_version: 0,
+    created_at: '2026-08-02T08:00:00Z',
+    updated_at: '2026-08-02T08:00:00Z',
+    display_state: 'awaiting_review',
+    legacy: false,
+    latest_run_status: 'completed',
+    latest_run_error: null,
+    current_version: version,
+    active_run: null,
+    open_input_request: null,
+    ...overrides,
+  };
+}
+
 describe('ChatView', () => {
   const projects: Project[] = [];
   const onBack = vi.fn();
@@ -141,6 +210,8 @@ describe('ChatView', () => {
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getPlanStaleness as ReturnType<typeof vi.fn>).mockResolvedValue({
       stale: false,
       reasons: [],
@@ -2091,6 +2162,8 @@ describe('independent Plan attachments', () => {
     localStorage.removeItem('ccm-plan-dismissed-1');
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
+    (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -2104,6 +2177,7 @@ describe('independent Plan attachments', () => {
   });
 
   it('creates an associated Plan using the global pipeline settings', async () => {
+    (api.createPlan as ReturnType<typeof vi.fn>).mockResolvedValue(makePlan());
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
@@ -2115,10 +2189,11 @@ describe('independent Plan attachments', () => {
     );
     await userEvent.click(screen.getByRole('button', { name: 'Create Plan' }));
 
-    await waitFor(() => expect(api.createRelatedPlan).toHaveBeenCalledWith(
-      1,
-      { input: 'Design the migration' },
-    ));
+    await waitFor(() => expect(api.createPlan).toHaveBeenCalledWith({
+      input: 'Design the migration',
+      target_task_id: 1,
+    }));
+    expect(api.createRelatedPlan).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: 'Models' })).not.toBeInTheDocument();
   });
 
@@ -2156,6 +2231,7 @@ describe('independent Plan attachments', () => {
   });
 
   it('creates an associated Plan with uploaded files from the modal composer', async () => {
+    (api.createPlan as ReturnType<typeof vi.fn>).mockResolvedValue(makePlan());
     (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
       id: 'plan-upload',
       filename: 'design-notes.txt',
@@ -2179,8 +2255,9 @@ describe('independent Plan attachments', () => {
     );
     await userEvent.click(screen.getByRole('button', { name: 'Create Plan' }));
 
-    await waitFor(() => expect(api.createRelatedPlan).toHaveBeenCalledWith(1, {
+    await waitFor(() => expect(api.createPlan).toHaveBeenCalledWith({
       input: 'Use the attached design notes',
+      target_task_id: 1,
       file_paths: ['/srv/uploads/design-notes.txt'],
       image_paths: [],
       attachments: [{
@@ -2196,65 +2273,44 @@ describe('independent Plan attachments', () => {
   });
 
   it('updates an associated Plan stage and ready state in real time', async () => {
-    const plan = makeTask({
-      id: 80,
-      title: 'Live Plan',
-      mode: 'plan',
-      status: 'executing',
-      plan_stage: 'planning',
-      plan_stage_round: 1,
-      plan_target_task_id: 1,
+    const activeRun = {
+      id: 700, plan_id: 80, run_type: 'initial', status: 'running',
+      current_stage: 'planner', base_version_id: null, result_version_id: null,
+      request_text: 'Design', round: 1, generation: 1, instance_id: 2,
+      worker_id: null, open_input_request_id: null, interaction_count: 0,
+      max_interactions: 3, execution_seconds: 0, last_execution_started_at: null,
+      review_verdict: null,
+      review_feedback: null, review_exhausted: false, error: null,
+      created_at: '2026-08-02T08:00:00Z', updated_at: '2026-08-02T08:00:00Z',
+      finished_at: null, steps: [], input_requests: [],
+    };
+    const running = makePlan({
+      title: 'Live Plan', display_state: 'planner', current_version_id: null,
+      current_version: null, active_run_id: 700, active_run: activeRun,
     });
-    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+    const ready = makePlan({ title: 'Live Plan' });
+    (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([running]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([ready.current_version]);
 
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
     expect((await screen.findAllByText('Planning')).length).toBeGreaterThan(0);
+    await userEvent.click(await screen.findByRole('button', { name: /#80 Live Plan/ }));
 
+    (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([ready]);
     act(() => {
       capturedOnMessage?.({
-        channel: 'tasks',
+        channel: 'plans',
         data: {
-          event: 'plan_stage_change',
-          task_id: 80,
-          plan_stage: 'reviewing',
-          plan_stage_round: 2,
-          plan_stage_provider: 'codex',
-          plan_stage_model: 'gpt-5.6-terra',
-          plan_stage_effort: 'xhigh',
-          plan_stage_route_slot: 'fallback',
+          event: 'plan_run_change',
+          plan_id: 80,
+          run_id: 700,
+          status: 'completed',
         },
       });
     });
-    expect((await screen.findAllByText('Reviewing · Round 2')).length).toBeGreaterThan(0);
-    expect(await screen.findByTestId('plan-pipeline-badge')).toHaveTextContent(
-      'Reviewer · gpt-5.6-terra',
-    );
-    expect(screen.getByTestId('plan-pipeline-badge')).toHaveTextContent('fallback');
-
-    act(() => {
-      capturedOnMessage?.({
-        channel: 'tasks',
-        data: {
-          event: 'plan_ready',
-          task_id: 80,
-        },
-      });
-    });
-    expect(await screen.findByRole('button', { name: 'Approve & attach' })).toBeInTheDocument();
-
-    act(() => {
-      capturedOnMessage?.({
-        channel: 'tasks',
-        data: {
-          event: 'status_change',
-          task_id: 80,
-          new_status: 'superseded',
-        },
-      });
-    });
-    expect((await screen.findAllByText('Superseded')).length).toBeGreaterThan(0);
-    expect(screen.queryByRole('button', { name: 'Approve & attach' })).not.toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /Approve & attach v1/ })).toBeInTheDocument();
+    expect(api.listPlans).toHaveBeenCalledWith({ target_task_id: 1 });
   });
 
   it('persists an approved Plan in the composer and sends its explicit id', async () => {
@@ -2296,90 +2352,66 @@ describe('independent Plan attachments', () => {
   });
 
   it('approves a Plan without sending a chat turn', async () => {
-    const plan = makeTask({
-      id: 82,
-      title: 'Review me',
-      mode: 'plan',
-      status: 'plan_review',
-      plan_content: 'A candidate Plan',
-      plan_approved: null,
-      plan_target_task_id: 1,
-    });
-    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
-    (api.approvePlan as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ...plan,
-      status: 'completed',
-      plan_approved: true,
+    const version = makePlanVersion({ id: 502, plan_id: 82 });
+    const plan = makePlan({ id: 82, title: 'Review me', current_version_id: 502, current_version: version });
+    const approved = makePlan({ ...plan, display_state: 'approved', current_version: { ...version, human_decision: 'approved' } });
+    let isApproved = false;
+    (api.listPlans as ReturnType<typeof vi.fn>).mockImplementation(async () => [isApproved ? approved : plan]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([version]);
+    (api.approvePlanVersion as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      isApproved = true;
+      return approved.current_version;
     });
 
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.click(await screen.findByRole('button', { name: /#82 Review me/ }));
     await userEvent.click(await screen.findByRole('button', { name: 'Approve only' }));
 
-    await waitFor(() => expect(api.approvePlan).toHaveBeenCalledWith(
-      82,
-      {
-        provider: 'claude',
-        model: null,
-        codex_service_tier: 'default',
-      },
-    ));
-    expect(JSON.parse(localStorage.getItem('ccm-plan-dismissed-1') || '[]')).toContain(82);
+    await waitFor(() => expect(api.approvePlanVersion).toHaveBeenCalledWith(502, 502, false));
     expect(api.sendTaskChat).not.toHaveBeenCalled();
   });
 
   it('approves and explicitly attaches a Plan to the next message', async () => {
-    const plan = makeTask({
-      id: 84,
-      title: 'Attach me',
-      mode: 'plan',
-      status: 'plan_review',
-      plan_content: 'A candidate Plan',
-      plan_approved: null,
-      plan_target_task_id: 1,
+    const version = makePlanVersion({ id: 504, plan_id: 84 });
+    const plan = makePlan({ id: 84, title: 'Attach me', current_version_id: 504, current_version: version });
+    const approved = makePlan({ ...plan, display_state: 'approved', current_version: { ...version, human_decision: 'approved' } });
+    let isApproved = false;
+    (api.listPlans as ReturnType<typeof vi.fn>).mockImplementation(async () => [isApproved ? approved : plan]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([version]);
+    (api.approvePlanVersion as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      isApproved = true;
+      return approved.current_version;
     });
-    const approved = {
-      ...plan,
-      status: 'completed',
-      plan_approved: true,
-      plan_applied_at: null,
-    };
-    (api.listRelatedPlans as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce([plan])
-      .mockResolvedValue([approved]);
-    (api.approvePlan as ReturnType<typeof vi.fn>).mockResolvedValue(approved);
 
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
-    await userEvent.click(await screen.findByRole('button', { name: 'Approve & attach' }));
+    await userEvent.click(await screen.findByRole('button', { name: /#84 Attach me/ }));
+    await userEvent.click(await screen.findByRole('button', { name: /Approve & attach v1/ }));
 
-    expect(await screen.findByText('Plan #84 · Attach me')).toBeInTheDocument();
-    expect(screen.queryByRole('dialog', { name: 'Plans for Task #1' })).not.toBeInTheDocument();
-    expect(JSON.parse(localStorage.getItem('ccm-plan-dismissed-1') || '[]')).not.toContain(84);
+    expect(await screen.findByText('Plan #84 · v1 · Attach me')).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Plans for Task #1' })).toBeInTheDocument();
   });
 
   it('creates a new related Plan when the user requests a revision', async () => {
-    const plan = makeTask({
-      id: 83,
-      title: 'Revise me',
-      mode: 'plan',
-      status: 'plan_review',
-      plan_content: 'A candidate Plan',
-      plan_approved: null,
-      plan_target_task_id: 1,
-    });
-    (api.listRelatedPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+    const version = makePlanVersion({ id: 503, plan_id: 83 });
+    const plan = makePlan({ id: 83, title: 'Revise me', current_version_id: 503, current_version: version });
+    (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([version]);
+    (api.createPlanRun as ReturnType<typeof vi.fn>).mockResolvedValue({});
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
     await userEvent.type(
-      await screen.findByPlaceholderText('Describe changes for a new revision…'),
+      await screen.findByPlaceholderText('Revision feedback…'),
       'Preserve backwards compatibility',
     );
     await userEvent.click(await screen.findByRole('button', { name: 'Revise' }));
 
-    await waitFor(() => expect(api.revisePlan).toHaveBeenCalledWith(
-      83,
-      'Preserve backwards compatibility',
-    ));
+    await waitFor(() => expect(api.createPlanRun).toHaveBeenCalledWith(83, {
+      run_type: 'user_revision',
+      request: 'Preserve backwards compatibility',
+      base_version_id: 503,
+      expected_current_version_id: 503,
+    }));
   });
 });

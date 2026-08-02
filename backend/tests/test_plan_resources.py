@@ -15,7 +15,10 @@ from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_agent_runner import PlanAgentRunner
-from backend.services.plan_service import apply_worker_plan_outcome
+from backend.services.plan_service import (
+    apply_worker_plan_outcome,
+    materialize_execution_task,
+)
 
 
 async def _target(client, session_factory) -> Task:
@@ -411,6 +414,59 @@ async def test_approve_and_create_execution_is_atomic_and_history_stays_linked(
     assert payload["application"] is None
     assert payload["applications"][0]["plan_version_id"] == version_id
     assert payload["applications"][0]["execution_task_id"] == execution_task_id
+
+
+@pytest.mark.asyncio
+async def test_execution_task_materializer_is_directly_callable_and_idempotent(
+    client, session_factory
+):
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Expose a stable execution seam", "target_repo": "/tmp"},
+    )
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+
+    async with session_factory() as db:
+        first = await materialize_execution_task(
+            db,
+            plan_id=plan_id,
+            version_id=version_id,
+            expected_current_version_id=version_id,
+            confirm_stale=False,
+            approve_if_pending=True,
+            actor_id=42,
+            execution_metadata={
+                "auto_run_id": "auto-7",
+                "created_from_plan_id": -1,
+            },
+        )
+        replay = await materialize_execution_task(
+            db,
+            plan_id=plan_id,
+            version_id=version_id,
+            expected_current_version_id=version_id,
+            confirm_stale=False,
+            approve_if_pending=False,
+            actor_id=42,
+            execution_metadata={"auto_run_id": "ignored-on-replay"},
+        )
+
+        assert first.created is True
+        assert replay.created is False
+        assert replay.task.id == first.task.id
+        assert replay.application.id == first.application.id
+        assert first.task.metadata_["auto_run_id"] == "auto-7"
+        assert first.task.metadata_["created_from_plan_id"] == plan_id
+        assert first.task.metadata_["created_from_plan_version_id"] == version_id
+        assert await db.scalar(
+            select(func.count(PlanApplication.id)).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        ) == 1
 
 
 @pytest.mark.asyncio

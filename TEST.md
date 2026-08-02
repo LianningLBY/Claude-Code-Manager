@@ -172,6 +172,7 @@ Task 为载体的用例只验证 contract 期 legacy API；新产品路径以 `t
 | `test_related_plan_approval_requires_stale_confirmation_and_no_turn` | 对话/repo 已变化时 approve 先 409，确认后只完成 Plan，不 wake/enqueue 或改变目标 Task |
 | `test_approved_plan_is_applied_only_with_selected_user_message` | 只有显式 `plan_task_ids` 才把已批准方案与真实 user message 同 turn 入队，并以 Manager-local log id 一次性审计 |
 | `test_standalone_plan_creates_one_idempotent_execution_task` | standalone approve 后创建新的 auto Task，重复调用返回同一执行 Task |
+| `test_execution_task_materializer_is_directly_callable_and_idempotent` | Auto/内部调用方可直接经 `plan_service` 物化 exact Version，重放返回同一 Task/Application，且 Plan 审计 metadata 不可覆盖 |
 | `test_claude_plan_command_is_read_only` / `test_codex_plan_uses_disposable_read_only_app_server_thread` | Claude 禁 Bash/MCP/子 agent；Codex 复用 App Server 但使用 disposable read-only thread、空 MCP/禁 autonomous features，终态删除 thread |
 | `test_pipeline_revises_then_persists_audited_approval` | Planner → Reviewer revise → Planner → approve 的 run/step、模型与 feedback 全量审计 |
 | `test_stage_uses_fallback_only_after_primary_route_is_unavailable` | primary 不可用后才尝试 fallback，并审计 route slot 与实际成功模型 |

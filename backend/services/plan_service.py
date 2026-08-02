@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
 
@@ -35,6 +36,17 @@ from backend.schemas.plan_resource import (
 ACTIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_user"})
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _plan_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+@dataclass(frozen=True)
+class PlanExecutionTaskResult:
+    """Exact, idempotent result of applying a Plan Version as a new Task."""
+
+    plan: Plan
+    version: PlanVersion
+    application: PlanApplication
+    task: Task
+    created: bool
 
 
 def plan_operation_lock(plan_id: int) -> asyncio.Lock:
@@ -502,6 +514,208 @@ async def decide_version(
     await db.commit()
     await db.refresh(version)
     return version
+
+
+async def materialize_execution_task(
+    db: AsyncSession,
+    *,
+    plan_id: int,
+    version_id: int,
+    expected_current_version_id: int,
+    confirm_stale: bool,
+    approve_if_pending: bool,
+    actor_id: int | None,
+    execution_metadata: dict | None = None,
+) -> PlanExecutionTaskResult:
+    """Idempotently apply one standalone Plan Version as an execution Task.
+
+    This is the canonical in-process boundary for UI/API callers and future
+    orchestrators.  The exact Plan Version is the idempotency key: replaying
+    the operation returns its existing Task and never creates a second one.
+    Authorization and post-commit wake/broadcast behavior remain adapter
+    concerns and must be handled by the caller.
+    """
+
+    async with plan_operation_lock(plan_id):
+        plan = await db.get(Plan, plan_id, populate_existing=True)
+        version = await db.get(PlanVersion, version_id, populate_existing=True)
+        if plan is None:
+            raise HTTPException(404, "Plan not found")
+        if version is None or version.plan_id != plan.id:
+            raise HTTPException(404, "Plan Version not found")
+        if plan.target_task_id is not None:
+            raise HTTPException(400, "Only standalone Plans create execution Tasks")
+        if (
+            plan.current_version_id != expected_current_version_id
+            or version.id != expected_current_version_id
+        ):
+            raise HTTPException(
+                409,
+                {
+                    "code": "plan_version_changed",
+                    "message": "Plan current Version changed",
+                    "plan_id": plan.id,
+                    "current_version_id": plan.current_version_id,
+                    "active_run_id": plan.active_run_id,
+                },
+            )
+
+        from backend.services.plan_staleness import version_staleness
+
+        stale = await version_staleness(db, plan, version)
+        if stale["hard_conflict"]:
+            raise HTTPException(
+                409,
+                {
+                    "code": "plan_hard_conflict",
+                    "message": "Execution target is unavailable",
+                    **stale,
+                },
+            )
+        if stale["stale"] and not confirm_stale:
+            raise HTTPException(
+                409,
+                {
+                    "code": "plan_stale",
+                    "message": "Plan Version context is stale",
+                    **stale,
+                },
+            )
+        if version.human_decision == "pending" and approve_if_pending:
+            version = await decide_version(
+                db,
+                plan=plan,
+                version=version,
+                decision="approved",
+                decided_by=actor_id,
+                expected_current_version_id=expected_current_version_id,
+            )
+        if version.human_decision != "approved":
+            raise HTTPException(409, "Plan Version must be approved")
+
+        existing = (
+            await db.execute(
+                select(PlanApplication).where(
+                    PlanApplication.plan_version_id == version.id
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if (
+                existing.application_type != "execution_task"
+                or existing.execution_task_id is None
+            ):
+                raise HTTPException(409, "Plan Version was already applied")
+            task = await db.get(Task, existing.execution_task_id)
+            if task is None:
+                raise HTTPException(
+                    409,
+                    "Plan Version execution Task is missing",
+                )
+            return PlanExecutionTaskResult(
+                plan=plan,
+                version=version,
+                application=existing,
+                task=task,
+                created=False,
+            )
+
+        metadata = dict(execution_metadata or {})
+        # These audit keys are authoritative and cannot be overridden by an
+        # embedding orchestrator's optional correlation metadata.
+        metadata.update(
+            {
+                "created_from_plan_id": plan.id,
+                "created_from_plan_version_id": version.id,
+            }
+        )
+        task = Task(
+            title=f"Execute {plan.title} · v{version.version_number}"[:200],
+            description=(
+                "[Approved implementation plan]\n"
+                "Implement the exact approved Plan Version below.\n\n"
+                f'<plan id="{plan.id}" version="{version.version_number}">\n'
+                f"{version.content}\n</plan>\n\n"
+                f"[Original planning request]\n{plan.initial_request}"
+            ),
+            status="pending",
+            priority=plan.priority,
+            project_id=plan.project_id,
+            target_repo=plan.target_repo,
+            target_branch=plan.target_branch,
+            merge_status="pending",
+            worker_id=plan.worker_id,
+            created_by=actor_id,
+            mode="auto",
+            metadata_=metadata,
+        )
+        db.add(task)
+        await db.flush()
+        application = PlanApplication(
+            plan_id=plan.id,
+            plan_version_id=version.id,
+            application_type="execution_task",
+            execution_task_id=task.id,
+            applied_by=actor_id,
+        )
+        db.add(application)
+        try:
+            await db.commit()
+        except IntegrityError:
+            # The database uniqueness fence is authoritative across API
+            # processes.  A concurrent winner may have committed after our
+            # pre-check; discard this transaction's Task and return that exact
+            # application instead of exposing a false failure to a retrying
+            # orchestrator.
+            await db.rollback()
+            existing = (
+                await db.execute(
+                    select(PlanApplication).where(
+                        PlanApplication.plan_version_id == version_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if (
+                existing is None
+                or existing.application_type != "execution_task"
+                or existing.execution_task_id is None
+            ):
+                raise
+            existing_task = await db.get(Task, existing.execution_task_id)
+            refreshed_plan = await db.get(Plan, plan_id, populate_existing=True)
+            refreshed_version = await db.get(
+                PlanVersion,
+                version_id,
+                populate_existing=True,
+            )
+            if (
+                existing_task is None
+                or refreshed_plan is None
+                or refreshed_version is None
+            ):
+                raise HTTPException(
+                    409,
+                    "Plan Version execution Task is missing",
+                )
+            return PlanExecutionTaskResult(
+                plan=refreshed_plan,
+                version=refreshed_version,
+                application=existing,
+                task=existing_task,
+                created=False,
+            )
+        except Exception:
+            await db.rollback()
+            raise
+        await db.refresh(application)
+        await db.refresh(task)
+        return PlanExecutionTaskResult(
+            plan=plan,
+            version=version,
+            application=application,
+            task=task,
+            created=True,
+        )
 
 
 async def cancel_run(

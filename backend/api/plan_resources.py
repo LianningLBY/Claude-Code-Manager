@@ -29,7 +29,6 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.plan import (
     Plan,
-    PlanApplication,
     PlanApplicationReceipt,
     PlanInputRequest,
     PlanVersion,
@@ -65,6 +64,7 @@ from backend.services.plan_service import (
     create_plan_with_run,
     decide_version,
     input_request_resource,
+    materialize_execution_task,
     plan_operation_lock,
     plan_resource,
     resolve_legacy_task,
@@ -1127,91 +1127,17 @@ async def create_execution_task(
     db: AsyncSession = Depends(get_db),
 ):
     plan, _ = await _require_version(request, db, version_id, control=True)
-    async with plan_operation_lock(plan.id):
-        plan, version = await _require_version(request, db, version_id, control=True)
-        if plan.target_task_id is not None:
-            raise HTTPException(400, "Only standalone Plans create execution Tasks")
-        if plan.current_version_id != body.expected_current_version_id or version.id != body.expected_current_version_id:
-            raise HTTPException(
-                409,
-                {
-                    "code": "plan_version_changed",
-                    "message": "Plan current Version changed",
-                    "plan_id": plan.id,
-                    "current_version_id": plan.current_version_id,
-                    "active_run_id": plan.active_run_id,
-                },
-            )
-        stale = await _version_staleness(db, plan, version)
-        if stale["hard_conflict"]:
-            raise HTTPException(
-                409,
-                {"code": "plan_hard_conflict", "message": "Execution target is unavailable", **stale},
-            )
-        if stale["stale"] and not body.confirm_stale:
-            raise HTTPException(
-                409,
-                {"code": "plan_stale", "message": "Plan Version context is stale", **stale},
-            )
-        if version.human_decision == "pending" and body.approve_if_pending:
-            version = await decide_version(
-                db,
-                plan=plan,
-                version=version,
-                decision="approved",
-                decided_by=get_current_user_id(request),
-                expected_current_version_id=body.expected_current_version_id,
-            )
-        if version.human_decision != "approved":
-            raise HTTPException(409, "Plan Version must be approved")
-        existing = (
-            await db.execute(
-                select(PlanApplication).where(PlanApplication.plan_version_id == version.id)
-            )
-        ).scalar_one_or_none()
-        if existing is not None:
-            if existing.application_type != "execution_task" or existing.execution_task_id is None:
-                raise HTTPException(409, "Plan Version was already applied")
-            execution_id = existing.execution_task_id
-        else:
-            execution = Task(
-                title=f"Execute {plan.title} · v{version.version_number}"[:200],
-                description=(
-                    "[Approved implementation plan]\n"
-                    "Implement the exact approved Plan Version below.\n\n"
-                    f"<plan id=\"{plan.id}\" version=\"{version.version_number}\">\n"
-                    f"{version.content}\n</plan>\n\n"
-                    f"[Original planning request]\n{plan.initial_request}"
-                ),
-                status="pending",
-                priority=plan.priority,
-                project_id=plan.project_id,
-                target_repo=plan.target_repo,
-                target_branch=plan.target_branch,
-                merge_status="pending",
-                worker_id=plan.worker_id,
-                created_by=get_current_user_id(request),
-                mode="auto",
-                metadata_={
-                    "created_from_plan_id": plan.id,
-                    "created_from_plan_version_id": version.id,
-                },
-            )
-            db.add(execution)
-            await db.flush()
-            db.add(PlanApplication(
-                plan_id=plan.id,
-                plan_version_id=version.id,
-                application_type="execution_task",
-                execution_task_id=execution.id,
-                applied_by=get_current_user_id(request),
-            ))
-            try:
-                await db.commit()
-            except Exception:
-                await db.rollback()
-                raise
-            execution_id = execution.id
+    result = await materialize_execution_task(
+        db,
+        plan_id=plan.id,
+        version_id=version_id,
+        expected_current_version_id=body.expected_current_version_id,
+        confirm_stale=body.confirm_stale,
+        approve_if_pending=body.approve_if_pending,
+        actor_id=get_current_user_id(request),
+    )
+    execution_id = result.task.id
+    version = result.version
     await _wake_dispatcher()
     refreshed_plan = await db.get(Plan, plan.id)
     refreshed_version = await db.get(PlanVersion, version.id)

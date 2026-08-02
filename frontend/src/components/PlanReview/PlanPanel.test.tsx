@@ -10,6 +10,7 @@ vi.mock('../../api/client', () => ({
     approvePlan: vi.fn().mockResolvedValue({}),
     rejectPlan: vi.fn().mockResolvedValue({}),
     revisePlan: vi.fn().mockResolvedValue({}),
+    deleteTask: vi.fn().mockResolvedValue({ ok: true }),
     createPlanExecutionTask: vi.fn().mockResolvedValue({
       execution_task: { id: 99 },
     }),
@@ -20,6 +21,7 @@ import { api } from '../../api/client';
 
 describe('PlanPanel', () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     localStorage.removeItem('ccm-plan-dismissed-7');
   });
@@ -121,5 +123,51 @@ describe('PlanPanel', () => {
 
     expect(JSON.parse(localStorage.getItem('ccm-plan-dismissed-7') || '[]')).toContain(44);
     expect(window.location.hash).toBe('');
+  });
+
+  it('keeps Plan content collapsed until the user opens it', async () => {
+    const task = {
+      id: 45,
+      title: 'Compact review',
+      mode: 'plan',
+      status: 'plan_review',
+      plan_content: 'Hidden until requested',
+      plan_target_task_id: null,
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+      codex_service_tier: 'default',
+    } as Task;
+
+    render(<PlanPanel tasks={[task]} onRefresh={vi.fn()} />);
+
+    expect(screen.queryByText('Hidden until requested')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'View Plan' }));
+    expect(screen.getByText('Hidden until requested')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Collapse Plan' }));
+    expect(screen.queryByText('Hidden until requested')).not.toBeInTheDocument();
+  });
+
+  it('deletes a reviewed Plan after explicit confirmation', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const task = {
+      id: 46,
+      title: 'Disposable review',
+      mode: 'plan',
+      status: 'plan_review',
+      plan_content: 'Remove this',
+      plan_target_task_id: null,
+      provider: 'claude',
+      model: 'claude-fable-5',
+      codex_service_tier: 'default',
+    } as Task;
+    const onRefresh = vi.fn();
+
+    render(<PlanPanel tasks={[task]} onRefresh={onRefresh} />);
+    await userEvent.click(screen.getByRole('button', {
+      name: 'Delete Plan #46',
+    }));
+
+    expect(api.deleteTask).toHaveBeenCalledWith(46);
+    await waitFor(() => expect(onRefresh).toHaveBeenCalled());
   });
 });

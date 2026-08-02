@@ -207,7 +207,11 @@ async def _create_related_plan(
         title=(
             body.title.strip()
             if body.title and body.title.strip()
-            else f"Plan for #{target.id}: {target.title or 'Untitled'}"
+            else (
+                f"Plan for #{target.id}: {target.title.strip()}"
+                if target.title and target.title.strip()
+                else f"Plan for #{target.id}"
+            )
         )[:200],
         description=body.input.strip(),
         status="pending",

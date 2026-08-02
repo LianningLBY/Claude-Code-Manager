@@ -1351,8 +1351,18 @@ class PlanAgentRunner:
                 unavailable.append(str(exc))
                 await self._finish_step(step_id, error=str(exc))
                 continue
+            except asyncio.CancelledError:
+                await self._finish_step(
+                    step_id,
+                    status="cancelled",
+                    error="Plan step cancelled",
+                )
+                raise
             except BaseException as exc:
-                await self._finish_step(step_id, error=str(exc))
+                await self._finish_step(
+                    step_id,
+                    error=str(exc) or type(exc).__name__,
+                )
                 raise
             await self._finish_step(
                 step_id,
@@ -1448,13 +1458,16 @@ class PlanAgentRunner:
         output: str | None = None,
         error: str | None = None,
         account_id: str | None = None,
+        status: str | None = None,
     ) -> None:
         async with self.db_factory() as db:
             step = await db.get(PlanAgentStep, step_id)
             if step is None:
                 return
             max_chars = max(1_000, settings.plan_step_output_max_chars)
-            step.status = "failed" if error else "completed"
+            step.status = status or (
+                "failed" if error is not None else "completed"
+            )
             step.output = output[:max_chars] if output else None
             step.error = error[:max_chars] if error else None
             step.account_id = account_id

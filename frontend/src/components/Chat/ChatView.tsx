@@ -703,6 +703,38 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     localStorage.setItem(`ccm-chat-queue-${task.id}`, JSON.stringify(messageQueue));
   }, [messageQueue, task.id]);
 
+  const deleteRelatedPlan = async (planId: number): Promise<boolean> => {
+    if (!window.confirm(
+      `Delete Plan #${planId} permanently? Its Plan content and review history will be removed.`,
+    )) return false;
+    setPlanBusyId(planId);
+    setPlanError(null);
+    try {
+      await api.deleteTask(planId);
+      setSelectedPlanIds((current) => current.filter((id) => id !== planId));
+      setPlanStaleIds((current) => {
+        const next = new Set(current);
+        next.delete(planId);
+        return next;
+      });
+      const dismissed = readDismissedPlans();
+      dismissed.delete(planId);
+      writeDismissedPlans(dismissed);
+      setMessageQueue((current) => current.map((item) => ({
+        ...item,
+        planTaskIds: item.planTaskIds?.filter((id) => id !== planId),
+      })));
+      await refreshPlans();
+      onTaskUpdated?.();
+      return true;
+    } catch (error) {
+      setPlanError(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      setPlanBusyId(null);
+    }
+  };
+
   const addToQueue = useCallback((
     text: string,
     uploadResults?: UploadResult[],
@@ -2188,6 +2220,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         onReject={rejectRelatedPlan}
         onRevise={reviseRelatedPlan}
         onCancel={cancelRelatedPlan}
+        onDelete={deleteRelatedPlan}
         onToggleAttachment={togglePlanAttachment}
         onClose={() => setPlansOpen(false)}
       />}

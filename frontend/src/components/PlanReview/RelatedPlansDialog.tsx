@@ -9,6 +9,7 @@ import {
   ListTodo,
   Loader2,
   Paperclip,
+  Trash2,
   X,
 } from '../icons';
 import { PlanPipelineBadge, PlanRevisionBadge } from '../Tasks/TaskBadges';
@@ -34,11 +35,21 @@ interface RelatedPlansDialogProps {
   onReject: (planId: number) => Promise<void>;
   onRevise: (plan: Task, feedback: string) => Promise<number | null>;
   onCancel: (planId: number) => Promise<void>;
+  onDelete: (planId: number) => Promise<boolean>;
   onToggleAttachment: (planId: number) => void;
   onClose: () => void;
 }
 
 const RUNNING_STATUSES = new Set(['pending', 'in_progress', 'executing']);
+const DELETABLE_PLAN_STATUSES = new Set([
+  'pending',
+  'plan_review',
+  'superseded',
+  'failed',
+  'cancelled',
+  'conflict',
+  'completed',
+]);
 
 function matchesFilter(plan: Task, filter: PlanFilter) {
   if (filter === 'decision') return plan.status === 'plan_review';
@@ -122,6 +133,7 @@ export function RelatedPlansDialog({
   onReject,
   onRevise,
   onCancel,
+  onDelete,
   onToggleAttachment,
   onClose,
 }: RelatedPlansDialogProps) {
@@ -155,6 +167,13 @@ export function RelatedPlansDialog({
     const revisedPlanId = await onRevise(plan, reviseText.trim());
     if (revisedPlanId != null) {
       setSelectedPlanId(revisedPlanId);
+      setReviseText('');
+    }
+  };
+
+  const deletePlan = async (planId: number) => {
+    if (await onDelete(planId)) {
+      setSelectedPlanId(null);
       setReviseText('');
     }
   };
@@ -193,7 +212,7 @@ export function RelatedPlansDialog({
               <h2 className="text-sm font-semibold text-gray-100">Plans</h2>
               <span className="text-xs text-gray-500">Task #{taskId}</span>
               <span className="flex-1" />
-              <button type="button" onClick={onClose} className="p-1 text-gray-500 hover:text-gray-300" aria-label="Close Plans">
+              <button type="button" onClick={onClose} className="p-1 text-gray-500 hover:text-gray-300 sm:hidden" aria-label="Close Plans">
                 <X size={16} />
               </button>
             </div>
@@ -292,9 +311,24 @@ export function RelatedPlansDialog({
                     <ChevronLeft size={15} /> Plans
                   </button>
                   <span className="flex-1 sm:hidden" />
-                  <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${getPlanStatusMeta(selectedPlan).className}`}>
+                  <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium sm:hidden ${getPlanStatusMeta(selectedPlan).className}`}>
                     {getPlanStatusMeta(selectedPlan).label}
                   </span>
+                  {DELETABLE_PLAN_STATUSES.has(selectedPlan.status) && (
+                    <button
+                      type="button"
+                      onClick={() => void deletePlan(selectedPlan.id)}
+                      disabled={busyId === selectedPlan.id}
+                      className="flex items-center gap-1 rounded-lg border border-red-500/30 px-2.5 py-1.5 text-xs font-medium text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+                      aria-label={`Delete Plan #${selectedPlan.id}`}
+                      title="Delete Plan"
+                    >
+                      {busyId === selectedPlan.id
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : <Trash2 size={12} />}
+                      <span className="hidden md:inline">Delete</span>
+                    </button>
+                  )}
                   <button type="button" onClick={onClose} className="hidden p-1 text-gray-500 hover:text-gray-300 sm:block" aria-label="Close Plans">
                     <X size={16} />
                   </button>

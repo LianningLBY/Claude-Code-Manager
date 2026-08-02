@@ -125,6 +125,27 @@ async def test_related_plans_are_independent_and_limited(
 
 
 @pytest.mark.asyncio
+async def test_related_plan_title_does_not_expose_empty_target_placeholder(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    async with session_factory() as db:
+        await db.execute(
+            update(Task).where(Task.id == target_id).values(title="")
+        )
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={"input": "Inspect the current behavior"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["title"] == f"Plan for #{target_id}"
+
+
+@pytest.mark.asyncio
 async def test_related_plan_snapshots_custom_primary_and_fallback_routes(
     client,
     session_factory,

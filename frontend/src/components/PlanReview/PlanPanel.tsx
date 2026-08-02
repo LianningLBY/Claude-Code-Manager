@@ -2,7 +2,7 @@ import { useState } from 'react';
 
 import { api, isApiRequestError } from '../../api/client';
 import type { Task } from '../../api/client';
-import { Check, ChevronDown, Loader2, Play, X } from '../icons';
+import { Check, ChevronDown, Loader2, Play, Trash2, X } from '../icons';
 import { PlanRevisionBadge } from '../Tasks/TaskBadges';
 import { PlanProgress } from './PlanProgress';
 import { getPlanStatusMeta } from './planStatus';
@@ -119,6 +119,39 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
     }
   };
 
+  const handleDelete = async (task: Task) => {
+    if (!window.confirm(
+      `Delete Plan #${task.id} permanently? Its Plan content and review history will be removed.`,
+    )) return;
+    setBusyId(task.id);
+    setError(null);
+    try {
+      await api.deleteTask(task.id);
+      if (task.plan_target_task_id != null) {
+        const storageKey = `ccm-plan-dismissed-${task.plan_target_task_id}`;
+        try {
+          const parsed = JSON.parse(localStorage.getItem(storageKey) || '[]');
+          if (Array.isArray(parsed)) {
+            localStorage.setItem(
+              storageKey,
+              JSON.stringify(parsed.filter((value) => value !== task.id)),
+            );
+          }
+        } catch { /* stale local preferences are harmless */ }
+      }
+      setExpandedIds((current) => {
+        const next = new Set(current);
+        next.delete(task.id);
+        return next;
+      });
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : String(deleteError));
+    } finally {
+      setBusyId(null);
+      onRefresh();
+    }
+  };
+
   const toggleExpanded = (id: number) => {
     setExpandedIds((current) => {
       const next = new Set(current);
@@ -158,27 +191,56 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
                   <span className="text-xs text-indigo-300">for Task #{task.plan_target_task_id}</span>
                 )}
                 <PlanRevisionBadge task={task} />
+                <span className="flex-1" />
+                <button
+                  type="button"
+                  onClick={() => void handleDelete(task)}
+                  disabled={busyId === task.id}
+                  className="flex items-center gap-1 rounded-lg border border-red-500/30 px-2.5 py-1.5 text-xs font-medium text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+                  aria-label={`Delete Plan #${task.id}`}
+                  title="Delete Plan"
+                >
+                  {busyId === task.id
+                    ? <Loader2 size={12} className="animate-spin" />
+                    : <Trash2 size={12} />}
+                  <span className="hidden sm:inline">Delete</span>
+                </button>
               </div>
-              <PlanProgress task={task} />
-              {task.metadata_?.plan_review_exhausted && (
-                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-300">
-                  <span className="font-medium">Reviewer revision limit reached:</span>{' '}
-                  {task.metadata_.plan_review_feedback || 'Review the Plan carefully before approval.'}
-                </div>
-              )}
-              <div className="relative rounded-xl border border-gray-700/70 bg-gray-950/55">
-                <pre className={`whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-gray-300 ${expanded ? 'max-h-[55vh]' : 'max-h-48'} overflow-y-auto`}>
-                  {task.plan_content}
-                </pre>
+              {expanded ? (
+                <>
+                  <PlanProgress task={task} />
+                  {task.metadata_?.plan_review_exhausted && (
+                    <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-300">
+                      <span className="font-medium">Reviewer revision limit reached:</span>{' '}
+                      {task.metadata_.plan_review_feedback || 'Review the Plan carefully before approval.'}
+                    </div>
+                  )}
+                  <div className="relative rounded-xl border border-gray-700/70 bg-gray-950/55">
+                    <pre className="max-h-[55vh] overflow-y-auto whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-gray-300">
+                      {task.plan_content}
+                    </pre>
+                    <button
+                      type="button"
+                      onClick={() => toggleExpanded(task.id)}
+                      className="flex w-full items-center justify-center gap-1 border-t border-gray-800 py-2 text-xs text-indigo-300 hover:bg-gray-900/70"
+                      aria-expanded="true"
+                    >
+                      Collapse Plan
+                      <ChevronDown size={13} className="rotate-180" />
+                    </button>
+                  </div>
+                </>
+              ) : (
                 <button
                   type="button"
                   onClick={() => toggleExpanded(task.id)}
-                  className="flex w-full items-center justify-center gap-1 border-t border-gray-800 py-2 text-xs text-indigo-300 hover:bg-gray-900/70"
+                  className="flex w-full items-center justify-center gap-1 rounded-lg border border-gray-700/70 py-2 text-xs text-indigo-300 hover:bg-gray-900/50"
+                  aria-expanded="false"
                 >
-                  {expanded ? 'Collapse Plan' : 'View full Plan'}
-                  <ChevronDown size={13} className={expanded ? 'rotate-180' : ''} />
+                  View Plan
+                  <ChevronDown size={13} />
                 </button>
-              </div>
+              )}
             </div>
 
             <div className="mt-3 border-t border-gray-700/70 bg-gray-900/35 px-4 py-3 sm:px-5">

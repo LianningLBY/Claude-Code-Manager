@@ -28,7 +28,11 @@ from backend.schemas.task import (
     WorkerRoutingConfigRequest,
     WorkerRoutingConfigSnapshot,
 )
-from backend.services.task_queue import TaskQueue, task_delete_fence
+from backend.services.task_queue import (
+    TaskQueue,
+    is_task_status_deletable,
+    task_delete_fence,
+)
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
@@ -2553,12 +2557,9 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
                     409,
                     "Task moved back to this Manager; refresh before deleting",
                 )
-            if worker_task.status not in (
-                "pending",
-                "failed",
-                "cancelled",
-                "conflict",
-                "completed",
+            if not is_task_status_deletable(
+                mode=worker_task.mode,
+                status=worker_task.status,
             ):
                 raise HTTPException(
                     400,

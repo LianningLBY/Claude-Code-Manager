@@ -17,6 +17,24 @@ from backend.services.worker_routing_config import (
 
 
 PR_REVIEW_SUPERSEDED_METADATA_KEY = "pr_review_superseded"
+BASE_DELETABLE_TASK_STATUSES = frozenset(
+    {"pending", "failed", "cancelled", "conflict", "completed"}
+)
+PLAN_DELETABLE_TASK_STATUSES = BASE_DELETABLE_TASK_STATUSES | {
+    "plan_review",
+    "superseded",
+}
+
+
+def is_task_status_deletable(*, mode: str, status: str) -> bool:
+    """Return whether a stopped Task generation may enter safe deletion."""
+
+    statuses = (
+        PLAN_DELETABLE_TASK_STATUSES
+        if mode == "plan"
+        else BASE_DELETABLE_TASK_STATUSES
+    )
+    return status in statuses
 
 
 class _UnixTimestamp(FunctionElement):
@@ -386,13 +404,9 @@ class TaskQueue:
         ) = expected_fence or task_delete_fence(task)
         if (
             not remote_worker_deleted
-            and observed_status
-            not in (
-                "pending",
-                "failed",
-                "cancelled",
-                "conflict",
-                "completed",
+            and not is_task_status_deletable(
+                mode=task.mode,
+                status=observed_status,
             )
         ):
             return False

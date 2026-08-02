@@ -1118,6 +1118,78 @@ async def test_delete_in_progress_rejected(client, session_factory):
     assert resp.status_code == 400
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["plan_review", "superseded"])
+async def test_delete_stopped_plan_cleans_pipeline_history(
+    client,
+    session_factory,
+    status,
+):
+    from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        plan = Task(
+            title="Disposable Plan",
+            description="Plan this",
+            status=status,
+            mode="plan",
+            plan_content="A completed proposal",
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(plan_task_id=plan.id, status="completed")
+        db.add(run)
+        await db.flush()
+        db.add(
+            PlanAgentStep(
+                run_id=run.id,
+                step_type="planner",
+                provider="claude",
+                status="completed",
+            )
+        )
+        await db.commit()
+        plan_id = plan.id
+        run_id = run.id
+
+    response = await client.delete(f"/api/tasks/{plan_id}")
+
+    assert response.status_code == 200
+    async with session_factory() as db:
+        assert await db.get(Task, plan_id) is None
+        assert await db.get(PlanAgentRun, run_id) is None
+        steps = (
+            await db.execute(
+                select(PlanAgentStep).where(PlanAgentStep.run_id == run_id)
+            )
+        ).scalars().all()
+        assert steps == []
+
+
+@pytest.mark.asyncio
+async def test_delete_non_plan_in_plan_review_state_is_rejected(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="Not a Plan",
+            description="work",
+            status="plan_review",
+            mode="auto",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    response = await client.delete(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 400
+
+
 # === image_paths tests ===
 
 

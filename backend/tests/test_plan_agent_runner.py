@@ -1,3 +1,4 @@
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
@@ -80,6 +81,82 @@ async def test_pipeline_rejects_unknown_planner_provider(db_factory):
 
     with pytest.raises(PlanAgentError, match="provider must be"):
         await runner.run(task, cwd="/tmp")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pipeline_marks_active_step_cancelled(db_factory):
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": False,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 0,
+    })
+    async with db_factory() as db:
+        task = Task(
+            title="Cancelled Plan",
+            description="Stop this Plan",
+            target_repo="/tmp",
+            mode="plan",
+            provider="claude",
+            model="claude-fable-5",
+            plan_pipeline_config=pipeline.model_dump(mode="json"),
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._run_route = AsyncMock(side_effect=asyncio.CancelledError())
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(task, cwd="/tmp")
+
+    async with db_factory() as db:
+        run = (
+            await db.execute(
+                select(PlanAgentRun).where(
+                    PlanAgentRun.plan_task_id == task_id
+                )
+            )
+        ).scalar_one()
+        step = (
+            await db.execute(
+                select(PlanAgentStep).where(PlanAgentStep.run_id == run.id)
+            )
+        ).scalar_one()
+    assert run.status == "cancelled"
+    assert run.error == "Plan pipeline cancelled"
+    assert step.status == "cancelled"
+    assert step.error == "Plan step cancelled"
 
 
 @pytest.mark.asyncio

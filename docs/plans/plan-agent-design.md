@@ -4,6 +4,11 @@
 >
 > 2026-07-29 决策：Plan 永远是独立制品。Plan 完成或批准都不会自动唤醒目标
 > session；用户必须通过下一条真实消息携带方案，或显式创建执行 Task。
+>
+> 2026-08-02 演进说明：本文仍准确描述当前已实现行为，但“Plan 等同
+> `Task(mode="plan")`、Revise 创建新 Plan Task、Pipeline 无用户输入暂停点”已确定由
+> `docs/plans/interactive-versioned-plan-design.md` 取代。新设计实施完成前不要把该目标架构
+> 误写成当前行为；实施时以新文档的 Plan → Version → Run → Step/Input 分层为权威。
 
 ## 0. 决策摘要
 

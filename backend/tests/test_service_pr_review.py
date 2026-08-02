@@ -353,6 +353,28 @@ def test_build_review_prompt_records_optional_documents_as_absent():
     assert "PR_REVIEW_RESULT: approved_merged" in prompt
 
 
+def test_build_review_prompt_uses_three_lens_evidence_harness():
+    prompt = build_review_prompt(
+        _make_repo(auto_merge=False),
+        PR_DATA,
+        guidance_documents={"CLAUDE.md": None, "PROGRESS.md": None},
+    )
+
+    assert "Principal Engineer — architecture and system fit" in prompt
+    assert "Senior Engineer — implementation correctness" in prompt
+    assert "QA Engineer — behavior, regression, and proof" in prompt
+    assert "A clean result from one lens cannot cancel" in prompt
+    assert (
+        "[critical|high|medium] [principal|senior|qa] "
+        "path:line-or-hunk"
+    ) in prompt
+    assert "Evidence: concrete behavior" in prompt
+    assert "Required fix: the smallest verifiable correction" in prompt
+    assert "deduplicate findings by root cause" in prompt
+    assert "only when all three lenses have no\nblocking finding" in prompt
+    assert "any lens has a\n`critical`, `high`, or `medium` finding" in prompt
+
+
 @pytest.mark.parametrize(
     ("repo_name", "number", "base_sha", "head_sha"),
     [

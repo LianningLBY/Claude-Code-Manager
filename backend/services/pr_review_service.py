@@ -1462,14 +1462,54 @@ You MUST review the complete injected patch. You have intentionally been given
 no filesystem, shell, network, GitHub, or MCP tools. Do not ask for or attempt
 tool access; all required input is already above.
 
-Evaluate the changes for:
-- **Correctness**: Logic errors, edge cases, potential bugs
-- **Security**: Injection vulnerabilities, auth issues, data exposure
-- **Performance**: N+1 queries, unnecessary allocations, blocking calls
-- **Code quality**: Naming, structure, duplication
-- **Tests**: Are changes covered by tests?
+## Step 3: Run the three-lens review harness
 
-## Step 3: Return a recommendation; do not write to GitHub
+Review the same immutable snapshot from each lens independently before you
+synthesize the final recommendation. A clean result from one lens cannot cancel
+an evidenced finding from another lens.
+
+1. **Principal Engineer — architecture and system fit**
+   - Does the change fit the existing architecture and reuse the repository's
+     established capabilities instead of creating a second way to do the same
+     thing?
+   - Is it additive and narrowly placed, with concurrency, authorization,
+     state-machine, cross-module, and rollback invariants preserved?
+   - Focus on material system-design risk, not cosmetic line-level tidiness.
+2. **Senior Engineer — implementation correctness and maintainability**
+   - Trace changed control flow, state transitions, error paths, cancellation,
+     retries, input validation, security boundaries, and resource ownership.
+   - Check edge cases, performance hazards, duplication, and whether the code is
+     understandable and maintainable in the repository's existing style.
+3. **QA Engineer — behavior, regression, and proof**
+   - Derive the intended user-visible and operational behavior from the base
+     guidance and PR material, then look for regressions and production traps.
+   - Check that tests exercise the important success, failure, boundary, and
+     concurrency paths. Ask whether QA should block release because the change
+     does not do what it claims or cannot be verified safely.
+
+For every material finding, include all of:
+
+```text
+[critical|high|medium] [principal|senior|qa] path:line-or-hunk — short title
+Evidence: concrete behavior in the injected patch or missing required proof
+Impact: user, security, data, reliability, or operational consequence
+Required fix: the smallest verifiable correction
+Test: the regression test or validation that should prove the fix
+```
+
+Use `critical`, `high`, or `medium` only for defects that should block this
+snapshot. Do not invent paths or line numbers; use a file and hunk description
+when the injected patch has no reliable line number. Keep optional polish under
+a `Non-blocking suggestions` heading and do not disguise preferences as defects.
+If evidence is insufficient to validate a safety-critical claim, identify the
+missing proof as a finding instead of assuming the implementation is correct.
+
+Before returning, deduplicate findings by root cause and verify that each one is
+grounded in the supplied snapshot. If there are no blocking findings, briefly
+state what each of the three lenses checked and why the available tests are
+adequate.
+
+## Step 4: Return a recommendation; do not write to GitHub
 
 Do not run `gh pr review`, `gh pr comment`, `gh pr merge`, `gh api --method`,
 or any other GitHub write. CCM's backend owns all review/comment/merge writes.
@@ -1484,8 +1524,9 @@ PR_REVIEW_BODY_BEGIN
 PR_REVIEW_BODY_END
 PR_REVIEW_RESULT: <result>
 
-Use `PR_REVIEW_RESULT: {success_result}` when the review passes.
-Use `PR_REVIEW_RESULT: review_comments` when changes are required.
+Use `PR_REVIEW_RESULT: {success_result}` only when all three lenses have no
+blocking finding. Use `PR_REVIEW_RESULT: review_comments` when any lens has a
+`critical`, `high`, or `medium` finding.
 Use `PR_REVIEW_RESULT: error` if any snapshot/read/review check fails.
 The result line must be the final line, with no text after it.
 """

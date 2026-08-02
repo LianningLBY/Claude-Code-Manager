@@ -560,6 +560,7 @@ class _TurnContext:
     descendant_interrupt_lock: asyncio.Lock | None = None
     descendant_guard_task: asyncio.Task | None = None
     deferred_terminal_notification: dict[str, Any] | None = None
+    non_retry_error: dict[str, Any] | None = None
     tools_disabled: bool = False
     tool_policy_violation: str | None = None
     tool_policy_abort_task: asyncio.Task | None = None
@@ -1540,6 +1541,12 @@ class CodexAppServer:
             )
             exit_code = 1
             stderr = str(message)
+        if context.non_retry_error is not None and exit_code != 1:
+            # Match native `codex exec`: any ErrorNotification with
+            # willRetry=false makes the turn fail even if a later terminal
+            # notification reports completed/interrupted.
+            exit_code = 1
+            stderr = str(context.non_retry_error["message"])
         logger.info(
             "Codex latency task=%s thread=%s stage=completed elapsed_ms=%.1f status=%s",
             context.task_id,
@@ -1552,7 +1559,7 @@ class CodexAppServer:
             stderr,
             termination_kind=(
                 "user_interrupt"
-                if status == "interrupted"
+                if status == "interrupted" and exit_code in (-2, 130)
                 else None
             ),
         )
@@ -3813,12 +3820,21 @@ class CodexAppServer:
             return
 
         if method == "error":
+            # App-server also publishes this notification while the Codex
+            # client is retrying a live turn.  ``willRetry`` is authoritative:
+            # retry notices are advisory, while non-retry errors must remain
+            # fatal even though turn/completed closes the adapter later.
             error = params.get("error") or params
             normalized_error = self._normalize_turn_error(error)
+            will_retry = bool(params.get("willRetry"))
+            if not will_retry and context.non_retry_error is None:
+                context.non_retry_error = normalized_error
             context.process.feed({
-                "type": "turn.failed",
+                "type": "turn.retrying" if will_retry else "turn.failed",
                 "error": normalized_error,
                 "turn_id": context.turn_id,
+                "will_retry": will_retry,
+                "terminal": not will_retry,
             })
             return
 

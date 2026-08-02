@@ -3912,6 +3912,100 @@ async def test_context_window_error_keeps_structured_codex_error_info():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "will_retry",
+        "terminal_status",
+        "expected_type",
+        "expected_terminal",
+        "expected_exit_code",
+        "expected_termination_kind",
+    ),
+    [
+        pytest.param(
+            True, "completed", "turn.retrying", False, 0, None,
+            id="retrying",
+        ),
+        pytest.param(
+            False, "completed", "turn.failed", True, 1, None,
+            id="non-retry-fatal",
+        ),
+        pytest.param(
+            False, "interrupted", "turn.failed", True, 1, None,
+            id="non-retry-error-beats-interrupt",
+        ),
+    ],
+)
+async def test_error_notification_respects_will_retry(
+    will_retry,
+    terminal_status,
+    expected_type,
+    expected_terminal,
+    expected_exit_code,
+    expected_termination_kind,
+):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-1"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="continue",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=297,
+    )
+    await process.stdout.readline()
+
+    error = {
+        "message": "Reconnecting... 1/5",
+        "codexErrorInfo": {
+            "responseStreamDisconnected": {"httpStatusCode": 409},
+        },
+        "additionalDetails": (
+            "unexpected status 409 Conflict: "
+            '{"detail":"all logged-in accounts are busy"}'
+        ),
+    }
+    server._handle_notification("error", {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "error": error,
+        "willRetry": will_retry,
+    })
+
+    notification = json.loads((await process.stdout.readline()).decode())
+    assert notification == {
+        "type": expected_type,
+        "error": error,
+        "turn_id": "turn-1",
+        "will_retry": will_retry,
+        "terminal": expected_terminal,
+    }
+    assert process.returncode is None
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-1",
+        "turn": {
+            "id": "turn-1",
+            "status": terminal_status,
+            "error": None,
+        },
+    })
+
+    completed = json.loads((await process.stdout.readline()).decode())
+    assert completed["type"] == "turn.completed"
+    assert completed["turn_id"] == "turn-1"
+    assert await process.wait() == expected_exit_code
+    assert process.termination_kind == expected_termination_kind
+
+
+@pytest.mark.asyncio
 async def test_interleaved_notifications_are_isolated_by_turn():
     """Concurrent tasks must never receive another thread's output."""
     server = CodexAppServer("codex")

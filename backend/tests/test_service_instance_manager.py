@@ -1378,6 +1378,39 @@ def test_cloudrouter_429_is_transient_only_for_exact_api_account_home(
     )
 
 
+def test_apex_409_busy_is_transient_only_for_exact_apex_codex_home(
+    db_factory,
+):
+    im = InstanceManager(db_factory, MagicMock())
+    apex_account = types.SimpleNamespace(api_provider="apex")
+    cloudrouter_account = types.SimpleNamespace(api_provider="cloudrouter")
+    store = MagicMock()
+    store.account_for_codex_home.side_effect = lambda path: {
+        "/api/apex": apex_account,
+        "/api/cloudrouter": cloudrouter_account,
+    }.get(path)
+    im.cloudrouter_store = store
+    im._config_dirs.update({
+        1: "/api/apex",
+        2: "/api/cloudrouter",
+        3: "/native/codex",
+    })
+    busy = (
+        'unexpected status 409 Conflict: '
+        '{"detail":"all logged-in accounts are busy"}'
+    )
+
+    assert im.is_cloudrouter_transient(1, "codex", busy)
+    assert not im.is_cloudrouter_transient(2, "codex", busy)
+    assert not im.is_cloudrouter_transient(3, "codex", busy)
+    assert not im.is_cloudrouter_transient(
+        1, "codex", "unexpected status 409 Conflict: branch changed",
+    )
+    assert not im.is_cloudrouter_transient(
+        1, "codex", "all logged-in accounts are busy",
+    )
+
+
 def test_api_codex_home_scrubs_all_inherited_gateway_keys(db_factory):
     im = InstanceManager(db_factory, MagicMock())
     store = MagicMock()
@@ -4422,6 +4455,70 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
 
 
 @pytest.mark.asyncio
+async def test_apex_409_busy_terminal_failure_retries_same_account(
+    db_factory, monkeypatch,
+):
+    import backend.services.claude_pool as claude_pool_module
+
+    async with db_factory() as db:
+        task = Task(
+            title="apex busy retry",
+            status="executing",
+            provider="codex",
+            session_id="thread-apex-busy",
+            last_cwd="/tmp/apex-work",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    im._config_dirs[7] = "/api/apex/codex"
+    im._launch_params[7] = {
+        "provider": "codex",
+        "prompt": "continue after gateway capacity recovers",
+        "model": "gpt-5.6-sol",
+    }
+    store = MagicMock()
+    store.account_for_codex_home.return_value = types.SimpleNamespace(
+        api_provider="apex",
+    )
+    im.cloudrouter_store = store
+    im.get_recent_log_contents = AsyncMock(return_value=[json.dumps({
+        "type": "turn.failed",
+        "error": {
+            "message": "Reconnecting... 5/5",
+            "codexErrorInfo": {
+                "responseStreamDisconnected": {"httpStatusCode": 409},
+            },
+            "additionalDetails": (
+                "unexpected status 409 Conflict: "
+                '{"detail":"all logged-in accounts are busy"}'
+            ),
+        },
+    })])
+    im.launch = AsyncMock(return_value=12345)
+    monkeypatch.setattr(
+        claude_pool_module, "transient_retry_delay", lambda *_args: 0,
+    )
+
+    launched = await im._try_chat_transient_retry(
+        7, task.id, 1, "Reconnecting... 5/5",
+    )
+
+    assert launched is True
+    im.launch.assert_awaited_once()
+    retry = im.launch.await_args.kwargs
+    assert retry["task_id"] == task.id
+    assert retry["resume_session_id"] == "thread-apex-busy"
+    assert retry["config_dir"] == "/api/apex/codex"
+    assert retry["provider"] == "codex"
+    assert retry["model"] == "gpt-5.6-sol"
+    broadcaster.broadcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
     async with db_factory() as db:
         task = Task(
@@ -7087,6 +7184,114 @@ async def test_codex_turn_failed_does_not_append_generic_process_exit(
     assert task.status == "failed"
     assert task.error_message == error_text
     assert [entry.content for entry in error_entries] == [error_text]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "notification_type",
+        "will_retry",
+        "message",
+        "expected_status",
+        "expected_error",
+        "expected_exit_code",
+    ),
+    [
+        pytest.param(
+            "turn.retrying", True, "Reconnecting... 1/5",
+            "completed", None, 0, id="retrying",
+        ),
+        pytest.param(
+            "turn.failed", False, "backend failed",
+            "failed", "backend failed", 1, id="non-retry-fatal",
+        ),
+    ],
+)
+async def test_codex_error_notification_respects_will_retry(
+    db_factory,
+    notification_type,
+    will_retry,
+    message,
+    expected_status,
+    expected_error,
+    expected_exit_code,
+):
+    async with db_factory() as db:
+        inst = Instance(name="codex-retrying-inst")
+        task = Task(
+            title="codex retrying task",
+            description="d",
+            status="executing",
+            provider="codex",
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_id = task.id
+
+    process = _make_mock_process(returncode=0)
+    output = iter([
+        json.dumps({
+            "type": notification_type,
+            "error": {
+                "message": message,
+                "codexErrorInfo": {
+                    "responseStreamDisconnected": {"httpStatusCode": 409},
+                },
+                "additionalDetails": (
+                    "unexpected status 409 Conflict: "
+                    '{"detail":"all logged-in accounts are busy"}'
+                ),
+            },
+            "turn_id": "turn-1",
+            "will_retry": will_retry,
+            "terminal": not will_retry,
+        }).encode() + b"\n",
+        json.dumps({
+            "type": "turn.completed",
+            "turn_id": "turn-1",
+            "usage": {},
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager._try_proactive_pool_switch = AsyncMock(return_value=False)
+    manager.processes[inst_id] = process
+
+    await manager._consume_output(
+        inst_id,
+        task_id,
+        process,
+        chat_initiated=True,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        error_entries = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalars().all()
+
+    assert task.status == expected_status
+    assert task.error_message == expected_error
+    assert (task.completed_at is not None) == (expected_status == "completed")
+    assert manager.effective_exit_code(inst_id, process) == expected_exit_code
+    assert [entry.content for entry in error_entries] == [message]
 
 
 @pytest.mark.asyncio

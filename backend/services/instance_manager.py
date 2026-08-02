@@ -66,6 +66,15 @@ _CLOUDROUTER_TRANSIENT_RE = re.compile(
     r"[^\n]{0,120}(?:API|HTTP|request|upstream|error)",
     re.IGNORECASE,
 )
+_APEX_BUSY_TRANSIENT_RE = re.compile(
+    r"(?:unexpected status\s+409|httpStatusCode[\"']?\s*:\s*409|"
+    r"\bHTTP(?:/\d(?:\.\d)?)?\s+409\b|\b409\s+Conflict\b)"
+    r"[^\n]{0,600}\ball logged-in accounts are busy\b"
+    r"|\ball logged-in accounts are busy\b[^\n]{0,600}"
+    r"(?:unexpected status\s+409|httpStatusCode[\"']?\s*:\s*409|"
+    r"\bHTTP(?:/\d(?:\.\d)?)?\s+409\b|\b409\s+Conflict\b)",
+    re.IGNORECASE,
+)
 _CLOUDROUTER_AUTH_RE = re.compile(
     r"\b401\b[^\n]{0,120}(?:unauthori[sz]ed|invalid|API[ _-]?key)"
     r"|\b403\b[^\n]{0,120}(?:forbidden|unauthori[sz]ed|API[ _-]?key)"
@@ -1735,12 +1744,22 @@ class InstanceManager:
         provider: str,
         text: str,
     ) -> bool:
-        """Classify gateway 429s only for a proven API-account launch."""
+        """Classify retryable gateway capacity only for a proven API account."""
 
         config_dir = self._config_dirs.get(instance_id)
-        if self._cloudrouter_account_for_runtime_home(provider, config_dir) is None:
+        account = self._cloudrouter_account_for_runtime_home(
+            provider, config_dir,
+        )
+        if account is None:
             return False
-        return bool(_CLOUDROUTER_TRANSIENT_RE.search(text or ""))
+        value = text or ""
+        if _CLOUDROUTER_TRANSIENT_RE.search(value):
+            return True
+        return bool(
+            provider == "codex"
+            and getattr(account, "api_provider", None) == "apex"
+            and _APEX_BUSY_TRANSIENT_RE.search(value)
+        )
 
     def is_cloudrouter_auth_failure(
         self,

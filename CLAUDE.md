@@ -92,6 +92,7 @@ claude-manager/
 │       ├── config/theme.ts      # 主题注册表 (现代深/浅 + Legacy 组, localStorage 持久化)
 │       ├── pages/               # Dashboard, TasksPage, LoginPage, ServerConfigPage
 │       ├── components/
+│       │   ├── MarkdownContent.tsx            # Chat/Plan 共用 GFM 渲染（代码复制/链接/表格）
 │       │   ├── Chat/ChatView.tsx              # 多轮对话 UI (基于 task, 含 monitor 消息渲染)
 │       │   ├── Chat/SubSessionIndicator.tsx   # 子 session 计数指示器
 │       │   ├── Chat/MonitorPanel.tsx          # Monitor 面板 (活跃 monitor 列表 + 历史 checks)

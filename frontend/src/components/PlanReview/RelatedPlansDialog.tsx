@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Task, UploadResult } from '../../api/client';
 import { resolveAssetUrl } from '../../config/server';
 import { useFileUpload } from '../../hooks/useFileUpload';
+import { MarkdownContent } from '../MarkdownContent';
 import {
   AlertCircle,
   Check,
@@ -521,9 +522,10 @@ export function RelatedPlansDialog({
                       {getPlanStatusMeta(selectedPlan).label}…
                     </div>
                   ) : selectedPlan.plan_content ? (
-                    <pre className="whitespace-pre-wrap font-mono text-xs leading-6 text-gray-300 sm:text-[13px]">
-                      {selectedPlan.plan_content}
-                    </pre>
+                    <MarkdownContent
+                      content={selectedPlan.plan_content}
+                      className="text-xs text-gray-300 sm:text-[13px]"
+                    />
                   ) : (
                     <div className="py-12 text-center text-xs text-gray-600">No Plan content was produced.</div>
                   )}

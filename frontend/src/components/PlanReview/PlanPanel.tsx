@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { api, isApiRequestError } from '../../api/client';
 import type { Task } from '../../api/client';
 import { Check, ChevronRight, Loader2, Play, Trash2, X } from '../icons';
+import { MarkdownContent } from '../MarkdownContent';
 import { PlanRevisionBadge } from '../Tasks/TaskBadges';
 import { PlanProgress } from './PlanProgress';
 import { getPlanStatusMeta } from './planStatus';
@@ -317,9 +318,10 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
                   </div>
                 )}
                 <div className="min-h-48 rounded-xl border border-gray-800 bg-gray-950/55 p-4">
-                  <pre className="whitespace-pre-wrap font-mono text-xs leading-6 text-gray-300 sm:text-[13px]">
-                    {selectedPlan.plan_content}
-                  </pre>
+                  <MarkdownContent
+                    content={selectedPlan.plan_content || ''}
+                    className="text-xs text-gray-300 sm:text-[13px]"
+                  />
                 </div>
               </div>
 

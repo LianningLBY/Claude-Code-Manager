@@ -154,6 +154,41 @@ describe('PlanPanel', () => {
     expect(screen.queryByText('Hidden until requested')).not.toBeInTheDocument();
   });
 
+  it('renders standalone Plan detail content as Markdown', async () => {
+    const task = {
+      id: 48,
+      title: 'Markdown review',
+      mode: 'plan',
+      status: 'plan_review',
+      plan_content: [
+        '# Standalone heading',
+        '',
+        'Keep this **readable**.',
+        '',
+        '```bash',
+        'npm run build',
+        '```',
+      ].join('\n'),
+      plan_target_task_id: null,
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+      codex_service_tier: 'default',
+    } as Task;
+
+    render(<PlanPanel tasks={[task]} onRefresh={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Review Plan #48' }));
+
+    expect(screen.getByRole('heading', {
+      level: 1,
+      name: 'Standalone heading',
+    })).toBeInTheDocument();
+    expect(screen.getByText('readable').tagName).toBe('STRONG');
+    const code = screen.getByText(/npm run build/);
+    expect(code.tagName).toBe('CODE');
+    expect(code.closest('pre')).not.toBeNull();
+    expect(screen.queryByText('# Standalone heading')).not.toBeInTheDocument();
+  });
+
   it('keeps the approved standalone action directly on the compact row', async () => {
     const task = {
       id: 47,

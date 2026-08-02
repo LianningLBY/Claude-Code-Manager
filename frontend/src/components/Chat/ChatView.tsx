@@ -1,6 +1,4 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import { api, isApiRequestError } from '../../api/client';
 import type {
   AskUserAnswer,
@@ -23,6 +21,8 @@ import { ListFilter, Syringe } from '../icons';
 import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { RelatedPlansDialog } from '../PlanReview/RelatedPlansDialog';
 import { ExpandableText } from '../ExpandableText';
+import { copyToClipboard } from '../clipboard';
+import { MarkdownContent } from '../MarkdownContent';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
@@ -3044,52 +3044,6 @@ function ToolItem({ message, taskId }: { message: ChatMessage; taskId: number })
   );
 }
 
-function copyToClipboard(text: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    return navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
-  }
-  return fallbackCopy(text);
-}
-
-function fallbackCopy(text: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    try {
-      document.execCommand('copy') ? resolve() : reject();
-    } catch {
-      reject();
-    } finally {
-      document.body.removeChild(ta);
-    }
-  });
-}
-
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const handleCopy = () => {
-    copyToClipboard(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
-  };
-  return (
-    <button
-      onClick={handleCopy}
-      className="copy-btn absolute top-2 right-2 p-1 rounded bg-gray-700/80 hover:bg-gray-600 text-gray-400 hover:text-gray-200 opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto transition-opacity"
-      title="Copy"
-    >
-      {copied ? <Check size={12} /> : <Copy size={12} />}
-    </button>
-  );
-}
-
 function MessageCopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   const handleCopy = () => {
@@ -3127,56 +3081,6 @@ function ForkButton({ onClick, disabled = false }: { onClick: () => void; disabl
 function stripSenderPrefix(text: string): string {
   return text.replace(/^\[[^\]\r\n]+\][ \t]+/, '');
 }
-
-const remarkPlugins = [remarkGfm];
-
-const markdownComponents: Components = {
-  pre({ children }) {
-    let codeText = '';
-    if (children && typeof children === 'object' && 'props' in (children as React.ReactElement)) {
-      const codeEl = children as React.ReactElement<{ children?: React.ReactNode }>;
-      codeText = typeof codeEl.props.children === 'string' ? codeEl.props.children : '';
-    }
-    return (
-      <div className="relative group my-2">
-        {codeText && <CopyButton text={codeText} />}
-        <pre className="bg-gray-900 rounded-lg p-3 overflow-x-auto text-xs">{children}</pre>
-      </div>
-    );
-  },
-  code({ className: codeClassName, children, ...props }) {
-    const isInline = !codeClassName;
-    if (isInline) {
-      return <code className="bg-gray-700/60 px-1.5 py-0.5 rounded text-xs" {...props}>{children}</code>;
-    }
-    return <code className={`${codeClassName || ''} text-xs`} {...props}>{children}</code>;
-  },
-  a({ href, children }) {
-    return <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:text-indigo-300 underline">{children}</a>;
-  },
-  table({ children }) {
-    return <div className="overflow-x-auto my-2"><table className="border-collapse text-xs w-full">{children}</table></div>;
-  },
-  th({ children }) {
-    return <th className="border border-gray-700 px-2 py-1 bg-gray-800/50 text-left">{children}</th>;
-  },
-  td({ children }) {
-    return <td className="border border-gray-700 px-2 py-1">{children}</td>;
-  },
-};
-
-const MarkdownContent = memo(function MarkdownContent({ content, className }: { content: string; className?: string }) {
-  return (
-    <div className={`markdown-body ${className || ''}`}>
-    <ReactMarkdown
-      remarkPlugins={remarkPlugins}
-      components={markdownComponents}
-    >
-      {content}
-    </ReactMarkdown>
-    </div>
-  );
-});
 
 function MessageTimestamp({ timestamp, className }: { timestamp: string | null; className?: string }) {
   if (!timestamp) return null;
@@ -3499,11 +3403,7 @@ const MessageBubble = memo(function MessageBubble({
       // (new messages arrive as user_message with source=monitor/sub-agent)
       return (
         <div className="border-l-2 border-gray-600 pl-2 py-1 my-0.5 opacity-50">
-          <div className="markdown-body text-xs text-gray-500">
-            <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
-              {content}
-            </ReactMarkdown>
-          </div>
+          <MarkdownContent content={content} className="text-xs text-gray-500" />
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} className="mt-0.5" />}
         </div>
       );

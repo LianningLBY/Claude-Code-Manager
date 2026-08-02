@@ -79,6 +79,34 @@ describe('RelatedPlansDialog', () => {
     expect(screen.getByRole('button', { name: 'Attach files' })).toBeInTheDocument();
   });
 
+  it('renders selected Plan content as Markdown', () => {
+    renderDialog({
+      plans: [{
+        ...readyPlan(),
+        plan_content: [
+          '# Implementation heading',
+          '',
+          'Use the **shared renderer**.',
+          '',
+          '```ts',
+          'const ready = true;',
+          '```',
+        ].join('\n'),
+      }],
+    });
+
+    expect(screen.getByRole('heading', {
+      level: 1,
+      name: 'Implementation heading',
+    })).toBeInTheDocument();
+    expect(screen.getByText('shared renderer').tagName).toBe('STRONG');
+    const code = screen.getByText(/const ready = true/);
+    expect(code.tagName).toBe('CODE');
+    expect(code.closest('pre')).not.toBeNull();
+    expect(screen.getByTitle('Copy')).toBeInTheDocument();
+    expect(screen.queryByText('# Implementation heading')).not.toBeInTheDocument();
+  });
+
   it('offers deletion from the selected Plan detail', async () => {
     const { onDelete } = renderDialog();
 

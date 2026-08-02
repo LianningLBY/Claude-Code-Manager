@@ -1091,6 +1091,9 @@ Controller 启动或 Turn 前验证：
 
 ## 13. PR Monitor 与 Reviewer Panel
 
+Reviewer 的 Guide Pack、角色 Prompt、Finding schema、Gate 与 Legacy 迁移细节见
+[`pr-monitor-review-harness-design.md`](./pr-monitor-review-harness-design.md)。
+
 ### 13.1 同一 Webhook，两个模式
 
 - Legacy PR：保留当前 PR Monitor 行为，直到单独迁移。

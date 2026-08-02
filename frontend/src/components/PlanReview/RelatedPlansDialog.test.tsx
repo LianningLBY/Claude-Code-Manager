@@ -47,18 +47,27 @@ function renderDialog(overrides: Partial<Parameters<typeof RelatedPlansDialog>[0
 }
 
 describe('RelatedPlansDialog', () => {
-  it('keeps the mobile and desktop close controls mutually exclusive', () => {
+  it('owns one close control at the dialog shell', () => {
     renderDialog();
 
     const closeButtons = screen.getAllByRole('button', { name: 'Close Plans' });
-    expect(closeButtons).toHaveLength(2);
-    expect(closeButtons[0]).toHaveClass('sm:hidden');
-    expect(closeButtons[1]).toHaveClass('hidden', 'sm:block');
+    expect(closeButtons).toHaveLength(1);
+    expect(closeButtons[0].parentElement).toHaveAttribute('role', 'dialog');
     const statusBadges = screen.getAllByText('Ready · decision needed')
       .filter((badge) => badge.closest('header'));
     expect(statusBadges).toHaveLength(2);
     expect(statusBadges[0]).toHaveClass('sm:hidden');
     expect(statusBadges[1].parentElement).toHaveClass('hidden', 'sm:block');
+  });
+
+  it('keeps the shell close control when there are no Plans', async () => {
+    const onClose = vi.fn();
+    renderDialog({ plans: [], onClose });
+
+    expect(screen.getByText('No Plans yet. Creating one will not interrupt the current session.')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close Plans' }));
+
+    expect(onClose).toHaveBeenCalledOnce();
   });
 
   it('offers deletion from the selected Plan detail', async () => {

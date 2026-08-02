@@ -198,23 +198,27 @@ export function RelatedPlansDialog({
         role="dialog"
         aria-modal="true"
         aria-label={`Plans for Task #${taskId}`}
-        className={`flex w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(82vh,760px)] sm:max-w-5xl sm:rounded-2xl ${
+        className={`relative flex w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(82vh,760px)] sm:max-w-5xl sm:rounded-2xl ${
           selectedPlanId == null
             ? 'h-[72dvh] rounded-t-2xl'
             : 'h-[100dvh] rounded-none'
         }`}
       >
+        <button
+          type="button"
+          onClick={onClose}
+          className="absolute right-3 top-[max(0.75rem,env(safe-area-inset-top))] z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 shadow-sm hover:bg-gray-800 hover:text-gray-300 sm:top-3"
+          aria-label="Close Plans"
+        >
+          <X size={16} />
+        </button>
         <section className={`${selectedPlanId == null ? 'flex' : 'hidden'} w-full flex-col bg-gray-900 sm:flex sm:w-80 sm:shrink-0 sm:border-r sm:border-gray-800`}>
-          <div className="shrink-0 border-b border-gray-800 px-4 pb-3 pt-3">
+          <div className="shrink-0 border-b border-gray-800 px-4 pb-3 pt-3 pr-12">
             <div className="mx-auto mb-2 h-1 w-9 rounded-full bg-gray-700 sm:hidden" />
             <div className="flex items-center gap-2">
               <ListTodo size={16} className="text-indigo-300" />
               <h2 className="text-sm font-semibold text-gray-100">Plans</h2>
               <span className="text-xs text-gray-500">Task #{taskId}</span>
-              <span className="flex-1" />
-              <button type="button" onClick={onClose} className="p-1 text-gray-500 hover:text-gray-300 sm:hidden" aria-label="Close Plans">
-                <X size={16} />
-              </button>
             </div>
             <form
               className="mt-3 flex gap-2"
@@ -298,7 +302,7 @@ export function RelatedPlansDialog({
         <section className={`${selectedPlanId == null ? 'hidden' : 'flex'} min-w-0 flex-1 flex-col bg-gray-900 sm:flex`}>
           {selectedPlan ? (
             <>
-              <header className="shrink-0 border-b border-gray-800 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-5 sm:pt-4">
+              <header className="shrink-0 border-b border-gray-800 px-4 pb-3 pr-12 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-5 sm:pr-14 sm:pt-4">
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
@@ -329,9 +333,6 @@ export function RelatedPlansDialog({
                       <span className="hidden md:inline">Delete</span>
                     </button>
                   )}
-                  <button type="button" onClick={onClose} className="hidden p-1 text-gray-500 hover:text-gray-300 sm:block" aria-label="Close Plans">
-                    <X size={16} />
-                  </button>
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-2 sm:mt-0">
                   <h2 className="min-w-0 text-base font-semibold text-gray-100 sm:text-lg">

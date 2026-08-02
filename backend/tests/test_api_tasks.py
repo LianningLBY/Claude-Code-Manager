@@ -3253,6 +3253,73 @@ async def test_stop_helper_rechecks_live_owner_inside_manager_lock(
 
 
 @pytest.mark.asyncio
+async def test_stop_helper_reconciles_an_exact_dead_reverse_owner(
+    session_factory,
+):
+    from backend.api.tasks import _stop_task_process
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+    import backend.main
+
+    started_at = datetime(2026, 8, 2, 7, 36, 23)
+    manager = backend.main.instance_manager
+    async with session_factory() as db:
+        task = Task(title="orphan owner", status="executing")
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="dead reverse owner",
+            status="running",
+            pid=145_0775,
+            current_task_id=task.id,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+
+        with (
+            patch.object(
+                manager,
+                "stop",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as stop,
+            patch.object(
+                manager,
+                "reconcile_dead_reverse_task_owner",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as reconcile,
+        ):
+            assert await _stop_task_process(
+                task_id,
+                db,
+                expected_generations=[(
+                    instance_id,
+                    145_0775,
+                    started_at,
+                )],
+            ) is True
+
+    stop.assert_awaited_once_with(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=145_0775,
+        expected_started_at=started_at,
+        task_status="completed",
+        terminal_consumer_timeout=30.0,
+        consumer_cancel_timeout=10.0,
+    )
+    reconcile.assert_awaited_once_with(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=145_0775,
+        expected_started_at=started_at,
+    )
+
+
+@pytest.mark.asyncio
 async def test_stop_helper_passes_exact_generation_for_same_task_aba(
     session_factory,
 ):
@@ -3312,10 +3379,18 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
         return False
 
     async with session_factory() as db:
-        with patch.object(
-            backend.main.instance_manager,
-            "stop",
-            side_effect=reject_old_generation,
+        with (
+            patch.object(
+                backend.main.instance_manager,
+                "stop",
+                side_effect=reject_old_generation,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "reconcile_dead_reverse_task_owner",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as reconcile,
         ):
             assert await _stop_task_process(
                 task_id,
@@ -3324,6 +3399,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
                     (instance_id, 1111, old_started_at)
                 ],
             ) is False
+            reconcile.assert_not_awaited()
 
     async with session_factory() as db:
         instance = await db.get(Instance, instance_id)

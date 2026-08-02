@@ -630,6 +630,24 @@ describe('ChatView', () => {
       expect(screen.getByTitle(/Send \(Ctrl\+Enter\)/)).toBeInTheDocument();
     });
 
+    it('shows an Interrupt failure and keeps the control available', async () => {
+      (api.stopTaskSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('Task process cleanup could not be confirmed for instance(s): 9, 10'),
+      );
+      const task = makeTask({
+        id: 38,
+        status: 'executing',
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByTitle('Interrupt session'));
+
+      expect(await screen.findByText(
+        'Interrupt failed: Task process cleanup could not be confirmed for instance(s): 9, 10',
+      )).toBeInTheDocument();
+      expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
+    });
+
     it('does not finish or dequeue at terminal/process_exit until the marker clears', async () => {
       const task = makeTask({
         id: 35,

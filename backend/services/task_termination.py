@@ -230,23 +230,53 @@ async def stop_task_process(
     retry of the same task id (ABA), even when PID/start fences are later used.
     """
 
-    del db  # The manager verifies ownership with independent current reads.
     from backend.main import instance_manager
 
     stopped = False
     for instance_id, expected_pid, expected_started_at in expected_generations:
-        stopped = (
-            await instance_manager.stop(
-                instance_id,
-                expected_task_id=task_id,
-                expected_pid=expected_pid,
-                expected_started_at=expected_started_at,
-                task_status=task_status,
-                terminal_consumer_timeout=30.0,
-                consumer_cancel_timeout=10.0,
-            )
-            or stopped
+        generation_stopped = await instance_manager.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_pid=expected_pid,
+            expected_started_at=expected_started_at,
+            task_status=task_status,
+            terminal_consumer_timeout=30.0,
+            consumer_cancel_timeout=10.0,
         )
+        if not generation_stopped:
+            # ``stop(False)`` can still mean that terminal bookkeeping won
+            # and only a later publication lost its fence. Re-read outside
+            # the old transaction before attempting orphan reconciliation.
+            await db.rollback()
+            exact_owner_remains = await db.scalar(
+                select(Instance.id).where(
+                    Instance.id == instance_id,
+                    Instance.current_task_id == task_id,
+                    (
+                        Instance.pid.is_(None)
+                        if expected_pid is None
+                        else Instance.pid == expected_pid
+                    ),
+                    (
+                        Instance.started_at.is_(None)
+                        if expected_started_at is None
+                        else Instance.started_at == expected_started_at
+                    ),
+                )
+            )
+            await db.rollback()
+        else:
+            exact_owner_remains = None
+        if not generation_stopped and exact_owner_remains is not None:
+            generation_stopped = (
+                await instance_manager.reconcile_dead_reverse_task_owner(
+                    instance_id,
+                    expected_task_id=task_id,
+                    expected_pid=expected_pid,
+                    expected_started_at=expected_started_at,
+                )
+            )
+        stopped = generation_stopped or stopped
     return stopped
 
 

@@ -2022,10 +2022,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     } else {
                       setError(null);
                     }
-                  } catch (e) {
+                  } catch (interruptError) {
                     setSending(false);
-                    setStillRunning(false);
+                    setStillRunning(true);
                     setLocalStatus(null);
+                    setError(
+                      `Interrupt failed: ${interruptError instanceof Error
+                        ? interruptError.message
+                        : String(interruptError)}`,
+                    );
                   }
                   finally { setInterrupting(false); }
                 }}

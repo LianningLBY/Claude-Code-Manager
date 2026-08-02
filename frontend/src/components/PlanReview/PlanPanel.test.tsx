@@ -40,6 +40,7 @@ describe('PlanPanel', () => {
     const onRefresh = vi.fn();
 
     render(<PlanPanel tasks={[task]} onRefresh={onRefresh} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Review Plan #41' }));
     await userEvent.click(screen.getByRole('button', { name: 'Approve only' }));
 
     expect(api.approvePlan).toHaveBeenCalledWith(41, {
@@ -67,6 +68,8 @@ describe('PlanPanel', () => {
     const onRefresh = vi.fn();
     render(<PlanPanel tasks={[task]} onRefresh={onRefresh} />);
     expect(screen.getByText('Revision of #41')).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('Describe changes for a new revision…')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Review Plan #42' }));
     await userEvent.type(
       screen.getByPlaceholderText('Describe changes for a new revision…'),
       'Add a rollback phase',
@@ -91,6 +94,7 @@ describe('PlanPanel', () => {
     } as Task;
 
     render(<PlanPanel tasks={[task]} onRefresh={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Review Plan #43' }));
     await userEvent.click(screen.getByRole('button', {
       name: 'Approve & create execution Task',
     }));
@@ -119,13 +123,14 @@ describe('PlanPanel', () => {
     } as Task;
 
     render(<PlanPanel tasks={[task]} onRefresh={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Review Plan #44' }));
     await userEvent.click(screen.getByRole('button', { name: 'Approve only' }));
 
     expect(JSON.parse(localStorage.getItem('ccm-plan-dismissed-7') || '[]')).toContain(44);
     expect(window.location.hash).toBe('');
   });
 
-  it('keeps Plan content collapsed until the user opens it', async () => {
+  it('renders a compact row and opens the full Plan in a review dialog', async () => {
     const task = {
       id: 45,
       title: 'Compact review',
@@ -141,10 +146,36 @@ describe('PlanPanel', () => {
     render(<PlanPanel tasks={[task]} onRefresh={vi.fn()} />);
 
     expect(screen.queryByText('Hidden until requested')).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'View Plan' }));
+    expect(screen.queryByRole('button', { name: 'Approve only' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Review Plan #45' }));
+    expect(screen.getByRole('dialog', { name: 'Review Plan #45' })).toBeInTheDocument();
     expect(screen.getByText('Hidden until requested')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Collapse Plan' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Close Plan review' }));
     expect(screen.queryByText('Hidden until requested')).not.toBeInTheDocument();
+  });
+
+  it('keeps the approved standalone action directly on the compact row', async () => {
+    const task = {
+      id: 47,
+      title: 'Approved Plan',
+      mode: 'plan',
+      status: 'completed',
+      plan_content: 'Ready for execution',
+      plan_approved: true,
+      plan_target_task_id: null,
+      plan_execution_task_id: null,
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+      codex_service_tier: 'default',
+    } as Task;
+
+    render(<PlanPanel tasks={[task]} onRefresh={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: 'Review Plan #47' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Create execution Task' }));
+    expect(api.approvePlan).not.toHaveBeenCalled();
+    expect(api.createPlanExecutionTask).toHaveBeenCalledWith(47);
+    window.location.hash = '';
   });
 
   it('deletes a reviewed Plan after explicit confirmation', async () => {

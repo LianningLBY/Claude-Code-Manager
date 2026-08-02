@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { api, isApiRequestError } from '../../api/client';
 import type { Task } from '../../api/client';
-import { Check, ChevronDown, Loader2, Play, Trash2, X } from '../icons';
+import { Check, ChevronRight, Loader2, Play, Trash2, X } from '../icons';
 import { PlanRevisionBadge } from '../Tasks/TaskBadges';
 import { PlanProgress } from './PlanProgress';
 import { getPlanStatusMeta } from './planStatus';
@@ -16,7 +16,7 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [revisionDrafts, setRevisionDrafts] = useState<Record<number, string>>({});
-  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+  const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
   const planTasks = tasks.filter((task) =>
     task.mode === 'plan'
     && (
@@ -29,6 +29,28 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
       )
     )
   );
+
+  const selectedPlan = planTasks.find((task) => task.id === selectedPlanId) || null;
+
+  useEffect(() => {
+    if (selectedPlanId != null && selectedPlan == null) {
+      setSelectedPlanId(null);
+    }
+  }, [selectedPlan, selectedPlanId]);
+
+  useEffect(() => {
+    if (selectedPlanId == null) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSelectedPlanId(null);
+    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [selectedPlanId]);
 
   if (planTasks.length === 0) return null;
 
@@ -139,26 +161,13 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
           }
         } catch { /* stale local preferences are harmless */ }
       }
-      setExpandedIds((current) => {
-        const next = new Set(current);
-        next.delete(task.id);
-        return next;
-      });
+      if (selectedPlanId === task.id) setSelectedPlanId(null);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : String(deleteError));
     } finally {
       setBusyId(null);
       onRefresh();
     }
-  };
-
-  const toggleExpanded = (id: number) => {
-    setExpandedIds((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
   };
 
   return (
@@ -175,155 +184,229 @@ export function PlanPanel({ tasks, onRefresh }: PlanPanelProps) {
       {planTasks.map((task) => {
         const ready = task.status === 'plan_review';
         const standalone = task.plan_target_task_id == null;
-        const expanded = expandedIds.has(task.id);
         const status = getPlanStatusMeta(task);
         return (
-          <article key={task.id} className="overflow-hidden rounded-xl border border-gray-700/70 bg-gray-800 shadow-sm">
-            <div className="space-y-3 px-4 pt-4 sm:px-5">
-              <div className="flex flex-wrap items-center gap-2">
-                <h3 className="text-sm font-semibold text-foreground">
-                  #{task.id} {task.title || 'Untitled Plan'}
-                </h3>
-                <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${status.className}`}>
-                  {status.label}
-                </span>
-                {task.plan_target_task_id != null && (
-                  <span className="text-xs text-indigo-300">for Task #{task.plan_target_task_id}</span>
-                )}
-                <PlanRevisionBadge task={task} />
-                <span className="flex-1" />
+          <article
+            key={task.id}
+            className="flex flex-col gap-3 rounded-xl border border-gray-700/70 bg-gray-800 px-4 py-3.5 shadow-sm sm:flex-row sm:items-center sm:px-5"
+          >
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+              <h3 className="min-w-0 truncate text-sm font-semibold text-foreground">
+                #{task.id} {task.title || 'Untitled Plan'}
+              </h3>
+              <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${status.className}`}>
+                {status.label}
+              </span>
+              <span className="rounded-full border border-gray-600 px-2.5 py-1 text-[10px] font-medium text-gray-400">
+                {standalone ? 'Standalone' : `Task #${task.plan_target_task_id}`}
+              </span>
+              <PlanRevisionBadge task={task} />
+            </div>
+            <div className="flex shrink-0 items-center justify-end gap-2">
+              {ready ? (
                 <button
                   type="button"
-                  onClick={() => void handleDelete(task)}
+                  onClick={() => {
+                    setError(null);
+                    setSelectedPlanId(task.id);
+                  }}
+                  className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500"
+                  aria-label={`Review Plan #${task.id}`}
+                >
+                  Review <ChevronRight size={13} />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void approve(task, 'create-execution')}
                   disabled={busyId === task.id}
-                  className="flex items-center gap-1 rounded-lg border border-red-500/30 px-2.5 py-1.5 text-xs font-medium text-red-300 hover:bg-red-500/10 disabled:opacity-40"
-                  aria-label={`Delete Plan #${task.id}`}
-                  title="Delete Plan"
+                  className="flex items-center gap-1.5 rounded-lg border border-indigo-500 px-3 py-2 text-xs font-medium text-indigo-300 hover:bg-indigo-500/10 disabled:opacity-40"
                 >
                   {busyId === task.id
                     ? <Loader2 size={12} className="animate-spin" />
-                    : <Trash2 size={12} />}
-                  <span className="hidden sm:inline">Delete</span>
-                </button>
-              </div>
-              {expanded ? (
-                <>
-                  <PlanProgress task={task} />
-                  {task.metadata_?.plan_review_exhausted && (
-                    <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-300">
-                      <span className="font-medium">Reviewer revision limit reached:</span>{' '}
-                      {task.metadata_.plan_review_feedback || 'Review the Plan carefully before approval.'}
-                    </div>
-                  )}
-                  <div className="relative rounded-xl border border-gray-700/70 bg-gray-950/55">
-                    <pre className="max-h-[55vh] overflow-y-auto whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-gray-300">
-                      {task.plan_content}
-                    </pre>
-                    <button
-                      type="button"
-                      onClick={() => toggleExpanded(task.id)}
-                      className="flex w-full items-center justify-center gap-1 border-t border-gray-800 py-2 text-xs text-indigo-300 hover:bg-gray-900/70"
-                      aria-expanded="true"
-                    >
-                      Collapse Plan
-                      <ChevronDown size={13} className="rotate-180" />
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => toggleExpanded(task.id)}
-                  className="flex w-full items-center justify-center gap-1 rounded-lg border border-gray-700/70 py-2 text-xs text-indigo-300 hover:bg-gray-900/50"
-                  aria-expanded="false"
-                >
-                  View Plan
-                  <ChevronDown size={13} />
+                    : <Play size={12} />}
+                  Create execution Task
                 </button>
               )}
-            </div>
-
-            <div className="mt-3 border-t border-gray-700/70 bg-gray-900/35 px-4 py-3 sm:px-5">
-              {ready ? (
-                <div className="space-y-2.5">
-                  <div className="flex gap-2">
-                    <input
-                      value={revisionDrafts[task.id] || ''}
-                      onChange={(event) => setRevisionDrafts((current) => ({
-                        ...current,
-                        [task.id]: event.target.value,
-                      }))}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
-                          event.preventDefault();
-                          void handleRevise(task);
-                        }
-                      }}
-                      placeholder="Describe changes for a new revision…"
-                      className="min-w-0 flex-1 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => void handleRevise(task)}
-                      disabled={!revisionDrafts[task.id]?.trim() || busyId === task.id}
-                      className="rounded-lg border border-gray-600 px-3 py-2 text-xs font-medium text-gray-300 hover:bg-gray-700 disabled:opacity-40"
-                    >
-                      Revise
-                    </button>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleReject(task.id)}
-                      disabled={busyId === task.id}
-                      className="flex items-center gap-1 rounded-lg border border-red-500/40 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/10 disabled:opacity-40"
-                    >
-                      <X size={12} /> Reject
-                    </button>
-                    <span className="flex-1" />
-                    <button
-                      type="button"
-                      onClick={() => void approve(task, 'approve-only')}
-                      disabled={busyId === task.id}
-                      className="flex items-center gap-1 rounded-lg border border-green-500/40 px-3 py-2 text-xs font-medium text-green-300 hover:bg-green-500/10 disabled:opacity-40"
-                    >
-                      <Check size={12} /> Approve only
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void approve(
-                        task,
-                        standalone ? 'create-execution' : 'attach-to-target',
-                      )}
-                      disabled={busyId === task.id}
-                      className="flex items-center gap-1.5 rounded-lg bg-green-600 px-3 py-2 text-xs font-medium text-white hover:bg-green-500 disabled:opacity-40"
-                    >
-                      {busyId === task.id
-                        ? <Loader2 size={12} className="animate-spin" />
-                        : standalone ? <Play size={12} /> : <Check size={12} />}
-                      {standalone
-                        ? 'Approve & create execution Task'
-                        : `Approve & open Task #${task.plan_target_task_id}`}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    onClick={() => void approve(task, 'create-execution')}
-                    disabled={busyId === task.id}
-                    className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
-                  >
-                    {busyId === task.id ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
-                    Create execution Task
-                  </button>
-                </div>
-              )}
+              <button
+                type="button"
+                onClick={() => void handleDelete(task)}
+                disabled={busyId === task.id}
+                className="rounded-lg p-2 text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
+                aria-label={`Delete Plan #${task.id}`}
+                title="Delete Plan"
+              >
+                {busyId === task.id
+                  ? <Loader2 size={14} className="animate-spin" />
+                  : <Trash2 size={14} />}
+              </button>
             </div>
           </article>
         );
       })}
+
+      {selectedPlan && (() => {
+        const ready = selectedPlan.status === 'plan_review';
+        const standalone = selectedPlan.plan_target_task_id == null;
+        const status = getPlanStatusMeta(selectedPlan);
+        return (
+          <div
+            className="fixed inset-0 z-[70] flex items-end justify-center bg-black/60 sm:items-center sm:p-5"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setSelectedPlanId(null);
+            }}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Review Plan #${selectedPlan.id}`}
+              className="flex h-[100dvh] w-full flex-col overflow-hidden bg-gray-900 shadow-2xl sm:h-[min(86vh,780px)] sm:max-w-5xl sm:rounded-2xl sm:border sm:border-gray-700"
+            >
+              <header className="shrink-0 border-b border-gray-800 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-5 sm:pt-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="min-w-0 flex-1 text-base font-semibold text-gray-100 sm:text-lg">
+                    #{selectedPlan.id} {selectedPlan.title || 'Untitled Plan'}
+                  </h2>
+                  <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${status.className}`}>
+                    {status.label}
+                  </span>
+                  <span className="rounded-full border border-gray-600 px-2.5 py-1 text-[10px] font-medium text-gray-400">
+                    {standalone ? 'Standalone' : `Task #${selectedPlan.plan_target_task_id}`}
+                  </span>
+                  <PlanRevisionBadge task={selectedPlan} />
+                  <button
+                    type="button"
+                    onClick={() => void handleDelete(selectedPlan)}
+                    disabled={busyId === selectedPlan.id}
+                    className="rounded-lg p-2 text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
+                    aria-label={`Delete Plan #${selectedPlan.id}`}
+                    title="Delete Plan"
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedPlanId(null)}
+                    className="rounded-lg p-2 text-gray-500 hover:bg-gray-800 hover:text-gray-300"
+                    aria-label="Close Plan review"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="mt-3">
+                  <PlanProgress task={selectedPlan} />
+                </div>
+              </header>
+
+              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 sm:px-5 sm:py-4">
+                {error && (
+                  <div className="mb-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                    {error}
+                  </div>
+                )}
+                {selectedPlan.metadata_?.plan_review_exhausted && (
+                  <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-300">
+                    <span className="font-medium">Reviewer revision limit reached:</span>{' '}
+                    {selectedPlan.metadata_.plan_review_feedback || 'Review the Plan carefully before approval.'}
+                  </div>
+                )}
+                {selectedPlan.description && (
+                  <div className="mb-3 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2">
+                    <div className="text-[10px] font-medium uppercase tracking-wide text-gray-600">Planning request</div>
+                    <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-gray-400">{selectedPlan.description}</p>
+                  </div>
+                )}
+                <div className="min-h-48 rounded-xl border border-gray-800 bg-gray-950/55 p-4">
+                  <pre className="whitespace-pre-wrap font-mono text-xs leading-6 text-gray-300 sm:text-[13px]">
+                    {selectedPlan.plan_content}
+                  </pre>
+                </div>
+              </div>
+
+              <footer className="shrink-0 border-t border-gray-800 bg-gray-900 px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 sm:px-5 sm:pb-4">
+                {ready ? (
+                  <div className="space-y-2.5">
+                    <div className="flex gap-2">
+                      <input
+                        value={revisionDrafts[selectedPlan.id] || ''}
+                        onChange={(event) => setRevisionDrafts((current) => ({
+                          ...current,
+                          [selectedPlan.id]: event.target.value,
+                        }))}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                            event.preventDefault();
+                            void handleRevise(selectedPlan);
+                          }
+                        }}
+                        placeholder="Describe changes for a new revision…"
+                        className="min-w-0 flex-1 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleRevise(selectedPlan)}
+                        disabled={!revisionDrafts[selectedPlan.id]?.trim() || busyId === selectedPlan.id}
+                        className="rounded-lg border border-gray-600 px-3 py-2 text-xs font-medium text-gray-300 hover:bg-gray-800 disabled:opacity-40"
+                      >
+                        Revise
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleReject(selectedPlan.id)}
+                        disabled={busyId === selectedPlan.id}
+                        className="rounded-lg border border-red-500/40 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+                      >
+                        Reject
+                      </button>
+                      <span className="flex-1" />
+                      <button
+                        type="button"
+                        onClick={() => void approve(selectedPlan, 'approve-only')}
+                        disabled={busyId === selectedPlan.id}
+                        className="rounded-lg border border-green-500/40 px-3 py-2 text-xs font-medium text-green-300 hover:bg-green-500/10 disabled:opacity-40"
+                      >
+                        Approve only
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void approve(
+                          selectedPlan,
+                          standalone ? 'create-execution' : 'attach-to-target',
+                        )}
+                        disabled={busyId === selectedPlan.id}
+                        className="flex items-center gap-1.5 rounded-lg bg-green-600 px-3 py-2 text-xs font-medium text-white hover:bg-green-500 disabled:opacity-40"
+                      >
+                        {busyId === selectedPlan.id
+                          ? <Loader2 size={12} className="animate-spin" />
+                          : standalone ? <Play size={12} /> : <Check size={12} />}
+                        {standalone
+                          ? 'Approve & create execution Task'
+                          : `Approve & open Task #${selectedPlan.plan_target_task_id}`}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => void approve(selectedPlan, 'create-execution')}
+                      disabled={busyId === selectedPlan.id}
+                      className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+                    >
+                      {busyId === selectedPlan.id
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : <Play size={12} />}
+                      Create execution Task
+                    </button>
+                  </div>
+                )}
+              </footer>
+            </div>
+          </div>
+        );
+      })()}
     </section>
   );
 }

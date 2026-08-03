@@ -999,3 +999,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **发现**：续聊用用户可控的 XML tag 判断“已注入”，用户可伪造 tag 让权威产物规则缺席；提示侧只检查 `target_repo` 是绝对路径，会接受 `/`、NUL 或 `..`，但下载侧必然拒绝；Manager 又会把 Worker 产物请求直接代理给旧版本，混跑时缺少新的跨 Task namespace fence。
 - **修复与预防**：项目根准入与下载端集中到 `task_artifact_contract.configured_workspace_root`；每个 turn 都由 CCM 无条件前置 policy，不再从不可信 prompt 猜是否注入。`/api/system/config` 声明 `task_artifact_scope_version=1`，Manager 流式代理前必须精确握手，旧 Worker 在发出文件请求前 409 fail closed。能力升级属于安全边界时必须显式版本化，不能假设 Manager/Worker 同步部署。
 - **验证**：Task artifact、System、Dispatcher、Ralph 四个完整后端文件 `302 passed`；前端全量 `40 files / 525 tests`，production build、Python compile 与 `git diff --check` 通过。Loop/TaskArtifact 改动文件 ESLint 通过；ChatView 仍有 main 未改行上的 3 个既有 lint error 与 1 warning。
+
+### 2026-08-03 — Codex 共享 app-server 精确停止隔离（commit b22c2e6）
+
+- **事故**：停止一个 Codex Task 时，未确认 `turn/interrupt` 的兜底路径会关闭该账号共享的 app-server，使同一 `CODEX_HOME` 上的其他 Task 一并失败；clean exit 0 又被误报为 unexpected，并把账号级历史 stderr 拼到每个 Task 的错误中。
+- **修复**：已领取 turn 改走 exact-generation `stop_claimed_turn`。只有目标仍是权威 live turn、没有 peer turn、没有已准入 RPC 时才允许关闭 transport；存在 peer、并发 steer/RPC 或目标已变化时保留原 process/consumer/DB owner 并向停止接口返回 409。未领取 turn 的清理仍保持 fail-closed。transport EOF 时冻结精确 shutdown intent，计划关闭与真实异常分开归因；共享 stderr 只留服务日志，不再泄漏到 Task 错误。
+- **验证**：Codex app-server 与 InstanceManager 完整文件 `456 passed`，关键停止/EOF/steer 并发矩阵 `10 passed`；后端全量 `3247 passed, 2 failed`，两项均与修改前基线相同（queued-message 旧 prompt 断言、login-runtime stale socket 环境断言），无新增回归。前端全量 `40 files / 525 tests`、`tsc --noEmit`、production build、Python compile 与 `git diff --check` 均通过。

@@ -10,7 +10,7 @@ import {
   type UploadResult,
 } from '../../api/client';
 import { useFileUpload } from '../../hooks/useFileUpload';
-import { Archive, ArchiveRestore, Check, GitBranch, Loader2, Paperclip, Play, RefreshCw, X } from '../icons';
+import { AlertCircle, Archive, ArchiveRestore, Check, GitBranch, Loader2, Paperclip, Play, RefreshCw, X } from '../icons';
 import { MarkdownContent } from '../MarkdownContent';
 import { CollapsiblePlanningRequest } from './CollapsiblePlanningRequest';
 import { PlanInputForm } from './PlanInputForm';
@@ -163,7 +163,13 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
       {plan.latest_run_error && <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">Latest Run {plan.latest_run_status}: {plan.latest_run_error}</div>}
-      {staleness?.stale && !staleness.hard_conflict && <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"><span className="font-semibold">Confirmation required.</span> {staleMessages.join(' ')} You may continue after explicit confirmation; refreshing or re-planning is optional.</div>}
+      {staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
+        <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-400" />
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-amber-300">Confirmation required</div>
+          <div className="mt-0.5 text-sm leading-5">{staleMessages.join(' ')} You may continue after explicit confirmation; refreshing or re-planning is optional.</div>
+        </div>
+      </div>}
       {staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       <CollapsiblePlanningRequest content={plan.initial_request} />
 

@@ -165,6 +165,8 @@ describe('PlanDetail', () => {
 
     expect(await screen.findByText(/no historical repository snapshot/)).toBeInTheDocument();
     expect(screen.getByText(/refreshing or re-planning is optional/i)).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveClass('text-gray-200', 'bg-amber-500/15');
+    expect(screen.getByText('Confirmation required')).toHaveClass('text-amber-300');
     expect(screen.queryByText(/This action is blocked/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve v2 & create execution Task' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Reject v2' })).toBeEnabled();

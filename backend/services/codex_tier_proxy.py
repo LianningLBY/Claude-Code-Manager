@@ -664,7 +664,20 @@ class CodexActualTierProxy:
     def codex_override_args(self) -> tuple[str, ...]:
         local = json.dumps(self.local_base_url)
         if self.route.built_in_openai:
-            overrides = [f"openai_base_url={local}"]
+            # ``openai_base_url`` keeps the built-in provider's WebSocket
+            # capability enabled.  Recent Codex versions treat a 426 from
+            # that transport as fatal instead of reliably falling back to
+            # HTTP, so describe the loopback proof proxy as a separate
+            # provider whose transport capability is explicit.
+            provider_id = "ccm_actual_tier"
+            overrides = [
+                f"model_provider={json.dumps(provider_id)}",
+                f"model_providers.{provider_id}.name={json.dumps('OpenAI via CCM tier proof')}",
+                f"model_providers.{provider_id}.base_url={local}",
+                f"model_providers.{provider_id}.wire_api={json.dumps('responses')}",
+                f"model_providers.{provider_id}.requires_openai_auth=true",
+                f"model_providers.{provider_id}.supports_websockets=false",
+            ]
         else:
             overrides = [
                 f"model_providers.{provider_id}.base_url={local}"

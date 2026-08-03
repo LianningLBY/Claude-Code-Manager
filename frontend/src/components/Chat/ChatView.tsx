@@ -13,6 +13,7 @@ import { FastModeBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { ExpandableText } from '../ExpandableText';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
+import { useVisualViewportBounds } from '../../hooks/useVisualViewportBounds';
 import {
   dedupeUploadResults,
   isUploadResult,
@@ -265,11 +266,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [titleDraft, setTitleDraft] = useState(task.title || '');
   const titleInputRef = useRef<HTMLInputElement>(null);
   const [titleExpanded, setTitleExpanded] = useState(false);
+  const chatRootRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [starred, setStarred] = useState(task.starred);
+
+  useVisualViewportBounds(chatRootRef, !inline);
 
   // Temp model override (one-shot per message, not persisted to the task)
   const [modelOverride, setModelOverride] = useState<string | null>(null);
@@ -1595,7 +1599,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   };
 
   return (
-    <div className={inline ? "flex flex-col h-full bg-gray-950" : "fixed inset-0 bg-gray-950 flex flex-col z-50"}>
+    <div ref={chatRootRef} className={inline ? "flex flex-col h-full bg-gray-950" : "fixed inset-0 bg-gray-950 flex flex-col z-50"}>
       {/* Header — two rows */}
       <div className="px-3 sm:px-4 py-1.5 pt-[max(0.375rem,env(safe-area-inset-top))] border-b border-gray-800 bg-gray-900">
         {/* Row 1: back + task info + action buttons */}

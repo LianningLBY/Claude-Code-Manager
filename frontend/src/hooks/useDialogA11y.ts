@@ -6,6 +6,11 @@ let previousBodyOverflow = '';
 export function useDialogA11y(open: boolean, onClose: () => void) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     if (!open) return;
@@ -18,13 +23,13 @@ export function useDialogA11y(open: boolean, onClose: () => void) {
     bodyLockCount += 1;
     if (dialog && !dialog.hasAttribute('tabindex')) dialog.tabIndex = -1;
     const selector = 'button:not([disabled]),a[href],input:not([disabled]),textarea:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
-    window.setTimeout(() => {
+    const focusTimer = window.setTimeout(() => {
       (dialog?.querySelector<HTMLElement>(selector) || dialog)?.focus();
     }, 0);
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== 'Tab' || !dialog) return;
@@ -40,12 +45,13 @@ export function useDialogA11y(open: boolean, onClose: () => void) {
     };
     document.addEventListener('keydown', onKeyDown);
     return () => {
+      window.clearTimeout(focusTimer);
       document.removeEventListener('keydown', onKeyDown);
       bodyLockCount = Math.max(0, bodyLockCount - 1);
       if (bodyLockCount === 0) document.body.style.overflow = previousBodyOverflow;
       if (previousFocus.current?.isConnected) previousFocus.current.focus();
     };
-  }, [onClose, open]);
+  }, [open]);
 
   return dialogRef;
 }

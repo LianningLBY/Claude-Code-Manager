@@ -8,9 +8,11 @@
 > 方案上请求 Revise 时创建新 Run 和新 Version，但不创建新 Plan。
 >
 > 代码已切换到本文的一等 Plan/Version/Run/Input/Application 架构；旧
-> `Task(mode="plan")` 数据在迁移后通过 legacy link 解析，前端和所有新产品写入只使用 canonical
-> Plan API。通用 `POST /api/tasks` 已拒绝 `mode=plan`，窄化的旧读写 API 仅在 contract
-> 观察期服务历史客户端。生产行为仍取决于是否已部署本提交。
+> `origin/main` 能产生的 `Task(mode="plan")` 数据在迁移后通过 legacy link 解析，前端和所有
+> 新产品写入只使用 canonical Plan API。每个 Main carrier 只迁移为一个 Plan、至多一个 v1；
+> 本功能分支早期实现产生的 revision chain、独立 Plan/Run/Input/Application 测试数据不属于
+> 生产历史，由 cutover reconciliation 清理。通用 `POST /api/tasks` 已拒绝 `mode=plan`，窄化的
+> 旧读写 API 仅在 contract 观察期服务历史客户端。生产行为仍取决于是否已部署本提交。
 > 2026-08-03 信息架构决策：新增独立顶级 **Plans** 页面；**Tasks** 页面和 New Task
 > 表单只承载真正的 Task，不再通过 Task 类型筛选展示 Plan。不会新增“执行 Task / Plan 先行”
 > 滑块。
@@ -87,7 +89,8 @@ Standalone Plan
 - Reviewer 自动 revision round 与用户主动 revision 统一进入同一版本图；
 - 审批、拒绝、应用、创建执行 Task 都有精确 Version 审计；
 - 保留当前 primary/fallback 选号、只读沙箱、staleness、ACL、Worker 和部署安全约束；
-- 平滑迁移现有 Plan Task、revision chain、审批和 application 历史。
+- 精确迁移 `origin/main` 可产生的单 carrier Plan Task、审批和执行状态，不承诺保留本功能分支
+  早期 schema 产生的 revision/application 测试历史。
 
 ### 1.2 非目标
 
@@ -505,7 +508,7 @@ target_session_id, user_log_id, execution_task_id, applied_by, created_at`。
 
 新增 `plan_legacy_task_links(task_id, plan_id, version_id, run_id)`，用于：
 
-- 旧 URL/API 按任意历史 Plan Task id 找到新 Plan/Version；
+- 旧 URL/API 按 Main 历史 Plan Task id 找到新 Plan/Version；
 - 数据迁移前后做逐行对账；
 - Worker 协议滚动升级期间兼容旧 payload。
 
@@ -853,34 +856,40 @@ canonical Plan 不再依赖普通 Task list response；历史 Task 仍遵守 Tas
 
 ### 16.2 Backfill
 
-按 `supersedes_plan_task_id` 把历史 Plan Task 组成有向链：
+迁移事实源固定为当前 `origin/main` 的旧 schema，而不是本功能分支曾经出现过的中间 schema：
 
-1. 在部署 blocker 已证明没有 active Plan 进程/claim 后开始迁移；验证无 cycle、一个节点最多
-   一个 predecessor/successor、同链 target/project 一致；
-2. 每条链创建一个 Plan，root 的请求作为 `initial_request`；
-3. 每个有 `plan_content` 的旧 Task 按链顺序创建一个 Version；
-4. 旧 `plan_agent_runs/steps` 关联新 Plan，并把成功 Run 对应到 Version；
-5. `plan_review` → current Version decision pending；
-6. `completed + plan_approved=True`：旧 main 自动执行语义（没有 `plan_approved_at`）→
-   application 指向原 carrier Task；后续 independent Plan 语义 → approved；
-7. `cancelled + plan_approved=False` → rejected；
-8. `superseded` → 历史 Version，并链接下一 Version；
-9. `plan_applied_*` / `plan_execution_task_id` → PlanApplication，并将 Version 认定为 approved；
-10. 未批准的 pending carrier（无论是否存在历史 attempt）→ 新建唯一 queued canonical Run，
-    并把旧 Task 标为 superseded，避免部署后 Task 与 Run 双重领取；旧 main 已批准的 pending
-    carrier 保持为原 execution Task，并创建 exact Version application；failed 且没有 content 的
-    Task → failed Run；
-11. 理论上不应存在 in_progress/executing Task 或 planning/reviewing Run；任一 Task、Run、
-    Instance/进程 active 证据都使 migration fail closed，包括远端 Worker 状态；
-12. 每个旧 Task 写 legacy link，不改变旧 id/URL 可解析性；superseded carrier 只读保留。
+1. 在部署 blocker 已证明没有 active Plan 进程/claim 后开始迁移；任何 in_progress/executing
+   Task、active Run 或 Instance/process owner 证据都使 migration fail closed；
+2. 只选择 `mode=plan` 且处于 Main 生命周期状态，并要求
+   `plan_target_task_id/plan_context_*/plan_repo_revision/supersedes_plan_task_id/
+   plan_approved_at/by/plan_applied_*/plan_execution_task_id/plan_pipeline_config` 全为空；这些字段和
+   `plan_agent_runs/steps` 都由本功能分支引入，不可能是 Main 历史；
+3. 每个符合条件的 Task 独立创建一个 Plan；有 `plan_content` 时只创建 v1，没有内容时不伪造
+   Version；不读取或重建 revision chain；
+4. `plan_review` + content → `review_verdict=disabled, human_decision=pending`，进入
+   `Plans requiring action`；Main 当时没有 Reviewer；
+5. `plan_approved=True` + content → v1 approved，并创建 execution application 指向同一个
+   carrier Task；Main 的 approve 就是把该 Task 重新排队执行，因此它是精确应用事实；
+6. `cancelled + plan_approved=False` + content → v1 rejected；
+7. 未批准 pending carrier → 唯一 queued canonical Run，并把旧 Task 标为 superseded，避免
+   Task 与 Run 双重领取；已批准 pending carrier 仍是原 execution Task，不得 supersede；
+8. 有 content 的历史规划 Run 记为 completed；无 content 的 failed/cancelled 状态投影为对应
+   terminal Run；每个 Main Task 写一个 legacy link。
 
-若链分叉、target 冲突、应用字段不完整或多个 Task 声称同一 application，migration 必须 fail
-closed 并输出脱敏的 task ids；不能猜测链顺序。
+首次 backfill 直接忽略带本分支 provenance 的 Task。对于已经运行过早期迁移的数据库，后续
+一次性 reconciliation 在同样的 quiescence fence 下：
+
+- 保留每个 Main-compatible carrier 已有的 Plan id 和其链接的 v1 id；从原 Task 重新规范化
+  title/content/decision/application/run/link；
+- 删除额外 Version、无 Main carrier 的 canonical Plan，以及旧分支创建的 Step/Input/Application
+  receipt/Run/Application 审计；旧 Task 行本身不删除；
+- 清除分支期间产生的 Archive/Closed/Fork 状态，因为这些状态不属于 Main 生产事实；
+- migration 不用日期、部署时间或硬编码 Task id 判断来源。
 
 ### 16.3 Dual-read / 校验
 
 - 新 API 读新表，旧 API 通过 legacy links 投影兼容 TaskResponse；
-- 临时后台对账新旧数量、current Version、审批、application、run/step 关联；
+- 临时后台对账 Main-compatible Task 数量、单 v1 内容、审批、carrier application 和 link；
 - 新写入只进入新模型；旧字段仅做兼容投影，不允许两个方向同时可写；
 - Manager 与 Worker 协议增加 capability/version 握手，旧 Worker 在包含新 PlanRun 时返回 409，
   不静默降级成旧 Plan Task。
@@ -902,13 +911,13 @@ closed 并输出脱敏的 task ids；不能猜测链顺序。
 ### Phase 1：领域表与只读投影
 
 - 新模型、schema、Alembic expand migration；
-- legacy chain backfill 和一致性校验；
+- Main 单 carrier backfill 和分支中间 schema 清理；
 - Plan/Version/Run read API；
 - 旧行为不变，前端不切换；
 - 加 migration 与 dual-read contract tests。
 
-完成门槛：现有数据库迁移后，新 API 对所有 Plan 历史的数量、内容、审批、应用和 revision 顺序
-与旧 API 一致；downgrade/restore 路径在三种数据库方言测试通过。
+完成门槛：现有数据库迁移后，新 API 与所有 Main-compatible Plan Task 的数量、v1 内容、审批和
+carrier 执行 application 一致；本分支中间 schema 数据已清理；restore 路径完成验证。
 
 ### Phase 2：可重入 Runner 与用户输入
 
@@ -1056,16 +1065,17 @@ thread、Instance owner 或部署 blocker。
 
 至少构造：
 
-- standalone/related 单 Plan；
-- 2–5 节点 revision chain；
-- plan_review/approved/rejected/applied/execution-task；
+- Main standalone 单 carrier Plan；
+- 带本分支 provenance 的 2–5 节点 revision chain，验证不迁移；
+- Main plan_review/approved/rejected/applied carrier；
 - failed/pending、无 content；
-- run/step primary/fallback audit；
 - legacy attachment metadata；
-- chain cycle、分叉、target 冲突、悬空 application 等坏数据；
+- 已跑过旧分支迁移的数据库：保留 Main Plan/v1 id，删除额外 Version、standalone/related
+  分支 Plan、Run/Step/Input/Application/receipt；
+- active Task/Run/Instance fence；
 - SQLite/PostgreSQL/MySQL upgrade；
-- upgrade 后 counts/content/ids/application 对账；
-- snapshot restore 与可支持范围内 downgrade。
+- upgrade 后 Main counts/content/ids/carrier application 对账；
+- snapshot restore；reconciliation 是不可逆数据清理，downgrade 不重造分支测试数据。
 
 ### 19.7 前端测试
 
@@ -1123,6 +1133,17 @@ thread、Instance owner 或部署 blocker。
 6. running PlanRun 阻止更新，waiting_user 不阻止；
 7. Claude 和 Codex primary/fallback 各覆盖一次并验证 repo 零写入。
 
+### 20.5 旧数据迁移
+
+1. 对停服后的生产 SQLite 在线备份执行 migration，不直接用开发库演练；
+2. Main `Task(mode=plan)` 数量与 legacy link/Plan 数量一致，每个 Plan 至多一个 v1；
+3. `plan_review` 出现在 `Plans requiring action`，rejected 保持 rejected；
+4. Main `plan_approved=True` 的 pending/completed/failed carrier 都显示 Applied，并跳回同一 Task；
+5. Main 旧 Task 继续出现在 Tasks list/search，点击 canonical link 可打开对应 Plan；
+6. 本分支中间实现产生的多 Version/无 Main source Plan 和交互审计已清除；
+7. Archived only、列表选中高亮和旧 Plan 深链接在迁移副本上验证；
+8. 校验完成前保留数据库快照，生产迁移/重启仍走独立部署授权。
+
 ## 21. 发布门禁与完成定义
 
 以下全部满足才算完成，不能只以 UI 可提问为完成：
@@ -1132,7 +1153,7 @@ thread、Instance owner 或部署 blocker。
 - Planner/Reviewer request-input 均可跨服务重启恢复；
 - waiting_user 无任何进程、thread、Instance owner、capacity 或 update blocker；
 - 所有审批和应用绑定 exact Version；
-- 旧 Plan Task 历史迁移无丢失且 legacy URL 可解析；
+- Main-compatible 旧 Plan Task 的 v1/decision/carrier application 无丢失且 legacy URL 可解析；
 - 旧 Plan Task 继续出现在 Tasks list/count/search，且 Plan 决策只允许在 canonical Plan 执行；
 - 本机与 Worker 行为对等；
 - Worker protocol v1 先握手，再以 attachment size/SHA-256 manifest、generation CAS 和 durable
@@ -1149,7 +1170,7 @@ thread、Instance owner 或部署 blocker。
 |---|---|
 | 状态表数量增加、查询复杂 | Plan 聚合服务统一读写；API 返回派生 display_state；禁止前端拼状态 |
 | Run 等待时恢复重复调用模型 | durable status + generation + step/version unique idempotency |
-| 旧 Plan revision 链异常 | migration 预检 fail closed，不猜测、不删除旧 Task |
+| 本分支中间 Plan schema 污染生产事实 | 只认 Main-compatible carrier；reconciliation 删除 canonical 分支数据但保留旧 Task |
 | Task/PlanRun 抢 Instance 产生 owner 竞态 | 同一 capacity/admission lock、DB CAS、owner XOR、exact generation |
 | 用户回答不进入最终方案 | Reviewer question 回 Planner；最终批准 Version 必须自包含 |
 | 等待期间主对话/repo 改变 | 对话不隐式刷新；Version 输出时重记 repo；审批/application stale 检查 |

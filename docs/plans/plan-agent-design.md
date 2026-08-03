@@ -1,7 +1,9 @@
 # 独立 Plan Task 与 Plan Agent 设计
 
-> 状态：Legacy 设计；前端与新写入已经移除该形态。历史 `Task(mode="plan")` 经迁移 link
-> 解析，窄化旧 API 只在 contract 观察期兼容旧客户端；通用 `mode=plan` 创建入口已关闭。
+> 状态：Legacy 设计；前端与新写入已经移除该形态。只有 `origin/main` 能产生的单 carrier
+> `Task(mode="plan")` 经迁移 link 解析；本文后续描述的独立 Plan Task/revision chain 是本功能
+> 分支的中间方案，不作为迁移事实源。窄化旧 API 只在 contract 观察期兼容旧客户端；通用
+> `mode=plan` 创建入口已关闭。
 >
 > 2026-07-29 决策：Plan 永远是独立制品。Plan 完成或批准都不会自动唤醒目标
 > session；用户必须通过下一条真实消息携带方案，或显式创建执行 Task。

@@ -1453,6 +1453,8 @@ export const api = {
     display_state?: string;
     project_id?: number;
     include_archived?: boolean;
+    archived_only?: boolean;
+    q?: string;
     limit?: number;
     offset?: number;
   }) => {
@@ -1461,7 +1463,9 @@ export const api = {
     if (params?.kind) query.set('kind', params.kind);
     if (params?.display_state) query.set('display_state', params.display_state);
     if (params?.project_id != null) query.set('project_id', String(params.project_id));
-    if (params?.include_archived) query.set('include_archived', 'true');
+    if (params?.archived_only) query.set('archived_only', 'true');
+    else if (params?.include_archived) query.set('include_archived', 'true');
+    if (params?.q?.trim()) query.set('q', params.q.trim());
     if (params?.limit != null) query.set('limit', String(params.limit));
     if (params?.offset != null) query.set('offset', String(params.offset));
     return request<PlanResource[]>(`/api/plans${query.size ? `?${query}` : ''}`);
@@ -1472,13 +1476,17 @@ export const api = {
     display_state?: string;
     project_id?: number;
     include_archived?: boolean;
+    archived_only?: boolean;
+    q?: string;
   }) => {
     const query = new URLSearchParams();
     if (params?.target_task_id != null) query.set('target_task_id', String(params.target_task_id));
     if (params?.kind) query.set('kind', params.kind);
     if (params?.display_state) query.set('display_state', params.display_state);
     if (params?.project_id != null) query.set('project_id', String(params.project_id));
-    if (params?.include_archived) query.set('include_archived', 'true');
+    if (params?.archived_only) query.set('archived_only', 'true');
+    else if (params?.include_archived) query.set('include_archived', 'true');
+    if (params?.q?.trim()) query.set('q', params.q.trim());
     return request<{ total: number }>(`/api/plans/count${query.size ? `?${query}` : ''}`);
   },
   getPlan: (planId: number) => request<PlanResource>(`/api/plans/${planId}`),

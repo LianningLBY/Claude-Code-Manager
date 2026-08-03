@@ -173,7 +173,7 @@ claude-manager/
 │       ├── api/ws.ts            # WebSocket 客户端 (指数退避重连)
 │       ├── config/server.ts     # 远程服务器 URL 配置 (Capacitor/Android)
 │       ├── config/theme.ts      # 主题注册表 (现代深/浅 + Legacy 组, meta theme-color 同步)
-│       ├── pages/               # Dashboard, TasksPage, WorkersPage, PRMonitorPage, LoginPage...
+│       ├── pages/               # Dashboard, TasksPage, PlansPage, WorkersPage, PRMonitorPage, LoginPage...
 │       ├── components/
 │       │   ├── AskUserNotifications.tsx   # 全局 ask_user 弹窗通知
 │       │   ├── Chat/ChatView.tsx          # 多轮对话 UI
@@ -377,13 +377,15 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 
 Plan 是独立于 Task 的一等、版本化制品：
 
-1. 在 New Task 选择 Plan 创建 standalone Plan，或在已有 Chat 的 **Plans** 面板创建多个互相独立的 related Plan。
+1. 在独立的 **Plans** 页面创建 standalone Plan，或在已有 Chat 的 **Plans** 面板创建多个互相独立的 related Plan。**Tasks** 页面只创建和展示真正的 Task。
 2. Planner/Reviewer 路由只在全局 Settings 配置；每个新 Plan 冻结当时的 primary/fallback provider、model、effort 和轮数设置。
 3. Planner 和 Reviewer 都可暂停同一个 Run 请求必要输入；单轮问题数量没有业务上限，每 Run 可暂停次数是独立的 `0–5` 全局设置。
 4. 每次完整方案写入不可变 Version。Revise 在同一 Plan 下创建新 Run/Version，只有 Fork 才创建新 Plan。
 5. Approve/Reject 绑定用户看到的 exact Version，不唤醒或改变原 Task/session。关联 Version 只有显式附到下一条真实消息时才应用一次；standalone Version 可显式创建普通 execution Task。
 
-首页用 **Plans requiring action** 汇总待输入、待审批和待执行动作；Plans 详情保留 Version
+**Plans** 页面用 **Plans requiring action** 汇总待输入、待审批和待执行动作；下方目录支持
+standalone/related、状态、Project、搜索和 Archived only 筛选。Archive 是可恢复的软归档，不会
+删除 Plan、Version、Run 或问答历史。Plans 详情保留 Version
 切换/比较、完整 Q&A/Run/route/repository 审计，以及旧 Version 已应用而新 Version 待审的双状态。
 若对话、仓库或目标发生变化，操作会要求 stale 确认或因 hard conflict 明确阻断。
 

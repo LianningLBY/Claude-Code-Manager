@@ -35,7 +35,6 @@ vi.mock('../../api/client', () => ({
       },
     }),
     createTask: vi.fn().mockResolvedValue({ id: 1 }),
-    createPlan: vi.fn().mockResolvedValue({ id: 1 }),
     createProject: vi.fn().mockResolvedValue({ id: 2 }),
     listWorkers: vi.fn().mockResolvedValue([]),
     listSkillsCached: vi.fn().mockResolvedValue([
@@ -583,44 +582,18 @@ describe('Codex Fast speed configuration', () => {
     ));
   });
 
-  it('uses the global Plan pipeline instead of per-create routing', async () => {
-    vi.mocked(api.listSecrets).mockResolvedValueOnce([{
-      id: 7,
-      name: 'deploy-token',
-      content: 'masked',
-      created_at: '2026-08-02T00:00:00Z',
-      updated_at: '2026-08-02T00:00:00Z',
-    }]);
-    const speedSelect = await switchToCodexFastForm();
-    expect(await screen.findByRole('button', { name: 'Secrets' })).toBeInTheDocument();
-    await userEvent.selectOptions(speedSelect, 'priority');
-    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'plan');
-
-    await waitFor(() => {
-      expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: 'Secrets' })).not.toBeInTheDocument();
-    });
-    await selectProject();
-    await userEvent.type(
-      screen.getByPlaceholderText(
-        'Prompt / Description (this will be sent to Codex)',
-      ),
-      'standard plan',
-    );
-    await userEvent.click(screen.getByRole('button', { name: /create/i }));
-
-    await waitFor(() => expect(api.createPlan).toHaveBeenCalled());
-    const payload = vi.mocked(api.createPlan).mock.calls.at(-1)?.[0];
-    expect(payload).toEqual(expect.objectContaining({
-      input: 'standard plan',
-      project_id: 1,
+  it('removes Plan mode and normalizes a legacy saved Plan default', async () => {
+    localStorage.setItem('cc_default_task_config', JSON.stringify({
+      mode: 'plan',
+      provider: 'codex',
+      codexServiceTier: 'priority',
     }));
-    expect(api.createTask).not.toHaveBeenCalled();
-    expect(payload).not.toHaveProperty('provider');
-    expect(payload).not.toHaveProperty('model');
-    expect(payload).not.toHaveProperty('effort_level');
-    expect(payload).not.toHaveProperty('codex_service_tier');
-    expect(payload).not.toHaveProperty('pipeline_config');
+
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+
+    expect(screen.getByDisplayValue('Auto')).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Plan' })).not.toBeInTheDocument();
   });
 
   it('atomically resets Fast when switching to an unsupported model', async () => {

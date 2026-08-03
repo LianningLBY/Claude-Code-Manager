@@ -1,0 +1,142 @@
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from 'react';
+
+import { api, type PlanResource, type Project } from '../api/client';
+import { PlanCatalog } from '../components/PlanReview/PlanCatalog';
+import { PlanCreateForm } from '../components/PlanReview/PlanCreateForm';
+import { PlanDetail } from '../components/PlanReview/PlanDetail';
+import { PlanNeedsInputPanel } from '../components/PlanReview/PlanNeedsInputPanel';
+import { usePlanEvents } from '../components/PlanReview/usePlanEvents';
+import { VersionedPlanPanel } from '../components/PlanReview/VersionedPlanPanel';
+import { ProjectSelect } from '../components/ProjectSelect';
+import { useDialogA11y } from '../hooks/useDialogA11y';
+import { Archive, ChevronLeft, ChevronRight, Search, X } from '../components/icons';
+
+const PAGE_SIZE = 20;
+type KindFilter = 'all' | 'standalone' | 'related';
+type StatusFilter = 'all' | 'waiting_user' | 'awaiting_review' | 'running' | 'approved' | 'applied' | 'failed';
+
+const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'waiting_user', label: 'Input' },
+  { value: 'awaiting_review', label: 'Review' },
+  { value: 'running', label: 'Running' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'applied', label: 'Applied' },
+  { value: 'failed', label: 'Failed' },
+];
+
+const DISPLAY_STATE_QUERY: Record<StatusFilter, string | undefined> = {
+  all: undefined,
+  waiting_user: 'waiting_user',
+  awaiting_review: 'awaiting_review',
+  running: 'planner,reviewer,queued,running',
+  approved: 'approved',
+  applied: 'applied',
+  failed: 'failed',
+};
+
+interface Props {
+  selectedPlanId: number | null;
+  onSelectedPlanChange: (planId: number | null) => void;
+}
+
+export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
+  const [plans, setPlans] = useState<PlanResource[]>([]);
+  const [selectedPlan, setSelectedPlan] = useState<PlanResource | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [kind, setKind] = useState<KindFilter>('all');
+  const [status, setStatus] = useState<StatusFilter>('all');
+  const [projectId, setProjectId] = useState<number | undefined>();
+  const [archivedOnly, setArchivedOnly] = useState(false);
+  const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const close = useCallback(() => {
+    setExpanded(false);
+    setSelectedPlan(null);
+    onSelectedPlanChange(null);
+  }, [onSelectedPlanChange]);
+  const dialogRef = useDialogA11y(selectedPlanId != null, close);
+
+  const query = useMemo(() => ({
+    ...(kind !== 'all' ? { kind } : {}),
+    ...(DISPLAY_STATE_QUERY[status] ? { display_state: DISPLAY_STATE_QUERY[status] } : {}),
+    ...(projectId != null ? { project_id: projectId } : {}),
+    ...(archivedOnly ? { archived_only: true } : {}),
+    ...(deferredSearch.trim() ? { q: deferredSearch.trim() } : {}),
+  }), [archivedOnly, deferredSearch, kind, projectId, status]);
+
+  const refresh = useCallback(async (showLoading = false) => {
+    if (showLoading) setLoading(true);
+    try {
+      const offset = (page - 1) * PAGE_SIZE;
+      const [rows, count, projectRows, detail] = await Promise.all([
+        api.listPlans({ ...query, limit: PAGE_SIZE, offset }),
+        api.countPlans(query),
+        api.listProjects(),
+        selectedPlanId != null ? api.getPlan(selectedPlanId) : Promise.resolve(null),
+      ]);
+      setPlans(rows);
+      setTotal(count.total);
+      setProjects(projectRows);
+      setSelectedPlan(detail);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (showLoading) setLoading(false);
+    }
+  }, [page, query, selectedPlanId]);
+
+  useEffect(() => {
+    void refresh(true);
+    const timer = window.setInterval(() => void refresh(), 15000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+  useEffect(() => setPage(1), [query]);
+  usePlanEvents(selectedPlan && !plans.some((plan) => plan.id === selectedPlan.id) ? [...plans, selectedPlan] : plans, refresh);
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const selectPlan = (planId: number) => {
+    const local = plans.find((plan) => plan.id === planId);
+    if (local) setSelectedPlan(local);
+    onSelectedPlanChange(planId);
+  };
+  const created = (plan: PlanResource) => {
+    setSelectedPlan(plan);
+    onSelectedPlanChange(plan.id);
+  };
+
+  return <div className="space-y-6">
+    <PlanCreateForm onCreated={created} />
+
+    <section className="space-y-4" aria-label="Plans requiring action">
+      <h2 className="text-base font-semibold text-gray-200">Plans requiring action</h2>
+      <PlanNeedsInputPanel />
+      <VersionedPlanPanel />
+    </section>
+
+    <section className="space-y-3" aria-label="All Plans">
+      <div className="flex flex-wrap items-center gap-2">
+        <select aria-label="Plan kind" value={kind} onChange={(event) => setKind(event.target.value as KindFilter)} className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-300">
+          <option value="all">All Plans</option>
+          <option value="standalone">Standalone</option>
+          <option value="related">Related</option>
+        </select>
+        <ProjectSelect projects={projects.filter((project) => project.show_in_selector)} value={projectId} onChange={(value) => setProjectId(value ? Number(value) : undefined)} placeholder="All Projects" />
+        <div className="relative min-w-[180px] flex-1 sm:max-w-sm"><Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search Plans" className="w-full rounded-lg border border-gray-700 bg-gray-800 py-2 pl-8 pr-8 text-xs text-gray-200 outline-none focus:border-indigo-500" />{search && <button type="button" onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500" aria-label="Clear Plan search"><X size={13} /></button>}</div>
+        <button type="button" onClick={() => setArchivedOnly((value) => !value)} aria-pressed={archivedOnly} className={`flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs ${archivedOnly ? 'border-amber-500/50 bg-amber-500/15 text-amber-300' : 'border-gray-700 bg-gray-800 text-gray-400 hover:text-gray-200'}`}><Archive size={13} /> Archived only</button>
+      </div>
+      <div className="flex gap-1 overflow-x-auto pb-1">{STATUS_OPTIONS.map((option) => <button key={option.value} type="button" onClick={() => setStatus(option.value)} aria-pressed={status === option.value} className={`whitespace-nowrap rounded-full px-3 py-1.5 text-xs ${status === option.value ? 'bg-indigo-500/20 text-indigo-300' : 'text-gray-500 hover:bg-gray-800 hover:text-gray-300'}`}>{option.label}</button>)}</div>
+      {error && <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
+      {loading ? <div className="py-12 text-center text-sm text-gray-500">Loading Plans…</div> : <PlanCatalog plans={plans} projects={projects} selectedPlanId={selectedPlanId} onSelectPlan={selectPlan} />}
+      {totalPages > 1 && <div className="flex items-center justify-center gap-3 py-2"><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Previous Plans page"><ChevronLeft size={17} /></button><span className="text-xs text-gray-500">{page} / {totalPages} · {total} Plans</span><button type="button" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Next Plans page"><ChevronRight size={17} /></button></div>}
+    </section>
+
+    {selectedPlan && <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && close()}><div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plan #${selectedPlan.id}`} className={`w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(88vh,860px)] sm:max-w-5xl sm:rounded-2xl ${expanded ? 'h-[100dvh]' : 'h-[70dvh]'}`}><button type="button" onClick={() => setExpanded((value) => !value)} className="absolute left-1/2 top-2 z-10 h-1.5 w-12 -translate-x-1/2 rounded-full bg-gray-600 sm:hidden" aria-label={expanded ? 'Collapse Plan detail' : 'Expand Plan detail'} /><PlanDetail plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={(taskId) => { window.location.hash = `#/tasks/chat/${taskId}`; }} /></div></div>}
+  </div>;
+}

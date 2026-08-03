@@ -153,6 +153,61 @@ async def test_plan_and_run_requests_reject_blank_text(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_plan_catalog_search_and_archived_only_match_list_and_count(client):
+    archived = await client.post(
+        "/api/plans",
+        json={"input": "Needle migration details", "title": "Archived artifact"},
+    )
+    active = await client.post(
+        "/api/plans",
+        json={"input": "Unrelated active request", "title": "Active Plan"},
+    )
+    assert archived.status_code == 201, archived.text
+    assert active.status_code == 201, active.text
+    archived_payload = archived.json()
+
+    cancelled = await client.post(
+        f"/api/plan-runs/{archived_payload['active_run']['id']}/cancel"
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    current = await client.get(f"/api/plans/{archived_payload['id']}")
+    assert current.status_code == 200, current.text
+    archived_result = await client.patch(
+        f"/api/plans/{archived_payload['id']}",
+        json={
+            "archived": True,
+            "expected_lock_version": current.json()["lock_version"],
+        },
+    )
+    assert archived_result.status_code == 200, archived_result.text
+
+    default_rows = await client.get(
+        "/api/plans", params={"q": "needle migration"}
+    )
+    assert default_rows.status_code == 200
+    assert default_rows.json() == []
+
+    rows = await client.get(
+        "/api/plans", params={"archived_only": True, "q": "needle migration"}
+    )
+    count = await client.get(
+        "/api/plans/count",
+        params={"archived_only": True, "q": "needle migration"},
+    )
+    assert [item["id"] for item in rows.json()] == [archived_payload["id"]]
+    assert count.json() == {"total": 1}
+
+    running_rows = await client.get(
+        "/api/plans", params={"display_state": "planner,reviewer"}
+    )
+    running_count = await client.get(
+        "/api/plans/count", params={"display_state": "planner,reviewer"}
+    )
+    assert [item["id"] for item in running_rows.json()] == [active.json()["id"]]
+    assert running_count.json() == {"total": 1}
+
+
+@pytest.mark.asyncio
 async def test_retry_requires_exact_terminal_failed_source(client, session_factory):
     created = await client.post(
         "/api/plans",

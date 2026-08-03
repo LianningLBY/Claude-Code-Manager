@@ -11,7 +11,9 @@
 > `Task(mode="plan")` 数据在迁移后通过 legacy link 解析，前端和所有新产品写入只使用 canonical
 > Plan API。通用 `POST /api/tasks` 已拒绝 `mode=plan`，窄化的旧读写 API 仅在 contract
 > 观察期服务历史客户端。生产行为仍取决于是否已部署本提交。
-> 首页沿用现有 New Task Mode 下拉，不新增“执行 Task / Plan 先行”切换。
+> 2026-08-03 信息架构决策：新增独立顶级 **Plans** 页面；**Tasks** 页面和 New Task
+> 表单只承载真正的 Task，不再通过 Task 类型筛选展示 Plan。不会新增“执行 Task / Plan 先行”
+> 滑块。
 
 > 2026-08-02 实施复核：全局行动区统一命名为 `Plans requiring action`；Planner/Reviewer
 > 只能在全局 Settings 配置，新 Plan 冻结完整路由快照；每 Run 的用户交互轮数是独立的
@@ -778,7 +780,7 @@ WebSocket 当权威状态。管理员可订阅全局 `plans`；普通成员只�
 
 ### 14.2 Plans requiring action / Input needed
 
-- 首页以 `Plans requiring action` 统一包裹 `Input needed` 与 review/execute 两类动作；
+- Plans 页面以 `Plans requiring action` 统一包裹 `Input needed` 与 review/execute 两类动作；
 - Plans modal 使用 `Input` 过滤器和 attention badge；
 - InputRequest 使用专用表单渲染 text/single/multi choice；
 - 表单按响应中的完整 questions 数组渲染，不截断、不分页丢题，也不因问题数量拒绝提交；
@@ -792,22 +794,24 @@ WebSocket 当权威状态。管理员可订阅全局 `plans`；普通成员只�
 
 - `Plans requiring action` 的 review/execute 分组只展示 current Version decision=pending，
   或已批准但尚未创建 execution Task 的 standalone Version；
-- TasksPage 的 Normal/Standalone/Related 类型筛选不影响该区域；
+- Plans 目录的 kind/status/Project/search/archive 筛选不影响该区域；
 - Approve/Reject 文案带 Version，例如 `Approve v3`；
 - composer attachment 显示 `Plan #12 · v3`；
 - user message 展开内容展示 exact applied Version snapshot；
 - v1 已 applied、v2 新生成时，清晰显示两条状态，不把整个 Plan 永久标成 applied；
 - standalone `Create execution task` 绑定批准的 Version，成功后显示目标 Task 链接。
 
-### 14.4 Task 首页
+### 14.4 顶级 Plans 页面与 Tasks 边界
 
 Plan 不再依赖普通 Task list response：
 
-- Normal tasks 仍查询 Tasks；
-- Standalone Plans 查询 `plans?kind=standalone`；
-- Related Plans 查询 `plans?kind=related`；
-- UI 可以维持现有三类筛选外观，但数据源和类型改为显式 union；
-- awaiting review / needs input 使用独立查询，不受 task list filter、分页和 count 影响。
+- Tasks 页面、分页、计数和全局 Task 搜索固定查询 `task_kind=main`；
+- New Task 表单不提供 Plan mode；standalone 统一从 Plans 页面创建；
+- Plans 页面目录查询 canonical `/api/plans`，支持 standalone/related、display state、Project、
+  title/request 搜索和 `archived_only`；
+- Archive 是可恢复软归档，Archived only 可发现并打开完整历史；
+- 每个 Plan 可用 `#/plans/{plan_id}` 深链接打开，列表选中项必须高亮；
+- awaiting review / needs input 使用独立查询，不受 Plan 目录筛选、分页和 count 影响。
 
 ## 15. 权限与安全
 
@@ -906,7 +910,7 @@ thread、Instance owner 或部署 blocker。
 - canonical create/revise/fork/approve/reject/application API；
 - Plans modal、Needs input、Version history/diff；
 - Chat `plan_version_ids` 和 applied snapshot；
-- 首页 Plan 数据源切换；
+- 独立 Plans 页面、standalone 创建、目录筛选和深链接；Tasks 页面只查询 main Task；
 - 旧 API 保留兼容。
 
 完成门槛：用户 Revise 后 Plan id 和卡片不变，只增加 Run/Version；所有刷新/重连状态一致。
@@ -959,7 +963,8 @@ thread、Instance owner 或部署 blocker。
 - `frontend/src/api/client.ts`：Plan/Version/Run/Input/Application 类型和 API；
 - `components/PlanReview/`：Plan 列表、Version selector/diff、Run progress、Input form；
 - `Chat/ChatView.tsx`：按 Version 创建/选择/应用；
-- `Tasks/TaskList` / `TasksPage`：Plan 独立数据源和筛选；
+- `pages/PlansPage` / `components/PlanReview`：Plan 创建、目录、筛选、深链接和行动队列；
+- `Tasks/TaskList` / `TasksPage`：只展示 `task_kind=main`；
 - WebSocket invalidation/refetch；
 - 对应 Vitest/RTL 测试。
 

@@ -1034,14 +1034,16 @@ python -m pytest \
 
 | 步骤 | 谁 | 做什么 |
 |------|-----|--------|
-| 1 | 人 | 创建 standalone 和 related Plan → 确认出现独立 Plan id，未创建 `Task(mode=plan)` |
-| 2 | 人 | Planner/Reviewer 请求多项输入 → 刷新后问题/草稿仍在，提交后恢复同一 Run |
-| 3 | 人 | Approve exact Version → 确认没有新 Agent turn；related 需显式附到下一条消息才应用 |
-| 4 | 人 | standalone Version 点击 Create execution Task → 确认跳转且历史仍保留执行 Task 链接 |
-| 5 | 人 | v1 已应用后 Revise 生成 v2 → 确认同时显示 v1 applied 与 v2 awaiting review |
-| 6 | 人 | 任务完成后点 Chat 按钮 → 发送追问消息 |
-| 7 | AI | 查 DB 确认 task.session_id 存在，`--resume` 会被使用 |
-| 8 | 人 | 测试语音按钮 → 确认录音转文字填入输入框 |
+| 1 | 人 | 确认侧栏有独立 Plans；Tasks 的 New Task/Filter 均无 Plan 入口，Task list/search 不出现 Plan |
+| 2 | 人 | 从 Plans 创建 standalone Plan → 确认立即出现在目录并打开 `#/plans/{id}`，Task List/Task count 不增加 |
+| 3 | 人 | 从 Task Chat 创建 related Plan → 确认 Plans 页 Related 筛选可找到，目标 Task Plans modal 选中项有高亮 |
+| 4 | 人 | 分别测试 kind/status/Project/search；Archive 后默认目录消失，Archived only 可找到、打开并恢复，Version/Run/Q&A 未丢失 |
+| 5 | 人 | Planner/Reviewer 请求多项输入 → 刷新后问题仍在，提交后恢复同一 Run；一次请求包含很多问题时完整渲染、不截断 |
+| 6 | 人 | Approve exact Version → 确认没有新 Agent turn；related 需显式附到下一条消息才应用 |
+| 7 | 人 | standalone Version 点击 Create execution Task → 确认跳转且历史仍保留同一个执行 Task 链接，重复点击不创建第二个 Task |
+| 8 | 人 | v1 已应用后 Revise 生成 v2 → 确认同一 Plan id、Version selector 可切换，并同时显示 v1 applied 与 v2 awaiting review |
+| 9 | 人 | Fork → 确认产生新 Plan id；Refresh context/Retry/Cancel/Reject/Archive 各自不改变原 Task/session |
+| 10 | 人 | Run 失败后确认旧可用 Version 仍可查看；桌面 modal、移动端全屏详情、附件上传/失败重试/问答历史均正常 |
 
 ### AI 验证命令速查
 

@@ -15,8 +15,6 @@ vi.mock('../api/client', () => ({
     }),
     listTasks: vi.fn(),
     countTasks: vi.fn(),
-    listPlans: vi.fn().mockResolvedValue([]),
-    countPlans: vi.fn().mockResolvedValue({ total: 0 }),
     listProjects: vi.fn(),
     listTags: vi.fn(),
     getTask: vi.fn(),
@@ -54,17 +52,6 @@ vi.mock('../hooks/useTaskReorder', () => ({
 
 vi.mock('../components/Tasks/TaskForm', () => ({
   TaskForm: () => null,
-}));
-vi.mock('../components/PlanReview/PlanNeedsInputPanel', () => ({
-  PlanNeedsInputPanel: () => <div data-testid="needs-input-panel" />,
-}));
-vi.mock('../components/PlanReview/VersionedPlanPanel', () => ({
-  VersionedPlanPanel: () => <div data-testid="versioned-review-panel" />,
-}));
-vi.mock('../components/PlanReview/PlanCatalog', () => ({
-  PlanCatalog: ({ plans }: { plans: Array<{ id: number }> }) => (
-    <div data-testid="plan-catalog">{plans.map((plan) => plan.id).join(',')}</div>
-  ),
 }));
 vi.mock('../components/Tasks/TaskList', () => ({
   TaskList: ({
@@ -252,24 +239,9 @@ describe('TasksPage realtime reconciliation', () => {
     expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
   });
 
-  it('loads first-class related Plans without filtering review panels', async () => {
-    const main = { ...task, id: 1, mode: 'auto' };
-    const standalone = {
-      ...task,
-      id: 2,
-      mode: 'plan',
-      plan_target_task_id: null,
-    };
-    const related = {
-      ...task,
-      id: 3,
-      mode: 'plan',
-      plan_target_task_id: 1,
-    };
-    vi.mocked(api.listTasks).mockResolvedValue([main, standalone, related] as never);
+  it('queries only main Tasks and contains no Plan catalog or action panels', async () => {
+    vi.mocked(api.listTasks).mockResolvedValue([{ ...task, id: 1 }] as never);
     vi.mocked(api.countTasks).mockResolvedValue({ total: 1 });
-    vi.mocked(api.listPlans).mockResolvedValue([{ id: 30 }] as never);
-    vi.mocked(api.countPlans).mockResolvedValue({ total: 1 });
 
     render(
       <TasksPage
@@ -278,20 +250,13 @@ describe('TasksPage realtime reconciliation', () => {
       />,
     );
 
-    await userEvent.click(await screen.findByRole('button', { name: /Filter/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Related Plans' }));
-
-    await waitFor(() => expect(api.listPlans).toHaveBeenCalledWith({
-      kind: 'related',
-      project_id: undefined,
-      include_archived: false,
-      limit: 20,
-      offset: 0,
-    }));
-    expect(await screen.findByTestId('plan-catalog')).toHaveTextContent('30');
-    expect(screen.queryByTestId('task-snapshots')).not.toBeInTheDocument();
-    expect(screen.getByRole('region', { name: 'Plans requiring action' })).toBeInTheDocument();
-    expect(screen.getByTestId('needs-input-panel')).toBeInTheDocument();
-    expect(screen.getByTestId('versioned-review-panel')).toBeInTheDocument();
+    expect(await screen.findByText('1:pending:false')).toBeInTheDocument();
+    await waitFor(() => expect(api.listTasks).toHaveBeenCalled());
+    expect(vi.mocked(api.listTasks).mock.calls.every((call) => call[8] === 'main')).toBe(true);
+    expect(vi.mocked(api.countTasks).mock.calls.every((call) => call[6] === 'main')).toBe(true);
+    expect(screen.queryByRole('region', { name: 'Plans requiring action' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Filter/ }));
+    expect(screen.queryByText('Standalone Plans')).not.toBeInTheDocument();
+    expect(screen.queryByText('Related Plans')).not.toBeInTheDocument();
   });
 });

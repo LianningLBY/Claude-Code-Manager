@@ -7,7 +7,7 @@ import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import (
@@ -660,6 +660,8 @@ async def list_plans(
     display_state: str | None = None,
     project_id: int | None = None,
     include_archived: bool = False,
+    archived_only: bool = False,
+    q: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -673,15 +675,31 @@ async def list_plans(
         query = query.where(Plan.target_task_id.is_(None))
     elif kind == "related":
         query = query.where(Plan.target_task_id.isnot(None))
-    if not include_archived:
+    if archived_only:
+        query = query.where(Plan.archived_at.isnot(None))
+    elif not include_archived:
         query = query.where(Plan.archived_at.is_(None))
+    if q and q.strip():
+        escaped = (
+            q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        query = query.where(
+            or_(
+                Plan.title.ilike(pattern, escape="\\"),
+                Plan.initial_request.ilike(pattern, escape="\\"),
+            )
+        )
     rows = list((await db.execute(query.order_by(Plan.updated_at.desc(), Plan.id.desc()))).scalars())
+    display_states = {
+        state.strip() for state in (display_state or "").split(",") if state.strip()
+    }
     resources: list[PlanResource] = []
     for plan in rows:
         if not await _has_plan_access(request, plan, db, control=False):
             continue
         resource = await plan_resource(db, plan)
-        if display_state is None or resource.display_state == display_state:
+        if not display_states or resource.display_state in display_states:
             resources.append(resource)
     return resources[offset:offset + limit]
 
@@ -694,6 +712,8 @@ async def count_plans(
     display_state: str | None = None,
     project_id: int | None = None,
     include_archived: bool = False,
+    archived_only: bool = False,
+    q: str | None = Query(default=None, max_length=200),
     db: AsyncSession = Depends(get_db),
 ):
     """Count the same ACL-filtered projection exposed by ``list_plans``."""
@@ -707,16 +727,32 @@ async def count_plans(
         query = query.where(Plan.target_task_id.is_(None))
     elif kind == "related":
         query = query.where(Plan.target_task_id.isnot(None))
-    if not include_archived:
+    if archived_only:
+        query = query.where(Plan.archived_at.isnot(None))
+    elif not include_archived:
         query = query.where(Plan.archived_at.is_(None))
+    if q and q.strip():
+        escaped = (
+            q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        query = query.where(
+            or_(
+                Plan.title.ilike(pattern, escape="\\"),
+                Plan.initial_request.ilike(pattern, escape="\\"),
+            )
+        )
     rows = list((await db.execute(query)).scalars())
+    display_states = {
+        state.strip() for state in (display_state or "").split(",") if state.strip()
+    }
     total = 0
     for plan in rows:
         if not await _has_plan_access(request, plan, db, control=False):
             continue
-        if display_state is not None:
+        if display_states:
             resource = await plan_resource(db, plan)
-            if resource.display_state != display_state:
+            if resource.display_state not in display_states:
                 continue
         total += 1
     return {"total": total}

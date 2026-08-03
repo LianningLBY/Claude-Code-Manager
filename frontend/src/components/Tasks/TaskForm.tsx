@@ -110,7 +110,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     fallbackProvider: string,
   ) => {
     setPriority(stored?.priority ?? 0);
-    setMode(stored?.mode || 'auto');
+    // Plan creation now lives on the first-class Plans page. Normalize the
+    // legacy saved value so an old browser preference cannot recreate the
+    // removed Task-form mode invisibly.
+    setMode(stored?.mode === 'plan' ? 'auto' : stored?.mode || 'auto');
     setProvider(stored?.provider || fallbackProvider);
     setModel(stored?.model || '');
     setEffort(stored?.effort || '');
@@ -322,14 +325,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   // Fast is Codex-only and model-gated. Wait for the capability response before
   // normalizing persisted defaults so a slow config request cannot erase them.
   useEffect(() => {
-    if (provider !== 'codex' || mode === 'plan') {
+    if (provider !== 'codex') {
       if (codexServiceTier !== 'default') setCodexServiceTier('default');
       return;
     }
     if (codexCapabilitiesLoaded && codexServiceTier === 'priority' && !activeCodexModelSupportsFast) {
       setCodexServiceTier('default');
     }
-  }, [provider, mode, codexServiceTier, codexCapabilitiesLoaded, activeCodexModelSupportsFast]);
+  }, [provider, codexServiceTier, codexCapabilitiesLoaded, activeCodexModelSupportsFast]);
 
   const handleProjectChange = (val: string) => {
     if (val === NEW_PROJECT_VALUE) {
@@ -428,17 +431,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         is_image: r.is_image,
       }));
 
-      if (mode === 'plan') {
-        await api.createPlan({
-          input: description,
-          project_id: pid as number,
-          priority,
-          ...(uploadedPaths.length > 0 ? { file_paths: uploadedPaths } : {}),
-          ...(attachments.length > 0 ? { attachments } : {}),
-          ...(workerId ? { worker_id: parseInt(workerId) } : {}),
-          ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
-        });
-      } else await api.createTask({
+      await api.createTask({
         description: description || undefined,
         project_id: pid as number,
         priority,
@@ -449,14 +442,12 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
         ...(workerId ? { worker_id: parseInt(workerId) } : {}),
-        ...(mode !== 'plan' ? {
-          provider,
-          model: model || activeDefaultModel,
-          ...(effort ? { effort_level: effort } : {}),
-          ...(provider === 'codex'
-            ? { codex_service_tier: codexServiceTier }
-            : {}),
-        } : {}),
+        provider,
+        model: model || activeDefaultModel,
+        ...(effort ? { effort_level: effort } : {}),
+        ...(provider === 'codex'
+          ? { codex_service_tier: codexServiceTier }
+          : {}),
         ...(thinkingBudget ? { thinking_budget: parseInt(thinkingBudget) || null } : {}),
         ...(systemPromptMode ? { system_prompt_mode: systemPromptMode } : {}),
         ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
@@ -537,7 +528,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           className="hidden"
           onChange={handleFileSelect}
         />
-        {mode !== 'plan' && <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />}
+        <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />
         {fileUpload.uploads.map((upload) => (
           <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
             {upload.preview ? (
@@ -721,7 +712,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   onChange={(e) => setMode(e.target.value)}
                 >
                   <option value="auto">Auto</option>
-                  <option value="plan">Plan</option>
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
                 </select>
@@ -735,10 +725,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   </>
                 )}
 
-                {mode !== 'plan' && (
-                  <>
-                    <span className="text-gray-400">CLI</span>
-                    <select
+                <span className="text-gray-400">CLI</span>
+                <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={provider}
                   onChange={(e) => {
@@ -752,10 +740,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   {providerOptions.map((p) => (
                     <option key={p} value={p}>{p === 'claude' ? 'Claude' : p === 'codex' ? 'Codex' : p}</option>
                   ))}
-                    </select>
+                </select>
 
-                    <span className="text-gray-400">Model</span>
-                    <select
+                <span className="text-gray-400">Model</span>
+                <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={model}
                   onChange={(e) => {
@@ -776,10 +764,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   {activeModelOptions.map((m) => (
                     <option key={m} value={m}>{m}</option>
                   ))}
-                    </select>
+                </select>
 
-                    <span className="text-gray-400">Effort</span>
-                    <select
+                <span className="text-gray-400">Effort</span>
+                <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={effort}
                   onChange={(e) => setEffort(e.target.value)}
@@ -788,11 +776,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   {activeEffortOptions.filter((e) => e !== defaultEffort).map((e) => (
                     <option key={e} value={e}>{e}</option>
                   ))}
-                    </select>
-                  </>
-                )}
+                </select>
 
-                {provider === 'codex' && mode !== 'plan' && (
+                {provider === 'codex' && (
                   <>
                     <span className="text-gray-400">Speed</span>
                     <select

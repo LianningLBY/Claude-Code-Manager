@@ -23,6 +23,11 @@ vi.mock('./components/Layout/AppShell', () => ({
 vi.mock('./pages/TasksPage', () => ({
   TasksPage: () => <div>Tasks screen</div>,
 }));
+vi.mock('./pages/PlansPage', () => ({
+  PlansPage: ({ selectedPlanId }: { selectedPlanId: number | null }) => (
+    <div>Plans screen {selectedPlanId ?? 'none'}</div>
+  ),
+}));
 vi.mock('./pages/LoginPage', () => ({
   LoginPage: () => <div>Login screen</div>,
 }));
@@ -108,5 +113,20 @@ describe('App authentication probe', () => {
         role: 'super_admin',
       });
     });
+  });
+
+  it('restores a first-class Plan deep link', async () => {
+    window.location.hash = '#/plans/14';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ ok: true, role: 'super_admin' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText('Plans screen 14')).toBeInTheDocument();
   });
 });

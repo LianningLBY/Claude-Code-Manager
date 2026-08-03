@@ -114,12 +114,14 @@ describe('AppShell layout and z-index architecture', () => {
 
     expect(screen.queryByRole('button', { name: 'Files' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Secrets' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
   });
 
   it('keeps the process-wide update control available to administrators', () => {
     renderShell();
 
     expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
   });

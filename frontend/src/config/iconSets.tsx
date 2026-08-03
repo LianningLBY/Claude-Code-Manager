@@ -1,10 +1,12 @@
+/* eslint-disable react-refresh/only-export-components -- this module is a
+   navigation registry, not a hot-reloaded component boundary */
 import type { ReactNode } from 'react';
 import {
   DashboardTwo, ListCheckbox, FolderCode, Key, FolderClose, CommentOne,
-  PullRequests, Server, Magic, Peoples, International,
+  Plan, PullRequests, Server, Magic, Peoples, International,
 } from '@icon-park/react';
 import {
-  IoGrid, IoList, IoFolder, IoKey, IoDocuments, IoChatbubbles,
+  IoGrid, IoList, IoDocumentText, IoFolder, IoKey, IoDocuments, IoChatbubbles,
   IoGitPullRequest, IoServer, IoSparkles, IoPeople, IoGlobe,
 } from 'react-icons/io5';
 
@@ -29,7 +31,7 @@ import {
 
 /** 导航语义图标名 = AppShell 导航项的 key */
 export const NAV_ICON_KEYS = [
-  'dashboard', 'tasks', 'projects', 'secrets', 'files', 'discussions',
+  'dashboard', 'tasks', 'plans', 'projects', 'secrets', 'files', 'discussions',
   'pr-monitor', 'workers', 'skills', 'team', 'server',
 ] as const;
 export type NavIconKey = typeof NAV_ICON_KEYS[number];
@@ -60,6 +62,7 @@ export const ICON_SETS: Record<string, IconSet> = {
   feishu: {
     dashboard: fs(DashboardTwo),
     tasks: fs(ListCheckbox),
+    plans: fs(Plan),
     projects: fs(FolderCode),
     secrets: fs(Key),
     files: fs(FolderClose),
@@ -73,6 +76,7 @@ export const ICON_SETS: Record<string, IconSet> = {
   sf: {
     dashboard: sf(IoGrid),
     tasks: sf(IoList),
+    plans: sf(IoDocumentText),
     projects: sf(IoFolder),
     secrets: sf(IoKey),
     files: sf(IoDocuments),

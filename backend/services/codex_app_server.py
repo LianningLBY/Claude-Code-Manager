@@ -65,6 +65,10 @@ _DESCENDANT_RECONCILE_INTERVAL = 5.0
 _DESCENDANT_RECONCILE_REQUEST_TIMEOUT = 5.0
 _DESCENDANT_INTERRUPT_CONFIRM_TIMEOUT = 10.0
 _DESCENDANT_INTERRUPT_POLL_INTERVAL = 0.1
+# A transient local app-server RPC failure is not evidence that a Goal ended.
+# Retry while retaining the exact CCM process generation; turn/Goal
+# notifications remain the fast path and invalidate the stale guard.
+_GOAL_RECONCILE_INTERVAL = 5.0
 # Native sub-agents are otherwise allowed to run for hours.  Reaching this
 # fence is an explicit failure, never permission to publish a false success.
 _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
@@ -1507,6 +1511,24 @@ class CodexAppServer:
                 context.turn_id,
             )
             return
+        turn = params.get("turn") or {}
+        runtime = self._thread_runtime.get(context.thread_id)
+        goal_may_continue = bool(
+            context.following_native_goal
+            or (
+                runtime is not None
+                and runtime.goal_status == "active"
+            )
+        )
+        if turn.get("status", "completed") == "completed" and goal_may_continue:
+            # Goal continuation is allowed as soon as the root thread is idle,
+            # even while native descendants from the older turn are still
+            # winding down. Release the completed root identity now so its
+            # next turn can bind without dropping early output. The newer turn
+            # invalidates this older deferred terminal below, while descendant
+            # ownership remains attached to the shared context.
+            self._reset_goal_turn_identity(context)
+            self._mark_following_native_goal(context)
         guard = context.descendant_guard_task
         if guard is None or guard.done():
             context.descendant_guard_task = asyncio.create_task(
@@ -1544,6 +1566,15 @@ class CodexAppServer:
         if context.pending_goal_terminal_notification is not None:
             context.pending_goal_terminal_notification = None
             context.goal_terminal_generation += 1
+        if context.deferred_terminal_notification is not None:
+            context.deferred_terminal_notification = None
+            guard = context.descendant_guard_task
+            context.descendant_guard_task = None
+            if guard is not None and not guard.done():
+                guard.cancel()
+            state_changed = context.descendant_state_changed
+            if state_changed is not None:
+                state_changed.set()
         self._mark_following_native_goal(context)
         context.usage = None
         context.first_input_seen = False
@@ -1558,32 +1589,78 @@ class CodexAppServer:
     ) -> None:
         """Keep the CCM process alive while app-server reports an active Goal."""
 
-        try:
-            goal = await self._read_thread_goal(context.thread_id)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            # A completed native turn must not leave a permanent phantom CCM
-            # process merely because the optional Goals RPC was unavailable.
-            # Preserve the ordinary terminal behavior and make the failed
-            # proof visible in service logs.
-            logger.exception(
-                "Could not inspect native Goal after Codex turn completion "
-                "task=%s thread=%s",
-                context.task_id,
-                context.thread_id,
+        while True:
+            try:
+                goal = await self._read_thread_goal(context.thread_id)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                if (
+                    not self._context_is_current(context)
+                    or context.goal_terminal_generation != generation
+                    or context.pending_goal_terminal_notification is None
+                ):
+                    return
+                # This guard only exists because an authoritative Goal event or
+                # an already-followed generation said work may continue. An
+                # unavailable local RPC cannot safely downgrade that evidence
+                # to success; retain ownership and reconcile again.
+                logger.exception(
+                    "Could not inspect native Goal after Codex turn completion; "
+                    "retaining generation and retrying task=%s thread=%s",
+                    context.task_id,
+                    context.thread_id,
+                )
+                try:
+                    await asyncio.sleep(_GOAL_RECONCILE_INTERVAL)
+                except asyncio.CancelledError:
+                    return
+                continue
+
+            if (
+                not self._context_is_current(context)
+                or context.goal_terminal_generation != generation
+                or context.pending_goal_terminal_notification is None
+            ):
+                return
+
+            runtime = self._thread_runtime.get(context.thread_id)
+            newer_turn_active = bool(
+                context.turn_id
+                or (
+                    runtime is not None
+                    and (
+                        runtime.status_type == "active"
+                        or runtime.active_turn_ids
+                    )
+                )
             )
-            goal = None
+            if (
+                isinstance(goal, dict)
+                and goal.get("status") == "active"
+            ) or newer_turn_active:
+                # Keep the completed turn snapshot until either a newer turn
+                # starts (and supersedes it) or a terminal Goal notification
+                # proves that the retained between-turn generation can close.
+                self._mark_following_native_goal(context)
+                return
 
-        if (
-            not self._context_is_current(context)
-            or context.goal_terminal_generation != generation
-            or context.pending_goal_terminal_notification is None
-        ):
+            context.pending_goal_terminal_notification = None
+            self._publish_turn_context_terminal(context, params)
             return
 
+    def _finish_retained_goal_if_terminal(
+        self,
+        context: _TurnContext,
+        goal_status: str | None,
+    ) -> None:
+        """Close an idle retained Goal only after a terminal Goal event."""
+
+        pending = context.pending_goal_terminal_notification
+        if pending is None or goal_status == "active":
+            return
         runtime = self._thread_runtime.get(context.thread_id)
-        newer_turn_active = bool(
+        if (
             context.turn_id
             or (
                 runtime is not None
@@ -1592,21 +1669,13 @@ class CodexAppServer:
                     or runtime.active_turn_ids
                 )
             )
-        )
-        if (
-            isinstance(goal, dict)
-            and goal.get("status") == "active"
-        ) or newer_turn_active:
-            context.pending_goal_terminal_notification = None
-            self._mark_following_native_goal(context)
-            context.usage = None
-            context.first_input_seen = False
-            context.first_output_seen = False
-            context.non_retry_error = None
+        ):
+            # A terminal update emitted from inside a live turn is finalized by
+            # that turn's own turn/completed notification, not the older one.
             return
-
         context.pending_goal_terminal_notification = None
-        self._publish_turn_context_terminal(context, params)
+        context.goal_terminal_generation += 1
+        self._publish_turn_context_terminal(context, pending)
 
     def _defer_terminal_turn_for_native_goal(
         self,
@@ -2624,6 +2693,13 @@ class CodexAppServer:
             ),
         )
         self._contexts_by_thread[thread_id] = context
+        if adopt_active_goal:
+            # The app-server keeps lineage/runtime observations even when an
+            # older CCM adapter detached. Re-adopt every already-known child
+            # before steering new input so root completion cannot release the
+            # Task while one of those exact descendants is still active.
+            for child_id in self._children_by_thread.get(thread_id, set()):
+                self._attach_descendant(context, child_id, active=None)
         # Persist the native thread id through the same event path as exec.
         turn_process.feed({"type": "thread.started", "thread_id": thread_id})
         if on_turn_prepared is not None:
@@ -3953,8 +4029,17 @@ class CodexAppServer:
                 else None
             )
             self._runtime_state_for(thread_id_str).goal_status = goal_status
+            context = self._contexts_by_thread.get(thread_id_str)
+            if context is not None and not params.get("turnId"):
+                self._finish_retained_goal_if_terminal(
+                    context,
+                    goal_status,
+                )
         elif method == "thread/goal/cleared" and thread_id_str is not None:
             self._runtime_state_for(thread_id_str).goal_status = None
+            context = self._contexts_by_thread.get(thread_id_str)
+            if context is not None:
+                self._finish_retained_goal_if_terminal(context, None)
         if method == "thread/status/changed":
             if thread_id_str is not None:
                 self._record_thread_status(

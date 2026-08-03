@@ -3012,12 +3012,262 @@ async def test_active_native_goal_keeps_process_across_continuation_turns():
 
 
 @pytest.mark.asyncio
+async def test_active_goal_rpc_failure_retries_without_false_success():
+    """Unknown Goal state must retain ownership until terminal proof arrives."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    goal_checks = 0
+
+    async def request(method, _params):
+        nonlocal goal_checks
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-goal-retry",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-goal-retry"}}
+        if method == "thread/goal/get":
+            goal_checks += 1
+            if goal_checks == 1:
+                raise CodexAppServerError("temporary goal read failure")
+            return {"goal": {"status": "active"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="retain this goal",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=306,
+    )
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-retry",
+        "turnId": "turn-goal-retry",
+        "goal": {"status": "active"},
+    })
+    server._handle_notification("thread/tokenUsage/updated", {
+        "threadId": "thread-goal-retry",
+        "turnId": "turn-goal-retry",
+        "tokenUsage": {
+            "last": {
+                "inputTokens": 100,
+                "cachedInputTokens": 25,
+                "outputTokens": 10,
+                "reasoningOutputTokens": 3,
+                "totalTokens": 110,
+            },
+            "modelContextWindow": 272_000,
+        },
+    })
+    with patch(
+        "backend.services.codex_app_server._GOAL_RECONCILE_INTERVAL",
+        0,
+    ):
+        server._handle_notification("turn/completed", {
+            "threadId": "thread-goal-retry",
+            "turn": {
+                "id": "turn-goal-retry",
+                "status": "completed",
+                "error": None,
+            },
+        })
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if goal_checks >= 2:
+                break
+
+    context = server._contexts_by_thread["thread-goal-retry"]
+    assert goal_checks == 2
+    assert process.returncode is None
+    assert context.pending_goal_terminal_notification is not None
+
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-retry",
+        "goal": {"status": "complete"},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    assert server._contexts_by_thread == {}
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    terminal = next(row for row in rows if row.get("type") == "turn.completed")
+    assert terminal["usage"]["input_tokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_cleared_goal_closes_retained_between_turn_context():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-goal-cleared",
+                "status": {"type": "idle"},
+            },
+        },
+        {"turn": {"id": "turn-goal-cleared"}},
+        {"goal": {"status": "active"}},
+    ])
+
+    process, _ = await server.start_turn(
+        prompt="retain until cleared",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=307,
+    )
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-cleared",
+        "turnId": "turn-goal-cleared",
+        "goal": {"status": "active"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-goal-cleared",
+        "turn": {
+            "id": "turn-goal-cleared",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    for _ in range(20):
+        await asyncio.sleep(0)
+        context = server._contexts_by_thread.get("thread-goal-cleared")
+        if (
+            context is not None
+            and context.pending_goal_terminal_notification is not None
+        ):
+            break
+
+    assert process.returncode is None
+    server._handle_notification("thread/goal/cleared", {
+        "threadId": "thread-goal-cleared",
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    assert server._contexts_by_thread == {}
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_rebinds_while_descendant_is_finishing():
+    """An older descendant guard must not drop the next Goal turn."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-goal-descendant",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-goal-parent"}}
+        if method == "thread/goal/get":
+            return {"goal": {"status": "complete"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="goal with a child",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=308,
+    )
+    server._handle_notification("thread/started", {
+        "thread": {
+            "id": "thread-goal-child",
+            "parentThreadId": "thread-goal-descendant",
+            "status": {"type": "active"},
+        },
+    })
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-descendant",
+        "turnId": "turn-goal-parent",
+        "goal": {"status": "active"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-goal-descendant",
+        "turn": {
+            "id": "turn-goal-parent",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    context = server._contexts_by_thread["thread-goal-descendant"]
+    assert context.turn_id is None
+    assert "thread-goal-child" in context.active_descendant_thread_ids
+
+    server._handle_notification("turn/started", {
+        "threadId": "thread-goal-descendant",
+        "turn": {"id": "turn-goal-next", "status": "inProgress"},
+    })
+    server._handle_notification("item/agentMessage/delta", {
+        "threadId": "thread-goal-descendant",
+        "turnId": "turn-goal-next",
+        "itemId": "continued-message",
+        "delta": "next turn was not dropped",
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-goal-child",
+        "status": {"type": "idle"},
+    })
+    server._handle_notification("thread/goal/updated", {
+        "threadId": "thread-goal-descendant",
+        "turnId": "turn-goal-next",
+        "goal": {"status": "complete"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-goal-descendant",
+        "turn": {
+            "id": "turn-goal-next",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    assert any(
+        row.get("delta") == "next turn was not dropped"
+        for row in rows
+    )
+    assert sum(row.get("type") == "turn.completed" for row in rows) == 1
+
+
+@pytest.mark.asyncio
 async def test_standard_resume_adopts_detached_active_goal_before_steering():
     """A pending chat recovers an already-detached Goal without a race window."""
 
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
+    server._record_child_relation(
+        "thread-detached-goal",
+        "thread-detached-child",
+    )
+    server._record_thread_status(
+        "thread-detached-child",
+        {"type": "active"},
+    )
     prepared = False
     steer_requests: list[dict] = []
     goal_checks = 0
@@ -3077,6 +3327,14 @@ async def test_standard_resume_adopts_detached_active_goal_before_steering():
     context = server._contexts_by_thread[thread_id]
     assert context.following_native_goal is True
     assert context.turn_id == "turn-native-goal"
+    assert context.active_descendant_thread_ids == {
+        "thread-detached-child",
+    }
+
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-detached-child",
+        "status": {"type": "idle"},
+    })
 
     server._handle_notification("turn/completed", {
         "threadId": thread_id,

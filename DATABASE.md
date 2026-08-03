@@ -90,13 +90,14 @@ uv run alembic heads           # 查看当前所有 head
 uv run alembic history         # 查看分叉点
 ```
 
-手动编辑其中一个 migration 文件，将 `down_revision` 改为另一个 migration 的 revision ID，形成线性链，然后：
+若两个 migration **都尚未进入任何可部署分支**，可以手动编辑其中一个 migration 的 `down_revision`，形成线性链。只要任一 revision 已发布，就不得再改写历史；必须新增 merge revision：
 
 ```bash
+uv run alembic merge -m "merge migration heads" <head_a> <head_b>
 uv run alembic upgrade head    # 验证合并后的链路正常
 ```
 
-解决完冲突后按正常流程测试并提交。
+merge revision 的 `down_revision` 必须同时列出两个 head，`upgrade()` / `downgrade()` 通常保持无 schema 操作。分别从全新数据库及每个已发布 branch head 升级到新 head，并验证最终只有一个 head；mergepoint 的 `downgrade -1` 有歧义时需显式指定父 revision。解决完冲突后按正常流程测试并提交。
 
 ---
 
@@ -128,6 +129,8 @@ uv run alembic stamp head
 
 - **文件位置**：`alembic/versions/`
 - **命名格式**：`<revision_id>_<描述>.py`（由 Alembic 自动生成）
+- **已发布 revision 不可删除或改写**：曾进入可部署分支的 migration 必须永久保留。回滚功能时新增一个以旧 revision 为 `down_revision` 的前向清理 migration，禁止删除旧文件、改 revision ID 或手动 `stamp` 绕过历史。
+- **已发布分支用 merge revision 汇合**：两个已发布 sibling head 必须以新的 tuple `down_revision` 汇合，不得修改任一旧 revision 来伪造线性历史。
 - **必须包含 downgrade**：`downgrade()` 函数必须实现，能够回滚所有 `upgrade()` 的变更
 - **SQLite 的 ALTER 限制**：修改已有列（改类型、改 nullable）必须使用 batch 模式：
 
@@ -146,3 +149,7 @@ uv run alembic stamp head
 |------------------|-----------------------------------|------------|
 | `6b3f8a1c2d9e`   | Initial schema（所有初始表）       | 2025-01-01 |
 | `c4d7e2f9a0b1`   | Loop task 字段（todo_file_path 等）| 2026-03-07 |
+| `b6e1f4a2c9d7`   | Independent Plan schema（历史 revision，永久保留） | 2026-07-29 |
+| `f7a1c3d9e5b2`   | 清理已撤回的 Independent Plan schema | 2026-07-31 |
+| `5f7a9c2e4d61`   | PR Review base SHA / publishing snapshot | 2026-07-31 |
+| `7e4b9c1d2a63`   | 汇合 Plan cleanup 与 PR Review 两个已发布 head | 2026-08-03 |

@@ -750,6 +750,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
 | `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障 |
 | `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
+| `test_alembic_migrations.py::TestPublishedMigrationHistory` | `b6e1f4a2c9d7`、`f7a1c3d9e5b2` 与 sibling `5f7a9c2e4d61` 三种已部署状态都可升级到唯一 merge head；Plan cleanup 和 mergepoint 可降级/再升级，且旧 revision 文件无需改写 |
 | `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
 
 ##### `test_service_pr_review.py` — PR 审核服务
@@ -1076,6 +1077,12 @@ curl -X POST http://localhost:8000/api/github/webhook \
 ```
 
 ### 前端测试
+
+Markdown 数学公式回归：
+
+| 文件 | 覆盖内容 |
+|------|----------|
+| `frontend/src/components/Markdown/MarkdownRenderer.test.tsx` | Codex `\\[...\\]` display math、`\\(...\\)` inline math、`$$...$$`、单 `$`/货币原文、URL/image/autolink/HTML/reference/code 隔离、跨段落分隔符和 KaTeX `maxSize`/`trust` 边界 |
 
 1. 导航到 PR Monitor 页面
 2. 添加仓库 → 验证表格显示

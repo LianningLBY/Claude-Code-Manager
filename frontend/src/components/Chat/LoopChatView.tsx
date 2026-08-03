@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import type { Components } from 'react-markdown';
 import { api } from '../../api/client';
 import type { ChatMessage, Task } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
@@ -11,6 +10,7 @@ import {
 } from './messageMerge';
 import { TaskArtifactLink } from './TaskArtifactLink';
 import { remarkTaskArtifactPaths } from './taskArtifactMarkdown';
+import { MarkdownRenderer } from '../Markdown/MarkdownRenderer';
 
 interface LoopChatViewProps {
   task: Task;
@@ -233,8 +233,7 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-const remarkPlugins = [remarkGfm, remarkTaskArtifactPaths];
-
+const taskRemarkPlugins = [remarkTaskArtifactPaths];
 const markdownComponents: Components = {
   pre({ children }) {
     let codeText = '';
@@ -267,12 +266,11 @@ const MarkdownContent = memo(function MarkdownContent({ content, taskId }: { con
   }), [taskId]);
   return (
     <div className="markdown-body">
-      <ReactMarkdown
-        remarkPlugins={remarkPlugins}
+      <MarkdownRenderer
+        content={content}
         components={taskComponents}
-      >
-        {content}
-      </ReactMarkdown>
+        remarkPlugins={taskRemarkPlugins}
+      />
     </div>
   );
 });

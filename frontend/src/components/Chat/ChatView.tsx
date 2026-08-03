@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import type { Components } from 'react-markdown';
 import { api, isApiRequestError } from '../../api/client';
 import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
@@ -29,6 +28,7 @@ import {
 } from './messageMerge';
 import { TaskArtifactLink } from './TaskArtifactLink';
 import { remarkTaskArtifactPaths } from './taskArtifactMarkdown';
+import { MarkdownRenderer } from '../Markdown/MarkdownRenderer';
 
 interface ChatViewProps {
   task: Task;
@@ -2734,9 +2734,7 @@ function stripSenderPrefix(text: string): string {
   return text.replace(/^\[[^\]\r\n]+\][ \t]+/, '');
 }
 
-const remarkPlugins = [remarkGfm];
-const taskRemarkPlugins = [remarkGfm, remarkTaskArtifactPaths];
-
+const taskRemarkPlugins = [remarkTaskArtifactPaths];
 const markdownComponents: Components = {
   pre({ children }) {
     let codeText = '';
@@ -2789,12 +2787,11 @@ const MarkdownContent = memo(function MarkdownContent({
   }), [taskId]);
   return (
     <div className={`markdown-body ${className || ''}`}>
-    <ReactMarkdown
-      remarkPlugins={taskRemarkPlugins}
-      components={taskComponents}
-    >
-      {content}
-    </ReactMarkdown>
+      <MarkdownRenderer
+        content={content}
+        components={taskComponents}
+        remarkPlugins={taskRemarkPlugins}
+      />
     </div>
   );
 });
@@ -3121,9 +3118,7 @@ const MessageBubble = memo(function MessageBubble({
       return (
         <div className="border-l-2 border-gray-600 pl-2 py-1 my-0.5 opacity-50">
           <div className="markdown-body text-xs text-gray-500">
-            <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
-              {content}
-            </ReactMarkdown>
+            <MarkdownRenderer content={content} components={markdownComponents} />
           </div>
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} className="mt-0.5" />}
         </div>

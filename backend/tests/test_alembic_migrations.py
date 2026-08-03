@@ -28,6 +28,10 @@ import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
+PLAN_CLEANUP_REVISION = "f7a1c3d9e5b2"
+PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
+PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -765,6 +769,150 @@ class TestSchemaConsistency:
                 + "\n".join(str(d) for d in significant_diffs)
             )
 
+        engine.dispose()
+
+
+class TestPublishedMigrationHistory:
+    """Published sibling histories converge without rewriting either branch."""
+
+    def _assert_revision_schema(
+        self,
+        engine,
+        *,
+        revisions,
+        plan_schema_present,
+        snapshot_schema_present,
+    ):
+        tables = _get_all_tables(engine)
+        task_columns = _get_table_columns(engine, "tasks")
+        log_columns = _get_table_columns(engine, "log_entries")
+        review_columns = _get_table_columns(engine, "pr_reviews")
+
+        assert ("plan_agent_runs" in tables) is plan_schema_present
+        assert ("plan_agent_steps" in tables) is plan_schema_present
+        assert (
+            "plan_target_task_id" in task_columns
+        ) is plan_schema_present
+        assert (
+            "task_retry_count" in log_columns
+        ) is snapshot_schema_present
+        assert ("base_sha" in review_columns) is snapshot_schema_present
+
+        with engine.connect() as conn:
+            current_revisions = {
+                row[0]
+                for row in conn.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).fetchall()
+            }
+        assert current_revisions == set(revisions)
+
+    def test_migration_graph_has_one_merge_head(self, tmp_path):
+        cfg = _alembic_cfg(str(tmp_path / "graph.db"))
+        script = ScriptDirectory.from_config(cfg)
+
+        assert script.get_heads() == [PUBLISHED_BRANCH_MERGE_REVISION]
+        assert script.get_current_head() == PUBLISHED_BRANCH_MERGE_REVISION
+
+    @pytest.mark.parametrize(
+        ("start_revision", "plan_schema_present", "snapshot_schema_present"),
+        [
+            (PUBLISHED_PLAN_REVISION, True, False),
+            (PLAN_CLEANUP_REVISION, False, False),
+            (PR_REVIEW_SNAPSHOT_REVISION, False, True),
+        ],
+    )
+    def test_each_published_branch_upgrades_to_merge_head(
+        self,
+        tmp_path,
+        start_revision,
+        plan_schema_present,
+        snapshot_schema_present,
+    ):
+        db_path = str(tmp_path / f"published-{start_revision}.db")
+        cfg = _alembic_cfg(db_path)
+
+        # Each revision was a deployable branch head before the histories met.
+        _run_alembic(cfg, command.upgrade, start_revision)
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={start_revision},
+            plan_schema_present=plan_schema_present,
+            snapshot_schema_present=snapshot_schema_present,
+        )
+        engine.dispose()
+
+        # The no-op merge applies the missing sibling branch and converges all
+        # deployed states on one schema/head.
+        _run_alembic(cfg, command.upgrade, "head")
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={PUBLISHED_BRANCH_MERGE_REVISION},
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+    def test_merge_revision_downgrades_and_reupgrades(self, tmp_path):
+        db_path = str(tmp_path / "merge-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, "head")
+        # Relative ``-1`` is ambiguous at a mergepoint, so select either
+        # published parent explicitly; Alembic retains the sibling head.
+        _run_alembic(cfg, command.downgrade, PLAN_CLEANUP_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={
+                PLAN_CLEANUP_REVISION,
+                PR_REVIEW_SNAPSHOT_REVISION,
+            },
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={PUBLISHED_BRANCH_MERGE_REVISION},
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+    def test_reverted_plan_cleanup_downgrades_and_reupgrades(self, tmp_path):
+        db_path = str(tmp_path / "plan-cleanup-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.downgrade, PUBLISHED_PLAN_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={
+                PUBLISHED_PLAN_REVISION,
+                PR_REVIEW_SNAPSHOT_REVISION,
+            },
+            plan_schema_present=True,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={PUBLISHED_BRANCH_MERGE_REVISION},
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
         engine.dispose()
 
 

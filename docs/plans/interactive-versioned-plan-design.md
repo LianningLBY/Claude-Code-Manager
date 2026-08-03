@@ -803,9 +803,10 @@ WebSocket 当权威状态。管理员可订阅全局 `plans`；普通成员只�
 
 ### 14.4 顶级 Plans 页面与 Tasks 边界
 
-Plan 不再依赖普通 Task list response：
+canonical Plan 不再依赖普通 Task list response；历史 Task 仍遵守 Task 页面语义：
 
-- Tasks 页面、分页、计数和全局 Task 搜索固定查询 `task_kind=main`；
+- Tasks 页面、分页、计数和全局 Task 搜索展示全部真实 Task，包括迁移后只读的
+  `Task(mode="plan")` 历史；其卡片通过 legacy link 跳转 canonical Plan；
 - New Task 表单不提供 Plan mode；standalone 统一从 Plans 页面创建；
 - Plans 页面目录查询 canonical `/api/plans`，支持 standalone/related、display state、Project、
   title/request 搜索和 `archived_only`；
@@ -849,13 +850,15 @@ Plan 不再依赖普通 Task list response：
 3. 每个有 `plan_content` 的旧 Task 按链顺序创建一个 Version；
 4. 旧 `plan_agent_runs/steps` 关联新 Plan，并把成功 Run 对应到 Version；
 5. `plan_review` → current Version decision pending；
-6. `completed + plan_approved=True` → approved；
+6. `completed + plan_approved=True`：旧 main 自动执行语义（没有 `plan_approved_at`）→
+   application 指向原 carrier Task；后续 independent Plan 语义 → approved；
 7. `cancelled + plan_approved=False` → rejected；
 8. `superseded` → 历史 Version，并链接下一 Version；
 9. `plan_applied_*` / `plan_execution_task_id` → PlanApplication；
-10. pending carrier（无论是否存在历史 attempt）→ 新建唯一 queued canonical Run，并把旧
-    Task 标为 superseded，避免部署后 Task 与 Run 双重领取；failed 且没有 content 的 Task →
-    failed Run；
+10. 未批准的 pending carrier（无论是否存在历史 attempt）→ 新建唯一 queued canonical Run，
+    并把旧 Task 标为 superseded，避免部署后 Task 与 Run 双重领取；旧 main 已批准的 pending
+    carrier 保持为原 execution Task，并创建 exact Version application；failed 且没有 content 的
+    Task → failed Run；
 11. 理论上不应存在 in_progress/executing Task 或 planning/reviewing Run；任一 Task、Run、
     Instance/进程 active 证据都使 migration fail closed，包括远端 Worker 状态；
 12. 每个旧 Task 写 legacy link，不改变旧 id/URL 可解析性；superseded carrier 只读保留。
@@ -875,7 +878,9 @@ closed 并输出脱敏的 task ids；不能猜测链顺序。
 
 - 前端全部切换 Plan/Version API；
 - Dispatcher 只 claim PlanRun；
-- 旧 Plan Task 标记只读 legacy，不再入队或出现在普通 Task count；
+- 旧 Plan Task 标记只读 legacy；规划 mutation 只走 canonical Plan，但历史 Task 继续出现在
+  Task list/count/search，并显示 canonical Plan 链接；作为旧 main execution Task 的 pending carrier
+  仍可完成既有执行；
 - `mode=plan` 通用创建入口已关闭；观察至少一个发布周期后移除剩余窄化旧 mutation
   endpoints、Worker legacy payload 和 `Task.plan_*` 字段；保留只读 legacy resolver/link；
 - downgrade 只保证 schema 可回退，不承诺把多 Version/交互 Run 无损压回单 Task 模型；发布
@@ -910,7 +915,7 @@ thread、Instance owner 或部署 blocker。
 - canonical create/revise/fork/approve/reject/application API；
 - Plans modal、Needs input、Version history/diff；
 - Chat `plan_version_ids` 和 applied snapshot；
-- 独立 Plans 页面、standalone 创建、目录筛选和深链接；Tasks 页面只查询 main Task；
+- 独立 Plans 页面、standalone 创建、目录筛选和深链接；Tasks 页面继续展示完整 Task 历史；
 - 旧 API 保留兼容。
 
 完成门槛：用户 Revise 后 Plan id 和卡片不变，只增加 Run/Version；所有刷新/重连状态一致。
@@ -928,7 +933,7 @@ thread、Instance owner 或部署 blocker。
 ### Phase 5：Legacy contract
 
 - 停止旧写 API；
-- 从普通 Task list/count/filter 排除 legacy Plan Task；
+- legacy Plan Task 在普通 Task list/count/filter 中保留只读历史，并链接 canonical Plan；
 - 清理 Task Plan 字段、legacy services 和兼容 UI；
 - 更新 README、TEST、AGENTS/CLAUDE 文档和运维手册。
 
@@ -964,7 +969,7 @@ thread、Instance owner 或部署 blocker。
 - `components/PlanReview/`：Plan 列表、Version selector/diff、Run progress、Input form；
 - `Chat/ChatView.tsx`：按 Version 创建/选择/应用；
 - `pages/PlansPage` / `components/PlanReview`：Plan 创建、目录、筛选、深链接和行动队列；
-- `Tasks/TaskList` / `TasksPage`：只展示 `task_kind=main`；
+- `Tasks/TaskList` / `TasksPage`：展示全部 Task；legacy Plan Task 显示 canonical Plan 链接；
 - WebSocket invalidation/refetch；
 - 对应 Vitest/RTL 测试。
 
@@ -1117,6 +1122,7 @@ thread、Instance owner 或部署 blocker。
 - waiting_user 无任何进程、thread、Instance owner、capacity 或 update blocker；
 - 所有审批和应用绑定 exact Version；
 - 旧 Plan Task 历史迁移无丢失且 legacy URL 可解析；
+- 旧 Plan Task 继续出现在 Tasks list/count/search，且 Plan 决策只允许在 canonical Plan 执行；
 - 本机与 Worker 行为对等；
 - Worker protocol v1 先握手，再以 attachment size/SHA-256 manifest、generation CAS 和 durable
   application receipt 验证导入/回答/应用；丢失 HTTP ACK 可按 receipt 查询恢复，不能重复应用；

@@ -151,9 +151,11 @@ class Task(Base):
 
 def _configure_task_properties():
     from backend.models.monitor_session import MonitorSession
+    from backend.models.plan import PlanLegacyTaskLink
     from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 
     ms = MonitorSession.__table__
+    legacy_plan_links = PlanLegacyTaskLink.__table__
     plan_runs = PlanAgentRun.__table__
     plan_steps = PlanAgentStep.__table__
     # Always show real running sub-agent count — background agents can
@@ -161,6 +163,16 @@ def _configure_task_properties():
     Task.active_sub_agents = column_property(
         select(func.count(ms.c.id))
         .where(ms.c.task_id == Task.id, ms.c.status == "running")
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    # A migrated Plan Task remains a real, visible Task history row. Expose its
+    # canonical Plan destination so clients can navigate to the new aggregate
+    # without treating the legacy Task as the writable Plan authority.
+    Task.canonical_plan_id = column_property(
+        select(legacy_plan_links.c.plan_id)
+        .where(legacy_plan_links.c.legacy_task_id == Task.id)
+        .limit(1)
         .correlate(Task.__table__)
         .scalar_subquery()
     )

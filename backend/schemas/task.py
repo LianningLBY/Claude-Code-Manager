@@ -281,6 +281,7 @@ class TaskResponse(BaseModel):
     plan_applied_at: datetime | None = None
     plan_applied_to_session_id: str | None = None
     plan_execution_task_id: int | None = None
+    canonical_plan_id: int | None = None
     plan_pipeline_config: PlanPipelineConfig | None = None
     # Read-only projection of the latest PlanAgentRun. Task.status remains the
     # stable scheduler lifecycle (for example ``executing``).

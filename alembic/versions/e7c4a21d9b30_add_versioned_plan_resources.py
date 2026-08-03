@@ -451,13 +451,61 @@ def _backfill_legacy_plans() -> None:
         version_number = 0
         for task_id in chain:
             row = by_id[task_id]
+            legacy_runs = list(bind.execute(
+                sa.text(
+                    "SELECT id, status, review_verdict, review_feedback, "
+                    "review_exhausted, updated_at FROM plan_agent_runs "
+                    "WHERE plan_task_id=:task_id ORDER BY id"
+                ),
+                {"task_id": task_id},
+            ).mappings())
+            latest_legacy_run = legacy_runs[-1] if legacy_runs else None
+            # Before independent Plans existed on main, approving a Plan Task
+            # queued that same Task for implementation. The later independent
+            # Plan workflow records plan_approved_at and never executes the
+            # carrier itself, which gives the migration an exact discriminator.
+            plan_approved = row["plan_approved"]
+            legacy_carrier_execution = (
+                plan_approved is not None
+                and bool(plan_approved)
+                and row["plan_approved_at"] is None
+            )
             if row["plan_content"]:
                 version_number += 1
                 decision = "pending"
-                if row["plan_approved"] is True:
+                if plan_approved is not None and bool(plan_approved):
                     decision = "approved"
-                elif row["plan_approved"] is False and row["status"] == "cancelled":
+                elif (
+                    plan_approved is not None
+                    and not bool(plan_approved)
+                    and row["status"] == "cancelled"
+                ):
                     decision = "rejected"
+                review_verdict = (
+                    latest_legacy_run["review_verdict"]
+                    if latest_legacy_run is not None
+                    else None
+                )
+                review_feedback = (
+                    latest_legacy_run["review_feedback"]
+                    if latest_legacy_run is not None
+                    else None
+                )
+                review_exhausted = bool(
+                    latest_legacy_run is not None
+                    and latest_legacy_run["review_exhausted"]
+                )
+                reviewed_at = (
+                    latest_legacy_run["updated_at"]
+                    if latest_legacy_run is not None
+                    else None
+                )
+                if row["status"] == "plan_review" and review_verdict is None:
+                    # Main's original single-agent Plan phase had no Reviewer.
+                    # ``disabled`` is the canonical reviewed-and-ready verdict,
+                    # so the Version appears under Plans requiring action.
+                    review_verdict = "disabled"
+                    reviewed_at = row["completed_at"] or row["created_at"]
                 version_result = bind.execute(
                     versions_table.insert().values({
                         "plan_id": plan_id,
@@ -470,11 +518,11 @@ def _backfill_legacy_plans() -> None:
                         "context_log_id": row["plan_context_log_id"],
                         "context_snapshot": row["plan_context_snapshot"],
                         "repo_revision": _json_value(row["plan_repo_revision"], None),
-                        "review_verdict": None,
-                        "review_feedback": None,
+                        "review_verdict": review_verdict,
+                        "review_feedback": review_feedback,
                         "reviewed_by_step_id": None,
-                        "review_exhausted": False,
-                        "reviewed_at": None,
+                        "review_exhausted": review_exhausted,
+                        "reviewed_at": _datetime_value(reviewed_at, None),
                         "human_decision": decision,
                         "decided_at": _datetime_value(row["plan_approved_at"], None),
                         "decided_by": row["plan_approved_by"],
@@ -496,8 +544,24 @@ def _backfill_legacy_plans() -> None:
                 previous_version_id = current_version_id = version_id
                 version_by_task[task_id] = version_id
 
-                if row["plan_applied_at"] is not None or row["plan_execution_task_id"] is not None:
-                    is_execution = row["plan_execution_task_id"] is not None
+                if (
+                    row["plan_applied_at"] is not None
+                    or row["plan_execution_task_id"] is not None
+                    or legacy_carrier_execution
+                ):
+                    is_execution = (
+                        row["plan_execution_task_id"] is not None
+                        or legacy_carrier_execution
+                    )
+                    execution_task_id = (
+                        (
+                            row["plan_execution_task_id"]
+                            if row["plan_execution_task_id"] is not None
+                            else task_id
+                        )
+                        if is_execution
+                        else None
+                    )
                     if not is_execution and row["plan_applied_log_id"] is None:
                         raise RuntimeError(
                             f"legacy Plan Task {task_id} has an incomplete chat application"
@@ -505,7 +569,7 @@ def _backfill_legacy_plans() -> None:
                     if is_execution:
                         execution_exists = bind.execute(
                             sa.text("SELECT id FROM tasks WHERE id=:id"),
-                            {"id": row["plan_execution_task_id"]},
+                            {"id": execution_task_id},
                         ).first()
                         if execution_exists is None:
                             raise RuntimeError(
@@ -539,7 +603,7 @@ def _backfill_legacy_plans() -> None:
                             "target_task_id": row["plan_target_task_id"],
                             "session_id": row["plan_applied_to_session_id"],
                             "log_id": None if is_execution else row["plan_applied_log_id"],
-                            "execution_task_id": row["plan_execution_task_id"],
+                            "execution_task_id": execution_task_id,
                             "applied_by": row["plan_approved_by"],
                             "created_at": _datetime_value(
                                 row["plan_applied_at"] or row["completed_at"], now
@@ -547,14 +611,11 @@ def _backfill_legacy_plans() -> None:
                         },
                     )
 
-            legacy_runs = list(bind.execute(
-                sa.text(
-                    "SELECT id, status FROM plan_agent_runs "
-                    "WHERE plan_task_id=:task_id ORDER BY id"
-                ),
-                {"task_id": task_id},
-            ).mappings())
-            queued = row["status"] == "pending"
+            # A pre-independent approved carrier in pending state is already
+            # the execution Task. Leave it queued in Tasks and record the exact
+            # Version application above; only an unapproved pending Plan moves
+            # to a canonical Planner Run.
+            queued = row["status"] == "pending" and not legacy_carrier_execution
             if queued:
                 # The first-class Run takes over the durable queue item. Keep
                 # historical attempts as audit, but never let the old carrier

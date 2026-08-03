@@ -232,6 +232,7 @@ export interface Task {
   plan_applied_at: string | null;
   plan_applied_to_session_id: string | null;
   plan_execution_task_id: number | null;
+  canonical_plan_id: number | null;
   plan_pipeline_config: PlanPipelineConfig | null;
   plan_stage?: string | null;
   plan_stage_round?: number | null;

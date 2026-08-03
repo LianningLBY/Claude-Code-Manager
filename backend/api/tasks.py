@@ -3842,6 +3842,11 @@ async def get_queue(
 
 
 def _require_plan_review_operation(task: Task) -> None:
+    if task.canonical_plan_id is not None:
+        raise HTTPException(
+            409,
+            f"Legacy Plan Task has migrated to canonical Plan #{task.canonical_plan_id}",
+        )
     if task.mode == "plan" and task.status == "superseded":
         successor_id = (task.metadata_ or {}).get(
             "plan_superseded_by_task_id"

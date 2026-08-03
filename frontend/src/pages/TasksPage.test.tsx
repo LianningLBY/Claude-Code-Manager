@@ -239,7 +239,7 @@ describe('TasksPage realtime reconciliation', () => {
     expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
   });
 
-  it('queries only main Tasks and contains no Plan catalog or action panels', async () => {
+  it('queries the complete Task history without embedding Plan catalog panels', async () => {
     vi.mocked(api.listTasks).mockResolvedValue([{ ...task, id: 1 }] as never);
     vi.mocked(api.countTasks).mockResolvedValue({ total: 1 });
 
@@ -252,8 +252,8 @@ describe('TasksPage realtime reconciliation', () => {
 
     expect(await screen.findByText('1:pending:false')).toBeInTheDocument();
     await waitFor(() => expect(api.listTasks).toHaveBeenCalled());
-    expect(vi.mocked(api.listTasks).mock.calls.every((call) => call[8] === 'main')).toBe(true);
-    expect(vi.mocked(api.countTasks).mock.calls.every((call) => call[6] === 'main')).toBe(true);
+    expect(vi.mocked(api.listTasks).mock.calls.every((call) => call[8] === undefined)).toBe(true);
+    expect(vi.mocked(api.countTasks).mock.calls.every((call) => call[6] === undefined)).toBe(true);
     expect(screen.queryByRole('region', { name: 'Plans requiring action' })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /Filter/ }));
     expect(screen.queryByText('Standalone Plans')).not.toBeInTheDocument();

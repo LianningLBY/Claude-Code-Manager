@@ -193,6 +193,16 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
               </span>
               {t.mode === 'plan' ? (
                 <>
+                  {t.canonical_plan_id != null && (
+                    <button
+                      type="button"
+                      onClick={() => { window.location.hash = `#/plans/${t.canonical_plan_id}`; }}
+                      className="rounded bg-teal-600/20 px-1.5 text-[10px] font-medium text-teal-300 hover:bg-teal-600/30"
+                      title={`This historical Task has migrated to Plan #${t.canonical_plan_id}`}
+                    >
+                      Plan #{t.canonical_plan_id}
+                    </button>
+                  )}
                   <PlanPipelineBadge task={t} />
                   <PlanRevisionBadge task={t} />
                 </>

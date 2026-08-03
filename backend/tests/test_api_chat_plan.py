@@ -781,6 +781,41 @@ async def test_plan_reject_not_plan_review(client):
 
 
 @pytest.mark.asyncio
+async def test_migrated_plan_task_is_visible_but_legacy_decisions_are_blocked(
+    client,
+    session_factory,
+):
+    """The Task remains history; its canonical Plan owns future decisions."""
+    from backend.models.plan import PlanLegacyTaskLink
+
+    task_id = await _legacy_plan_task(
+        session_factory,
+        title="Migrated Plan Task",
+        description="d",
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task).where(Task.id == task_id).values(
+                status="plan_review",
+                plan_content="Historical plan",
+            )
+        )
+        db.add(PlanLegacyTaskLink(legacy_task_id=task_id, plan_id=456))
+        await db.commit()
+
+    task_response = await client.get(f"/api/tasks/{task_id}")
+    assert task_response.status_code == 200
+    assert task_response.json()["canonical_plan_id"] == 456
+
+    for action in ("approve", "reject"):
+        response = await client.post(f"/api/tasks/{task_id}/plan/{action}")
+        assert response.status_code == 409
+        assert response.json()["detail"] == (
+            "Legacy Plan Task has migrated to canonical Plan #456"
+        )
+
+
+@pytest.mark.asyncio
 async def test_plan_approve_success(client, session_factory):
     """Approval completes the Plan without scheduling an execution turn."""
     task_id = await _legacy_plan_task(

@@ -38,7 +38,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   // Regex search over task titles (falls back to plain substring on invalid regex)
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useTaskSearch(searchQuery, showArchived, 'main');
+  const [searchResults, setSearchResults] = useTaskSearch(searchQuery, showArchived);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
   const [chatTask, setChatTask] = useState<Task | null>(null);
@@ -217,9 +217,9 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     try {
       const offset = (page - 1) * PAGE_SIZE;
       const [filtered, count, all, projs, tags] = await Promise.all([
-        api.listTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, PAGE_SIZE, offset, showArchived, unreadFilter || undefined, 'main'),
-        api.countTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, showArchived, unreadFilter || undefined, 'main'),
-        api.listTasks(undefined, false, undefined, undefined, PAGE_SIZE, 0, showArchived, undefined, 'main'),
+        api.listTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, PAGE_SIZE, offset, showArchived, unreadFilter || undefined),
+        api.countTasks(statusFilterParam, false, projectFilter, starredFilter || undefined, showArchived, unreadFilter || undefined),
+        api.listTasks(undefined, false, undefined, undefined, PAGE_SIZE, 0, showArchived),
         api.listProjects(),
         api.listTags(),
       ]);

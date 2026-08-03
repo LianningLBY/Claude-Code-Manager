@@ -729,6 +729,81 @@ class TestVersionedPlanBackfill:
             assert pipeline["max_interactions"] == 3
         engine.dispose()
 
+    def test_main_plan_task_states_preserve_review_and_execution_semantics(
+        self,
+        tmp_path,
+    ):
+        """Main approved by reusing the carrier Task; do not execute it twice."""
+        db_path = str(tmp_path / "main_plan_task_states.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, plan_content,
+                    plan_approved, plan_approved_at, created_at, completed_at
+                ) VALUES
+                (31, 'Needs decision', 'Review this', 'plan_review', 0,
+                 'main', 'pending', 0, 2, 'plan', '# Review', NULL, NULL,
+                 '2026-08-01 09:00:00', NULL),
+                (32, 'Approved and queued', 'Execute this', 'pending', 0,
+                 'main', 'pending', 0, 2, 'plan', '# Queued', 1, NULL,
+                 '2026-08-01 10:00:00', NULL),
+                (33, 'Already executed', 'Was executed', 'completed', 0,
+                 'main', 'pending', 0, 2, 'plan', '# Done', 1, NULL,
+                 '2026-08-01 11:00:00', '2026-08-01 12:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT l.legacy_task_id, t.status AS task_status,
+                       p.active_run_id, v.review_verdict, v.human_decision,
+                       a.application_type, a.execution_task_id
+                FROM plan_legacy_task_links l
+                JOIN tasks t ON t.id = l.legacy_task_id
+                JOIN plans p ON p.id = l.plan_id
+                JOIN plan_versions v ON v.id = l.plan_version_id
+                LEFT JOIN plan_applications a
+                  ON a.plan_version_id = l.plan_version_id
+                ORDER BY l.legacy_task_id
+            """)).mappings().all()
+
+            assert dict(rows[0]) == {
+                "legacy_task_id": 31,
+                "task_status": "plan_review",
+                "active_run_id": None,
+                "review_verdict": "disabled",
+                "human_decision": "pending",
+                "application_type": None,
+                "execution_task_id": None,
+            }
+            assert dict(rows[1]) == {
+                "legacy_task_id": 32,
+                "task_status": "pending",
+                "active_run_id": None,
+                "review_verdict": None,
+                "human_decision": "approved",
+                "application_type": "execution_task",
+                "execution_task_id": 32,
+            }
+            assert dict(rows[2]) == {
+                "legacy_task_id": 33,
+                "task_status": "completed",
+                "active_run_id": None,
+                "review_verdict": None,
+                "human_decision": "approved",
+                "application_type": "execution_task",
+                "execution_task_id": 33,
+            }
+        engine.dispose()
+
     def test_active_legacy_plan_process_blocks_backfill(self, tmp_path):
         db_path = str(tmp_path / "active_legacy_plan.db")
         cfg = _alembic_cfg(db_path)

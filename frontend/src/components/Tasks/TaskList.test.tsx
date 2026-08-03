@@ -195,6 +195,25 @@ describe('TaskList', () => {
     expect(screen.queryByText('Config')).not.toBeInTheDocument();
   });
 
+  it('keeps a migrated Plan Task visible and links it to the canonical Plan', async () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          id: 12,
+          mode: 'plan',
+          status: 'completed',
+          canonical_plan_id: 44,
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plan #44' }));
+    expect(window.location.hash).toBe('#/plans/44');
+  });
+
   it('shows empty state when no tasks', () => {
     render(<TaskList tasks={[]} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('No tasks yet')).toBeInTheDocument();

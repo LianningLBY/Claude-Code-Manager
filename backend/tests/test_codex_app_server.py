@@ -4320,6 +4320,248 @@ async def test_unconfirmed_descendant_abandon_escalates_transport_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_claimed_stop_preserves_shared_transport_when_interrupt_unconfirmed(
+    tmp_path,
+):
+    """A user stop must not kill another live turn sharing the account."""
+
+    home = normalize_codex_home(tmp_path / "shared-claimed-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-target", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-target"}},
+        {"thread": {"id": "thread-peer", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-peer"}},
+        {
+            "thread": {
+                "id": "thread-child",
+                "status": {"type": "active", "activeFlags": []},
+                "turns": [],
+            },
+        },
+    ])
+    target, _ = await server.start_turn(
+        prompt="target",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=16,
+    )
+    peer, _ = await server.start_turn(
+        prompt="peer",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=17,
+    )
+    await target.stdout.readline()
+    await peer.stdout.readline()
+    server._handle_notification("item/completed", {
+        "threadId": "thread-target",
+        "turnId": "turn-target",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-target",
+        "turn": {
+            "id": "turn-target",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    await asyncio.sleep(0)
+
+    target_context = server._contexts_by_thread["thread-target"]
+    peer_context = server._contexts_by_thread["thread-peer"]
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="shared Codex app-server transport",
+    ) as exc_info:
+        await registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+
+    assert type(exc_info.value).__name__ == "CodexSharedTransportBusyError"
+    server.shutdown.assert_not_awaited()
+    assert target.returncode is None
+    assert peer.returncode is None
+    assert server._contexts_by_thread == {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    assert server._contexts_by_turn["turn-target"] is target_context
+    assert server._contexts_by_turn["turn-peer"] is peer_context
+    assert server._contexts_by_descendant["thread-child"] is target_context
+    assert registry._servers[home] is server
+    assert registry._thread_owners == {
+        "thread-target": home,
+        "thread-peer": home,
+    }
+    assert home not in registry._draining
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_may_shutdown_transport_for_an_isolated_turn(tmp_path):
+    """An isolated claimed turn retains fail-closed transport escalation."""
+
+    home = normalize_codex_home(tmp_path / "isolated-claimed-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-target", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-target"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="target",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=18,
+    )
+    await process.stdout.readline()
+    server.abandon_turn = AsyncMock(return_value=False)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners["thread-target"] = home
+
+    assert await registry.stop_claimed_turn(
+        home,
+        process,
+        reason="user requested stop",
+    ) is True
+
+    server.shutdown.assert_awaited_once_with(
+        interrupted_process=process,
+        reason="user requested stop",
+    )
+    assert process.returncode == 130
+    assert process.termination_kind == "internal_abort"
+    assert not server._contexts_by_thread
+    assert not server._contexts_by_turn
+    assert home not in registry._servers
+    assert home not in registry._draining
+    assert "thread-target" not in registry._thread_owners
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_rejects_an_in_flight_steer_before_interrupt(tmp_path):
+    """A concurrent steer must settle before a claimed stop defines its boundary."""
+
+    home = normalize_codex_home(tmp_path / "claimed-stop-steer")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-target", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-target"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="target",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=19,
+    )
+    await process.stdout.readline()
+    steer_entered = asyncio.Event()
+    release_steer = asyncio.Event()
+
+    async def blocking_steer(thread_id, content):
+        assert (thread_id, content) == ("thread-target", "new direction")
+        steer_entered.set()
+        await release_steer.wait()
+        return True
+
+    server.steer_turn = AsyncMock(side_effect=blocking_steer)
+    server.abandon_turn = AsyncMock(return_value=False)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners["thread-target"] = home
+
+    steer = asyncio.create_task(
+        registry.steer_turn("thread-target", "new direction")
+    )
+    await steer_entered.wait()
+    try:
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="in flight",
+        ):
+            await registry.stop_claimed_turn(
+                home,
+                process,
+                reason="user requested stop",
+            )
+
+        server.abandon_turn.assert_not_awaited()
+        server.shutdown.assert_not_awaited()
+        assert process.returncode is None
+        assert home not in registry._draining
+    finally:
+        release_steer.set()
+        assert await steer is True
+
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    async def blocking_abandon(exact_process, reason):
+        assert exact_process is process
+        assert reason == "user requested stop"
+        stop_entered.set()
+        await release_stop.wait()
+        return False
+
+    server.abandon_turn.reset_mock(side_effect=True)
+    server.abandon_turn.side_effect = blocking_abandon
+    server.steer_turn.reset_mock(side_effect=True)
+    server.steer_turn.return_value = True
+    stop = asyncio.create_task(
+        registry.stop_claimed_turn(
+            home,
+            process,
+            reason="user requested stop",
+        )
+    )
+    await stop_entered.wait()
+    try:
+        with pytest.raises(CodexAppServerBusyError, match="draining"):
+            await registry.steer_turn("thread-target", "too late")
+        server.steer_turn.assert_not_awaited()
+    finally:
+        release_stop.set()
+    assert await stop is True
+
+
+@pytest.mark.asyncio
 async def test_read_and_fork_thread_use_native_app_server_protocol():
     server = CodexAppServer("codex")
     server.ensure_started = AsyncMock()
@@ -4639,9 +4881,11 @@ async def test_interleaved_notifications_are_isolated_by_turn():
 
 
 @pytest.mark.asyncio
-async def test_reader_exit_fails_pending_requests_and_active_turns():
+async def test_reader_exit_does_not_leak_shared_stderr_to_tasks():
     """A crashed shared process must unblock every waiter instead of hanging."""
     server = CodexAppServer("codex")
+    stale_stderr = "historic router error from an unrelated task"
+    server._stderr_lines.append(stale_stderr)
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
@@ -4692,8 +4936,144 @@ async def test_reader_exit_fails_pending_requests_and_active_turns():
     with pytest.raises(
         CodexAppServerError,
         match=r"exited unexpectedly \(exit code 1\)",
-    ):
+    ) as exc_info:
         await pending
+    assert stale_stderr not in str(exc_info.value)
+    turn_stderr = (await turn_process.stderr.read()).decode()
+    assert "exited unexpectedly (exit code 1)" in turn_stderr
+    assert stale_stderr not in turn_stderr
+
+
+@pytest.mark.asyncio
+async def test_reader_exit_zero_during_shutdown_is_not_reported_as_unexpected():
+    """A CCM-requested clean exit must not masquerade as a task crash."""
+
+    server = CodexAppServer("codex")
+    stale_stderr = "historic apply_patch failure from an unrelated task"
+    server._stderr_lines.append(stale_stderr)
+    app_process = _ShutdownProcess()
+    app_process.stdout = asyncio.StreamReader()
+    app_process.stderr = asyncio.StreamReader()
+    server._process = app_process
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-1"}},
+        {"thread": {"id": "thread-2", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-2"}},
+    ])
+    turn_process, _ = await server.start_turn(
+        prompt="hi",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=1,
+    )
+    await turn_process.stdout.readline()
+    peer_process, _ = await server.start_turn(
+        prompt="peer",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=2,
+    )
+    await peer_process.stdout.readline()
+    pending = asyncio.get_running_loop().create_future()
+    server._pending[99] = pending
+    server._reader_task = asyncio.create_task(server._read_loop(app_process))
+    server._stderr_task = asyncio.create_task(server._stderr_loop(app_process))
+
+    def exit_cleanly():
+        app_process.exit(0)
+        app_process.stdout.feed_eof()
+        app_process.stderr.feed_eof()
+
+    app_process.stdin.close.side_effect = exit_cleanly
+    await server.shutdown(
+        interrupted_process=turn_process,
+        reason="CCM task session interrupted",
+    )
+
+    assert await turn_process.wait() == 130
+    assert turn_process.termination_kind == "internal_abort"
+    assert await peer_process.wait() == 1
+    with pytest.raises(CodexAppServerError) as exc_info:
+        await pending
+    pending_error = str(exc_info.value)
+    assert "unexpected" not in pending_error.lower()
+    assert any(
+        phrase in pending_error.lower()
+        for phrase in ("shut down", "stopped")
+    )
+    assert stale_stderr not in pending_error
+    turn_stderr = (await turn_process.stderr.read()).decode()
+    assert turn_stderr == "CCM task session interrupted"
+    assert "unexpected" not in turn_stderr.lower()
+    assert stale_stderr not in turn_stderr
+    peer_stderr = (await peer_process.stderr.read()).decode()
+    assert "shut down by CCM (exit code 0)" in peer_stderr
+    assert "unexpected" not in peer_stderr.lower()
+    assert stale_stderr not in peer_stderr
+    assert not server._contexts_by_thread
+    assert not server._contexts_by_turn
+
+
+@pytest.mark.asyncio
+async def test_eof_observed_before_shutdown_intent_remains_unexpected():
+    """A later stop request must not relabel an already-observed transport EOF."""
+
+    server = CodexAppServer("codex")
+    app_process = _ShutdownProcess()
+    app_process.stdout = asyncio.StreamReader()
+    app_process.stderr = asyncio.StreamReader()
+    server._process = app_process
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-1"}},
+    ])
+    turn_process, _ = await server.start_turn(
+        prompt="hi",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=1,
+    )
+    await turn_process.stdout.readline()
+
+    wait_entered = asyncio.Event()
+    original_wait = app_process.wait
+
+    async def observed_wait():
+        wait_entered.set()
+        return await original_wait()
+
+    app_process.wait = observed_wait
+    app_process.stdout.feed_eof()
+    server._reader_task = asyncio.create_task(server._read_loop(app_process))
+    await wait_entered.wait()
+
+    def exit_after_late_shutdown():
+        app_process.exit(0)
+        app_process.stderr.feed_eof()
+
+    app_process.stdin.close.side_effect = exit_after_late_shutdown
+    await server.shutdown(
+        interrupted_process=turn_process,
+        reason="late stop must not rewrite the crash",
+    )
+
+    assert await turn_process.wait() == 1
+    assert turn_process.termination_kind is None
+    turn_stderr = (await turn_process.stderr.read()).decode()
+    assert "exited unexpectedly (exit code 0)" in turn_stderr
+    assert "late stop" not in turn_stderr
 
 
 @pytest.mark.parametrize(

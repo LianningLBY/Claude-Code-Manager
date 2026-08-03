@@ -32,6 +32,7 @@ from backend.services.codex_app_server import (
     CodexRequiredMcpError,
     CodexRequiredMcpPreTurnError,
     CodexServiceTierUnavailableError,
+    CodexSharedTransportBusyError,
     CodexThreadHomeMismatchError,
     CodexTurnProcess,
 )
@@ -4749,7 +4750,7 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
     process = CodexTurnProcess(43_210, interrupt, thread_id="thread-stuck")
     registry = MagicMock()
 
-    async def abort_turn(codex_home, exact_process, *, reason):
+    async def stop_claimed_turn(codex_home, exact_process, *, reason):
         assert codex_home == "/tmp/codex-stop-home"
         assert exact_process is process
         assert reason == "CCM task session interrupted"
@@ -4759,7 +4760,12 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
         )
         return True
 
-    registry.abort_unclaimed_turn = AsyncMock(side_effect=abort_turn)
+    registry.stop_claimed_turn = AsyncMock(side_effect=stop_claimed_turn)
+    registry.abort_unclaimed_turn = AsyncMock(
+        side_effect=AssertionError(
+            "a durable Instance owner must not use unclaimed-turn cleanup"
+        )
+    )
     broadcaster = MagicMock(broadcast=AsyncMock())
     im = InstanceManager(db_factory, broadcaster)
     im._codex_app_server = registry
@@ -4780,7 +4786,8 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
     ):
         assert await im.stop(inst_id) is True
 
-    registry.abort_unclaimed_turn.assert_awaited_once()
+    registry.stop_claimed_turn.assert_awaited_once()
+    registry.abort_unclaimed_turn.assert_not_awaited()
     signal_tree.assert_not_awaited()
     wait_tree.assert_not_awaited()
     assert process.returncode == 130
@@ -4788,6 +4795,159 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
         inst = await db.get(Instance, inst_id)
         assert inst.status == "idle"
         assert inst.pid is None
+
+
+@pytest.mark.asyncio
+async def test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy(
+    db_factory,
+):
+    """An unisolatable stop must not tear down another turn on the home."""
+
+    shared_pid = 43_211
+    first_started_at = datetime(2026, 8, 3, 11, 13, 30)
+    peer_started_at = datetime(2026, 8, 3, 11, 13, 31)
+    async with db_factory() as db:
+        first_instance = Instance(
+            name="codex-shared-stop-target",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=first_started_at,
+        )
+        peer_instance = Instance(
+            name="codex-shared-stop-peer",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=peer_started_at,
+        )
+        db.add_all([first_instance, peer_instance])
+        await db.flush()
+        first_task = Task(
+            title="shared stop target",
+            status="executing",
+            provider="codex",
+            instance_id=first_instance.id,
+        )
+        peer_task = Task(
+            title="shared stop peer",
+            status="executing",
+            provider="codex",
+            instance_id=peer_instance.id,
+        )
+        db.add_all([first_task, peer_task])
+        await db.flush()
+        first_instance.current_task_id = first_task.id
+        peer_instance.current_task_id = peer_task.id
+        await db.commit()
+        first_instance_id = first_instance.id
+        peer_instance_id = peer_instance.id
+        first_task_id = first_task.id
+        peer_task_id = peer_task.id
+
+    async def interrupt():
+        raise AssertionError("the registry owns exact-turn interruption")
+
+    first_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-stop-target",
+    )
+    peer_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-stop-peer",
+    )
+    first_release = asyncio.Event()
+    peer_release = asyncio.Event()
+    first_consumer = asyncio.create_task(first_release.wait())
+    peer_consumer = asyncio.create_task(peer_release.wait())
+    registry = MagicMock()
+    registry.stop_claimed_turn = AsyncMock(
+        side_effect=CodexSharedTransportBusyError(
+            "cannot isolate the requested turn while a peer is active"
+        )
+    )
+    registry.abort_unclaimed_turn = AsyncMock(
+        side_effect=AssertionError(
+            "a durable Instance owner must not shut down shared transport"
+        )
+    )
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager._codex_app_server = registry
+    manager._config_dirs[first_instance_id] = "/tmp/codex-shared-home"
+    manager._config_dirs[peer_instance_id] = "/tmp/codex-shared-home"
+    manager.processes[first_instance_id] = first_process
+    manager.processes[peer_instance_id] = peer_process
+    manager._track_output_consumer(
+        first_instance_id,
+        first_process,
+        first_consumer,
+        provider="codex",
+        task_id=first_task_id,
+        task_retry_count=0,
+        instance_started_at=first_started_at,
+    )
+    manager._track_output_consumer(
+        peer_instance_id,
+        peer_process,
+        peer_consumer,
+        provider="codex",
+        task_id=peer_task_id,
+        task_retry_count=0,
+        instance_started_at=peer_started_at,
+    )
+
+    try:
+        assert await manager.stop(
+            first_instance_id,
+            expected_task_id=first_task_id,
+            expected_pid=shared_pid,
+            expected_started_at=first_started_at,
+            task_status="completed",
+            consumer_cancel_timeout=0.01,
+        ) is False
+
+        registry.stop_claimed_turn.assert_awaited_once_with(
+            "/tmp/codex-shared-home",
+            first_process,
+            reason="CCM task session interrupted",
+        )
+        registry.abort_unclaimed_turn.assert_not_awaited()
+        assert first_process.returncode is None
+        assert peer_process.returncode is None
+        assert not first_consumer.done()
+        assert not first_consumer.cancelling()
+        assert not peer_consumer.done()
+        assert not peer_consumer.cancelling()
+        assert manager.processes[first_instance_id] is first_process
+        assert manager.processes[peer_instance_id] is peer_process
+        assert manager._tasks[first_instance_id] is first_consumer
+        assert manager._tasks[peer_instance_id] is peer_consumer
+        assert manager._consumer_records[first_instance_id].process is first_process
+        assert manager._consumer_records[peer_instance_id].process is peer_process
+        broadcaster.broadcast.assert_not_awaited()
+
+        async with db_factory() as db:
+            durable_first_instance = await db.get(Instance, first_instance_id)
+            durable_peer_instance = await db.get(Instance, peer_instance_id)
+            durable_first_task = await db.get(Task, first_task_id)
+            durable_peer_task = await db.get(Task, peer_task_id)
+            assert durable_first_instance.status == "running"
+            assert durable_first_instance.pid == shared_pid
+            assert durable_first_instance.current_task_id == first_task_id
+            assert durable_peer_instance.status == "running"
+            assert durable_peer_instance.pid == shared_pid
+            assert durable_peer_instance.current_task_id == peer_task_id
+            assert durable_first_task.status == "executing"
+            assert durable_first_task.instance_id == first_instance_id
+            assert durable_peer_task.status == "executing"
+            assert durable_peer_task.instance_id == peer_instance_id
+    finally:
+        first_release.set()
+        peer_release.set()
+        await asyncio.gather(first_consumer, peer_consumer)
 
 
 @pytest.mark.asyncio

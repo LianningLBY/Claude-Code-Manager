@@ -583,6 +583,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_codex_app_server.py::test_existing_goal_turn_notification_rebinds_submission_id` | adopted goal 同时保留 active/submission 两个通知 ID，任一 ID 的 assistant/terminal 事件都不能丢 |
 | `test_codex_app_server.py::test_signal_interrupt_reconciles_and_pauses_existing_goal_turn` | adopted goal Interrupt 只做一次 pause RPC，再中断权威 active turn |
 | `test_service_instance_manager.py::test_internal_codex_abort_is_not_a_successful_chat_terminal` | transport/admission 内部 abort 不得伪装成用户 Interrupt 的 completed |
+| `test_codex_app_server.py::test_claimed_stop_preserves_shared_transport_when_interrupt_unconfirmed` / `test_claimed_stop_rejects_an_in_flight_steer_before_interrupt` / `test_unconfirmed_descendant_abandon_escalates_transport_shutdown` | 已持久 claim 的 stop 在 peer/steer 存在时保留共享 transport 与所有 turn；drain 后拒绝新 steer；真正 unclaimed cleanup 仍 fail closed 关闭账号 transport |
+| `test_service_instance_manager.py::test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy` / `test_api_tasks.py::test_stop_session_reports_unresolved_exact_owner` | 无法隔离的停止保留 Task→Instance、process 和 consumer，不影响 peer；API 返回 409 且不写伪终态/广播 |
+| `test_codex_app_server.py::test_reader_exit_zero_during_shutdown_is_not_reported_as_unexpected` / `test_eof_observed_before_shutdown_intent_remains_unexpected` / `test_reader_exit_does_not_leak_shared_stderr_to_tasks` | exact-generation 计划关闭只中断 target，EOF 先发生仍算真实崩溃；账号级 stderr tail 不泄漏给 Task |
 | `test_service_dispatcher.py::test_cancelled_task_followup_reclaims_session_instead_of_dropping` | Cancel 仅终止当前 generation，后续 chat 可安全领取原生 session 并恢复 executing |
 | `test_codex_app_server.py::test_context_window_error_keeps_structured_codex_error_info` | `turn/completed` 失败不得丢弃 `codexErrorInfo=contextWindowExceeded` 与 additionalDetails |
 | `test_context_compaction.py` | provider 共享的上下文超限分类、Codex current-context token 计算及旧 usage fallback |
@@ -595,6 +598,11 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | 前端 `ProjectTodoList.test.tsx` | Todo Run 建 task 带 provider |
 | 前端 `TaskForm.test.tsx::Codex provider UI gating` | Codex 开放普通/User Skills 与 Sub-Agent；仅 capability 已确认的本地 Project 显示 Monitor，Worker Project 与 kill switch 关闭状态隐藏 |
 | 前端 `MonitorPanel.test.tsx` | 本地 Codex capability 已确认时不显示警告；Worker、Shared 或 capability 未知时显示本地范围限制，Claude 无横幅 |
+
+共享 app-server 停止边界修改须先定向运行
+`test_codex_app_server.py`、`test_service_instance_manager.py` 与 `test_api_tasks.py`
+的 claimed/unclaimed、peer/in-flight、planned/unexpected 场景，再运行全部
+`backend/tests/` 和前端 `npx tsc --noEmit`；不能只验证单 turn 的关闭成功路径。
 
 ##### Codex 普通 Skills / User Skills 对等（PR 6）
 

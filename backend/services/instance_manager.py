@@ -9749,7 +9749,10 @@ class InstanceManager:
             and self._pty_backend is not None
             and instance_id in getattr(self._pty_backend, "_sessions", {})
         )
-        from backend.services.codex_app_server import CodexTurnProcess
+        from backend.services.codex_app_server import (
+            CodexSharedTransportBusyError,
+            CodexTurnProcess,
+        )
 
         codex_app_server_managed = (
             process_live and isinstance(process, CodexTurnProcess)
@@ -9764,10 +9767,11 @@ class InstanceManager:
             # active: descendant cleanup can fail, yet killing the adapter
             # cannot reap that native work.
             #
-            # The registry owns the required fail-closed escalation.  It first
-            # interrupts the exact parent/descendant turn and, if that cannot
-            # be confirmed, drains and shuts down only this account's
-            # transport before finishing the adapter.
+            # This is a durably claimed turn, so the registry may escalate to
+            # account transport shutdown only when no peer turn shares that
+            # process.  If isolation cannot be proven, retain every runtime
+            # and durable owner so the API can return a conflict without
+            # killing unrelated tasks.
             registry = self._codex_app_server
             codex_home = self._config_dirs.get(instance_id)
             if registry is None or not codex_home:
@@ -9775,11 +9779,20 @@ class InstanceManager:
                     "Codex app-server turn has no registered account owner "
                     f"for instance {instance_id}"
                 )
-            await registry.abort_unclaimed_turn(
-                codex_home,
-                process,
-                reason="CCM task session interrupted",
-            )
+            try:
+                await registry.stop_claimed_turn(
+                    codex_home,
+                    process,
+                    reason="CCM task session interrupted",
+                )
+            except CodexSharedTransportBusyError as exc:
+                logger.warning(
+                    "Keeping claimed Codex turn active because its shared "
+                    "transport cannot be isolated for instance %s: %s",
+                    instance_id,
+                    exc,
+                )
+                return False
             try:
                 await asyncio.wait_for(
                     asyncio.shield(process.wait()),

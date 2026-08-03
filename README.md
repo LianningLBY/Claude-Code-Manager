@@ -748,6 +748,7 @@ cloudflared tunnel run <tunnel-name>
 - **Claude Code 集成**：默认 PTY 模式（常驻交互会话，多轮免冷启动）；可切换为 `claude -p` 一次性进程模式（`USE_PTY_MODE=false`）
 - **进程超时保护**：任务执行超过 `TASK_TIMEOUT_SECONDS`（默认 30 分钟）后自动 kill，防止进程挂死
 - **多轮对话**：session_id 绑定在 Task 上，follow-up 时使用 `--resume <session_id>` 续接会话
+- **Codex 共享传输停止**：`stop-session` 只停止目标 turn。若精确中断暂时无法确认，且同一账号 app-server 还在服务其他 turn 或已准入请求，API 返回 409 并保留原任务运行证据，可稍后重试；不会为停一个任务杀掉同账号的其他任务
 - **Codex Fast**：`Task.codex_service_tier` 持久保存 `default|priority`。Standard 会显式清除会话残留的 Fast tier；Fast 必须同时通过当前账号 `model/list` 能力检查、app-server 显式 priority 准入，以及 CCM loopback Responses 代理对上游 `response.created.response.service_tier=priority` 的实际响应验证。成功 SSE 在验证前不会释放；缺字段、不一致、非 2xx、未知 lineage 或代理不可用都会明确失败，且 Fast 禁止回退 `codex exec`。日志与聊天事件会记录 `actual_service_tier_verified=true` 和上游 response id。Fast Goal evaluator 使用与任务相同的模型并走同一实际 tier 证明链路；当前 Distill 无法提供同等证明，因此 Fast Task 会在 Distill 执行前明确返回 409
 - **子 Agent 系统**：统一存 `sub_agent_sessions` 表，`agent_type` 区分类别（monitor / native-agent / native-monitor）。CCM 自有子 agent 拥有独立 MCP server，通过 HTTP API 与系统通信
 - **瞬时过载重试**：Anthropic 基础设施侧 429/overloaded 与账号额度用尽严格区分，前者退避重试同一账号，后者走号池轮换

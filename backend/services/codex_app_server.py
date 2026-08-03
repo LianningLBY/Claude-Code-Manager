@@ -208,6 +208,10 @@ class CodexAppServerBusyError(CodexAppServerError):
     """The requested account home still has an active Codex turn."""
 
 
+class CodexSharedTransportBusyError(CodexAppServerBusyError):
+    """A claimed turn cannot be stopped without disrupting a shared transport."""
+
+
 class CodexThreadNotIdleError(CodexAppServerBusyError):
     """A native thread can still execute outside CCM's current turn adapter."""
 
@@ -643,6 +647,24 @@ class CodexAppServer:
         self._write_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._shutdown_requested = False
+        # A shutdown intent is generation-bound.  ``_shutdown_requested`` is
+        # published before the lifecycle lock to block new starts, but the
+        # reader must only call an EOF planned after shutdown owns this exact
+        # subprocess generation and is about to close its stdin.
+        self._planned_shutdown: tuple[
+            asyncio.subprocess.Process,
+            CodexTurnProcess | None,
+            str,
+        ] | None = None
+        self._observed_transport_exit: tuple[
+            asyncio.subprocess.Process,
+            tuple[
+                asyncio.subprocess.Process,
+                CodexTurnProcess | None,
+                str,
+            ] | None,
+        ] | None = None
+        self._finalized_transport_process: asyncio.subprocess.Process | None = None
         # App-server keeps completed threads loaded in memory.  The registry
         # uses this set to restart an idle target server before a migrated
         # rollout is resumed there again, avoiding stale in-memory history.
@@ -670,6 +692,23 @@ class CodexAppServer:
     def has_active_thread(self, thread_id: str) -> bool:
         context = self._contexts_by_thread.get(thread_id)
         return bool(context and context.process.returncode is None)
+
+    def owns_live_turn_process(self, process: CodexTurnProcess) -> bool:
+        """Return whether this server owns the exact live adapter generation."""
+
+        return any(
+            context.process is process and context.process.returncode is None
+            for context in self._contexts_by_thread.values()
+        )
+
+    def has_other_live_turn_processes(self, process: CodexTurnProcess) -> bool:
+        """Return whether another task still uses this account transport."""
+
+        return any(
+            context.process is not process
+            and context.process.returncode is None
+            for context in self._contexts_by_thread.values()
+        )
 
     def knows_thread(self, thread_id: str) -> bool:
         return thread_id in self._known_threads
@@ -2062,6 +2101,9 @@ class CodexAppServer:
 
     async def _start(self) -> None:
         self._stderr_lines.clear()
+        self._planned_shutdown = None
+        self._observed_transport_exit = None
+        self._finalized_transport_process = None
         self._skills_revision = 0
         # These facts belong to one app-server process generation.  Persisted
         # thread ownership is kept separately in ``_known_threads``.
@@ -3805,6 +3847,98 @@ class CodexAppServer:
             self._process.stdin.write(payload.encode("utf-8") + b"\n")
             await self._process.stdin.drain()
 
+    def _finalize_transport_exit(
+        self,
+        process: asyncio.subprocess.Process,
+        returncode: int | None,
+        planned_shutdown: tuple[
+            asyncio.subprocess.Process,
+            CodexTurnProcess | None,
+            str,
+        ] | None,
+    ) -> None:
+        """Settle every waiter and adapter for one exact transport generation."""
+
+        if self._finalized_transport_process is process:
+            return
+        self._finalized_transport_process = process
+        detail = "\n".join(self._stderr_lines)[-4000:]
+        planned = bool(
+            planned_shutdown is not None
+            and planned_shutdown[0] is process
+        )
+        if planned:
+            error = CodexAppServerError(
+                "Codex app-server shut down by CCM "
+                f"({_format_process_exit(returncode)})"
+            )
+            if detail:
+                logger.debug(
+                    "Codex app-server stderr before planned shutdown "
+                    "home=%s pid=%s:\n%s",
+                    self.codex_home,
+                    getattr(process, "pid", None),
+                    detail,
+                )
+        else:
+            error = CodexAppServerError(
+                "Codex app-server exited unexpectedly "
+                f"({_format_process_exit(returncode)})"
+            )
+            logger.error(
+                "Codex app-server transport exited unexpectedly "
+                "home=%s pid=%s %s%s",
+                self.codex_home,
+                getattr(process, "pid", None),
+                _format_process_exit(returncode),
+                f"; stderr tail:\n{detail}" if detail else "",
+            )
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.set_exception(error)
+        self._pending.clear()
+        for future in list(self._thread_settings_waiters.values()):
+            if not future.done():
+                future.set_exception(error)
+        self._thread_settings_waiters.clear()
+        for context in list(self._contexts_by_thread.values()):
+            future = context.admission_observed_future
+            if future is not None and not future.done():
+                future.set_exception(error)
+            if (
+                planned
+                and planned_shutdown is not None
+                and context.process is planned_shutdown[1]
+            ):
+                context.process.finish(
+                    130,
+                    planned_shutdown[2],
+                    termination_kind="internal_abort",
+                )
+            else:
+                # A planned account/server shutdown is not successful turn
+                # completion.  Any non-target adapter that never received
+                # turn/completed still fails, but receives only a fixed
+                # transport-level reason rather than another task's shared
+                # stderr history.
+                context.process.finish(1, str(error))
+            self._detach_turn_context(context)
+        self._contexts_by_thread.clear()
+        self._contexts_by_turn.clear()
+        self._contexts_by_descendant.clear()
+        self._children_by_thread.clear()
+        self._thread_runtime.clear()
+        if (
+            self._planned_shutdown is not None
+            and self._planned_shutdown[0] is process
+        ):
+            self._planned_shutdown = None
+        if (
+            self._observed_transport_exit is not None
+            and self._observed_transport_exit[0] is process
+        ):
+            self._observed_transport_exit = None
+
     async def _read_loop(self, process: asyncio.subprocess.Process) -> None:
         assert process.stdout
         try:
@@ -3833,32 +3967,22 @@ class CodexAppServer:
         except Exception:
             logger.exception("Codex app-server reader failed")
         finally:
+            # Freeze intent at the instant EOF/reader failure is observed.  A
+            # later administrative shutdown must not relabel an already-broken
+            # transport as a planned clean exit while process.wait() settles.
+            planned_shutdown = self._planned_shutdown
+            if (
+                planned_shutdown is None
+                or planned_shutdown[0] is not process
+            ):
+                planned_shutdown = None
+            self._observed_transport_exit = (process, planned_shutdown)
             returncode = await process.wait()
-            detail = "\n".join(self._stderr_lines)[-4000:]
-            error = CodexAppServerError(
-                "Codex app-server exited unexpectedly "
-                f"({_format_process_exit(returncode)}): "
-                f"{detail or 'no stderr'}"
+            self._finalize_transport_exit(
+                process,
+                returncode,
+                planned_shutdown,
             )
-            for future in list(self._pending.values()):
-                if not future.done():
-                    future.set_exception(error)
-            self._pending.clear()
-            for future in list(self._thread_settings_waiters.values()):
-                if not future.done():
-                    future.set_exception(error)
-            self._thread_settings_waiters.clear()
-            for context in list(self._contexts_by_thread.values()):
-                future = context.admission_observed_future
-                if future is not None and not future.done():
-                    future.set_exception(error)
-                context.process.finish(1, str(error))
-                self._detach_turn_context(context)
-            self._contexts_by_thread.clear()
-            self._contexts_by_turn.clear()
-            self._contexts_by_descendant.clear()
-            self._children_by_thread.clear()
-            self._thread_runtime.clear()
 
     async def _stderr_loop(self, process: asyncio.subprocess.Process) -> None:
         assert process.stderr
@@ -4527,6 +4651,26 @@ class CodexAppServer:
             *(task for task in (self._reader_task, self._stderr_task) if task),
             return_exceptions=True,
         )
+        # A very fast clean exit can complete before the reader coroutine gets
+        # its first scheduling turn; cancelling such an unstarted task does not
+        # execute its ``finally`` block.  Finalize here as an idempotent fallback
+        # so adapters and pending RPCs can never remain open after verified
+        # transport shutdown.
+        observed_exit = self._observed_transport_exit
+        if observed_exit is not None and observed_exit[0] is process:
+            planned_shutdown = observed_exit[1]
+        else:
+            planned_shutdown = self._planned_shutdown
+            if (
+                planned_shutdown is None
+                or planned_shutdown[0] is not process
+            ):
+                planned_shutdown = None
+        self._finalize_transport_exit(
+            process,
+            process.returncode,
+            planned_shutdown,
+        )
         if self._process is process:
             self._process = None
         if self._process_group_process is process:
@@ -4538,7 +4682,12 @@ class CodexAppServer:
         if proxy is not None:
             await proxy.close()
 
-    async def shutdown(self) -> None:
+    async def shutdown(
+        self,
+        *,
+        interrupted_process: CodexTurnProcess | None = None,
+        reason: str = "CCM requested Codex app-server shutdown",
+    ) -> None:
         """Permanently stop and verify this server object's process group."""
 
         # Publish the close intent before waiting for the lifecycle barrier.
@@ -4546,6 +4695,21 @@ class CodexAppServer:
         # one queued behind it will observe this flag and cannot spawn later.
         self._shutdown_requested = True
         async with self._lifecycle_lock:
+            process = self._process
+            planned_shutdown = self._planned_shutdown
+            if (
+                process is not None
+                and process.returncode is None
+                and (
+                    planned_shutdown is None
+                    or planned_shutdown[0] is not process
+                )
+            ):
+                self._planned_shutdown = (
+                    process,
+                    interrupted_process,
+                    reason,
+                )
             await self._shutdown_locked()
 
 
@@ -4593,6 +4757,11 @@ class CodexAppServerRegistry:
         self._starting_threads: dict[str, object] = {}
         self._shutdown_requested = False
         self._lock = asyncio.Lock()
+        # Claimed stops and truly-unclaimed admission cleanup can both need to
+        # reason about every turn on one shared transport.  Serialize those
+        # decisions per home so two cleanup attempts cannot independently
+        # conclude that shutting down the same server generation is safe.
+        self._abort_locks: dict[str, asyncio.Lock] = {}
 
     def _new_server(self, home: str) -> CodexAppServer:
         server_kwargs: dict[str, Any] = {}
@@ -5167,6 +5336,159 @@ class CodexAppServerRegistry:
 
             await _settle_registry_cleanup(_release_recycle_thread())
 
+    async def _abort_lock_for_home(self, home: str) -> asyncio.Lock:
+        async with self._lock:
+            lock = self._abort_locks.get(home)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._abort_locks[home] = lock
+            return lock
+
+    async def stop_claimed_turn(
+        self,
+        codex_home: str | os.PathLike[str],
+        process: CodexTurnProcess,
+        *,
+        reason: str,
+    ) -> bool:
+        """Stop one durably-owned turn without killing peers on its transport.
+
+        A failed exact interrupt is safe to escalate to account transport
+        shutdown only when no other live turn or admitted RPC shares that
+        server generation.  Otherwise the caller must retain its Task,
+        Instance and consumer ownership and surface a retryable conflict.
+
+        Returns whether transport shutdown was required.
+        """
+
+        home = normalize_codex_home(codex_home)
+        abort_lock = await self._abort_lock_for_home(home)
+        async with abort_lock:
+            server: CodexAppServer | None = None
+            drain_owned = False
+            shutdown_attempted = False
+            try:
+                async with self._lock:
+                    if self._shutdown_requested:
+                        raise CodexSharedTransportBusyError(
+                            "Codex app-server registry is shutting down"
+                        )
+                    if home in self._draining:
+                        raise CodexSharedTransportBusyError(
+                            "Cannot isolate a claimed turn while its shared "
+                            f"Codex app-server transport is draining: {home}"
+                        )
+                    server = self._servers.get(home)
+                    if (
+                        server is None
+                        or not server.owns_live_turn_process(process)
+                    ):
+                        raise CodexSharedTransportBusyError(
+                            "Cannot isolate a claimed turn because its exact "
+                            "Codex app-server transport generation is no "
+                            f"longer registered: {home}"
+                        )
+                    starting = self._starting.get(home, 0)
+                    if starting:
+                        raise CodexSharedTransportBusyError(
+                            "Cannot stop the claimed turn while "
+                            f"{starting} admitted app-server request(s) are "
+                            f"in flight on its shared transport: {home}"
+                        )
+                    # Close admission before the interrupt RPC.  A request
+                    # admitted earlier remains visible in ``_starting`` and
+                    # blocks transport-level escalation below.
+                    self._draining.add(home)
+                    drain_owned = True
+
+                interrupt_confirmed = False
+                try:
+                    interrupt_confirmed = await server.abandon_turn(
+                        process,
+                        reason,
+                    )
+                except BaseException:
+                    logger.exception(
+                        "Failed to interrupt claimed Codex turn: %s",
+                        home,
+                    )
+                if interrupt_confirmed or process.returncode is not None:
+                    return False
+
+                async with self._lock:
+                    server_is_current = self._servers.get(home) is server
+                    target_is_current = server.owns_live_turn_process(process)
+                    has_peer_turns = server.has_other_live_turn_processes(
+                        process
+                    )
+                    starting = self._starting.get(home, 0)
+                    registry_shutdown = self._shutdown_requested
+
+                blockers: list[str] = []
+                if not server_is_current or not target_is_current:
+                    blockers.append("the exact target generation changed")
+                if has_peer_turns:
+                    blockers.append("another live turn shares the transport")
+                if starting:
+                    blockers.append(
+                        f"{starting} admitted app-server request(s) are in flight"
+                    )
+                if registry_shutdown:
+                    blockers.append("the registry is shutting down")
+                if blockers:
+                    raise CodexSharedTransportBusyError(
+                        "Cannot stop the claimed turn without disrupting its "
+                        "shared Codex app-server transport: "
+                        + "; ".join(blockers)
+                    )
+
+                # Admission is drained and the target is the only remaining
+                # live adapter.  A verified transport stop is now isolated to
+                # this claimed task generation.
+                shutdown_attempted = True
+                await server.shutdown(
+                    interrupted_process=process,
+                    reason=reason,
+                )
+
+                # Real servers finish the target in their reader.  Preserve
+                # the same guarantee for test doubles and an already-settled
+                # reader cancellation race.
+                for context in list(server._contexts_by_thread.values()):
+                    if context.process is process:
+                        server._detach_turn_context(context)
+                process.finish(
+                    130,
+                    reason,
+                    termination_kind="internal_abort",
+                )
+
+                async with self._lock:
+                    if self._servers.get(home) is server:
+                        self._servers.pop(home, None)
+                    for thread_id, owner in list(self._thread_owners.items()):
+                        if owner == home:
+                            self._thread_owners.pop(thread_id, None)
+                    self._draining.discard(home)
+                    drain_owned = False
+                return True
+            finally:
+                if (
+                    drain_owned
+                    and not shutdown_attempted
+                    and server is not None
+                ):
+                    # A shared-transport conflict leaves the original consumer
+                    # authoritative, so the account may reopen after the stop
+                    # fails.  A transport shutdown failure, by contrast, keeps
+                    # the home draining because its process state is unknown.
+                    async with self._lock:
+                        if (
+                            not self._shutdown_requested
+                            and self._servers.get(home) is server
+                        ):
+                            self._draining.discard(home)
+
     async def abort_unclaimed_turn(
         self,
         codex_home: str | os.PathLike[str],
@@ -5177,6 +5499,23 @@ class CodexAppServerRegistry:
         """Ensure a successfully-started turn cannot outlive its cancelled caller."""
 
         home = normalize_codex_home(codex_home)
+        abort_lock = await self._abort_lock_for_home(home)
+        async with abort_lock:
+            return await self._abort_unclaimed_turn_locked(
+                home,
+                process,
+                reason=reason,
+            )
+
+    async def _abort_unclaimed_turn_locked(
+        self,
+        home: str,
+        process: CodexTurnProcess,
+        *,
+        reason: str,
+    ) -> bool:
+        """Fail-closed cleanup while the per-home abort lock is held."""
+
         async with self._lock:
             server = self._servers.get(home)
             if server is not None:
@@ -5223,7 +5562,10 @@ class CodexAppServerRegistry:
         # leaves the account draining (fail-closed).
         shutdown_completed = False
         try:
-            await server.shutdown()
+            await server.shutdown(
+                interrupted_process=process,
+                reason=reason,
+            )
             shutdown_completed = True
         except BaseException:
             logger.exception(
@@ -5267,18 +5609,45 @@ class CodexAppServerRegistry:
         *,
         input_items: list[dict[str, Any]] | None = None,
     ) -> bool:
+        home: str | None = None
         async with self._lock:
+            if self._shutdown_requested:
+                raise CodexAppServerBusyError(
+                    "Codex app-server registry is shutting down"
+                )
             home = self._thread_owners.get(thread_id)
+            if home in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex account app-server is draining: {home}"
+                )
+            if thread_id in self._rebindings:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} is being rebound"
+                )
             server = self._servers.get(home) if home else None
+            if server is not None and home is not None:
+                # A steer can start more native work on the exact turn.  Make
+                # it an admitted home operation so claimed stop/maintenance
+                # cannot define a terminal boundary across an in-flight RPC.
+                self._starting[home] = self._starting.get(home, 0) + 1
         if server is None:
             return False
-        if input_items is None:
-            return await server.steer_turn(thread_id, content)
-        return await server.steer_turn(
-            thread_id,
-            content,
-            input_items=input_items,
-        )
+        try:
+            if input_items is None:
+                return await server.steer_turn(thread_id, content)
+            return await server.steer_turn(
+                thread_id,
+                content,
+                input_items=input_items,
+            )
+        finally:
+            assert home is not None
+
+            async def _release_steer_reservation() -> None:
+                async with self._lock:
+                    self._decrement_starting_locked(home)
+
+            await _settle_registry_cleanup(_release_steer_reservation())
 
     async def read_rate_limits(
         self, codex_home: str | os.PathLike[str] | None,

@@ -1286,9 +1286,16 @@ class TestCodexTransientDetection:
     def test_retry_limit_429(self):
         assert is_codex_transient("exceeded retry limit, last status: 429 Too Many Requests")
 
-    def test_unexpected_status_409_is_not_generic_transient(self):
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "all logged-in accounts are busy",
+            "no eligible logged-in account is ready",
+        ],
+    )
+    def test_unexpected_status_409_is_not_generic_transient(self, detail):
         assert not is_codex_transient(
-            "unexpected status 409 Conflict: all logged-in accounts are busy"
+            f"unexpected status 409 Conflict: {detail}"
         )
 
     def test_unexpected_status_401_not_transient(self):

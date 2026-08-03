@@ -69,8 +69,10 @@ _CLOUDROUTER_TRANSIENT_RE = re.compile(
 _APEX_BUSY_TRANSIENT_RE = re.compile(
     r"(?:unexpected status\s+409|httpStatusCode[\"']?\s*:\s*409|"
     r"\bHTTP(?:/\d(?:\.\d)?)?\s+409\b|\b409\s+Conflict\b)"
-    r"[^\n]{0,600}\ball logged-in accounts are busy\b"
-    r"|\ball logged-in accounts are busy\b[^\n]{0,600}"
+    r"[^\n]{0,600}\b(?:all logged-in accounts are busy"
+    r"|no eligible logged-in account is ready)\b"
+    r"|\b(?:all logged-in accounts are busy"
+    r"|no eligible logged-in account is ready)\b[^\n]{0,600}"
     r"(?:unexpected status\s+409|httpStatusCode[\"']?\s*:\s*409|"
     r"\bHTTP(?:/\d(?:\.\d)?)?\s+409\b|\b409\s+Conflict\b)",
     re.IGNORECASE,

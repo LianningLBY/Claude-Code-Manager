@@ -1379,8 +1379,15 @@ def test_cloudrouter_429_is_transient_only_for_exact_api_account_home(
     )
 
 
-def test_apex_409_busy_is_transient_only_for_exact_apex_codex_home(
-    db_factory,
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "all logged-in accounts are busy",
+        "no eligible logged-in account is ready",
+    ],
+)
+def test_apex_409_capacity_is_transient_only_for_exact_apex_codex_home(
+    db_factory, detail,
 ):
     im = InstanceManager(db_factory, MagicMock())
     apex_account = types.SimpleNamespace(api_provider="apex")
@@ -1398,7 +1405,7 @@ def test_apex_409_busy_is_transient_only_for_exact_apex_codex_home(
     })
     busy = (
         'unexpected status 409 Conflict: '
-        '{"detail":"all logged-in accounts are busy"}'
+        f'{{"detail":"{detail}"}}'
     )
 
     assert im.is_cloudrouter_transient(1, "codex", busy)
@@ -1408,7 +1415,7 @@ def test_apex_409_busy_is_transient_only_for_exact_apex_codex_home(
         1, "codex", "unexpected status 409 Conflict: branch changed",
     )
     assert not im.is_cloudrouter_transient(
-        1, "codex", "all logged-in accounts are busy",
+        1, "codex", detail,
     )
 
 
@@ -4497,8 +4504,15 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
 
 
 @pytest.mark.asyncio
-async def test_apex_409_busy_terminal_failure_retries_same_account(
-    db_factory, monkeypatch,
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "all logged-in accounts are busy",
+        "no eligible logged-in account is ready",
+    ],
+)
+async def test_apex_409_capacity_terminal_failure_retries_same_account(
+    db_factory, monkeypatch, detail,
 ):
     import backend.services.claude_pool as claude_pool_module
 
@@ -4536,7 +4550,7 @@ async def test_apex_409_busy_terminal_failure_retries_same_account(
             },
             "additionalDetails": (
                 "unexpected status 409 Conflict: "
-                '{"detail":"all logged-in accounts are busy"}'
+                f'{{"detail":"{detail}"}}'
             ),
         },
     })])

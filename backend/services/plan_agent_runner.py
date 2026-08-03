@@ -123,70 +123,47 @@ _QUESTION_SCHEMA = {
 }
 
 PLANNER_SCHEMA_V2 = {
-    "oneOf": [
-        {
-            "type": "object",
-            "properties": {
-                "action": {"const": "propose"},
-                "plan": {"type": "string", "minLength": 1},
-            },
-            "required": ["action", "plan"],
-            "additionalProperties": False,
+    # Claude Code implements structured output as a custom tool. Anthropic's
+    # tool contract requires an object root and rejects oneOf/allOf/anyOf at
+    # that root. Action-specific required/exclusive fields are therefore
+    # enforced by _validate_structured_v2 after generation.
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["propose", "request_input"],
         },
-        {
-            "type": "object",
-            "properties": {
-                "action": {"const": "request_input"},
-                "reason": {"type": "string", "minLength": 1, "maxLength": 4000},
-                # Intentionally no maxItems: one request may contain every
-                # currently necessary question. Payload/field limits remain.
-                "questions": {
-                    "type": "array",
-                    "items": _QUESTION_SCHEMA,
-                    "minItems": 1,
-                },
-            },
-            "required": ["action", "reason", "questions"],
-            "additionalProperties": False,
+        "plan": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4000},
+        # Intentionally no maxItems: one request may contain every currently
+        # necessary question. Payload/field limits remain.
+        "questions": {
+            "type": "array",
+            "items": _QUESTION_SCHEMA,
+            "minItems": 1,
         },
-    ]
+    },
+    "required": ["action"],
+    "additionalProperties": False,
 }
 
 REVIEWER_SCHEMA_V2 = {
-    "oneOf": [
-        {
-            "type": "object",
-            "properties": {
-                "action": {"const": "approve"},
-                "feedback": {"type": "string"},
-            },
-            "required": ["action", "feedback"],
-            "additionalProperties": False,
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["approve", "revise", "request_input"],
         },
-        {
-            "type": "object",
-            "properties": {
-                "action": {"const": "revise"},
-                "feedback": {"type": "string", "minLength": 1},
-            },
-            "required": ["action", "feedback"],
-            "additionalProperties": False,
+        "feedback": {"type": "string"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "questions": {
+            "type": "array",
+            "items": _QUESTION_SCHEMA,
+            "minItems": 1,
         },
-        {
-            "type": "object",
-            "properties": {
-                "action": {"const": "request_input"},
-                "reason": {"type": "string", "minLength": 1, "maxLength": 4000},
-                "questions": {
-                    "type": "array",
-                    "items": _QUESTION_SCHEMA,
-                    "minItems": 1,
-                },
-            },
-            "required": ["action", "reason", "questions"],
-            "additionalProperties": False,
-        },
-    ]
+    },
+    "required": ["action"],
+    "additionalProperties": False,
 }
 
 
@@ -755,9 +732,14 @@ def _validate_structured_v2(step_type: str, content: str) -> dict:
     except ValueError as exc:
         raise ValueError(f"{step_type} returned invalid JSON") from exc
     action = value.get("action")
+    allowed_fields = (
+        {"action", "plan", "reason", "questions"}
+        if step_type == "planner"
+        else {"action", "feedback", "reason", "questions"}
+    )
+    if set(value) - allowed_fields:
+        raise ValueError(f"{step_type} response contains invalid fields")
     if action == "request_input":
-        if set(value) != {"action", "reason", "questions"}:
-            raise ValueError("request_input response contains invalid fields")
         reason = value.get("reason")
         questions = value.get("questions")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 4000:
@@ -776,13 +758,13 @@ def _validate_structured_v2(step_type: str, content: str) -> dict:
             raise ValueError("request_input question ids must be unique")
         return {"action": action, "reason": reason.strip(), "questions": parsed}
     if step_type == "planner":
-        if action != "propose" or set(value) != {"action", "plan"}:
+        if action != "propose":
             raise ValueError("planner response must be propose or request_input")
         plan = value.get("plan")
         if not isinstance(plan, str) or not plan.strip():
             raise ValueError("planner propose requires a non-empty plan")
         return {"action": "propose", "plan": plan.strip()}
-    if action not in {"approve", "revise"} or set(value) != {"action", "feedback"}:
+    if action not in {"approve", "revise"}:
         raise ValueError("reviewer response must be approve, revise, or request_input")
     feedback = value.get("feedback")
     if not isinstance(feedback, str) or (action == "revise" and not feedback.strip()):

@@ -14,6 +14,7 @@ from backend.services.codex_app_server import CodexTurnProcess
 from backend.services.plan_agent_runner import (
     PLANNER_SCHEMA,
     PLANNER_SCHEMA_V2,
+    REVIEWER_SCHEMA_V2,
     PlanAgentError,
     PlanAgentRunner,
     PlanRouteUnavailable,
@@ -87,8 +88,36 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
         "questions": questions,
     }
 
-    assert "maxItems" not in PLANNER_SCHEMA_V2["oneOf"][1]["properties"]["questions"]
+    assert PLANNER_SCHEMA_V2["type"] == "object"
+    assert REVIEWER_SCHEMA_V2["type"] == "object"
+    assert not {"oneOf", "allOf", "anyOf"} & PLANNER_SCHEMA_V2.keys()
+    assert not {"oneOf", "allOf", "anyOf"} & REVIEWER_SCHEMA_V2.keys()
+    assert "maxItems" not in PLANNER_SCHEMA_V2["properties"]["questions"]
     assert _validate_structured_v2("planner", json.dumps(payload)) == payload
+
+
+def test_interactive_schema_projects_known_inactive_action_fields():
+    assert _validate_structured_v2(
+        "planner",
+        json.dumps({
+            "action": "propose",
+            "plan": "Schema smoke test passed.",
+            "reason": "Known optional field emitted by Claude structured output",
+        }),
+    ) == {
+        "action": "propose",
+        "plan": "Schema smoke test passed.",
+    }
+
+    with pytest.raises(ValueError, match="invalid fields"):
+        _validate_structured_v2(
+            "planner",
+            json.dumps({
+                "action": "propose",
+                "plan": "Do the work",
+                "unexpected": "must remain rejected",
+            }),
+        )
 
 
 def test_plan_request_includes_user_attachment_paths_and_names():

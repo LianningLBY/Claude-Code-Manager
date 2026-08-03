@@ -21,6 +21,10 @@ from backend.api.deps import require_task_access
 from backend.database import get_db
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.services.task_artifact_contract import (
+    MANAGED_ARTIFACT_ROOT,
+    configured_workspace_root as _configured_workspace_root,
+)
 
 
 router = APIRouter(prefix="/api/tasks", tags=["task-artifacts"])
@@ -86,30 +90,6 @@ def _decode_artifact_reference(reference: str) -> str:
     if not decoded_path or "\x00" in decoded_path or "\\" in decoded_path:
         raise HTTPException(400, "Invalid artifact path")
     return decoded_path
-
-
-def _configured_workspace_root(raw_root: str) -> Path:
-    """Return a normalized absolute root without following any symlinks."""
-
-    if not raw_root or "\x00" in raw_root:
-        raise ValueError("invalid workspace root")
-    try:
-        root = Path(raw_root).expanduser()
-    except RuntimeError as exc:
-        raise ValueError("invalid workspace root") from exc
-    if not root.is_absolute() or root.anchor != os.path.sep:
-        raise ValueError("workspace root must be an absolute POSIX path")
-
-    components = []
-    for component in root.parts[1:]:
-        if component in {"", "."}:
-            continue
-        if component == "..":
-            raise ValueError("workspace root cannot contain parent traversal")
-        components.append(component)
-    if not components:
-        raise ValueError("filesystem root cannot be a task workspace")
-    return Path(os.path.sep, *components)
 
 
 async def _task_workspace_root(task: Task, db: AsyncSession) -> Path:
@@ -219,6 +199,14 @@ def _lexical_artifact_parts(
             _task_execution_base_parts(task, root),
             PurePosixPath(artifact_path).parts,
         )
+
+    if parts[:2] == MANAGED_ARTIFACT_ROOT:
+        expected_task_dir = f"task-{task.id}"
+        if len(parts) < 3 or parts[2] != expected_task_dir:
+            raise HTTPException(
+                403,
+                "Artifact belongs to a different task",
+            )
 
     if not parts:
         raise HTTPException(400, "Invalid artifact path")

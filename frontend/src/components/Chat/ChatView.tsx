@@ -2781,8 +2781,8 @@ const MarkdownContent = memo(function MarkdownContent({
 }) {
   const taskComponents = useMemo<Components>(() => ({
     ...markdownComponents,
-    a({ href, children }) {
-      return <TaskArtifactLink taskId={taskId} href={href}>{children}</TaskArtifactLink>;
+    a({ href, title, children }) {
+      return <TaskArtifactLink taskId={taskId} href={href} linkTitle={title}>{children}</TaskArtifactLink>;
     },
   }), [taskId]);
   return (

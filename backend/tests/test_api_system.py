@@ -217,6 +217,7 @@ async def test_config_declares_pr_review_snapshot_context_capability(client):
     assert resp.status_code == 200
     assert resp.json()["pr_review_snapshot_context_version"] == 2
     assert resp.json()["pr_review_terminal_chat_version"] == 1
+    assert resp.json()["task_artifact_scope_version"] == 1
 
 
 @pytest.mark.asyncio

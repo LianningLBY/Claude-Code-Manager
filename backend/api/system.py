@@ -26,6 +26,9 @@ from backend.services.pr_review_runtime import (
     PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
     PR_REVIEW_TERMINAL_CHAT_VERSION,
 )
+from backend.services.task_artifact_contract import (
+    TASK_ARTIFACT_SCOPE_VERSION,
+)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -86,6 +89,9 @@ async def get_config():
         # A Manager must confirm this before persisting a terminal PR-review
         # follow-up for a Worker. Older Workers still freeze every PR chat.
         "pr_review_terminal_chat_version": PR_REVIEW_TERMINAL_CHAT_VERSION,
+        # Manager-side ACL must not proxy the managed Task namespace to an
+        # older Worker that lacks the same cross-Task path fence.
+        "task_artifact_scope_version": TASK_ARTIFACT_SCOPE_VERSION,
     }
 
 

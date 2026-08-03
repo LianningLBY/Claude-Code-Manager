@@ -2,8 +2,12 @@ interface MarkdownNode {
   type: string;
   value?: string;
   url?: string;
+  title?: string;
   children?: MarkdownNode[];
 }
+
+
+export const TASK_ARTIFACT_LINK_TITLE = 'ccm-task-artifact';
 
 
 const SKIP_DESCENDANTS = new Set([
@@ -76,6 +80,7 @@ function splitBareArtifactPaths(value: string): MarkdownNode[] | null {
     nodes.push({
       type: 'link',
       url: path,
+      title: TASK_ARTIFACT_LINK_TITLE,
       // Preserve the assistant's visible text exactly; this fallback only
       // adds link semantics and the download affordance.
       children: [{ type: 'text', value: path }],

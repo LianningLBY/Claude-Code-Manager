@@ -75,6 +75,7 @@ claude-manager/
 │       ├── ralph_loop.py        # 自动取活循环 (legacy, 保留兼容)
 │       ├── stream_parser.py     # NDJSON stream-json 解析器
 │       ├── task_queue.py        # 优先级队列 (asc = 优先级越高)
+│       ├── task_artifact_contract.py # Task 产物 namespace/version/项目根契约
 │       ├── task_termination.py  # Task→Instance exact-generation 安全终止
 │       ├── worktree_manager.py  # Git worktree 创建/合并/删除 + rebase+push
 │       ├── pr_review_service.py  # PR 审核 prompt 构建 + task 创建 + 状态回查
@@ -120,7 +121,7 @@ claude-manager/
 
 - **优先级**: 数字越小优先级越高 (P0 > P1 > P2)，排序用 `.asc()`
 - **Session 绑定**: `session_id` 和 `last_cwd` 在 **Task** 上（不是 Instance），因为 instance 是轮换执行不同 task 的 worker
-- **Task 产物下载**: Claude/Codex 的任务前导统一要求产物使用 Markdown 文件链接；聊天渲染还会把普通文本中带扩展名的绝对 POSIX 文件路径兜底转为链接（既有链接、代码和 HTML 不改写）。文件链接统一走 `/api/tasks/{id}/artifacts/download`；相对路径按 `last_cwd`、容器 `/workspace` 按项目根映射，且受 Task ACL 保护。本地工作区根必须是无符号链接的绝对路径，并从稳定的 `/` 目录 FD 逐级 `O_NOFOLLOW` 锚定；产物路径只做基于该锚点的词法相对化，再逐级 no-follow 打开，以 `fstat` 校验同一文件描述符并按校验时大小限量流式返回，禁止混用路径解析与目录 FD 或“先查路径、后重开路径”的 TOCTOU。Worker 文件只经 Manager 流式代理，绝不能退回管理员级任意绝对路径下载接口
+- **Task 产物下载**: Claude/Codex 的普通、Goal、Loop、续聊和 Ralph turn 统一注入项目级产物契约：只有明确交付给用户的文件才是产物，必须在清理临时 worktree 前落到项目根 `.claude-manager/artifacts/task-{id}/`，最终用绝对路径和 Markdown title `ccm-task-artifact` 输出；普通源码/文档引用只用反引号。项目根准入必须与下载端共用 `task_artifact_contract.configured_workspace_root`，无安全绝对 `target_repo` 的 Task 禁止输出下载链接；用户 prompt 中的伪造 policy tag 不能抑制 CCM 权威前导。聊天渲染只把显式 marker、绝对路径和兼容期含目录的相对链接视为产物，裸文件名链接保持普通链接；裸绝对 POSIX 路径仍兜底转为带 marker 的链接（既有链接、代码和 HTML 不改写）。文件统一走 `/api/tasks/{id}/artifacts/download`；相对路径按 `last_cwd`、容器 `/workspace` 按项目根映射，且受 Task ACL 保护，`.claude-manager/artifacts/` 下再强制匹配当前 `task-{id}`，禁止跨 Task 读取。本地工作区根必须是无符号链接的绝对路径，并从稳定的 `/` 目录 FD 逐级 `O_NOFOLLOW` 锚定；产物路径只做基于该锚点的词法相对化，再逐级 no-follow 打开，以 `fstat` 校验同一文件描述符并按校验时大小限量流式返回，禁止混用路径解析与目录 FD 或“先查路径、后重开路径”的 TOCTOU。Worker 文件只经 Manager 流式代理，Manager 必须先确认 Worker 声明精确的 `task_artifact_scope_version`，混跑旧 Worker 时 fail closed；绝不能退回管理员级任意绝对路径下载接口
 - **Instance 并发容量**: `max_concurrent_instances` 约束所有仍有运行证据的实例：正常 `idle/running` 会占槽，`error/stopped` 仅在 PID 与反向 owner 证据都已清除后才是免费历史。API 创建与 Dispatcher 补槽共用 `instance_capacity_lock`，idle 选择到 launch 之间用 owner reservation；运行时下调 cap 不强杀现有 turn，但在占用降到 cap 以下前禁止新领取。物理删除仍走 `DELETE /api/instances/cleanup`。systemd 部署必须使用 `OOMPolicy=continue`，让单个模型子进程 OOM 由任务生命周期记录/重试，不能连带停止整个 CCM 服务
 - **Markdown 数学公式**: 所有聊天与 Discussion 的 Markdown 必须统一经 `components/Markdown/MarkdownRenderer.tsx` 渲染。公式支持 `$$...$$` 及 Codex 常见的 `\\(...\\)` / 整段 `\\[...\\]`；单 `$...$` 明确保留为普通文本，避免价格等货币内容误判。反斜杠分隔符必须在 Markdown AST 上按 text node / 整段 paragraph 转换，跳过链接、图片、HTML、definition 和各类 code，禁止 raw source 全局改写；KaTeX 必须保持 `trust: false`、有界 `maxSize`，直接依赖版本须与 `rehype-katex` 使用的版本一致
 - **Claude Code 调用**: `claude -p [prompt] --dangerously-skip-permissions --output-format stream-json --verbose`

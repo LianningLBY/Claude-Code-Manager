@@ -993,3 +993,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **问题**：此前为保护 exact review generation，把所有 `pr-review` Task 的 chat/inject 永久 409；GitHub 评论或合并已经落定后仍无法追问。前端又把任意 409 当成 Agent 忙碌，错误显示 Interrupt。
 - **解决**：只在 Review 已持久进入 `approved/merged/commented/error` 后开放普通续聊和 live inject；审查/发布/替换中的快照及 `superseded` 仍 fail closed，edit/retry/cancel/stop/delete 不变。Manager→Worker 在落用户消息前先握手 `pr_review_terminal_chat_version`，再用 service-token 认证的终态断言，混跑旧 Worker 时明确 409 而不留幽灵消息；Shared shadow 不复制 owner-only review 状态，因此所有 Shared chat 都改为先让 owner 在同一 Task operation lock 内准入、再本地落消息。前端仅对真实 busy conflict 显示 Interrupt。
 - **验证**：覆盖四种终态、五种非终态/替换态、本地注入、Worker 内部断言/能力握手、Shared owner 准入/无幽灵消息及前端 409 分类；受影响后端矩阵 `328 passed`，前端 `508 passed`，production build、`compileall` 与 `git diff --check` 通过。后端全量 `3202 passed, 1 failed`；唯一失败仍是 7 月 31 日已记录的 `login_runtime` stale-socket 基线断言，单项复跑稳定复现。
+
+### 2026-08-03 — PR #93：Project-scoped Task 产物契约评审修复
+
+- **发现**：续聊用用户可控的 XML tag 判断“已注入”，用户可伪造 tag 让权威产物规则缺席；提示侧只检查 `target_repo` 是绝对路径，会接受 `/`、NUL 或 `..`，但下载侧必然拒绝；Manager 又会把 Worker 产物请求直接代理给旧版本，混跑时缺少新的跨 Task namespace fence。
+- **修复与预防**：项目根准入与下载端集中到 `task_artifact_contract.configured_workspace_root`；每个 turn 都由 CCM 无条件前置 policy，不再从不可信 prompt 猜是否注入。`/api/system/config` 声明 `task_artifact_scope_version=1`，Manager 流式代理前必须精确握手，旧 Worker 在发出文件请求前 409 fail closed。能力升级属于安全边界时必须显式版本化，不能假设 Manager/Worker 同步部署。
+- **验证**：Task artifact、System、Dispatcher、Ralph 四个完整后端文件 `302 passed`；前端全量 `40 files / 525 tests`，production build、Python compile 与 `git diff --check` 通过。Loop/TaskArtifact 改动文件 ESLint 通过；ChatView 仍有 main 未改行上的 3 个既有 lint error 与 1 warning。

@@ -29,6 +29,9 @@ from backend.services.pr_review_runtime import (
     is_pr_review_task,
 )
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
+from backend.services.task_artifact_contract import (
+    TASK_ARTIFACT_SCOPE_VERSION,
+)
 from backend.services.worker_relay import worker_task_generation
 
 logger = logging.getLogger(__name__)
@@ -484,6 +487,35 @@ class WorkerProxy:
         for path in paths:
             await ssh.copy_file(path, path)
 
+    async def require_task_artifact_scope_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Fail closed when a Worker cannot enforce the managed namespace."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                f"无法确认 Worker {worker.name} 的 Task 产物隔离能力",
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("task_artifact_scope_version")
+            != TASK_ARTIFACT_SCOPE_VERSION
+        ):
+            raise HTTPException(
+                409,
+                f"Worker {worker.name} 版本过旧，升级后才能下载 Task 产物",
+            )
+
     async def stream_task_artifact(
         self,
         task: Task,
@@ -492,6 +524,7 @@ class WorkerProxy:
         """Stream a task-scoped file from its Worker without buffering it."""
 
         worker = await self.require_ready_worker(task.worker_id)
+        await self.require_task_artifact_scope_support(worker)
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10, read=None, write=30, pool=10),
         )

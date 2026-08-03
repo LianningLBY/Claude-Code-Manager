@@ -2,11 +2,12 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -140,6 +141,61 @@ async def test_supports_container_workspace_links(
     assert absolute.content == b"%PDF-test"
     assert host_absolute.status_code == 200
     assert host_absolute.content == b"%PDF-test"
+
+
+@pytest.mark.asyncio
+async def test_managed_artifacts_are_scoped_to_the_current_task(
+    artifact_client,
+    tmp_path,
+):
+    """Task 专用目录不能借另一个 Task 的下载端点越权读取。"""
+    client, session_factory = artifact_client
+    first_task_id = await _create_local_task(
+        session_factory,
+        tmp_path,
+        created_by=1,
+    )
+    second_task_id = await _create_local_task(
+        session_factory,
+        tmp_path,
+        created_by=2,
+    )
+    first_dir = (
+        tmp_path
+        / ".claude-manager"
+        / "artifacts"
+        / f"task-{first_task_id}"
+    )
+    second_dir = (
+        tmp_path
+        / ".claude-manager"
+        / "artifacts"
+        / f"task-{second_task_id}"
+    )
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    (first_dir / "report.txt").write_text("first", encoding="utf-8")
+    (second_dir / "secret.txt").write_text("second", encoding="utf-8")
+    endpoint = f"/api/tasks/{first_task_id}/artifacts/download"
+
+    own = await client.get(
+        endpoint,
+        params={
+            "path": (
+                f"/workspace/.claude-manager/artifacts/"
+                f"task-{first_task_id}/report.txt"
+            )
+        },
+    )
+    other = await client.get(
+        endpoint,
+        params={"path": str(second_dir / "secret.txt")},
+    )
+
+    assert own.status_code == 200
+    assert own.content == b"first"
+    assert other.status_code == 403
+    assert b"second" not in other.content
 
 
 @pytest.mark.asyncio
@@ -570,6 +626,11 @@ async def test_worker_proxy_streams_content_and_download_headers(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
+        if request.url.path == "/api/system/config":
+            return httpx.Response(
+                200,
+                json={"task_artifact_scope_version": 1},
+            )
         return httpx.Response(
             200,
             content=b"worker bytes",
@@ -608,5 +669,51 @@ async def test_worker_proxy_streams_content_and_download_headers(monkeypatch):
 
     assert body == b"worker bytes"
     assert response.headers["content-disposition"] == 'attachment; filename="worker.txt"'
-    assert captured[0].headers["authorization"] == "Bearer internal-token"
-    assert captured[0].url.params["path"] == "输出/worker.txt"
+    assert [request.url.path for request in captured] == [
+        "/api/system/config",
+        "/api/tasks/91/artifacts/download",
+    ]
+    assert captured[1].headers["authorization"] == "Bearer internal-token"
+    assert captured[1].url.params["path"] == "输出/worker.txt"
+
+
+@pytest.mark.asyncio
+async def test_worker_proxy_rejects_unscoped_older_worker(monkeypatch):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"default_provider": "claude"})
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    proxy = WorkerProxy(db_factory=None, relay=None)
+    worker = SimpleNamespace(
+        id=7,
+        name="old-worker",
+        status="ready",
+        private_ip="worker.internal",
+        ccm_port=8000,
+        auth_token="internal-token",
+    )
+    monkeypatch.setattr(
+        proxy,
+        "require_ready_worker",
+        AsyncMock(return_value=worker),
+    )
+    task = SimpleNamespace(id=91, worker_id=7)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy.stream_task_artifact(task, "worker.txt")
+
+    assert exc_info.value.status_code == 409
+    assert "版本过旧" in exc_info.value.detail
+    assert [request.url.path for request in captured] == [
+        "/api/system/config",
+    ]

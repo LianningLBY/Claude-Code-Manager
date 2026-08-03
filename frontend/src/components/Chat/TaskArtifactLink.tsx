@@ -2,12 +2,13 @@ import { useState, type MouseEvent, type ReactNode } from 'react';
 
 import { api } from '../../api/client';
 import { Download, Loader2 } from '../icons';
+import { TASK_ARTIFACT_LINK_TITLE } from './taskArtifactMarkdown';
 
 
 const EXTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
 
 
-function isTaskArtifactHref(href?: string): boolean {
+function isTaskArtifactHref(href?: string, linkTitle?: string): boolean {
   const value = href?.trim();
   if (!value || value.startsWith('#') || value.startsWith('?') || value.startsWith('//')) {
     return false;
@@ -16,7 +17,14 @@ function isTaskArtifactHref(href?: string): boolean {
     return false;
   }
   const scheme = value.match(EXTERNAL_SCHEME_RE)?.[0].slice(0, -1).toLowerCase();
-  return !scheme || scheme === 'file';
+  if (scheme && scheme !== 'file') return false;
+  if (linkTitle === TASK_ARTIFACT_LINK_TITLE) return true;
+  if (scheme === 'file' || value.startsWith('/')) return true;
+
+  // Backward compatibility for links emitted before the explicit marker was
+  // introduced. A bare filename is deliberately not enough evidence: source
+  // references such as [DEPLOYMENT.md](DEPLOYMENT.md) must remain normal links.
+  return value.includes('/');
 }
 
 
@@ -36,19 +44,22 @@ function startBrowserDownload(blob: Blob, filename: string): void {
 export function TaskArtifactLink({
   taskId,
   href,
+  linkTitle,
   children,
 }: {
   taskId: number;
   href?: string;
+  linkTitle?: string;
   children: ReactNode;
 }) {
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (!isTaskArtifactHref(href)) {
+  if (!isTaskArtifactHref(href, linkTitle)) {
     return (
       <a
         href={href}
+        title={linkTitle}
         target="_blank"
         rel="noopener noreferrer"
         className="text-indigo-400 hover:text-indigo-300 underline"

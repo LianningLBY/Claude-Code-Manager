@@ -653,8 +653,10 @@ Approve、Apply、创建 execution Task 时基于**目标 Version 的** context/
 
 - 主对话新增 → `conversation_changed`；
 - repo HEAD/dirty 指纹变化 → `repository_changed`；
+- 迁移 Version 没有历史 repo 指纹 → `captured_repository_state_missing`，属于可确认风险，
+  不强制 Refresh/Re-plan；
 - 目标 Task/Project/Worker 不可用 → hard conflict；
-- 普通过期首次 409，用户显式确认后继续；
+- 普通过期或迁移快照缺失首次 409，用户显式确认后继续；Reject 不要求确认；
 - `Refresh context` 不修改旧 Version，而是同一 Plan 下创建新 Run/Version。
 
 ## 11. Worker 与分布式协议

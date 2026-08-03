@@ -425,6 +425,102 @@ async def test_stale_confirmation_and_missing_target_hard_conflict(
 
 
 @pytest.mark.asyncio
+async def test_missing_legacy_repository_snapshot_is_confirmable_not_blocking(
+    client,
+    session_factory,
+):
+    async def create_legacy_version(title: str) -> tuple[int, int]:
+        created = await client.post(
+            "/api/plans",
+            json={"input": title, "target_repo": "/tmp"},
+        )
+        assert created.status_code == 201, created.text
+        plan_id = created.json()["id"]
+        version_id = await _finish_current_run_with_version(
+            session_factory,
+            plan_id=plan_id,
+        )
+        async with session_factory() as db:
+            version = await db.get(PlanVersion, version_id)
+            version.repo_revision = None
+            version.reviewer_repo_revision = None
+            await db.commit()
+        return plan_id, version_id
+
+    with patch(
+        "backend.services.plan_staleness.capture_repo_revision",
+        new=AsyncMock(return_value={
+            "available": True,
+            "head": "current-head",
+            "dirty_sha256": "clean",
+        }),
+    ):
+        _reject_plan_id, reject_version_id = await create_legacy_version(
+            "Reject migrated Version",
+        )
+        stale = await client.get(
+            f"/api/plan-versions/{reject_version_id}/staleness"
+        )
+        assert stale.status_code == 200, stale.text
+        assert stale.json()["stale"] is True
+        assert stale.json()["hard_conflict"] is False
+        assert stale.json()["can_confirm"] is True
+        assert stale.json()["reasons"] == [
+            "captured_repository_state_missing"
+        ]
+
+        rejected = await client.post(
+            f"/api/plan-versions/{reject_version_id}/reject",
+            json={"expected_current_version_id": reject_version_id},
+        )
+        assert rejected.status_code == 200, rejected.text
+        assert rejected.json()["human_decision"] == "rejected"
+
+        _approve_plan_id, approve_version_id = await create_legacy_version(
+            "Approve migrated Version",
+        )
+        unconfirmed = await client.post(
+            f"/api/plan-versions/{approve_version_id}/approve",
+            json={"expected_current_version_id": approve_version_id},
+        )
+        assert unconfirmed.status_code == 409
+        assert unconfirmed.json()["detail"]["can_confirm"] is True
+
+        approved = await client.post(
+            f"/api/plan-versions/{approve_version_id}/approve",
+            json={
+                "expected_current_version_id": approve_version_id,
+                "confirm_stale": True,
+            },
+        )
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["human_decision"] == "approved"
+
+        _execution_plan_id, execution_version_id = await create_legacy_version(
+            "Execute migrated Version",
+        )
+        blocked_execution = await client.post(
+            f"/api/plan-versions/{execution_version_id}/create-execution-task",
+            json={
+                "expected_current_version_id": execution_version_id,
+                "approve_if_pending": True,
+            },
+        )
+        assert blocked_execution.status_code == 409
+        assert blocked_execution.json()["detail"]["can_confirm"] is True
+
+        confirmed_execution = await client.post(
+            f"/api/plan-versions/{execution_version_id}/create-execution-task",
+            json={
+                "expected_current_version_id": execution_version_id,
+                "approve_if_pending": True,
+                "confirm_stale": True,
+            },
+        )
+        assert confirmed_execution.status_code == 201, confirmed_execution.text
+
+
+@pytest.mark.asyncio
 async def test_approve_and_create_execution_is_atomic_and_history_stays_linked(
     client, session_factory
 ):

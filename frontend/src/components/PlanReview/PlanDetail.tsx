@@ -16,6 +16,11 @@ import { CollapsiblePlanningRequest } from './CollapsiblePlanningRequest';
 import { PlanInputForm } from './PlanInputForm';
 import { planDisplayStateLabel } from './planResourceStatus';
 import { PlanRunInputAudit } from './PlanRunInputAudit';
+import {
+  planHardConflictMessages,
+  planStalenessConfirmationMessage,
+  planStalenessMessages,
+} from './planStaleness';
 
 interface Props {
   plan: PlanResource;
@@ -38,10 +43,12 @@ function uploadPayload(results: UploadResult[]) {
   } : {};
 }
 
-function isConfirmableStale(error: unknown) {
-  if (!isApiRequestError(error) || error.status !== 409 || !error.detail || typeof error.detail !== 'object') return false;
+function confirmableStaleness(error: unknown): PlanStaleness | null {
+  if (!isApiRequestError(error) || error.status !== 409 || !error.detail || typeof error.detail !== 'object') return null;
   const detail = error.detail as Record<string, unknown>;
-  return detail.stale === true && detail.can_confirm !== false && detail.hard_conflict !== true;
+  return detail.stale === true && detail.can_confirm !== false && detail.hard_conflict !== true
+    ? detail as unknown as PlanStaleness
+    : null;
 }
 
 export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onNavigateTask }: Props) {
@@ -97,7 +104,8 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         : api.rejectPlanVersion(shown.id, shown.id, confirm);
       try { await invoke(false); }
       catch (reason) {
-        if (!isConfirmableStale(reason) || !window.confirm('Repository or session context changed. Approve this exact Version anyway?')) throw reason;
+        const stale = confirmableStaleness(reason);
+        if (!stale || !window.confirm(planStalenessConfirmationMessage(stale, 'approve'))) throw reason;
         await invoke(true);
       }
       if (decision === 'approve' && attach) onToggleVersion?.(shown.id);
@@ -111,7 +119,8 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       let result;
       try { result = await invoke(false); }
       catch (reason) {
-        if (!isConfirmableStale(reason) || !window.confirm('Repository context changed. Create the execution Task from this exact Version anyway?')) throw reason;
+        const stale = confirmableStaleness(reason);
+        if (!stale || !window.confirm(planStalenessConfirmationMessage(stale, 'execute'))) throw reason;
         result = await invoke(true);
       }
       onNavigateTask?.(result.execution_task_id);
@@ -134,6 +143,8 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
 
   const current = shown?.id === plan.current_version_id;
   const route = plan.pipeline_config;
+  const staleMessages = planStalenessMessages(staleness);
+  const hardConflictMessages = planHardConflictMessages(staleness);
   return <div className="flex h-full min-h-0 flex-col">
     <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-3">
       <div className="min-w-0 flex-1">
@@ -152,7 +163,8 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
       {plan.latest_run_error && <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">Latest Run {plan.latest_run_status}: {plan.latest_run_error}</div>}
-      {staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">This action is blocked: {(staleness.hard_conflicts || []).join(', ')}.</div>}
+      {staleness?.stale && !staleness.hard_conflict && <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"><span className="font-semibold">Confirmation required.</span> {staleMessages.join(' ')} You may continue after explicit confirmation; refreshing or re-planning is optional.</div>}
+      {staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       <CollapsiblePlanningRequest content={plan.initial_request} />
 
       <details className="mt-3 rounded-lg border border-gray-800 bg-gray-900/60 p-3 text-xs text-gray-400">

@@ -84,7 +84,11 @@ async def version_staleness(
     if current_repo is None:
         hard_conflicts.append("repository_unavailable")
     elif version.repo_revision is None:
-        hard_conflicts.append("captured_repository_state_missing")
+        # Legacy Versions may predate repository fingerprinting. The absence
+        # of a historical baseline is uncertainty, not proof that the current
+        # execution target is unavailable. Require an explicit user
+        # confirmation, but do not force a re-plan or make the Version inert.
+        reasons.append("captured_repository_state_missing")
     elif current_repo != version.repo_revision:
         if current_repo.get("available") is not True:
             hard_conflicts.append("repository_unavailable")

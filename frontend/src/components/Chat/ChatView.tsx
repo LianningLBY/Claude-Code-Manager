@@ -22,6 +22,7 @@ import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
 import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { VersionedPlansDialog } from '../PlanReview/VersionedPlansDialog';
+import { planStalenessConfirmationMessage } from '../PlanReview/planStaleness';
 import { ExpandableText } from '../ExpandableText';
 import { copyToClipboard } from '../clipboard';
 import { MarkdownContent } from '../MarkdownContent';
@@ -1667,9 +1668,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             || staleState?.stale !== true
             || staleState.hard_conflict === true
             || staleState.can_confirm === false
-            || !window.confirm(
-              `Plan #${stalePlanId} is based on older conversation or repository state. Apply it to this message anyway?`,
-            )
+            || !window.confirm(planStalenessConfirmationMessage(staleState, 'apply'))
           ) {
             throw sendError;
           }

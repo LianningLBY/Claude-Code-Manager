@@ -146,4 +146,27 @@ describe('PlanDetail', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'Applied proposal' })).toBeInTheDocument();
     expect(screen.getByText(/Historical Version/)).toBeInTheDocument();
   });
+
+  it('shows a confirmable warning for a migrated Version without blocking decisions', async () => {
+    const current = version({ repo_revision: null, reviewer_repo_revision: null });
+    const prior = version({ id: 11, version_number: 1 });
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.getPlanVersionStaleness).mockResolvedValueOnce({
+      stale: true,
+      reasons: ['captured_repository_state_missing'],
+      hard_conflict: false,
+      hard_conflicts: [],
+      can_confirm: true,
+      current_log_id: null,
+      current_repo_revision: { available: true, head: 'current' },
+    });
+
+    render(<PlanDetail plan={plan(current, prior)} onRefresh={vi.fn()} />);
+
+    expect(await screen.findByText(/no historical repository snapshot/)).toBeInTheDocument();
+    expect(screen.getByText(/refreshing or re-planning is optional/i)).toBeInTheDocument();
+    expect(screen.queryByText(/This action is blocked/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve v2 & create execution Task' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Reject v2' })).toBeEnabled();
+  });
 });

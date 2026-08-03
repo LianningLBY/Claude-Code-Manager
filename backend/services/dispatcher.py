@@ -46,6 +46,10 @@ from backend.services.instance_manager import (
     InstanceManager,
 )
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.pr_review_runtime import (
+    is_pr_review_task,
+    isolated_pr_review_cwd,
+)
 from backend.services.deployment_start_guard import (
     DeploymentTaskStartBlocked,
 )
@@ -134,6 +138,12 @@ _DOC_SYNC_NOTE = (
     "若两者是 symlink 关系则改一处即可，无需额外操作）。"
 )
 
+_TASK_ARTIFACT_LINK_NOTE = (
+    "如果在任务工作区创建或修改了供用户查看、下载的产物文件，最终回复必须把每个产物写成 "
+    "Markdown 链接，不要只输出裸文件路径。链接目标优先使用相对当前工作目录的路径；"
+    "路径包含空格时用尖括号包裹，例如 `[下载报告](<reports/final report.pdf>)`。"
+)
+
 
 def _agent_doc_preamble(provider: str | None) -> str:
     """First-line prompt preamble pointing the agent at the project doc.
@@ -144,9 +154,9 @@ def _agent_doc_preamble(provider: str | None) -> str:
     Claude still needs the explicit CLAUDE.md workflow reminder.
     """
     if (provider or "claude").lower() == "codex":
-        return _DOC_SYNC_NOTE
+        return f"{_DOC_SYNC_NOTE}\n{_TASK_ARTIFACT_LINK_NOTE}"
     read_line = "请阅读项目根目录的 CLAUDE.md 了解项目规范和任务完成后的 git 流程。"
-    return f"{read_line}\n{_DOC_SYNC_NOTE}"
+    return f"{read_line}\n{_DOC_SYNC_NOTE}\n{_TASK_ARTIFACT_LINK_NOTE}"
 
 
 # Priority levels for the per-task message queue
@@ -4075,7 +4085,16 @@ class GlobalDispatcher:
         image_paths = metadata.get("image_paths") or []
         secret_ids = metadata.get("secret_ids") or []
         secrets_block = await _build_secrets_block(self.db_factory, secret_ids)
-        parts = [_agent_doc_preamble(task.provider)]
+        # PR reviews run against an immutable remote GitHub snapshot described
+        # by their own prompt.  Adding the normal preamble here would tell
+        # Claude to read the CCM checkout's CLAUDE.md; Codex would likewise load
+        # its AGENTS.md from cwd.  The lifecycle therefore also gives these
+        # tasks a neutral task-private directory.
+        parts = (
+            []
+            if is_pr_review_task(task)
+            else [_agent_doc_preamble(task.provider)]
+        )
         if secrets_block:
             parts.append(secrets_block)
         if image_paths:
@@ -5030,13 +5049,19 @@ class GlobalDispatcher:
 
             # === Step 2: Determine cwd and update task ===
             # 必须是绝对路径：PTY 模式按 cwd 推导 JSONL 轮询路径，"." 会落空
-            cwd = task.last_cwd or task.target_repo or os.getcwd()
+            review_task = is_pr_review_task(task)
+            cwd = (
+                isolated_pr_review_cwd(task)
+                if review_task
+                else task.last_cwd or task.target_repo or os.getcwd()
+            )
 
             # 存量项目统一补 AGENTS.md（Codex 指令文件）：有 CLAUDE.md 而无
             # AGENTS.md 时注入 symlink，任何项目下次跑任务时自动补齐。
             # 不 commit（由 agent 的正常 git 流程带入），幂等且绝不阻断任务。
-            from backend.services.agent_docs import ensure_agents_md
-            ensure_agents_md(task.target_repo or cwd)
+            if not review_task:
+                from backend.services.agent_docs import ensure_agents_md
+                ensure_agents_md(task.target_repo or cwd)
             thinking_budget = task.thinking_budget
             effort_level = task.effort_level or settings.default_effort
             async with self.db_factory() as db:
@@ -5653,43 +5678,54 @@ class GlobalDispatcher:
         try:
             from backend.models.pr_monitor import MonitoredRepo, PRReview
             from backend.services.pr_review_service import check_and_update_review
-            async with self.db_factory() as db:
-                current_task = await db.get(Task, task.id)
-                session_id = (
-                    current_task.session_id if current_task is not None else None
-                )
+            from backend.services.worker_proxy import get_task_operation_lock
 
-                def background_handoff_pending() -> bool:
-                    return bool(
-                        session_id
-                        and self.instance_manager
-                        .has_pty_autonomous_activity_handoff(
-                            task.id, session_id
-                        )
+            # Serialize the reviewing->publishing/terminal transition with
+            # retry, chat, delete, migration, and Worker mutations. The Task
+            # row is a generation fence, but a no-op row lock alone does not
+            # stop a later API operation from changing that generation after
+            # this transaction commits.
+            async with get_task_operation_lock(task.id):
+                async with self.db_factory() as db:
+                    current_task = await db.get(Task, task.id)
+                    session_id = (
+                        current_task.session_id
+                        if current_task is not None
+                        else None
                     )
 
-                if (
-                    current_task is None
-                    or current_task.status != "completed"
-                    or current_task.retry_count != task.retry_count
-                    or current_task.pty_background_generation is not None
-                    or background_handoff_pending()
-                ):
-                    return
-                review = await db.get(PRReview, pr_review_id)
-                if not review:
-                    return
-                repo = await db.get(MonitoredRepo, review.repo_id)
-                if not repo:
-                    return
-                await check_and_update_review(
-                    db,
-                    pr_review_id,
-                    repo.repo_full_name,
-                    terminal_task_id=task.id,
-                    terminal_task_retry_count=task.retry_count,
-                    background_handoff_pending=background_handoff_pending,
-                )
+                    def background_handoff_pending() -> bool:
+                        return bool(
+                            session_id
+                            and self.instance_manager
+                            .has_pty_autonomous_activity_handoff(
+                                task.id, session_id
+                            )
+                        )
+
+                    if (
+                        current_task is None
+                        or current_task.status != "completed"
+                        or current_task.retry_count != task.retry_count
+                        or current_task.pty_background_generation is not None
+                        or background_handoff_pending()
+                    ):
+                        return
+                    review = await db.get(PRReview, pr_review_id)
+                    if not review:
+                        return
+                    repo = await db.get(MonitoredRepo, review.repo_id)
+                    if not repo:
+                        return
+                    await check_and_update_review(
+                        db,
+                        pr_review_id,
+                        repo.repo_full_name,
+                        terminal_task_id=task.id,
+                        terminal_task_retry_count=task.retry_count,
+                        background_handoff_pending=background_handoff_pending,
+                        db_factory=self.db_factory,
+                    )
         except Exception as e:
             logger.error(f"PR review completion handler error: {e}", exc_info=True)
 
@@ -5700,29 +5736,69 @@ class GlobalDispatcher:
             return
         try:
             from backend.models.pr_monitor import PRReview
+            from backend.services.worker_proxy import get_task_operation_lock
             from datetime import datetime
-            async with self.db_factory() as db:
-                failed = await db.execute(
-                    update(PRReview)
-                    .where(
-                        PRReview.id == pr_review_id,
-                        PRReview.task_id == task.id,
-                        PRReview.status.in_(("pending", "reviewing")),
+
+            async with get_task_operation_lock(task.id):
+                async with self.db_factory() as db:
+                    current = await db.get(
+                        Task,
+                        task.id,
+                        populate_existing=True,
                     )
-                    .values(
-                        status="error",
-                        action_taken="error",
-                        review_summary=f"Task failed: {error[:500]}",
-                        completed_at=datetime.utcnow(),
+                    if (
+                        current is None
+                        or current.status != "failed"
+                        or current.retry_count != task.retry_count
+                        or current.pty_background_generation is not None
+                    ):
+                        return
+                    # Revalidate the exact failed Task generation while holding
+                    # the same operation lock used by manual retry.
+                    task_guard = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == current.id,
+                            Task.status == "failed",
+                            Task.retry_count == current.retry_count,
+                            (
+                                Task.started_at.is_(None)
+                                if current.started_at is None
+                                else Task.started_at == current.started_at
+                            ),
+                            (
+                                Task.completed_at.is_(None)
+                                if current.completed_at is None
+                                else Task.completed_at == current.completed_at
+                            ),
+                            Task.pty_background_generation.is_(None),
+                        )
+                        .values(status=Task.status)
                     )
-                )
-                await db.commit()
-                if failed.rowcount:
-                    await self.broadcaster.broadcast("pr-monitor", {
-                        "type": "review_updated",
-                        "review_id": pr_review_id,
-                        "status": "error",
-                    })
+                    if task_guard.rowcount != 1:
+                        await db.rollback()
+                        return
+                    failed = await db.execute(
+                        update(PRReview)
+                        .where(
+                            PRReview.id == pr_review_id,
+                            PRReview.task_id == task.id,
+                            PRReview.status.in_(("pending", "reviewing")),
+                        )
+                        .values(
+                            status="error",
+                            action_taken="error",
+                            review_summary=f"Task failed: {error[:500]}",
+                            completed_at=datetime.utcnow(),
+                        )
+                    )
+                    await db.commit()
+                    if failed.rowcount:
+                        await self.broadcaster.broadcast("pr-monitor", {
+                            "type": "review_updated",
+                            "review_id": pr_review_id,
+                            "status": "error",
+                        })
         except Exception as e:
             logger.error(f"PR review failure handler error: {e}", exc_info=True)
 
@@ -10728,6 +10804,22 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task_id,
                 )
                 return
+            if is_pr_review_task(task):
+                from backend.models.pr_monitor import PRReview
+
+                publishing = await db.execute(
+                    select(PRReview.id).where(
+                        PRReview.task_id == task_id,
+                        PRReview.status.in_(("publishing", "superseding")),
+                    )
+                )
+                if publishing.scalar_one_or_none() is not None:
+                    logger.info(
+                        "Discarding queued message for publishing PR review "
+                        "task %s",
+                        task_id,
+                    )
+                    return
             current_expected_route = (
                 (task.provider or "claude").lower(),
                 msg.model_override or task.model,

@@ -6,6 +6,10 @@ import type { Task, Project, ChatMessage, UploadResult } from '../../api/client'
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
+  isApiRequestError: (error: unknown) => (
+    error instanceof Error
+    && typeof (error as { status?: unknown }).status === 'number'
+  ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
     sendTaskChat: vi.fn().mockResolvedValue({}),
@@ -167,6 +171,88 @@ describe('ChatView', () => {
     (api.injectTaskMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       injected: true,
+    });
+    (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  });
+
+  it('fits full-screen chat to the iOS visual viewport but leaves inline chat alone', () => {
+    const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const viewport = Object.assign(new EventTarget(), {
+      height: 486,
+      offsetTop: 47,
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: viewport,
+    });
+
+    try {
+      const fullScreen = render(
+        <ChatView task={makeTask()} projects={projects} onBack={onBack} />,
+      );
+      expect(fullScreen.container.firstElementChild).toHaveStyle({
+        height: '486px',
+        top: '47px',
+        bottom: 'auto',
+      });
+      fullScreen.unmount();
+
+      const inline = render(
+        <ChatView task={makeTask()} projects={projects} onBack={onBack} inline />,
+      );
+      expect((inline.container.firstElementChild as HTMLElement).style.height).toBe('');
+      expect((inline.container.firstElementChild as HTMLElement).style.top).toBe('');
+      expect((inline.container.firstElementChild as HTMLElement).style.bottom).toBe('');
+      inline.unmount();
+    } finally {
+      if (originalViewport) {
+        Object.defineProperty(window, 'visualViewport', originalViewport);
+      } else {
+        Reflect.deleteProperty(window, 'visualViewport');
+      }
+    }
+  });
+
+  describe('chat conflict state', () => {
+    it('does not show Interrupt for a non-busy 409 rejection', async () => {
+      const rejection = Object.assign(
+        new Error('PR review workflow is not terminal'),
+        { status: 409, detail: 'PR review workflow is not terminal' },
+      );
+      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(rejection);
+      render(
+        <ChatView
+          task={makeTask({ status: 'completed', tags: ['pr-review'] })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      await userEvent.type(screen.getByRole('textbox'), 'follow up');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      await screen.findByText(/PR review workflow is not terminal/);
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    });
+
+    it('still shows Interrupt for a genuine busy conflict', async () => {
+      const rejection = Object.assign(
+        new Error('The preceding Codex turn is still running'),
+        { status: 409, detail: 'The preceding Codex turn is still running' },
+      );
+      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(rejection);
+      render(
+        <ChatView
+          task={makeTask({ status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      await userEvent.type(screen.getByRole('textbox'), 'follow up');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      expect(await screen.findByTitle('Interrupt session')).toBeInTheDocument();
     });
   });
 
@@ -2397,6 +2483,66 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     expect(clickSpy).toHaveBeenCalled();
     clickSpy.mockRestore();
     vi.unstubAllGlobals();
+  });
+
+  it.each(['claude', 'codex'] as const)(
+    '%s 助手返回裸绝对文件路径时自动显示任务下载链接',
+    async (provider) => {
+      const artifactPath = '/home/ubuntu/Projects/调研coding agent/test-download.txt';
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        {
+          id: 502,
+          role: 'assistant',
+          event_type: 'message',
+          content: `测试下载文件已生成：${artifactPath}\n\n文件约 1 KB。`,
+          tool_name: null,
+          tool_input: null,
+          tool_output: null,
+          is_error: false,
+          loop_iteration: null,
+          timestamp: null,
+          image_urls: null,
+          attachments: null,
+        },
+      ]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 89, provider })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const link = await screen.findByRole('link', { name: /test-download\.txt/ });
+      expect(decodeURI(link.getAttribute('href') || '')).toBe(artifactPath);
+      expect(link).toHaveAttribute('title', '下载任务文件');
+    },
+  );
+
+  it('不把代码中的绝对文件路径兜底改写为下载链接', async () => {
+    vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+      {
+        id: 503,
+        role: 'assistant',
+        event_type: 'message',
+        content: '示例：`/home/ubuntu/report.txt`\n\n```text\n/home/ubuntu/output.txt\n```',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      },
+    ]);
+
+    render(<ChatView task={makeTask({ id: 90 })} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('/home/ubuntu/report.txt')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'report.txt' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'output.txt' })).not.toBeInTheDocument();
   });
 });
 

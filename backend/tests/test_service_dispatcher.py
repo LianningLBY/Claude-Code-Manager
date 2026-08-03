@@ -7114,6 +7114,63 @@ async def test_stale_pr_failure_cannot_overwrite_superseded_review(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_stale_pr_failure_cannot_overwrite_retried_generation(db_factory):
+    from backend.models.pr_monitor import MonitoredRepo, PRReview
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="retried-review",
+            status="failed",
+            retry_count=0,
+            started_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+            metadata_={},
+        )
+        repo = MonitoredRepo(
+            repo_full_name="owner/repo-retried-failure",
+            webhook_secret="secret",
+        )
+        db.add_all([task, repo])
+        await db.flush()
+        review = PRReview(
+            repo_id=repo.id,
+            pr_number=8,
+            pr_title="retry",
+            pr_author="author",
+            pr_url="https://example.test/pr/8",
+            task_id=task.id,
+            status="reviewing",
+        )
+        db.add(review)
+        await db.flush()
+        task.metadata_ = {"pr_review_id": review.id}
+        await db.commit()
+        task_id = task.id
+        review_id = review.id
+        stale_task = task
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.status = "pending"
+        current.retry_count = 1
+        current.started_at = None
+        current.completed_at = None
+        await db.commit()
+
+    await d._handle_pr_review_failure(stale_task, "late retry-0 failure")
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        review = await db.get(PRReview, review_id)
+        assert current.status == "pending"
+        assert current.retry_count == 1
+        assert review.status == "reviewing"
+        assert review.action_taken is None
+    d.broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_pause_preserves_live_lifecycle_and_process(
     db_factory,
 ):
@@ -8015,6 +8072,60 @@ async def test_build_task_prompt_carries_doc_sync_note(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_build_task_prompt_requires_downloadable_artifact_links(db_factory):
+    """Claude/Codex 都不能只报告无法点击的裸产物路径。"""
+    d = _make_dispatcher(db_factory)
+    for provider in ("claude", "codex"):
+        prompt = await d._build_task_prompt(
+            Task(title="t", description="create report", provider=provider)
+        )
+        assert "Markdown 链接" in prompt
+        assert "不要只输出裸文件路径" in prompt
+        assert "[下载报告](<reports/final report.pdf>)" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "ordinary_preamble"),
+    [
+        ("claude", "请阅读项目根目录的 CLAUDE.md"),
+        ("codex", "关键内容必须保持同步"),
+    ],
+)
+async def test_pr_review_prompt_omits_host_agent_doc_preamble_by_tag_only(
+    db_factory,
+    provider,
+    ordinary_preamble,
+):
+    """Remote review policy must not be mixed with the CCM checkout policy."""
+
+    dispatcher = _make_dispatcher(db_factory)
+    tagged = Task(
+        title="review",
+        description="READ_REMOTE_BASE_SNAPSHOT",
+        provider=provider,
+        tags=["pr-review"],
+        metadata_={"pr_review_id": 17},
+    )
+    metadata_only = Task(
+        title="ordinary",
+        description="do X",
+        provider=provider,
+        metadata_={"pr_review_id": 18},
+    )
+
+    review_prompt = await dispatcher._build_task_prompt(tagged)
+    ordinary_prompt = await dispatcher._build_task_prompt(metadata_only)
+
+    assert review_prompt == "任务:\nREAD_REMOTE_BASE_SNAPSHOT"
+    assert "请阅读项目根目录的 CLAUDE.md" not in review_prompt
+    assert "关键内容必须保持同步" not in review_prompt
+    # The runtime exception is intentionally keyed only by the tag that survives
+    # Manager -> Worker forwarding, never by Manager-only metadata.
+    assert ordinary_preamble in ordinary_prompt
+
+
+@pytest.mark.asyncio
 async def test_build_task_prompt_does_not_claim_enabled_skill_was_invoked(
     db_factory, monkeypatch,
 ):
@@ -8109,3 +8220,203 @@ async def test_lifecycle_backfills_agents_md(db_factory, tmp_path):
     await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
 
     assert (tmp_path / "AGENTS.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
+    db_factory,
+    tmp_path,
+    monkeypatch,
+):
+    """A stale CCM cwd/target must never make a review load host instructions."""
+
+    from backend.services import agent_docs, pr_review_runtime
+
+    host_checkout = tmp_path / "ccm-host"
+    host_checkout.mkdir()
+    (host_checkout / "CLAUDE.md").write_text("# host policy\n")
+    (host_checkout / "AGENTS.md").symlink_to("CLAUDE.md")
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    runtime_root = trusted_home / "review-runtime"
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+    monkeypatch.setattr(
+        pr_review_runtime.secrets,
+        "token_hex",
+        lambda _size: "neutral",
+    )
+    ensure_agents = MagicMock()
+    monkeypatch.setattr(agent_docs, "ensure_agents_md", ensure_agents)
+
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="review-worker")
+        task = Task(
+            title="PR Review",
+            description="READ_REMOTE_BASE_SNAPSHOT",
+            target_repo=str(host_checkout),
+            last_cwd=str(host_checkout),
+            provider="codex",
+            tags=["pr-review"],
+        )
+        db.add_all([instance, task])
+        await db.commit()
+        await db.refresh(instance)
+        await db.refresh(task)
+        instance_id = instance.id
+        task_obj = task
+
+    process = MagicMock(returncode=0)
+    process.wait = AsyncMock(return_value=0)
+    dispatcher.instance_manager.processes = {instance_id: process}
+
+    await _run_claimed_lifecycle(
+        dispatcher,
+        db_factory,
+        instance_id,
+        task_obj,
+    )
+
+    launch = dispatcher.instance_manager.launch.await_args.kwargs
+    neutral_cwds = list(runtime_root.iterdir())
+    assert len(neutral_cwds) == 1
+    neutral_cwd = neutral_cwds[0]
+    assert launch["cwd"] == str(neutral_cwd)
+    assert launch["cwd"] != str(host_checkout)
+    assert launch["prompt"] == "任务:\nREAD_REMOTE_BASE_SNAPSHOT"
+    assert not (neutral_cwd / "CLAUDE.md").exists()
+    assert not (neutral_cwd / "AGENTS.md").exists()
+    ensure_agents.assert_not_called()
+
+
+def test_pr_review_cwd_reuse_requires_private_current_user_directory(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    task_id = 42
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    runtime_root = trusted_home / "review-runtime"
+    runtime_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+    previous = runtime_root / f"ccm-pr-review-{task_id}-previous"
+    previous.mkdir(mode=0o700)
+
+    assert pr_review_runtime._is_reusable_review_cwd(
+        str(previous),
+        task_id,
+    )
+
+    previous.chmod(0o750)
+    assert not pr_review_runtime._is_reusable_review_cwd(
+        str(previous),
+        task_id,
+    )
+
+    previous.chmod(0o700)
+    real_uid = os.getuid()
+    monkeypatch.setattr(pr_review_runtime.os, "getuid", lambda: real_uid + 1)
+    assert not pr_review_runtime._is_reusable_review_cwd(
+        str(previous),
+        task_id,
+    )
+
+
+def test_pr_review_cwd_rejects_progress_doc_in_ancestry(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    trusted_home = tmp_path / "host-context"
+    trusted_home.mkdir(mode=0o700)
+    (trusted_home / "PROGRESS.md").write_text("# host lessons\n")
+    runtime_root = trusted_home / "review-runtime"
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="ancestry contains CLAUDE.md/AGENTS.md/PROGRESS.md",
+    ):
+        pr_review_runtime.isolated_pr_review_cwd(
+            Task(id=9, tags=["pr-review"]),
+        )
+
+
+def test_pr_review_runtime_root_must_be_below_trusted_home(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    outside = tmp_path / "public-temp-style-root"
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(outside),
+    )
+
+    with pytest.raises(RuntimeError, match="trusted home directory"):
+        pr_review_runtime.isolated_pr_review_cwd(
+            Task(id=10, tags=["pr-review"]),
+        )
+    assert not outside.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership/mode contract")
+def test_pr_review_runtime_rejects_insecure_existing_root(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    runtime_root = trusted_home / "review-runtime"
+    runtime_root.mkdir(mode=0o755)
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+
+    with pytest.raises(RuntimeError, match="mode 0700"):
+        pr_review_runtime.isolated_pr_review_cwd(
+            Task(id=11, tags=["pr-review"]),
+        )

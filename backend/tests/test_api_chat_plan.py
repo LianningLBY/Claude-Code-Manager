@@ -1172,6 +1172,81 @@ async def test_shared_chat_sender_prefix_is_display_only(client, session_factory
 
 
 @pytest.mark.asyncio
+async def test_shared_pr_review_chat_waits_for_terminal_owner_state(
+    client,
+    session_factory,
+):
+    from fastapi import HTTPException
+
+    from backend.api.shared_access import SharedChatMessage, shared_chat
+    from backend.models.pr_monitor import MonitoredRepo, PRReview
+
+    task_id = await _create_task_with_session(client, session_factory)
+    async with session_factory() as db:
+        repo = MonitoredRepo(
+            repo_full_name="owner/shared-review",
+            webhook_secret="shared-review-secret",
+        )
+        db.add(repo)
+        await db.flush()
+        review = PRReview(
+            repo_id=repo.id,
+            pr_number=1,
+            pr_title="Shared review",
+            pr_author="alice",
+            pr_url="https://example.test/pr/1",
+            task_id=task_id,
+            status="reviewing",
+        )
+        db.add(review)
+        db.add(TaskShare(
+            task_id=task_id,
+            shared_to_open_id="ou-shared-review",
+            shared_to_name="Remote Reviewer",
+            shared_to_ccm_url="https://receiver.test",
+            share_token="shared-review-token",
+            status="active",
+        ))
+        await db.commit()
+        review_id = review.id
+
+    dispatcher = _mock_dispatcher()
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    async with session_factory() as db:
+        with patch("backend.main.dispatcher", dispatcher), patch(
+            "backend.main.broadcaster",
+            broadcaster,
+        ), pytest.raises(HTTPException) as blocked:
+            await shared_chat(
+                task_id,
+                SharedChatMessage(message="too early"),
+                token="shared-review-token",
+                db=db,
+            )
+    assert blocked.value.status_code == 409
+    broadcaster.broadcast.assert_not_awaited()
+
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        review.status = "approved"
+        await db.commit()
+    async with session_factory() as db:
+        with patch("backend.main.dispatcher", dispatcher), patch(
+            "backend.main.broadcaster",
+            broadcaster,
+        ):
+            accepted = await shared_chat(
+                task_id,
+                SharedChatMessage(message="explain the result"),
+                token="shared-review-token",
+                db=db,
+            )
+
+    assert accepted["queued"] is True
+    dispatcher.enqueue_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
     client,
     session_factory,
@@ -1507,6 +1582,75 @@ async def test_codex_shared_chat_rejects_monitor_before_local_side_effects(
     assert response.status_code == 400
     assert "does not support Skills: monitor" in response.text
     proxy_chat.assert_not_awaited()
+    broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert stored == []
+
+
+@pytest.mark.asyncio
+async def test_shared_owner_rejection_leaves_no_local_ghost_message(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.models.feishu_binding import FeishuUserBinding
+    from backend.models.task_share import SharedTaskReceived
+    import backend.services.shared_proxy as shared_proxy_module
+
+    engine = session_factory.kw["bind"]
+    async with engine.begin() as conn:
+        await conn.run_sync(FeishuUserBinding.__table__.create, checkfirst=True)
+
+    async with session_factory() as db:
+        shared = SharedTaskReceived(
+            owner_ccm_url="https://owner.test",
+            remote_task_id=92,
+            share_token="active-review-token",
+            task_title="Shared PR review",
+            task_description="d",
+            status="active",
+        )
+        db.add(shared)
+        await db.flush()
+        shadow = Task(
+            title="Shared PR review",
+            description="d",
+            status="completed",
+            provider="claude",
+            shared_from_id=shared.id,
+            session_id="shadow-review-session",
+        )
+        db.add(shadow)
+        await db.flush()
+        shared.local_task_id = shadow.id
+        await db.commit()
+        task_id = shadow.id
+
+    rejection = RuntimeError("owner rejected active review")
+    rejection.response = SimpleNamespace(
+        status_code=409,
+        json=lambda: {"detail": "review is still active"},
+    )
+    proxy_chat = AsyncMock(side_effect=rejection)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    monkeypatch.setattr(shared_proxy_module, "proxy_chat", proxy_chat)
+    monkeypatch.setattr("backend.main.broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/chat",
+        json={"message": "explain this review"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "review is still active"
     broadcaster.broadcast.assert_not_awaited()
     async with session_factory() as db:
         stored = list((await db.execute(

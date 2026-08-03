@@ -1,7 +1,11 @@
+import re
 from datetime import datetime
+
 from pydantic import BaseModel, Field, field_validator
 
 from backend.config import settings
+
+_GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
 class MonitoredRepoCreate(BaseModel):
@@ -18,8 +22,10 @@ class MonitoredRepoCreate(BaseModel):
     @field_validator("repo_full_name")
     @classmethod
     def validate_repo_name(cls, v: str) -> str:
-        if "/" not in v or len(v.split("/")) != 2:
-            raise ValueError("repo_full_name must be in 'owner/repo' format")
+        if _GITHUB_REPO_RE.fullmatch(v) is None:
+            raise ValueError(
+                "repo_full_name must be a literal GitHub 'owner/repo' name"
+            )
         return v
 
 
@@ -85,6 +91,7 @@ class PRReviewResponse(BaseModel):
     id: int
     repo_id: int
     pr_number: int
+    base_sha: str | None
     head_sha: str | None
     delivery_id: str | None
     pr_title: str

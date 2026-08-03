@@ -215,12 +215,14 @@ class TestLegacyMigration:
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
+        assert "task_retry_count" in log_cols
 
         project_cols = _get_table_columns(engine, "projects")
         assert "sort_order" in project_cols
         assert "tags" in project_cols
 
         pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" in pr_review_cols
         assert "head_sha" in pr_review_cols
         assert "delivery_id" in pr_review_cols
 
@@ -422,19 +424,27 @@ class TestFreshMigration:
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
+        assert "task_retry_count" in log_cols
 
         project_cols = _get_table_columns(engine, "projects")
         assert "sort_order" in project_cols
         assert "tags" in project_cols
 
         pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" in pr_review_cols
         assert "head_sha" in pr_review_cols
         assert "delivery_id" in pr_review_cols
         unique_column_sets = {
             tuple(constraint["column_names"])
             for constraint in inspect(engine).get_unique_constraints("pr_reviews")
         }
-        assert ("repo_id", "pr_number", "head_sha") in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) in unique_column_sets
+        assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         assert ("repo_id", "delivery_id") in unique_column_sets
 
         # Verify alembic_version at head
@@ -520,9 +530,162 @@ class TestAlreadyMigratedDb:
         engine = create_engine(f"sqlite:///{db_path}")
         with engine.connect() as conn:
             rows = conn.execute(text(
-                "SELECT head_sha, delivery_id FROM pr_reviews ORDER BY id"
+                "SELECT base_sha, head_sha, delivery_id "
+                "FROM pr_reviews ORDER BY id"
             )).fetchall()
-            assert rows == [(None, None), (None, None)]
+            assert rows == [(None, None, None), (None, None, None)]
+        engine.dispose()
+
+    def test_base_sha_migration_preserves_existing_snapshot_keys(self, tmp_path):
+        db_path = str(tmp_path / "existing_pr_review_snapshot.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "c8f5d3a72b10")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    repo_full_name, enabled, auto_merge, webhook_secret,
+                    provider, default_branch, allowed_authors, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'owner/repo', 1, 0, 'secret', 'codex', 'main', '[]',
+                    'active', '2026-07-31 00:00:00', '2026-07-31 00:00:00'
+                )
+            """))
+            conn.execute(
+                text("""
+                    INSERT INTO pr_reviews (
+                        repo_id, pr_number, head_sha, delivery_id, pr_title,
+                        pr_author, pr_url, status, created_at
+                    ) VALUES (
+                        1, 42, :head_sha, 'delivery-1', 'Title', 'alice',
+                        'https://github.com/owner/repo/pull/42',
+                        'approved', '2026-07-31 00:00:00'
+                    )
+                """),
+                {"head_sha": "a" * 40},
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT base_sha, head_sha, delivery_id, action_nonce, "
+                "pending_action, pending_review_body, publishing_actor, "
+                "publishing_retry_count, publishing_task_started_at, "
+                "publishing_started_at FROM pr_reviews"
+            )).one()
+            assert row == (
+                None,
+                "a" * 40,
+                "delivery-1",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+            unique_column_sets = {
+                tuple(constraint["column_names"])
+                for constraint in inspect(conn).get_unique_constraints("pr_reviews")
+            }
+            assert (
+                "repo_id",
+                "pr_number",
+                "base_sha",
+                "head_sha",
+            ) in unique_column_sets
+            assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
+        engine.dispose()
+
+    def test_base_sha_migration_downgrade_restores_head_constraint(self, tmp_path):
+        db_path = str(tmp_path / "base_sha_roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    repo_full_name, enabled, auto_merge, webhook_secret,
+                    provider, default_branch, allowed_authors, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'owner/rollback', 1, 0, 'secret', 'claude', 'main', '[]',
+                    'active', '2026-07-31 00:00:00',
+                    '2026-07-31 00:00:00'
+                )
+            """))
+            for base_sha in ("1" * 40, "2" * 40):
+                conn.execute(
+                    text("""
+                        INSERT INTO pr_reviews (
+                            repo_id, pr_number, base_sha, head_sha, pr_title,
+                            pr_author, pr_url, status, created_at
+                        ) VALUES (
+                            1, 42, :base_sha, :head_sha, 'Title', 'alice',
+                            'https://github.com/owner/rollback/pull/42',
+                            'approved', '2026-07-31 00:00:00'
+                        )
+                    """),
+                    {"base_sha": base_sha, "head_sha": "a" * 40},
+                )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, "c8f5d3a72b10")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" not in pr_review_cols
+        assert "publishing_actor" not in pr_review_cols
+        log_cols = _get_table_columns(engine, "log_entries")
+        assert "task_retry_count" not in log_cols
+        unique_column_sets = {
+            tuple(constraint["column_names"])
+            for constraint in inspect(engine).get_unique_constraints("pr_reviews")
+        }
+        assert ("repo_id", "pr_number", "head_sha") in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) not in unique_column_sets
+        with engine.connect() as conn:
+            heads = [
+                row[0]
+                for row in conn.execute(
+                    text("SELECT head_sha FROM pr_reviews ORDER BY id")
+                ).fetchall()
+            ]
+            assert heads == [None, "a" * 40]
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" in pr_review_cols
+        assert "publishing_actor" in pr_review_cols
+        log_cols = _get_table_columns(engine, "log_entries")
+        assert "task_retry_count" in log_cols
+        unique_column_sets = {
+            tuple(constraint["column_names"])
+            for constraint in inspect(engine).get_unique_constraints("pr_reviews")
+        }
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) in unique_column_sets
+        assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         engine.dispose()
 
 

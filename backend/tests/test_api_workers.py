@@ -799,6 +799,22 @@ async def test_provisioner_system_init_installs_codex_and_login_runtime(
     assert "google-chrome-stable_current" not in script
 
 
+async def test_provisioner_service_survives_child_oom(db_factory):
+    prov = WorkerProvisioner(
+        db_factory=db_factory,
+        cloud=FakeCloud(),
+        broadcaster=None,
+    )
+    ssh = AsyncMock()
+    ssh.run.return_value = (0, "ok")
+    worker = Mock(ssh_user="ubuntu", ccm_port=8000)
+
+    await prov._step_ccm_service(ssh, worker)
+
+    unit_script = ssh.run.await_args.args[0]
+    assert "OOMPolicy=continue" in unit_script
+
+
 async def test_provisioner_login_persists_credentials_and_onet_method(
     db_factory, session_factory,
 ):

@@ -1286,6 +1286,11 @@ class TestCodexTransientDetection:
     def test_retry_limit_429(self):
         assert is_codex_transient("exceeded retry limit, last status: 429 Too Many Requests")
 
+    def test_unexpected_status_409_is_not_generic_transient(self):
+        assert not is_codex_transient(
+            "unexpected status 409 Conflict: all logged-in accounts are busy"
+        )
+
     def test_unexpected_status_401_not_transient(self):
         # 401 是认证失败，不能退避重试
         assert not is_codex_transient(

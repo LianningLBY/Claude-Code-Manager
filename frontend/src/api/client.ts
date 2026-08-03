@@ -291,6 +291,8 @@ export interface ChatMessage {
   is_error: boolean;
   pty_cold_start?: boolean;
   loop_iteration: number | null;
+  /** Exact Task retry generation that persisted this history row. */
+  task_retry_count?: number | null;
   timestamp: string | null;
   image_urls: string[] | null;
   attachments: FileAttachment[] | null;
@@ -509,6 +511,7 @@ export interface PRReview {
   id: number;
   repo_id: number;
   pr_number: number;
+  base_sha: string | null;
   head_sha: string | null;
   delivery_id: string | null;
   pr_title: string;
@@ -1581,7 +1584,7 @@ export const api = {
   // System
   health: () => request<{ status: string; commit?: string }>('/api/system/health'),
   stats: () => request<{ tasks: Record<string, number>; running_instances: number }>('/api/system/stats'),
-  config: () => request<{ default_provider: string; provider_options: string[]; default_model: string; model_options: string[]; default_codex_model: string; codex_model_options: string[]; default_effort: string; effort_options: string[]; claude_model_efforts: Record<string, string[]>; claude_model_context_windows: Record<string, number>; codex_effort_options: string[]; codex_model_efforts: Record<string, string[]>; default_codex_service_tier?: CodexServiceTier; codex_service_tier_options?: CodexServiceTier[]; codex_model_service_tiers: Record<string, CodexServiceTier[]> }>('/api/system/config'),
+  config: () => request<{ default_provider: string; provider_options: string[]; default_model: string; model_options: string[]; default_codex_model: string; codex_model_options: string[]; default_effort: string; effort_options: string[]; claude_model_efforts: Record<string, string[]>; claude_model_context_windows: Record<string, number>; codex_effort_options: string[]; codex_model_efforts: Record<string, string[]>; default_codex_service_tier?: CodexServiceTier; codex_service_tier_options?: CodexServiceTier[]; codex_model_service_tiers: Record<string, CodexServiceTier[]>; pr_review_snapshot_context_version?: number; pr_review_terminal_chat_version?: number }>('/api/system/config'),
   listSkills: () => request<{ key: string; label: string; description: string; always: boolean; priority: number; tags: string[] }[]>('/api/system/skills'),
   listSkillsCached: () => listSkillsCached(),
   listUserSkillsCached: () => listUserSkillsCached(),

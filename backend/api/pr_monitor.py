@@ -1,8 +1,11 @@
+import asyncio
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 from datetime import datetime
+from weakref import WeakKeyDictionary
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import and_, desc, func, or_, select, update as sa_update
@@ -30,6 +33,29 @@ from backend.schemas.pr_monitor import (
 logger = logging.getLogger(__name__)
 
 _GH_LOGIN_CACHE: str | None = None
+_GIT_COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+_PR_SYNCHRONIZE_LOCKS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[int, asyncio.Lock],
+] = WeakKeyDictionary()
+
+
+def _pr_repo_write_lock(repo_id: int) -> asyncio.Lock:
+    """Serialize one monitor's webhook/delete barrier in this process."""
+
+    loop = asyncio.get_running_loop()
+    locks = _PR_SYNCHRONIZE_LOCKS.setdefault(loop, {})
+    return locks.setdefault(repo_id, asyncio.Lock())
+
+
+def _parse_commit_sha(value: object, field_name: str) -> str:
+    """Return a canonical webhook commit SHA or reject the signed payload."""
+    if not isinstance(value, str) or _GIT_COMMIT_SHA_RE.fullmatch(value) is None:
+        raise HTTPException(
+            400,
+            f"pull_request.{field_name}.sha must be exactly 40 hexadecimal characters",
+        )
+    return value.lower()
 
 
 def _gh_login() -> str:
@@ -56,14 +82,16 @@ async def _find_processed_review(
     db: AsyncSession,
     repo_id: int,
     pr_number: int,
+    base_sha: str,
     head_sha: str,
     delivery_id: str | None,
 ) -> PRReview | None:
-    """Find an existing review for this commit or exact webhook delivery."""
+    """Find an existing review for this snapshot or exact webhook delivery."""
     duplicate_keys = [
         and_(
             PRReview.repo_id == repo_id,
             PRReview.pr_number == pr_number,
+            PRReview.base_sha == base_sha,
             PRReview.head_sha == head_sha,
         )
     ]
@@ -94,7 +122,7 @@ def _duplicate_review_response(
         "reason": (
             "webhook delivery already processed"
             if same_delivery
-            else "PR commit already reviewed"
+            else "PR snapshot already reviewed"
         ),
         "review_id": review.id,
     }
@@ -227,17 +255,43 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
         raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
 
-    await db.execute(
-        select(PRReview).where(PRReview.repo_id == repo_id)
-    )
-    reviews = (await db.execute(
-        select(PRReview).where(PRReview.repo_id == repo_id)
-    )).scalars().all()
-    for review in reviews:
-        await db.delete(review)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        locked_repo = (
+            await db.execute(
+                select(MonitoredRepo)
+                .where(MonitoredRepo.id == repo_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if locked_repo is None:
+            raise HTTPException(404, "Repository not found")
+        await _require_pr_monitor_access(request, db, locked_repo)
+        reviews = (await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo_id)
+        )).scalars().all()
+        active = [
+            review
+            for review in reviews
+            if review.status in {
+                "pending",
+                "reviewing",
+                "publishing",
+                "superseding",
+            }
+        ]
+        if active:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Cannot delete a PR monitor while review Tasks, publication, "
+                "or synchronize recovery are active",
+            )
+        for review in reviews:
+            await db.delete(review)
 
-    await db.delete(repo)
-    await db.commit()
+        await db.delete(locked_repo)
+        await db.commit()
     return {"ok": True}
 
 
@@ -350,14 +404,27 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     if action not in ("opened", "synchronize"):
         return {"status": "ignored", "reason": f"action: {action}"}
 
-    pr = payload.get("pull_request", {})
+    pr = payload.get("pull_request")
+    if not isinstance(pr, dict):
+        raise HTTPException(400, "pull_request must be an object")
+
+    base = pr.get("base")
+    head = pr.get("head")
+    base_sha = _parse_commit_sha(
+        base.get("sha") if isinstance(base, dict) else None,
+        "base",
+    )
+    head_sha = _parse_commit_sha(
+        head.get("sha") if isinstance(head, dict) else None,
+        "head",
+    )
 
     # Skip draft PRs
     if pr.get("draft", False):
         return {"status": "ignored", "reason": "draft PR"}
 
     # Check target branch
-    base_branch = pr.get("base", {}).get("ref", "")
+    base_branch = base.get("ref", "") if isinstance(base, dict) else ""
     if base_branch != repo.default_branch:
         return {"status": "ignored", "reason": f"target branch: {base_branch}"}
 
@@ -374,15 +441,16 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         return {"status": "ignored", "reason": f"self PR (gh login: {own_login})"}
 
     pr_number = pr.get("number")
-    head_sha = (pr.get("head", {}).get("sha") or "").strip().lower()
     delivery_id = (request.headers.get("X-GitHub-Delivery", "") or "").strip() or None
     repo_id = repo.id
     repo_name = repo.repo_full_name
 
-    if not pr_number:
-        return {"status": "ignored", "reason": "missing PR number"}
-    if not head_sha:
-        return {"status": "ignored", "reason": "missing PR head SHA"}
+    if (
+        not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number <= 0
+    ):
+        raise HTTPException(400, "pull_request.number must be a positive integer")
 
     pr_title = pr.get("title", "")
     pr_url = pr.get("html_url", "")
@@ -394,38 +462,216 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         db,
         repo_id,
         pr_number,
+        base_sha,
         head_sha,
         delivery_id,
     )
     if processed_review:
         logger.info(
-            "Ignored duplicate PR webhook for %s#%d at %s (review %d)",
+            "Ignored duplicate PR webhook for %s#%d at %s...%s (review %d)",
             repo_name,
             pr_number,
+            base_sha,
             head_sha,
             processed_review.id,
         )
         return _duplicate_review_response(processed_review, delivery_id)
 
-    # Dedup: check for existing reviews (any non-terminal status)
-    active_result = await db.execute(
-        select(PRReview).where(
-            PRReview.repo_id == repo.id,
-            PRReview.pr_number == pr_number,
-            PRReview.status.in_(["pending", "reviewing"]),
-        )
-    )
-    active_reviews = active_result.scalars().all()
-
     if action == "synchronize":
-        # Snapshot scalar review generations before Task termination expires the
-        # session identity map. A review is not declared superseded until every
-        # linked local/Worker Task generation has been safely reaped.
-        active_review_generations = [
-            (old.id, old.task_id, old.status)
-            for old in active_reviews
-        ]
-        if active_review_generations:
+        from backend.services.pr_review_service import (
+            create_pr_review_task,
+            prepare_pr_review_context,
+            verify_pr_review_snapshot_current,
+        )
+
+        replacement_data = {
+            "number": pr_number,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "delivery_id": delivery_id,
+            "title": pr_title,
+            "author": pr_author,
+            "url": pr_url,
+        }
+        # Fetch and validate every model-visible byte before terminating the
+        # old generation. A transient GitHub/context failure therefore leaves
+        # the still-running review untouched and lets GitHub retry delivery.
+        prepared_context = await prepare_pr_review_context(
+            repo,
+            replacement_data,
+        )
+        await db.rollback()
+
+        async with _pr_repo_write_lock(repo_id):
+            db.expire_all()
+            # This row lock is the cross-process write barrier. The lightweight
+            # GitHub guard runs inside it, after context preparation, so a slow
+            # older webhook cannot overwrite a newer durable intent.
+            locked_repo = (
+                await db.execute(
+                    select(MonitoredRepo)
+                    .where(MonitoredRepo.id == repo_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if locked_repo is None or not locked_repo.enabled:
+                await db.rollback()
+                return {
+                    "status": "ignored",
+                    "reason": "repository not monitored or disabled",
+                }
+            await verify_pr_review_snapshot_current(
+                locked_repo,
+                replacement_data,
+            )
+
+            # Re-run idempotency at the actual write barrier. This prevents a
+            # duplicate same-snapshot synchronize from claiming its own newly
+            # created review as an older generation.
+            processed_review = await _find_processed_review(
+                db,
+                repo_id,
+                pr_number,
+                base_sha,
+                head_sha,
+                delivery_id,
+            )
+            if processed_review is not None:
+                duplicate_response = _duplicate_review_response(
+                    processed_review,
+                    delivery_id,
+                )
+                await db.rollback()
+                return duplicate_response
+
+            active_result = await db.execute(
+                select(PRReview).where(
+                    PRReview.repo_id == repo_id,
+                    PRReview.pr_number == pr_number,
+                    PRReview.status.in_(
+                        ("pending", "reviewing", "superseding")
+                    ),
+                )
+            )
+            observed_reviews = list(active_result.scalars().all())
+
+            # A publishing row is a durable external-action outbox. Never
+            # supersede it while a GitHub write may be in flight; it remains
+            # pinned to the old head and reconciles independently.
+            if not observed_reviews:
+                try:
+                    review = await create_pr_review_task(
+                        db,
+                        locked_repo,
+                        replacement_data,
+                        prepared_context=prepared_context,
+                    )
+                except IntegrityError:
+                    await db.rollback()
+                    winner = await _find_processed_review(
+                        db,
+                        repo_id,
+                        pr_number,
+                        base_sha,
+                        head_sha,
+                        delivery_id,
+                    )
+                    if winner is not None:
+                        return _duplicate_review_response(
+                            winner,
+                            delivery_id,
+                        )
+                    raise
+                return {"status": "accepted", "review_id": review.id}
+
+            # Persist the immutable replacement intent before touching any old
+            # Task. Each row is exact-CASed from the state observed under the
+            # repository barrier. A stale webhook cannot overwrite a newer
+            # superseding token, and a partial claim is rolled back atomically.
+            superseding_token = secrets.token_hex(24)
+            superseding_started_at = datetime.utcnow()
+            superseding_snapshot = {
+                "version": 2,
+                "pr_data": replacement_data,
+                "prepared_context": prepared_context,
+            }
+            active_review_generations = []
+            for old in observed_reviews:
+                predicates = [
+                    PRReview.id == old.id,
+                    PRReview.repo_id == repo_id,
+                    PRReview.pr_number == pr_number,
+                    PRReview.status == old.status,
+                    (
+                        PRReview.task_id.is_(None)
+                        if old.task_id is None
+                        else PRReview.task_id == old.task_id
+                    ),
+                ]
+                if old.status == "superseding":
+                    predicates.extend(
+                        (
+                            (
+                                PRReview.superseding_token.is_(None)
+                                if old.superseding_token is None
+                                else PRReview.superseding_token
+                                == old.superseding_token
+                            ),
+                            (
+                                PRReview.superseding_started_at.is_(None)
+                                if old.superseding_started_at is None
+                                else PRReview.superseding_started_at
+                                == old.superseding_started_at
+                            ),
+                        )
+                    )
+                claimed = await db.execute(
+                    sa_update(PRReview)
+                    .where(*predicates)
+                    .values(
+                        status="superseding",
+                        superseding_snapshot=superseding_snapshot,
+                        superseding_token=superseding_token,
+                        superseding_started_at=superseding_started_at,
+                    )
+                )
+                if claimed.rowcount != 1:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "A newer PR synchronize intent won the write barrier; "
+                        "this stale delivery was not applied",
+                    )
+                active_review_generations.append(
+                    (old.id, old.task_id, old.status)
+                )
+            await db.commit()
+
+            claimed_rows = await db.execute(
+                select(PRReview.id).where(
+                    PRReview.id.in_(
+                        review_id
+                        for review_id, _task_id, _status
+                        in active_review_generations
+                    ),
+                    PRReview.status == "superseding",
+                    PRReview.superseding_token == superseding_token,
+                )
+            )
+            claimed_ids = set(claimed_rows.scalars().all())
+            expected_ids = {
+                review_id
+                for review_id, _task_id, _status
+                in active_review_generations
+            }
+            if claimed_ids != expected_ids:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "A newer PR synchronize intent replaced this delivery; "
+                    "durable recovery will finish the newer snapshot",
+                )
+
             from backend.services.task_termination import (
                 TaskTerminationResult,
                 TaskTerminationConflict,
@@ -477,7 +723,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         raise HTTPException(
                             409,
                             "Previous PR review task cleanup could not be "
-                            "confirmed; no new review was created",
+                            "confirmed; durable replacement recovery will retry",
                         ) from exc
 
                 # Reacquire every exact resulting generation in stable order
@@ -506,20 +752,42 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                             terminated.resulting,
                         )
                     if locked_task is None:
+                        await db.rollback()
                         raise HTTPException(
                             409,
                             "Previous PR review task started a newer generation; "
-                            "no new review was created",
+                            "durable replacement recovery will retry",
                         )
+
+                # The first repository row lock was released by the durable
+                # intent commit. Reacquire it before the final review updates
+                # and replacement INSERT so a newer webhook on another Manager
+                # cannot observe the old token, wait here, then lose its intent
+                # after this transaction commits.
+                current_repo = (
+                    await db.execute(
+                        select(MonitoredRepo)
+                        .where(MonitoredRepo.id == repo_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if current_repo is None or not current_repo.enabled:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "PR monitor changed during synchronize; durable "
+                        "replacement recovery will retry",
+                    )
 
                 for (
                     review_id,
                     old_task_id,
-                    old_status,
+                    _old_status,
                 ) in active_review_generations:
                     review_predicates = [
                         PRReview.id == review_id,
-                        PRReview.status == old_status,
+                        PRReview.status == "superseding",
+                        PRReview.superseding_token == superseding_token,
                         (
                             PRReview.task_id.is_(None)
                             if old_task_id is None
@@ -532,6 +800,9 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         .values(
                             status="superseded",
                             completed_at=datetime.utcnow(),
+                            superseding_snapshot=None,
+                            superseding_token=None,
+                            superseding_started_at=None,
                         )
                     )
                     if not superseded.rowcount:
@@ -539,7 +810,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         raise HTTPException(
                             409,
                             "Previous PR review changed while it was being "
-                            "stopped; no new review was created",
+                            "stopped; durable replacement recovery will retry",
                         )
                     if old_task_id is not None:
                         logger.info(
@@ -550,23 +821,36 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 # Termination commits/expirations invalidate the repo ORM
                 # identity. Keep supersede writes uncommitted and let
                 # replacement creation commit both review generations.
-                await db.refresh(repo)
-                from backend.services.pr_review_service import (
-                    create_pr_review_task,
-                )
-
-                review = await create_pr_review_task(db, repo, {
-                    "number": pr_number,
-                    "head_sha": head_sha,
-                    "delivery_id": delivery_id,
-                    "title": pr_title,
-                    "author": pr_author,
-                    "url": pr_url,
-                })
+                try:
+                    review = await create_pr_review_task(
+                        db,
+                        current_repo,
+                        replacement_data,
+                        prepared_context=prepared_context,
+                    )
+                except IntegrityError as exc:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "Another synchronize created the replacement snapshot; "
+                        "durable recovery will reconcile the old generation",
+                    ) from exc
                 return {"status": "accepted", "review_id": review.id}
-    elif active_reviews:
+
+    # Opened deliveries do not replace another live generation.
+    active_result = await db.execute(
+        select(PRReview).where(
+            PRReview.repo_id == repo.id,
+            PRReview.pr_number == pr_number,
+            PRReview.status.in_(
+                ["pending", "reviewing", "publishing", "superseding"]
+            ),
+        )
+    )
+    active_reviews = active_result.scalars().all()
+    if active_reviews:
         return {"status": "ignored", "reason": "review already in progress"}
-    elif action == "opened":
+    if action == "opened":
         # Also skip if a completed review already exists for this PR
         completed_result = await db.execute(
             select(func.count()).select_from(PRReview).where(
@@ -579,39 +863,116 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             return {"status": "ignored", "reason": "PR already reviewed"}
 
     # Import and call service
-    from backend.services.pr_review_service import create_pr_review_task
+    from backend.services.pr_review_service import (
+        create_pr_review_task,
+        prepare_pr_review_context,
+        verify_pr_review_snapshot_current,
+    )
 
-    try:
-        review = await create_pr_review_task(db, repo, {
-            "number": pr_number,
-            "head_sha": head_sha,
-            "delivery_id": delivery_id,
-            "title": pr_title,
-            "author": pr_author,
-            "url": pr_url,
-        })
-    except IntegrityError:
-        # A concurrent delivery may have inserted the same idempotency key
-        # after our fast-path SELECT. Roll back supersede/task changes from
-        # this transaction and return the winner instead of surfacing a 500.
-        await db.rollback()
+    review_data = {
+        "number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "delivery_id": delivery_id,
+        "title": pr_title,
+        "author": pr_author,
+        "url": pr_url,
+    }
+    prepared_context = await prepare_pr_review_context(repo, review_data)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        db.expire_all()
+        locked_repo = (
+            await db.execute(
+                select(MonitoredRepo)
+                .where(MonitoredRepo.id == repo_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if locked_repo is None or not locked_repo.enabled:
+            await db.rollback()
+            return {
+                "status": "ignored",
+                "reason": "repository not monitored or disabled",
+            }
+        await verify_pr_review_snapshot_current(locked_repo, review_data)
         processed_review = await _find_processed_review(
             db,
             repo_id,
             pr_number,
+            base_sha,
             head_sha,
             delivery_id,
         )
-        if processed_review:
-            logger.info(
-                "Ignored concurrently duplicated PR webhook for %s#%d at %s "
-                "(review %d)",
-                repo_name,
-                pr_number,
-                head_sha,
-                processed_review.id,
+        if processed_review is not None:
+            duplicate_response = _duplicate_review_response(
+                processed_review,
+                delivery_id,
             )
-            return _duplicate_review_response(processed_review, delivery_id)
-        raise
+            await db.rollback()
+            return duplicate_response
+        active_now = await db.execute(
+            select(PRReview.id)
+            .where(
+                PRReview.repo_id == repo_id,
+                PRReview.pr_number == pr_number,
+                PRReview.status.in_(
+                    ("pending", "reviewing", "publishing", "superseding")
+                ),
+            )
+            .limit(1)
+        )
+        if active_now.scalar_one_or_none() is not None:
+            await db.rollback()
+            return {
+                "status": "ignored",
+                "reason": "review already in progress",
+            }
+        completed_now = await db.execute(
+            select(PRReview.id)
+            .where(
+                PRReview.repo_id == repo_id,
+                PRReview.pr_number == pr_number,
+                PRReview.status.in_(("approved", "merged", "commented")),
+            )
+            .limit(1)
+        )
+        if completed_now.scalar_one_or_none() is not None:
+            await db.rollback()
+            return {"status": "ignored", "reason": "PR already reviewed"}
+        try:
+            review = await create_pr_review_task(
+                db,
+                locked_repo,
+                review_data,
+                prepared_context=prepared_context,
+            )
+        except IntegrityError:
+            # A concurrent Manager may have won the same database uniqueness
+            # key despite the process-local companion lock.
+            await db.rollback()
+            processed_review = await _find_processed_review(
+                db,
+                repo_id,
+                pr_number,
+                base_sha,
+                head_sha,
+                delivery_id,
+            )
+            if processed_review:
+                logger.info(
+                    "Ignored concurrently duplicated PR webhook for %s#%d at "
+                    "%s...%s (review %d)",
+                    repo_name,
+                    pr_number,
+                    base_sha,
+                    head_sha,
+                    processed_review.id,
+                )
+                return _duplicate_review_response(
+                    processed_review,
+                    delivery_id,
+                )
+            raise
 
     return {"status": "accepted", "review_id": review.id}

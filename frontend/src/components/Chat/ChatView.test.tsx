@@ -2485,6 +2485,33 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     vi.unstubAllGlobals();
   });
 
+  it('普通文件名链接不误判为产物，显式标记仍可下载', async () => {
+    vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+      {
+        id: 504,
+        role: 'assistant',
+        event_type: 'message',
+        content: '[DEPLOYMENT.md](DEPLOYMENT.md) [下载报告](report.pdf "ccm-task-artifact")',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      },
+    ]);
+
+    render(<ChatView task={makeTask({ id: 91 })} projects={projects} onBack={onBack} />);
+
+    const sourceLink = await screen.findByRole('link', { name: 'DEPLOYMENT.md' });
+    const artifactLink = screen.getByRole('link', { name: /下载报告/ });
+    expect(sourceLink).toHaveAttribute('href', 'DEPLOYMENT.md');
+    expect(sourceLink).not.toHaveAttribute('title', '下载任务文件');
+    expect(artifactLink).toHaveAttribute('title', '下载任务文件');
+  });
+
   it.each(['claude', 'codex'] as const)(
     '%s 助手返回裸绝对文件路径时自动显示任务下载链接',
     async (provider) => {

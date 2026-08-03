@@ -29,6 +29,7 @@ MAX_ARTIFACT_DOWNLOAD_SIZE = 100 * 1024 * 1024
 MAX_ARTIFACT_REFERENCE_LENGTH = 4096
 ARTIFACT_STREAM_CHUNK_SIZE = 64 * 1024
 CONTAINER_WORKSPACE = Path("/workspace")
+MANAGED_ARTIFACT_ROOT = (".claude-manager", "artifacts")
 
 
 @dataclass
@@ -219,6 +220,14 @@ def _lexical_artifact_parts(
             _task_execution_base_parts(task, root),
             PurePosixPath(artifact_path).parts,
         )
+
+    if parts[:2] == MANAGED_ARTIFACT_ROOT:
+        expected_task_dir = f"task-{task.id}"
+        if len(parts) < 3 or parts[2] != expected_task_dir:
+            raise HTTPException(
+                403,
+                "Artifact belongs to a different task",
+            )
 
     if not parts:
         raise HTTPException(400, "Invalid artifact path")

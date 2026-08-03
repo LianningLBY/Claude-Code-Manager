@@ -143,6 +143,61 @@ async def test_supports_container_workspace_links(
 
 
 @pytest.mark.asyncio
+async def test_managed_artifacts_are_scoped_to_the_current_task(
+    artifact_client,
+    tmp_path,
+):
+    """Task 专用目录不能借另一个 Task 的下载端点越权读取。"""
+    client, session_factory = artifact_client
+    first_task_id = await _create_local_task(
+        session_factory,
+        tmp_path,
+        created_by=1,
+    )
+    second_task_id = await _create_local_task(
+        session_factory,
+        tmp_path,
+        created_by=2,
+    )
+    first_dir = (
+        tmp_path
+        / ".claude-manager"
+        / "artifacts"
+        / f"task-{first_task_id}"
+    )
+    second_dir = (
+        tmp_path
+        / ".claude-manager"
+        / "artifacts"
+        / f"task-{second_task_id}"
+    )
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    (first_dir / "report.txt").write_text("first", encoding="utf-8")
+    (second_dir / "secret.txt").write_text("second", encoding="utf-8")
+    endpoint = f"/api/tasks/{first_task_id}/artifacts/download"
+
+    own = await client.get(
+        endpoint,
+        params={
+            "path": (
+                f"/workspace/.claude-manager/artifacts/"
+                f"task-{first_task_id}/report.txt"
+            )
+        },
+    )
+    other = await client.get(
+        endpoint,
+        params={"path": str(second_dir / "secret.txt")},
+    )
+
+    assert own.status_code == 200
+    assert own.content == b"first"
+    assert other.status_code == 403
+    assert b"second" not in other.content
+
+
+@pytest.mark.asyncio
 async def test_relative_parent_segments_can_remain_inside_workspace(
     artifact_client,
     tmp_path,

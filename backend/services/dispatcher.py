@@ -138,14 +138,76 @@ _DOC_SYNC_NOTE = (
     "若两者是 symlink 关系则改一处即可，无需额外操作）。"
 )
 
-_TASK_ARTIFACT_LINK_NOTE = (
-    "如果在任务工作区创建或修改了供用户查看、下载的产物文件，最终回复必须把每个产物写成 "
-    "Markdown 链接，不要只输出裸文件路径。链接目标优先使用相对当前工作目录的路径；"
-    "路径包含空格时用尖括号包裹，例如 `[下载报告](<reports/final report.pdf>)`。"
-)
+_TASK_ARTIFACT_POLICY_TAG = "<ccm_task_artifact_policy>"
+_TASK_ARTIFACT_LINK_TITLE = "ccm-task-artifact"
 
 
-def _agent_doc_preamble(provider: str | None) -> str:
+def _task_artifact_policy(task: Task) -> str:
+    """Build the provider-neutral, project-scoped artifact contract."""
+
+    if is_pr_review_task(task):
+        return ""
+
+    task_id = task.id
+    raw_root = str(task.target_repo or "").strip()
+    try:
+        project_root = Path(raw_root).expanduser() if raw_root else None
+    except RuntimeError:
+        project_root = None
+    if (
+        task_id is None
+        or task_id <= 0
+        or project_root is None
+        or not project_root.is_absolute()
+    ):
+        return (
+            f"{_TASK_ARTIFACT_POLICY_TAG}\n"
+            "此 Task 没有可验证的项目根目录，因此不得创建或输出可下载文件链接。"
+            "普通文件名和项目文件只用反引号表示，不要写成本地 Markdown 链接。\n"
+            "</ccm_task_artifact_policy>"
+        )
+
+    relative_dir = f".claude-manager/artifacts/task-{task_id}"
+    host_dir = project_root / relative_dir
+    return (
+        f"{_TASK_ARTIFACT_POLICY_TAG}\n"
+        "任务下载产物规则（Claude/Codex 均必须遵守）：\n"
+        f"- 当前 Task 的宿主机项目根目录（JSON 字符串）是 "
+        f"{json.dumps(str(project_root), ensure_ascii=False)}。若 Claude 在共享项目容器内运行，"
+        "运行时项目根目录以 `/workspace` 为准。\n"
+        f"- 只有用户明确要求查看、交付或下载的生成文件才是下载产物。所有下载产物必须放在项目根目录下 "
+        f"`{relative_dir}/`；宿主机目录是 "
+        f"{json.dumps(str(host_dir), ensure_ascii=False)}，容器内目录是 "
+        f"`/workspace/{relative_dir}/`。\n"
+        "- 禁止把下载产物留在 `/tmp`、用户主目录、项目外目录或 "
+        "`.claude-manager/worktrees/` 临时 worktree 中。若文件在 worktree 中生成，"
+        "必须在清理 worktree 前复制到上述 Task 专用目录。\n"
+        "- Task 专用目录是运行时交付区，不得 `git add` 或提交其中的文件。"
+        "若项目尚未忽略 `.claude-manager/`，只写入该仓库本地的 Git exclude，"
+        "不要为了产物修改项目的共享 `.gitignore`。\n"
+        "- 源码、配置、普通项目文档以及变更摘要中提到的文件默认不是下载产物，"
+        "用反引号表示（例如 `DEPLOYMENT.md`），不要自动生成 Markdown 链接。"
+        "即使用户明确要求下载某个项目文件，也应先复制一份到 Task 专用目录。\n"
+        "- 回复前逐个确认产物仍然存在、是普通文件而非符号链接，且最终路径位于本 Task 专用目录内。"
+        "无法确认时不要输出下载链接。\n"
+        "- 最终回复必须使用文件最终位置的绝对路径和专用标题标记，"
+        "不要只输出裸路径、文件名或相对路径。格式："
+        f"`[下载报告](</绝对路径/{relative_dir}/report.pdf> \"{_TASK_ARTIFACT_LINK_TITLE}\")`。"
+        "路径包含空格时必须保留尖括号。\n"
+        "</ccm_task_artifact_policy>"
+    )
+
+
+def _prepend_task_artifact_policy(task: Task, prompt: str) -> str:
+    """Attach the artifact contract once to any task turn prompt."""
+
+    policy = _task_artifact_policy(task)
+    if not policy or _TASK_ARTIFACT_POLICY_TAG in prompt:
+        return prompt
+    return f"{policy}\n\n{prompt}"
+
+
+def _agent_doc_preamble(task: Task) -> str:
     """First-line prompt preamble pointing the agent at the project doc.
 
     Codex automatically loads AGENTS.md.  Explicitly telling it to read the
@@ -153,10 +215,10 @@ def _agent_doc_preamble(provider: str | None) -> str:
     operations.  Keep only the cross-document synchronization rule for Codex;
     Claude still needs the explicit CLAUDE.md workflow reminder.
     """
-    if (provider or "claude").lower() == "codex":
-        return f"{_DOC_SYNC_NOTE}\n{_TASK_ARTIFACT_LINK_NOTE}"
+    if (task.provider or "claude").lower() == "codex":
+        return f"{_DOC_SYNC_NOTE}\n{_task_artifact_policy(task)}"
     read_line = "请阅读项目根目录的 CLAUDE.md 了解项目规范和任务完成后的 git 流程。"
-    return f"{read_line}\n{_DOC_SYNC_NOTE}\n{_TASK_ARTIFACT_LINK_NOTE}"
+    return f"{read_line}\n{_DOC_SYNC_NOTE}\n{_task_artifact_policy(task)}"
 
 
 # Priority levels for the per-task message queue
@@ -4093,7 +4155,7 @@ class GlobalDispatcher:
         parts = (
             []
             if is_pr_review_task(task)
-            else [_agent_doc_preamble(task.provider)]
+            else [_agent_doc_preamble(task)]
         )
         if secrets_block:
             parts.append(secrets_block)
@@ -4135,7 +4197,10 @@ class GlobalDispatcher:
         if session_id:
             await self.instance_manager.launch(
                 instance_id=instance_id,
-                prompt="请继续之前的工作。",
+                prompt=_prepend_task_artifact_policy(
+                    task,
+                    "请继续之前的工作。",
+                ),
                 task_id=task.id,
                 cwd=cwd,
                 model=task.model,
@@ -6648,7 +6713,12 @@ class GlobalDispatcher:
                 )
             else:
                 resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
-                turn_prompt = self._build_goal_followup_prompt(resume_reason, turn, max_turns)
+                turn_prompt = self._build_goal_followup_prompt(
+                    task,
+                    resume_reason,
+                    turn,
+                    max_turns,
+                )
                 turn_resume_session = session_id
                 # Resume on the session's resident account (no config_dir drift →
                 # PTY hot session preserved); migrate / fall back if cooled down.
@@ -6778,7 +6848,7 @@ class GlobalDispatcher:
 
     def _build_goal_initial_prompt(self, task: Task) -> str:
         """Build the first-turn prompt for a goal task."""
-        parts = [_agent_doc_preamble(task.provider)]
+        parts = [_agent_doc_preamble(task)]
 
         metadata = task.metadata_ or {}
         image_paths = metadata.get("image_paths") or []
@@ -6796,15 +6866,22 @@ class GlobalDispatcher:
         )
         return "\n\n".join(parts)
 
-    def _build_goal_followup_prompt(self, last_reason: str, turn: int, max_turns: int) -> str:
+    def _build_goal_followup_prompt(
+        self,
+        task: Task,
+        last_reason: str,
+        turn: int,
+        max_turns: int,
+    ) -> str:
         """Build follow-up prompt for subsequent goal turns."""
         remaining = max_turns - turn
-        return (
+        prompt = (
             f"评估器判断目标尚未达成。\n\n"
             f"评估器反馈: {last_reason}\n\n"
             f"请继续工作以满足目标条件。你还有 {remaining} 轮机会。\n"
             f"本轮结束时请简要说明完成了什么、当前状态如何。"
         )
+        return _prepend_task_artifact_policy(task, prompt)
 
     async def _collect_goal_conversation(self, task_id: int, current_turn: int) -> str:
         """Collect recent conversation log entries for the evaluator.
@@ -6851,7 +6928,8 @@ class GlobalDispatcher:
         Only describes todo-related responsibilities. Git/commit/worktree lifecycle
         is already covered by CLAUDE.md — no need to repeat it here.
         """
-        parts = []
+        artifact_policy = _task_artifact_policy(task)
+        parts = [artifact_policy] if artifact_policy else []
         doc = _agent_doc_name(task.provider)
         max_iterations = task.max_iterations or 50
         remaining = max_iterations - iteration
@@ -11262,7 +11340,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # Capture launch params before closing DB session
             launch_kwargs = dict(
                 instance_id=inst.id,
-                prompt=msg.prompt,
+                prompt=_prepend_task_artifact_policy(task, msg.prompt),
                 task_id=task_id,
                 cwd=task.last_cwd or task.target_repo or os.getcwd(),
                 model=effective_model,

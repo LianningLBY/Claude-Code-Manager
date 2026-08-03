@@ -1169,6 +1169,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/tmp_space_manager.py` | `backend/tests/test_tmp_space_manager.py` |
 | `backend/services/container_manager.py`（容器 `/tmp`） | `backend/tests/test_container_manager.py` |
 | `backend/api/files.py`（SSH 下载临时文件） | `backend/tests/test_api_files.py` |
+| `backend/api/task_artifacts.py` + Task 产物提示 | `backend/tests/test_api_task_artifacts.py` + `backend/tests/test_service_dispatcher.py` |
 | `backend/services/token_manager_service.py` | `backend/tests/test_service_token_manager.py` |
 | `backend/schemas/task.py` (datetime serialization) | `backend/tests/test_task_schema.py` |
 | `backend/api/chat.py` (timestamp Z suffix) | `backend/tests/test_chat_timestamp.py` |
@@ -1186,6 +1187,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/pr_review_service.py` | 集成测试（webhook → task 创建） |
 | `frontend/src/pages/PRMonitorPage.tsx` | TypeScript 类型检查 + 手动 UI 测试 |
 | `frontend/src/**` | TypeScript 类型检查 (`tsc --noEmit`) |
+| `frontend/src/components/Chat/TaskArtifactLink.tsx` | `frontend/src/components/Chat/ChatView.test.tsx` + `LoopChatView.test.tsx` |
 
 ## 分布式 Worker 测试
 

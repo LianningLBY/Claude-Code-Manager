@@ -15,6 +15,7 @@ from backend.services.dispatcher import (
     GlobalDispatcher,
     QueuedMessage,
     QueuedMessagePrelaunchError,
+    _prepend_task_artifact_policy,
 )
 from backend.services.deployment_start_guard import (
     DeploymentTaskStartBlocked,
@@ -3432,9 +3433,21 @@ async def test_goal_initial_prompt_with_images(db_factory):
 async def test_goal_followup_prompt_contains_reason(db_factory):
     """_build_goal_followup_prompt includes evaluator reason and remaining turns."""
     d = _make_dispatcher(db_factory)
-    prompt = d._build_goal_followup_prompt("3 tests still failing", turn=2, max_turns=10)
+    task = Task(
+        id=41,
+        title="goal",
+        provider="claude",
+        target_repo="/srv/project",
+    )
+    prompt = d._build_goal_followup_prompt(
+        task,
+        "3 tests still failing",
+        turn=2,
+        max_turns=10,
+    )
     assert "3 tests still failing" in prompt
     assert "8" in prompt  # remaining turns
+    assert ".claude-manager/artifacts/task-41" in prompt
 
 
 @pytest.mark.asyncio
@@ -4287,7 +4300,12 @@ async def test_spawn_oserror_requeues_exact_queued_message(
     d._task_queue_workers[task_id] = worker
     try:
         await asyncio.wait_for(launched.wait(), timeout=2)
-        assert seen_prompts == [msg.prompt, msg.prompt]
+        assert len(seen_prompts) == 2
+        assert seen_prompts[0] == seen_prompts[1]
+        assert seen_prompts[0].endswith(msg.prompt)
+        assert seen_prompts[0].count(
+            "<ccm_task_artifact_policy>"
+        ) == 1
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
@@ -8073,15 +8091,82 @@ async def test_build_task_prompt_carries_doc_sync_note(db_factory):
 
 @pytest.mark.asyncio
 async def test_build_task_prompt_requires_downloadable_artifact_links(db_factory):
-    """Claude/Codex 都不能只报告无法点击的裸产物路径。"""
+    """两种 provider 都把交付物限制在本 Task 的项目内目录。"""
     d = _make_dispatcher(db_factory)
     for provider in ("claude", "codex"):
         prompt = await d._build_task_prompt(
-            Task(title="t", description="create report", provider=provider)
+            Task(
+                id=42,
+                title="t",
+                description="create report",
+                provider=provider,
+                target_repo="/srv/项目 A",
+            )
         )
         assert "Markdown 链接" in prompt
-        assert "不要只输出裸文件路径" in prompt
-        assert "[下载报告](<reports/final report.pdf>)" in prompt
+        assert "不要只输出裸路径、文件名或相对路径" in prompt
+        assert ".claude-manager/artifacts/task-42" in prompt
+        assert '"/srv/项目 A/.claude-manager/artifacts/task-42"' in prompt
+        assert "/workspace/.claude-manager/artifacts/task-42" in prompt
+        assert ".claude-manager/worktrees/" in prompt
+        assert "不得 `git add`" in prompt
+        assert "`DEPLOYMENT.md`" in prompt
+        assert '"ccm-task-artifact"' in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_task_prompt_without_project_forbids_artifact_links(
+    db_factory,
+):
+    """没有权威项目根目录时，不诱导 Agent 生成必然 404 的链接。"""
+    d = _make_dispatcher(db_factory)
+    for provider in ("claude", "codex"):
+        prompt = await d._build_task_prompt(
+            Task(id=43, title="t", description="create report", provider=provider)
+        )
+        assert "没有可验证的项目根目录" in prompt
+        assert "不得创建或输出可下载文件链接" in prompt
+        assert ".claude-manager/artifacts/task-43" not in prompt
+
+
+def test_task_artifact_policy_wraps_followups_once():
+    """续聊、重试等非初始 turn 也携带同一份严格产物契约。"""
+    task = Task(
+        id=45,
+        title="t",
+        provider="claude",
+        target_repo="/srv/project",
+    )
+    wrapped = _prepend_task_artifact_policy(task, "继续处理")
+
+    assert wrapped.endswith("继续处理")
+    assert ".claude-manager/artifacts/task-45" in wrapped
+    assert wrapped.count("<ccm_task_artifact_policy>") == 1
+    assert _prepend_task_artifact_policy(task, wrapped) == wrapped
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_loop_prompt_repeats_artifact_policy_each_iteration(
+    db_factory,
+    provider,
+):
+    """Claude 无 PTY 时 Loop 每轮可为新上下文，不能只在第一轮下发。"""
+    d = _make_dispatcher(db_factory)
+    task = Task(
+        id=46,
+        title="t",
+        description="bg",
+        mode="loop",
+        todo_file_path="TODO.md",
+        provider=provider,
+        max_iterations=5,
+        target_repo="/srv/project",
+    )
+
+    prompt = d._build_loop_prompt(task, 2, "/tmp/sig.json")
+
+    assert ".claude-manager/artifacts/task-46" in prompt
+    assert '"ccm-task-artifact"' in prompt
 
 
 @pytest.mark.asyncio
@@ -8187,12 +8272,14 @@ def test_loop_prompt_codex_references_agents_md(db_factory):
     """Loop prompts reference AGENTS.md for codex tasks."""
     d = _make_dispatcher(db_factory)
     task = Task(
-        title="t", description="bg", mode="loop", todo_file_path="TODO.md",
-        provider="codex", max_iterations=5,
+        id=44, title="t", description="bg", mode="loop",
+        todo_file_path="TODO.md", provider="codex", max_iterations=5,
+        target_repo="/srv/project",
     )
     prompt = d._build_loop_prompt(task, 0, "/tmp/sig.json")
     assert "AGENTS.md" in prompt
     assert "CLAUDE.md" not in prompt
+    assert ".claude-manager/artifacts/task-44" in prompt
 
 
 @pytest.mark.asyncio

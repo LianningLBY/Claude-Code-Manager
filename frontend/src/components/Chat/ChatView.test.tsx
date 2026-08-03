@@ -165,6 +165,7 @@ function makePlanVersion(overrides: Partial<PlanVersion> = {}): PlanVersion {
     decided_by: null,
     superseded_by_version_id: null,
     applied: false,
+    display_state: 'awaiting_review',
     created_at: '2026-08-02T08:00:00Z',
     ...overrides,
   };

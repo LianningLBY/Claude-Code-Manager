@@ -23,6 +23,7 @@ from backend.models.plan import (
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
 from backend.schemas.plan_resource import (
+    PlanApplicationResource,
     PlanInputAnswer,
     PlanInputRequestResponse,
     PlanQuestion,
@@ -906,9 +907,60 @@ async def _version_resource(
         )
         is not None
     )
+    if applied:
+        display_state = "applied"
+    elif version.human_decision == "rejected":
+        display_state = "rejected"
+    elif version.human_decision == "approved":
+        display_state = "approved"
+    elif version.superseded_by_version_id is not None:
+        display_state = "superseded"
+    elif (
+        version.review_verdict in {"approve", "disabled", "exhausted"}
+        or version.review_exhausted
+    ):
+        display_state = "awaiting_review"
+    else:
+        display_state = "draft"
     return PlanVersionResource.model_validate(version).model_copy(
-        update={"applied": applied}
+        update={"applied": applied, "display_state": display_state}
     )
+
+
+async def _application_resources(
+    db: AsyncSession,
+    applications: list[PlanApplication],
+) -> list[PlanApplicationResource]:
+    execution_task_ids = {
+        item.execution_task_id
+        for item in applications
+        if item.application_type == "execution_task"
+        and item.execution_task_id is not None
+    }
+    available_execution_task_ids = (
+        set(
+            (
+                await db.execute(
+                    select(Task.id).where(Task.id.in_(execution_task_ids))
+                )
+            ).scalars()
+        )
+        if execution_task_ids
+        else set()
+    )
+    return [
+        PlanApplicationResource.model_validate(item).model_copy(
+            update={
+                "execution_task_available": (
+                    item.execution_task_id in available_execution_task_ids
+                    if item.application_type == "execution_task"
+                    and item.execution_task_id is not None
+                    else None
+                )
+            }
+        )
+        for item in applications
+    ]
 
 
 async def _run_resource(
@@ -978,6 +1030,7 @@ async def plan_resource(
             )
         ).scalars()
     )
+    application_resources = await _application_resources(db, applications)
     application = None
     applied = False
     if current is not None:
@@ -1038,8 +1091,17 @@ async def plan_resource(
         legacy=legacy,
         latest_run_status=latest.status if latest else None,
         latest_run_error=latest.error if latest else None,
-        application=application,
-        applications=applications,
+        application=(
+            next(
+                (
+                    item
+                    for item in application_resources
+                    if application is not None and item.id == application.id
+                ),
+                None,
+            )
+        ),
+        applications=application_resources,
         current_version=await _version_resource(db, current),
         active_run=await _run_resource(db, active, include_audit=include_audit),
         open_input_request=(

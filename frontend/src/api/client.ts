@@ -482,6 +482,7 @@ export interface PlanVersion {
   decided_by: number | null;
   superseded_by_version_id: number | null;
   applied: boolean;
+  display_state: 'applied' | 'approved' | 'rejected' | 'superseded' | 'awaiting_review' | 'draft';
   created_at: string;
 }
 
@@ -557,6 +558,7 @@ export interface PlanApplication {
   target_session_id: string | null;
   user_log_id: number | null;
   execution_task_id: number | null;
+  execution_task_available: boolean | null;
   created_at: string;
 }
 

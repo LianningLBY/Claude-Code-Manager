@@ -1,4 +1,4 @@
-import type { PlanResource } from '../../api/client';
+import type { PlanResource, PlanVersion } from '../../api/client';
 
 const LABELS: Record<PlanResource['display_state'], string> = {
   queued: 'Queued',
@@ -16,4 +16,17 @@ const LABELS: Record<PlanResource['display_state'], string> = {
 
 export function planDisplayStateLabel(state: PlanResource['display_state']) {
   return LABELS[state] ?? state.replaceAll('_', ' ');
+}
+
+const VERSION_LABELS: Record<PlanVersion['display_state'], string> = {
+  applied: 'Applied',
+  approved: 'Approved',
+  rejected: 'Rejected',
+  superseded: 'Superseded (not decided)',
+  awaiting_review: 'Awaiting approval',
+  draft: 'Draft',
+};
+
+export function planVersionDisplayLabel(version: PlanVersion) {
+  return VERSION_LABELS[version.display_state];
 }

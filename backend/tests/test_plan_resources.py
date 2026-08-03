@@ -565,6 +565,64 @@ async def test_approve_and_create_execution_is_atomic_and_history_stays_linked(
     assert payload["application"] is None
     assert payload["applications"][0]["plan_version_id"] == version_id
     assert payload["applications"][0]["execution_task_id"] == execution_task_id
+    assert payload["applications"][0]["execution_task_available"] is True
+
+    versions = await client.get(f"/api/plans/{plan_id}/versions")
+    assert versions.status_code == 200, versions.text
+    version_states = {
+        item["version_number"]: item["display_state"]
+        for item in versions.json()
+    }
+    assert version_states == {1: "applied", 2: "awaiting_review"}
+
+    async with session_factory() as db:
+        execution_task = await db.get(Task, execution_task_id)
+        await db.delete(execution_task)
+        await db.commit()
+
+    missing_target = await client.get(f"/api/plans/{plan_id}")
+    assert missing_target.status_code == 200, missing_target.text
+    missing_application = missing_target.json()["applications"][0]
+    assert missing_application["execution_task_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_undecided_superseded_version_has_derived_historical_state(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Revise an undecided Version", "target_repo": "/tmp"},
+    )
+    plan_id = created.json()["id"]
+    version1_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+        content="# Undecided v1",
+    )
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        version1 = await db.get(PlanVersion, version1_id)
+        version2 = PlanVersion(
+            plan_id=plan.id,
+            version_number=2,
+            parent_version_id=version1.id,
+            content="# Current v2",
+            review_verdict="approve",
+        )
+        db.add(version2)
+        await db.flush()
+        version1.superseded_by_version_id = version2.id
+        plan.current_version_id = version2.id
+        await db.commit()
+
+    versions = await client.get(f"/api/plans/{plan_id}/versions")
+    assert versions.status_code == 200, versions.text
+    by_number = {item["version_number"]: item for item in versions.json()}
+    assert by_number[1]["human_decision"] == "pending"
+    assert by_number[1]["display_state"] == "superseded"
+    assert by_number[2]["display_state"] == "awaiting_review"
 
 
 @pytest.mark.asyncio

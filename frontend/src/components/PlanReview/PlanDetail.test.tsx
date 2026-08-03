@@ -43,6 +43,7 @@ function version(overrides: Partial<PlanVersion>): PlanVersion {
     decided_by: null,
     superseded_by_version_id: null,
     applied: false,
+    display_state: 'awaiting_review',
     created_at: '2026-08-02T08:00:00Z',
     ...overrides,
   };
@@ -97,6 +98,7 @@ function plan(current: PlanVersion, prior: PlanVersion): PlanResource {
       target_session_id: null,
       user_log_id: null,
       execution_task_id: 91,
+      execution_task_available: true,
       created_at: '2026-08-02T08:30:00Z',
     },
     applications: [{
@@ -108,6 +110,7 @@ function plan(current: PlanVersion, prior: PlanVersion): PlanResource {
       target_session_id: null,
       user_log_id: null,
       execution_task_id: 91,
+      execution_task_available: true,
       created_at: '2026-08-02T08:30:00Z',
     }],
     current_version: current,
@@ -127,6 +130,7 @@ describe('PlanDetail', () => {
       content: '# Applied proposal',
       human_decision: 'approved',
       applied: true,
+      display_state: 'applied',
     });
     const current = version({});
     vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
@@ -135,6 +139,8 @@ describe('PlanDetail', () => {
     render(<PlanDetail plan={plan(current, prior)} onRefresh={vi.fn()} onNavigateTask={navigate} />);
 
     expect(await screen.findByText('v1 applied')).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'v2 · Awaiting approval · Current' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'v1 · Applied' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve v2 & create execution Task' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve v2 only' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Reject v2' })).toBeInTheDocument();
@@ -145,6 +151,36 @@ describe('PlanDetail', () => {
     await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Plan Version' }), '11');
     expect(await screen.findByRole('heading', { level: 1, name: 'Applied proposal' })).toBeInTheDocument();
     expect(screen.getByText(/Historical Version/)).toBeInTheDocument();
+  });
+
+  it('labels an undecided historical Version as superseded and disables a missing execution Task link', async () => {
+    const prior = version({
+      id: 11,
+      version_number: 1,
+      parent_version_id: null,
+      superseded_by_version_id: 12,
+      display_state: 'superseded',
+    });
+    const current = version({
+      human_decision: 'approved',
+      applied: true,
+      display_state: 'applied',
+    });
+    const resource = plan(current, prior);
+    resource.application = {
+      ...resource.applications[0],
+      plan_version_id: current.id,
+      execution_task_available: false,
+    };
+    resource.applications = [resource.application];
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} onNavigateTask={vi.fn()} />);
+
+    expect(await screen.findByRole('option', { name: 'v1 · Superseded (not decided)' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'v2 · Applied · Current' })).toBeInTheDocument();
+    expect(screen.getByText('v2 applied · execution Task #91 unavailable')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Open v2 execution Task/ })).not.toBeInTheDocument();
   });
 
   it('shows a confirmable warning for a migrated Version without blocking decisions', async () => {

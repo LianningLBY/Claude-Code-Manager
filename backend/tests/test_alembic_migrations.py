@@ -862,6 +862,108 @@ class TestVersionedPlanBackfill:
         ):
             _run_alembic(cfg, command.upgrade, "head")
 
+    def test_application_evidence_approves_inconsistent_legacy_version(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "legacy_applied_pending_plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, plan_content,
+                    plan_approved, plan_approved_at, plan_applied_at,
+                    plan_execution_task_id, created_at, completed_at
+                ) VALUES
+                (50, 'Applied legacy Plan', 'Historical application',
+                 'completed', 0, 'main', 'pending', 0, 2, 'plan', '# Applied',
+                 NULL, '2026-08-01 11:00:00', '2026-08-01 11:00:00', 51,
+                 '2026-08-01 09:00:00', '2026-08-01 11:00:00'),
+                (51, 'Execution Task', 'Implemented the Plan', 'completed', 0,
+                 'main', 'pending', 0, 2, 'auto', NULL, NULL, NULL, NULL, NULL,
+                 '2026-08-01 11:00:00', '2026-08-01 12:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT v.human_decision, v.decided_at,
+                       a.application_type, a.execution_task_id
+                FROM plan_versions v
+                JOIN plan_applications a ON a.plan_version_id = v.id
+            """)).mappings().one()
+            assert row["human_decision"] == "approved"
+            assert row["decided_at"] is not None
+            assert row["application_type"] == "execution_task"
+            assert row["execution_task_id"] == 51
+        engine.dispose()
+
+    def test_repair_migration_only_approves_versions_with_applications(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "repair_applied_pending_plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "f1a8c4d72e90")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO plans (
+                    id, title, initial_request, priority, pipeline_config,
+                    current_version_id, lock_version, created_at, updated_at
+                ) VALUES (
+                    90, 'Migrated Plan', 'Repair it', 0, '{}', 902, 0,
+                    '2026-08-01 09:00:00', '2026-08-01 11:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO plan_versions (
+                    id, plan_id, version_number, content, review_exhausted,
+                    human_decision, superseded_by_version_id, created_at
+                ) VALUES
+                (901, 90, 1, '# Superseded', 0, 'pending', 902,
+                 '2026-08-01 10:00:00'),
+                (902, 90, 2, '# Applied', 0, 'pending', NULL,
+                 '2026-08-01 11:00:00')
+            """))
+            conn.execute(text("""
+                INSERT INTO plan_applications (
+                    plan_id, plan_version_id, application_type,
+                    execution_task_id, applied_by, created_at
+                ) VALUES (
+                    90, 902, 'execution_task', 999, 77,
+                    '2026-08-01 12:00:00'
+                )
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, human_decision, decided_at, decided_by
+                FROM plan_versions ORDER BY id
+            """)).mappings().all()
+            assert dict(rows[0]) == {
+                "id": 901,
+                "human_decision": "pending",
+                "decided_at": None,
+                "decided_by": None,
+            }
+            assert rows[1]["human_decision"] == "approved"
+            assert rows[1]["decided_at"] is not None
+            assert rows[1]["decided_by"] == 77
+        engine.dispose()
+
 
 class TestSchemaConsistency:
     """The schema produced by Alembic migrations matches the ORM models.

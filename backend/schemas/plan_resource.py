@@ -316,6 +316,17 @@ class PlanVersionResource(BaseModel):
     decided_by: int | None
     superseded_by_version_id: int | None
     applied: bool = False
+    display_state: (
+        Literal[
+            "applied",
+            "approved",
+            "rejected",
+            "superseded",
+            "awaiting_review",
+            "draft",
+        ]
+        | None
+    ) = None
     created_at: datetime
 
 
@@ -371,6 +382,7 @@ class PlanApplicationResource(BaseModel):
     target_session_id: str | None
     user_log_id: int | None
     execution_task_id: int | None
+    execution_task_available: bool | None = None
     created_at: datetime
 
 

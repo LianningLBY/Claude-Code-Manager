@@ -473,7 +473,14 @@ def _backfill_legacy_plans() -> None:
             if row["plan_content"]:
                 version_number += 1
                 decision = "pending"
-                if plan_approved is not None and bool(plan_approved):
+                application_evidence = (
+                    row["plan_applied_at"] is not None
+                    or row["plan_execution_task_id"] is not None
+                    or legacy_carrier_execution
+                )
+                if (
+                    plan_approved is not None and bool(plan_approved)
+                ) or application_evidence:
                     decision = "approved"
                 elif (
                     plan_approved is not None
@@ -524,7 +531,15 @@ def _backfill_legacy_plans() -> None:
                         "review_exhausted": review_exhausted,
                         "reviewed_at": _datetime_value(reviewed_at, None),
                         "human_decision": decision,
-                        "decided_at": _datetime_value(row["plan_approved_at"], None),
+                        "decided_at": _datetime_value(
+                            row["plan_approved_at"]
+                            or (
+                                row["plan_applied_at"]
+                                if decision == "approved"
+                                else None
+                            ),
+                            None,
+                        ),
                         "decided_by": row["plan_approved_by"],
                         "superseded_by_version_id": None,
                         "created_at": _datetime_value(

@@ -313,6 +313,11 @@ Version 内容不可变，两个正交维度分别记录：
 `superseded_by_version_id`，但旧 decision/application 不改变。只有 current Version 能进入
 全局 `Plans requiring action` 的 review/execute 分组。
 
+API 另行派生 Version 的用户可见 `display_state`，不得把正交字段直接拼成标签。优先级为
+`applied → rejected → approved → superseded → awaiting_review → draft`。因此未经人类决定就被
+Revise 的历史 Version 保留 `human_decision=pending` 审计事实，但显示为
+`Superseded (not decided)`；`pending + applied` 属于数据不变量破坏，必须修复而不能展示。
+
 ### 4.3 Plan 展示状态
 
 API 按以下优先级派生 `display_state`：
@@ -490,6 +495,10 @@ target_session_id, user_log_id, execution_task_id, applied_by, created_at`。
 - `plan_version_id` 唯一，保证一个 Version 只应用一次；
 - `chat_message` 必须有 `user_log_id` 且无 `execution_task_id`；
 - `execution_task` 反之；
+- 任何 Application 都要求目标 Version 已 approved；迁移中存在 Application 是 approved 的
+  权威历史证据，`rejected + applied` 必须 fail closed；
+- execution Task 后续被删除时保留 Application 历史，但 API 标记 target unavailable，UI 不得
+  提供会 404 的打开入口；
 - 应用内容从 Version 复制到 LogEntry 的 `applied_plans` snapshot，删除/归档 Plan 不影响历史消息。
 
 ### 6.7 Legacy 映射
@@ -856,7 +865,7 @@ canonical Plan 不再依赖普通 Task list response；历史 Task 仍遵守 Tas
    application 指向原 carrier Task；后续 independent Plan 语义 → approved；
 7. `cancelled + plan_approved=False` → rejected；
 8. `superseded` → 历史 Version，并链接下一 Version；
-9. `plan_applied_*` / `plan_execution_task_id` → PlanApplication；
+9. `plan_applied_*` / `plan_execution_task_id` → PlanApplication，并将 Version 认定为 approved；
 10. 未批准的 pending carrier（无论是否存在历史 attempt）→ 新建唯一 queued canonical Run，
     并把旧 Task 标为 superseded，避免部署后 Task 与 Run 双重领取；旧 main 已批准的 pending
     carrier 保持为原 execution Task，并创建 exact Version application；failed 且没有 content 的

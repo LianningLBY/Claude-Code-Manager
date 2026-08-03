@@ -175,6 +175,44 @@ describe('ChatView', () => {
     (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({});
   });
 
+  it('fits full-screen chat to the iOS visual viewport but leaves inline chat alone', () => {
+    const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const viewport = Object.assign(new EventTarget(), {
+      height: 486,
+      offsetTop: 47,
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: viewport,
+    });
+
+    try {
+      const fullScreen = render(
+        <ChatView task={makeTask()} projects={projects} onBack={onBack} />,
+      );
+      expect(fullScreen.container.firstElementChild).toHaveStyle({
+        height: '486px',
+        top: '47px',
+        bottom: 'auto',
+      });
+      fullScreen.unmount();
+
+      const inline = render(
+        <ChatView task={makeTask()} projects={projects} onBack={onBack} inline />,
+      );
+      expect((inline.container.firstElementChild as HTMLElement).style.height).toBe('');
+      expect((inline.container.firstElementChild as HTMLElement).style.top).toBe('');
+      expect((inline.container.firstElementChild as HTMLElement).style.bottom).toBe('');
+      inline.unmount();
+    } finally {
+      if (originalViewport) {
+        Object.defineProperty(window, 'visualViewport', originalViewport);
+      } else {
+        Reflect.deleteProperty(window, 'visualViewport');
+      }
+    }
+  });
+
   describe('chat conflict state', () => {
     it('does not show Interrupt for a non-busy 409 rejection', async () => {
       const rejection = Object.assign(

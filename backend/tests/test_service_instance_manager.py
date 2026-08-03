@@ -3887,6 +3887,47 @@ async def test_codex_soft_quota_switch_migrates_rebinds_and_updates_binding(
 
 
 @pytest.mark.asyncio
+async def test_codex_soft_quota_switch_does_not_override_explicit_preference(
+    db_factory, tmp_path,
+):
+    source = tmp_path / "codex-pinned"
+    target = tmp_path / "api-account"
+    config = tmp_path / "codex-pinned-pool.json"
+    config.write_text(json.dumps({"accounts": [
+        {"id": "codex-2", "codex_home": str(source), "enabled": True},
+        {"id": "api-1", "codex_home": str(target), "enabled": True},
+    ]}))
+    pool = CodexPool(config_path=config)
+    assert pool.set_preferred("codex-2") is True
+    pool.select_quota_alternative = AsyncMock(return_value=str(target.resolve()))
+
+    async with db_factory() as db:
+        task = Task(
+            title="keep explicit codex account",
+            provider="codex",
+            status="executing",
+            session_id="thread-pinned",
+            metadata_={"codex_account_id": "codex-2"},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._config_dirs[7] = str(source.resolve())
+    im.rebind_codex_thread = AsyncMock()
+    dispatcher = MagicMock(pool=None, codex_pool=pool)
+
+    with patch("backend.main.dispatcher", dispatcher):
+        switched = await im._try_proactive_pool_switch(7, task.id)
+
+    assert switched is False
+    pool.select_quota_alternative.assert_not_awaited()
+    im.rebind_codex_thread.assert_not_awaited()
+    assert im.get_config_dir(7) == str(source.resolve())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("rollback_fails", [False, True])
 async def test_codex_soft_quota_binding_failure_rolls_back_owner_without_cooldown(
     db_factory, tmp_path, rollback_fails,

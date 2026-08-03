@@ -7090,6 +7090,20 @@ class InstanceManager:
                 pool = dispatcher.codex_pool
                 if not (pool and pool.enabled):
                     return False
+                # An explicit UI selection is a routing lock, not merely a
+                # hint for fresh tasks.  In particular, do not let the
+                # completed-turn quota balancer undo "switch to this
+                # account" by moving the same thread back to an API account.
+                # The normal next-turn resolver owns migration to the pinned
+                # account when the selection was made while a turn was busy.
+                if pool.preferred_account_id is not None:
+                    logger.info(
+                        "Codex quota switch skipped for task %d: account %s "
+                        "is explicitly preferred",
+                        task_id,
+                        pool.preferred_account_id,
+                    )
+                    return False
                 old_home = self._config_dirs.get(instance_id)
                 if not old_home and isinstance(bound_codex_id, str):
                     old_home = pool.home_for_account(bound_codex_id)
@@ -7102,6 +7116,16 @@ class InstanceManager:
                     service_tier=task_service_tier,
                 )
                 if not await generation_is_current(generation):
+                    return False
+                # set_preferred() can race the asynchronous quota lookup.  A
+                # late pin must still win before any rollout/owner mutation.
+                if pool.preferred_account_id is not None:
+                    logger.info(
+                        "Codex quota switch abandoned for task %d: account %s "
+                        "was explicitly preferred during quota selection",
+                        task_id,
+                        pool.preferred_account_id,
+                    )
                     return False
                 if not new_home:
                     logger.info(
@@ -7196,6 +7220,11 @@ class InstanceManager:
                             raise RuntimeError(
                                 "task generation changed after rollout copy"
                             )
+                        if pool.preferred_account_id is not None:
+                            raise RuntimeError(
+                                "explicit Codex account preference changed "
+                                "during quota switch"
+                            )
                         await self.rebind_codex_thread(
                             session_id,
                             source_codex_home=old_home,
@@ -7205,6 +7234,11 @@ class InstanceManager:
                         if not await generation_is_current(generation):
                             raise RuntimeError(
                                 "task generation changed after owner rebind"
+                            )
+                        if pool.preferred_account_id is not None:
+                            raise RuntimeError(
+                                "explicit Codex account preference changed "
+                                "after quota owner rebind"
                             )
                         binding_changed = await (
                             dispatcher._persist_codex_binding_for_route(

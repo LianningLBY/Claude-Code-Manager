@@ -1,128 +1,211 @@
-type MathDelimiter = 'inline' | 'display';
+import { decodeString } from 'micromark-util-decode-string';
 
-interface OpenDelimiter {
-  kind: MathDelimiter;
-  position: number;
+interface MarkdownPosition {
+  start?: { offset?: number };
+  end?: { offset?: number };
 }
 
-function markRange(protectedCharacters: Uint8Array, start: number, end: number) {
-  protectedCharacters.fill(1, start, end);
+interface MarkdownNode {
+  type: string;
+  value?: string;
+  children?: MarkdownNode[];
+  position?: MarkdownPosition;
+  data?: Record<string, unknown>;
 }
 
-/**
- * Mark fenced and inline code before normalizing LaTeX delimiters. Formula-like
- * text in source snippets must remain byte-for-byte unchanged.
- */
-function findCodeCharacters(source: string): Uint8Array {
-  const protectedCharacters = new Uint8Array(source.length);
-  let fence: { character: '`' | '~'; length: number } | null = null;
-  let offset = 0;
+interface MarkdownFile {
+  value?: unknown;
+}
 
-  for (const line of source.matchAll(/.*(?:\n|$)/g)) {
-    const value = line[0];
-    if (!value) continue;
-    const lineWithoutEnding = value.replace(/[\r\n]+$/, '');
+const SKIP_DESCENDANTS = new Set([
+  'code',
+  'definition',
+  'html',
+  'image',
+  'imageReference',
+  'inlineCode',
+  'link',
+  'linkReference',
+  'math',
+  'inlineMath',
+]);
 
-    if (fence) {
-      markRange(protectedCharacters, offset, offset + value.length);
-      const closingFence = lineWithoutEnding.match(/^ {0,3}(`+|~+)\s*$/);
-      if (
-        closingFence
-        && closingFence[1][0] === fence.character
-        && closingFence[1].length >= fence.length
-      ) {
-        fence = null;
-      }
-    } else {
-      const openingFence = lineWithoutEnding.match(/^ {0,3}(`{3,}|~{3,})/);
-      if (openingFence) {
-        const marker = openingFence[1];
-        fence = {
-          character: marker[0] as '`' | '~',
-          length: marker.length,
-        };
-        markRange(protectedCharacters, offset, offset + value.length);
-      }
-    }
-    offset += value.length;
+function isMarkdownNode(value: unknown): value is MarkdownNode {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && typeof (value as { type?: unknown }).type === 'string',
+  );
+}
+
+function sourceForNode(node: MarkdownNode, source: string): string | null {
+  const start = node.position?.start?.offset;
+  const end = node.position?.end?.offset;
+  if (
+    typeof start !== 'number'
+    || typeof end !== 'number'
+    || start < 0
+    || end < start
+    || end > source.length
+  ) {
+    return null;
   }
+  return source.slice(start, end);
+}
 
-  for (let index = 0; index < source.length;) {
-    if (protectedCharacters[index] || source[index] !== '`') {
-      index += 1;
+function isEscaped(source: string, index: number): boolean {
+  let precedingBackslashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && source[cursor] === '\\'; cursor -= 1) {
+    precedingBackslashes += 1;
+  }
+  return precedingBackslashes % 2 === 1;
+}
+
+function findDelimiter(
+  source: string,
+  closingCharacter: '(' | ')' | '[' | ']',
+  fromIndex: number,
+): number {
+  for (let index = fromIndex; index < source.length - 1; index += 1) {
+    if (
+      source[index] === '\\'
+      && source[index + 1] === closingCharacter
+      && !isEscaped(source, index)
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function inlineMathNode(value: string): MarkdownNode {
+  return {
+    type: 'inlineMath',
+    value,
+    data: {
+      hName: 'code',
+      hProperties: { className: ['language-math', 'math-inline'] },
+      hChildren: [{ type: 'text', value }],
+    },
+  };
+}
+
+function displayMathNode(value: string): MarkdownNode {
+  return {
+    type: 'math',
+    value,
+    data: {
+      hName: 'pre',
+      hChildren: [{
+        type: 'element',
+        tagName: 'code',
+        properties: { className: ['language-math', 'math-display'] },
+        children: [{ type: 'text', value }],
+      }],
+    },
+  };
+}
+
+function stripOneLineEnding(value: string, fromStart: boolean): string {
+  if (fromStart) return value.replace(/^(?:\r\n|\r|\n)/, '');
+  return value.replace(/(?:\r\n|\r|\n)$/, '');
+}
+
+function parseDisplayMath(paragraph: MarkdownNode, source: string): MarkdownNode | null {
+  const raw = sourceForNode(paragraph, source);
+  if (raw === null) return null;
+
+  const leadingWhitespace = raw.match(/^[ \t]*/)?.[0].length || 0;
+  const opening = findDelimiter(raw, '[', leadingWhitespace);
+  if (opening !== leadingWhitespace) return null;
+
+  const closing = findDelimiter(raw, ']', opening + 2);
+  if (closing < 0 || !/^[ \t]*$/.test(raw.slice(closing + 2))) return null;
+
+  let value = raw.slice(opening + 2, closing);
+  value = stripOneLineEnding(value, true);
+  value = stripOneLineEnding(value, false);
+  return displayMathNode(value);
+}
+
+function splitInlineMath(node: MarkdownNode, source: string): MarkdownNode[] | null {
+  const raw = sourceForNode(node, source);
+  if (raw === null) return null;
+
+  const transformed: MarkdownNode[] = [];
+  let cursor = 0;
+  let searchFrom = 0;
+  let found = false;
+
+  while (searchFrom < raw.length - 1) {
+    const opening = findDelimiter(raw, '(', searchFrom);
+    if (opening < 0) break;
+
+    const closing = findDelimiter(raw, ')', opening + 2);
+    const nextOpening = findDelimiter(raw, '(', opening + 2);
+    const lineEnding = raw.slice(opening + 2).search(/[\r\n]/);
+    if (
+      closing < 0
+      || (lineEnding >= 0 && opening + 2 + lineEnding < closing)
+    ) {
+      searchFrom = opening + 2;
+      continue;
+    }
+    if (nextOpening >= 0 && nextOpening < closing) {
+      searchFrom = nextOpening;
       continue;
     }
 
-    let markerLength = 1;
-    while (source[index + markerLength] === '`') markerLength += 1;
-    let closing = index + markerLength;
-    while (closing < source.length) {
-      if (protectedCharacters[closing] || source[closing] !== '`') {
-        closing += 1;
+    if (opening > cursor) {
+      transformed.push({ type: 'text', value: decodeString(raw.slice(cursor, opening)) });
+    }
+    transformed.push(inlineMathNode(raw.slice(opening + 2, closing)));
+    cursor = closing + 2;
+    searchFrom = cursor;
+    found = true;
+  }
+
+  if (!found) return null;
+  if (cursor < raw.length) {
+    transformed.push({ type: 'text', value: decodeString(raw.slice(cursor)) });
+  }
+  return transformed;
+}
+
+function transformChildren(parent: MarkdownNode, source: string): void {
+  if (!parent.children || SKIP_DESCENDANTS.has(parent.type)) return;
+
+  const transformed: MarkdownNode[] = [];
+  for (const child of parent.children) {
+    if (child.type === 'paragraph') {
+      const displayMath = parseDisplayMath(child, source);
+      if (displayMath) {
+        transformed.push(displayMath);
         continue;
       }
-      let closingLength = 1;
-      while (source[closing + closingLength] === '`') closingLength += 1;
-      if (closingLength === markerLength) break;
-      closing += closingLength;
     }
 
-    if (closing < source.length) {
-      const end = closing + markerLength;
-      markRange(protectedCharacters, index, end);
-      index = end;
-    } else {
-      index += markerLength;
-    }
-  }
-
-  return protectedCharacters;
-}
-
-/**
- * remark-math understands dollar delimiters, while Codex commonly emits the
- * LaTeX forms \(...\) and \[...\]. Convert only complete pairs outside code.
- */
-export function normalizeMathDelimiters(source: string): string {
-  const protectedCharacters = findCodeCharacters(source);
-  const replacements = new Map<number, string>();
-  let open: OpenDelimiter | null = null;
-
-  for (let index = 0; index < source.length - 1; index += 1) {
-    if (protectedCharacters[index] || source[index] !== '\\') continue;
-    if (index > 0 && source[index - 1] === '\\') continue;
-
-    const next = source[index + 1];
-    if (!open) {
-      if (next === '(') open = { kind: 'inline', position: index };
-      if (next === '[') open = { kind: 'display', position: index };
+    if (child.type === 'text') {
+      transformed.push(...(splitInlineMath(child, source) || [child]));
       continue;
     }
 
-    const isClosing = (
-      (open.kind === 'inline' && next === ')')
-      || (open.kind === 'display' && next === ']')
-    );
-    if (!isClosing) continue;
-
-    const replacement = open.kind === 'inline' ? '$' : '$$';
-    replacements.set(open.position, replacement);
-    replacements.set(index, replacement);
-    open = null;
-    index += 1;
+    transformChildren(child, source);
+    transformed.push(child);
   }
+  parent.children = transformed;
+}
 
-  if (replacements.size === 0) return source;
-
-  let normalized = '';
-  for (let index = 0; index < source.length; index += 1) {
-    const replacement = replacements.get(index);
-    if (replacement !== undefined) {
-      normalized += replacement;
-      index += 1;
-    } else {
-      normalized += source[index];
-    }
-  }
-  return normalized;
+/**
+ * Parse Codex's `\\(...\\)` and `\\[...\\]` notation after Markdown has
+ * formed its AST. Source positions recover the escaped delimiters without
+ * rewriting URLs, HTML, code, definitions, images, or link destinations.
+ * Inline pairs are deliberately confined to one text node, and display math
+ * must occupy a whole paragraph, so delimiters cannot capture unrelated AST.
+ */
+export function remarkBackslashMath() {
+  return (tree: unknown, file: MarkdownFile): void => {
+    if (!isMarkdownNode(tree) || typeof file.value !== 'string') return;
+    transformChildren(tree, file.value);
+  };
 }

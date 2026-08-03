@@ -4,7 +4,7 @@ import type { PluggableList } from 'unified';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
-import { normalizeMathDelimiters } from './markdownMath';
+import { remarkBackslashMath } from './markdownMath';
 
 interface MarkdownRendererProps {
   content: string;
@@ -15,11 +15,24 @@ interface MarkdownRendererProps {
 export function MarkdownRenderer({ content, components, remarkPlugins = [] }: MarkdownRendererProps) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath, ...remarkPlugins]}
-      rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
+      remarkPlugins={[
+        remarkGfm,
+        [remarkMath, { singleDollarTextMath: false }],
+        remarkBackslashMath,
+        ...remarkPlugins,
+      ]}
+      rehypePlugins={[[
+        rehypeKatex,
+        {
+          maxSize: 20,
+          strict: false,
+          throwOnError: false,
+          trust: false,
+        },
+      ]]}
       components={components}
     >
-      {normalizeMathDelimiters(content)}
+      {content}
     </ReactMarkdown>
   );
 }

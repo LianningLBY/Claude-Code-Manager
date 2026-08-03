@@ -7509,6 +7509,12 @@ class InstanceManager:
         item_type = item.get("type")
 
         event = self._base_codex_event(line, now)
+        item_id = data.get("item_id") or data.get("itemId") or item.get("id")
+        if item_id:
+            # Keep the native item identity on the durable completion event as
+            # well as its deltas. The frontend uses it to replace a partial
+            # live bubble after a task-channel resubscription.
+            event["item_id"] = str(item_id)
 
         if codex_type == "item.agent_message.delta":
             event.update({

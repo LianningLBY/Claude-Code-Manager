@@ -5147,6 +5147,19 @@ async def test_turn_process_interrupt_is_nonblocking_and_completes():
 
 
 @pytest.mark.asyncio
+async def test_turn_process_timeout_cannot_be_relabelled_user_interrupt():
+    async def interrupt():
+        return None
+
+    process = CodexTurnProcess(1, interrupt)
+    process.termination_kind = "timeout"
+    process.finish(130, termination_kind="user_interrupt")
+
+    assert await process.wait() == 130
+    assert process.termination_kind == "timeout"
+
+
+@pytest.mark.asyncio
 async def test_turn_process_failed_interrupt_preserves_active_evidence():
     interrupt_attempted = asyncio.Event()
 

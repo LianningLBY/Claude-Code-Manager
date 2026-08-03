@@ -7600,6 +7600,8 @@ def test_internal_codex_abort_is_not_a_successful_chat_terminal():
     assert not InstanceManager._chat_terminal_succeeded(process, 130)
     process.termination_kind = "user_interrupt"
     assert InstanceManager._chat_terminal_succeeded(process, 130)
+    process.termination_kind = "timeout"
+    assert not InstanceManager._chat_terminal_succeeded(process, 130)
     assert InstanceManager._chat_terminal_succeeded(process, 0)
 
 

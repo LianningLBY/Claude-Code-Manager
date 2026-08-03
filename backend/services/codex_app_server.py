@@ -525,7 +525,11 @@ class CodexTurnProcess:
         if self.returncode is not None:
             return
         self.returncode = returncode
-        self.termination_kind = termination_kind
+        # Dispatcher timeout is stamped before interrupting the native turn.
+        # Do not let the subsequent app-server ``interrupted`` notification
+        # relabel that forced abort as a successful user interrupt.
+        if self.termination_kind != "timeout":
+            self.termination_kind = termination_kind
         if stderr:
             self.stderr.feed_data(stderr.encode("utf-8", errors="replace"))
         self.stdout.feed_eof()

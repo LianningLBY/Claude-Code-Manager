@@ -2307,6 +2307,14 @@ class GlobalDispatcher:
                     task.id,
                     timeout,
                 )
+                # A provider may report the forced interrupt as the same
+                # SIGINT/130 terminal used for a user-requested stop.  Stamp
+                # the process before signalling it so the output consumer
+                # cannot publish a timed-out, partial reply as completed.
+                try:
+                    process.termination_kind = "timeout"
+                except (AttributeError, TypeError):
+                    pass
                 killed = await self.instance_manager.kill_process_generation(
                     instance_id,
                     process,

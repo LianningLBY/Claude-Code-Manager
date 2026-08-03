@@ -1176,7 +1176,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/tmp_space_manager.py` | `backend/tests/test_tmp_space_manager.py` |
 | `backend/services/container_manager.py`（容器 `/tmp`） | `backend/tests/test_container_manager.py` |
 | `backend/api/files.py`（SSH 下载临时文件） | `backend/tests/test_api_files.py` |
-| `backend/api/task_artifacts.py` + Task 产物提示 | `backend/tests/test_api_task_artifacts.py` + `backend/tests/test_service_dispatcher.py` |
+| `backend/services/task_artifact_contract.py` + `backend/api/task_artifacts.py` + Task 产物提示/Worker capability | `backend/tests/test_api_task_artifacts.py` + `backend/tests/test_service_dispatcher.py` + `backend/tests/test_api_system.py`（跨 Task namespace、旧 Worker fail-closed、伪造 tag、非法项目根） |
 | `backend/services/token_manager_service.py` | `backend/tests/test_service_token_manager.py` |
 | `backend/schemas/task.py` (datetime serialization) | `backend/tests/test_task_schema.py` |
 | `backend/api/chat.py` (timestamp Z suffix) | `backend/tests/test_chat_timestamp.py` |

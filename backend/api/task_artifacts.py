@@ -21,6 +21,10 @@ from backend.api.deps import require_task_access
 from backend.database import get_db
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.services.task_artifact_contract import (
+    MANAGED_ARTIFACT_ROOT,
+    configured_workspace_root as _configured_workspace_root,
+)
 
 
 router = APIRouter(prefix="/api/tasks", tags=["task-artifacts"])
@@ -29,7 +33,6 @@ MAX_ARTIFACT_DOWNLOAD_SIZE = 100 * 1024 * 1024
 MAX_ARTIFACT_REFERENCE_LENGTH = 4096
 ARTIFACT_STREAM_CHUNK_SIZE = 64 * 1024
 CONTAINER_WORKSPACE = Path("/workspace")
-MANAGED_ARTIFACT_ROOT = (".claude-manager", "artifacts")
 
 
 @dataclass
@@ -87,30 +90,6 @@ def _decode_artifact_reference(reference: str) -> str:
     if not decoded_path or "\x00" in decoded_path or "\\" in decoded_path:
         raise HTTPException(400, "Invalid artifact path")
     return decoded_path
-
-
-def _configured_workspace_root(raw_root: str) -> Path:
-    """Return a normalized absolute root without following any symlinks."""
-
-    if not raw_root or "\x00" in raw_root:
-        raise ValueError("invalid workspace root")
-    try:
-        root = Path(raw_root).expanduser()
-    except RuntimeError as exc:
-        raise ValueError("invalid workspace root") from exc
-    if not root.is_absolute() or root.anchor != os.path.sep:
-        raise ValueError("workspace root must be an absolute POSIX path")
-
-    components = []
-    for component in root.parts[1:]:
-        if component in {"", "."}:
-            continue
-        if component == "..":
-            raise ValueError("workspace root cannot contain parent traversal")
-        components.append(component)
-    if not components:
-        raise ValueError("filesystem root cannot be a task workspace")
-    return Path(os.path.sep, *components)
 
 
 async def _task_workspace_root(task: Task, db: AsyncSession) -> Path:

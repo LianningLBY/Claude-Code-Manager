@@ -62,6 +62,12 @@ from backend.services.task_skill_overrides import (
     TEMP_SKILLS_GENERATION_KEY,
     clear_temporary_skills_marker,
 )
+from backend.services.task_artifact_contract import (
+    TASK_ARTIFACT_LINK_TITLE,
+    TASK_ARTIFACT_POLICY_TAG,
+    configured_workspace_root,
+    workspace_root_is_secure_directory,
+)
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
@@ -138,9 +144,6 @@ _DOC_SYNC_NOTE = (
     "若两者是 symlink 关系则改一处即可，无需额外操作）。"
 )
 
-_TASK_ARTIFACT_POLICY_TAG = "<ccm_task_artifact_policy>"
-_TASK_ARTIFACT_LINK_TITLE = "ccm-task-artifact"
-
 
 def _task_artifact_policy(task: Task) -> str:
     """Build the provider-neutral, project-scoped artifact contract."""
@@ -149,19 +152,23 @@ def _task_artifact_policy(task: Task) -> str:
         return ""
 
     task_id = task.id
-    raw_root = str(task.target_repo or "").strip()
+    raw_root = str(task.target_repo or "")
     try:
-        project_root = Path(raw_root).expanduser() if raw_root else None
-    except RuntimeError:
+        project_root = configured_workspace_root(raw_root)
+    except ValueError:
+        project_root = None
+    if (
+        project_root is not None
+        and not workspace_root_is_secure_directory(project_root)
+    ):
         project_root = None
     if (
         task_id is None
         or task_id <= 0
         or project_root is None
-        or not project_root.is_absolute()
     ):
         return (
-            f"{_TASK_ARTIFACT_POLICY_TAG}\n"
+            f"{TASK_ARTIFACT_POLICY_TAG}\n"
             "此 Task 没有可验证的项目根目录，因此不得创建或输出可下载文件链接。"
             "普通文件名和项目文件只用反引号表示，不要写成本地 Markdown 链接。\n"
             "</ccm_task_artifact_policy>"
@@ -170,7 +177,7 @@ def _task_artifact_policy(task: Task) -> str:
     relative_dir = f".claude-manager/artifacts/task-{task_id}"
     host_dir = project_root / relative_dir
     return (
-        f"{_TASK_ARTIFACT_POLICY_TAG}\n"
+        f"{TASK_ARTIFACT_POLICY_TAG}\n"
         "任务下载产物规则（Claude/Codex 均必须遵守）：\n"
         f"- 当前 Task 的宿主机项目根目录（JSON 字符串）是 "
         f"{json.dumps(str(project_root), ensure_ascii=False)}。若 Claude 在共享项目容器内运行，"
@@ -192,19 +199,17 @@ def _task_artifact_policy(task: Task) -> str:
         "无法确认时不要输出下载链接。\n"
         "- 最终回复必须使用文件最终位置的绝对路径和专用标题标记，"
         "不要只输出裸路径、文件名或相对路径。格式："
-        f"`[下载报告](</绝对路径/{relative_dir}/report.pdf> \"{_TASK_ARTIFACT_LINK_TITLE}\")`。"
+        f"`[下载报告](</绝对路径/{relative_dir}/report.pdf> \"{TASK_ARTIFACT_LINK_TITLE}\")`。"
         "路径包含空格时必须保留尖括号。\n"
         "</ccm_task_artifact_policy>"
     )
 
 
 def _prepend_task_artifact_policy(task: Task, prompt: str) -> str:
-    """Attach the artifact contract once to any task turn prompt."""
+    """Attach the artifact contract to one Task turn prompt."""
 
     policy = _task_artifact_policy(task)
-    if not policy or _TASK_ARTIFACT_POLICY_TAG in prompt:
-        return prompt
-    return f"{policy}\n\n{prompt}"
+    return f"{policy}\n\n{prompt}" if policy else prompt
 
 
 def _agent_doc_preamble(task: Task) -> str:

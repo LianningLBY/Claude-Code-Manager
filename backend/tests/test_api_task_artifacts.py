@@ -2,11 +2,12 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -625,6 +626,11 @@ async def test_worker_proxy_streams_content_and_download_headers(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
+        if request.url.path == "/api/system/config":
+            return httpx.Response(
+                200,
+                json={"task_artifact_scope_version": 1},
+            )
         return httpx.Response(
             200,
             content=b"worker bytes",
@@ -663,5 +669,51 @@ async def test_worker_proxy_streams_content_and_download_headers(monkeypatch):
 
     assert body == b"worker bytes"
     assert response.headers["content-disposition"] == 'attachment; filename="worker.txt"'
-    assert captured[0].headers["authorization"] == "Bearer internal-token"
-    assert captured[0].url.params["path"] == "输出/worker.txt"
+    assert [request.url.path for request in captured] == [
+        "/api/system/config",
+        "/api/tasks/91/artifacts/download",
+    ]
+    assert captured[1].headers["authorization"] == "Bearer internal-token"
+    assert captured[1].url.params["path"] == "输出/worker.txt"
+
+
+@pytest.mark.asyncio
+async def test_worker_proxy_rejects_unscoped_older_worker(monkeypatch):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"default_provider": "claude"})
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    proxy = WorkerProxy(db_factory=None, relay=None)
+    worker = SimpleNamespace(
+        id=7,
+        name="old-worker",
+        status="ready",
+        private_ip="worker.internal",
+        ccm_port=8000,
+        auth_token="internal-token",
+    )
+    monkeypatch.setattr(
+        proxy,
+        "require_ready_worker",
+        AsyncMock(return_value=worker),
+    )
+    task = SimpleNamespace(id=91, worker_id=7)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy.stream_task_artifact(task, "worker.txt")
+
+    assert exc_info.value.status_code == 409
+    assert "版本过旧" in exc_info.value.detail
+    assert [request.url.path for request in captured] == [
+        "/api/system/config",
+    ]

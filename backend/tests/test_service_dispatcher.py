@@ -3875,6 +3875,7 @@ class TestResolveTimeout:
         )
         await d._wait_process(p, t, "test", instance_id=1)
         assert p.killed is True
+        assert p.termination_kind == "timeout"
 
 
 @pytest.mark.asyncio

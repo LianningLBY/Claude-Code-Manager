@@ -10506,7 +10506,7 @@ class InstanceManager:
             return False
         return (
             getattr(process, "termination_kind", None)
-            != "internal_abort"
+            not in {"internal_abort", "timeout"}
         )
 
     def get_config_dir(self, instance_id: int) -> str | None:

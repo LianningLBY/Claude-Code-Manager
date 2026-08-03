@@ -138,7 +138,7 @@ function PlanActivity({ runs, versions }: { runs: PlanRun[]; versions: PlanVersi
         <div className="min-w-0 flex-1">
           <div className="text-xs font-medium text-gray-300">{runTypeLabel(run.run_type)}</div>
           <div className="mt-0.5 text-[11px] text-gray-500">{runStatusLabel(run, versions)}</div>
-          {run.status === 'failed' && run.error && <div className="mt-1 text-[11px] text-red-300">{run.error}</div>}
+          {run.status === 'failed' && <div className="mt-1 text-[11px] text-red-300">No Plan Version was produced. You can retry this attempt.</div>}
         </div>
       </div>)}
     </div>
@@ -177,6 +177,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const previous = useMemo(() => shown ? versions.find((item) => item.version_number === shown.version_number - 1) || null : null, [shown, versions]);
   const appliedVersion = versions.find((item) => item.applied) || null;
   const executionApplications = (plan.applications || []).filter((item) => item.execution_task_id != null);
+  const latestFailedRun = runs.find((run) => run.status === 'failed') || null;
 
   useEffect(() => {
     if (!shown) { setStaleness(null); return; }
@@ -256,7 +257,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
 
     <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
-      {plan.latest_run_error && <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">Latest planning attempt {plan.latest_run_status}: {plan.latest_run_error}</div>}
+      {plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> No Plan Version was produced. Technical details are available in Debug information.</div>}
       {staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
         <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-400" />
         <div className="min-w-0">
@@ -303,7 +304,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           </section>
           {runs.length > 0 && <section>
             <div className="mb-1 font-semibold text-gray-300">Runs</div>
-            <div className="space-y-2">{runs.map((run) => <div key={run.id} className="border-t border-gray-800 pt-2 first:border-0 first:pt-0">Run #{run.id} · {run.run_type} · {run.status} · round {run.round}{run.steps.map((step) => <div key={step.id} className="ml-3 text-gray-500">{step.step_type}: {step.provider}/{step.model || 'default'} ({step.route_slot || 'primary'}) · {step.status}</div>)}</div>)}</div>
+            <div className="space-y-2">{runs.map((run) => <div key={run.id} className="border-t border-gray-800 pt-2 first:border-0 first:pt-0">Run #{run.id} · {run.run_type} · {run.status} · round {run.round}{run.steps.map((step) => <div key={step.id} className="ml-3 text-gray-500">{step.step_type}: {step.provider}/{step.model || 'default'} ({step.route_slot || 'primary'}) · {step.status}</div>)}{run.error && <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-red-300/80">{run.error}</pre>}</div>)}</div>
           </section>}
           {shown && (shown.repo_revision || shown.reviewer_repo_revision) && <section>
             <div className="mb-1 font-semibold text-gray-300">Repository audit</div>
@@ -323,6 +324,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       </div>}
 
       <div className="mt-4 flex flex-wrap gap-2">
+        {!plan.active_run_id && latestFailedRun && <button type="button" disabled={busy} onClick={() => void mutate(() => api.createPlanRun(plan.id, { run_type: 'retry', request: latestFailedRun.request_text || plan.initial_request, base_version_id: latestFailedRun.base_version_id || undefined, expected_current_version_id: plan.current_version_id || undefined, source_run_id: latestFailedRun.id }))} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw size={12} /> Retry planning</button>}
         {shown && current && plan.display_state === 'awaiting_review' && plan.target_task_id != null && <><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve', true)} className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><Check size={12} /> Approve & attach v{shown.version_number}</button><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve')} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 disabled:opacity-40">Approve v{shown.version_number} only</button><button type="button" disabled={busy} onClick={() => void decide('reject')} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Reject v{shown.version_number}</button></>}
         {shown && current && plan.display_state === 'awaiting_review' && plan.target_task_id == null && <><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void createExecution(true)} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><Play size={12} /> Approve v{shown.version_number} & create execution Task</button><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve')} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300">Approve v{shown.version_number} only</button><button type="button" disabled={busy} onClick={() => void decide('reject')} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Reject v{shown.version_number}</button></>}
         {shown && current && plan.display_state === 'approved' && plan.target_task_id == null && <button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void createExecution(false)} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><Play size={12} /> Create execution Task</button>}

@@ -10,6 +10,7 @@ vi.mock('../../api/client', () => ({
   api: {
     listPlanVersions: vi.fn(),
     listPlanResourceRuns: vi.fn().mockResolvedValue([]),
+    createPlanRun: vi.fn(),
     getPlanVersionStaleness: vi.fn().mockResolvedValue({
       stale: false,
       hard_conflict: false,
@@ -263,5 +264,69 @@ describe('PlanDetail', () => {
     expect(debug).not.toHaveAttribute('open');
     expect(within(debug!).getByText(/Run #15 · initial · running · round 1/))
       .toBeInTheDocument();
+  });
+
+  it('keeps failed Run details in Debug and offers an in-place retry', async () => {
+    const current = version({});
+    const prior = version({ id: 11, version_number: 1 });
+    const rawError = 'Claude Plan Agent exited with 1: API Error: 400 tools.3.custom.input_schema';
+    const failedRun = {
+      id: 16,
+      plan_id: 4,
+      run_type: 'initial',
+      status: 'failed',
+      current_stage: 'failed',
+      base_version_id: null,
+      source_run_id: null,
+      result_version_id: null,
+      request_text: 'Design the migration',
+      round: 1,
+      generation: 1,
+      instance_id: null,
+      worker_id: null,
+      open_input_request_id: null,
+      interaction_count: 0,
+      max_interactions: 5,
+      execution_seconds: 2,
+      last_execution_started_at: null,
+      review_verdict: null,
+      review_feedback: null,
+      review_exhausted: false,
+      error: rawError,
+      created_at: '2026-08-03T10:27:22Z',
+      updated_at: '2026-08-03T10:27:26Z',
+      finished_at: '2026-08-03T10:27:26Z',
+      steps: [],
+      input_requests: [],
+    } satisfies PlanRun;
+    const resource = plan(current, prior);
+    resource.current_version_id = null;
+    resource.current_version = null;
+    resource.display_state = 'failed';
+    resource.latest_run_status = 'failed';
+    resource.latest_run_error = rawError;
+    vi.mocked(api.listPlanVersions).mockResolvedValue([]);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([failedRun]);
+    vi.mocked(api.createPlanRun).mockResolvedValue(failedRun);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Latest planning attempt failed');
+    expect(alert).not.toHaveTextContent(rawError);
+    const activity = screen.getByRole('region', { name: 'Plan activity' });
+    expect(activity).toHaveTextContent('You can retry this attempt');
+    expect(activity).not.toHaveTextContent(rawError);
+    const debug = screen.getByText('Debug information').closest('details');
+    expect(within(debug!).getByText(rawError)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Retry planning' }));
+    expect(api.createPlanRun).toHaveBeenCalledWith(4, {
+      run_type: 'retry',
+      request: 'Design the migration',
+      base_version_id: undefined,
+      expected_current_version_id: undefined,
+      source_run_id: 16,
+    });
   });
 });

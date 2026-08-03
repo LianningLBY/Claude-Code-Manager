@@ -84,24 +84,64 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
     ]
     payload = {
         "action": "request_input",
+        "plan": "",
         "reason": "All decisions materially affect the Plan",
         "questions": questions,
     }
+    expected = {key: value for key, value in payload.items() if key != "plan"}
 
     assert PLANNER_SCHEMA_V2["type"] == "object"
     assert REVIEWER_SCHEMA_V2["type"] == "object"
-    assert not {"oneOf", "allOf", "anyOf"} & PLANNER_SCHEMA_V2.keys()
-    assert not {"oneOf", "allOf", "anyOf"} & REVIEWER_SCHEMA_V2.keys()
-    planner_union = PLANNER_SCHEMA_V2["properties"]["response"]["oneOf"]
-    reviewer_union = REVIEWER_SCHEMA_V2["properties"]["response"]["oneOf"]
-    assert "maxItems" not in planner_union[1]["properties"]["questions"]
-    assert planner_union[1]["required"] == ["action", "reason", "questions"]
-    assert reviewer_union[2]["required"] == ["action", "reason", "questions"]
-    assert _validate_structured_v2("planner", json.dumps(payload)) == payload
+
+    def assert_portable_schema(schema):
+        assert not {
+            "oneOf", "allOf", "anyOf", "const", "minLength", "maxLength",
+        } & schema.keys()
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            assert set(schema["required"]) == set(properties)
+            for child in properties.values():
+                assert_portable_schema(child)
+        items = schema.get("items")
+        if isinstance(items, dict):
+            assert_portable_schema(items)
+
+    assert_portable_schema(PLANNER_SCHEMA_V2)
+    assert_portable_schema(REVIEWER_SCHEMA_V2)
+    planner_response = PLANNER_SCHEMA_V2["properties"]["response"]
+    reviewer_response = REVIEWER_SCHEMA_V2["properties"]["response"]
+    assert "maxItems" not in planner_response["properties"]["questions"]
+    assert planner_response["required"] == ["action", "plan", "reason", "questions"]
+    assert reviewer_response["required"] == [
+        "action", "feedback", "reason", "questions",
+    ]
+    assert _validate_structured_v2("planner", json.dumps(payload)) == expected
     assert _validate_structured_v2(
         "planner",
         json.dumps({"response": payload}),
-    ) == payload
+    ) == expected
+    assert _validate_structured_v2(
+        "planner",
+        json.dumps({
+            "response": {
+                "action": "propose",
+                "plan": "# Safe implementation plan",
+                "reason": "",
+                "questions": [],
+            },
+        }),
+    ) == {"action": "propose", "plan": "# Safe implementation plan"}
+    assert _validate_structured_v2(
+        "reviewer",
+        json.dumps({
+            "response": {
+                "action": "approve",
+                "feedback": "Ready to implement",
+                "reason": "",
+                "questions": [],
+            },
+        }),
+    ) == {"action": "approve", "feedback": "Ready to implement"}
     with pytest.raises(ValueError, match="valid reason"):
         _validate_structured_v2(
             "planner",
@@ -117,6 +157,25 @@ def test_interactive_schema_rejects_inactive_action_fields():
                 "action": "propose",
                 "plan": "Do the work",
                 "reason": "must remain rejected",
+                "questions": [],
+            }),
+        )
+
+    with pytest.raises(ValueError, match="request_input response contains invalid fields"):
+        _validate_structured_v2(
+            "reviewer",
+            json.dumps({
+                "action": "request_input",
+                "feedback": "must remain rejected",
+                "reason": "Choose a rollout window",
+                "questions": [{
+                    "id": "window",
+                    "header": "Rollout",
+                    "question": "Which rollout window should be used?",
+                    "response_type": "text",
+                    "options": [],
+                    "required": True,
+                }],
             }),
         )
 

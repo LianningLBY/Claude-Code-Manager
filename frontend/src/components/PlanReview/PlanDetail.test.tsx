@@ -139,7 +139,7 @@ describe('PlanDetail', () => {
 
     render(<PlanDetail plan={plan(current, prior)} onRefresh={vi.fn()} onNavigateTask={navigate} />);
 
-    expect(await screen.findByText('v1 applied')).toBeInTheDocument();
+    expect(await screen.findByText(/v1 applied/)).toBeInTheDocument();
     expect(screen.getByRole('option', { name: 'v2 · Awaiting approval · Current' })).toBeInTheDocument();
     expect(screen.getByRole('option', { name: 'v1 · Applied' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve v2 & create execution Task' })).toBeInTheDocument();
@@ -253,12 +253,8 @@ describe('PlanDetail', () => {
 
     render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
 
-    expect(await screen.findByRole('status', { name: 'Plan generation progress' }))
-      .toHaveTextContent('Drafting your Plan');
-    expect(screen.getByText(/This view updates automatically/)).toBeInTheDocument();
-    const activity = screen.getByRole('region', { name: 'Plan activity' });
-    expect(within(activity).getByText('Initial Plan')).toBeInTheDocument();
-    expect(within(activity).getByText('Creating the draft…')).toBeInTheDocument();
+    expect(await screen.findByRole('status')).toHaveTextContent('Creating draft');
+    expect(screen.queryByRole('region', { name: 'Plan activity' })).not.toBeInTheDocument();
 
     const debug = screen.getByText('Debug information').closest('details');
     expect(debug).not.toHaveAttribute('open');
@@ -314,9 +310,7 @@ describe('PlanDetail', () => {
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('Latest planning attempt failed');
     expect(alert).not.toHaveTextContent(rawError);
-    const activity = screen.getByRole('region', { name: 'Plan activity' });
-    expect(activity).toHaveTextContent('You can retry this attempt');
-    expect(activity).not.toHaveTextContent(rawError);
+    expect(screen.queryByRole('region', { name: 'Plan activity' })).not.toBeInTheDocument();
     const debug = screen.getByText('Debug information').closest('details');
     expect(within(debug!).getByText(rawError)).toBeInTheDocument();
 
@@ -328,5 +322,59 @@ describe('PlanDetail', () => {
       expected_current_version_id: undefined,
       source_run_id: 16,
     });
+  });
+
+  it('shows the planner draft read-only while the reviewer is running', async () => {
+    const prior = version({ id: 11, version_number: 1 });
+    const current = version({ review_verdict: null, reviewed_at: null });
+    const reviewerRun = {
+      id: 20,
+      plan_id: 4,
+      run_type: 'user_revision',
+      status: 'running',
+      current_stage: 'reviewer',
+      base_version_id: prior.id,
+      source_run_id: null,
+      result_version_id: current.id,
+      request_text: 'Tighten the rollout plan',
+      round: 1,
+      generation: 2,
+      instance_id: 2,
+      worker_id: null,
+      open_input_request_id: null,
+      interaction_count: 0,
+      max_interactions: 5,
+      execution_seconds: 9,
+      last_execution_started_at: '2026-08-03T11:07:57Z',
+      review_verdict: null,
+      review_feedback: null,
+      review_exhausted: false,
+      error: null,
+      created_at: '2026-08-03T11:06:48Z',
+      updated_at: '2026-08-03T11:07:57Z',
+      finished_at: null,
+      steps: [],
+      input_requests: [],
+    } satisfies PlanRun;
+    const resource = plan(current, prior);
+    resource.active_run_id = reviewerRun.id;
+    resource.active_run = reviewerRun;
+    resource.display_state = 'reviewer';
+    resource.latest_run_status = 'running';
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([reviewerRun]);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Reviewing draft · actions unlock when review finishes',
+    );
+    expect(await screen.findByRole('heading', { level: 1, name: 'Current proposal' }))
+      .toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('Revise from v2…')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Refresh context' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Fork' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Approve v2/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel planning' })).toBeInTheDocument();
   });
 });

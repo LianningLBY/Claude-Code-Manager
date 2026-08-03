@@ -6,7 +6,11 @@ import { ChevronRight, MessageCircle, X } from '../icons';
 import { PlanInputForm } from './PlanInputForm';
 import { usePlanEvents } from './usePlanEvents';
 
-export function PlanNeedsInputPanel() {
+interface Props {
+  onVisibilityChange?: (visible: boolean) => void;
+}
+
+export function PlanNeedsInputPanel({ onVisibilityChange }: Props = {}) {
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -18,13 +22,15 @@ export function PlanNeedsInputPanel() {
       const rows = await api.listPlans({ display_state: 'waiting_user' });
       setPlans(rows);
       setError(null);
+      onVisibilityChange?.(rows.length > 0);
       if (selectedId != null && !rows.some((plan) => plan.id === selectedId)) {
         setSelectedId(null);
       }
     } catch (fetchError) {
       setError(fetchError instanceof Error ? fetchError.message : String(fetchError));
+      onVisibilityChange?.(true);
     }
-  }, [selectedId]);
+  }, [onVisibilityChange, selectedId]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);

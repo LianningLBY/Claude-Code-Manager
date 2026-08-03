@@ -55,6 +55,8 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [needsInputVisible, setNeedsInputVisible] = useState(false);
+  const [reviewVisible, setReviewVisible] = useState(false);
   const close = useCallback(() => {
     setExpanded(false);
     setSelectedPlan(null);
@@ -114,10 +116,10 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
   return <div className="space-y-6">
     <PlanCreateForm onCreated={created} />
 
-    <section className="space-y-4" aria-label="Plans requiring action">
-      <h2 className="text-base font-semibold text-gray-200">Plans requiring action</h2>
-      <PlanNeedsInputPanel />
-      <VersionedPlanPanel />
+    <section className={needsInputVisible || reviewVisible ? 'space-y-4' : ''} aria-label={needsInputVisible || reviewVisible ? 'Plans requiring action' : undefined}>
+      {(needsInputVisible || reviewVisible) && <h2 className="text-base font-semibold text-gray-200">Plans requiring action</h2>}
+      <PlanNeedsInputPanel onVisibilityChange={setNeedsInputVisible} />
+      <VersionedPlanPanel onVisibilityChange={setReviewVisible} />
     </section>
 
     <section className="space-y-3" aria-label="All Plans">

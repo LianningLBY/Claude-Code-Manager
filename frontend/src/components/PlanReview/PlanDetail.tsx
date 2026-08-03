@@ -53,96 +53,17 @@ function confirmableStaleness(error: unknown): PlanStaleness | null {
 
 const ACTIVE_RUN_STATUSES = new Set<PlanRun['status']>(['queued', 'running', 'waiting_user']);
 
-function runTypeLabel(runType: string) {
-  if (runType === 'initial') return 'Initial Plan';
-  if (runType === 'user_revision') return 'Revision';
-  if (runType === 'refresh_context') return 'Context refresh';
-  if (runType === 'fork') return 'Forked Plan';
-  return 'Plan update';
-}
-
-function runStatusLabel(run: PlanRun, versions: PlanVersion[]) {
-  if (run.status === 'queued') return 'Waiting to start';
-  if (run.status === 'running') return run.current_stage === 'reviewer' ? 'Reviewing the draft…' : 'Creating the draft…';
-  if (run.status === 'waiting_user') return 'Needs your input';
-  if (run.status === 'failed') return 'Failed';
-  if (run.status === 'cancelled') return 'Cancelled';
-  const result = versions.find((version) => version.id === run.result_version_id);
-  return result ? `Created v${result.version_number}` : 'Completed';
-}
-
-function PlanGenerationStatus({ plan }: { plan: PlanResource }) {
+function planStatusText(plan: PlanResource) {
   const run = plan.active_run;
-  if (!run || !ACTIVE_RUN_STATUSES.has(run.status)) return null;
-  const reviewing = run.current_stage === 'reviewer' || plan.display_state === 'reviewer';
-  const waiting = run.status === 'waiting_user';
-  const queued = run.status === 'queued';
-  const title = waiting
-    ? 'Your input is needed'
-    : queued
-      ? 'Plan queued'
-      : reviewing
-        ? 'Reviewing the draft'
-        : 'Drafting your Plan';
-  const description = waiting
-    ? 'Answer the questions below so planning can continue.'
-    : queued
-      ? 'Planning will start as soon as a worker is available. This view updates automatically.'
-      : reviewing
-        ? 'The reviewer is checking the proposal for gaps and may request a revision. This view updates automatically.'
-        : 'The planner is analyzing your request and repository context. This view updates automatically.';
-  const steps = plan.pipeline_config.reviewer.enabled
-    ? ['Planning', 'Review', 'Ready']
-    : ['Planning', 'Ready'];
-  const activeStep = reviewing && plan.pipeline_config.reviewer.enabled ? 1 : 0;
-
-  return <section role="status" aria-live="polite" aria-label="Plan generation progress" className="mt-4 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-4">
-    <div className="flex items-start gap-3">
-      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 text-indigo-300">
-        {waiting ? <AlertCircle size={17} /> : <Loader2 size={17} className="animate-spin" />}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="text-sm font-semibold text-gray-100">{title}</div>
-        <p className="mt-1 text-xs leading-5 text-gray-400">{description}</p>
-      </div>
-    </div>
-    <div className="mt-4 flex items-center" aria-hidden="true">
-      {steps.map((step, index) => <div key={step} className="flex min-w-0 flex-1 items-center last:flex-none">
-        <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] ${index < activeStep
-          ? 'border-emerald-500 bg-emerald-600 text-white'
-          : index === activeStep
-            ? 'border-indigo-500 bg-indigo-500/20 text-indigo-300'
-            : 'border-gray-600 text-gray-500'
-        }`}>{index < activeStep ? <Check size={11} /> : index + 1}</span>
-        <span className={`ml-1.5 whitespace-nowrap text-[10px] ${index === activeStep ? 'font-medium text-indigo-300' : index < activeStep ? 'text-emerald-300' : 'text-gray-500'}`}>{step}</span>
-        {index < steps.length - 1 && <span className={`mx-2 h-px min-w-4 flex-1 ${index < activeStep ? 'bg-emerald-500/60' : 'bg-gray-700'}`} />}
-      </div>)}
-    </div>
-  </section>;
-}
-
-function PlanActivity({ runs, versions }: { runs: PlanRun[]; versions: PlanVersion[] }) {
-  if (runs.length === 0) return null;
-  return <section aria-label="Plan activity" className="mt-4 rounded-xl border border-gray-700 bg-gray-800/45 p-3">
-    <h2 className="text-xs font-semibold text-gray-300">Plan activity</h2>
-    <div className="mt-2 space-y-2">
-      {runs.map((run) => <div key={run.id} className="flex items-start gap-2 border-t border-gray-700/70 pt-2 first:border-0 first:pt-0">
-        <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${run.status === 'failed'
-          ? 'bg-red-400'
-          : run.status === 'cancelled'
-            ? 'bg-gray-500'
-            : ACTIVE_RUN_STATUSES.has(run.status)
-              ? 'animate-pulse bg-indigo-400'
-              : 'bg-emerald-400'
-        }`} />
-        <div className="min-w-0 flex-1">
-          <div className="text-xs font-medium text-gray-300">{runTypeLabel(run.run_type)}</div>
-          <div className="mt-0.5 text-[11px] text-gray-500">{runStatusLabel(run, versions)}</div>
-          {run.status === 'failed' && <div className="mt-1 text-[11px] text-red-300">No Plan Version was produced. You can retry this attempt.</div>}
-        </div>
-      </div>)}
-    </div>
-  </section>;
+  if (!run || !ACTIVE_RUN_STATUSES.has(run.status)) {
+    return planDisplayStateLabel(plan.display_state);
+  }
+  if (run.status === 'waiting_user') return 'Needs your input';
+  if (run.current_stage === 'reviewer' || plan.display_state === 'reviewer') {
+    return 'Reviewing draft · actions unlock when review finishes';
+  }
+  if (run.status === 'queued') return 'Queued';
+  return 'Creating draft';
 }
 
 export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onNavigateTask }: Props) {
@@ -178,6 +99,9 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const appliedVersion = versions.find((item) => item.applied) || null;
   const executionApplications = (plan.applications || []).filter((item) => item.execution_task_id != null);
   const latestFailedRun = runs.find((run) => run.status === 'failed') || null;
+  const activeRun = plan.active_run && ACTIVE_RUN_STATUSES.has(plan.active_run.status)
+    ? plan.active_run
+    : null;
 
   useEffect(() => {
     if (!shown) { setStaleness(null); return; }
@@ -244,10 +168,11 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-3">
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-semibold text-gray-100">Plan #{plan.id} · {plan.title}</div>
-        <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] text-gray-400">
-          <span className="rounded-full border border-gray-700 px-2 py-0.5">{planDisplayStateLabel(plan.display_state)}</span>
-          {plan.current_version && <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-indigo-300">v{plan.current_version.version_number} current</span>}
-          {appliedVersion && appliedVersion.id !== plan.current_version_id && <span className="rounded-full bg-teal-500/15 px-2 py-0.5 text-teal-300">v{appliedVersion.version_number} applied</span>}
+        <div role={activeRun ? 'status' : undefined} aria-live={activeRun ? 'polite' : undefined} className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-gray-400">
+          {activeRun && activeRun.status !== 'waiting_user' && <Loader2 size={11} className="animate-spin text-indigo-300" />}
+          <span className={activeRun ? 'text-indigo-300' : ''}>{planStatusText(plan)}</span>
+          {plan.current_version && <span>· v{plan.current_version.version_number} current</span>}
+          {appliedVersion && appliedVersion.id !== plan.current_version_id && <span className="text-teal-300">· v{appliedVersion.version_number} applied</span>}
           {staleness?.stale && <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-300">stale context</span>}
           {staleness?.hard_conflict && <span className="rounded-full bg-red-500/15 px-2 py-0.5 text-red-300">target conflict</span>}
         </div>
@@ -257,7 +182,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
 
     <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
-      {plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> No Plan Version was produced. Technical details are available in Debug information.</div>}
+      {plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> You can retry it; technical details are available in Debug information.</div>}
       {staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
         <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-400" />
         <div className="min-w-0">
@@ -268,11 +193,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       {staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       <CollapsiblePlanningRequest content={plan.initial_request} />
 
-      <PlanGenerationStatus plan={plan} />
-
       {plan.active_run?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm run={plan.active_run} request={plan.open_input_request} onAnswered={onRefresh} /></div>}
-
-      <PlanActivity runs={runs} versions={versions} />
 
       {shown ? <>
         {!current && <div className="mt-4 rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-2 text-xs text-gray-400">Historical Version. You can revise or fork it explicitly; approval remains limited to the current Version.</div>}
@@ -333,7 +254,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           : <button key={application.id} type="button" onClick={() => onNavigateTask?.(application.execution_task_id!)} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300">Open v{applied?.version_number || '?'} execution Task #{application.execution_task_id}</button>; })}
         {shown && current && plan.target_task_id != null && shown.human_decision === 'approved' && !shown.applied && onToggleVersion && <button type="button" onClick={() => onToggleVersion(shown.id)} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300">{selectedVersionIds.includes(shown.id) ? 'Detach from next message' : 'Attach to next message'}</button>}
         {shown && current && !plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.createPlanRun(plan.id, { run_type: 'refresh_context', request: 'Refresh this Plan using the latest task context and repository state.', base_version_id: shown.id, expected_current_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><RefreshCw size={12} /> Refresh context</button>}
-        {shown && <button type="button" disabled={busy} onClick={() => void mutate(() => api.forkPlan(plan.id, { base_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><GitBranch size={12} /> Fork</button>}
+        {shown && !plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.forkPlan(plan.id, { base_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><GitBranch size={12} /> Fork</button>}
         {plan.active_run && ['queued', 'running', 'waiting_user'].includes(plan.active_run.status) && <button type="button" disabled={busy} onClick={() => void mutate(() => api.cancelPlanRun(plan.active_run!.id))} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Cancel planning</button>}
         {!plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.updatePlan(plan.id, { archived: plan.archived_at == null, expected_lock_version: plan.lock_version }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-400">{plan.archived_at ? <ArchiveRestore size={12} /> : <Archive size={12} />}{plan.archived_at ? 'Restore' : 'Archive'}</button>}
       </div>

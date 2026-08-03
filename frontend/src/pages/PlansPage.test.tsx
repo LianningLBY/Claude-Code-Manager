@@ -20,7 +20,9 @@ vi.mock('../components/PlanReview/PlanCreateForm', () => ({
   ),
 }));
 vi.mock('../components/PlanReview/PlanNeedsInputPanel', () => ({
-  PlanNeedsInputPanel: () => <div>Needs input panel</div>,
+  PlanNeedsInputPanel: ({ onVisibilityChange }: { onVisibilityChange?: (visible: boolean) => void }) => (
+    <button type="button" onClick={() => onVisibilityChange?.(true)}>Show input actions</button>
+  ),
 }));
 vi.mock('../components/PlanReview/VersionedPlanPanel', () => ({
   VersionedPlanPanel: () => <div>Review panel</div>,
@@ -100,13 +102,18 @@ describe('PlansPage', () => {
     vi.mocked(api.getPlan).mockResolvedValue(plan);
   });
 
-  it('owns the Plan catalog, action queues, and deep-link selection', async () => {
+  it('owns the Plan catalog, hides an empty action heading, and supports deep-link selection', async () => {
     const onSelectedPlanChange = vi.fn();
     render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} />);
 
     expect(await screen.findByRole('button', { name: plan.title })).toBeInTheDocument();
-    expect(screen.getByRole('region', { name: 'Plans requiring action' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Plans requiring action' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Plans requiring action' })).not.toBeInTheDocument();
     expect(api.listPlans).toHaveBeenCalledWith(expect.objectContaining({ limit: 20, offset: 0 }));
+
+    await userEvent.click(screen.getByRole('button', { name: 'Show input actions' }));
+    expect(screen.getByRole('region', { name: 'Plans requiring action' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Plans requiring action' })).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: plan.title }));
     expect(onSelectedPlanChange).toHaveBeenCalledWith(plan.id);

@@ -6,7 +6,11 @@ import { ChevronRight } from '../icons';
 import { PlanDetail } from './PlanDetail';
 import { usePlanEvents } from './usePlanEvents';
 
-export function VersionedPlanPanel() {
+interface Props {
+  onVisibilityChange?: (visible: boolean) => void;
+}
+
+export function VersionedPlanPanel({ onVisibilityChange }: Props = {}) {
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -22,9 +26,13 @@ export function VersionedPlanPanel() {
       ));
       setPlans(rows);
       setError(null);
+      onVisibilityChange?.(rows.length > 0);
       setSelectedId((current) => current != null && rows.some((plan) => plan.id === current) ? current : null);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-  }, []);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      onVisibilityChange?.(true);
+    }
+  }, [onVisibilityChange]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);

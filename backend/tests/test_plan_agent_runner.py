@@ -92,30 +92,31 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
     assert REVIEWER_SCHEMA_V2["type"] == "object"
     assert not {"oneOf", "allOf", "anyOf"} & PLANNER_SCHEMA_V2.keys()
     assert not {"oneOf", "allOf", "anyOf"} & REVIEWER_SCHEMA_V2.keys()
-    assert "maxItems" not in PLANNER_SCHEMA_V2["properties"]["questions"]
+    planner_union = PLANNER_SCHEMA_V2["properties"]["response"]["oneOf"]
+    reviewer_union = REVIEWER_SCHEMA_V2["properties"]["response"]["oneOf"]
+    assert "maxItems" not in planner_union[1]["properties"]["questions"]
+    assert planner_union[1]["required"] == ["action", "reason", "questions"]
+    assert reviewer_union[2]["required"] == ["action", "reason", "questions"]
     assert _validate_structured_v2("planner", json.dumps(payload)) == payload
-
-
-def test_interactive_schema_projects_known_inactive_action_fields():
     assert _validate_structured_v2(
         "planner",
-        json.dumps({
-            "action": "propose",
-            "plan": "Schema smoke test passed.",
-            "reason": "Known optional field emitted by Claude structured output",
-        }),
-    ) == {
-        "action": "propose",
-        "plan": "Schema smoke test passed.",
-    }
+        json.dumps({"response": payload}),
+    ) == payload
+    with pytest.raises(ValueError, match="valid reason"):
+        _validate_structured_v2(
+            "planner",
+            json.dumps({"response": {**payload, "reason": ""}}),
+        )
 
-    with pytest.raises(ValueError, match="invalid fields"):
+
+def test_interactive_schema_rejects_inactive_action_fields():
+    with pytest.raises(ValueError, match="propose or request_input"):
         _validate_structured_v2(
             "planner",
             json.dumps({
                 "action": "propose",
                 "plan": "Do the work",
-                "unexpected": "must remain rejected",
+                "reason": "must remain rejected",
             }),
         )
 

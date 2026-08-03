@@ -1,8 +1,8 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { api, type PlanResource, type PlanVersion } from '../../api/client';
+import { api, type PlanResource, type PlanRun, type PlanVersion } from '../../api/client';
 import { PlanDetail } from './PlanDetail';
 
 vi.mock('../../api/client', () => ({
@@ -206,5 +206,62 @@ describe('PlanDetail', () => {
     expect(screen.queryByText(/This action is blocked/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve v2 & create execution Task' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Reject v2' })).toBeEnabled();
+  });
+
+  it('shows live planning feedback and keeps internal Run identifiers inside Debug information', async () => {
+    const prior = version({ id: 11, version_number: 1 });
+    const current = version({});
+    const activeRun = {
+      id: 15,
+      plan_id: 4,
+      run_type: 'initial',
+      status: 'running',
+      current_stage: 'planner',
+      base_version_id: null,
+      source_run_id: null,
+      result_version_id: null,
+      request_text: 'Design the migration',
+      round: 1,
+      generation: 1,
+      instance_id: 2,
+      worker_id: null,
+      open_input_request_id: null,
+      interaction_count: 0,
+      max_interactions: 5,
+      execution_seconds: 8,
+      last_execution_started_at: '2026-08-03T08:00:00Z',
+      review_verdict: null,
+      review_feedback: null,
+      review_exhausted: false,
+      error: null,
+      created_at: '2026-08-03T08:00:00Z',
+      updated_at: '2026-08-03T08:00:08Z',
+      finished_at: null,
+      steps: [],
+      input_requests: [],
+    } satisfies PlanRun;
+    const resource = plan(current, prior);
+    resource.current_version_id = null;
+    resource.current_version = null;
+    resource.active_run_id = activeRun.id;
+    resource.active_run = activeRun;
+    resource.display_state = 'planner';
+    resource.latest_run_status = 'running';
+    vi.mocked(api.listPlanVersions).mockResolvedValue([]);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([activeRun]);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    expect(await screen.findByRole('status', { name: 'Plan generation progress' }))
+      .toHaveTextContent('Drafting your Plan');
+    expect(screen.getByText(/This view updates automatically/)).toBeInTheDocument();
+    const activity = screen.getByRole('region', { name: 'Plan activity' });
+    expect(within(activity).getByText('Initial Plan')).toBeInTheDocument();
+    expect(within(activity).getByText('Creating the draft…')).toBeInTheDocument();
+
+    const debug = screen.getByText('Debug information').closest('details');
+    expect(debug).not.toHaveAttribute('open');
+    expect(within(debug!).getByText(/Run #15 · initial · running · round 1/))
+      .toBeInTheDocument();
   });
 });

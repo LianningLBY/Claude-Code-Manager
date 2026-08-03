@@ -241,6 +241,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [error, setError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
   const fileUpload = useFileUpload();
+  const addChatFiles = fileUpload.addFiles;
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(task.context_window_usage ?? null);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -1363,7 +1364,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   useFileDrop({
     onDrop: (files) => {
       if (!injectingRef.current) {
-        fileUpload.addFiles(files, (msg) => setDropError(msg));
+        addChatFiles(files, (msg) => setDropError(msg));
       }
     },
     disabled: injecting || (!task.session_id && !task.shared_from_id),
@@ -1373,6 +1374,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (injecting || (!task.session_id && !task.shared_from_id)) return;
     const handlePaste = (e: ClipboardEvent) => {
       if (injectingRef.current) return;
+      const target = e.target;
+      if (target instanceof Element && target.closest('[data-attachment-paste-target]')) return;
       const items = e.clipboardData?.items;
       if (!items) return;
       const files: File[] = [];
@@ -1384,7 +1387,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       if (files.length > 0) {
         e.preventDefault();
-        fileUpload.addFiles(files, (msg) => setDropError(msg));
+        addChatFiles(files, (msg) => setDropError(msg));
       }
     };
     document.addEventListener('paste', handlePaste);
@@ -1392,7 +1395,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [
     task.session_id,
     task.shared_from_id,
-    fileUpload.addFiles,
+    addChatFiles,
     injecting,
   ]);
 
@@ -1410,7 +1413,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
-    fileUpload.addFiles(files, (msg) => setDropError(msg));
+    addChatFiles(files, (msg) => setDropError(msg));
     e.target.value = '';
   };
 

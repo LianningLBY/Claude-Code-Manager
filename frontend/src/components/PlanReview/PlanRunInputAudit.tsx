@@ -11,7 +11,7 @@ export function PlanRunInputAudit({ runs, version }: { runs: PlanRun[]; version:
   if (requests.length === 0) return null;
   return (
     <details className="mt-4 rounded-xl border border-dashed border-gray-700 bg-gray-800/35 p-3 text-xs text-gray-400">
-      <summary className="cursor-pointer font-semibold text-gray-300">Input history for Run #{run!.id} ({requests.length})</summary>
+      <summary className="cursor-pointer font-semibold text-gray-300">Input history ({requests.length})</summary>
       <div className="mt-3 space-y-3">
         {requests.map((request) => {
           const answers = new Map((request.answers || []).map((item) => [item.question_id, item.value]));

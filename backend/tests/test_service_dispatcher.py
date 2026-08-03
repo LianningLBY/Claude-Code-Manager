@@ -23,6 +23,8 @@ from backend.services.task_skill_overrides import (
     TEMP_SKILLS_GENERATION_KEY,
 )
 from backend.models.instance import Instance
+from backend.models.plan import Plan
+from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 
 
@@ -158,6 +160,102 @@ async def test_status_not_running(db_factory):
     s = d.status()
     assert s["running"] is False
     assert s["active_tasks"] == {}
+
+
+@pytest.mark.asyncio
+async def test_claim_plan_run_returns_exact_persisted_generation(db_factory):
+    """The lifecycle fence must match the generation committed by the claim."""
+    dispatcher = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        instance = Instance(name="plan-worker", status="idle")
+        plan = Plan(
+            title="Generation fence",
+            initial_request="Plan this",
+            pipeline_config={},
+        )
+        db.add_all([instance, plan])
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="initial",
+            status="queued",
+            generation=0,
+            pipeline_config={},
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        instance_id = instance.id
+        run_id = run.id
+
+        claimed = await dispatcher._claim_plan_run(db, instance=instance)
+
+    assert claimed == (run_id, 1)
+    async with db_factory() as db:
+        persisted_run = await db.get(PlanAgentRun, run_id)
+        persisted_owner = await db.get(Instance, instance_id)
+        assert persisted_run.status == "running"
+        assert persisted_run.generation == claimed[1]
+        assert persisted_run.instance_id == instance_id
+        assert persisted_owner.status == "running"
+        assert persisted_owner.current_plan_run_id == run_id
+
+
+@pytest.mark.asyncio
+async def test_recover_orphaned_plan_run_without_disturbing_reused_instance(
+    db_factory,
+):
+    """A restart requeues a lost Run even if its old slot now owns a Task."""
+    dispatcher = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(title="current owner", description="keep running", status="executing")
+        instance = Instance(name="reused-worker", status="running", pid=4321)
+        plan = Plan(
+            title="Recover me",
+            initial_request="Plan this",
+            pipeline_config={},
+        )
+        db.add_all([task, instance, plan])
+        await db.flush()
+        task.instance_id = instance.id
+        instance.current_task_id = task.id
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="initial",
+            status="running",
+            current_stage="planner",
+            generation=1,
+            instance_id=instance.id,
+            pipeline_config={},
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+        plan_id = plan.id
+        run_id = run.id
+
+    await dispatcher._recover_versioned_plan_runs()
+
+    async with db_factory() as db:
+        recovered = await db.get(PlanAgentRun, run_id)
+        owner = await db.get(Instance, instance_id)
+        plan = await db.get(Plan, plan_id)
+        assert recovered.status == "queued"
+        assert recovered.generation == 2
+        assert recovered.instance_id is None
+        assert recovered.last_execution_started_at is None
+        assert plan.active_run_id == run_id
+        assert owner.status == "running"
+        assert owner.pid == 4321
+        assert owner.current_task_id == task_id
+        assert owner.current_plan_run_id is None
 
 
 @pytest.mark.asyncio

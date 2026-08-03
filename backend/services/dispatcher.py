@@ -2638,6 +2638,7 @@ class GlobalDispatcher:
             plan.updated_at = now
             await db.commit()
             return None
+        claimed_generation = run.generation + 1
         claimed_run = await db.execute(
             update(PlanAgentRun)
             .where(
@@ -2650,7 +2651,7 @@ class GlobalDispatcher:
             .values(
                 status="running",
                 instance_id=instance.id,
-                generation=PlanAgentRun.generation + 1,
+                generation=claimed_generation,
                 last_execution_started_at=now,
                 updated_at=now,
             )
@@ -2673,7 +2674,7 @@ class GlobalDispatcher:
             await db.rollback()
             return None
         await db.commit()
-        return run.id, run.generation + 1
+        return run.id, claimed_generation
 
     async def _cleanup_plan_run_owner(
         self,

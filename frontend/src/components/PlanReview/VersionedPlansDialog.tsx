@@ -23,8 +23,27 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const uploads = useFileUpload();
+  const addPlanFiles = uploads.addFiles;
   const fileInput = useRef<HTMLInputElement>(null);
+  const createForm = useRef<HTMLFormElement>(null);
   const dialogRef = useDialogA11y(open, onClose);
+
+  useEffect(() => {
+    const form = createForm.current;
+    if (!form) return;
+    const handlePaste = (event: ClipboardEvent) => {
+      const files = Array.from(event.clipboardData?.items || [])
+        .filter((item) => item.kind === 'file')
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file != null);
+      if (files.length === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      addPlanFiles(files, setError);
+    };
+    form.addEventListener('paste', handlePaste);
+    return () => form.removeEventListener('paste', handlePaste);
+  }, [addPlanFiles]);
 
   const refresh = useCallback(async (showLoading = false) => {
     if (showLoading) setLoading(true);
@@ -46,8 +65,8 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
     if (!requestText.trim() || busy || uploads.isUploading || uploads.hasFailed) return;
     setBusy(true); setError(null);
     try {
-      const created = await api.createPlan({ input: requestText.trim(), target_task_id: taskId, ...uploadPayload(uploads.uploadedResults) });
-      setRequestText(''); uploads.clear(); await refresh(); setSelectedId(created.id);
+      await api.createPlan({ input: requestText.trim(), target_task_id: taskId, ...uploadPayload(uploads.uploadedResults) });
+      setRequestText(''); uploads.clear(); await refresh();
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
   };
@@ -59,9 +78,9 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
       <button type="button" onClick={onClose} className="absolute right-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 hover:bg-gray-800" aria-label="Close Plans"><X size={16} /></button>
       <section className={`${selected ? 'hidden' : 'flex'} w-full flex-col border-gray-800 sm:flex sm:w-80 sm:shrink-0 sm:border-r`}>
         <div className="border-b border-gray-800 p-4 pr-12"><div className="flex items-center gap-2 text-sm font-semibold text-gray-100"><ListTodo size={16} className="text-indigo-300" /> Plans <span className="text-xs font-normal text-gray-500">Task #{taskId}</span></div>
-          <form className="mt-3 space-y-2" onSubmit={(event) => { event.preventDefault(); void create(); }}><fieldset disabled={busy} className="space-y-2"><textarea value={requestText} onChange={(event) => setRequestText(event.target.value)} rows={4} maxLength={200000} placeholder="Create an independent Plan…" className="w-full resize-none rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
+          <form ref={createForm} data-attachment-paste-target="plan-create" className="mt-3 space-y-2" onSubmit={(event) => { event.preventDefault(); void create(); }}><fieldset disabled={busy} className="space-y-2"><textarea value={requestText} onChange={(event) => setRequestText(event.target.value)} rows={4} maxLength={200000} placeholder="Create an independent Plan…" className="w-full resize-none rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
             {uploads.uploads.length > 0 && <div className="flex flex-wrap gap-1.5">{uploads.uploads.map((item) => <span key={item.id} className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-400">{item.preview && <img src={item.preview} alt="" className="h-7 w-7 rounded object-cover" />}<span className="max-w-32 truncate">{item.file.name}</span>{item.status === 'uploading' && <Loader2 size={10} className="animate-spin" />}<button type="button" onClick={() => uploads.removeFile(item.id)}><X size={10} /></button></span>)}</div>}
-            <div className="flex items-center justify-between"><input ref={fileInput} type="file" multiple className="hidden" onChange={(event) => { uploads.addFiles(Array.from(event.target.files || []), setError); event.target.value = ''; }} /><button type="button" onClick={() => fileInput.current?.click()} className="rounded-lg border border-gray-700 p-2 text-gray-400" aria-label="Attach Plan files"><Paperclip size={13} /></button><button type="submit" disabled={!requestText.trim() || uploads.isUploading || uploads.hasFailed} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40">Create Plan</button></div></fieldset></form>
+            <div className="flex items-center justify-between"><input ref={fileInput} type="file" multiple className="hidden" onChange={(event) => { addPlanFiles(Array.from(event.target.files || []), setError); event.target.value = ''; }} /><button type="button" onClick={() => fileInput.current?.click()} className="rounded-lg border border-gray-700 p-2 text-gray-400" aria-label="Attach Plan files"><Paperclip size={13} /></button><button type="submit" disabled={!requestText.trim() || uploads.isUploading || uploads.hasFailed} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40">Create Plan</button></div></fieldset></form>
         </div>
         <div className="flex gap-1 overflow-x-auto border-b border-gray-800 px-3 py-2">{filters.map((item) => <button key={item.id} type="button" onClick={() => setFilter(item.id)} className={`rounded-full px-2 py-1 text-[10px] ${filter === item.id ? 'bg-indigo-500/20 text-indigo-300' : 'text-gray-500 hover:bg-gray-800'}`}>{item.label} {plans.filter((plan) => filterPlan(plan, item.id)).length}</button>)}</div>
         {error && <div className="m-3 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-300">{error}</div>}
@@ -82,7 +101,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
               <div className="flex items-start gap-2">
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap gap-1">
-                    <span className={`rounded-full px-2 py-0.5 text-[10px] ${isSelected ? 'bg-indigo-400/20 text-indigo-200' : 'bg-gray-700 text-gray-300'}`}>{planDisplayStateLabel(plan.display_state)}</span>
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] ${isSelected ? 'bg-indigo-500/20 text-indigo-300 ring-1 ring-inset ring-indigo-500/30' : 'bg-gray-700 text-gray-300'}`}>{planDisplayStateLabel(plan.display_state)}</span>
                     {plan.current_version && <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[10px] text-indigo-300">v{plan.current_version.version_number}</span>}
                     {plan.current_version && selectedVersionIds.includes(plan.current_version.id) && <span className="rounded-full bg-teal-500/15 px-2 py-0.5 text-[10px] text-teal-300">Attached</span>}
                   </div>

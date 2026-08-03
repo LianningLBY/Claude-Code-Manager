@@ -106,9 +106,9 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
     if (local) setSelectedPlan(local);
     onSelectedPlanChange(planId);
   };
-  const created = (plan: PlanResource) => {
-    setSelectedPlan(plan);
-    onSelectedPlanChange(plan.id);
+  const created = () => {
+    if (page === 1) void refresh(true);
+    else setPage(1);
   };
 
   return <div className="space-y-6">

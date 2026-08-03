@@ -113,7 +113,7 @@ describe('PlansPage', () => {
     expect(screen.getByText(`Detail for ${plan.title}`)).toBeInTheDocument();
   });
 
-  it('uses canonical Plan search/archive filters and opens a newly created Plan', async () => {
+  it('uses canonical Plan search/archive filters and keeps a newly created Plan in the catalog', async () => {
     const onSelectedPlanChange = vi.fn();
     render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} />);
 
@@ -127,7 +127,7 @@ describe('PlansPage', () => {
     })));
 
     await userEvent.click(screen.getByRole('button', { name: 'Create standalone Plan' }));
-    expect(onSelectedPlanChange).toHaveBeenCalledWith(plan.id);
-    expect(screen.getByText(`Detail for ${plan.title}`)).toBeInTheDocument();
+    expect(onSelectedPlanChange).not.toHaveBeenCalled();
+    expect(screen.queryByText(`Detail for ${plan.title}`)).not.toBeInTheDocument();
   });
 });

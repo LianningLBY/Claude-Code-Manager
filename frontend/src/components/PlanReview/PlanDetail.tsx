@@ -51,6 +51,100 @@ function confirmableStaleness(error: unknown): PlanStaleness | null {
     : null;
 }
 
+const ACTIVE_RUN_STATUSES = new Set<PlanRun['status']>(['queued', 'running', 'waiting_user']);
+
+function runTypeLabel(runType: string) {
+  if (runType === 'initial') return 'Initial Plan';
+  if (runType === 'user_revision') return 'Revision';
+  if (runType === 'refresh_context') return 'Context refresh';
+  if (runType === 'fork') return 'Forked Plan';
+  return 'Plan update';
+}
+
+function runStatusLabel(run: PlanRun, versions: PlanVersion[]) {
+  if (run.status === 'queued') return 'Waiting to start';
+  if (run.status === 'running') return run.current_stage === 'reviewer' ? 'Reviewing the draft…' : 'Creating the draft…';
+  if (run.status === 'waiting_user') return 'Needs your input';
+  if (run.status === 'failed') return 'Failed';
+  if (run.status === 'cancelled') return 'Cancelled';
+  const result = versions.find((version) => version.id === run.result_version_id);
+  return result ? `Created v${result.version_number}` : 'Completed';
+}
+
+function PlanGenerationStatus({ plan }: { plan: PlanResource }) {
+  const run = plan.active_run;
+  if (!run || !ACTIVE_RUN_STATUSES.has(run.status)) return null;
+  const reviewing = run.current_stage === 'reviewer' || plan.display_state === 'reviewer';
+  const waiting = run.status === 'waiting_user';
+  const queued = run.status === 'queued';
+  const title = waiting
+    ? 'Your input is needed'
+    : queued
+      ? 'Plan queued'
+      : reviewing
+        ? 'Reviewing the draft'
+        : 'Drafting your Plan';
+  const description = waiting
+    ? 'Answer the questions below so planning can continue.'
+    : queued
+      ? 'Planning will start as soon as a worker is available. This view updates automatically.'
+      : reviewing
+        ? 'The reviewer is checking the proposal for gaps and may request a revision. This view updates automatically.'
+        : 'The planner is analyzing your request and repository context. This view updates automatically.';
+  const steps = plan.pipeline_config.reviewer.enabled
+    ? ['Planning', 'Review', 'Ready']
+    : ['Planning', 'Ready'];
+  const activeStep = reviewing && plan.pipeline_config.reviewer.enabled ? 1 : 0;
+
+  return <section role="status" aria-live="polite" aria-label="Plan generation progress" className="mt-4 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-4">
+    <div className="flex items-start gap-3">
+      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 text-indigo-300">
+        {waiting ? <AlertCircle size={17} /> : <Loader2 size={17} className="animate-spin" />}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-semibold text-gray-100">{title}</div>
+        <p className="mt-1 text-xs leading-5 text-gray-400">{description}</p>
+      </div>
+    </div>
+    <div className="mt-4 flex items-center" aria-hidden="true">
+      {steps.map((step, index) => <div key={step} className="flex min-w-0 flex-1 items-center last:flex-none">
+        <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] ${index < activeStep
+          ? 'border-emerald-500 bg-emerald-600 text-white'
+          : index === activeStep
+            ? 'border-indigo-500 bg-indigo-500/20 text-indigo-300'
+            : 'border-gray-600 text-gray-500'
+        }`}>{index < activeStep ? <Check size={11} /> : index + 1}</span>
+        <span className={`ml-1.5 whitespace-nowrap text-[10px] ${index === activeStep ? 'font-medium text-indigo-300' : index < activeStep ? 'text-emerald-300' : 'text-gray-500'}`}>{step}</span>
+        {index < steps.length - 1 && <span className={`mx-2 h-px min-w-4 flex-1 ${index < activeStep ? 'bg-emerald-500/60' : 'bg-gray-700'}`} />}
+      </div>)}
+    </div>
+  </section>;
+}
+
+function PlanActivity({ runs, versions }: { runs: PlanRun[]; versions: PlanVersion[] }) {
+  if (runs.length === 0) return null;
+  return <section aria-label="Plan activity" className="mt-4 rounded-xl border border-gray-700 bg-gray-800/45 p-3">
+    <h2 className="text-xs font-semibold text-gray-300">Plan activity</h2>
+    <div className="mt-2 space-y-2">
+      {runs.map((run) => <div key={run.id} className="flex items-start gap-2 border-t border-gray-700/70 pt-2 first:border-0 first:pt-0">
+        <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${run.status === 'failed'
+          ? 'bg-red-400'
+          : run.status === 'cancelled'
+            ? 'bg-gray-500'
+            : ACTIVE_RUN_STATUSES.has(run.status)
+              ? 'animate-pulse bg-indigo-400'
+              : 'bg-emerald-400'
+        }`} />
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-medium text-gray-300">{runTypeLabel(run.run_type)}</div>
+          <div className="mt-0.5 text-[11px] text-gray-500">{runStatusLabel(run, versions)}</div>
+          {run.status === 'failed' && run.error && <div className="mt-1 text-[11px] text-red-300">{run.error}</div>}
+        </div>
+      </div>)}
+    </div>
+  </section>;
+}
+
 export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onNavigateTask }: Props) {
   const [versions, setVersions] = useState<PlanVersion[]>([]);
   const [runs, setRuns] = useState<PlanRun[]>([]);
@@ -162,7 +256,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
 
     <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
-      {plan.latest_run_error && <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">Latest Run {plan.latest_run_status}: {plan.latest_run_error}</div>}
+      {plan.latest_run_error && <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">Latest planning attempt {plan.latest_run_status}: {plan.latest_run_error}</div>}
       {staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
         <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-400" />
         <div className="min-w-0">
@@ -173,15 +267,11 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       {staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       <CollapsiblePlanningRequest content={plan.initial_request} />
 
-      <details className="mt-3 rounded-lg border border-gray-800 bg-gray-900/60 p-3 text-xs text-gray-400">
-        <summary className="cursor-pointer font-medium text-gray-300">Frozen Pipeline routes</summary>
-        <div className="mt-2 grid gap-2 sm:grid-cols-2">
-          <div>Planner: {route.planner.primary.provider} / {route.planner.primary.model} / {route.planner.primary.effort || 'default'}<br />Fallback: {route.planner.fallback.provider} / {route.planner.fallback.model}</div>
-          <div>Reviewer: {route.reviewer.enabled ? `${route.reviewer.primary.provider} / ${route.reviewer.primary.model} / ${route.reviewer.primary.effort || 'default'}` : 'disabled'}<br />Input pauses: {route.max_interactions} · revision rounds: {route.max_revision_cycles}</div>
-        </div>
-      </details>
+      <PlanGenerationStatus plan={plan} />
 
       {plan.active_run?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm run={plan.active_run} request={plan.open_input_request} onAnswered={onRefresh} /></div>}
+
+      <PlanActivity runs={runs} versions={versions} />
 
       {shown ? <>
         {!current && <div className="mt-4 rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-2 text-xs text-gray-400">Historical Version. You can revise or fork it explicitly; approval remains limited to the current Version.</div>}
@@ -196,13 +286,31 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           <div className="rounded-xl border border-gray-700 bg-gray-950/60 p-4"><div className="mb-2 text-xs text-indigo-300">v{shown.version_number} · {planVersionDisplayLabel(shown)}{current ? ' · Current' : ''}</div><MarkdownContent content={shown.content} /></div>
         </div>
         {shown.review_feedback && <div className="mt-3 rounded-xl border border-gray-700 bg-gray-800/60 p-3 text-sm text-gray-300"><div className="mb-1 text-xs font-semibold text-gray-500">Reviewer feedback</div>{shown.review_feedback}</div>}
-        {(shown.repo_revision || shown.reviewer_repo_revision) && <details className="mt-3 rounded-lg border border-gray-800 bg-gray-900/50 p-3 text-xs text-gray-400"><summary className="cursor-pointer font-medium text-gray-300">Repository audit</summary><div className="mt-2 grid gap-2 lg:grid-cols-2"><div><div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Planner snapshot</div><pre className="overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(shown.repo_revision, null, 2)}</pre></div><div><div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Reviewer snapshot</div><pre className="overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(shown.reviewer_repo_revision, null, 2)}</pre></div></div></details>}
         <PlanRunInputAudit runs={runs} version={shown} />
       </> : <div className="mt-4 rounded-xl border border-gray-800 px-4 py-8 text-center text-sm text-gray-500">No Version has been produced yet.</div>}
 
-      {runs.length > 0 && <details className="mt-4 rounded-xl border border-gray-800 bg-gray-900/50 p-3 text-xs text-gray-400"><summary className="cursor-pointer font-semibold text-gray-300">Run timeline ({runs.length})</summary><div className="mt-2 space-y-2">{runs.map((run) => <div key={run.id} className="border-t border-gray-800 pt-2 first:border-0">Run #{run.id} · {run.run_type} · {run.status} · round {run.round}{run.steps.map((step) => <div key={step.id} className="ml-3 text-gray-500">{step.step_type}: {step.provider}/{step.model || 'default'} ({step.route_slot || 'primary'}) · {step.status}</div>)}</div>)}</div></details>}
-
       {plan.applications.length > 0 && <details className="mt-4 rounded-xl border border-gray-800 bg-gray-900/50 p-3 text-xs text-gray-400"><summary className="cursor-pointer font-semibold text-gray-300">Application history ({plan.applications.length})</summary><div className="mt-2 space-y-1">{plan.applications.map((application) => { const applied = versions.find((item) => item.id === application.plan_version_id); return <div key={application.id}>v{applied?.version_number || '?'} · {application.application_type === 'execution_task' ? `execution Task #${application.execution_task_id}` : `chat message #${application.user_log_id}`}</div>; })}</div></details>}
+
+      <details className="mt-4 rounded-xl border border-dashed border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-400">
+        <summary className="cursor-pointer font-semibold text-gray-400">Debug information</summary>
+        <div className="mt-3 space-y-4">
+          <section>
+            <div className="mb-1 font-semibold text-gray-300">Pipeline routes</div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <div>Planner: {route.planner.primary.provider} / {route.planner.primary.model} / {route.planner.primary.effort || 'default'}<br />Fallback: {route.planner.fallback.provider} / {route.planner.fallback.model}</div>
+              <div>Reviewer: {route.reviewer.enabled ? `${route.reviewer.primary.provider} / ${route.reviewer.primary.model} / ${route.reviewer.primary.effort || 'default'}` : 'disabled'}<br />Input pauses: {route.max_interactions} · revision rounds: {route.max_revision_cycles}</div>
+            </div>
+          </section>
+          {runs.length > 0 && <section>
+            <div className="mb-1 font-semibold text-gray-300">Runs</div>
+            <div className="space-y-2">{runs.map((run) => <div key={run.id} className="border-t border-gray-800 pt-2 first:border-0 first:pt-0">Run #{run.id} · {run.run_type} · {run.status} · round {run.round}{run.steps.map((step) => <div key={step.id} className="ml-3 text-gray-500">{step.step_type}: {step.provider}/{step.model || 'default'} ({step.route_slot || 'primary'}) · {step.status}</div>)}</div>)}</div>
+          </section>}
+          {shown && (shown.repo_revision || shown.reviewer_repo_revision) && <section>
+            <div className="mb-1 font-semibold text-gray-300">Repository audit</div>
+            <div className="grid gap-2 lg:grid-cols-2"><div><div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Planner snapshot</div><pre className="overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(shown.repo_revision, null, 2)}</pre></div><div><div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Reviewer snapshot</div><pre className="overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(shown.reviewer_repo_revision, null, 2)}</pre></div></div>
+          </section>}
+        </div>
+      </details>
 
       {shown && !plan.active_run_id && <div className="mt-5 space-y-2 border-t border-gray-800 pt-4">
         <textarea value={revision} onChange={(event) => setRevision(event.target.value)} rows={3} maxLength={50000} placeholder={`Revise from v${shown.version_number}…`} disabled={busy} className="w-full resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500 disabled:opacity-60" />
@@ -224,7 +332,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         {shown && current && plan.target_task_id != null && shown.human_decision === 'approved' && !shown.applied && onToggleVersion && <button type="button" onClick={() => onToggleVersion(shown.id)} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300">{selectedVersionIds.includes(shown.id) ? 'Detach from next message' : 'Attach to next message'}</button>}
         {shown && current && !plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.createPlanRun(plan.id, { run_type: 'refresh_context', request: 'Refresh this Plan using the latest task context and repository state.', base_version_id: shown.id, expected_current_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><RefreshCw size={12} /> Refresh context</button>}
         {shown && <button type="button" disabled={busy} onClick={() => void mutate(() => api.forkPlan(plan.id, { base_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><GitBranch size={12} /> Fork</button>}
-        {plan.active_run && ['queued', 'running', 'waiting_user'].includes(plan.active_run.status) && <button type="button" disabled={busy} onClick={() => void mutate(() => api.cancelPlanRun(plan.active_run!.id))} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Cancel Run</button>}
+        {plan.active_run && ['queued', 'running', 'waiting_user'].includes(plan.active_run.status) && <button type="button" disabled={busy} onClick={() => void mutate(() => api.cancelPlanRun(plan.active_run!.id))} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Cancel planning</button>}
         {!plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.updatePlan(plan.id, { archived: plan.archived_at == null, expected_lock_version: plan.lock_version }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-400">{plan.archived_at ? <ArchiveRestore size={12} /> : <Archive size={12} />}{plan.archived_at ? 'Restore' : 'Archive'}</button>}
       </div>
     </div>

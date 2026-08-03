@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ChatView } from './ChatView';
 import type { Task, Project, ChatMessage, PlanResource, PlanVersion } from '../../api/client';
@@ -2213,6 +2213,28 @@ describe('independent Plan attachments', () => {
     expect(screen.queryByRole('button', { name: 'Models' })).not.toBeInTheDocument();
   });
 
+  it('keeps the Plan catalog open after creating an associated Plan', async () => {
+    const created = makePlan({ id: 86, title: 'New background Plan' });
+    let refreshes = 0;
+    (api.createPlan as ReturnType<typeof vi.fn>).mockResolvedValue(created);
+    (api.listPlans as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      refreshes += 1;
+      return refreshes === 1 ? [] : [created];
+    });
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.type(
+      await screen.findByPlaceholderText('Create an independent Plan…'),
+      'Plan without opening details',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Create Plan' }));
+
+    expect(await screen.findByRole('button', { name: /#86 New background Plan/ }))
+      .not.toHaveAttribute('aria-current');
+    expect(screen.getByText('Select or create a Plan')).toBeInTheDocument();
+  });
+
   it('highlights the selected Plan in the modal list', async () => {
     const selectedPlan = makePlan({ id: 80, title: 'Selected Plan' });
     const otherPlan = makePlan({ id: 81, title: 'Other Plan' });
@@ -2234,6 +2256,8 @@ describe('independent Plan attachments', () => {
 
     expect(selectedButton).toHaveAttribute('aria-current', 'true');
     expect(selectedButton).toHaveClass('border-indigo-500/70', 'bg-indigo-500/15');
+    expect(within(selectedButton).getByText('Awaiting review'))
+      .toHaveClass('text-indigo-300', 'ring-indigo-500/30');
     expect(otherButton).not.toHaveAttribute('aria-current');
   });
 
@@ -2310,6 +2334,45 @@ describe('independent Plan attachments', () => {
       expect(screen.getByPlaceholderText('Create an independent Plan…')).toHaveValue('');
       expect(screen.queryByText('design-notes.txt')).not.toBeInTheDocument();
     });
+  });
+
+  it('routes pasted files to the Plan composer instead of the main chat composer', async () => {
+    const pasted = new File(['pasted notes'], 'pasted-notes.txt', { type: 'text/plain' });
+    (api.createPlan as ReturnType<typeof vi.fn>).mockResolvedValue(makePlan());
+    (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      id: 'pasted-plan-upload',
+      filename: pasted.name,
+      path: '/srv/uploads/pasted-notes.txt',
+      url: '/api/uploads/pasted-notes.txt',
+      is_image: false,
+    }]);
+    render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    const planInput = await screen.findByPlaceholderText('Create an independent Plan…');
+    fireEvent.paste(planInput, {
+      clipboardData: {
+        items: [{ kind: 'file', getAsFile: () => pasted }],
+      },
+    });
+
+    await waitFor(() => expect(api.uploadImages).toHaveBeenCalledTimes(1));
+    expect(api.uploadImages).toHaveBeenCalledWith([pasted]);
+    expect(await screen.findByText(pasted.name)).toBeInTheDocument();
+
+    await userEvent.type(planInput, 'Use the pasted notes');
+    await userEvent.click(screen.getByRole('button', { name: 'Create Plan' }));
+    await waitFor(() => expect(api.createPlan).toHaveBeenCalledWith({
+      input: 'Use the pasted notes',
+      target_task_id: 1,
+      file_paths: ['/srv/uploads/pasted-notes.txt'],
+      image_paths: [],
+      attachments: [{
+        url: '/api/uploads/pasted-notes.txt',
+        name: 'pasted-notes.txt',
+        is_image: false,
+      }],
+    }));
   });
 
   it('updates an associated Plan stage and ready state in real time', async () => {

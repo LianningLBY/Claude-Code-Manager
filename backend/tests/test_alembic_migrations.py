@@ -32,6 +32,7 @@ PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
 PLAN_CLEANUP_REVISION = "f7a1c3d9e5b2"
 PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
 PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
+CURRENT_HEAD_REVISION = "7a1d4e9c2b60"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -807,12 +808,16 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_merge_head(self, tmp_path):
+    def test_migration_graph_has_one_head_after_published_merge(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
-        assert script.get_heads() == [PUBLISHED_BRANCH_MERGE_REVISION]
-        assert script.get_current_head() == PUBLISHED_BRANCH_MERGE_REVISION
+        assert script.get_heads() == [CURRENT_HEAD_REVISION]
+        assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == PUBLISHED_BRANCH_MERGE_REVISION
+        )
 
     @pytest.mark.parametrize(
         ("start_revision", "plan_schema_present", "snapshot_schema_present"),
@@ -845,7 +850,7 @@ class TestPublishedMigrationHistory:
 
         # The no-op merge applies the missing sibling branch and converges all
         # deployed states on one schema/head.
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         engine = create_engine(f"sqlite:///{db_path}")
         self._assert_revision_schema(
             engine,
@@ -859,7 +864,7 @@ class TestPublishedMigrationHistory:
         db_path = str(tmp_path / "merge-roundtrip.db")
         cfg = _alembic_cfg(db_path)
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         # Relative ``-1`` is ambiguous at a mergepoint, so select either
         # published parent explicitly; Alembic retains the sibling head.
         _run_alembic(cfg, command.downgrade, PLAN_CLEANUP_REVISION)
@@ -876,7 +881,7 @@ class TestPublishedMigrationHistory:
         )
         engine.dispose()
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         engine = create_engine(f"sqlite:///{db_path}")
         self._assert_revision_schema(
             engine,
@@ -890,7 +895,7 @@ class TestPublishedMigrationHistory:
         db_path = str(tmp_path / "plan-cleanup-roundtrip.db")
         cfg = _alembic_cfg(db_path)
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         _run_alembic(cfg, command.downgrade, PUBLISHED_PLAN_REVISION)
 
         engine = create_engine(f"sqlite:///{db_path}")
@@ -905,7 +910,7 @@ class TestPublishedMigrationHistory:
         )
         engine.dispose()
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         engine = create_engine(f"sqlite:///{db_path}")
         self._assert_revision_schema(
             engine,

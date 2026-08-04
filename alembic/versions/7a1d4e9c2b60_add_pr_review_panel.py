@@ -1,7 +1,7 @@
 """add PR review panel and findings
 
 Revision ID: 7a1d4e9c2b60
-Revises: 5f7a9c2e4d61
+Revises: 7e4b9c1d2a63
 Create Date: 2026-08-02
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = "7a1d4e9c2b60"
-down_revision: Union[str, None] = "5f7a9c2e4d61"
+down_revision: Union[str, None] = "7e4b9c1d2a63"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

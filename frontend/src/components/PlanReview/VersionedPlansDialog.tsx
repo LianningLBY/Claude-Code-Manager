@@ -55,7 +55,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
       setPlans(rows); onPlansChange(rows); setError(null);
       setSelectedId((current) => current != null && rows.some((plan) => plan.id === current) ? current : null);
     } catch (reason) { if (requestId === refreshRequest.current) setError(reason instanceof Error ? reason.message : String(reason)); }
-    finally { if (showLoading && requestId === refreshRequest.current) setLoading(false); }
+    finally { if (requestId === refreshRequest.current) setLoading(false); }
   }, [onPlansChange, taskId]);
 
   useEffect(() => { if (!open) return; void refresh(true); const timer = window.setInterval(() => void refresh(), 15000); return () => window.clearInterval(timer); }, [open, refresh]);
@@ -78,17 +78,17 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
 
   return <div className="fixed inset-0 z-[75] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plans for Task #${taskId}`} className="relative flex h-[100dvh] w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl sm:h-[min(86vh,820px)] sm:max-w-6xl sm:rounded-2xl">
-      <button type="button" onClick={onClose} className="absolute right-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 hover:bg-gray-800" aria-label="Close Plans"><X size={16} /></button>
+      <button type="button" onClick={onClose} className="absolute right-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200" aria-label="Close Plans"><X size={16} /></button>
       <section className={`${selected ? 'hidden' : 'flex'} w-full flex-col border-gray-800 sm:flex sm:w-80 sm:shrink-0 sm:border-r`}>
         <div className="border-b border-gray-800 p-4 pr-12"><div className="flex items-center gap-2 text-sm font-semibold text-gray-100"><ListTodo size={16} className="text-indigo-300" /> Plans <span className="text-xs font-normal text-gray-500">Task #{taskId}</span></div>
           <form ref={createForm} data-attachment-paste-target="plan-create" className="mt-3 space-y-2" onSubmit={(event) => { event.preventDefault(); void create(); }}><fieldset disabled={busy} className="space-y-2"><textarea value={requestText} onChange={(event) => setRequestText(event.target.value)} rows={4} maxLength={200000} placeholder="Create an independent Plan…" className="w-full resize-none rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
-            {uploads.uploads.length > 0 && <div className="flex flex-wrap gap-1.5">{uploads.uploads.map((item) => <span key={item.id} className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-400">{item.preview && <img src={item.preview} alt="" className="h-7 w-7 rounded object-cover" />}<span className="max-w-32 truncate">{item.file.name}</span>{item.status === 'uploading' && <Loader2 size={10} className="animate-spin" />}<button type="button" onClick={() => uploads.removeFile(item.id)}><X size={10} /></button></span>)}</div>}
-            <div className="flex items-center justify-between"><input ref={fileInput} type="file" multiple className="hidden" onChange={(event) => { addPlanFiles(Array.from(event.target.files || []), setError); event.target.value = ''; }} /><button type="button" onClick={() => fileInput.current?.click()} className="rounded-lg border border-gray-700 p-2 text-gray-400" aria-label="Attach Plan files"><Paperclip size={13} /></button><button type="submit" disabled={!requestText.trim() || uploads.isUploading || uploads.hasFailed} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40">Create Plan</button></div></fieldset></form>
+            {uploads.uploads.length > 0 && <div className="flex flex-wrap gap-1.5">{uploads.uploads.map((item) => <span key={item.id} className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-400">{item.preview && <img src={item.preview} alt="" className="h-7 w-7 rounded object-cover" />}<span className="max-w-32 truncate">{item.file.name}</span>{item.status === 'uploading' && <Loader2 size={10} className="animate-spin" />}<button type="button" onClick={() => uploads.removeFile(item.id)} className="rounded p-0.5 transition-colors hover:bg-gray-800 hover:text-gray-200"><X size={10} /></button></span>)}</div>}
+            <div className="flex items-center justify-between"><input ref={fileInput} type="file" multiple className="hidden" onChange={(event) => { addPlanFiles(Array.from(event.target.files || []), setError); event.target.value = ''; }} /><button type="button" onClick={() => fileInput.current?.click()} className="rounded-lg border border-gray-700 p-2 text-gray-400 transition-colors hover:border-gray-600 hover:bg-gray-800 hover:text-gray-200" aria-label="Attach Plan files"><Paperclip size={13} /></button><button type="submit" disabled={!requestText.trim() || uploads.isUploading || uploads.hasFailed} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-indigo-500 disabled:pointer-events-none disabled:opacity-40">Create Plan</button></div></fieldset></form>
         </div>
-        <div className="flex gap-1 overflow-x-auto border-b border-gray-800 px-3 py-2">{filters.map((item) => <button key={item.id} type="button" onClick={() => setFilter(item.id)} className={`rounded-full px-2 py-1 text-[10px] ${filter === item.id ? 'bg-indigo-500/20 text-indigo-300' : 'text-gray-500 hover:bg-gray-800'}`}>{item.label} {plans.filter((plan) => filterPlan(plan, item.id)).length}</button>)}</div>
+        <div className="flex gap-1 overflow-x-auto border-b border-gray-800 px-3 py-2">{filters.map((item) => <button key={item.id} type="button" onClick={() => setFilter(item.id)} className={`rounded-full px-2 py-1 text-[10px] transition-colors ${filter === item.id ? 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30' : 'text-gray-500 hover:bg-gray-800 hover:text-gray-300'}`}>{item.label} {plans.filter((plan) => filterPlan(plan, item.id)).length}</button>)}</div>
         {error && <div className="m-3 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-300">{error}</div>}
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
-          {loading && <div className="flex justify-center p-6"><Loader2 className="animate-spin text-gray-500" /></div>}
+          {loading && <div role="status" aria-label="Loading Plans" className="flex justify-center p-6"><Loader2 className="animate-spin text-gray-500" /></div>}
           {filtered.map((plan) => {
             const isSelected = plan.id === selectedId;
             return <button
@@ -97,7 +97,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
               onClick={() => setSelectedId(plan.id)}
               aria-current={isSelected ? 'true' : undefined}
               className={`w-full rounded-xl border p-3 text-left transition-colors ${isSelected
-                ? 'border-indigo-500/70 bg-indigo-500/15 ring-1 ring-inset ring-indigo-400/30'
+                ? 'border-indigo-500/70 bg-indigo-500/15 ring-1 ring-inset ring-indigo-400/30 hover:border-indigo-400/80 hover:bg-indigo-500/20'
                 : 'border-gray-700 bg-gray-800/60 hover:border-gray-600 hover:bg-gray-800'
               }`}
             >
@@ -117,7 +117,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
           })}
         </div>
       </section>
-      <section className={`${selected ? 'flex' : 'hidden'} min-w-0 flex-1 flex-col sm:flex`}>{selected ? <><button type="button" onClick={() => setSelectedId(null)} className="absolute left-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 sm:hidden" aria-label="Back to Plans"><ChevronLeft size={16} /></button><PlanDetail plan={selected} onRefresh={refresh} onClose={onClose} selectedVersionIds={selectedVersionIds} onToggleVersion={onToggleVersion} onAttachVersion={onAttachVersion} /></> : <div className="m-auto text-sm text-gray-500">Select or create a Plan</div>}</section>
+      <section className={`${selected ? 'flex' : 'hidden'} min-w-0 flex-1 flex-col sm:flex`}>{selected ? <><button type="button" onClick={() => setSelectedId(null)} className="absolute left-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200 sm:hidden" aria-label="Back to Plans"><ChevronLeft size={16} /></button><PlanDetail plan={selected} onRefresh={refresh} onClose={onClose} selectedVersionIds={selectedVersionIds} onToggleVersion={onToggleVersion} onAttachVersion={onAttachVersion} /></> : <div className="m-auto text-sm text-gray-500">Select or create a Plan</div>}</section>
     </div>
   </div>;
 }

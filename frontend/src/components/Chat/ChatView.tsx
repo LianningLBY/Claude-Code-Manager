@@ -2945,7 +2945,7 @@ function AppliedPlansInMessage({ plans }: { plans: AppliedPlanSnapshot[] }) {
           <summary className="cursor-pointer select-none text-xs font-medium text-white marker:text-white/70">
             Applied Plan #{plan.id}: {plan.title}
           </summary>
-          <div className="mt-2 max-h-80 overflow-y-auto rounded-md bg-black/20 p-2.5">
+          <div className="applied-plan-content mt-2 max-h-80 overflow-y-auto rounded-md bg-transparent p-2.5">
             <MarkdownContent
               content={plan.content}
               className="text-xs text-white"

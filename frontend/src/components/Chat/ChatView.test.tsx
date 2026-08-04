@@ -2315,6 +2315,8 @@ describe('independent Plan attachments', () => {
     expect(applied.closest('.applied-plan-message')).toBeInTheDocument();
     expect(applied.closest('details')).toHaveClass('bg-black/15', 'border-white/25');
     await userEvent.click(applied);
+    expect(document.querySelector('.applied-plan-content')).toHaveClass('bg-transparent');
+    expect(document.querySelector('.applied-plan-content')).not.toHaveClass('bg-black/20');
     expect(screen.getByRole('heading', { level: 1, name: 'Migration' }))
       .toBeInTheDocument();
     expect(screen.getByText('safe path').tagName).toBe('STRONG');
@@ -2503,6 +2505,12 @@ describe('independent Plan attachments', () => {
     expect(await screen.findByText('Plan #83 · v1 · Already attached')).toBeInTheDocument();
     expect(await screen.findByText('Plan #84 · v1 · Attach me')).toBeInTheDocument();
     expect(screen.queryByRole('dialog', { name: 'Plans for Task #1' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    expect(await screen.findByRole('button', { name: /#84 Attach me/ })).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Loading Plans' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close Plans' }));
+
     await userEvent.type(
       screen.getByPlaceholderText('Type a follow-up message...'),
       'Implement the approved Version',

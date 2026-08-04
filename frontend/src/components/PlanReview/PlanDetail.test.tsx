@@ -388,7 +388,7 @@ describe('PlanDetail', () => {
     expect(screen.queryByText('stale context')).not.toBeInTheDocument();
   });
 
-  it('shows in-progress feedback and closes after archiving succeeds', async () => {
+  it('shows in-progress feedback and keeps the modal open after archiving succeeds', async () => {
     const current = version({});
     const prior = version({ id: 11, version_number: 1 });
     const resource = plan(current, prior);
@@ -403,7 +403,8 @@ describe('PlanDetail', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Archiving Plan…');
     expect(onClose).not.toHaveBeenCalled();
     finishArchive({ ...resource, archived_at: '2026-08-04T12:00:00Z' });
-    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText('Archiving Plan…')).not.toBeInTheDocument());
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('opens the Task associated with a related Plan', async () => {

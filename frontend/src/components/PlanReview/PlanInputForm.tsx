@@ -159,9 +159,9 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
               <span className="max-w-40 truncate">{upload.file.name}</span>
               {upload.status === 'uploading' && <Loader2 size={11} className="animate-spin" />}
               {upload.status === 'failed' && (
-                <button type="button" className="text-red-300" onClick={() => uploads.retryFile(upload.id)}>Retry</button>
+                <button type="button" className="rounded px-1 py-0.5 text-red-300 transition-colors hover:bg-red-500/10 hover:text-red-200" onClick={() => uploads.retryFile(upload.id)}>Retry</button>
               )}
-              <button type="button" aria-label={`Remove ${upload.file.name}`} onClick={() => uploads.removeFile(upload.id)}><X size={11} /></button>
+              <button type="button" aria-label={`Remove ${upload.file.name}`} onClick={() => uploads.removeFile(upload.id)} className="rounded p-0.5 text-gray-500 transition-colors hover:bg-gray-700 hover:text-gray-200"><X size={11} /></button>
             </span>
           ))}
         </div>
@@ -179,7 +179,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
               event.target.value = '';
             }}
           />
-          <button type="button" onClick={() => inputRef.current?.click()} className="flex items-center gap-1.5 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300 hover:bg-gray-800">
+          <button type="button" onClick={() => inputRef.current?.click()} className="flex items-center gap-1.5 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-800 hover:text-gray-200">
             <Paperclip size={13} /> Attach files
           </button>
         </div>

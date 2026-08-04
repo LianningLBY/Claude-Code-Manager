@@ -49,8 +49,9 @@ vi.mock('../components/PlanReview/PlanCatalog', () => ({
   ))}</div>,
 }));
 vi.mock('../components/PlanReview/PlanDetail', () => ({
-  PlanDetail: ({ plan, onClose }: { plan: PlanResource; onClose?: () => void }) => <div>
+  PlanDetail: ({ plan, onClose, onNavigateTask }: { plan: PlanResource; onClose?: () => void; onNavigateTask: (taskId: number) => void }) => <div>
     <span>Detail for {plan.title}</span>
+    {plan.target_task_id != null && <button type="button" onClick={() => { onNavigateTask(plan.target_task_id!); onClose?.(); }}>Open related Task #{plan.target_task_id}</button>}
     <button type="button" onClick={onClose}>Close detail</button>
   </div>,
 }));
@@ -106,7 +107,7 @@ const createdPlan = {
 
 function StatefulPlansPage() {
   const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
-  return <PlansPage selectedPlanId={selectedPlanId} onSelectedPlanChange={setSelectedPlanId} />;
+  return <PlansPage selectedPlanId={selectedPlanId} onSelectedPlanChange={setSelectedPlanId} onNavigateTask={vi.fn()} />;
 }
 
 describe('PlansPage', () => {
@@ -120,7 +121,7 @@ describe('PlansPage', () => {
 
   it('owns the Plan catalog, hides an empty action heading, and supports deep-link selection', async () => {
     const onSelectedPlanChange = vi.fn();
-    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} />);
+    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={vi.fn()} />);
 
     expect(await screen.findByRole('button', { name: plan.title })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Plans requiring action' })).not.toBeInTheDocument();
@@ -138,7 +139,7 @@ describe('PlansPage', () => {
 
   it('uses canonical Plan search/archive filters and keeps a newly created Plan in the catalog', async () => {
     const onSelectedPlanChange = vi.fn();
-    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} />);
+    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={vi.fn()} />);
 
     await screen.findByRole('button', { name: plan.title });
     await userEvent.type(screen.getByPlaceholderText('Search Plans'), 'architecture');
@@ -195,5 +196,19 @@ describe('PlansPage', () => {
 
     resolveRefresh([createdPlan, plan]);
     await waitFor(() => expect(api.listPlans).toHaveBeenCalledTimes(2));
+  });
+
+  it('uses the app navigation callback for a related Plan Task', async () => {
+    const relatedPlan = { ...plan, target_task_id: 200 };
+    vi.mocked(api.listPlans).mockResolvedValue([relatedPlan]);
+    vi.mocked(api.getPlan).mockResolvedValue(relatedPlan);
+    const onSelectedPlanChange = vi.fn();
+    const onNavigateTask = vi.fn();
+
+    render(<PlansPage selectedPlanId={relatedPlan.id} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={onNavigateTask} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Open related Task #200' }));
+
+    expect(onNavigateTask).toHaveBeenCalledWith(200);
+    expect(onSelectedPlanChange).toHaveBeenCalledWith(null);
   });
 });

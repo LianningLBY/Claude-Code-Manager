@@ -38,9 +38,10 @@ const DISPLAY_STATE_QUERY: Record<StatusFilter, string | undefined> = {
 interface Props {
   selectedPlanId: number | null;
   onSelectedPlanChange: (planId: number | null) => void;
+  onNavigateTask: (taskId: number) => void;
 }
 
-export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
+export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask }: Props) {
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedPlan, setSelectedPlan] = useState<PlanResource | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -145,7 +146,7 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
     <section className={needsInputVisible || reviewVisible ? 'space-y-4' : ''} aria-label={needsInputVisible || reviewVisible ? 'Plans requiring action' : undefined}>
       {(needsInputVisible || reviewVisible) && <h2 className="text-base font-semibold text-gray-200">Plans requiring action</h2>}
       <PlanNeedsInputPanel onVisibilityChange={setNeedsInputVisible} />
-      <VersionedPlanPanel onVisibilityChange={setReviewVisible} />
+      <VersionedPlanPanel onVisibilityChange={setReviewVisible} onNavigateTask={onNavigateTask} />
     </section>
 
     <section className="space-y-3" aria-label="All Plans">
@@ -165,6 +166,6 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
       {totalPages > 1 && <div className="flex items-center justify-center gap-3 py-2"><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Previous Plans page"><ChevronLeft size={17} /></button><span className="text-xs text-gray-500">{page} / {totalPages} · {total} Plans</span><button type="button" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Next Plans page"><ChevronRight size={17} /></button></div>}
     </section>
 
-    {selectedPlan && <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && close()}><div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plan #${selectedPlan.id}`} className={`min-w-0 w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(88vh,860px)] sm:max-w-5xl sm:rounded-2xl ${expanded ? 'h-[100dvh]' : 'h-[70dvh]'}`}><button type="button" onClick={() => setExpanded((value) => !value)} className="absolute left-1/2 top-2 z-10 h-1.5 w-12 -translate-x-1/2 rounded-full bg-gray-600 sm:hidden" aria-label={expanded ? 'Collapse Plan detail' : 'Expand Plan detail'} /><PlanDetail plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={(taskId) => { window.location.hash = `#/tasks/chat/${taskId}`; }} /></div></div>}
+    {selectedPlan && <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && close()}><div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plan #${selectedPlan.id}`} className={`min-w-0 w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(88vh,860px)] sm:max-w-5xl sm:rounded-2xl ${expanded ? 'h-[100dvh]' : 'h-[70dvh]'}`}><button type="button" onClick={() => setExpanded((value) => !value)} className="absolute left-1/2 top-2 z-10 h-1.5 w-12 -translate-x-1/2 rounded-full bg-gray-600 transition-colors hover:bg-gray-500 sm:hidden" aria-label={expanded ? 'Collapse Plan detail' : 'Expand Plan detail'} /><PlanDetail plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={onNavigateTask} /></div></div>}
   </div>;
 }

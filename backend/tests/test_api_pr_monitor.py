@@ -659,6 +659,90 @@ async def test_webhook_missing_signature_rejected(client):
 
 
 @pytest.mark.asyncio
+async def test_webhook_rechecks_rotated_secret_after_context_capture(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    repo = await _create_repo(client, "owner/rotated-secret")
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_rotate(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            current.webhook_secret = "f" * 64
+            await db.commit()
+        return context
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_rotate,
+    )
+    resp = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/rotated-secret"),
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Invalid signature"
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        assert reviews == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        ("default_branch", "develop", "target branch: main"),
+        ("allowed_authors", ["bob"], "author not allowed: alice"),
+    ],
+)
+async def test_webhook_rechecks_policy_after_context_capture(
+    client,
+    session_factory,
+    monkeypatch,
+    field,
+    value,
+    expected_reason,
+):
+    repo = await _create_repo(client, f"owner/policy-{field}")
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_change_policy(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            setattr(current, field, value)
+            await db.commit()
+        return context
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_change_policy,
+    )
+    resp = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(f"owner/policy-{field}"),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored", "reason": expected_reason}
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        assert reviews == []
+
+
+@pytest.mark.asyncio
 async def test_webhook_unknown_repo_ignored(client):
     resp = await _post_webhook(client, "irrelevant", _pr_payload("other/repo"))
     assert resp.status_code == 200

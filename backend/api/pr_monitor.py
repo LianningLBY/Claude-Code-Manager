@@ -102,6 +102,44 @@ def _gh_login() -> str:
     return _GH_LOGIN_CACHE
 
 
+def _require_current_webhook_signature(
+    repo: MonitoredRepo,
+    *,
+    body: bytes,
+    signature_header: str,
+) -> None:
+    """Verify the delivery against the exact locked monitor generation."""
+
+    if not signature_header.startswith("sha256="):
+        raise HTTPException(403, "Missing or invalid signature")
+    expected_sig = "sha256=" + hmac.new(
+        repo.webhook_secret.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature_header, expected_sig):
+        raise HTTPException(403, "Invalid signature")
+
+
+def _webhook_policy_rejection(
+    repo: MonitoredRepo,
+    *,
+    base_branch: str,
+    pr_author: str,
+) -> str | None:
+    """Return why a signed PR is outside the monitor's current policy."""
+
+    if base_branch != repo.default_branch:
+        return f"target branch: {base_branch}"
+    allowed = repo.allowed_authors or []
+    if allowed and pr_author not in allowed:
+        return f"author not allowed: {pr_author}"
+    own_login = _gh_login()
+    if own_login and pr_author == own_login and pr_author not in allowed:
+        return f"self PR (gh login: {own_login})"
+    return None
+
+
 router = APIRouter(prefix="/api/pr-monitor", tags=["pr-monitor"])
 webhook_router = APIRouter(prefix="/api/github", tags=["pr-monitor"])
 
@@ -757,10 +795,20 @@ async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = D
     if not repo:
         raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
-    repo.webhook_secret = secrets.token_hex(32)
-    await db.commit()
-    await db.refresh(repo)
-    return repo
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        repo = (await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        if repo is None:
+            raise HTTPException(404, "Repository not found")
+        await _require_pr_monitor_access(request, db, repo)
+        repo.webhook_secret = secrets.token_hex(32)
+        await db.commit()
+        await db.refresh(repo)
+        return repo
 
 
 @router.get("/repos/{repo_id}/reviews", response_model=list[PRReviewResponse])
@@ -1441,19 +1489,12 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     if not repo or not repo.enabled:
         return {"status": "ignored", "reason": "repository not monitored or disabled"}
 
-    # HMAC-SHA256 signature verification
     signature_header = request.headers.get("X-Hub-Signature-256", "")
-    if not signature_header.startswith("sha256="):
-        raise HTTPException(403, "Missing or invalid signature")
-
-    expected_sig = "sha256=" + hmac.new(
-        repo.webhook_secret.encode(),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(signature_header, expected_sig):
-        raise HTTPException(403, "Invalid signature")
+    _require_current_webhook_signature(
+        repo,
+        body=body,
+        signature_header=signature_header,
+    )
 
     event_type = request.headers.get("X-GitHub-Event", "")
     if event_type == "merge_group":
@@ -1468,9 +1509,31 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             raise HTTPException(400, "merge_group.head_ref is invalid")
         from backend.services.pr_merge_queue import bind_merge_group
 
-        bound = await bind_merge_group(
-            db, repo=repo, head_sha=merge_sha, head_ref=merge_ref
-        )
+        repo_id = repo.id
+        await db.rollback()
+        async with _pr_repo_write_lock(repo_id):
+            locked_repo = (await db.execute(
+                select(MonitoredRepo)
+                .where(MonitoredRepo.id == repo_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if locked_repo is None or not locked_repo.enabled:
+                await db.rollback()
+                return {
+                    "status": "ignored",
+                    "reason": "repository not monitored or disabled",
+                }
+            _require_current_webhook_signature(
+                locked_repo,
+                body=body,
+                signature_header=signature_header,
+            )
+            bound = await bind_merge_group(
+                db,
+                repo=locked_repo,
+                head_sha=merge_sha,
+                head_ref=merge_ref,
+            )
         return {
             "status": "accepted" if bound else "ignored",
             "reason": None if bound else "no unique queued PR for merge group",
@@ -1503,22 +1566,15 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     if pr.get("draft", False):
         return {"status": "ignored", "reason": "draft PR"}
 
-    # Check target branch
     base_branch = base.get("ref", "") if isinstance(base, dict) else ""
-    if base_branch != repo.default_branch:
-        return {"status": "ignored", "reason": f"target branch: {base_branch}"}
-
-    # Check allowed authors
     pr_author = pr.get("user", {}).get("login", "")
-    allowed = repo.allowed_authors or []
-    if allowed and pr_author not in allowed:
-        return {"status": "ignored", "reason": f"author not allowed: {pr_author}"}
-
-    # 自动屏蔽本机 gh 登录账号的 PR：审核者与作者同账号时 GitHub 禁止
-    # self-approval，审了也无法 approve；除非白名单显式包含该账号
-    own_login = _gh_login()
-    if own_login and pr_author == own_login and pr_author not in allowed:
-        return {"status": "ignored", "reason": f"self PR (gh login: {own_login})"}
+    policy_rejection = _webhook_policy_rejection(
+        repo,
+        base_branch=base_branch,
+        pr_author=pr_author,
+    )
+    if policy_rejection is not None:
+        return {"status": "ignored", "reason": policy_rejection}
 
     pr_number = pr.get("number")
     delivery_id = (request.headers.get("X-GitHub-Delivery", "") or "").strip() or None
@@ -1619,6 +1675,23 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                     "status": "ignored",
                     "reason": "repository not monitored or disabled",
                 }
+            # Context capture may take long enough for an administrator to
+            # rotate the secret or edit admission policy.  The repository row
+            # lock is the delivery's linearization point, so repeat both checks
+            # here before persisting a supersede intent or stopping old work.
+            _require_current_webhook_signature(
+                locked_repo,
+                body=body,
+                signature_header=signature_header,
+            )
+            policy_rejection = _webhook_policy_rejection(
+                locked_repo,
+                base_branch=base_branch,
+                pr_author=pr_author,
+            )
+            if policy_rejection is not None:
+                await db.rollback()
+                return {"status": "ignored", "reason": policy_rejection}
             await verify_pr_review_snapshot_current(
                 locked_repo,
                 replacement_data,
@@ -2101,6 +2174,19 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 "status": "ignored",
                 "reason": "repository not monitored or disabled",
             }
+        _require_current_webhook_signature(
+            locked_repo,
+            body=body,
+            signature_header=signature_header,
+        )
+        policy_rejection = _webhook_policy_rejection(
+            locked_repo,
+            base_branch=base_branch,
+            pr_author=pr_author,
+        )
+        if policy_rejection is not None:
+            await db.rollback()
+            return {"status": "ignored", "reason": policy_rejection}
         await verify_pr_review_snapshot_current(locked_repo, review_data)
         processed_review = await _find_processed_review(
             db,

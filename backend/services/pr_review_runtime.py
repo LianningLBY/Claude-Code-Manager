@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 PR_REVIEW_TAG = "pr-review"
+PR_REVIEW_FIX_TAG = "pr-review-fix"
 PR_REVIEW_SNAPSHOT_CONTEXT_VERSION = 2
 PR_REVIEW_TERMINAL_CHAT_VERSION = 1
 PR_REVIEW_RUNTIME_DIR_ENV = "CCM_PR_REVIEW_RUNTIME_DIR"
@@ -33,6 +34,16 @@ def is_pr_review_task(task: object) -> bool:
 
     tags = getattr(task, "tags", None)
     return isinstance(tags, list) and PR_REVIEW_TAG in tags
+
+
+def is_pr_sandbox_task(task: object) -> bool:
+    """Return whether a review or fix Task needs tool-free isolation."""
+
+    tags = getattr(task, "tags", None)
+    return (
+        isinstance(tags, list)
+        and bool({PR_REVIEW_TAG, PR_REVIEW_FIX_TAG}.intersection(tags))
+    )
 
 
 def _trusted_runtime_anchor() -> Path:

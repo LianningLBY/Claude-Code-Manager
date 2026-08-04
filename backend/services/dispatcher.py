@@ -48,6 +48,7 @@ from backend.services.instance_manager import (
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.pr_review_runtime import (
     is_pr_review_task,
+    is_pr_sandbox_task,
     isolated_pr_review_cwd,
 )
 from backend.services.deployment_start_guard import (
@@ -148,7 +149,7 @@ _DOC_SYNC_NOTE = (
 def _task_artifact_policy(task: Task) -> str:
     """Build the provider-neutral, project-scoped artifact contract."""
 
-    if is_pr_review_task(task):
+    if is_pr_sandbox_task(task):
         return ""
 
     task_id = task.id
@@ -4181,7 +4182,7 @@ class GlobalDispatcher:
         # tasks a neutral task-private directory.
         parts = (
             []
-            if is_pr_review_task(task)
+            if is_pr_sandbox_task(task)
             else [_agent_doc_preamble(task)]
         )
         if secrets_block:
@@ -4226,7 +4227,7 @@ class GlobalDispatcher:
         # must therefore resend the complete immutable snapshot contract;
         # sending only "continue" would create an empty-context review turn.
         fresh_codex_pr_review = (
-            task.provider == "codex" and is_pr_review_task(task)
+            task.provider == "codex" and is_pr_sandbox_task(task)
         )
         if session_id and not fresh_codex_pr_review:
             await self.instance_manager.launch(
@@ -5148,7 +5149,7 @@ class GlobalDispatcher:
 
             # === Step 2: Determine cwd and update task ===
             # 必须是绝对路径：PTY 模式按 cwd 推导 JSONL 轮询路径，"." 会落空
-            review_task = is_pr_review_task(task)
+            review_task = is_pr_sandbox_task(task)
             cwd = (
                 isolated_pr_review_cwd(task)
                 if review_task
@@ -5771,6 +5772,25 @@ class GlobalDispatcher:
 
     async def _handle_pr_review_completion(self, task: Task):
         meta = task.metadata_ or {}
+        fix_action_id = meta.get("pr_finding_action_id")
+        if type(fix_action_id) is int:
+            try:
+                from backend.services.pr_review_fix import handle_fix_task_completion
+                from backend.services.worker_proxy import get_task_operation_lock
+
+                async with get_task_operation_lock(task.id):
+                    async with self.db_factory() as db:
+                        await handle_fix_task_completion(
+                            db,
+                            action_id=fix_action_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                        )
+            except Exception:
+                logger.exception(
+                    "PR fix completion handler error for Task %s", task.id
+                )
+            return
         pr_review_id = meta.get("pr_review_id")
         reviewer_run_id = meta.get("pr_reviewer_run_id")
         adjudication_id = meta.get("pr_adjudication_id")
@@ -5865,6 +5885,26 @@ class GlobalDispatcher:
 
     async def _handle_pr_review_failure(self, task: Task, error: str):
         meta = task.metadata_ or {}
+        fix_action_id = meta.get("pr_finding_action_id")
+        if type(fix_action_id) is int:
+            try:
+                from backend.services.pr_review_fix import handle_fix_task_failure
+                from backend.services.worker_proxy import get_task_operation_lock
+
+                async with get_task_operation_lock(task.id):
+                    async with self.db_factory() as db:
+                        await handle_fix_task_failure(
+                            db,
+                            action_id=fix_action_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                            error=error,
+                        )
+            except Exception:
+                logger.exception(
+                    "PR fix failure handler error for Task %s", task.id
+                )
+            return
         pr_review_id = meta.get("pr_review_id")
         reviewer_run_id = meta.get("pr_reviewer_run_id")
         adjudication_id = meta.get("pr_adjudication_id")
@@ -10999,7 +11039,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 ):
                     logger.info("Discarding stale or duplicate Repair Wake for task %s", task_id)
                     return
-            if is_pr_review_task(task):
+            if is_pr_sandbox_task(task):
                 from backend.models.pr_monitor import PRReview, PRReviewerRun
 
                 publishing = await db.execute(

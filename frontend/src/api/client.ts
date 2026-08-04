@@ -542,6 +542,7 @@ export interface PRReview {
     observed: Array<RequiredCheckPolicy & { state: string; details_url?: string | null }>;
   } | null;
   reviewer_runs?: PRReviewerRun[];
+  is_current_snapshot?: boolean;
   created_at: string;
   completed_at: string | null;
 }
@@ -594,6 +595,26 @@ export interface PRFindingRebuttal {
   error_message: string | null;
 }
 
+export interface PRFindingAction {
+  id: number;
+  finding_id: number;
+  action_type: 'ignore' | 'human_advice' | 'ai_fix';
+  status: 'pending' | 'running' | 'awaiting_confirmation' | 'completed' | 'failed' | 'cancelled' | 'stale';
+  idempotency_key: string;
+  actor_user_id: number | null;
+  human_advice: string | null;
+  task_id: number | null;
+  expected_head_sha: string;
+  patch_sha256: string | null;
+  result: Record<string, unknown> | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  diff_download_url: string | null;
+  confirmation_token: string | null;
+}
+
 export interface PRFinding {
   id: number;
   reviewer_run_id: number;
@@ -614,6 +635,7 @@ export interface PRFinding {
   github_comment_url: string | null;
   thread_error: string | null;
   rebuttals: PRFindingRebuttal[];
+  latest_action: PRFindingAction | null;
 }
 
 export interface PRReviewerRun {
@@ -1554,6 +1576,36 @@ export const api = {
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>
     request<PRReview>(`/api/pr-monitor/reviews/${reviewId}`),
+  ignoreReviewFinding: (findingId: number, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/ignore`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),
+    }),
+  saveReviewFindingAdvice: (findingId: number, advice: string, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/advice`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey, advice }),
+    }),
+  createReviewFindingFix: (findingId: number, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/fix`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),
+    }),
+  getReviewFindingAction: (actionId: number) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}`),
+  confirmReviewFindingFix: (actionId: number, confirmationToken: string, patchSha256: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ confirmation_token: confirmationToken, patch_sha256: patchSha256 }),
+    }),
+  downloadReviewFindingDiff: async (actionId: number): Promise<TaskArtifactDownload> => {
+    const token = getToken();
+    const res = await fetch(`${getBase()}/api/pr-monitor/actions/${actionId}/diff`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    return {
+      blob: await res.blob(),
+      filename: downloadFilename(res.headers.get('Content-Disposition'), `pr-fix-${actionId}.diff`),
+    };
+  },
   getPRMonitorRun: (runId: number) =>
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}`),
   bindPRMonitorDeveloper: (runId: number, taskId: number) =>

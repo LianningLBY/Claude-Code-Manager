@@ -90,6 +90,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const [hasWorker, setHasWorker] = useState(isAdmin);
+  const [hasPlanActions, setHasPlanActions] = useState(false);
 
   const refreshWorkerStatus = useCallback(() => {
     if (!isAdmin) {
@@ -109,6 +110,19 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
 
   // Refresh nav when worker assignments change
   useWebSocket(['workers'], () => { refreshWorkerStatus(); });
+
+  const refreshPlanAttention = useCallback(() => {
+    void api.countPlans({ display_state: 'waiting_user,awaiting_review,approved' })
+      .then((result) => setHasPlanActions(result.total > 0))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshPlanAttention();
+    const timer = window.setInterval(refreshPlanAttention, 30000);
+    return () => window.clearInterval(timer);
+  }, [refreshPlanAttention]);
+  useWebSocket(['plans'], refreshPlanAttention);
 
   const allPages: NavItem[] = [
     { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, show: isAdmin },
@@ -181,6 +195,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
               );
             })()}
             {p.label}
+            {p.key === 'plans' && hasPlanActions && <span aria-label="Plans requiring action" className="ml-auto h-2 w-2 shrink-0 rounded-full bg-red-500 ring-2 ring-red-500/20" />}
           </button>
         );
       })}

@@ -743,6 +743,28 @@ html[data-theme='rose'] {
   background: oklch(100% 0 0 / 0.35);
 }
 
+/* Applied Plan lives inside the solid-blue user bubble. Keep its nested
+   Markdown neutral in every light/dark/custom theme instead of reusing the
+   theme-inverted gray/indigo surfaces. */
+.applied-plan-message .markdown-body code {
+  background: rgb(255 255 255 / 0.18);
+}
+
+.applied-plan-message .markdown-body pre,
+.applied-plan-message .markdown-body th {
+  background: rgb(0 0 0 / 0.28);
+}
+
+.applied-plan-message .markdown-body a,
+.applied-plan-message .markdown-body blockquote {
+  color: rgb(255 255 255 / 0.82);
+}
+
+.applied-plan-message .markdown-body th,
+.applied-plan-message .markdown-body td {
+  border-color: rgb(255 255 255 / 0.25);
+}
+
 /* Markdown body styles */
 .markdown-body {
   min-width: 0;

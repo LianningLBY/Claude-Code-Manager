@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   isApiRequestError,
+  type PlanInputRequest,
   type PlanResource,
   type PlanRun,
   type PlanStaleness,
@@ -10,7 +11,7 @@ import {
   type UploadResult,
 } from '../../api/client';
 import { useFileUpload } from '../../hooks/useFileUpload';
-import { AlertCircle, Archive, ArchiveRestore, Check, GitBranch, Loader2, Paperclip, Play, RefreshCw, X } from '../icons';
+import { AlertCircle, Archive, ArchiveRestore, Check, Loader2, Paperclip, Play, RefreshCw, X } from '../icons';
 import { MarkdownContent } from '../MarkdownContent';
 import { CollapsiblePlanningRequest } from './CollapsiblePlanningRequest';
 import { PlanInputForm } from './PlanInputForm';
@@ -28,6 +29,7 @@ interface Props {
   onClose?: () => void;
   selectedVersionIds?: number[];
   onToggleVersion?: (versionId: number) => void;
+  onAttachVersion?: (versionId: number) => void;
   onNavigateTask?: (taskId: number) => void;
 }
 
@@ -53,8 +55,7 @@ function confirmableStaleness(error: unknown): PlanStaleness | null {
 
 const ACTIVE_RUN_STATUSES = new Set<PlanRun['status']>(['queued', 'running', 'waiting_user']);
 
-function planStatusText(plan: PlanResource, candidateVersionNumber: number) {
-  const run = plan.active_run;
+function planStatusText(plan: PlanResource, candidateVersionNumber: number, run: PlanRun | null) {
   if (!run || !ACTIVE_RUN_STATUSES.has(run.status)) {
     return planDisplayStateLabel(plan.display_state);
   }
@@ -69,24 +70,41 @@ function planStatusText(plan: PlanResource, candidateVersionNumber: number) {
     : `Creating v${candidateVersionNumber} draft from v${base}`;
 }
 
-export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onNavigateTask }: Props) {
+function stepDebugLabel(run: PlanRun, stepIndex: number) {
+  const step = run.steps[stepIndex];
+  const peers = run.steps.filter((item) => item.step_type === step.step_type && item.round === step.round);
+  if (peers.length <= 1) return step.step_type;
+  return `${step.step_type} call ${peers.findIndex((item) => item.id === step.id) + 1}`;
+}
+
+function uniqueRunError(run: PlanRun) {
+  const normalized = run.error?.trim();
+  if (!normalized || run.steps.some((step) => step.error?.trim() === normalized)) return null;
+  return normalized;
+}
+
+export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onAttachVersion, onNavigateTask }: Props) {
   const [versions, setVersions] = useState<PlanVersion[]>([]);
   const [runs, setRuns] = useState<PlanRun[]>([]);
   const [versionId, setVersionId] = useState<number | null>(plan.current_version_id);
   const [revision, setRevision] = useState('');
   const [compare, setCompare] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [staleness, setStaleness] = useState<PlanStaleness | null>(null);
   const uploads = useFileUpload();
   const fileInput = useRef<HTMLInputElement>(null);
   const previousCurrentVersionId = useRef(plan.current_version_id);
+  const loadRequest = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = ++loadRequest.current;
     const [versionRows, runRows] = await Promise.all([
       api.listPlanVersions(plan.id),
       api.listPlanResourceRuns(plan.id),
     ]);
+    if (requestId !== loadRequest.current) return;
     setVersions(versionRows);
     setRuns(runRows);
     setVersionId((current) => versionRows.some((item) => item.id === current) ? current : plan.current_version_id);
@@ -116,16 +134,24 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     void api.getPlanVersionStaleness(shown.id).then(setStaleness).catch(() => setStaleness(null));
   }, [shown]);
 
-  const mutate = async (operation: () => Promise<unknown>) => {
-    setBusy(true); setError(null);
-    try { await operation(); await onRefresh(); await load(); }
+  const refreshDetail = useCallback(async () => {
+    await Promise.all([onRefresh(), load()]);
+  }, [load, onRefresh]);
+
+  const mutate = async (
+    label: string,
+    operation: () => Promise<unknown>,
+    onSuccess?: () => void,
+  ) => {
+    setBusy(true); setBusyLabel(label); setError(null);
+    try { await operation(); await refreshDetail(); onSuccess?.(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-    finally { setBusy(false); }
+    finally { setBusy(false); setBusyLabel(null); }
   };
 
   const decide = async (decision: 'approve' | 'reject', attach = false) => {
     if (!shown || shown.id !== plan.current_version_id) return;
-    await mutate(async () => {
+    await mutate(decision === 'approve' ? 'Approving Plan' : 'Rejecting Plan', async () => {
       const invoke = (confirm: boolean) => decision === 'approve'
         ? api.approvePlanVersion(shown.id, shown.id, confirm)
         : api.rejectPlanVersion(shown.id, shown.id, confirm);
@@ -135,13 +161,13 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         if (!stale || !window.confirm(planStalenessConfirmationMessage(stale, 'approve'))) throw reason;
         await invoke(true);
       }
-      if (decision === 'approve' && attach) onToggleVersion?.(shown.id);
-    });
+      if (decision === 'approve' && attach) onAttachVersion?.(shown.id);
+    }, onClose);
   };
 
   const createExecution = async (approveIfPending: boolean) => {
     if (!shown || shown.id !== plan.current_version_id) return;
-    await mutate(async () => {
+    await mutate('Creating execution Task', async () => {
       const invoke = (confirm: boolean) => api.createVersionExecutionTask(shown.id, shown.id, confirm, approveIfPending);
       let result;
       try { result = await invoke(false); }
@@ -151,12 +177,12 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         result = await invoke(true);
       }
       onNavigateTask?.(result.execution_task_id);
-    });
+    }, onClose);
   };
 
   const revise = async () => {
     if (!shown || !revision.trim() || plan.active_run_id != null) return;
-    await mutate(async () => {
+    await mutate('Starting revision', async () => {
       await api.createPlanRun(plan.id, {
         run_type: 'user_revision',
         request: revision.trim(),
@@ -168,21 +194,38 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     });
   };
 
+  const answered = async (answeredRequest?: PlanInputRequest) => {
+    if (answeredRequest) {
+      setRuns((currentRuns) => currentRuns.map((run) => run.id !== answeredRequest.run_id ? run : {
+        ...run,
+        status: 'queued',
+        current_stage: 'planner',
+        generation: run.generation + 1,
+        open_input_request_id: null,
+        input_requests: run.input_requests.map((request) => (
+          request.id === answeredRequest.id ? answeredRequest : request
+        )),
+      }));
+    }
+    await refreshDetail();
+  };
+
   const current = shown?.id === plan.current_version_id;
   const route = plan.pipeline_config;
   const staleMessages = planStalenessMessages(staleness);
   const hardConflictMessages = planHardConflictMessages(staleness);
+  const showStaleness = Boolean(shown && !shown.applied);
   return <div className="flex h-full min-h-0 min-w-0 flex-col overflow-x-hidden">
     <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-3">
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-semibold text-gray-100">Plan #{plan.id} · {plan.title}</div>
         <div role={activeRun ? 'status' : undefined} aria-live={activeRun ? 'polite' : undefined} className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-gray-400">
           {activeRun && activeRun.status !== 'waiting_user' && <Loader2 size={11} className="animate-spin text-indigo-300" />}
-          <span className={activeRun ? 'text-indigo-300' : ''}>{planStatusText(plan, candidateVersionNumber)}</span>
+          <span className={activeRun ? 'text-indigo-300' : ''}>{planStatusText(plan, candidateVersionNumber, activeRun)}</span>
           {plan.current_version && <span>· v{plan.current_version.version_number} current</span>}
           {appliedVersion && appliedVersion.id !== plan.current_version_id && <span className="text-teal-300">· v{appliedVersion.version_number} applied</span>}
-          {staleness?.stale && <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-300">stale context</span>}
-          {staleness?.hard_conflict && <span className="rounded-full bg-red-500/15 px-2 py-0.5 text-red-300">target conflict</span>}
+          {showStaleness && staleness?.stale && <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-300">stale context</span>}
+          {showStaleness && staleness?.hard_conflict && <span className="rounded-full bg-red-500/15 px-2 py-0.5 text-red-300">target conflict</span>}
         </div>
       </div>
       {onClose && <button type="button" onClick={onClose} aria-label="Close Plan" className="rounded-lg p-1.5 text-gray-500 hover:bg-gray-800"><X size={16} /></button>}
@@ -190,19 +233,20 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
 
     <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
+      {busyLabel && <div role="status" aria-live="polite" className="mb-4 flex items-center gap-2 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-300"><Loader2 size={13} className="animate-spin" /> {busyLabel}…</div>}
       {plan.latest_run_status === 'failed' && plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> You can retry it; technical details are available in Debug information.</div>}
-      {staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
+      {showStaleness && staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
         <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-400" />
         <div className="min-w-0">
-          <div className="text-sm font-semibold text-amber-300">Confirmation required</div>
-          <div className="mt-0.5 text-sm leading-5">{staleMessages.join(' ')} You may continue after explicit confirmation; refreshing or re-planning is optional.</div>
+          <div className="text-sm font-semibold text-amber-300">Context changed</div>
+          <div className="mt-0.5 text-sm leading-5">{staleMessages.join(' ')} Confirm to continue, or regenerate first.</div>
         </div>
       </div>}
-      {staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
+      {showStaleness && staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       <CollapsiblePlanningRequest content={plan.initial_request} />
 
-      {plan.active_run?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm run={plan.active_run} request={plan.open_input_request} onAnswered={onRefresh} /></div>}
-      {activeRun && <PlanRunInputAudit run={activeRun} title={`v${candidateVersionNumber} input history`} defaultOpen />}
+      {activeRun?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm run={activeRun} request={plan.open_input_request} onAnswered={answered} /></div>}
+      {activeRun && <PlanRunInputAudit run={activeRun} title={`v${candidateVersionNumber} ${activeRun.run_type === 'user_revision' ? 'revision & input history' : 'input history'}`} defaultOpen />}
 
       {activeRun?.draft_content && <section className="mt-4 min-w-0 rounded-xl border border-indigo-500/35 bg-indigo-500/5 p-4">
         <div className="mb-2 text-xs font-semibold text-indigo-300">v{candidateVersionNumber} candidate · not a Version yet</div>
@@ -210,7 +254,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       </section>}
 
       {shown ? <>
-        {!current && <div className="mt-4 rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-2 text-xs text-gray-400">Historical Version. You can revise or fork it explicitly; approval remains limited to the current Version.</div>}
+        {!current && <div className="mt-4 rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-2 text-xs text-gray-400">Historical Version. You can revise from it explicitly; approval remains limited to the current Version.</div>}
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <select aria-label="Plan Version" value={shown.id} onChange={(event) => setVersionId(Number(event.target.value))} className="rounded-lg border border-gray-700 bg-gray-800 px-2 py-1.5 text-xs text-gray-200">
             {versions.map((version) => <option key={version.id} value={version.id}>v{version.version_number} · {planVersionDisplayLabel(version)}{version.id === plan.current_version_id ? ' · Current' : ''}</option>)}
@@ -225,8 +269,6 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         <PlanRunInputAudit runs={runs} version={shown} />
       </> : <div className="mt-4 rounded-xl border border-gray-800 px-4 py-8 text-center text-sm text-gray-500">No Version has been produced yet.</div>}
 
-      {plan.applications.length > 0 && <details className="mt-4 rounded-xl border border-gray-800 bg-gray-900/50 p-3 text-xs text-gray-400"><summary className="cursor-pointer font-semibold text-gray-300">Application history ({plan.applications.length})</summary><div className="mt-2 space-y-1">{plan.applications.map((application) => { const applied = versions.find((item) => item.id === application.plan_version_id); return <div key={application.id}>v{applied?.version_number || '?'} · {application.application_type === 'execution_task' ? `execution Task #${application.execution_task_id}` : `chat message #${application.user_log_id}`}</div>; })}</div></details>}
-
       <details className="mt-4 rounded-xl border border-dashed border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-400">
         <summary className="cursor-pointer font-semibold text-gray-400">Debug information</summary>
         <div className="mt-3 space-y-4">
@@ -234,16 +276,20 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
             <div className="mb-1 font-semibold text-gray-300">Pipeline routes</div>
             <div className="grid gap-2 sm:grid-cols-2">
               <div>Planner: {route.planner.primary.provider} / {route.planner.primary.model} / {route.planner.primary.effort || 'default'}<br />Fallback: {route.planner.fallback.provider} / {route.planner.fallback.model}</div>
-              <div>Reviewer: {route.reviewer.enabled ? `${route.reviewer.primary.provider} / ${route.reviewer.primary.model} / ${route.reviewer.primary.effort || 'default'}` : 'disabled'}<br />Input pauses: {route.max_interactions} · revision rounds: {route.max_revision_cycles}</div>
+              <div>Reviewer: {route.reviewer.enabled ? `${route.reviewer.primary.provider} / ${route.reviewer.primary.model} / ${route.reviewer.primary.effort || 'default'}` : 'disabled'}<br />Fallback: {route.reviewer.enabled ? `${route.reviewer.fallback.provider} / ${route.reviewer.fallback.model} / ${route.reviewer.fallback.effort || 'default'}` : 'disabled'}<br />Input pauses: {route.max_interactions} · revision rounds: {route.max_revision_cycles}</div>
             </div>
           </section>
           {runs.length > 0 && <section>
             <div className="mb-1 font-semibold text-gray-300">Runs</div>
-            <div className="space-y-2">{runs.map((run) => <div key={run.id} className="border-t border-gray-800 pt-2 first:border-0 first:pt-0">Run #{run.id} · {run.run_type} · {run.status} · round {run.round}{run.steps.map((step) => <div key={step.id} className="ml-3 text-gray-500"><div>{step.step_type}: {step.provider}/{step.model || 'default'} ({step.route_slot || 'primary'}) · {step.status}</div>{(step.last_delta_at || step.last_event_type || (step.streamed_output_chars ?? 0) > 0) && <div className="ml-3 text-[10px] text-gray-600">last delta: {step.last_delta_at || 'none'} · streamed chars: {step.streamed_output_chars || 0} · last event: {step.last_event_type || 'none'}</div>}{step.error && <pre className="ml-3 mt-1 overflow-x-auto whitespace-pre-wrap break-all text-red-300/80">{step.error}</pre>}</div>)}{run.error && <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-red-300/80">{run.error}</pre>}</div>)}</div>
+            <div className="space-y-2">{runs.map((run) => <div key={run.id} className="border-t border-gray-800 pt-2 first:border-0 first:pt-0">Run #{run.id} · {run.run_type} · {run.status} · round {run.round}{run.steps.map((step, stepIndex) => <div key={step.id} className="ml-3 text-gray-500"><div>{stepDebugLabel(run, stepIndex)}: {step.provider}/{step.model || 'default'} ({step.route_slot || 'primary'}) · {step.status} · generation {step.generation ?? '?'}</div>{(step.last_delta_at || step.last_event_type || (step.streamed_output_chars ?? 0) > 0) && <div className="ml-3 text-[10px] text-gray-600">last delta: {step.last_delta_at || 'none'} · streamed chars: {step.streamed_output_chars || 0} · last event: {step.last_event_type || 'none'}</div>}{step.error && <pre className="ml-3 mt-1 overflow-x-auto whitespace-pre-wrap break-all text-red-300/80">{step.error}</pre>}</div>)}{uniqueRunError(run) && <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-red-300/80">{uniqueRunError(run)}</pre>}</div>)}</div>
           </section>}
           {shown && (shown.repo_revision || shown.reviewer_repo_revision) && <section>
             <div className="mb-1 font-semibold text-gray-300">Repository audit</div>
             <div className="grid gap-2 lg:grid-cols-2"><div><div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Planner snapshot</div><pre className="overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(shown.repo_revision, null, 2)}</pre></div><div><div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Reviewer snapshot</div><pre className="overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(shown.reviewer_repo_revision, null, 2)}</pre></div></div>
+          </section>}
+          {plan.applications.length > 0 && <section>
+            <div className="mb-1 font-semibold text-gray-300">Applications ({plan.applications.length})</div>
+            <div className="space-y-1">{plan.applications.map((application) => { const applied = versions.find((item) => item.id === application.plan_version_id); return <div key={application.id}>v{applied?.version_number || '?'} · {application.application_type === 'execution_task' ? `execution Task #${application.execution_task_id}` : `chat message #${application.user_log_id}`}</div>; })}</div>
           </section>}
         </div>
       </details>
@@ -259,18 +305,18 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       </div>}
 
       <div className="mt-4 flex flex-wrap gap-2">
-        {!plan.active_run_id && latestFailedRun && <button type="button" disabled={busy} onClick={() => void mutate(() => api.createPlanRun(plan.id, { run_type: 'retry', request: latestFailedRun.request_text || plan.initial_request, base_version_id: latestFailedRun.base_version_id || undefined, expected_current_version_id: plan.current_version_id || undefined, source_run_id: latestFailedRun.id }))} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw size={12} /> Retry planning</button>}
+        {plan.target_task_id != null && onNavigateTask && <button type="button" disabled={busy} onClick={() => { onNavigateTask(plan.target_task_id!); onClose?.(); }} className="rounded-lg border border-indigo-500/40 px-3 py-2 text-xs text-indigo-300 disabled:opacity-40">Open related Task #{plan.target_task_id}</button>}
+        {!plan.active_run_id && latestFailedRun && <button type="button" disabled={busy} onClick={() => void mutate('Retrying planning', () => api.createPlanRun(plan.id, { run_type: 'retry', request: latestFailedRun.request_text || plan.initial_request, base_version_id: latestFailedRun.base_version_id || undefined, expected_current_version_id: plan.current_version_id || undefined, source_run_id: latestFailedRun.id }))} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw size={12} /> Retry planning</button>}
         {shown && current && plan.display_state === 'awaiting_review' && plan.target_task_id != null && <><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve', true)} className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><Check size={12} /> Approve & attach v{shown.version_number}</button><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve')} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 disabled:opacity-40">Approve v{shown.version_number} only</button><button type="button" disabled={busy} onClick={() => void decide('reject')} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Reject v{shown.version_number}</button></>}
         {shown && current && plan.display_state === 'awaiting_review' && plan.target_task_id == null && <><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void createExecution(true)} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><Play size={12} /> Approve v{shown.version_number} & create execution Task</button><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve')} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300">Approve v{shown.version_number} only</button><button type="button" disabled={busy} onClick={() => void decide('reject')} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Reject v{shown.version_number}</button></>}
         {shown && current && plan.display_state === 'approved' && plan.target_task_id == null && <button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void createExecution(false)} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"><Play size={12} /> Create execution Task</button>}
         {executionApplications.map((application) => { const applied = versions.find((item) => item.id === application.plan_version_id); return application.execution_task_available === false
           ? <span key={application.id} className="rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-2 text-xs text-gray-400">v{applied?.version_number || '?'} applied · execution Task #{application.execution_task_id} unavailable</span>
           : <button key={application.id} type="button" onClick={() => onNavigateTask?.(application.execution_task_id!)} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300">Open v{applied?.version_number || '?'} execution Task #{application.execution_task_id}</button>; })}
-        {shown && current && plan.target_task_id != null && shown.human_decision === 'approved' && !shown.applied && onToggleVersion && <button type="button" onClick={() => onToggleVersion(shown.id)} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300">{selectedVersionIds.includes(shown.id) ? 'Detach from next message' : 'Attach to next message'}</button>}
-        {shown && current && !plan.active_run_id && staleness?.stale && <button type="button" disabled={busy} onClick={() => void mutate(() => api.createPlanRun(plan.id, { run_type: 'refresh_context', request: 'Refresh all contexts and regenerate this Plan using the latest task conversation and repository state.', base_version_id: shown.id, expected_current_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><RefreshCw size={12} /> Refresh contexts and regenerate Plan</button>}
-        {shown && !plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.forkPlan(plan.id, { base_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><GitBranch size={12} /> Fork</button>}
-        {plan.active_run && ['queued', 'running', 'waiting_user'].includes(plan.active_run.status) && <button type="button" disabled={busy} onClick={() => void mutate(() => api.cancelPlanRun(plan.active_run!.id))} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Cancel planning</button>}
-        {!plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.updatePlan(plan.id, { archived: plan.archived_at == null, expected_lock_version: plan.lock_version }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-400">{plan.archived_at ? <ArchiveRestore size={12} /> : <Archive size={12} />}{plan.archived_at ? 'Restore' : 'Archive'}</button>}
+        {shown && current && plan.target_task_id != null && shown.human_decision === 'approved' && !shown.applied && onToggleVersion && <button type="button" disabled={busy} onClick={() => { onToggleVersion(shown.id); onClose?.(); }} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300 disabled:opacity-40">{selectedVersionIds.includes(shown.id) ? 'Detach from next message' : 'Attach to next message'}</button>}
+        {shown && current && !plan.active_run_id && showStaleness && staleness?.stale && <button type="button" disabled={busy} onClick={() => void mutate('Refreshing Plan context', () => api.createPlanRun(plan.id, { run_type: 'refresh_context', request: 'Refresh all contexts and regenerate this Plan using the latest task conversation and repository state.', base_version_id: shown.id, expected_current_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><RefreshCw size={12} /> Refresh contexts and regenerate Plan</button>}
+        {activeRun && <button type="button" disabled={busy} onClick={() => void mutate('Cancelling planning', () => api.cancelPlanRun(activeRun.id))} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Cancel planning</button>}
+        {!plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(plan.archived_at ? 'Restoring Plan' : 'Archiving Plan', () => api.updatePlan(plan.id, { archived: plan.archived_at == null, expected_lock_version: plan.lock_version }), onClose)} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-400">{plan.archived_at ? <ArchiveRestore size={12} /> : <Archive size={12} />}{plan.archived_at ? 'Restore' : 'Archive'}</button>}
       </div>
     </div>
   </div>;

@@ -387,6 +387,8 @@ export interface PlanStaleness {
 
 export interface PlanAgentStep {
   id: number;
+  generation?: number;
+  input_request_id?: number | null;
   step_type: 'planner' | 'reviewer';
   round: number;
   provider: string;

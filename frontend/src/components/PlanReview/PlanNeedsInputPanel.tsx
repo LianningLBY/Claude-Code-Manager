@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { api, type PlanResource } from '../../api/client';
 import { useDialogA11y } from '../../hooks/useDialogA11y';
@@ -14,23 +14,25 @@ export function PlanNeedsInputPanel({ onVisibilityChange }: Props = {}) {
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const refreshRequest = useRef(0);
   const close = useCallback(() => setSelectedId(null), []);
   const dialogRef = useDialogA11y(selectedId != null, close);
 
   const refresh = useCallback(async () => {
+    const requestId = ++refreshRequest.current;
     try {
       const rows = await api.listPlans({ display_state: 'waiting_user' });
+      if (requestId !== refreshRequest.current) return;
       setPlans(rows);
       setError(null);
       onVisibilityChange?.(rows.length > 0);
-      if (selectedId != null && !rows.some((plan) => plan.id === selectedId)) {
-        setSelectedId(null);
-      }
+      setSelectedId((current) => current != null && rows.some((plan) => plan.id === current) ? current : null);
     } catch (fetchError) {
+      if (requestId !== refreshRequest.current) return;
       setError(fetchError instanceof Error ? fetchError.message : String(fetchError));
       onVisibilityChange?.(true);
     }
-  }, [onVisibilityChange, selectedId]);
+  }, [onVisibilityChange]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);

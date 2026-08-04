@@ -9,12 +9,12 @@ import { planDisplayStateLabel } from './planResourceStatus';
 import { usePlanEvents } from './usePlanEvents';
 
 type Filter = 'all' | 'input' | 'review' | 'running' | 'approved';
-interface Props { open: boolean; taskId: number; refreshGeneration?: number; selectedVersionIds: number[]; onToggleVersion: (versionId: number) => void; onPlansChange: (plans: PlanResource[]) => void; onClose: () => void; }
+interface Props { open: boolean; taskId: number; refreshGeneration?: number; selectedVersionIds: number[]; onToggleVersion: (versionId: number) => void; onAttachVersion: (versionId: number) => void; onPlansChange: (plans: PlanResource[]) => void; onClose: () => void; }
 const RUNNING = new Set(['planner', 'reviewer', 'queued', 'running']);
 const filterPlan = (plan: PlanResource, filter: Filter) => filter === 'all' || (filter === 'input' ? plan.display_state === 'waiting_user' : filter === 'review' ? plan.display_state === 'awaiting_review' : filter === 'running' ? RUNNING.has(plan.display_state) : ['approved', 'applied'].includes(plan.display_state));
 const uploadPayload = (results: UploadResult[]) => results.length ? { file_paths: results.map((item) => item.path), image_paths: results.filter((item) => item.is_image).map((item) => item.path), attachments: results.map((item) => ({ url: item.url, name: item.filename || item.url.split('/').pop() || 'file', is_image: item.is_image })) } : {};
 
-export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, selectedVersionIds, onToggleVersion, onPlansChange, onClose }: Props) {
+export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, selectedVersionIds, onToggleVersion, onAttachVersion, onPlansChange, onClose }: Props) {
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
@@ -26,6 +26,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
   const addPlanFiles = uploads.addFiles;
   const fileInput = useRef<HTMLInputElement>(null);
   const createForm = useRef<HTMLFormElement>(null);
+  const refreshRequest = useRef(0);
   const dialogRef = useDialogA11y(open, onClose);
 
   useEffect(() => {
@@ -46,13 +47,15 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
   }, [addPlanFiles]);
 
   const refresh = useCallback(async (showLoading = false) => {
+    const requestId = ++refreshRequest.current;
     if (showLoading) setLoading(true);
     try {
       const rows = await api.listPlans({ target_task_id: taskId });
+      if (requestId !== refreshRequest.current) return;
       setPlans(rows); onPlansChange(rows); setError(null);
       setSelectedId((current) => current != null && rows.some((plan) => plan.id === current) ? current : null);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-    finally { if (showLoading) setLoading(false); }
+    } catch (reason) { if (requestId === refreshRequest.current) setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { if (showLoading && requestId === refreshRequest.current) setLoading(false); }
   }, [onPlansChange, taskId]);
 
   useEffect(() => { if (!open) return; void refresh(true); const timer = window.setInterval(() => void refresh(), 15000); return () => window.clearInterval(timer); }, [open, refresh]);
@@ -114,7 +117,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
           })}
         </div>
       </section>
-      <section className={`${selected ? 'flex' : 'hidden'} min-w-0 flex-1 flex-col sm:flex`}>{selected ? <><button type="button" onClick={() => setSelectedId(null)} className="absolute left-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 sm:hidden" aria-label="Back to Plans"><ChevronLeft size={16} /></button><PlanDetail plan={selected} onRefresh={refresh} onClose={onClose} selectedVersionIds={selectedVersionIds} onToggleVersion={onToggleVersion} /></> : <div className="m-auto text-sm text-gray-500">Select or create a Plan</div>}</section>
+      <section className={`${selected ? 'flex' : 'hidden'} min-w-0 flex-1 flex-col sm:flex`}>{selected ? <><button type="button" onClick={() => setSelectedId(null)} className="absolute left-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 sm:hidden" aria-label="Back to Plans"><ChevronLeft size={16} /></button><PlanDetail plan={selected} onRefresh={refresh} onClose={onClose} selectedVersionIds={selectedVersionIds} onToggleVersion={onToggleVersion} onAttachVersion={onAttachVersion} /></> : <div className="m-auto text-sm text-gray-500">Select or create a Plan</div>}</section>
     </div>
   </div>;
 }

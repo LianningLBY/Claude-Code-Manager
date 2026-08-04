@@ -8,7 +8,7 @@ interface PlanInputFormProps {
   run: PlanRun;
   request: PlanInputRequest;
   compact?: boolean;
-  onAnswered: () => void | Promise<void>;
+  onAnswered: (answered?: PlanInputRequest) => void | Promise<void>;
 }
 
 type AnswerValue = string | string[];
@@ -40,7 +40,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
     setError(null);
     try {
       const results = uploads.uploadedResults;
-      await api.answerPlanInput(run.id, request.id, {
+      const answered = await api.answerPlanInput(run.id, request.id, {
         expected_run_generation: run.generation,
         idempotency_key: answerIdempotencyKey,
         answers: request.questions.map((question) => ({
@@ -61,7 +61,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       setAnswers({});
       setAdditional('');
       uploads.clear();
-      await onAnswered();
+      await onAnswered(answered);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : String(submitError));
       if (isApiRequestError(submitError) && submitError.status === 409) {

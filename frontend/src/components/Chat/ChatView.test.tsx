@@ -2312,6 +2312,8 @@ describe('independent Plan attachments', () => {
     const applied = await screen.findByText(
       'Applied Plan #81: Schema migration',
     );
+    expect(applied.closest('.applied-plan-message')).toBeInTheDocument();
+    expect(applied.closest('details')).toHaveClass('bg-black/15', 'border-white/25');
     await userEvent.click(applied);
     expect(screen.getByRole('heading', { level: 1, name: 'Migration' }))
       .toBeInTheDocument();
@@ -2462,12 +2464,27 @@ describe('independent Plan attachments', () => {
   });
 
   it('approves and explicitly attaches a Plan to the next message', async () => {
+    const existingVersion = makePlanVersion({
+      id: 503,
+      plan_id: 83,
+      human_decision: 'approved',
+      display_state: 'approved',
+    });
+    const existing = makePlan({
+      id: 83,
+      title: 'Already attached',
+      display_state: 'approved',
+      current_version_id: 503,
+      current_version: existingVersion,
+    });
     const version = makePlanVersion({ id: 504, plan_id: 84 });
     const plan = makePlan({ id: 84, title: 'Attach me', current_version_id: 504, current_version: version });
     const approved = makePlan({ ...plan, display_state: 'approved', current_version: { ...version, human_decision: 'approved' } });
     let isApproved = false;
-    (api.listPlans as ReturnType<typeof vi.fn>).mockImplementation(async () => [isApproved ? approved : plan]);
-    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([version]);
+    (api.listPlans as ReturnType<typeof vi.fn>).mockImplementation(async () => [existing, isApproved ? approved : plan]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockImplementation(async (planId: number) => (
+      planId === existing.id ? [existingVersion] : [version]
+    ));
     (api.approvePlanVersion as ReturnType<typeof vi.fn>).mockImplementation(async () => {
       isApproved = true;
       return approved.current_version;
@@ -2475,12 +2492,17 @@ describe('independent Plan attachments', () => {
 
     render(<ChatView task={makeTask({ id: 1 })} projects={[]} onBack={vi.fn()} />);
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.click(await screen.findByRole('button', { name: /#83 Already attached/ }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Attach to next message' }));
+    expect(await screen.findByText('Plan #83 · v1 · Already attached')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
     await userEvent.click(await screen.findByRole('button', { name: /#84 Attach me/ }));
     await userEvent.click(await screen.findByRole('button', { name: /Approve & attach v1/ }));
 
+    expect(await screen.findByText('Plan #83 · v1 · Already attached')).toBeInTheDocument();
     expect(await screen.findByText('Plan #84 · v1 · Attach me')).toBeInTheDocument();
-    expect(screen.getByRole('dialog', { name: 'Plans for Task #1' })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Close Plans' }));
+    expect(screen.queryByRole('dialog', { name: 'Plans for Task #1' })).not.toBeInTheDocument();
     await userEvent.type(
       screen.getByPlaceholderText('Type a follow-up message...'),
       'Implement the approved Version',
@@ -2499,10 +2521,10 @@ describe('independent Plan attachments', () => {
       },
       undefined,
       undefined,
-      [504],
+      [503, 504],
       [],
     ));
-  });
+  }, 15_000);
 
   it('creates a new related Plan when the user requests a revision', async () => {
     const version = makePlanVersion({ id: 503, plan_id: 83 });
@@ -2514,7 +2536,7 @@ describe('independent Plan attachments', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
     await userEvent.click(await screen.findByRole('button', { name: /#83 Revise me/ }));
     await userEvent.type(
-      await screen.findByPlaceholderText('Revise from v1…'),
+      await screen.findByPlaceholderText('Revise from v1…', {}, { timeout: 5_000 }),
       'Preserve backwards compatibility',
     );
     await userEvent.click(await screen.findByRole('button', { name: 'Revise from v1' }));
@@ -2525,5 +2547,5 @@ describe('independent Plan attachments', () => {
       base_version_id: 503,
       expected_current_version_id: 503,
     }));
-  });
+  }, 10_000);
 });

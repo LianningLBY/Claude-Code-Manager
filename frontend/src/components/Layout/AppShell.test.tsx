@@ -7,6 +7,7 @@ import { setTheme } from '../../config/theme';
 vi.mock('../../api/client', () => ({
   api: {
     listWorkers: vi.fn().mockResolvedValue([]),
+    countPlans: vi.fn().mockResolvedValue({ total: 0 }),
     getRuntimeSettings: vi.fn().mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -124,6 +125,13 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
+  });
+
+  it('marks Plans navigation when a Plan requires user action', async () => {
+    vi.mocked(api.countPlans).mockResolvedValue({ total: 2 });
+    renderShell();
+
+    expect(await screen.findByLabelText('Plans requiring action')).toBeInTheDocument();
   });
 
   describe('header stacking context', () => {

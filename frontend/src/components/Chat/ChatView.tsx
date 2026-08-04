@@ -446,6 +446,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       : [...current, versionId]);
   }, []);
 
+  const attachPlanVersion = useCallback((versionId: number) => {
+    setSelectedPlanVersionIds((current) => current.includes(versionId)
+      ? current
+      : [...current, versionId]);
+  }, []);
+
   // Distill state
   const [distillOpen, setDistillOpen] = useState(false);
   const [distilling, setDistilling] = useState(false);
@@ -2083,6 +2089,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         refreshGeneration={planRefreshGeneration}
         selectedVersionIds={selectedPlanVersionIds}
         onToggleVersion={togglePlanVersionAttachment}
+        onAttachVersion={attachPlanVersion}
         onPlansChange={setVersionedPlans}
         onClose={() => setPlansOpen(false)}
       />}
@@ -2929,19 +2936,19 @@ function MessageTimestamp({ timestamp, className }: { timestamp: string | null; 
 
 function AppliedPlansInMessage({ plans }: { plans: AppliedPlanSnapshot[] }) {
   return (
-    <div className="mt-2 space-y-1.5 border-t border-indigo-300/25 pt-2">
+    <div className="applied-plan-message mt-2 space-y-1.5 border-t border-white/25 pt-2">
       {plans.map((plan) => (
         <details
           key={plan.id}
-          className="rounded-lg border border-indigo-200/25 bg-indigo-950/25 px-2.5 py-1.5"
+          className="rounded-lg border border-white/25 bg-black/15 px-2.5 py-1.5"
         >
-          <summary className="cursor-pointer select-none text-xs font-medium text-indigo-100 marker:text-indigo-200">
+          <summary className="cursor-pointer select-none text-xs font-medium text-white marker:text-white/70">
             Applied Plan #{plan.id}: {plan.title}
           </summary>
-          <div className="mt-2 max-h-80 overflow-y-auto rounded-md bg-gray-950/45 p-2.5">
+          <div className="mt-2 max-h-80 overflow-y-auto rounded-md bg-black/20 p-2.5">
             <MarkdownContent
               content={plan.content}
-              className="text-xs text-indigo-50"
+              className="text-xs text-white"
             />
           </div>
         </details>

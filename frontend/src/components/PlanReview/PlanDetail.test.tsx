@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -11,6 +11,8 @@ vi.mock('../../api/client', () => ({
     listPlanVersions: vi.fn(),
     listPlanResourceRuns: vi.fn().mockResolvedValue([]),
     createPlanRun: vi.fn(),
+    answerPlanInput: vi.fn(),
+    updatePlan: vi.fn(),
     getPlanVersionStaleness: vi.fn().mockResolvedValue({
       stale: false,
       hard_conflict: false,
@@ -148,6 +150,11 @@ describe('PlanDetail', () => {
     expect(screen.queryByRole('button', { name: 'Refresh contexts and regenerate Plan' }))
       .not.toBeInTheDocument();
     expect(screen.getByText(/Input pauses: 5/)).toBeInTheDocument();
+    expect(screen.getByText(/Reviewer: claude \/ claude-opus-4-6 \/ high/).parentElement)
+      .toHaveTextContent('Fallback: codex / gpt-5.6-terra / high');
+    expect(screen.queryByText(/Application history/)).not.toBeInTheDocument();
+    expect(within(screen.getByText('Debug information').closest('details')!)
+      .getByText('Applications (1)')).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Open v1 execution Task #91' }));
     expect(navigate).toHaveBeenCalledWith(91);
@@ -203,9 +210,9 @@ describe('PlanDetail', () => {
     render(<PlanDetail plan={plan(current, prior)} onRefresh={vi.fn()} />);
 
     expect(await screen.findByText(/no historical repository snapshot/)).toBeInTheDocument();
-    expect(screen.getByText(/refreshing or re-planning is optional/i)).toBeInTheDocument();
+    expect(screen.getByText(/Confirm to continue, or regenerate first/)).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveClass('text-gray-200', 'bg-amber-500/15');
-    expect(screen.getByText('Confirmation required')).toHaveClass('text-amber-300');
+    expect(screen.getByText('Context changed')).toHaveClass('text-amber-300');
     expect(screen.queryByText(/This action is blocked/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve v2 & create execution Task' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Reject v2' })).toBeEnabled();
@@ -264,6 +271,155 @@ describe('PlanDetail', () => {
     expect(debug).not.toHaveAttribute('open');
     expect(within(debug!).getByText(/Run #15 · initial · running · round 1/))
       .toBeInTheDocument();
+  });
+
+  it('immediately resumes the draft state and shows submitted input history', async () => {
+    const prior = version({ id: 11, version_number: 1 });
+    const current = version({});
+    const openRequest = {
+      id: 41,
+      plan_id: 4,
+      run_id: 21,
+      source_step_id: 30,
+      requested_by: 'planner' as const,
+      reason: 'Choose the rollout window',
+      questions: [{
+        id: 'window',
+        header: 'Window',
+        question: 'Which rollout window?',
+        response_type: 'text' as const,
+        options: [],
+        required: true,
+      }],
+      status: 'open' as const,
+      answers: null,
+      response_text: null,
+      attachments: null,
+      answered_by: null,
+      opened_at: '2026-08-03T11:06:50Z',
+      answered_at: null,
+      created_at: '2026-08-03T11:06:50Z',
+    };
+    const waitingRun = {
+      id: 21,
+      plan_id: 4,
+      run_type: 'initial',
+      status: 'waiting_user',
+      current_stage: 'planner',
+      base_version_id: null,
+      source_run_id: null,
+      result_version_id: null,
+      request_text: 'Design the migration',
+      round: 1,
+      generation: 3,
+      instance_id: null,
+      worker_id: null,
+      open_input_request_id: openRequest.id,
+      interaction_count: 1,
+      max_interactions: 5,
+      execution_seconds: 8,
+      last_execution_started_at: null,
+      review_verdict: null,
+      review_feedback: null,
+      review_exhausted: false,
+      error: null,
+      created_at: '2026-08-03T11:06:48Z',
+      updated_at: '2026-08-03T11:07:00Z',
+      finished_at: null,
+      steps: [],
+      input_requests: [openRequest],
+    } satisfies PlanRun;
+    const answeredRequest = {
+      ...openRequest,
+      status: 'answered' as const,
+      answers: [{ question_id: 'window', value: 'Sunday 02:00 UTC' }],
+      answered_at: '2026-08-03T11:08:00Z',
+    };
+    const queuedRun = {
+      ...waitingRun,
+      status: 'queued' as const,
+      generation: 4,
+      open_input_request_id: null,
+      input_requests: [answeredRequest],
+    } satisfies PlanRun;
+    const resource = plan(current, prior);
+    resource.current_version_id = null;
+    resource.current_version = null;
+    resource.active_run_id = waitingRun.id;
+    resource.active_run = waitingRun;
+    resource.open_input_request = openRequest;
+    resource.display_state = 'waiting_user';
+    resource.latest_run_status = 'waiting_user';
+    vi.mocked(api.listPlanVersions).mockResolvedValue([]);
+    vi.mocked(api.listPlanResourceRuns)
+      .mockResolvedValueOnce([waitingRun])
+      .mockResolvedValue([queuedRun]);
+    vi.mocked(api.answerPlanInput).mockResolvedValue(answeredRequest);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+    await userEvent.type((await screen.findAllByRole('textbox'))[0], 'Sunday 02:00 UTC');
+    await userEvent.click(screen.getByRole('button', { name: 'Submit answers' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent('v1 generation queued');
+    expect(screen.getByText('v1 input history (1)')).toBeInTheDocument();
+    expect(screen.getByText('Sunday 02:00 UTC')).toBeVisible();
+  });
+
+  it('hides stale warnings after the selected Version has already been applied', async () => {
+    const current = version({ human_decision: 'approved', applied: true, display_state: 'applied' });
+    const prior = version({ id: 11, version_number: 1 });
+    const resource = plan(current, prior);
+    resource.display_state = 'applied';
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.getPlanVersionStaleness).mockResolvedValueOnce({
+      stale: true,
+      reasons: ['conversation_advanced'],
+      hard_conflict: false,
+      hard_conflicts: [],
+      can_confirm: true,
+      current_log_id: 99,
+      current_repo_revision: null,
+    });
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    await screen.findByRole('option', { name: 'v2 · Applied · Current' });
+    expect(screen.queryByText('Context changed')).not.toBeInTheDocument();
+    expect(screen.queryByText('stale context')).not.toBeInTheDocument();
+  });
+
+  it('shows in-progress feedback and closes after archiving succeeds', async () => {
+    const current = version({});
+    const prior = version({ id: 11, version_number: 1 });
+    const resource = plan(current, prior);
+    let finishArchive!: (value: PlanResource) => void;
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.updatePlan).mockReturnValue(new Promise<PlanResource>((resolve) => { finishArchive = resolve; }));
+    const onClose = vi.fn();
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} onClose={onClose} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Archive' }));
+
+    expect(screen.getByRole('status')).toHaveTextContent('Archiving Plan…');
+    expect(onClose).not.toHaveBeenCalled();
+    finishArchive({ ...resource, archived_at: '2026-08-04T12:00:00Z' });
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it('opens the Task associated with a related Plan', async () => {
+    const current = version({});
+    const prior = version({ id: 11, version_number: 1 });
+    const resource = plan(current, prior);
+    resource.target_task_id = 200;
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    const navigate = vi.fn();
+    const onClose = vi.fn();
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} onNavigateTask={navigate} onClose={onClose} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Open related Task #200' }));
+
+    expect(navigate).toHaveBeenCalledWith(200);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it('keeps failed Run details in Debug and offers an in-place retry', async () => {
@@ -423,7 +579,8 @@ describe('PlanDetail', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'Candidate proposal' }))
       .toBeInTheDocument();
     expect(screen.getByText('v3 candidate · not a Version yet')).toBeInTheDocument();
-    expect(screen.getByText('v3 input history (1)')).toBeInTheDocument();
+    expect(screen.getByText('v3 revision & input history (2)')).toBeInTheDocument();
+    expect(screen.getByText('Tighten the rollout plan')).toBeVisible();
     expect(screen.getByText('Sunday 02:00 UTC')).toBeVisible();
     expect(screen.queryByPlaceholderText('Revise from v2…')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Refresh context' })).not.toBeInTheDocument();

@@ -1074,7 +1074,6 @@ async def bind_monitor_developer(
         raise HTTPException(404, "Repository or Developer Task not found")
     await _require_pr_monitor_access(request, db, repo)
     await require_task_control(request, task, db)
-    snapshot = _validated_pr_snapshot(await _gh_pr_view(run.pr_number, repo.repo_full_name))
     repo_id = repo.id
     task_id = task.id
     await db.rollback()
@@ -1139,6 +1138,9 @@ async def bind_monitor_developer(
                     409,
                     "Automatic Repair requires a proven same-repository PR head",
                 )
+            snapshot = _validated_pr_snapshot(
+                await _gh_pr_view(run.pr_number, repo.repo_full_name)
+            )
             if (
                 snapshot.get("state") != "OPEN"
                 or snapshot.get("is_draft") is not False
@@ -1392,6 +1394,19 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                 raise HTTPException(409, "Bound Developer Task is not resumable")
             if run.repair_attempts >= run.max_repair_attempts:
                 raise HTTPException(409, "Automatic repair budget is exhausted")
+            snapshot = _validated_pr_snapshot(
+                await _gh_pr_view(run.pr_number, repo.repo_full_name)
+            )
+            if (
+                snapshot.get("state") != "OPEN"
+                or snapshot.get("is_draft") is not False
+                or snapshot.get("base_sha") != current_wake.trigger_base_sha
+                or snapshot.get("head_sha") != current_wake.trigger_head_sha
+            ):
+                raise HTTPException(
+                    409,
+                    "GitHub PR subject changed while resuming Repair",
+                )
             current_wake.status = "pending"
             current_wake.delivery_token = secrets.token_hex(24)
             current_wake.last_error = None

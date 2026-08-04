@@ -164,6 +164,21 @@ def _sign(secret: str, body: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
+def _open_pr_snapshot(
+    *,
+    base_sha: str = BASE_SHA_1,
+    head_sha: str = HEAD_SHA_1,
+) -> dict:
+    return {
+        "state": "OPEN",
+        "mergedAt": None,
+        "baseRefOid": base_sha,
+        "headRefOid": head_sha,
+        "isDraft": False,
+        "mergeCommit": None,
+    }
+
+
 def _pr_payload(
     repo_full_name="owner/repo",
     action="opened",
@@ -506,6 +521,136 @@ async def test_regenerate_secret(client):
     new_secret = resp.json()["webhook_secret"]
     assert len(new_secret) == 64
     assert new_secret != created["webhook_secret"]
+
+
+@pytest.mark.asyncio
+async def test_bind_developer_reads_remote_subject_inside_task_barrier(
+    client,
+    session_factory,
+):
+    from backend.models.project import Project
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    async with session_factory() as db:
+        project = Project(name="bind-barrier-project")
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+    repo = await _create_repo(
+        client,
+        "owner/bind-barrier",
+        project_id=project_id,
+        auto_repair=True,
+        review_mode="panel",
+    )
+    async with session_factory() as db:
+        task = Task(
+            title="Developer",
+            description="Implement the PR",
+            status="completed",
+            project_id=project_id,
+            result_branch="feature",
+            session_id="developer-session",
+            last_cwd="/workspace/repo",
+        )
+        db.add(task)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=repo["id"],
+            pr_number=42,
+            status="waiting_for_fix",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            head_repo_full_name="owner/bind-barrier",
+            head_branch="feature",
+        )
+        db.add(run)
+        await db.commit()
+        task_id = task.id
+        run_id = run.id
+
+    async def read_while_fenced(_pr_number, _repo_name):
+        assert get_task_operation_lock(task_id).locked()
+        return _open_pr_snapshot()
+
+    with patch.object(
+        pr_review_service,
+        "_gh_pr_view",
+        side_effect=read_while_fenced,
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/bind-developer",
+            json={"task_id": task_id},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["developer_task_id"] == task_id
+
+
+@pytest.mark.asyncio
+async def test_resume_repair_rejects_remote_subject_drift(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(
+        client,
+        "owner/resume-repair-drift",
+        auto_repair=True,
+        review_mode="panel",
+    )
+    async with session_factory() as db:
+        task = Task(
+            title="Developer",
+            description="Repair the PR",
+            status="completed",
+            session_id="repair-session",
+            last_cwd="/workspace/repo",
+        )
+        db.add(task)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=repo["id"],
+            pr_number=42,
+            status="paused",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            developer_task_id=task.id,
+            pause_reason="repair_failed",
+        )
+        db.add(run)
+        await db.flush()
+        wake = PRRepairWake(
+            monitor_run_id=run.id,
+            developer_task_id=task.id,
+            trigger_base_sha=BASE_SHA_1,
+            trigger_head_sha=HEAD_SHA_1,
+            reason_kind="review_findings",
+            evidence_hash="e" * 64,
+            evidence={"kind": "test"},
+            status="failed",
+            delivery_token="d" * 48,
+        )
+        db.add(wake)
+        await db.commit()
+        run_id = run.id
+        wake_id = wake.id
+
+    with patch.object(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value=_open_pr_snapshot(head_sha=HEAD_SHA_2)),
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/resume"
+        )
+
+    assert response.status_code == 409
+    assert "subject changed" in response.json()["detail"]
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        wake = await db.get(PRRepairWake, wake_id)
+        assert run.status == "paused"
+        assert wake.status == "failed"
 
 
 @pytest.mark.asyncio

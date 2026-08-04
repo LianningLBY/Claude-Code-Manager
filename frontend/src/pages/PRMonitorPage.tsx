@@ -1,9 +1,23 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api/client';
-import type { MonitoredRepo, PRReview } from '../api/client';
+import type { MonitoredRepo, PRFinding, PRMonitorRun, PRReview, RequiredCheckPolicy } from '../api/client';
 import { Plus, ArrowLeft, X, Copy, RefreshCw, ToggleLeft, ToggleRight, Trash2, GitPullRequest, Check } from '../components/icons';
 
 const DEFAULT_WEBHOOK_URL = `${window.location.origin}/api/github/webhook`;
+
+function parseRequiredChecks(value: string): RequiredCheckPolicy[] {
+  return value.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
+    const [kind, name, appSlug, ...extra] = line.split(',').map((part) => part.trim());
+    if (extra.length || !name || !appSlug || (kind !== 'check_run' && kind !== 'status')) {
+      throw new Error('Required CI 每行格式必须是：check_run,检查名,GitHub App slug（或 status,context,机器人登录名）');
+    }
+    return { kind: kind as RequiredCheckPolicy['kind'], name, app_slug: appSlug };
+  });
+}
+
+function renderRequiredChecks(repo: MonitoredRepo) {
+  return (repo.required_checks || []).map((item) => `${item.kind},${item.name},${item.app_slug}`).join('\n');
+}
 
 function useProviderModels(): {
   providers: string[];
@@ -58,7 +72,10 @@ function useProviderModels(): {
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'bg-yellow-500/20 text-yellow-400',
+  waiting_ci: 'bg-yellow-500/20 text-yellow-400',
   reviewing: 'bg-blue-500/20 text-blue-400',
+  passed: 'bg-green-500/20 text-green-400',
+  changes_required: 'bg-orange-500/20 text-orange-400',
   merged: 'bg-green-500/20 text-green-400',
   approved: 'bg-green-500/20 text-green-400',
   commented: 'bg-orange-500/20 text-orange-400',
@@ -70,9 +87,41 @@ function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text);
 }
 
+function FindingRebuttalForm({ finding, onSubmitted }: { finding: PRFinding; onSubmitted: () => Promise<void> }) {
+  const [evidence, setEvidence] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const active = finding.rebuttals?.some(item => ['pending', 'adjudicating'].includes(item.status));
+  if (finding.status !== 'open' || finding.severity === 'low') return null;
+  return (
+    <div className="mt-2 space-y-1">
+      {finding.rebuttals?.map(item => (
+        <p key={item.id} className="text-gray-500">Rebuttal #{item.attempt}: {item.status}{item.result_body ? ` · ${item.result_body}` : ''}</p>
+      ))}
+      <textarea value={evidence} onChange={(event) => setEvidence(event.target.value)}
+        disabled={active || submitting} rows={3} placeholder="Concrete code/test/policy evidence for this exact head"
+        className="w-full bg-gray-700 rounded px-2 py-1 text-xs" />
+      {error && <p className="text-red-400">{error}</p>}
+      <button disabled={active || submitting || evidence.trim().length < 20}
+        className="bg-indigo-600 text-white rounded px-2 py-1 disabled:opacity-50"
+        onClick={async () => {
+          setSubmitting(true); setError(null);
+          try { await api.submitPRFindingRebuttal(finding.id, evidence.trim()); setEvidence(''); await onSubmitted(); }
+          catch (caught) { setError(String(caught)); }
+          finally { setSubmitting(false); }
+        }}>{active ? 'Adjudicating…' : 'Submit rebuttal'}</button>
+    </div>
+  );
+}
+
 function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
   const [repoName, setRepoName] = useState('');
   const [autoMerge, setAutoMerge] = useState(false);
+  const [autoRepair, setAutoRepair] = useState(false);
+  const [mergeQueueMode, setMergeQueueMode] = useState<'manual' | 'shadow' | 'auto'>('manual');
+  const [reviewMode, setReviewMode] = useState<'single' | 'panel'>('panel');
+  const [waitForCi, setWaitForCi] = useState(true);
+  const [requiredChecks, setRequiredChecks] = useState('');
   const [provider, setProvider] = useState('codex');
   const [reviewModel, setReviewModel] = useState('');
   const [reviewEffort, setReviewEffort] = useState('');
@@ -102,12 +151,22 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
     setError(null);
     try {
       const authors = allowedAuthors.trim() ? allowedAuthors.split(',').map(a => a.trim()).filter(Boolean) : [];
+      const checks = parseRequiredChecks(requiredChecks);
+      if (reviewMode === 'panel' && waitForCi && checks.length === 0) {
+        throw new Error('启用 CI Gate 时至少配置一个 required check');
+      }
       await api.createMonitoredRepo({
         repo_full_name: repoName.trim(),
         auto_merge: autoMerge,
+        auto_repair: autoRepair,
+        max_repair_attempts: 3,
+        merge_queue_mode: mergeQueueMode,
         provider,
         review_model: reviewModel.trim() || undefined,
         review_effort: reviewEffort || undefined,
+        review_mode: reviewMode,
+        wait_for_ci: reviewMode === 'panel' && waitForCi,
+        required_checks: checks,
         default_branch: defaultBranch.trim() || 'main',
         allowed_authors: authors,
         worker_id: workerId ? Number(workerId) : undefined,
@@ -139,9 +198,42 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
             />
           </div>
           <div className="flex items-center gap-2">
-            <input type="checkbox" id="autoMerge" checked={autoMerge} onChange={(e) => setAutoMerge(e.target.checked)}
+            <input type="checkbox" id="autoMerge" checked={autoMerge} onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
               className="rounded bg-gray-700 border-gray-600" />
             <label htmlFor="autoMerge" className="text-sm text-gray-300">Auto-merge approved PRs</label>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Merge Queue</label>
+            <select value={mergeQueueMode} onChange={(e) => { const value = e.target.value as 'manual' | 'shadow' | 'auto'; setMergeQueueMode(value); if (value !== 'manual') setAutoMerge(false); }}
+              className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2">
+              <option value="manual">Manual</option><option value="shadow">Shadow only</option><option value="auto">Automatic enqueue</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id="autoRepair" checked={autoRepair} onChange={(e) => setAutoRepair(e.target.checked)} />
+            <label htmlFor="autoRepair" className="text-sm text-gray-300">Auto-resume bound local Developer Task (max 3 heads)</label>
+          </div>
+          {reviewMode === 'panel' && waitForCi && (
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Required CI identities（每行一个）</label>
+              <textarea className="w-full bg-gray-700 text-foreground text-xs rounded px-3 py-2 font-mono"
+                rows={3} value={requiredChecks} onChange={(e) => setRequiredChecks(e.target.value)}
+                placeholder={'check_run,tests,github-actions\nstatus,lint,ci-bot'} required />
+              <p className="text-xs text-gray-500 mt-1">精确匹配当前 commit 的检查名和发布者身份，避免同名假绿。</p>
+            </div>
+          )}
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Review Harness</label>
+            <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2"
+              value={reviewMode} onChange={(e) => setReviewMode(e.target.value as 'single' | 'panel')}>
+              <option value="panel">Independent Principal / Senior / QA panel</option>
+              <option value="single">Legacy single reviewer</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id="newWaitForCi" checked={waitForCi}
+              disabled={reviewMode !== 'panel'} onChange={(e) => setWaitForCi(e.target.checked)} />
+            <label htmlFor="newWaitForCi" className="text-sm text-gray-300">Wait for exact-head CI</label>
           </div>
           <div>
             <label className="block text-xs text-gray-400 mb-1">Provider</label>
@@ -215,9 +307,18 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [reviews, setReviews] = useState<PRReview[]>([]);
   const [page, setPage] = useState(1);
   const [autoMerge, setAutoMerge] = useState(repo.auto_merge);
+  const [autoRepair, setAutoRepair] = useState(repo.auto_repair || false);
+  const [maxRepairAttempts, setMaxRepairAttempts] = useState(repo.max_repair_attempts || 3);
+  const [mergeQueueMode, setMergeQueueMode] = useState<'manual' | 'shadow' | 'auto'>(repo.merge_queue_mode || 'manual');
   const [provider, setProvider] = useState(repo.provider || 'claude');
   const [reviewModel, setReviewModel] = useState(repo.review_model || '');
   const [reviewEffort, setReviewEffort] = useState(repo.review_effort || '');
+  const [reviewMode, setReviewMode] = useState<'single' | 'panel'>(repo.review_mode || 'single');
+  const [waitForCi, setWaitForCi] = useState(repo.wait_for_ci || false);
+  const [requiredChecks, setRequiredChecks] = useState(renderRequiredChecks(repo));
+  const [selectedReview, setSelectedReview] = useState<PRReview | null>(null);
+  const [monitorRun, setMonitorRun] = useState<PRMonitorRun | null>(null);
+  const [developerTaskId, setDeveloperTaskId] = useState('');
   const { providers, modelsFor, effortsFor } = useProviderModels();
   const modelOptions = modelsFor(provider);
   const effortOptions = effortsFor(provider, reviewModel);
@@ -226,6 +327,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const [webhookUrl, setWebhookUrl] = useState(DEFAULT_WEBHOOK_URL);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     api.getWebhookInfo()
@@ -251,21 +353,33 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
     try {
       const authors = authorsInput.trim() ? authorsInput.split(',').map(a => a.trim()).filter(Boolean) : [];
+      const checks = parseRequiredChecks(requiredChecks);
+      if (reviewMode === 'panel' && waitForCi && checks.length === 0) {
+        throw new Error('启用 CI Gate 时至少配置一个 required check');
+      }
       const updated = await api.updateMonitoredRepo(repo.id, {
         auto_merge: autoMerge,
+        auto_repair: autoRepair,
+        max_repair_attempts: maxRepairAttempts,
+        merge_queue_mode: mergeQueueMode,
         provider,
         // 显式 null 才能清空（undefined 会被后端 exclude_unset 丢弃，
         // 换 provider 后旧模型残留会让 CLI 拿到错家族的 --model）
         review_model: reviewModel.trim() ? reviewModel.trim() : null,
         review_effort: reviewEffort || null,
+        review_mode: reviewMode,
+        wait_for_ci: waitForCi,
+        required_checks: checks,
         default_branch: defaultBranch.trim() || 'main',
         allowed_authors: authors,
       });
       setDetail(updated);
+      setRequiredChecks(renderRequiredChecks(updated));
       onRefresh();
-    } catch { /* ignore */ }
+    } catch (error) { setSaveError(String(error)); }
     setSaving(false);
   };
 
@@ -291,13 +405,39 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
 
       <div className="bg-gray-800 rounded-lg p-5 space-y-4">
         <h3 className="text-foreground font-semibold text-lg">{detail.repo_full_name}</h3>
+        {saveError && <p className="text-sm text-red-400">{saveError}</p>}
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="flex items-center gap-2">
-            <input type="checkbox" id="detailAutoMerge" checked={autoMerge} onChange={(e) => setAutoMerge(e.target.checked)}
+            <input type="checkbox" id="detailAutoMerge" checked={autoMerge} onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
               className="rounded bg-gray-700 border-gray-600" />
             <label htmlFor="detailAutoMerge" className="text-sm text-gray-300">Auto-merge approved PRs</label>
           </div>
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id="detailAutoRepair" checked={autoRepair} onChange={(e) => setAutoRepair(e.target.checked)} />
+            <label htmlFor="detailAutoRepair" className="text-sm text-gray-300">Auto-resume bound Developer Task</label>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Max automatic repair heads</label>
+            <input type="number" min={1} max={20} value={maxRepairAttempts}
+              onChange={(e) => setMaxRepairAttempts(Number(e.target.value))}
+              className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2" />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Merge Queue mode</label>
+            <select value={mergeQueueMode} onChange={(e) => { const value = e.target.value as 'manual' | 'shadow' | 'auto'; setMergeQueueMode(value); if (value !== 'manual') setAutoMerge(false); }}
+              className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2">
+              <option value="manual">Manual</option><option value="shadow">Shadow</option><option value="auto">Automatic</option>
+            </select>
+          </div>
+          {reviewMode === 'panel' && waitForCi && (
+            <div className="md:col-span-2">
+              <label className="block text-xs text-gray-400 mb-1">Required CI identities（每行一个）</label>
+              <textarea className="w-full bg-gray-700 text-foreground text-xs rounded px-3 py-2 font-mono"
+                rows={3} value={requiredChecks} onChange={(e) => setRequiredChecks(e.target.value)}
+                placeholder={'check_run,tests,github-actions\nstatus,lint,ci-bot'} />
+            </div>
+          )}
           <div>
             <label className="block text-xs text-gray-400 mb-1">Provider</label>
             <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
@@ -331,6 +471,19 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
             <label className="block text-xs text-gray-400 mb-1">Default Branch</label>
             <input className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
               value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Review Harness</label>
+            <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2"
+              value={reviewMode} onChange={(e) => setReviewMode(e.target.value as 'single' | 'panel')}>
+              <option value="panel">Independent Principal / Senior / QA panel</option>
+              <option value="single">Legacy single reviewer</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id="waitForCi" checked={waitForCi}
+              disabled={reviewMode !== 'panel'} onChange={(e) => setWaitForCi(e.target.checked)} />
+            <label htmlFor="waitForCi" className="text-sm text-gray-300">Wait for exact-head CI before review</label>
           </div>
           <div>
             <label className="block text-xs text-gray-400 mb-1">Allowed Authors (comma-separated)</label>
@@ -398,7 +551,12 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                 </thead>
                 <tbody>
                   {reviews.map(r => (
-                    <tr key={r.id} className="border-b border-gray-700/50 text-gray-300">
+                    <tr key={r.id} className="border-b border-gray-700/50 text-gray-300 cursor-pointer hover:bg-gray-700/30"
+                      onClick={async () => {
+                        const detail = await api.getReviewDetail(r.id);
+                        setSelectedReview(detail);
+                        setMonitorRun(detail.monitor_run_id ? await api.getPRMonitorRun(detail.monitor_run_id) : null);
+                      }}>
                       <td className="py-2 pr-4">
                         <a href={r.pr_url} target="_blank" rel="noopener noreferrer"
                           className="text-indigo-400 hover:text-indigo-300">#{r.pr_number}</a>
@@ -420,6 +578,86 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                 </tbody>
               </table>
             </div>
+            {selectedReview?.reviewer_runs && selectedReview.reviewer_runs.length > 0 && (
+              <div className="mt-4 border-t border-gray-700 pt-4 space-y-3">
+                <div className="flex justify-between">
+                  <h5 className="font-medium text-foreground">Reviewer Panel · PR #{selectedReview.pr_number}</h5>
+                  <button className="text-xs text-gray-400" onClick={() => setSelectedReview(null)}>Close</button>
+                </div>
+                {selectedReview.ci_summary && <p className="text-xs text-gray-400">CI: {selectedReview.ci_summary}</p>}
+                {monitorRun && (
+                  <div className="rounded bg-gray-900/50 p-3 text-xs space-y-2">
+                    <p>Loop: {monitorRun.status} · repair {monitorRun.repair_attempts}/{monitorRun.max_repair_attempts}</p>
+                    <p>Developer Task: {monitorRun.developer_task_id ? `#${monitorRun.developer_task_id}` : 'not bound'}</p>
+                    {!monitorRun.developer_task_id && (
+                      <div className="flex gap-2">
+                        <input value={developerTaskId} onChange={(e) => setDeveloperTaskId(e.target.value)}
+                          placeholder="Developer Task ID" className="bg-gray-700 rounded px-2 py-1" />
+                        <button className="bg-indigo-600 text-white rounded px-2 py-1" onClick={async () => {
+                          if (selectedReview.monitor_run_id && developerTaskId) {
+                            setMonitorRun(await api.bindPRMonitorDeveloper(selectedReview.monitor_run_id, Number(developerTaskId)));
+                          }
+                        }}>Bind</button>
+                      </div>
+                    )}
+                    {monitorRun.pause_reason && <p className="text-yellow-500">Paused: {monitorRun.pause_reason}</p>}
+                    {monitorRun.wakes.map(wake => <p key={wake.id}>Wake #{wake.id}: {wake.status} · {wake.reason_kind}{wake.last_error ? ` · ${wake.last_error}` : ''}</p>)}
+                    {monitorRun.merge_actions?.map(action => <p key={action.id}>Merge #{action.id}: {action.status}{action.ci_status ? ` · CI ${action.ci_status}` : ''}{action.last_error ? ` · ${action.last_error}` : ''}</p>)}
+                    <div className="flex gap-2">
+                      {monitorRun.status === 'paused' ? (
+                        <button className="bg-indigo-600 text-white rounded px-2 py-1"
+                          onClick={async () => setMonitorRun(await api.resumePRMonitorRun(monitorRun.id))}>Resume loop</button>
+                      ) : (
+                        <button className="bg-gray-700 rounded px-2 py-1"
+                          onClick={async () => setMonitorRun(await api.pausePRMonitorRun(monitorRun.id))}>Pause loop</button>
+                      )}
+                      {monitorRun.developer_task_id && (
+                        <button className="bg-gray-700 rounded px-2 py-1"
+                          onClick={async () => setMonitorRun(await api.unbindPRMonitorDeveloper(monitorRun.id))}>Unbind Developer</button>
+                      )}
+                      {monitorRun.status === 'ready_to_merge' && (
+                        <button className="bg-green-700 text-white rounded px-2 py-1"
+                          onClick={async () => setMonitorRun(await api.enqueuePRMonitorMerge(monitorRun.id))}>Enqueue merge</button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {selectedReview.ci_details?.observed.map((item) => (
+                  <p key={`${item.kind}:${item.name}:${item.app_slug}`} className="text-xs text-gray-500">
+                    {item.state} · {item.name} · {item.app_slug}
+                  </p>
+                ))}
+                {selectedReview.reviewer_runs.map(run => (
+                  <div key={run.id} className="rounded bg-gray-900/40 p-3">
+                    <div className="flex justify-between text-sm">
+                      <span className="font-medium text-gray-200">{run.role}</span>
+                      <span className={STATUS_COLORS[run.status] || 'text-gray-400'}>{run.status}</span>
+                    </div>
+                    {run.error_message && <p className="text-xs text-red-400 mt-1">{run.error_message}</p>}
+                    {run.findings.map(finding => (
+                      <div key={finding.id} className="mt-3 border-l-2 border-orange-500 pl-3 text-xs space-y-1">
+                        <p className="text-orange-300">[{finding.severity}] {finding.path}{finding.line ? `:${finding.line}` : ''} — {finding.title}</p>
+                        <p className="text-gray-300">Evidence: {finding.evidence}</p>
+                        <p className="text-gray-400">Impact: {finding.impact}</p>
+                        <p className="text-gray-400">Required fix: {finding.required_fix}</p>
+                        <p className="text-gray-400">Test: {finding.test}</p>
+                        <p className="text-gray-500">
+                          Thread: {finding.github_comment_url ? (
+                            <a className="text-indigo-400 hover:text-indigo-300" href={finding.github_comment_url}
+                              target="_blank" rel="noopener noreferrer">{finding.thread_status}</a>
+                          ) : finding.thread_status}
+                        </p>
+                        {finding.thread_error && <p className="text-yellow-500">{finding.thread_error}</p>}
+                        <FindingRebuttalForm finding={finding} onSubmitted={async () => {
+                          const refreshed = await api.getReviewDetail(selectedReview.id);
+                          setSelectedReview(refreshed);
+                        }} />
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="flex gap-2 pt-2">
               <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1}
                 className="px-3 py-1 text-xs bg-gray-700 text-gray-300 rounded disabled:opacity-50">Prev</button>

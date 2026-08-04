@@ -8,6 +8,29 @@ from backend.config import settings
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
+class RequiredCheckPolicy(BaseModel):
+    """Stable identity of one required GitHub check/status producer."""
+
+    name: str = Field(min_length=1, max_length=200)
+    app_slug: str = Field(min_length=1, max_length=200)
+    kind: str = "check_run"
+
+    @field_validator("name", "app_slug")
+    @classmethod
+    def strip_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value or "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("required check identity must be one non-empty line")
+        return value
+
+    @field_validator("kind")
+    @classmethod
+    def validate_kind(cls, value: str) -> str:
+        if value not in {"check_run", "status"}:
+            raise ValueError("required check kind must be 'check_run' or 'status'")
+        return value
+
+
 class MonitoredRepoCreate(BaseModel):
     repo_full_name: str
     project_id: int | None = None
@@ -16,6 +39,14 @@ class MonitoredRepoCreate(BaseModel):
     provider: str = Field(default_factory=lambda: settings.default_provider)
     review_model: str | None = None
     review_effort: str | None = None
+    # API compatibility: callers must opt in explicitly. The first-party UI
+    # defaults new monitors to the panel harness.
+    review_mode: str = "single"
+    wait_for_ci: bool = False
+    required_checks: list[RequiredCheckPolicy] = Field(default_factory=list)
+    auto_repair: bool = False
+    max_repair_attempts: int = Field(default=3, ge=1, le=20)
+    merge_queue_mode: str = "manual"
     default_branch: str = "main"
     allowed_authors: list[str] = []
 
@@ -28,6 +59,20 @@ class MonitoredRepoCreate(BaseModel):
             )
         return v
 
+    @field_validator("review_mode")
+    @classmethod
+    def validate_review_mode(cls, v: str) -> str:
+        if v not in {"single", "panel"}:
+            raise ValueError("review_mode must be 'single' or 'panel'")
+        return v
+
+    @field_validator("merge_queue_mode")
+    @classmethod
+    def validate_merge_queue_mode(cls, v: str) -> str:
+        if v not in {"manual", "shadow", "auto"}:
+            raise ValueError("merge_queue_mode must be manual, shadow, or auto")
+        return v
+
 
 class MonitoredRepoUpdate(BaseModel):
     project_id: int | None = None
@@ -35,9 +80,29 @@ class MonitoredRepoUpdate(BaseModel):
     provider: str | None = None
     review_model: str | None = None
     review_effort: str | None = None
+    review_mode: str | None = None
+    wait_for_ci: bool | None = None
+    required_checks: list[RequiredCheckPolicy] | None = None
+    auto_repair: bool | None = None
+    max_repair_attempts: int | None = Field(default=None, ge=1, le=20)
+    merge_queue_mode: str | None = None
     default_branch: str | None = None
     allowed_authors: list[str] | None = None
     enabled: bool | None = None
+
+    @field_validator("review_mode")
+    @classmethod
+    def validate_review_mode(cls, v: str | None) -> str | None:
+        if v is not None and v not in {"single", "panel"}:
+            raise ValueError("review_mode must be 'single' or 'panel'")
+        return v
+
+    @field_validator("merge_queue_mode")
+    @classmethod
+    def validate_merge_queue_mode(cls, v: str | None) -> str | None:
+        if v is not None and v not in {"manual", "shadow", "auto"}:
+            raise ValueError("merge_queue_mode must be manual, shadow, or auto")
+        return v
 
 
 class MonitoredRepoResponse(BaseModel):
@@ -51,6 +116,12 @@ class MonitoredRepoResponse(BaseModel):
     provider: str = "claude"
     review_model: str | None
     review_effort: str | None
+    review_mode: str = "single"
+    wait_for_ci: bool = False
+    required_checks: list[RequiredCheckPolicy] = Field(default_factory=list)
+    auto_repair: bool = False
+    max_repair_attempts: int = 3
+    merge_queue_mode: str = "manual"
     default_branch: str
     allowed_authors: list[str]
     status: str
@@ -89,6 +160,7 @@ class MonitoredRepoDetailResponse(MonitoredRepoResponse):
 
 class PRReviewResponse(BaseModel):
     id: int
+    monitor_run_id: int | None = None
     repo_id: int
     pr_number: int
     base_sha: str | None
@@ -101,7 +173,151 @@ class PRReviewResponse(BaseModel):
     status: str
     review_summary: str | None
     action_taken: str | None
+    ci_status: str | None = None
+    ci_summary: str | None = None
+    ci_details: dict | None = None
     created_at: datetime
     completed_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class PRFindingResponse(BaseModel):
+    id: int
+    reviewer_run_id: int
+    role: str
+    severity: str
+    category: str
+    path: str
+    line: int | None
+    hunk: str | None
+    title: str
+    evidence: str
+    impact: str
+    required_fix: str
+    test: str
+    status: str
+    thread_status: str = "pending"
+    github_comment_id: int | None = None
+    github_comment_url: str | None = None
+    github_thread_node_id: str | None = None
+    thread_error: str | None = None
+    rebuttals: list["PRFindingRebuttalResponse"] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
+
+
+class PRFindingRebuttalCreate(BaseModel):
+    evidence: str = Field(min_length=20, max_length=8000)
+
+    @field_validator("evidence")
+    @classmethod
+    def validate_evidence(cls, value: str) -> str:
+        value = value.strip()
+        if "\x00" in value:
+            raise ValueError("rebuttal evidence contains NUL")
+        return value
+
+
+class PRFindingRebuttalResponse(BaseModel):
+    id: int
+    finding_id: int
+    developer_task_id: int
+    task_id: int | None
+    attempt: int
+    base_sha: str
+    head_sha: str
+    evidence: str
+    status: str
+    verdict: str | None
+    result_body: str | None
+    error_message: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class PRReviewerRunResponse(BaseModel):
+    id: int
+    role: str
+    task_id: int | None
+    provider: str
+    model: str | None
+    effort: str | None
+    status: str
+    verdict: str | None
+    error_message: str | None
+    created_at: datetime
+    completed_at: datetime | None
+    findings: list[PRFindingResponse] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
+
+
+class PRReviewDetailResponse(PRReviewResponse):
+    reviewer_runs: list[PRReviewerRunResponse] = Field(default_factory=list)
+
+
+class PRMonitorBindRequest(BaseModel):
+    task_id: int = Field(gt=0)
+
+
+class PRRepairWakeResponse(BaseModel):
+    id: int
+    review_id: int | None
+    developer_task_id: int | None
+    trigger_base_sha: str
+    trigger_head_sha: str
+    reason_kind: str
+    status: str
+    attempt: int
+    evidence: dict
+    last_error: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class PRMergeQueueActionResponse(BaseModel):
+    id: int
+    review_id: int
+    trigger_base_sha: str
+    trigger_head_sha: str
+    status: str
+    github_queue_entry_id: str | None
+    merge_group_sha: str | None
+    merge_group_ref: str | None
+    ci_status: str | None
+    ci_details: dict | None
+    attempt_count: int
+    last_error: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class PRMonitorRunResponse(BaseModel):
+    id: int
+    repo_id: int
+    pr_number: int
+    status: str
+    current_base_sha: str
+    current_head_sha: str
+    current_review_id: int | None
+    developer_task_id: int | None
+    repair_attempts: int
+    max_repair_attempts: int
+    no_progress_count: int
+    state_version: int
+    pause_reason: str | None
+    binding_verified_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    wakes: list[PRRepairWakeResponse] = Field(default_factory=list)
+    merge_actions: list[PRMergeQueueActionResponse] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}

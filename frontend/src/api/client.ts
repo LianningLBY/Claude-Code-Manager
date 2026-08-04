@@ -499,6 +499,12 @@ export interface MonitoredRepo {
   provider: string;
   review_model: string | null;
   review_effort: string | null;
+  review_mode: 'single' | 'panel';
+  wait_for_ci: boolean;
+  required_checks: RequiredCheckPolicy[];
+  auto_repair: boolean;
+  max_repair_attempts: number;
+  merge_queue_mode: 'manual' | 'shadow' | 'auto';
   default_branch: string;
   allowed_authors: string[];
   status: string;
@@ -507,8 +513,15 @@ export interface MonitoredRepo {
   updated_at: string;
 }
 
+export interface RequiredCheckPolicy {
+  kind: 'check_run' | 'status';
+  name: string;
+  app_slug: string;
+}
+
 export interface PRReview {
   id: number;
+  monitor_run_id: number | null;
   repo_id: number;
   pr_number: number;
   base_sha: string | null;
@@ -521,8 +534,101 @@ export interface PRReview {
   status: string;
   review_summary: string | null;
   action_taken: string | null;
+  ci_status: string | null;
+  ci_summary: string | null;
+  ci_details: {
+    head_sha: string;
+    required: RequiredCheckPolicy[];
+    observed: Array<RequiredCheckPolicy & { state: string; details_url?: string | null }>;
+  } | null;
+  reviewer_runs?: PRReviewerRun[];
   created_at: string;
   completed_at: string | null;
+}
+
+export interface PRRepairWake {
+  id: number;
+  developer_task_id: number | null;
+  trigger_head_sha: string;
+  reason_kind: string;
+  status: string;
+  attempt: number;
+  last_error: string | null;
+}
+
+export interface PRMonitorRun {
+  id: number;
+  repo_id: number;
+  pr_number: number;
+  status: string;
+  current_head_sha: string;
+  developer_task_id: number | null;
+  repair_attempts: number;
+  max_repair_attempts: number;
+  pause_reason: string | null;
+  wakes: PRRepairWake[];
+  merge_actions: PRMergeQueueAction[];
+}
+
+export interface PRMergeQueueAction {
+  id: number;
+  review_id: number;
+  trigger_head_sha: string;
+  status: string;
+  github_queue_entry_id: string | null;
+  merge_group_sha: string | null;
+  ci_status: string | null;
+  attempt_count: number;
+  last_error: string | null;
+}
+
+export interface PRFindingRebuttal {
+  id: number;
+  finding_id: number;
+  task_id: number | null;
+  attempt: number;
+  evidence: string;
+  status: string;
+  verdict: string | null;
+  result_body: string | null;
+  error_message: string | null;
+}
+
+export interface PRFinding {
+  id: number;
+  reviewer_run_id: number;
+  role: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  category: string;
+  path: string;
+  line: number | null;
+  hunk: string | null;
+  title: string;
+  evidence: string;
+  impact: string;
+  required_fix: string;
+  test: string;
+  status: string;
+  thread_status: 'pending' | 'published_inline' | 'published_fallback' | 'resolved';
+  github_comment_id: number | null;
+  github_comment_url: string | null;
+  thread_error: string | null;
+  rebuttals: PRFindingRebuttal[];
+}
+
+export interface PRReviewerRun {
+  id: number;
+  role: string;
+  task_id: number | null;
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  status: string;
+  verdict: string | null;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+  findings: PRFinding[];
 }
 
 export interface PoolUsageWindow {
@@ -1432,9 +1538,9 @@ export const api = {
   // PR Monitor
   getMonitoredRepos: () =>
     request<MonitoredRepo[]>('/api/pr-monitor/repos'),
-  createMonitoredRepo: (data: { repo_full_name: string; project_id?: number; worker_id?: number; auto_merge?: boolean; provider?: string; review_model?: string; review_effort?: string; default_branch?: string; allowed_authors?: string[] }) =>
+  createMonitoredRepo: (data: { repo_full_name: string; project_id?: number; worker_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string; review_effort?: string; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[] }) =>
     request<MonitoredRepo>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
-  updateMonitoredRepo: (id: number, data: { project_id?: number; auto_merge?: boolean; provider?: string; review_model?: string | null; review_effort?: string | null; default_branch?: string; allowed_authors?: string[]; enabled?: boolean }) =>
+  updateMonitoredRepo: (id: number, data: { project_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string | null; review_effort?: string | null; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[]; enabled?: boolean }) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteMonitoredRepo: (id: number) =>
     request<{ ok: boolean }>(`/api/pr-monitor/repos/${id}`, { method: 'DELETE' }),
@@ -1446,6 +1552,20 @@ export const api = {
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>
     request<PRReview>(`/api/pr-monitor/reviews/${reviewId}`),
+  getPRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}`),
+  bindPRMonitorDeveloper: (runId: number, taskId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/bind-developer`, { method: 'POST', body: JSON.stringify({ task_id: taskId }) }),
+  pausePRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/pause`, { method: 'POST' }),
+  resumePRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/resume`, { method: 'POST' }),
+  unbindPRMonitorDeveloper: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/unbind-developer`, { method: 'POST' }),
+  submitPRFindingRebuttal: (findingId: number, evidence: string) =>
+    request<PRFindingRebuttal>(`/api/pr-monitor/findings/${findingId}/rebut`, { method: 'POST', body: JSON.stringify({ evidence }) }),
+  enqueuePRMonitorMerge: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/enqueue-merge`, { method: 'POST' }),
   getWebhookInfo: () =>
     request<{ webhook_url: string | null }>('/api/pr-monitor/webhook-info'),
 

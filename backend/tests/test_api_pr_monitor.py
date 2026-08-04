@@ -15,7 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from backend.database import Base, get_db
 from backend.models.log_entry import LogEntry
-from backend.models.pr_monitor import MonitoredRepo, PRReview
+from backend.models.pr_monitor import (
+    MonitoredRepo,
+    PRMonitorRun,
+    PRRepairWake,
+    PRReview,
+    PRReviewerRun,
+)
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services import pr_review_service
@@ -145,6 +151,172 @@ async def _post_webhook(
     if delivery_id:
         headers["X-GitHub-Delivery"] = delivery_id
     return await client.post("/api/github/webhook", content=body, headers=headers)
+
+
+@pytest.mark.asyncio
+async def test_resume_remote_repair_defers_authoritative_migration_to_reconciler(
+    client, session_factory
+):
+    repo = await _create_repo(
+        client,
+        "owner/remote-repair",
+        review_mode="panel",
+        wait_for_ci=True,
+        required_checks=[{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+        auto_repair=True,
+    )
+    async with session_factory() as db:
+        worker = Worker(name="remote-repair-worker", status="ready")
+        db.add(worker)
+        await db.flush()
+        developer = Task(
+            title="Remote developer",
+            description="repair the existing PR",
+            status="completed",
+            worker_id=worker.id,
+            session_id="remote-repair-session",
+            last_cwd="/workspace/remote-repair",
+        )
+        db.add(developer)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=repo["id"],
+            pr_number=42,
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            developer_task_id=developer.id,
+            status="paused",
+            pause_reason="manual",
+        )
+        db.add(run)
+        await db.flush()
+        review = PRReview(
+            monitor_run_id=run.id,
+            repo_id=repo["id"],
+            pr_number=42,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="remote repair",
+            pr_author="alice",
+            pr_url="https://github.com/owner/remote-repair/pull/42",
+            status="commented",
+        )
+        db.add(review)
+        await db.flush()
+        run.current_review_id = review.id
+        wake = PRRepairWake(
+            monitor_run_id=run.id,
+            review_id=review.id,
+            developer_task_id=developer.id,
+            trigger_base_sha=BASE_SHA_1,
+            trigger_head_sha=HEAD_SHA_1,
+            reason_kind="review_blocked",
+            evidence_hash="e" * 64,
+            evidence={"findings": []},
+            status="shadow",
+            delivery_token="d" * 48,
+        )
+        db.add(wake)
+        await db.commit()
+        run_id = run.id
+        wake_id = wake.id
+        worker_id = worker.id
+
+    response = await client.post(f"/api/pr-monitor/runs/{run_id}/resume")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "repair_pending"
+    async with session_factory() as db:
+        resumed = await db.get(PRRepairWake, wake_id)
+        developer = await db.get(Task, resumed.developer_task_id)
+        assert resumed.status == "pending"
+        assert developer.worker_id == worker_id
+
+
+@pytest.mark.asyncio
+async def test_panel_webhook_creates_roles_and_detail_api(client, session_factory):
+    repo = await _create_repo(
+        client,
+        "owner/panel",
+        review_mode="panel",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel"),
+    )
+    assert opened.status_code == 200
+    review_id = opened.json()["review_id"]
+    async with session_factory() as db:
+        runs = list((await db.execute(
+            select(PRReviewerRun)
+            .where(PRReviewerRun.pr_review_id == review_id)
+            .order_by(PRReviewerRun.id)
+        )).scalars())
+        assert [run.role for run in runs] == [
+            "principal_engineer",
+            "senior_engineer",
+            "qa_engineer",
+        ]
+        assert len({run.task_id for run in runs}) == 3
+
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert detail.status_code == 200, detail.text
+    assert [run["role"] for run in detail.json()["reviewer_runs"]] == [
+        "principal_engineer",
+        "senior_engineer",
+        "qa_engineer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_panel_synchronize_stops_every_old_role_task(client, session_factory):
+    repo = await _create_repo(
+        client,
+        "owner/panel-sync",
+        review_mode="panel",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel-sync"),
+    )
+    old_review_id = opened.json()["review_id"]
+    async with session_factory() as db:
+        old_task_ids = list((await db.execute(
+            select(PRReviewerRun.task_id).where(
+                PRReviewerRun.pr_review_id == old_review_id
+            )
+        )).scalars())
+
+    synchronized = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel-sync", action="synchronize", head_sha=HEAD_SHA_2),
+    )
+    assert synchronized.status_code == 200, synchronized.text
+    async with session_factory() as db:
+        old_review = await db.get(PRReview, old_review_id)
+        old_runs = list((await db.execute(
+            select(PRReviewerRun).where(
+                PRReviewerRun.pr_review_id == old_review_id
+            )
+        )).scalars())
+        old_tasks = [await db.get(Task, task_id) for task_id in old_task_ids]
+        new_runs = list((await db.execute(
+            select(PRReviewerRun).where(
+                PRReviewerRun.pr_review_id == synchronized.json()["review_id"]
+            )
+        )).scalars())
+    assert old_review.status == "superseded"
+    assert all(run.status == "superseded" for run in old_runs)
+    assert all(task.metadata_["pr_review_superseded"] is True for task in old_tasks)
+    assert len(new_runs) == 3
 
 
 # === CRUD tests ===

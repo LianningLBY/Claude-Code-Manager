@@ -13,7 +13,7 @@ import pytest_asyncio
 from sqlalchemy import select, update
 
 from backend.models.log_entry import LogEntry
-from backend.models.pr_monitor import MonitoredRepo, PRReview
+from backend.models.pr_monitor import MonitoredRepo, PRFinding, PRReview, PRReviewerRun
 from backend.models.task import Task
 from backend.services import pr_review_service
 from backend.services.pr_review_service import (
@@ -363,6 +363,13 @@ def test_build_review_prompt_uses_three_lens_evidence_harness():
     assert "Principal Engineer — architecture and system fit" in prompt
     assert "Senior Engineer — implementation correctness" in prompt
     assert "QA Engineer — behavior, regression, and proof" in prompt
+    assert "Honor cohesion within a module; reject unrelated coupling" in prompt
+    assert "Honor clear layers; reject dependency tangles" in prompt
+    assert "Honor capability reuse; reject copy-and-rebuild" in prompt
+    assert "Honor unit extension; reject feature sprawl" in prompt
+    assert "Honor one established pattern" in prompt
+    assert "Honor timely deletion of dead code" in prompt
+    assert "Honor the simplest sufficient design" in prompt
     assert "A clean result from one lens cannot cancel" in prompt
     assert (
         "[critical|high|medium] [principal|senior|qa] "
@@ -1224,6 +1231,42 @@ async def test_publish_self_approval_falls_back_to_validated_comment():
     )
     assert kwargs["ensure_current"].await_count == 2
     find_merge.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_self_request_changes_preserves_findings_in_comment():
+    api = AsyncMock(side_effect=[
+        GhError("Review Can not request changes on your own pull request"),
+        _comment_response(body=(
+            "blocking findings\n\nCCM review nonce: " + ACTION_NONCE
+        )),
+    ])
+    find_review = AsyncMock(side_effect=[None, None])
+    kwargs = _publisher_kwargs(
+        result="review_comments",
+        review_body="blocking findings",
+    )
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(side_effect=[_snapshot(), _snapshot()]),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            find_review,
+        ),
+    ):
+        result = await pr_review_service._publish_review_action(**kwargs)
+    assert result == ("commented", "review_comments")
+    payload = api.await_args_list[1].kwargs["payload"]
+    assert payload["event"] == "COMMENT"
+    assert payload["commit_id"] == PR_DATA["head_sha"]
+    assert "blocking findings" in payload["body"]
+    assert f"CCM review nonce: {ACTION_NONCE}" in payload["body"]
+    assert kwargs["ensure_current"].await_count == 2
 
 
 @pytest.mark.asyncio
@@ -2240,4 +2283,148 @@ async def test_recover_superseding_intent_creates_replacement_after_cleanup(
         assert len(reviews) == 2
         new = next(review for review in reviews if review.id != review_id)
         assert new.status == "reviewing"
-        assert new.head_sha == replacement["head_sha"]
+    assert new.head_sha == replacement["head_sha"]
+
+
+def _thread_finding(*, line=12):
+    return PRFinding(
+        id=41,
+        pr_review_id=1,
+        reviewer_run_id=2,
+        fingerprint="1" * 64,
+        thread_nonce="2" * 48,
+        role="senior_engineer",
+        severity="high",
+        category="correctness",
+        path="backend/app.py",
+        line=line,
+        title="Broken validation",
+        evidence="The invalid branch returns success.",
+        impact="Bad input is persisted.",
+        required_fix="Return a validation error.",
+        test="Exercise the invalid branch.",
+        base_sha=PR_DATA["base_sha"],
+        head_sha=PR_DATA["head_sha"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocking_finding_publishes_independent_inline_thread():
+    finding = _thread_finding()
+    response = {
+        "id": 99,
+        "body": pr_review_service._finding_thread_body(finding),
+        "user": {"login": ACTOR},
+        "html_url": "https://github.test/comment/99",
+        "commit_id": PR_DATA["head_sha"],
+        "path": finding.path,
+    }
+    with (
+        patch.object(pr_review_service, "_gh_api_value", AsyncMock(return_value=[[]])),
+        patch.object(pr_review_service, "_gh_api_json", AsyncMock(return_value=response)) as post,
+    ):
+        result = await pr_review_service._publish_one_finding_thread(
+            repo_name="owner/repo",
+            pr_number=7,
+            finding=finding,
+            actor=ACTOR,
+            ensure_current=AsyncMock(return_value=True),
+        )
+    assert result == ("published_inline", 99, "https://github.test/comment/99", None)
+    assert post.await_args.kwargs["payload"]["line"] == 12
+    assert post.await_args.kwargs["payload"]["commit_id"] == PR_DATA["head_sha"]
+
+
+@pytest.mark.asyncio
+async def test_unlocatable_finding_falls_back_without_clearing_blocker():
+    finding = _thread_finding(line=None)
+    response = {
+        "id": 100,
+        "body": pr_review_service._finding_thread_body(finding),
+        "user": {"login": ACTOR},
+        "html_url": "https://github.test/comment/100",
+    }
+    with (
+        patch.object(pr_review_service, "_gh_api_value", AsyncMock(return_value=[[]])),
+        patch.object(pr_review_service, "_gh_api_json", AsyncMock(return_value=response)) as post,
+    ):
+        result = await pr_review_service._publish_one_finding_thread(
+            repo_name="owner/repo",
+            pr_number=7,
+            finding=finding,
+            actor=ACTOR,
+            ensure_current=AsyncMock(return_value=True),
+        )
+    assert result[0] == "published_fallback"
+    assert "blocker remains open" in result[3]
+    assert "/issues/7/comments" in post.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_finding_publication_survives_exact_guard_rollback(db_session):
+    """A fresh publication guard rolls back and expires ORM state by design."""
+
+    repo = _make_repo(review_mode="panel")
+    db_session.add(repo)
+    await db_session.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=7,
+        base_sha=PR_DATA["base_sha"],
+        head_sha=PR_DATA["head_sha"],
+        pr_title="fixture",
+        pr_author="alice",
+        pr_url="https://github.test/owner/repo/pull/7",
+        status="publishing",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    reviewer = PRReviewerRun(
+        pr_review_id=review.id,
+        role="senior_engineer",
+        provider="codex",
+        status="changes_required",
+        prompt_policy_hash="3" * 64,
+        guide_pack_hash="4" * 64,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    finding = _thread_finding(line=8)
+    finding.id = None
+    finding.pr_review_id = review.id
+    finding.reviewer_run_id = reviewer.id
+    db_session.add(finding)
+    await db_session.commit()
+    review_id = review.id
+    finding_id = finding.id
+
+    async def exact_guard():
+        await db_session.rollback()
+        return True
+
+    async def post_comment(_endpoint, *, payload=None, **_kwargs):
+        return {
+            "id": 101,
+            "body": payload["body"],
+            "user": {"login": ACTOR},
+            "html_url": "https://github.test/comment/101",
+            "commit_id": PR_DATA["head_sha"],
+            "path": "backend/app.py",
+        }
+
+    with (
+        patch.object(pr_review_service, "_gh_api_value", AsyncMock(return_value=[[]])),
+        patch.object(pr_review_service, "_gh_api_json", side_effect=post_comment),
+    ):
+        await pr_review_service._publish_blocking_finding_threads(
+            db_session,
+            review_id=review_id,
+            repo_name="owner/repo",
+            pr_number=7,
+            actor=ACTOR,
+            ensure_current=exact_guard,
+        )
+
+    published = await db_session.get(PRFinding, finding_id, populate_existing=True)
+    assert published.thread_status == "published_inline"
+    assert published.github_comment_id == 101

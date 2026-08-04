@@ -202,6 +202,19 @@ async def _require_pr_review_chat_allowed(
     )
     task_marker = metadata_marker or tag_marker
 
+    def allow_terminal_discussion() -> bool:
+        if task.provider == "codex":
+            # Automated Codex reviews run in a tool-free isolated thread.
+            # That transport intentionally refuses native resume, so a
+            # terminal follow-up would otherwise open a context-less thread
+            # containing only the user's new message.
+            raise HTTPException(
+                409,
+                "Terminal discussion is unavailable for isolated Codex PR "
+                "review Tasks; start a separate Task with the review context",
+            )
+        return True
+
     linked = list((await db.execute(
         select(PRReview.status).distinct()
         .outerjoin(
@@ -224,7 +237,7 @@ async def _require_pr_review_chat_allowed(
             and linked[0] in _PR_REVIEW_CHAT_TERMINAL_STATUSES
             and metadata.get("pr_review_superseded") is not True
         ):
-            return True
+            return allow_terminal_discussion()
         raise HTTPException(
             409,
             "Automated PR review discussion is available only after its "
@@ -238,7 +251,7 @@ async def _require_pr_review_chat_allowed(
         and tag_marker
         and metadata.get("pr_review_superseded") is not True
     ):
-        return True
+        return allow_terminal_discussion()
     raise HTTPException(
         409,
         "Automated PR review Task has no locally verified terminal review "

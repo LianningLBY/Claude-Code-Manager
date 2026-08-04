@@ -2,6 +2,7 @@
 
 import json
 import base64
+import hashlib
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
@@ -144,6 +145,78 @@ def _output(role: str, *, blocker: bool = False) -> str:
     )
 
 
+async def _create_recoverable_panel_run(
+    db_session,
+    *,
+    worker_id: int | None,
+) -> tuple[PRReview, PRReviewerRun, Task]:
+    repo = MonitoredRepo(
+        repo_full_name=f"owner/recovery-{worker_id}",
+        webhook_secret="s" * 64,
+        provider="claude",
+        review_mode="panel",
+        wait_for_ci=False,
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=17,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        pr_title="Recovery review",
+        pr_author="alice",
+        pr_url=f"https://github.com/owner/recovery-{worker_id}/pull/17",
+        status="reviewing",
+        action_nonce="a" * 48,
+    )
+    db_session.add(review)
+    await db_session.flush()
+    task = Task(
+        title="recoverable reviewer",
+        description="immutable review",
+        status="completed",
+        provider="claude",
+        worker_id=worker_id,
+        retry_count=0,
+        started_at=datetime.utcnow(),
+        completed_at=datetime.utcnow(),
+        tags=["pr-review"],
+    )
+    waiting_task = Task(
+        title="still-running reviewer",
+        description="immutable review",
+        status="pending",
+        provider="claude",
+        worker_id=worker_id,
+        retry_count=0,
+        tags=["pr-review"],
+    )
+    db_session.add_all([task, waiting_task])
+    await db_session.flush()
+    run = PRReviewerRun(
+        pr_review_id=review.id,
+        role="principal_engineer",
+        task_id=task.id,
+        provider="claude",
+        status="pending",
+        prompt_policy_hash="b" * 64,
+        guide_pack_hash="c" * 64,
+    )
+    waiting_run = PRReviewerRun(
+        pr_review_id=review.id,
+        role="senior_engineer",
+        task_id=waiting_task.id,
+        provider="claude",
+        status="pending",
+        prompt_policy_hash="d" * 64,
+        guide_pack_hash="e" * 64,
+    )
+    db_session.add_all([run, waiting_run])
+    await db_session.commit()
+    return review, run, task
+
+
 def test_panel_prompts_share_engineering_standard_and_keep_distinct_litmus():
     prompts = {}
     for role in pr_review_panel.REVIEWER_ROLES:
@@ -223,6 +296,213 @@ async def test_changed_file_capture_uses_exact_base_and_head_blobs():
     assert captured[0]["head"]["content"] == new.decode()
     assert captured[0]["base"]["blob_sha"] == old_blob_sha
     assert captured[0]["head"]["blob_sha"] == new_blob_sha
+
+
+@pytest.mark.asyncio
+async def test_pr_files_rest_pagination_captures_all_266_paths_and_rename():
+    pages = []
+    for start, stop in ((0, 100), (100, 200), (200, 266)):
+        page = []
+        for index in range(start, stop):
+            item = {
+                "filename": f"src/file-{index}.py",
+                "status": "modified",
+                "additions": index + 1,
+                "deletions": index,
+            }
+            page.append(item)
+        pages.append(page)
+    pages[-1][-1] = {
+        "filename": "src/new-name.py",
+        "previous_filename": "src/old-name.py",
+        "status": "renamed",
+        "additions": 3,
+        "deletions": 2,
+    }
+
+    api = AsyncMock(side_effect=pages)
+    with patch.object(pr_review_service, "_gh_api_value", api):
+        files = await pr_review_service._fetch_pr_files(
+            repo_name="owner/repo",
+            pr_number=17,
+            changed_files=266,
+        )
+
+    assert len(files) == 266
+    assert files[0] == {
+        "path": "src/file-0.py",
+        "additions": 1,
+        "deletions": 0,
+    }
+    assert files[-1] == {
+        "path": "src/new-name.py",
+        "previous_path": "src/old-name.py",
+        "additions": 3,
+        "deletions": 2,
+    }
+    assert [call.args[0] for call in api.await_args_list] == [
+        "repos/owner/repo/pulls/17/files?per_page=100&page=1",
+        "repos/owner/repo/pulls/17/files?per_page=100&page=2",
+        "repos/owner/repo/pulls/17/files?per_page=100&page=3",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pr_files_rest_pagination_rejects_count_mismatch_and_duplicates():
+    first_page = [
+        {
+            "filename": f"src/file-{index}.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+        }
+        for index in range(100)
+    ]
+    with patch.object(
+        pr_review_service,
+        "_gh_api_value",
+        AsyncMock(side_effect=[first_page, []]),
+    ):
+        with pytest.raises(
+            pr_review_service.GhError,
+            match="does not match changedFiles",
+        ):
+            await pr_review_service._fetch_pr_files(
+                repo_name="owner/repo",
+                pr_number=17,
+                changed_files=101,
+            )
+
+    duplicate = {
+        "filename": "src/same.py",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 0,
+    }
+    with patch.object(
+        pr_review_service,
+        "_gh_api_value",
+        AsyncMock(return_value=[duplicate, duplicate]),
+    ):
+        with pytest.raises(pr_review_service.GhError, match="duplicate paths"):
+            await pr_review_service._fetch_pr_files(
+                repo_name="owner/repo",
+                pr_number=17,
+                changed_files=2,
+            )
+
+
+@pytest.mark.asyncio
+async def test_pr_files_rest_pagination_rejects_more_than_capture_limit():
+    api = AsyncMock()
+    with patch.object(pr_review_service, "_gh_api_value", api):
+        with pytest.raises(
+            pr_review_service.GhError,
+            match="more than 300 files",
+        ):
+            await pr_review_service._fetch_pr_files(
+                repo_name="owner/repo",
+                pr_number=17,
+                changed_files=301,
+            )
+    api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_changed_file_capture_uses_previous_path_for_rename_base():
+    base_tree_sha = "1" * 40
+    head_tree_sha = "2" * 40
+    old_blob_sha = "3" * 40
+    new_blob_sha = "4" * 40
+    old = b"old renamed contents\n"
+    new = b"new renamed contents\n"
+    responses = {
+        f"repos/owner/repo/git/commits/{BASE_SHA}": {
+            "sha": BASE_SHA,
+            "tree": {"sha": base_tree_sha},
+        },
+        f"repos/owner/repo/git/commits/{HEAD_SHA}": {
+            "sha": HEAD_SHA,
+            "tree": {"sha": head_tree_sha},
+        },
+        f"repos/owner/repo/git/trees/{base_tree_sha}?recursive=1": {
+            "sha": base_tree_sha,
+            "truncated": False,
+            "tree": [{
+                "path": "old.py",
+                "type": "blob",
+                "mode": "100644",
+                "sha": old_blob_sha,
+                "size": len(old),
+            }],
+        },
+        f"repos/owner/repo/git/trees/{head_tree_sha}?recursive=1": {
+            "sha": head_tree_sha,
+            "truncated": False,
+            "tree": [{
+                "path": "new.py",
+                "type": "blob",
+                "mode": "100644",
+                "sha": new_blob_sha,
+                "size": len(new),
+            }],
+        },
+        f"repos/owner/repo/git/blobs/{old_blob_sha}": {
+            "sha": old_blob_sha,
+            "size": len(old),
+            "encoding": "base64",
+            "content": base64.b64encode(old).decode(),
+        },
+        f"repos/owner/repo/git/blobs/{new_blob_sha}": {
+            "sha": new_blob_sha,
+            "size": len(new),
+            "encoding": "base64",
+            "content": base64.b64encode(new).decode(),
+        },
+    }
+
+    async def response(endpoint, **_kwargs):
+        return responses[endpoint]
+
+    with patch.object(
+        pr_review_service,
+        "_gh_api_json",
+        AsyncMock(side_effect=response),
+    ):
+        captured = await pr_review_service._fetch_changed_file_contents(
+            repo_name="owner/repo",
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+            files=[{
+                "path": "new.py",
+                "previous_path": "old.py",
+                "additions": 1,
+                "deletions": 1,
+            }],
+        )
+
+    assert captured == [{
+        "path": "new.py",
+        "previous_path": "old.py",
+        "base": {
+            "present": True,
+            "mode": "100644",
+            "blob_sha": old_blob_sha,
+            "byte_length": len(old),
+            "available": True,
+            "sha256": hashlib.sha256(old).hexdigest(),
+            "content": old.decode(),
+        },
+        "head": {
+            "present": True,
+            "mode": "100644",
+            "blob_sha": new_blob_sha,
+            "byte_length": len(new),
+            "available": True,
+            "sha256": hashlib.sha256(new).hexdigest(),
+            "content": new.decode(),
+        },
+    }]
 
 
 def test_parse_panel_output_enforces_subject_role_and_blocking_verdict():
@@ -327,6 +607,178 @@ async def test_panel_creates_three_independent_tasks_and_gates_findings(
     publish.assert_awaited_once()
 
 
+def test_finding_fingerprint_distinguishes_location_root_cause_and_path_case():
+    finding = {
+        "severity": "medium",
+        "category": "correctness",
+        "path": "backend/Case.py",
+        "line": 10,
+        "hunk": None,
+        "title": "Incorrect transition",
+        "evidence": "State A is committed after wake B.",
+        "impact": "The worker can become stranded.",
+        "required_fix": "Commit A before wake B.",
+        "test": "Crash at the transition boundary.",
+    }
+    base = pr_review_panel._finding_fingerprint("senior_engineer", finding)
+    assert base != pr_review_panel._finding_fingerprint(
+        "senior_engineer",
+        {**finding, "line": 20},
+    )
+    assert base != pr_review_panel._finding_fingerprint(
+        "senior_engineer",
+        {**finding, "evidence": "State C overwrites state D."},
+    )
+    assert base != pr_review_panel._finding_fingerprint(
+        "senior_engineer",
+        {**finding, "path": "backend/case.py"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_panel_recovery_defers_only_until_history_arrives(
+    db_session,
+    db_factory,
+):
+    review, run, task = await _create_recoverable_panel_run(
+        db_session,
+        worker_id=77,
+    )
+    with patch(
+        "backend.services.pr_review_service._broadcast_review_update",
+        AsyncMock(),
+    ):
+        assert await pr_review_panel.recover_panel_reviews(db_factory) == 0
+
+        db_session.add(LogEntry(
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            event_type="result",
+            role="assistant",
+            content=_output(run.role),
+            timestamp=task.started_at,
+        ))
+        await db_session.commit()
+        assert await pr_review_panel.recover_panel_reviews(db_factory) == 1
+
+    refreshed_review = await db_session.get(
+        PRReview,
+        review.id,
+        populate_existing=True,
+    )
+    refreshed_run = await db_session.get(
+        PRReviewerRun,
+        run.id,
+        populate_existing=True,
+    )
+    assert refreshed_review.status == "reviewing"
+    assert refreshed_run.status == "passed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_id", "candidate", "expected_error"),
+    [
+        (88, "malformed terminal candidate", "no valid strict terminal"),
+        (None, None, "no terminal output candidates"),
+    ],
+)
+async def test_panel_recovery_fails_closed_for_malformed_or_local_missing_output(
+    db_session,
+    db_factory,
+    worker_id,
+    candidate,
+    expected_error,
+):
+    review, run, task = await _create_recoverable_panel_run(
+        db_session,
+        worker_id=worker_id,
+    )
+    if candidate is not None:
+        db_session.add(LogEntry(
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            event_type="result",
+            role="assistant",
+            content=candidate,
+            timestamp=task.started_at,
+        ))
+        await db_session.commit()
+    with patch(
+        "backend.services.pr_review_service._broadcast_review_update",
+        AsyncMock(),
+    ):
+        assert await pr_review_panel.recover_panel_reviews(db_factory) == 1
+
+    refreshed_review = await db_session.get(
+        PRReview,
+        review.id,
+        populate_existing=True,
+    )
+    refreshed_run = await db_session.get(
+        PRReviewerRun,
+        run.id,
+        populate_existing=True,
+    )
+    assert refreshed_review.status == "error"
+    assert refreshed_run.status == "error"
+    assert expected_error in refreshed_run.error_message
+
+
+@pytest.mark.asyncio
+async def test_reviewer_completion_revalidates_stale_second_session(
+    db_session,
+    db_factory,
+):
+    review, run, task = await _create_recoverable_panel_run(
+        db_session,
+        worker_id=None,
+    )
+    db_session.add(LogEntry(
+        task_id=task.id,
+        task_retry_count=task.retry_count,
+        event_type="result",
+        role="assistant",
+        content=_output(run.role),
+        timestamp=task.started_at,
+    ))
+    await db_session.commit()
+
+    async with db_factory() as stale_db:
+        stale_run = await stale_db.get(PRReviewerRun, run.id)
+        assert stale_run.status == "pending"
+        async with db_factory() as first_db:
+            with patch(
+                "backend.services.pr_review_service._broadcast_review_update",
+                AsyncMock(),
+            ):
+                assert await pr_review_panel.check_and_update_reviewer_run(
+                    first_db,
+                    reviewer_run_id=run.id,
+                    task_id=task.id,
+                    retry_count=task.retry_count,
+                    db_factory=db_factory,
+                ) is True
+                assert await pr_review_panel.check_and_update_reviewer_run(
+                    stale_db,
+                    reviewer_run_id=run.id,
+                    task_id=task.id,
+                    retry_count=task.retry_count,
+                    db_factory=db_factory,
+                ) is False
+
+    findings = list((await db_session.execute(
+        select(PRFinding).where(PRFinding.reviewer_run_id == run.id)
+    )).scalars())
+    refreshed_review = await db_session.get(
+        PRReview,
+        review.id,
+        populate_existing=True,
+    )
+    assert refreshed_review.status == "reviewing"
+    assert findings == []
+
+
 @pytest.mark.asyncio
 async def test_fetch_exact_head_ci_combines_checks_and_statuses():
     responses = [
@@ -427,7 +879,14 @@ async def test_waiting_ci_reconciler_starts_panel_only_after_pass(
         ci_summary="Pending: tests",
         ci_details={"head_sha": HEAD_SHA, "required": [], "observed": []},
     )
-    await db_session.commit()
+    from backend.services.pr_monitor_loop import attach_review_to_run
+
+    await attach_review_to_run(
+        db_session,
+        repo=repo,
+        review=review,
+        pr_data=PR_DATA,
+    )
     with (
         patch.object(
             pr_review_panel,
@@ -452,3 +911,66 @@ async def test_waiting_ci_reconciler_starts_panel_only_after_pass(
     assert refreshed.status == "reviewing"
     assert refreshed.ci_status == "passed"
     assert len(runs) == 3
+
+
+@pytest.mark.asyncio
+async def test_waiting_ci_reconciler_requires_exact_monitor_run_fence(
+    db_session,
+    db_factory,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/missing-run",
+        webhook_secret="s" * 64,
+        provider="claude",
+        review_mode="panel",
+        wait_for_ci=True,
+        enabled=True,
+        default_branch="main",
+        allowed_authors=[],
+    )
+    db_session.add(repo)
+    await db_session.commit()
+    pr_data = {
+        **PR_DATA,
+        "url": "https://github.com/owner/missing-run/pull/17",
+    }
+    review = await pr_review_panel.create_waiting_ci_review(
+        db_session,
+        repo,
+        pr_data,
+        ci_status="pending",
+        ci_summary="Pending: tests",
+        ci_details={"head_sha": HEAD_SHA, "required": [], "observed": []},
+    )
+    await db_session.commit()
+
+    with (
+        patch.object(
+            pr_review_panel,
+            "fetch_exact_head_ci",
+            AsyncMock(return_value=(
+                "passed",
+                "1 required exact-head CI checks passed",
+                {"head_sha": HEAD_SHA, "required": [], "observed": []},
+            )),
+        ),
+        patch(
+            "backend.services.pr_review_service.verify_pr_review_snapshot_current",
+            AsyncMock(),
+        ),
+        patch(
+            "backend.services.pr_review_service.prepare_pr_review_context",
+            AsyncMock(return_value={
+                **_context(),
+                "repo_name": "owner/missing-run",
+            }),
+        ),
+    ):
+        assert await pr_review_panel.reconcile_waiting_ci_reviews(db_factory) == 0
+
+    refreshed = await db_session.get(PRReview, review.id, populate_existing=True)
+    runs = list((await db_session.execute(
+        select(PRReviewerRun).where(PRReviewerRun.pr_review_id == review.id)
+    )).scalars())
+    assert refreshed.status == "waiting_ci"
+    assert runs == []

@@ -959,7 +959,11 @@ async def test_terminal_pr_review_task_allows_follow_up_chat(
     session_factory,
     terminal_status,
 ):
-    repo = await _create_repo(client, f"owner/chat-{terminal_status}")
+    repo = await _create_repo(
+        client,
+        f"owner/chat-{terminal_status}",
+        provider="claude",
+    )
     opened = await _post_webhook(
         client,
         repo["webhook_secret"],
@@ -1001,6 +1005,52 @@ async def test_terminal_pr_review_task_allows_follow_up_chat(
     assert json.loads(messages[0].raw_json)["raw_content"] == (
         "explain the review"
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_codex_pr_review_rejects_contextless_follow_up_chat(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(
+        client,
+        "owner/codex-terminal-chat",
+        provider="codex",
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/codex-terminal-chat"),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, opened.json()["review_id"])
+        task = await db.get(Task, review.task_id)
+        task_id = task.id
+        task.status = "completed"
+        task.session_id = "isolated-codex-review-thread"
+        task.provider = "codex"
+        review.status = "commented"
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+
+    dispatcher = MagicMock(enqueue_message=AsyncMock())
+    with patch("backend.main.dispatcher", dispatcher):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "explain the review"},
+        )
+
+    assert response.status_code == 409
+    assert "isolated Codex PR review" in response.json()["detail"]
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with session_factory() as db:
+        messages = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars())
+    assert messages == []
 
 
 @pytest.mark.asyncio
@@ -1240,11 +1290,59 @@ async def test_worker_tag_only_pr_review_chat_requires_internal_terminal_header(
 
 
 @pytest.mark.asyncio
+async def test_worker_tag_only_codex_review_cannot_bypass_terminal_chat_block(
+    client,
+    session_factory,
+):
+    from backend.services.pr_review_runtime import (
+        PR_REVIEW_TERMINAL_CHAT_HEADER,
+        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="Worker terminal Codex PR review mirror",
+            description="immutable snapshot",
+            status="completed",
+            provider="codex",
+            tags=["pr-review"],
+            session_id="worker-codex-review-thread",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    dispatcher = MagicMock(enqueue_message=AsyncMock())
+    internal_auth = MagicMock()
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.api.chat.require_internal_service",
+        internal_auth,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            headers={
+                PR_REVIEW_TERMINAL_CHAT_HEADER:
+                PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+            },
+            json={"message": "discuss the completed review"},
+        )
+
+    assert response.status_code == 409
+    assert "isolated Codex PR review" in response.json()["detail"]
+    internal_auth.assert_called_once()
+    dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_manager_rejects_old_worker_terminal_chat_before_local_log(
     client,
     session_factory,
 ):
-    repo = await _create_repo(client, "owner/old-worker-chat")
+    repo = await _create_repo(
+        client,
+        "owner/old-worker-chat",
+        provider="claude",
+    )
     opened = await _post_webhook(
         client,
         repo["webhook_secret"],

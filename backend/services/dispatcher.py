@@ -4221,7 +4221,14 @@ class GlobalDispatcher:
                 instance_id,
             )
             return -2
-        if session_id:
+        # Tool-free Codex PR reviews deliberately start a fresh isolated
+        # thread even when a previous native thread id exists.  A relaunch
+        # must therefore resend the complete immutable snapshot contract;
+        # sending only "continue" would create an empty-context review turn.
+        fresh_codex_pr_review = (
+            task.provider == "codex" and is_pr_review_task(task)
+        )
+        if session_id and not fresh_codex_pr_review:
             await self.instance_manager.launch(
                 instance_id=instance_id,
                 prompt=_prepend_task_artifact_policy(

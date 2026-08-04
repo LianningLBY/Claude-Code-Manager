@@ -54,6 +54,23 @@ _MAX_PANEL_OUTPUT_BYTES = 60 * 1024
 _MAX_FINDINGS = 50
 _POLICY_VERSION = "ccm-pr-review-panel-v3"
 
+
+class _PanelTerminalError(ValueError):
+    """A completed reviewer generation has unusable terminal evidence."""
+
+
+class _PanelTerminalCandidatesMissing(_PanelTerminalError):
+    """No candidate log has arrived for the exact generation yet."""
+
+
+class _PanelTerminalMalformed(_PanelTerminalError):
+    """Candidate logs arrived, but none contains a valid strict result."""
+
+
+class _PanelTerminalConflict(_PanelTerminalError):
+    """Candidate logs contain more than one distinct strict result."""
+
+
 ENGINEERING_DESIGN_STANDARD = """Every reviewer must apply the same repository-wide engineering standard.
 Treat these as review criteria, not slogans:
 
@@ -681,17 +698,20 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     select(MonitoredRepo)
                     .where(MonitoredRepo.id == repo.id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )).scalar_one_or_none()
                 locked = (await db.execute(
                     select(PRReview)
                     .where(PRReview.id == review_id, PRReview.status == "waiting_ci")
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )).scalar_one_or_none()
                 locked_run = (
                     (await db.execute(
                         select(PRMonitorRun)
                         .where(PRMonitorRun.id == locked.monitor_run_id)
                         .with_for_update()
+                        .execution_options(populate_existing=True)
                     )).scalar_one_or_none()
                     if locked is not None and locked.monitor_run_id is not None
                     else None
@@ -755,24 +775,49 @@ async def _read_panel_terminal(db: AsyncSession, task: Task, role: str, base_sha
             ),
         )
     )
+    candidates = list(rows.scalars().all())
+    if not candidates:
+        raise _PanelTerminalCandidatesMissing(
+            "panel generation has no terminal output candidates"
+        )
     valid: dict[str, dict] = {}
-    for content in rows.scalars().all():
+    for content in candidates:
         try:
             parsed = parse_panel_output(content, role=role, base_sha=base_sha, head_sha=head_sha)
         except ValueError:
             continue
         valid[_canonical_hash(parsed)] = parsed
-    if len(valid) != 1:
-        raise ValueError("panel generation has no unique strict terminal output")
+    if not valid:
+        raise _PanelTerminalMalformed(
+            "panel generation has no valid strict terminal output"
+        )
+    if len(valid) > 1:
+        raise _PanelTerminalConflict(
+            "panel generation has conflicting strict terminal outputs"
+        )
     return next(iter(valid.values()))
 
 
 def _finding_fingerprint(role: str, finding: dict) -> str:
+    def normalized(value: str | None, *, fold_case: bool = False) -> str | None:
+        if value is None:
+            return None
+        result = " ".join(value.split())
+        return result.casefold() if fold_case else result
+
     return _canonical_hash({
         "role": role,
-        "category": finding["category"].lower(),
-        "path": finding["path"].lower(),
-        "title": " ".join(finding["title"].lower().split()),
+        "category": normalized(finding["category"], fold_case=True),
+        # Git paths are case-sensitive.  Folding them aliases distinct files
+        # on Linux and can violate the per-run uniqueness constraint.
+        "path": finding["path"],
+        "line": finding.get("line"),
+        "hunk": normalized(finding.get("hunk")),
+        "title": normalized(finding["title"], fold_case=True),
+        "evidence": normalized(finding["evidence"]),
+        "impact": normalized(finding["impact"]),
+        "required_fix": normalized(finding["required_fix"]),
+        "test": normalized(finding["test"]),
     })
 
 
@@ -802,20 +847,47 @@ async def check_and_update_reviewer_run(
     task_id: int,
     retry_count: int,
     db_factory=None,
-) -> None:
+    defer_missing_terminal: bool = False,
+) -> bool:
     from backend.services import pr_review_service
 
-    run = await db.get(PRReviewerRun, reviewer_run_id, populate_existing=True)
-    task = await db.get(Task, task_id, populate_existing=True)
-    if run is None or task is None or run.task_id != task_id or run.status not in {"pending", "reviewing"}:
-        return
+    # Discover the parent id without trusting a possibly stale identity-map
+    # object, then serialize every completion in Review -> Run -> Task order.
+    # A second process that loaded ``pending`` before the first committed must
+    # refresh all three rows after acquiring the Review lock.
+    review_id = (await db.execute(
+        select(PRReviewerRun.pr_review_id).where(
+            PRReviewerRun.id == reviewer_run_id,
+            PRReviewerRun.task_id == task_id,
+        )
+    )).scalar_one_or_none()
+    if review_id is None:
+        return False
     review = (await db.execute(
         select(PRReview)
-        .where(PRReview.id == run.pr_review_id)
+        .where(PRReview.id == review_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    run = (await db.execute(
+        select(PRReviewerRun)
+        .where(PRReviewerRun.id == reviewer_run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    task = (await db.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if (
         review is None
+        or run is None
+        or task is None
+        or run.pr_review_id != review.id
+        or run.task_id != task.id
+        or run.status not in {"pending", "reviewing"}
         or review.status != "reviewing"
         or task.status != "completed"
         or task.retry_count != retry_count
@@ -824,20 +896,43 @@ async def check_and_update_reviewer_run(
         or review.base_sha is None
         or review.head_sha is None
     ):
-        return
+        return False
+    claimed = await db.execute(
+        update(PRReviewerRun)
+        .where(
+            PRReviewerRun.id == run.id,
+            PRReviewerRun.task_id == task.id,
+            PRReviewerRun.status == run.status,
+        )
+        .values(status="finalizing")
+    )
+    if claimed.rowcount != 1:
+        return False
+    run.status = "finalizing"
     try:
         parsed = await _read_panel_terminal(db, task, run.role, review.base_sha, review.head_sha)
-    except ValueError as exc:
+    except _PanelTerminalCandidatesMissing as exc:
+        if defer_missing_terminal:
+            await db.rollback()
+            return False
+        terminal_error = exc
+    except _PanelTerminalError as exc:
+        terminal_error = exc
+    else:
+        terminal_error = None
+    if terminal_error is not None:
         run.status = "error"
-        run.error_message = str(exc)
+        run.error_message = str(terminal_error)
         run.completed_at = datetime.utcnow()
         review.status = "error"
         review.action_taken = "error"
-        review.review_summary = f"{run.role} reviewer failed closed: {exc}"
+        review.review_summary = (
+            f"{run.role} reviewer failed closed: {terminal_error}"
+        )
         review.completed_at = datetime.utcnow()
         await db.commit()
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
-        return
+        return True
     run.status = "passed" if parsed["verdict"] == "pass" else "changes_required"
     run.verdict = parsed["verdict"]
     run.result_body = parsed["summary"]
@@ -863,11 +958,11 @@ async def check_and_update_reviewer_run(
         review.completed_at = datetime.utcnow()
         await db.commit()
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
-        return
+        return True
     if not all(item.status in {"passed", "changes_required"} for item in runs):
         await db.commit()
         await pr_review_service._broadcast_review_update(review.id, "reviewing", None)
-        return
+        return True
     findings = list((await db.execute(select(PRFinding).where(PRFinding.pr_review_id == review.id))).scalars())
     body = _render_gate_body(runs, findings)
     if len(body.encode("utf-8")) > pr_review_service._MAX_REVIEW_BODY_BYTES:
@@ -877,7 +972,7 @@ async def check_and_update_reviewer_run(
         review.completed_at = datetime.utcnow()
         await db.commit()
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
-        return
+        return True
     blockers = any(item.severity in BLOCKING_SEVERITIES and item.status == "open" for item in findings)
     frozen_auto_merge = (task.metadata_ or {}).get("pr_auto_merge")
     nonce = pr_review_service._validated_action_nonce(task, review)
@@ -887,7 +982,7 @@ async def check_and_update_reviewer_run(
         review.review_summary = "Panel publication policy is invalid"
         review.completed_at = datetime.utcnow()
         await db.commit()
-        return
+        return True
     action = "review_comments" if blockers else ("approved_merged" if frozen_auto_merge else "lgtm_comment")
     try:
         actor = await pr_review_service._gh_authenticated_login()
@@ -905,7 +1000,7 @@ async def check_and_update_reviewer_run(
             "error",
             "error",
         )
-        return
+        return True
     review.task_id = task.id
     review.status = "publishing"
     review.pending_action = action
@@ -923,6 +1018,7 @@ async def check_and_update_reviewer_run(
         (await db.get(MonitoredRepo, review.repo_id)).repo_full_name,
         db_factory=db_factory,
     )
+    return True
 
 
 async def fail_reviewer_run(
@@ -961,6 +1057,7 @@ async def recover_panel_reviews(db_factory) -> int:
                 Task.id,
                 Task.status,
                 Task.retry_count,
+                Task.worker_id,
             )
             .join(Task, Task.id == PRReviewerRun.task_id)
             .join(PRReview, PRReview.id == PRReviewerRun.pr_review_id)
@@ -973,17 +1070,20 @@ async def recover_panel_reviews(db_factory) -> int:
             .order_by(PRReviewerRun.id)
         )).all())
     recovered = 0
-    for run_id, review_id, task_id, status, retry_count in rows:
+    for run_id, review_id, task_id, status, retry_count, worker_id in rows:
         async with pr_review_action_lock(review_id):
             async with db_factory() as db:
                 if status == "completed":
-                    await check_and_update_reviewer_run(
+                    processed = await check_and_update_reviewer_run(
                         db,
                         reviewer_run_id=run_id,
                         task_id=task_id,
                         retry_count=retry_count,
                         db_factory=db_factory,
+                        defer_missing_terminal=worker_id is not None,
                     )
+                    if not processed:
+                        continue
                 else:
                     await fail_reviewer_run(
                         db,

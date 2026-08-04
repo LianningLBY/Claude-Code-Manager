@@ -68,6 +68,7 @@ _MAX_GH_COMMIT_RESPONSE_BYTES = 1024 * 1024
 _MAX_GH_TREE_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_GH_BLOB_RESPONSE_BYTES = 1024 * 1024
 _MAX_GH_PR_VIEW_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_GH_PR_FILES_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_GH_PR_DIFF_BYTES = 2 * 1024 * 1024
 _MAX_GH_COMPARE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_GH_REVIEWS_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -758,6 +759,103 @@ def _validate_changed_path(path: object) -> str:
     return path
 
 
+async def _fetch_pr_files(
+    *,
+    repo_name: str,
+    pr_number: int,
+    changed_files: int,
+) -> list[dict]:
+    """Fetch and normalize every REST PR-file page.
+
+    ``gh pr view --json files`` uses a fixed GraphQL ``first: 100`` selection
+    and silently truncates larger pull requests.  The scalar ``changedFiles``
+    is still authoritative, so use it as a strict bound/count fence around the
+    paginated REST endpoint instead.
+    """
+
+    if not _GITHUB_REPO_RE.fullmatch(repo_name):
+        raise ValueError("invalid GitHub repository name")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise ValueError("PR number must be a positive integer")
+    if type(changed_files) is not int or changed_files < 0:
+        raise GhError("GitHub PR changedFiles metadata is malformed")
+    if changed_files > _MAX_CHANGED_FILES:
+        raise GhError("GitHub PR changes more than 300 files")
+
+    result: list[dict] = []
+    seen_paths: set[str] = set()
+    page_count = (changed_files + 99) // 100
+    for page in range(1, page_count + 1):
+        value = await _gh_api_value(
+            f"repos/{repo_name}/pulls/{pr_number}/files?per_page=100&page={page}",
+            max_output_bytes=_MAX_GH_PR_FILES_PAGE_RESPONSE_BYTES,
+        )
+        if not isinstance(value, list):
+            raise GhError("GitHub PR files page is malformed")
+        expected_page_size = min(100, changed_files - len(result))
+        if len(value) != expected_page_size:
+            raise GhError(
+                "GitHub PR files pagination count does not match changedFiles"
+            )
+        for item in value:
+            if not isinstance(item, dict):
+                raise GhError("GitHub PR files metadata contains a malformed entry")
+            path = _validate_changed_path(item.get("filename"))
+            additions = item.get("additions")
+            deletions = item.get("deletions")
+            status = item.get("status")
+            if (
+                type(additions) is not int
+                or additions < 0
+                or type(deletions) is not int
+                or deletions < 0
+                or not isinstance(status, str)
+                or status not in {
+                    "added",
+                    "removed",
+                    "modified",
+                    "renamed",
+                    "copied",
+                    "changed",
+                    "unchanged",
+                }
+            ):
+                raise GhError(
+                    "GitHub PR files metadata contains a malformed entry"
+                )
+            previous_value = item.get("previous_filename")
+            previous_path = (
+                _validate_changed_path(previous_value)
+                if previous_value is not None
+                else None
+            )
+            if status == "renamed" and (
+                previous_path is None or previous_path == path
+            ):
+                raise GhError(
+                    "GitHub PR renamed-file metadata has no distinct previous path"
+                )
+            if path in seen_paths:
+                raise GhError("GitHub PR files metadata contains duplicate paths")
+            seen_paths.add(path)
+            normalized = {
+                "path": path,
+                "additions": additions,
+                "deletions": deletions,
+            }
+            if status == "renamed":
+                normalized["previous_path"] = previous_path
+            result.append(normalized)
+            if len(result) > _MAX_CHANGED_FILES:
+                raise GhError("GitHub PR changes more than 300 files")
+
+    if len(result) != changed_files:
+        raise GhError(
+            "GitHub PR files pagination count does not match changedFiles"
+        )
+    return result
+
+
 def _decode_changed_blob(path: str, entry: dict, blob: dict) -> tuple[str, bytes]:
     entry_sha = entry.get("sha")
     entry_size = entry.get("size")
@@ -804,6 +902,10 @@ async def _fetch_changed_file_contents(
     if len(files) > _MAX_CHANGED_FILES:
         raise GhError("GitHub PR changes more than 300 files")
     paths = [_validate_changed_path(item.get("path")) for item in files]
+    base_paths = [
+        _validate_changed_path(item.get("previous_path", item.get("path")))
+        for item in files
+    ]
     if len(set(paths)) != len(paths):
         raise GhError("GitHub PR files metadata contains duplicate paths")
     base_tree, head_tree = await asyncio.gather(
@@ -854,10 +956,11 @@ async def _fetch_changed_file_contents(
         }
 
     result = []
-    for path in paths:
+    for path, base_path in zip(paths, base_paths):
         result.append({
             "path": path,
-            "base": await capture(path, base_tree.get(path)),
+            **({"previous_path": base_path} if base_path != path else {}),
+            "base": await capture(base_path, base_tree.get(base_path)),
             "head": await capture(path, head_tree.get(path)),
         })
     return result
@@ -874,7 +977,7 @@ async def _fetch_pr_material(
 
     fields = (
         "number,title,body,author,baseRefName,baseRefOid,"
-        "headRefName,headRefOid,state,isDraft,files"
+        "headRefName,headRefOid,state,isDraft,changedFiles"
     )
     try:
         returncode, stdout, stderr = await _run_gh(
@@ -914,20 +1017,19 @@ async def _fetch_pr_material(
         if value is not None and not isinstance(value, str):
             raise GhError(f"GitHub PR metadata field {key} is malformed")
     author = metadata.get("author")
-    files = metadata.get("files")
+    changed_files = metadata.get("changedFiles")
     if (
         not isinstance(author, dict)
         or not isinstance(author.get("login"), str)
-        or not isinstance(files, list)
-        or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("path"), str)
-            or not isinstance(item.get("additions"), int)
-            or not isinstance(item.get("deletions"), int)
-            for item in files
-        )
+        or type(changed_files) is not int
+        or changed_files < 0
     ):
         raise GhError("GitHub PR author/files metadata is malformed")
+    files = await _fetch_pr_files(
+        repo_name=repo_name,
+        pr_number=pr_number,
+        changed_files=changed_files,
+    )
 
     diff_text, changed_file_contents = await asyncio.gather(
         _fetch_immutable_compare_patch(

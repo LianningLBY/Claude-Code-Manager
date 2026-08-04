@@ -22,6 +22,7 @@ from backend.models.plan import (
 )
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
+from backend.services.task_defaults import resolve_task_runtime_defaults
 from backend.schemas.plan_resource import (
     PlanApplicationResource,
     PlanInputAnswer,
@@ -640,6 +641,11 @@ async def materialize_execution_task(
                 "created_from_plan_version_id": version.id,
             }
         )
+        provider, model, effort_level = resolve_task_runtime_defaults(
+            provider=None,
+            model=None,
+            effort_level=None,
+        )
         task = Task(
             title=f"Execute {plan.title} · v{version.version_number}"[:200],
             description=(
@@ -651,6 +657,7 @@ async def materialize_execution_task(
             ),
             status="pending",
             priority=plan.priority,
+            timeout_hours=plan.timeout_hours,
             project_id=plan.project_id,
             target_repo=plan.target_repo,
             target_branch=plan.target_branch,
@@ -658,6 +665,10 @@ async def materialize_execution_task(
             worker_id=plan.worker_id,
             created_by=actor_id,
             mode="auto",
+            provider=provider,
+            model=model,
+            codex_service_tier="default",
+            effort_level=effort_level,
             metadata_=metadata,
         )
         db.add(task)

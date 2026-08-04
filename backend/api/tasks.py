@@ -34,6 +34,7 @@ from backend.services.task_queue import (
     is_task_status_deletable,
     task_delete_fence,
 )
+from backend.services.task_defaults import resolve_task_runtime_defaults
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
@@ -702,15 +703,15 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
             data["last_cwd"] = cloned["last_cwd"]
 
     # 设置归 Task：创建时填入全局默认值，后续不再依赖 instance fallback
-    from backend.config import settings as app_settings
-    if not data.get("model"):
-        data["model"] = (
-            app_settings.default_codex_model
-            if data.get("provider") == "codex"
-            else app_settings.default_model
-        )
-    if not data.get("effort_level"):
-        data["effort_level"] = app_settings.default_effort
+    (
+        data["provider"],
+        data["model"],
+        data["effort_level"],
+    ) = resolve_task_runtime_defaults(
+        provider=data.get("provider"),
+        model=data.get("model"),
+        effort_level=data.get("effort_level"),
+    )
     if data.get("mode") == "plan" and data.get("plan_repo_revision") is None:
         from backend.services.plan_tasks import capture_repo_revision
 
@@ -861,15 +862,15 @@ async def import_migrated_task(
         created_by=get_current_user_id(request),
     )
 
-    from backend.config import settings as app_settings
-    if not data.get("model"):
-        data["model"] = (
-            app_settings.default_codex_model
-            if data.get("provider") == "codex"
-            else app_settings.default_model
-        )
-    if not data.get("effort_level"):
-        data["effort_level"] = app_settings.default_effort
+    (
+        data["provider"],
+        data["model"],
+        data["effort_level"],
+    ) = resolve_task_runtime_defaults(
+        provider=data.get("provider"),
+        model=data.get("model"),
+        effort_level=data.get("effort_level"),
+    )
     validation_skills = dict(data.get("enabled_skills") or {})
     validation_skills.update(
         _explicit_command_skills(data.get("description"))

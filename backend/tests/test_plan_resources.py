@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.global_settings import GlobalSettings
@@ -634,7 +635,11 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
 ):
     created = await client.post(
         "/api/plans",
-        json={"input": "Expose a stable execution seam", "target_repo": "/tmp"},
+        json={
+            "input": "Expose a stable execution seam",
+            "target_repo": "/tmp",
+            "timeout_hours": 3.5,
+        },
     )
     plan_id = created.json()["id"]
     version_id = await _finish_current_run_with_version(
@@ -674,6 +679,15 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
         assert first.task.metadata_["auto_run_id"] == "auto-7"
         assert first.task.metadata_["created_from_plan_id"] == plan_id
         assert first.task.metadata_["created_from_plan_version_id"] == version_id
+        assert first.task.provider == settings.default_provider
+        assert first.task.model == (
+            settings.default_codex_model
+            if settings.default_provider == "codex"
+            else settings.default_model
+        )
+        assert first.task.effort_level == settings.default_effort
+        assert first.task.codex_service_tier == "default"
+        assert first.task.timeout_hours == 3.5
         assert await db.scalar(
             select(func.count(PlanApplication.id)).where(
                 PlanApplication.plan_version_id == version_id

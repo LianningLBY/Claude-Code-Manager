@@ -22,6 +22,7 @@ class FindingActionConflict(RuntimeError):
 
 
 _ACTIONABLE_REVIEW_STATUSES = {"approved", "merged", "commented"}
+_ACTIVE_FIX_STATUSES = {"pending", "running", "awaiting_confirmation"}
 
 
 async def is_current_review_snapshot(
@@ -134,6 +135,21 @@ async def create_immediate_finding_action(
             "This finding belongs to a superseded PR snapshot"
         )
     _validate_action_state(review, finding, action_type=action_type)
+    active_fix = (
+        await db.execute(
+            select(PRFindingAction.id)
+            .where(
+                PRFindingAction.finding_id == finding.id,
+                PRFindingAction.action_type == "ai_fix",
+                PRFindingAction.status.in_(_ACTIVE_FIX_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if active_fix is not None:
+        raise FindingActionConflict(
+            "Finding already has an active AI repair; complete or cancel it first"
+        )
 
     now = datetime.utcnow()
     action = PRFindingAction(

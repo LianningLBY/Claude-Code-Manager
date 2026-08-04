@@ -150,6 +150,35 @@ async def test_immediate_action_is_idempotent_and_keeps_panel_gate_open(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_immediate_action_cannot_hide_an_active_ai_fix(db_session):
+    from backend.services.pr_review_actions import (
+        FindingActionConflict,
+        create_immediate_finding_action,
+    )
+
+    _, review, finding = await _seed_finding(db_session)
+    db_session.add(PRFindingAction(
+        finding_id=finding.id,
+        action_type="ai_fix",
+        status="awaiting_confirmation",
+        idempotency_key="active-fix-7",
+        expected_head_sha=HEAD_SHA,
+    ))
+    await db_session.commit()
+
+    with pytest.raises(FindingActionConflict, match="active AI repair"):
+        await create_immediate_finding_action(
+            db_session,
+            finding_id=finding.id,
+            review_id=review.id,
+            action_type="human_advice",
+            idempotency_key="advice-during-fix-7",
+            actor_user_id=12,
+            human_advice="Try another approach.",
+        )
+
+
+@pytest.mark.asyncio
 async def test_create_fix_task_captures_route_and_uses_tool_free_tag(db_session):
     from backend.services import pr_review_fix
 

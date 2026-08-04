@@ -368,7 +368,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
                 "codex_model_service_tiers": {
                     "gpt-5.6-sol": ["default", "priority"],
                 },
-                "pr_review_snapshot_context_version": 2,
+                "pr_review_snapshot_context_version": 3,
             })
 
         async def post(self, _url, *, headers, json):

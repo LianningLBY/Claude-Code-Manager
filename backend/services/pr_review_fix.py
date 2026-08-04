@@ -702,6 +702,7 @@ async def create_fix_task(
         operation_expires_at=now + timedelta(seconds=_PUSH_LEASE_SECONDS),
         result={
             "protocol_version": 1,
+            "pr_number": review.pr_number,
             "allowed_files": [finding.path],
             "action_nonce": nonce,
         },

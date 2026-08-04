@@ -43,6 +43,8 @@ describe('FindingActions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
+    URL.createObjectURL = vi.fn(() => 'blob:review-diff');
+    URL.revokeObjectURL = vi.fn();
   });
 
   it('creates an audited ignore action for the current snapshot', async () => {
@@ -86,5 +88,60 @@ describe('FindingActions', () => {
 
     expect(screen.getByText(/Historical snapshot/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Generate AI fix' })).not.toBeInTheDocument();
+  });
+
+  it('locks competing actions and confirms the exact downloaded target', async () => {
+    const patchSha = 'b'.repeat(64);
+    const activeFinding = {
+      ...finding,
+      latest_action: {
+        id: 32,
+        finding_id: 21,
+        action_type: 'ai_fix' as const,
+        status: 'awaiting_confirmation' as const,
+        idempotency_key: 'fix-key',
+        actor_user_id: null,
+        human_advice: null,
+        task_id: 71,
+        expected_head_sha: 'a'.repeat(40),
+        patch_sha256: patchSha,
+        result: {
+          head_repo_full_name: 'fork-owner/repo',
+          head_ref: 'feature/fix',
+          pr_number: 7,
+          allowed_files: ['backend/example.py'],
+        },
+        error_message: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        completed_at: null,
+        diff_download_url: '/api/pr-monitor/actions/32/diff',
+        confirmation_token: 'confirmation-token',
+      },
+    };
+    vi.mocked(api.downloadReviewFindingDiff).mockResolvedValue({
+      blob: new Blob(['diff']),
+      filename: 'finding-32.diff',
+    });
+    vi.mocked(api.confirmReviewFindingFix).mockResolvedValue(activeFinding.latest_action);
+
+    render(<FindingActions finding={activeFinding} currentSnapshot onChanged={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: 'Ignore' })).not.toBeInTheDocument();
+    expect(screen.getByText(/fork-owner\/repo#7/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Download diff' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm and push' }));
+
+    expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining(
+      `PR: fork-owner/repo#7\nSource ref: feature/fix\nExpected head: ${'a'.repeat(40)}`,
+    ));
+    expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining(
+      `Files: backend/example.py\nPatch SHA-256: ${patchSha}`,
+    ));
+    expect(api.confirmReviewFindingFix).toHaveBeenCalledWith(
+      32,
+      'confirmation-token',
+      patchSha,
+    );
   });
 });

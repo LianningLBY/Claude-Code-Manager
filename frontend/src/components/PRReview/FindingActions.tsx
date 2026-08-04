@@ -76,17 +76,31 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
     && reviewedDiff?.actionId === action.id
     && reviewedDiff.patchSha256 === action.patch_sha256,
   );
-  const canStart = currentSnapshot && finding.status === 'open';
+  const activeFix = Boolean(
+    action?.action_type === 'ai_fix'
+    && ['pending', 'running', 'awaiting_confirmation'].includes(action.status),
+  );
+  const result = action?.result;
+  const targetRepo = typeof result?.head_repo_full_name === 'string' ? result.head_repo_full_name : null;
+  const targetRef = typeof result?.head_ref === 'string' ? result.head_ref : null;
+  const prNumber = typeof result?.pr_number === 'number' ? result.pr_number : null;
+  const allowedFiles = Array.isArray(result?.allowed_files)
+    ? result.allowed_files.filter((value): value is string => typeof value === 'string')
+    : [];
+  const targetIdentityComplete = Boolean(targetRepo && targetRef && prNumber && allowedFiles.length);
+  const canStart = currentSnapshot && finding.status === 'open' && !activeFix;
   const canConfirm = Boolean(
     currentSnapshot
     && action?.status === 'awaiting_confirmation'
     && action.confirmation_token
-    && action.patch_sha256,
+    && action.patch_sha256
+    && targetIdentityComplete,
   );
   const canReconcile = Boolean(
     action?.status === 'running'
     && action.confirmation_token
-    && action.patch_sha256,
+    && action.patch_sha256
+    && targetIdentityComplete,
   );
 
   return (
@@ -94,6 +108,15 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
       {action && <p className="mb-2 text-gray-500">Action: {action.action_type} · {action.status}</p>}
       {error && <p role="alert" className="mb-2 text-red-400">{error}</p>}
       {!currentSnapshot && <p className="mb-2 text-gray-500">Historical snapshot — new actions are locked.</p>}
+      {activeFix && <p className="mb-2 text-gray-500">Finish the active AI fix before recording another action.</p>}
+      {(canConfirm || canReconcile) && action && (
+        <div className="mb-2 rounded border border-amber-700/50 bg-amber-950/20 p-2 text-xs text-gray-300">
+          <div>Target: {targetRepo}#{prNumber} · {targetRef}</div>
+          <div>Head: {action.expected_head_sha}</div>
+          <div>Files: {allowedFiles.join(', ')}</div>
+          <div>Patch SHA-256: {action.patch_sha256}</div>
+        </div>
+      )}
       <div className="flex flex-wrap gap-2">
         {canStart && (
           <>
@@ -118,7 +141,15 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
             <button disabled={busy} className="rounded bg-gray-700 px-2 py-1 disabled:opacity-50" onClick={() => void downloadDiff()}>Download diff</button>
             <button disabled={busy || !diffIsCurrent} className="rounded bg-amber-600 px-2 py-1 text-white disabled:opacity-50" onClick={() => {
               if (!action?.confirmation_token || !action.patch_sha256) return;
-              if (!window.confirm('Create a commit and non-force push this reviewed diff to the PR source branch?')) return;
+              const confirmation = [
+                'Create a commit and non-force push this reviewed diff?',
+                `PR: ${targetRepo}#${prNumber}`,
+                `Source ref: ${targetRef}`,
+                `Expected head: ${action.expected_head_sha}`,
+                `Files: ${allowedFiles.join(', ')}`,
+                `Patch SHA-256: ${action.patch_sha256}`,
+              ].join('\n');
+              if (!window.confirm(confirmation)) return;
               void run(() => api.confirmReviewFindingFix(action.id, action.confirmation_token!, action.patch_sha256!));
             }}>{canReconcile ? 'Reconcile push' : 'Confirm and push'}</button>
           </>

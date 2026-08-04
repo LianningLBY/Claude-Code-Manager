@@ -15,7 +15,10 @@ from pathlib import Path
 
 PR_REVIEW_TAG = "pr-review"
 PR_REVIEW_FIX_TAG = "pr-review-fix"
-PR_REVIEW_SNAPSHOT_CONTEXT_VERSION = 2
+# v3 extends the tool-free sandbox contract to ``pr-review-fix`` tasks.  A
+# v2 Worker only understands the original ``pr-review`` tag and must therefore
+# fail closed instead of accepting a fix task with inherited tools.
+PR_REVIEW_SNAPSHOT_CONTEXT_VERSION = 3
 PR_REVIEW_TERMINAL_CHAT_VERSION = 1
 PR_REVIEW_RUNTIME_DIR_ENV = "CCM_PR_REVIEW_RUNTIME_DIR"
 PR_REVIEW_TERMINAL_CHAT_HEADER = "X-CCM-PR-Review-Terminal-Chat"

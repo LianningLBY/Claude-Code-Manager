@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import re
 import secrets
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+from typing import Awaitable, Callable
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.log_entry import LogEntry
@@ -22,6 +26,12 @@ from backend.models.pr_monitor import (
 from backend.models.task import Task
 
 
+logger = logging.getLogger(__name__)
+
+_RESOLUTION_LEASE_TTL = timedelta(minutes=3)
+_RESOLUTION_LEASE_RENEW_SECONDS = 30.0
+
+
 _OUTPUT_RE = re.compile(
     r"(?:\A|\n)PR_REBUTTAL_ADJUDICATION_BEGIN\n"
     r"(?P<body>\{.*\})\n"
@@ -29,6 +39,63 @@ _OUTPUT_RE = re.compile(
     r"PR_REVIEW_RESULT: rebuttal_adjudicated\Z",
     re.DOTALL,
 )
+
+
+@dataclass(frozen=True)
+class _ResolutionFinding:
+    id: int
+    pr_review_id: int
+    fingerprint: str
+    head_sha: str
+    thread_nonce: str
+    thread_status: str
+    github_comment_id: int | None
+    github_thread_node_id: str | None
+
+    @classmethod
+    def from_model(cls, finding: PRFinding) -> "_ResolutionFinding":
+        return cls(
+            id=finding.id,
+            pr_review_id=finding.pr_review_id,
+            fingerprint=finding.fingerprint,
+            head_sha=finding.head_sha,
+            thread_nonce=finding.thread_nonce,
+            thread_status=finding.thread_status,
+            github_comment_id=finding.github_comment_id,
+            github_thread_node_id=finding.github_thread_node_id,
+        )
+
+
+@dataclass(frozen=True)
+class _ResolutionRebuttal:
+    id: int
+    resolution_nonce: str
+    resolution_actor: str | None
+    result_body: str | None
+
+    @classmethod
+    def from_model(cls, rebuttal: PRFindingRebuttal) -> "_ResolutionRebuttal":
+        return cls(
+            id=rebuttal.id,
+            resolution_nonce=rebuttal.resolution_nonce,
+            resolution_actor=rebuttal.resolution_actor,
+            result_body=rebuttal.result_body,
+        )
+
+
+@dataclass(frozen=True)
+class _ResolutionClaim:
+    kind: str
+    lease_token: str
+    finding: _ResolutionFinding
+    run_id: int
+    repo_id: int
+    repo_name: str
+    source_review_id: int
+    current_review_id: int
+    pr_number: int
+    target_head_sha: str
+    rebuttal: _ResolutionRebuttal | None = None
 
 
 def _hash(value: object) -> str:
@@ -249,7 +316,10 @@ async def fail_adjudication(
     await db.commit()
 
 
-def _resolution_marker(rebuttal: PRFindingRebuttal, finding: PRFinding) -> str:
+def _resolution_marker(
+    rebuttal: PRFindingRebuttal | _ResolutionRebuttal,
+    finding: PRFinding | _ResolutionFinding,
+) -> str:
     return (
         f"<!-- ccm-finding-resolution:{rebuttal.resolution_nonce};"
         f"head:{finding.head_sha};fingerprint:{finding.fingerprint} -->"
@@ -257,7 +327,9 @@ def _resolution_marker(rebuttal: PRFindingRebuttal, finding: PRFinding) -> str:
 
 
 async def _resolve_inline_thread(
-    *, repo_name: str, pr_number: int, finding: PRFinding,
+    *, repo_name: str, pr_number: int,
+    finding: PRFinding | _ResolutionFinding,
+    ensure_current: Callable[[], Awaitable[bool]] | None = None,
 ) -> str:
     from backend.services.pr_review_service import _gh_api_value
 
@@ -282,6 +354,8 @@ async def _resolve_inline_thread(
         raise ValueError("GitHub Finding comment has no unique review thread")
     thread = matches[0]
     if thread.get("isResolved") is not True:
+        if ensure_current is not None and not await ensure_current():
+            raise RuntimeError("Finding resolution lease is no longer current")
         mutation = """mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"""
         result = await _gh_api_value(
             "graphql",
@@ -297,8 +371,10 @@ async def _resolve_inline_thread(
 
 
 async def _resolve_fallback_comment(
-    *, repo_name: str, pr_number: int, finding: PRFinding,
-    rebuttal: PRFindingRebuttal,
+    *, repo_name: str, pr_number: int,
+    finding: PRFinding | _ResolutionFinding,
+    rebuttal: PRFindingRebuttal | _ResolutionRebuttal,
+    ensure_current: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     from backend.services.pr_review_service import _gh_api_value
 
@@ -336,6 +412,8 @@ async def _resolve_fallback_comment(
 
     if await find_existing():
         return
+    if ensure_current is not None and not await ensure_current():
+        raise RuntimeError("Finding resolution lease is no longer current")
     try:
         response = await _gh_api_value(endpoint, method="POST", payload={"body": body})
         if not isinstance(response, dict) or not isinstance(response.get("id"), int):
@@ -346,7 +424,10 @@ async def _resolve_fallback_comment(
         raise
 
 
-def _fixed_resolution_marker(finding: PRFinding, fixed_head_sha: str) -> str:
+def _fixed_resolution_marker(
+    finding: PRFinding | _ResolutionFinding,
+    fixed_head_sha: str,
+) -> str:
     return (
         f"<!-- ccm-finding-fixed:{finding.thread_nonce};"
         f"finding-head:{finding.head_sha};fixed-head:{fixed_head_sha} -->"
@@ -354,8 +435,10 @@ def _fixed_resolution_marker(finding: PRFinding, fixed_head_sha: str) -> str:
 
 
 async def _resolve_fixed_fallback_comment(
-    *, repo_name: str, pr_number: int, finding: PRFinding,
+    *, repo_name: str, pr_number: int,
+    finding: PRFinding | _ResolutionFinding,
     fixed_head_sha: str, actor: str,
+    ensure_current: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     """Publish one idempotent, authenticated resolution for a fallback Finding."""
     from backend.services.pr_review_service import _gh_api_value
@@ -393,6 +476,8 @@ async def _resolve_fixed_fallback_comment(
 
     if await find_existing():
         return
+    if ensure_current is not None and not await ensure_current():
+        raise RuntimeError("Finding resolution lease is no longer current")
     try:
         response = await _gh_api_value(endpoint, method="POST", payload={"body": body})
         if not isinstance(response, dict) or not isinstance(response.get("id"), int):
@@ -401,6 +486,566 @@ async def _resolve_fixed_fallback_comment(
         if await find_existing():
             return
         raise
+
+
+async def _resolution_database_now(db: AsyncSession) -> datetime:
+    # Keep every lease comparison on the authoritative database clock.  This
+    # also normalizes SQLite's string CURRENT_TIMESTAMP in tests.
+    from backend.services.pr_review_service import _database_now
+
+    return await _database_now(db)
+
+
+async def _acquire_resolution_lease(
+    db: AsyncSession,
+    *,
+    finding_id: int,
+    expected_thread_status: str,
+    expected_finding_status: str | None = None,
+) -> str | None:
+    token = secrets.token_hex(24)
+    now = await _resolution_database_now(db)
+    predicates = [
+        PRFinding.id == finding_id,
+        PRFinding.thread_status == expected_thread_status,
+        or_(
+            PRFinding.resolution_lease_token.is_(None),
+            PRFinding.resolution_lease_expires_at.is_(None),
+            PRFinding.resolution_lease_expires_at <= now,
+        ),
+    ]
+    if expected_finding_status is not None:
+        predicates.append(PRFinding.status == expected_finding_status)
+    claimed = await db.execute(
+        update(PRFinding)
+        .where(*predicates)
+        .values(
+            resolution_lease_token=token,
+            resolution_lease_expires_at=now + _RESOLUTION_LEASE_TTL,
+        )
+    )
+    if claimed.rowcount != 1:
+        await db.rollback()
+        return None
+    await db.commit()
+    return token
+
+
+async def _lease_is_live(
+    db: AsyncSession,
+    *,
+    finding_id: int,
+    lease_token: str,
+) -> bool:
+    now = await _resolution_database_now(db)
+    return (
+        await db.execute(
+            select(PRFinding.id).where(
+                PRFinding.id == finding_id,
+                PRFinding.resolution_lease_token == lease_token,
+                PRFinding.resolution_lease_expires_at.is_not(None),
+                PRFinding.resolution_lease_expires_at > now,
+            )
+        )
+    ).scalar_one_or_none() is not None
+
+
+async def _fixed_resolution_is_current(
+    db: AsyncSession,
+    claim: _ResolutionClaim,
+) -> bool:
+    if not await _lease_is_live(
+        db,
+        finding_id=claim.finding.id,
+        lease_token=claim.lease_token,
+    ):
+        return False
+    finding = await db.get(PRFinding, claim.finding.id, populate_existing=True)
+    source_review = await db.get(
+        PRReview, claim.source_review_id, populate_existing=True
+    )
+    current = await db.get(PRReview, claim.current_review_id, populate_existing=True)
+    run = await db.get(PRMonitorRun, claim.run_id, populate_existing=True)
+    repo = await db.get(MonitoredRepo, claim.repo_id, populate_existing=True)
+    if (
+        finding is None
+        or source_review is None
+        or current is None
+        or run is None
+        or repo is None
+        or repo.enabled is not True
+        or repo.review_mode != "panel"
+        or run.repo_id != repo.id
+        or run.status != "resolving_fixed_threads"
+        or run.current_review_id != current.id
+        or run.current_head_sha != claim.target_head_sha
+        or current.head_sha != claim.target_head_sha
+        or current.status not in ("approved", "commented")
+        or source_review.monitor_run_id != run.id
+        or source_review.id == current.id
+        or finding.pr_review_id != source_review.id
+        or finding.thread_status != claim.finding.thread_status
+    ):
+        return False
+    current_blockers = list((await db.execute(select(PRFinding).where(
+        PRFinding.pr_review_id == current.id,
+        PRFinding.severity.in_(("critical", "high", "medium")),
+    ))).scalars())
+    return not any(
+        item.status == "open" or item.thread_status != "resolved"
+        for item in current_blockers
+    )
+
+
+async def _rebuttal_resolution_is_current(
+    db: AsyncSession,
+    claim: _ResolutionClaim,
+) -> bool:
+    if claim.rebuttal is None or not await _lease_is_live(
+        db,
+        finding_id=claim.finding.id,
+        lease_token=claim.lease_token,
+    ):
+        return False
+    finding = await db.get(PRFinding, claim.finding.id, populate_existing=True)
+    rebuttal = await db.get(
+        PRFindingRebuttal, claim.rebuttal.id, populate_existing=True
+    )
+    review = await db.get(PRReview, claim.source_review_id, populate_existing=True)
+    run = await db.get(PRMonitorRun, claim.run_id, populate_existing=True)
+    repo = await db.get(MonitoredRepo, claim.repo_id, populate_existing=True)
+    return bool(
+        finding is not None
+        and rebuttal is not None
+        and review is not None
+        and run is not None
+        and repo is not None
+        and repo.enabled is True
+        and repo.review_mode == "panel"
+        and rebuttal.status == "accepted"
+        and rebuttal.finding_id == finding.id
+        and rebuttal.pr_review_id == review.id
+        and rebuttal.monitor_run_id == run.id
+        and finding.status == "resolved_rebutted"
+        and finding.thread_status == claim.finding.thread_status
+        and finding.pr_review_id == review.id
+        and review.monitor_run_id == run.id
+        and review.head_sha == claim.target_head_sha
+        and run.repo_id == repo.id
+        and run.status == "adjudicating"
+        and run.current_review_id == review.id
+        and run.current_head_sha == claim.target_head_sha
+    )
+
+
+async def _ensure_claim_current(db_factory, claim: _ResolutionClaim) -> bool:
+    async with db_factory() as db:
+        if claim.kind == "fixed":
+            return await _fixed_resolution_is_current(db, claim)
+        return await _rebuttal_resolution_is_current(db, claim)
+
+
+async def _renew_resolution_lease_loop(
+    db_factory,
+    *,
+    claim: _ResolutionClaim,
+    stop: asyncio.Event,
+    lost: asyncio.Event,
+) -> None:
+    while True:
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=_RESOLUTION_LEASE_RENEW_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            async with db_factory() as db:
+                now = await _resolution_database_now(db)
+                renewed = await db.execute(
+                    update(PRFinding)
+                    .where(
+                        PRFinding.id == claim.finding.id,
+                        PRFinding.thread_status == claim.finding.thread_status,
+                        PRFinding.resolution_lease_token == claim.lease_token,
+                        PRFinding.resolution_lease_expires_at.is_not(None),
+                        PRFinding.resolution_lease_expires_at > now,
+                    )
+                    .values(
+                        resolution_lease_expires_at=(
+                            now + _RESOLUTION_LEASE_TTL
+                        )
+                    )
+                )
+                if renewed.rowcount != 1:
+                    await db.rollback()
+                    lost.set()
+                    return
+                await db.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            lost.set()
+            logger.exception(
+                "Finding resolution lease renewal failed for Finding %s",
+                claim.finding.id,
+            )
+            return
+
+
+async def _release_resolution_lease(
+    db_factory,
+    claim: _ResolutionClaim,
+    *,
+    error: str | None = None,
+) -> None:
+    async with db_factory() as db:
+        values = {
+            "resolution_lease_token": None,
+            "resolution_lease_expires_at": None,
+        }
+        if error is not None:
+            values["thread_error"] = error[:1000]
+        released = await db.execute(
+            update(PRFinding)
+            .where(
+                PRFinding.id == claim.finding.id,
+                PRFinding.resolution_lease_token == claim.lease_token,
+            )
+            .values(**values)
+        )
+        if released.rowcount == 1:
+            await db.commit()
+        else:
+            await db.rollback()
+
+
+async def _stop_resolution_lease_renewal(
+    stop: asyncio.Event,
+    renewal_task: asyncio.Task,
+) -> None:
+    stop.set()
+    try:
+        await asyncio.shield(renewal_task)
+    except asyncio.CancelledError:
+        renewal_task.cancel()
+        raise
+
+
+async def _claim_fixed_resolution(
+    db_factory,
+    *,
+    run_id: int,
+    current_review_id: int,
+    finding_id: int,
+) -> _ResolutionClaim | None:
+    async with db_factory() as db:
+        run = await db.get(PRMonitorRun, run_id, populate_existing=True)
+        current = await db.get(
+            PRReview, current_review_id, populate_existing=True
+        )
+        finding = await db.get(PRFinding, finding_id, populate_existing=True)
+        source_review = await db.get(
+            PRReview, finding.pr_review_id, populate_existing=True
+        ) if finding is not None else None
+        repo = await db.get(
+            MonitoredRepo, run.repo_id, populate_existing=True
+        ) if run is not None else None
+        if (
+            run is None
+            or current is None
+            or finding is None
+            or source_review is None
+            or repo is None
+            or repo.enabled is not True
+            or repo.review_mode != "panel"
+            or run.status != "resolving_fixed_threads"
+            or run.current_review_id != current.id
+            or run.current_head_sha != current.head_sha
+            or current.status not in ("approved", "commented")
+            or source_review.monitor_run_id != run.id
+            or source_review.id == current.id
+            or finding.thread_status not in (
+                "published_inline", "published_fallback"
+            )
+        ):
+            return None
+        current_blockers = list((await db.execute(select(PRFinding).where(
+            PRFinding.pr_review_id == current.id,
+            PRFinding.severity.in_(("critical", "high", "medium")),
+        ))).scalars())
+        if any(
+            item.status == "open" or item.thread_status != "resolved"
+            for item in current_blockers
+        ):
+            return None
+        finding_snapshot = _ResolutionFinding.from_model(finding)
+        claim = _ResolutionClaim(
+            kind="fixed",
+            lease_token="",
+            finding=finding_snapshot,
+            run_id=run.id,
+            repo_id=repo.id,
+            repo_name=repo.repo_full_name,
+            source_review_id=source_review.id,
+            current_review_id=current.id,
+            pr_number=current.pr_number,
+            target_head_sha=current.head_sha,
+        )
+        token = await _acquire_resolution_lease(
+            db,
+            finding_id=finding.id,
+            expected_thread_status=finding.thread_status,
+        )
+        return replace(claim, lease_token=token) if token is not None else None
+
+
+async def _claim_rebuttal_resolution(
+    db_factory,
+    *,
+    rebuttal_id: int,
+) -> _ResolutionClaim | None:
+    from backend.services.pr_monitor_loop import record_gate_pass
+
+    async with db_factory() as db:
+        rebuttal = await db.get(
+            PRFindingRebuttal, rebuttal_id, populate_existing=True
+        )
+        if rebuttal is None or rebuttal.status != "accepted":
+            return None
+        finding = await db.get(
+            PRFinding, rebuttal.finding_id, populate_existing=True
+        )
+        review = await db.get(
+            PRReview, rebuttal.pr_review_id, populate_existing=True
+        )
+        run = await db.get(
+            PRMonitorRun, rebuttal.monitor_run_id, populate_existing=True
+        )
+        repo = await db.get(
+            MonitoredRepo, review.repo_id, populate_existing=True
+        ) if review is not None else None
+        if finding is None or review is None or run is None or repo is None:
+            return None
+        if (
+            run.current_review_id != review.id
+            or run.current_head_sha != finding.head_sha
+        ):
+            changed = await db.execute(
+                update(PRFindingRebuttal)
+                .where(
+                    PRFindingRebuttal.id == rebuttal.id,
+                    PRFindingRebuttal.status == "accepted",
+                )
+                .values(status="superseded")
+            )
+            if changed.rowcount:
+                await db.commit()
+            else:
+                await db.rollback()
+            return None
+        if finding.thread_status == "resolved":
+            changed = await db.execute(
+                update(PRFindingRebuttal)
+                .where(
+                    PRFindingRebuttal.id == rebuttal.id,
+                    PRFindingRebuttal.status == "accepted",
+                )
+                .values(status="resolved")
+            )
+            if changed.rowcount != 1:
+                await db.rollback()
+                return None
+            blockers = list((await db.execute(select(PRFinding).where(
+                PRFinding.pr_review_id == review.id,
+                PRFinding.severity.in_(("critical", "high", "medium")),
+            ))).scalars())
+            if blockers and all(
+                item.status != "open" and item.thread_status == "resolved"
+                for item in blockers
+            ):
+                await db.flush()
+                await record_gate_pass(db, review.id)
+            else:
+                await db.commit()
+            return None
+        if (
+            repo.enabled is not True
+            or repo.review_mode != "panel"
+            or run.status != "adjudicating"
+            or review.monitor_run_id != run.id
+            or review.head_sha != finding.head_sha
+            or finding.status != "resolved_rebutted"
+            or finding.thread_status not in (
+                "published_inline", "published_fallback"
+            )
+        ):
+            return None
+        finding_snapshot = _ResolutionFinding.from_model(finding)
+        claim = _ResolutionClaim(
+            kind="rebuttal",
+            lease_token="",
+            finding=finding_snapshot,
+            run_id=run.id,
+            repo_id=repo.id,
+            repo_name=repo.repo_full_name,
+            source_review_id=review.id,
+            current_review_id=review.id,
+            pr_number=review.pr_number,
+            target_head_sha=finding.head_sha,
+            rebuttal=_ResolutionRebuttal.from_model(rebuttal),
+        )
+        token = await _acquire_resolution_lease(
+            db,
+            finding_id=finding.id,
+            expected_thread_status=finding.thread_status,
+            expected_finding_status="resolved_rebutted",
+        )
+        return replace(claim, lease_token=token) if token is not None else None
+
+
+async def _persist_rebuttal_resolution_actor(
+    db_factory,
+    claim: _ResolutionClaim,
+    actor: str,
+) -> _ResolutionClaim | None:
+    assert claim.rebuttal is not None
+    async with db_factory() as db:
+        if not await _rebuttal_resolution_is_current(db, claim):
+            return None
+        rebuttal = await db.get(
+            PRFindingRebuttal, claim.rebuttal.id, populate_existing=True
+        )
+        if rebuttal is None or rebuttal.status != "accepted":
+            return None
+        if rebuttal.resolution_actor is None:
+            changed = await db.execute(
+                update(PRFindingRebuttal)
+                .where(
+                    PRFindingRebuttal.id == rebuttal.id,
+                    PRFindingRebuttal.status == "accepted",
+                    PRFindingRebuttal.resolution_actor.is_(None),
+                )
+                .values(resolution_actor=actor)
+            )
+            if changed.rowcount != 1:
+                await db.rollback()
+                return None
+            await db.commit()
+            persisted_actor = actor
+        else:
+            persisted_actor = rebuttal.resolution_actor
+        return replace(
+            claim,
+            rebuttal=replace(
+                claim.rebuttal,
+                resolution_actor=persisted_actor,
+            ),
+        )
+
+
+async def _finish_fixed_resolution(
+    db_factory,
+    claim: _ResolutionClaim,
+    *,
+    github_thread_node_id: str | None,
+) -> bool:
+    async with db_factory() as db:
+        if not await _fixed_resolution_is_current(db, claim):
+            return False
+        now = await _resolution_database_now(db)
+        changed = await db.execute(
+            update(PRFinding)
+            .where(
+                PRFinding.id == claim.finding.id,
+                PRFinding.thread_status == claim.finding.thread_status,
+                PRFinding.resolution_lease_token == claim.lease_token,
+                PRFinding.resolution_lease_expires_at.is_not(None),
+                PRFinding.resolution_lease_expires_at > now,
+            )
+            .values(
+                status="resolved_fixed",
+                thread_status="resolved",
+                thread_error=None,
+                thread_resolved_at=now,
+                github_thread_node_id=(
+                    github_thread_node_id
+                    if github_thread_node_id is not None
+                    else PRFinding.github_thread_node_id
+                ),
+                resolution_lease_token=None,
+                resolution_lease_expires_at=None,
+            )
+        )
+        if changed.rowcount != 1:
+            await db.rollback()
+            return False
+        await db.commit()
+        return True
+
+
+async def _finish_rebuttal_resolution(
+    db_factory,
+    claim: _ResolutionClaim,
+    *,
+    github_thread_node_id: str | None,
+) -> bool:
+    from backend.services.pr_monitor_loop import record_gate_pass
+
+    assert claim.rebuttal is not None
+    async with db_factory() as db:
+        if not await _rebuttal_resolution_is_current(db, claim):
+            return False
+        now = await _resolution_database_now(db)
+        finding_changed = await db.execute(
+            update(PRFinding)
+            .where(
+                PRFinding.id == claim.finding.id,
+                PRFinding.status == "resolved_rebutted",
+                PRFinding.thread_status == claim.finding.thread_status,
+                PRFinding.resolution_lease_token == claim.lease_token,
+                PRFinding.resolution_lease_expires_at.is_not(None),
+                PRFinding.resolution_lease_expires_at > now,
+            )
+            .values(
+                thread_status="resolved",
+                thread_error=None,
+                thread_resolved_at=now,
+                github_thread_node_id=(
+                    github_thread_node_id
+                    if github_thread_node_id is not None
+                    else PRFinding.github_thread_node_id
+                ),
+                resolution_lease_token=None,
+                resolution_lease_expires_at=None,
+            )
+        )
+        rebuttal_changed = await db.execute(
+            update(PRFindingRebuttal)
+            .where(
+                PRFindingRebuttal.id == claim.rebuttal.id,
+                PRFindingRebuttal.status == "accepted",
+                PRFindingRebuttal.finding_id == claim.finding.id,
+            )
+            .values(status="resolved", error_message=None)
+        )
+        if finding_changed.rowcount != 1 or rebuttal_changed.rowcount != 1:
+            await db.rollback()
+            return False
+        blockers = list((await db.execute(select(PRFinding).where(
+            PRFinding.pr_review_id == claim.source_review_id,
+            PRFinding.severity.in_(("critical", "high", "medium")),
+        ))).scalars())
+        if blockers and all(
+            item.status != "open" and item.thread_status == "resolved"
+            for item in blockers
+        ):
+            await db.flush()
+            await record_gate_pass(db, claim.source_review_id)
+        else:
+            await db.commit()
+        return True
 
 
 async def reconcile_fixed_finding_resolutions(db_factory) -> int:
@@ -470,137 +1115,180 @@ async def reconcile_fixed_finding_resolutions(db_factory) -> int:
                 run.status = "resolving_fixed_threads"
                 run.state_version += 1
                 await db.commit()
-            actor: str | None = None
-            for finding_id in finding_ids:
-                finding = await db.get(PRFinding, finding_id, populate_existing=True)
-                run = await db.get(PRMonitorRun, run_id, populate_existing=True)
-                if (
-                    finding is None or run is None
-                    or run.status != "resolving_fixed_threads"
-                    or run.current_review_id != current.id
-                    or run.current_head_sha != current.head_sha
-                ):
-                    break
-                try:
-                    if finding.thread_status == "published_inline":
-                        finding.github_thread_node_id = await _resolve_inline_thread(
-                            repo_name=repo.repo_full_name,
-                            pr_number=current.pr_number,
-                            finding=finding,
-                        )
-                    elif finding.thread_status == "published_fallback":
-                        if actor is None:
-                            actor = await _gh_authenticated_login()
-                        await _resolve_fixed_fallback_comment(
-                            repo_name=repo.repo_full_name,
-                            pr_number=current.pr_number,
-                            finding=finding,
-                            fixed_head_sha=current.head_sha,
-                            actor=actor,
-                        )
-                    else:
-                        continue
-                except Exception as exc:
-                    finding.thread_error = (
-                        f"fixed_resolution_failed:{type(exc).__name__}:{str(exc)[:500]}"
-                    )
-                    await db.commit()
-                    continue
-                finding.status = "resolved_fixed"
-                finding.thread_status = "resolved"
-                finding.thread_error = None
-                finding.thread_resolved_at = datetime.utcnow()
-                await db.commit()
-                resolved_count += 1
+            current_review_id = current.id
 
+        actor: str | None = None
+        for finding_id in finding_ids:
+            claim = await _claim_fixed_resolution(
+                db_factory,
+                run_id=run_id,
+                current_review_id=current_review_id,
+                finding_id=finding_id,
+            )
+            if claim is None:
+                continue
+            stop = asyncio.Event()
+            lost = asyncio.Event()
+            renewal_task = asyncio.create_task(
+                _renew_resolution_lease_loop(
+                    db_factory,
+                    claim=claim,
+                    stop=stop,
+                    lost=lost,
+                )
+            )
+
+            async def ensure_current() -> bool:
+                return not lost.is_set() and await _ensure_claim_current(
+                    db_factory, claim
+                )
+
+            try:
+                if not await ensure_current():
+                    await _release_resolution_lease(db_factory, claim)
+                    continue
+                github_thread_node_id: str | None = None
+                if claim.finding.thread_status == "published_inline":
+                    github_thread_node_id = await _resolve_inline_thread(
+                        repo_name=claim.repo_name,
+                        pr_number=claim.pr_number,
+                        finding=claim.finding,
+                        ensure_current=ensure_current,
+                    )
+                elif claim.finding.thread_status == "published_fallback":
+                    if actor is None:
+                        actor = await _gh_authenticated_login()
+                    await _resolve_fixed_fallback_comment(
+                        repo_name=claim.repo_name,
+                        pr_number=claim.pr_number,
+                        finding=claim.finding,
+                        fixed_head_sha=claim.target_head_sha,
+                        actor=actor,
+                        ensure_current=ensure_current,
+                    )
+                if await _finish_fixed_resolution(
+                    db_factory,
+                    claim,
+                    github_thread_node_id=github_thread_node_id,
+                ):
+                    resolved_count += 1
+            except asyncio.CancelledError:
+                # Leave the durable lease for expiry-based recovery.  The next
+                # owner reconciles the marker/thread before another mutation.
+                raise
+            except Exception as exc:
+                await _release_resolution_lease(
+                    db_factory,
+                    claim,
+                    error=(
+                        "fixed_resolution_failed:"
+                        f"{type(exc).__name__}:{str(exc)[:500]}"
+                    ),
+                )
+            finally:
+                await _stop_resolution_lease_renewal(stop, renewal_task)
+
+        async with db_factory() as db:
             run = await db.get(PRMonitorRun, run_id, populate_existing=True)
             if (
                 run is not None
                 and run.status == "resolving_fixed_threads"
-                and run.current_review_id == current.id
-                and run.current_head_sha == current.head_sha
+                and run.current_review_id == current_review_id
             ):
-                await record_gate_pass(db, current.id)
+                current = await db.get(
+                    PRReview, current_review_id, populate_existing=True
+                )
+                if current is not None and run.current_head_sha == current.head_sha:
+                    await record_gate_pass(db, current.id)
     return resolved_count
 
 
 async def reconcile_rebuttal_resolutions(db_factory) -> int:
     """Resolve accepted Finding effects and recompute the zero-thread Gate."""
-    from backend.services.pr_monitor_loop import record_gate_pass
+    from backend.services.pr_review_service import _gh_authenticated_login
 
     async with db_factory() as db:
         rebuttal_ids = list((await db.execute(
             select(PRFindingRebuttal.id).where(PRFindingRebuttal.status == "accepted")
         )).scalars())
-        resolved_count = 0
-        for rebuttal_id in rebuttal_ids:
-            rebuttal = await db.get(
-                PRFindingRebuttal, rebuttal_id, populate_existing=True
-            )
-            if rebuttal is None or rebuttal.status != "accepted":
-                continue
-            finding = await db.get(PRFinding, rebuttal.finding_id)
-            review = await db.get(PRReview, rebuttal.pr_review_id)
-            run = await db.get(PRMonitorRun, rebuttal.monitor_run_id)
-            repo = await db.get(MonitoredRepo, review.repo_id) if review else None
-            if finding is None or review is None or run is None or repo is None:
-                continue
-            if run.current_review_id != review.id or run.current_head_sha != finding.head_sha:
-                rebuttal.status = "superseded"
-                continue
-            if rebuttal.resolution_actor is None:
-                from backend.services.pr_review_service import _gh_authenticated_login
-                try:
-                    rebuttal.resolution_actor = await _gh_authenticated_login()
-                except Exception as exc:
-                    finding.thread_error = (
-                        f"resolution_actor_failed:{type(exc).__name__}:{str(exc)[:500]}"
-                    )
-                    continue
-                await db.commit()
-                rebuttal = await db.get(PRFindingRebuttal, rebuttal_id, populate_existing=True)
-                finding = await db.get(PRFinding, rebuttal.finding_id, populate_existing=True)
-                review = await db.get(PRReview, rebuttal.pr_review_id, populate_existing=True)
-                run = await db.get(PRMonitorRun, rebuttal.monitor_run_id, populate_existing=True)
-                repo = await db.get(MonitoredRepo, review.repo_id, populate_existing=True)
-            if finding.thread_status == "resolved":
-                continue
-            try:
-                if finding.thread_status == "published_inline" or finding.github_thread_node_id:
-                    finding.github_thread_node_id = await _resolve_inline_thread(
-                        repo_name=repo.repo_full_name,
-                        pr_number=review.pr_number,
-                        finding=finding,
-                    )
-                elif finding.thread_status == "published_fallback":
-                    await _resolve_fallback_comment(
-                        repo_name=repo.repo_full_name,
-                        pr_number=review.pr_number,
-                        finding=finding,
-                        rebuttal=rebuttal,
-                    )
-                else:
-                    raise ValueError("Finding publication is not ready for resolution")
-            except Exception as exc:
-                finding.thread_error = f"resolution_failed:{type(exc).__name__}:{str(exc)[:500]}"
-                continue
-            finding.thread_status = "resolved"
-            finding.thread_error = None
-            finding.thread_resolved_at = datetime.utcnow()
-            resolved_count += 1
 
-            blockers = list((await db.execute(select(PRFinding).where(
-                PRFinding.pr_review_id == review.id,
-                PRFinding.severity.in_(("critical", "high", "medium")),
-            ))).scalars())
-            if blockers and all(
-                item.status != "open" and item.thread_status == "resolved"
-                for item in blockers
+    resolved_count = 0
+    for rebuttal_id in rebuttal_ids:
+        claim = await _claim_rebuttal_resolution(
+            db_factory,
+            rebuttal_id=rebuttal_id,
+        )
+        if claim is None:
+            continue
+        stop = asyncio.Event()
+        lost = asyncio.Event()
+        renewal_task = asyncio.create_task(
+            _renew_resolution_lease_loop(
+                db_factory,
+                claim=claim,
+                stop=stop,
+                lost=lost,
+            )
+        )
+
+        async def ensure_current() -> bool:
+            return not lost.is_set() and await _ensure_claim_current(
+                db_factory, claim
+            )
+
+        try:
+            assert claim.rebuttal is not None
+            if claim.rebuttal.resolution_actor is None:
+                actor = await _gh_authenticated_login()
+                persisted = await _persist_rebuttal_resolution_actor(
+                    db_factory, claim, actor
+                )
+                if persisted is None:
+                    await _release_resolution_lease(db_factory, claim)
+                    continue
+                claim = persisted
+            if not await ensure_current():
+                await _release_resolution_lease(db_factory, claim)
+                continue
+            github_thread_node_id: str | None = None
+            if (
+                claim.finding.thread_status == "published_inline"
+                or claim.finding.github_thread_node_id
             ):
-                await db.flush()
-                await record_gate_pass(db, review.id)
-        await db.commit()
-        return resolved_count
+                github_thread_node_id = await _resolve_inline_thread(
+                    repo_name=claim.repo_name,
+                    pr_number=claim.pr_number,
+                    finding=claim.finding,
+                    ensure_current=ensure_current,
+                )
+            elif claim.finding.thread_status == "published_fallback":
+                await _resolve_fallback_comment(
+                    repo_name=claim.repo_name,
+                    pr_number=claim.pr_number,
+                    finding=claim.finding,
+                    rebuttal=claim.rebuttal,
+                    ensure_current=ensure_current,
+                )
+            if await _finish_rebuttal_resolution(
+                db_factory,
+                claim,
+                github_thread_node_id=github_thread_node_id,
+            ):
+                resolved_count += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await _release_resolution_lease(
+                db_factory,
+                claim,
+                error=(
+                    "resolution_failed:"
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ),
+            )
+        finally:
+            await _stop_resolution_lease_renewal(stop, renewal_task)
+    return resolved_count
 
 
 async def recover_adjudications(db_factory) -> int:

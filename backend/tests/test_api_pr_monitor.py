@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -24,6 +25,7 @@ from backend.models.pr_monitor import (
 )
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.schemas.pr_monitor import MonitoredRepoResponse, MonitoredRepoUpdate
 from backend.services import pr_review_service
 
 
@@ -86,6 +88,64 @@ async def _create_repo(client, repo_full_name="owner/repo", **overrides):
     resp = await client.post("/api/pr-monitor/repos", json=payload)
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+@pytest.mark.parametrize("field", [
+    "auto_merge",
+    "provider",
+    "review_mode",
+    "wait_for_ci",
+    "required_checks",
+    "auto_repair",
+    "max_repair_attempts",
+    "merge_queue_mode",
+    "default_branch",
+    "allowed_authors",
+    "enabled",
+])
+def test_monitor_update_rejects_explicit_null_for_non_nullable_fields(field):
+    with pytest.raises(ValidationError, match="field cannot be null"):
+        MonitoredRepoUpdate.model_validate({field: None})
+
+
+@pytest.mark.parametrize("field", [
+    "project_id",
+    "review_model",
+    "review_effort",
+])
+def test_monitor_update_preserves_explicitly_nullable_fields(field):
+    parsed = MonitoredRepoUpdate.model_validate({field: None})
+    assert field in parsed.model_fields_set
+    assert getattr(parsed, field) is None
+
+
+def test_monitor_response_normalizes_legacy_null_required_checks():
+    now = datetime.utcnow()
+    parsed = MonitoredRepoResponse.model_validate({
+        "id": 1,
+        "repo_full_name": "owner/repo",
+        "project_id": None,
+        "worker_id": None,
+        "enabled": True,
+        "auto_merge": False,
+        "webhook_secret": "secret",
+        "provider": "codex",
+        "review_model": None,
+        "review_effort": None,
+        "review_mode": "panel",
+        "wait_for_ci": True,
+        "required_checks": None,
+        "auto_repair": False,
+        "max_repair_attempts": 3,
+        "merge_queue_mode": "manual",
+        "default_branch": "main",
+        "allowed_authors": None,
+        "status": "active",
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    })
+    assert parsed.required_checks == []
 
 
 async def _create_worker(session_factory, worker_id: int) -> None:

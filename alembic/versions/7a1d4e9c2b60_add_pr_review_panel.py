@@ -31,16 +31,42 @@ def upgrade() -> None:
             sa.Column(
                 "wait_for_ci",
                 sa.Boolean(),
-                server_default=sa.text("0"),
+                server_default=sa.false(),
                 nullable=False,
             )
         )
         batch_op.add_column(
             sa.Column("required_checks", sa.JSON(), nullable=True)
         )
-        batch_op.add_column(sa.Column("auto_repair", sa.Boolean(), server_default=sa.text("0"), nullable=False))
+        batch_op.add_column(sa.Column("auto_repair", sa.Boolean(), server_default=sa.false(), nullable=False))
         batch_op.add_column(sa.Column("max_repair_attempts", sa.Integer(), server_default="3", nullable=False))
         batch_op.add_column(sa.Column("merge_queue_mode", sa.String(length=20), server_default="manual", nullable=False))
+
+    # JSON defaults are not portable across the supported SQLite/PostgreSQL/
+    # MySQL versions.  Backfill explicitly, then enforce the ORM invariant.
+    dialect_name = op.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        op.execute(sa.text(
+            "UPDATE monitored_repos SET required_checks = CAST('[]' AS JSON) "
+            "WHERE required_checks IS NULL"
+        ))
+    elif dialect_name == "mysql":
+        op.execute(sa.text(
+            "UPDATE monitored_repos SET required_checks = JSON_ARRAY() "
+            "WHERE required_checks IS NULL"
+        ))
+    else:
+        op.execute(sa.text(
+            "UPDATE monitored_repos SET required_checks = '[]' "
+            "WHERE required_checks IS NULL"
+        ))
+    with op.batch_alter_table("monitored_repos", schema=None) as batch_op:
+        batch_op.alter_column(
+            "required_checks",
+            existing_type=sa.JSON(),
+            nullable=False,
+            server_default="[]",
+        )
 
     op.create_table(
         "pr_monitor_runs",
@@ -134,6 +160,8 @@ def upgrade() -> None:
         sa.Column("thread_error", sa.Text(), nullable=True),
         sa.Column("thread_published_at", sa.DateTime(), nullable=True),
         sa.Column("thread_resolved_at", sa.DateTime(), nullable=True),
+        sa.Column("resolution_lease_token", sa.String(length=64), nullable=True),
+        sa.Column("resolution_lease_expires_at", sa.DateTime(), nullable=True),
         sa.Column("base_sha", sa.String(length=64), nullable=False),
         sa.Column("head_sha", sa.String(length=64), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
@@ -193,6 +221,8 @@ def upgrade() -> None:
         sa.Column("accepted_worker_id", sa.Integer(), nullable=True),
         sa.Column("accepted_task_retry_count", sa.Integer(), nullable=True),
         sa.Column("accepted_session_id", sa.String(length=200), nullable=True),
+        sa.Column("accepted_task_started_at", sa.DateTime(), nullable=True),
+        sa.Column("accepted_task_completed_at", sa.DateTime(), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),

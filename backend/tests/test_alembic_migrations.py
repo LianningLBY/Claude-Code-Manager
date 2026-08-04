@@ -5,6 +5,9 @@ Ensures:
 2. A fresh database can be created from scratch via migrations.
 3. The final migrated schema matches the ORM models (no drift).
 """
+import importlib.util
+import io
+import json
 import re
 from pathlib import Path
 from unittest.mock import patch
@@ -539,7 +542,68 @@ class TestAlreadyMigratedDb:
                 "FROM pr_reviews ORDER BY id"
             )).fetchall()
             assert rows == [(None, None, None), (None, None, None)]
+            required_checks = conn.execute(text(
+                "SELECT required_checks FROM monitored_repos WHERE id = 1"
+            )).scalar_one()
+            if isinstance(required_checks, str):
+                required_checks = json.loads(required_checks)
+            assert required_checks == []
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    repo_full_name, enabled, auto_merge, webhook_secret,
+                    provider, default_branch, allowed_authors, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'owner/default-checks', 1, 0, 'secret', 'codex', 'main',
+                    '[]', 'active', '2026-07-22 00:02:00',
+                    '2026-07-22 00:02:00'
+                )
+            """))
+            inserted_default = conn.execute(text(
+                "SELECT required_checks FROM monitored_repos "
+                "WHERE repo_full_name = 'owner/default-checks'"
+            )).scalar_one()
+            if isinstance(inserted_default, str):
+                inserted_default = json.loads(inserted_default)
+            assert inserted_default == []
+        required_column = next(
+            item for item in inspect(engine).get_columns("monitored_repos")
+            if item["name"] == "required_checks"
+        )
+        assert required_column["nullable"] is False
         engine.dispose()
+
+    def test_pr_panel_migration_compiles_postgresql_safe_defaults(self):
+        """The migration must never emit PostgreSQL's invalid BOOLEAN DEFAULT 0."""
+
+        migration_path = (
+            PROJECT_ROOT
+            / "alembic"
+            / "versions"
+            / "7a1d4e9c2b60_add_pr_review_panel.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "pr_panel_migration_for_postgresql", migration_path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(context)):
+            module.upgrade()
+        ddl = output.getvalue().lower()
+        assert "boolean default false not null" in ddl
+        assert "boolean default 0" not in ddl
+        assert "required_checks set not null" in ddl
+        assert "required_checks set default '[]'" in ddl
 
     def test_base_sha_migration_preserves_existing_snapshot_keys(self, tmp_path):
         db_path = str(tmp_path / "existing_pr_review_snapshot.db")

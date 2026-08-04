@@ -90,6 +90,26 @@ class MonitoredRepoUpdate(BaseModel):
     allowed_authors: list[str] | None = None
     enabled: bool | None = None
 
+    @field_validator(
+        "auto_merge",
+        "provider",
+        "review_mode",
+        "wait_for_ci",
+        "required_checks",
+        "auto_repair",
+        "max_repair_attempts",
+        "merge_queue_mode",
+        "default_branch",
+        "allowed_authors",
+        "enabled",
+        mode="before",
+    )
+    @classmethod
+    def reject_explicit_null_for_non_nullable_fields(cls, value):
+        if value is None:
+            raise ValueError("field cannot be null")
+        return value
+
     @field_validator("review_mode")
     @classmethod
     def validate_review_mode(cls, v: str | None) -> str | None:
@@ -141,6 +161,13 @@ class MonitoredRepoResponse(BaseModel):
     @field_validator("allowed_authors", mode="before")
     @classmethod
     def ensure_list(cls, v) -> list[str]:
+        if v is None:
+            return []
+        return v
+
+    @field_validator("required_checks", mode="before")
+    @classmethod
+    def ensure_required_checks_list(cls, v):
         if v is None:
             return []
         return v

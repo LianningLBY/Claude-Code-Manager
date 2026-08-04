@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     ForeignKey,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from backend.database import Base
@@ -30,10 +31,14 @@ class MonitoredRepo(Base):
         String(20), default="single", server_default="single"
     )
     wait_for_ci: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default="0"
+        Boolean, default=False, server_default=false()
     )
-    required_checks: Mapped[list | None] = mapped_column(JSON, default=list)
-    auto_repair: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    required_checks: Mapped[list] = mapped_column(
+        JSON, default=list, nullable=False, server_default="[]"
+    )
+    auto_repair: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
     max_repair_attempts: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
     merge_queue_mode: Mapped[str] = mapped_column(
         String(20), default="manual", server_default="manual"
@@ -220,6 +225,14 @@ class PRFinding(Base):
     thread_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     thread_published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     thread_resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # One durable cross-process fence covers both accepted-rebuttal and
+    # newer-green-head resolution effects for this exact Finding thread.
+    resolution_lease_token: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    resolution_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     base_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -320,6 +333,12 @@ class PRRepairWake(Base):
     accepted_worker_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     accepted_task_retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     accepted_session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    accepted_task_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    accepted_task_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -925,6 +925,58 @@ async def test_webhook_rechecks_rotated_secret_after_context_capture(
 
 
 @pytest.mark.asyncio
+async def test_synchronize_rechecks_secret_before_superseding_old_generation(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    repo = await _create_repo(client, "owner/sync-rotated-secret")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/sync-rotated-secret"),
+    )
+    assert opened.json()["status"] == "accepted"
+    old_review_id = opened.json()["review_id"]
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_rotate(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            current.webhook_secret = "e" * 64
+            await db.commit()
+        return context
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_rotate,
+    )
+    synchronized = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(
+            "owner/sync-rotated-secret",
+            action="synchronize",
+            head_sha=HEAD_SHA_2,
+        ),
+    )
+
+    assert synchronized.status_code == 403
+    assert synchronized.json()["detail"] == "Invalid signature"
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        assert [review.id for review in reviews] == [old_review_id]
+        assert reviews[0].status == "reviewing"
+        task = await db.get(Task, reviews[0].task_id)
+        assert task.status == "pending"
+        assert not (task.metadata_ or {}).get("pr_review_superseded", False)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value", "expected_reason"),
     [

@@ -8282,6 +8282,47 @@ async def test_build_task_prompt_does_not_claim_enabled_skill_was_invoked(
 
 
 @pytest.mark.asyncio
+async def test_codex_pr_review_relaunch_uses_fresh_thread_and_full_snapshot_prompt(
+    db_factory,
+):
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._task_claim_is_active = AsyncMock(return_value=True)
+    dispatcher._build_task_prompt = AsyncMock(
+        return_value="FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA"
+    )
+    task = Task(
+        id=97,
+        title="PR Review",
+        description="FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA",
+        provider="codex",
+        model="gpt-5.6-sol",
+        tags=["pr-review"],
+        metadata_={"pr_review_id": 17},
+    )
+
+    await dispatcher._relaunch_and_wait(
+        3,
+        task,
+        MagicMock(),
+        "/private/review-cwd",
+        None,
+        "/private/codex-home",
+        "native-thread-from-first-attempt",
+        thinking_budget=None,
+        effort_level="high",
+        label="transient retry",
+    )
+
+    launch = dispatcher.instance_manager.launch.await_args.kwargs
+    assert launch["prompt"] == (
+        "FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA"
+    )
+    assert "resume_session_id" not in launch
+    assert "请继续之前的工作" not in launch["prompt"]
+    dispatcher._build_task_prompt.assert_awaited_once_with(task)
+
+
+@pytest.mark.asyncio
 async def test_build_task_prompt_invokes_explicit_initial_command(
     db_factory,
     monkeypatch,

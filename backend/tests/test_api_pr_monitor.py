@@ -9,15 +9,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.database import Base, get_db
 from backend.models.log_entry import LogEntry
-from backend.models.pr_monitor import MonitoredRepo, PRReview
+from backend.models.pr_monitor import (
+    MonitoredRepo,
+    PRMergeQueueAction,
+    PRMonitorRun,
+    PRRepairWake,
+    PRReview,
+    PRReviewerRun,
+)
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.schemas.pr_monitor import MonitoredRepoResponse, MonitoredRepoUpdate
 from backend.services import pr_review_service
 
 
@@ -82,6 +91,64 @@ async def _create_repo(client, repo_full_name="owner/repo", **overrides):
     return resp.json()
 
 
+@pytest.mark.parametrize("field", [
+    "auto_merge",
+    "provider",
+    "review_mode",
+    "wait_for_ci",
+    "required_checks",
+    "auto_repair",
+    "max_repair_attempts",
+    "merge_queue_mode",
+    "default_branch",
+    "allowed_authors",
+    "enabled",
+])
+def test_monitor_update_rejects_explicit_null_for_non_nullable_fields(field):
+    with pytest.raises(ValidationError, match="field cannot be null"):
+        MonitoredRepoUpdate.model_validate({field: None})
+
+
+@pytest.mark.parametrize("field", [
+    "project_id",
+    "review_model",
+    "review_effort",
+])
+def test_monitor_update_preserves_explicitly_nullable_fields(field):
+    parsed = MonitoredRepoUpdate.model_validate({field: None})
+    assert field in parsed.model_fields_set
+    assert getattr(parsed, field) is None
+
+
+def test_monitor_response_normalizes_legacy_null_required_checks():
+    now = datetime.utcnow()
+    parsed = MonitoredRepoResponse.model_validate({
+        "id": 1,
+        "repo_full_name": "owner/repo",
+        "project_id": None,
+        "worker_id": None,
+        "enabled": True,
+        "auto_merge": False,
+        "webhook_secret": "secret",
+        "provider": "codex",
+        "review_model": None,
+        "review_effort": None,
+        "review_mode": "panel",
+        "wait_for_ci": True,
+        "required_checks": None,
+        "auto_repair": False,
+        "max_repair_attempts": 3,
+        "merge_queue_mode": "manual",
+        "default_branch": "main",
+        "allowed_authors": None,
+        "status": "active",
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    })
+    assert parsed.required_checks == []
+
+
 async def _create_worker(session_factory, worker_id: int) -> None:
     async with session_factory() as db:
         db.add(
@@ -96,6 +163,22 @@ async def _create_worker(session_factory, worker_id: int) -> None:
 
 def _sign(secret: str, body: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _open_pr_snapshot(
+    *,
+    base_sha: str = BASE_SHA_1,
+    head_sha: str = HEAD_SHA_1,
+    merged_at: str | None = None,
+) -> dict:
+    return {
+        "state": "OPEN",
+        "mergedAt": merged_at,
+        "baseRefOid": base_sha,
+        "headRefOid": head_sha,
+        "isDraft": False,
+        "mergeCommit": {"oid": "f" * 40} if merged_at else None,
+    }
 
 
 def _pr_payload(
@@ -147,6 +230,260 @@ async def _post_webhook(
     return await client.post("/api/github/webhook", content=body, headers=headers)
 
 
+@pytest.mark.asyncio
+async def test_resume_remote_repair_defers_authoritative_migration_to_reconciler(
+    client, session_factory
+):
+    repo = await _create_repo(
+        client,
+        "owner/remote-repair",
+        review_mode="panel",
+        wait_for_ci=True,
+        required_checks=[{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+        auto_repair=True,
+    )
+    async with session_factory() as db:
+        worker = Worker(name="remote-repair-worker", status="ready")
+        db.add(worker)
+        await db.flush()
+        developer = Task(
+            title="Remote developer",
+            description="repair the existing PR",
+            status="completed",
+            worker_id=worker.id,
+            session_id="remote-repair-session",
+            last_cwd="/workspace/remote-repair",
+        )
+        db.add(developer)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=repo["id"],
+            pr_number=42,
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            developer_task_id=developer.id,
+            status="paused",
+            pause_reason="manual",
+        )
+        db.add(run)
+        await db.flush()
+        review = PRReview(
+            monitor_run_id=run.id,
+            repo_id=repo["id"],
+            pr_number=42,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="remote repair",
+            pr_author="alice",
+            pr_url="https://github.com/owner/remote-repair/pull/42",
+            status="commented",
+        )
+        db.add(review)
+        await db.flush()
+        run.current_review_id = review.id
+        wake = PRRepairWake(
+            monitor_run_id=run.id,
+            review_id=review.id,
+            developer_task_id=developer.id,
+            trigger_base_sha=BASE_SHA_1,
+            trigger_head_sha=HEAD_SHA_1,
+            reason_kind="review_blocked",
+            evidence_hash="e" * 64,
+            evidence={"findings": []},
+            status="shadow",
+            delivery_token="d" * 48,
+        )
+        db.add(wake)
+        await db.commit()
+        run_id = run.id
+        wake_id = wake.id
+        worker_id = worker.id
+
+    with patch.object(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value=_open_pr_snapshot()),
+    ):
+        response = await client.post(f"/api/pr-monitor/runs/{run_id}/resume")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "repair_pending"
+    async with session_factory() as db:
+        resumed = await db.get(PRRepairWake, wake_id)
+        developer = await db.get(Task, resumed.developer_task_id)
+        assert resumed.status == "pending"
+        assert developer.worker_id == worker_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["entry", "merge_group"])
+async def test_resume_merge_queue_returns_conflict_when_remote_state_unknown(
+    client, session_factory, monkeypatch, failure
+):
+    repo = await _create_repo(
+        client,
+        f"owner/resume-queue-{failure}",
+        review_mode="panel",
+        wait_for_ci=True,
+        required_checks=[{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+        merge_queue_mode="auto",
+    )
+    async with session_factory() as db:
+        run = PRMonitorRun(
+            repo_id=repo["id"], pr_number=43,
+            current_base_sha=BASE_SHA_1, current_head_sha=HEAD_SHA_1,
+            status="paused", pause_reason="infrastructure",
+        )
+        db.add(run)
+        await db.flush()
+        review = PRReview(
+            monitor_run_id=run.id, repo_id=repo["id"], pr_number=43,
+            base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
+            pr_title="resume queue", pr_author="alice",
+            pr_url="https://github.com/owner/resume/pull/43",
+            status="commented",
+        )
+        db.add(review)
+        await db.flush()
+        run.current_review_id = review.id
+        action = PRMergeQueueAction(
+            monitor_run_id=run.id, review_id=review.id,
+            trigger_base_sha=BASE_SHA_1, trigger_head_sha=HEAD_SHA_1,
+            status="paused", action_nonce="q" * 48,
+            last_error="infrastructure",
+        )
+        db.add(action)
+        await db.commit()
+        run_id = run.id
+        action_id = action.id
+
+    async def exact_pr(_number, _repo_name):
+        return {
+            "state": "OPEN", "mergedAt": None,
+            "baseRefOid": BASE_SHA_1, "headRefOid": HEAD_SHA_1,
+            "isDraft": False, "mergeCommit": None,
+        }
+
+    async def read_entry(_repo_name, _number):
+        if failure == "entry":
+            raise RuntimeError("queue read unavailable")
+        return SimpleNamespace(
+            id="MQ-resume", state="QUEUED",
+            base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
+        )
+
+    async def read_group(*_args, **_kwargs):
+        raise RuntimeError("matching refs unavailable")
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", exact_pr
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", read_entry
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_merge_group_ref", read_group
+    )
+    response = await client.post(f"/api/pr-monitor/runs/{run_id}/resume")
+    assert response.status_code == 409
+    assert "could not be confirmed" in response.json()["detail"]
+    async with session_factory() as db:
+        preserved_run = await db.get(PRMonitorRun, run_id)
+        preserved_action = await db.get(PRMergeQueueAction, action_id)
+        assert preserved_run.status == "paused"
+        assert preserved_action.status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_panel_webhook_creates_roles_and_detail_api(client, session_factory):
+    repo = await _create_repo(
+        client,
+        "owner/panel",
+        review_mode="panel",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel"),
+    )
+    assert opened.status_code == 200
+    review_id = opened.json()["review_id"]
+    async with session_factory() as db:
+        runs = list((await db.execute(
+            select(PRReviewerRun)
+            .where(PRReviewerRun.pr_review_id == review_id)
+            .order_by(PRReviewerRun.id)
+        )).scalars())
+        assert [run.role for run in runs] == [
+            "principal_engineer",
+            "senior_engineer",
+            "qa_engineer",
+        ]
+        assert len({run.task_id for run in runs}) == 3
+
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert detail.status_code == 200, detail.text
+    assert [run["role"] for run in detail.json()["reviewer_runs"]] == [
+        "principal_engineer",
+        "senior_engineer",
+        "qa_engineer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_panel_synchronize_stops_every_old_role_task(client, session_factory):
+    repo = await _create_repo(
+        client,
+        "owner/panel-sync",
+        review_mode="panel",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel-sync"),
+    )
+    old_review_id = opened.json()["review_id"]
+    async with session_factory() as db:
+        old_task_ids = list((await db.execute(
+            select(PRReviewerRun.task_id).where(
+                PRReviewerRun.pr_review_id == old_review_id
+            )
+        )).scalars())
+
+    synchronized = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel-sync", action="synchronize", head_sha=HEAD_SHA_2),
+    )
+    assert synchronized.status_code == 200, synchronized.text
+    async with session_factory() as db:
+        old_review = await db.get(PRReview, old_review_id)
+        old_runs = list((await db.execute(
+            select(PRReviewerRun).where(
+                PRReviewerRun.pr_review_id == old_review_id
+            )
+        )).scalars())
+        old_tasks = [await db.get(Task, task_id) for task_id in old_task_ids]
+        new_runs = list((await db.execute(
+            select(PRReviewerRun).where(
+                PRReviewerRun.pr_review_id == synchronized.json()["review_id"]
+            )
+        )).scalars())
+    assert old_review.status == "superseded"
+    assert all(run.status == "superseded" for run in old_runs)
+    assert all(task.metadata_["pr_review_superseded"] is True for task in old_tasks)
+    assert len(new_runs) == 3
+
+
 # === CRUD tests ===
 
 
@@ -163,6 +500,38 @@ async def test_create_repo_success(client):
     assert data["review_effort"] == "high"
     # Detail response: full (unmasked) webhook secret
     assert len(data["webhook_secret"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_single_review_mode_rejects_auto_repair(client):
+    response = await client.post("/api/pr-monitor/repos", json={
+        "repo_full_name": "owner/single-repair",
+        "review_mode": "single",
+        "auto_repair": True,
+    })
+    assert response.status_code == 400
+    assert response.json()["detail"] == "auto_repair requires review_mode=panel"
+
+
+@pytest.mark.asyncio
+async def test_update_cannot_leave_auto_repair_enabled_in_single_mode(client):
+    created = await _create_repo(
+        client, "owner/panel-repair", review_mode="panel", auto_repair=True,
+    )
+    rejected = await client.put(
+        f"/api/pr-monitor/repos/{created['id']}",
+        json={"review_mode": "single"},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "auto_repair requires review_mode=panel"
+
+    disabled = await client.put(
+        f"/api/pr-monitor/repos/{created['id']}",
+        json={"review_mode": "single", "auto_repair": False},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["review_mode"] == "single"
+    assert disabled.json()["auto_repair"] is False
 
 
 @pytest.mark.asyncio
@@ -242,6 +611,150 @@ async def test_regenerate_secret(client):
     new_secret = resp.json()["webhook_secret"]
     assert len(new_secret) == 64
     assert new_secret != created["webhook_secret"]
+
+
+@pytest.mark.asyncio
+async def test_bind_developer_reads_remote_subject_inside_task_barrier(
+    client,
+    session_factory,
+):
+    from backend.models.project import Project
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    async with session_factory() as db:
+        project = Project(name="bind-barrier-project")
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+    repo = await _create_repo(
+        client,
+        "owner/bind-barrier",
+        project_id=project_id,
+        auto_repair=True,
+        review_mode="panel",
+    )
+    async with session_factory() as db:
+        task = Task(
+            title="Developer",
+            description="Implement the PR",
+            status="completed",
+            project_id=project_id,
+            result_branch="feature",
+            session_id="developer-session",
+            last_cwd="/workspace/repo",
+        )
+        db.add(task)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=repo["id"],
+            pr_number=42,
+            status="waiting_for_fix",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            head_repo_full_name="owner/bind-barrier",
+            head_branch="feature",
+        )
+        db.add(run)
+        await db.commit()
+        task_id = task.id
+        run_id = run.id
+
+    async def read_while_fenced(_pr_number, _repo_name):
+        assert get_task_operation_lock(task_id).locked()
+        return _open_pr_snapshot()
+
+    with patch.object(
+        pr_review_service,
+        "_gh_pr_view",
+        side_effect=read_while_fenced,
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/bind-developer",
+            json={"task_id": task_id},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["developer_task_id"] == task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "remote_snapshot",
+    [
+        pytest.param(
+            _open_pr_snapshot(head_sha=HEAD_SHA_2),
+            id="head-drift",
+        ),
+        pytest.param(
+            _open_pr_snapshot(merged_at="2026-08-04T00:00:00Z"),
+            id="open-with-merged-at",
+        ),
+    ],
+)
+async def test_resume_repair_rejects_remote_subject_change(
+    client,
+    session_factory,
+    remote_snapshot,
+):
+    repo = await _create_repo(
+        client,
+        "owner/resume-repair-drift",
+        auto_repair=True,
+        review_mode="panel",
+    )
+    async with session_factory() as db:
+        task = Task(
+            title="Developer",
+            description="Repair the PR",
+            status="completed",
+            session_id="repair-session",
+            last_cwd="/workspace/repo",
+        )
+        db.add(task)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=repo["id"],
+            pr_number=42,
+            status="paused",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            developer_task_id=task.id,
+            pause_reason="repair_failed",
+        )
+        db.add(run)
+        await db.flush()
+        wake = PRRepairWake(
+            monitor_run_id=run.id,
+            developer_task_id=task.id,
+            trigger_base_sha=BASE_SHA_1,
+            trigger_head_sha=HEAD_SHA_1,
+            reason_kind="review_findings",
+            evidence_hash="e" * 64,
+            evidence={"kind": "test"},
+            status="failed",
+            delivery_token="d" * 48,
+        )
+        db.add(wake)
+        await db.commit()
+        run_id = run.id
+        wake_id = wake.id
+
+    with patch.object(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value=remote_snapshot),
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/resume"
+        )
+
+    assert response.status_code == 409
+    assert "subject changed" in response.json()["detail"]
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        wake = await db.get(PRRepairWake, wake_id)
+        assert run.status == "paused"
+        assert wake.status == "failed"
 
 
 @pytest.mark.asyncio
@@ -392,6 +905,142 @@ async def test_webhook_missing_signature_rejected(client):
         "Content-Type": "application/json",
     })
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_webhook_rechecks_rotated_secret_after_context_capture(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    repo = await _create_repo(client, "owner/rotated-secret")
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_rotate(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            current.webhook_secret = "f" * 64
+            await db.commit()
+        return context
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_rotate,
+    )
+    resp = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/rotated-secret"),
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Invalid signature"
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        assert reviews == []
+
+
+@pytest.mark.asyncio
+async def test_synchronize_rechecks_secret_before_superseding_old_generation(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    repo = await _create_repo(client, "owner/sync-rotated-secret")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/sync-rotated-secret"),
+    )
+    assert opened.json()["status"] == "accepted"
+    old_review_id = opened.json()["review_id"]
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_rotate(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            current.webhook_secret = "e" * 64
+            await db.commit()
+        return context
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_rotate,
+    )
+    synchronized = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(
+            "owner/sync-rotated-secret",
+            action="synchronize",
+            head_sha=HEAD_SHA_2,
+        ),
+    )
+
+    assert synchronized.status_code == 403
+    assert synchronized.json()["detail"] == "Invalid signature"
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        assert [review.id for review in reviews] == [old_review_id]
+        assert reviews[0].status == "reviewing"
+        task = await db.get(Task, reviews[0].task_id)
+        assert task.status == "pending"
+        assert not (task.metadata_ or {}).get("pr_review_superseded", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        ("default_branch", "develop", "target branch: main"),
+        ("allowed_authors", ["bob"], "author not allowed: alice"),
+    ],
+)
+async def test_webhook_rechecks_policy_after_context_capture(
+    client,
+    session_factory,
+    monkeypatch,
+    field,
+    value,
+    expected_reason,
+):
+    repo = await _create_repo(client, f"owner/policy-{field}")
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_change_policy(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            setattr(current, field, value)
+            await db.commit()
+        return context
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_change_policy,
+    )
+    resp = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(f"owner/policy-{field}"),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored", "reason": expected_reason}
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        assert reviews == []
 
 
 @pytest.mark.asyncio
@@ -695,7 +1344,11 @@ async def test_terminal_pr_review_task_allows_follow_up_chat(
     session_factory,
     terminal_status,
 ):
-    repo = await _create_repo(client, f"owner/chat-{terminal_status}")
+    repo = await _create_repo(
+        client,
+        f"owner/chat-{terminal_status}",
+        provider="claude",
+    )
     opened = await _post_webhook(
         client,
         repo["webhook_secret"],
@@ -737,6 +1390,52 @@ async def test_terminal_pr_review_task_allows_follow_up_chat(
     assert json.loads(messages[0].raw_json)["raw_content"] == (
         "explain the review"
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_codex_pr_review_rejects_contextless_follow_up_chat(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(
+        client,
+        "owner/codex-terminal-chat",
+        provider="codex",
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/codex-terminal-chat"),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, opened.json()["review_id"])
+        task = await db.get(Task, review.task_id)
+        task_id = task.id
+        task.status = "completed"
+        task.session_id = "isolated-codex-review-thread"
+        task.provider = "codex"
+        review.status = "commented"
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+
+    dispatcher = MagicMock(enqueue_message=AsyncMock())
+    with patch("backend.main.dispatcher", dispatcher):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "explain the review"},
+        )
+
+    assert response.status_code == 409
+    assert "isolated Codex PR review" in response.json()["detail"]
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with session_factory() as db:
+        messages = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars())
+    assert messages == []
 
 
 @pytest.mark.asyncio
@@ -976,11 +1675,59 @@ async def test_worker_tag_only_pr_review_chat_requires_internal_terminal_header(
 
 
 @pytest.mark.asyncio
+async def test_worker_tag_only_codex_review_cannot_bypass_terminal_chat_block(
+    client,
+    session_factory,
+):
+    from backend.services.pr_review_runtime import (
+        PR_REVIEW_TERMINAL_CHAT_HEADER,
+        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="Worker terminal Codex PR review mirror",
+            description="immutable snapshot",
+            status="completed",
+            provider="codex",
+            tags=["pr-review"],
+            session_id="worker-codex-review-thread",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    dispatcher = MagicMock(enqueue_message=AsyncMock())
+    internal_auth = MagicMock()
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.api.chat.require_internal_service",
+        internal_auth,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            headers={
+                PR_REVIEW_TERMINAL_CHAT_HEADER:
+                PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+            },
+            json={"message": "discuss the completed review"},
+        )
+
+    assert response.status_code == 409
+    assert "isolated Codex PR review" in response.json()["detail"]
+    internal_auth.assert_called_once()
+    dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_manager_rejects_old_worker_terminal_chat_before_local_log(
     client,
     session_factory,
 ):
-    repo = await _create_repo(client, "owner/old-worker-chat")
+    repo = await _create_repo(
+        client,
+        "owner/old-worker-chat",
+        provider="claude",
+    )
     opened = await _post_webhook(
         client,
         repo["webhook_secret"],

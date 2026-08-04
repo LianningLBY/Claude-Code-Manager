@@ -883,6 +883,20 @@ class GlobalDispatcher:
         async with self._dispatch_claim_lock:
             return set(self._pending_task_starts)
 
+    async def has_task_queue_work(self, task_id: int) -> bool:
+        """Return exact in-process evidence for queued or claimed task work.
+
+        Looking only at ``Queue.empty()`` is insufficient because ``q.get()``
+        happens just before the consumer records the message as in-flight.
+        """
+        async with self._dispatch_claim_lock:
+            queue = self._task_queues.get(task_id)
+            return bool(
+                task_id in self._pending_task_starts
+                or self._task_queue_inflight.get(task_id, 0)
+                or (queue is not None and not queue.empty())
+            )
+
     @asynccontextmanager
     async def maintenance_shutdown_guard(self):
         """Hold task admission closed across the final check and stop spawn."""
@@ -4207,7 +4221,14 @@ class GlobalDispatcher:
                 instance_id,
             )
             return -2
-        if session_id:
+        # Tool-free Codex PR reviews deliberately start a fresh isolated
+        # thread even when a previous native thread id exists.  A relaunch
+        # must therefore resend the complete immutable snapshot contract;
+        # sending only "continue" would create an empty-context review turn.
+        fresh_codex_pr_review = (
+            task.provider == "codex" and is_pr_review_task(task)
+        )
+        if session_id and not fresh_codex_pr_review:
             await self.instance_manager.launch(
                 instance_id=instance_id,
                 prompt=_prepend_task_artifact_policy(
@@ -5751,6 +5772,8 @@ class GlobalDispatcher:
     async def _handle_pr_review_completion(self, task: Task):
         meta = task.metadata_ or {}
         pr_review_id = meta.get("pr_review_id")
+        reviewer_run_id = meta.get("pr_reviewer_run_id")
+        adjudication_id = meta.get("pr_adjudication_id")
         if not pr_review_id:
             return
         try:
@@ -5789,6 +5812,39 @@ class GlobalDispatcher:
                         or background_handoff_pending()
                     ):
                         return
+                    if adjudication_id:
+                        from backend.services.pr_review_adjudication import (
+                            complete_adjudication,
+                        )
+
+                        await complete_adjudication(
+                            db,
+                            adjudication_id=adjudication_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                        )
+                        from backend.services.pr_review_adjudication import (
+                            reconcile_rebuttal_resolutions,
+                        )
+                        await reconcile_rebuttal_resolutions(self.db_factory)
+                        return
+                    if reviewer_run_id:
+                        from backend.services.pr_review_panel import (
+                            check_and_update_reviewer_run,
+                        )
+                        from backend.services.pr_review_service import (
+                            pr_review_action_lock,
+                        )
+
+                        async with pr_review_action_lock(pr_review_id):
+                            await check_and_update_reviewer_run(
+                                db,
+                                reviewer_run_id=reviewer_run_id,
+                                task_id=task.id,
+                                retry_count=task.retry_count,
+                                db_factory=self.db_factory,
+                            )
+                        return
                     review = await db.get(PRReview, pr_review_id)
                     if not review:
                         return
@@ -5810,6 +5866,8 @@ class GlobalDispatcher:
     async def _handle_pr_review_failure(self, task: Task, error: str):
         meta = task.metadata_ or {}
         pr_review_id = meta.get("pr_review_id")
+        reviewer_run_id = meta.get("pr_reviewer_run_id")
+        adjudication_id = meta.get("pr_adjudication_id")
         if not pr_review_id:
             return
         try:
@@ -5855,6 +5913,36 @@ class GlobalDispatcher:
                     )
                     if task_guard.rowcount != 1:
                         await db.rollback()
+                        return
+                    if adjudication_id:
+                        from backend.services.pr_review_adjudication import (
+                            fail_adjudication,
+                        )
+
+                        await fail_adjudication(
+                            db,
+                            adjudication_id=adjudication_id,
+                            task_id=task.id,
+                            error=error,
+                        )
+                        return
+                    if reviewer_run_id:
+                        from backend.services.pr_review_panel import (
+                            fail_reviewer_run,
+                        )
+
+                        changed_review_id = await fail_reviewer_run(
+                            db,
+                            reviewer_run_id=reviewer_run_id,
+                            task_id=task.id,
+                            error=error,
+                        )
+                        if changed_review_id:
+                            await self.broadcaster.broadcast("pr-monitor", {
+                                "type": "review_updated",
+                                "review_id": changed_review_id,
+                                "status": "error",
+                            })
                         return
                     failed = await db.execute(
                         update(PRReview)
@@ -10895,12 +10983,36 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task_id,
                 )
                 return
+            repair_wake_identity = None
+            if msg.source.startswith("pr-repair:"):
+                from backend.services.pr_monitor_loop import (
+                    admit_repair_wake,
+                    parse_repair_wake_source,
+                )
+
+                repair_wake_identity = parse_repair_wake_source(msg.source)
+                if repair_wake_identity is None or not await admit_repair_wake(
+                    db,
+                    wake_id=repair_wake_identity[0],
+                    delivery_token=repair_wake_identity[1],
+                    task=task,
+                ):
+                    logger.info("Discarding stale or duplicate Repair Wake for task %s", task_id)
+                    return
             if is_pr_review_task(task):
-                from backend.models.pr_monitor import PRReview
+                from backend.models.pr_monitor import PRReview, PRReviewerRun
 
                 publishing = await db.execute(
-                    select(PRReview.id).where(
-                        PRReview.task_id == task_id,
+                    select(PRReview.id).distinct()
+                    .outerjoin(
+                        PRReviewerRun,
+                        PRReviewerRun.pr_review_id == PRReview.id,
+                    )
+                    .where(
+                        or_(
+                            PRReview.task_id == task_id,
+                            PRReviewerRun.task_id == task_id,
+                        ),
                         PRReview.status.in_(("publishing", "superseding")),
                     )
                 )
@@ -11825,7 +11937,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # FullMirrorCCMBackend.on_exit is the sole authoritative PTY
             # Task→Instance finalizer. A queue cancellation or wait failure
             # must never manufacture a successful ``completed`` generation.
-            pass
+            if repair_wake_identity is not None:
+                from backend.services.pr_monitor_loop import finish_repair_wake
+
+                async with self.db_factory() as repair_db:
+                    await finish_repair_wake(
+                        repair_db,
+                        wake_id=repair_wake_identity[0],
+                        delivery_token=repair_wake_identity[1],
+                        task_id=task_id,
+                    )
 
     async def _compact_session(
         self,

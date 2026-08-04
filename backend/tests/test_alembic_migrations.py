@@ -5,6 +5,9 @@ Ensures:
 2. A fresh database can be created from scratch via migrations.
 3. The final migrated schema matches the ORM models (no drift).
 """
+import importlib.util
+import io
+import json
 import re
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +16,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import BigInteger, create_engine, inspect, text
 
 # All ORM models must be imported so Base.metadata is complete.
 from backend.database import Base
@@ -32,6 +35,7 @@ PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
 PLAN_CLEANUP_REVISION = "f7a1c3d9e5b2"
 PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
 PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
+CURRENT_HEAD_REVISION = "7a1d4e9c2b60"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -416,7 +420,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -450,6 +454,24 @@ class TestFreshMigration:
         ) in unique_column_sets
         assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         assert ("repo_id", "delivery_id") in unique_column_sets
+
+        pr_finding_cols = {
+            item["name"]: item
+            for item in inspect(engine).get_columns("pr_findings")
+        }
+        assert "resolution_lease_token" in pr_finding_cols
+        assert "resolution_lease_expires_at" in pr_finding_cols
+        assert "fixed_resolution_actor" in pr_finding_cols
+        assert "BIGINT" in str(pr_finding_cols["github_comment_id"]["type"]).upper()
+        assert isinstance(
+            Base.metadata.tables["pr_findings"].c.github_comment_id.type,
+            BigInteger,
+        )
+        assert (
+            Base.metadata.tables["monitored_repos"]
+            .c.required_checks.server_default
+            is None
+        )
 
         # Verify alembic_version at head
         with engine.connect() as conn:
@@ -538,7 +560,81 @@ class TestAlreadyMigratedDb:
                 "FROM pr_reviews ORDER BY id"
             )).fetchall()
             assert rows == [(None, None, None), (None, None, None)]
+            required_checks = conn.execute(text(
+                "SELECT required_checks FROM monitored_repos WHERE id = 1"
+            )).scalar_one()
+            if isinstance(required_checks, str):
+                required_checks = json.loads(required_checks)
+            assert required_checks == []
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    repo_full_name, enabled, auto_merge, webhook_secret,
+                    provider, default_branch, allowed_authors, required_checks, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'owner/default-checks', 1, 0, 'secret', 'codex', 'main',
+                    '[]', '[]', 'active', '2026-07-22 00:02:00',
+                    '2026-07-22 00:02:00'
+                )
+            """))
+            inserted_default = conn.execute(text(
+                "SELECT required_checks FROM monitored_repos "
+                "WHERE repo_full_name = 'owner/default-checks'"
+            )).scalar_one()
+            if isinstance(inserted_default, str):
+                inserted_default = json.loads(inserted_default)
+            assert inserted_default == []
+        required_column = next(
+            item for item in inspect(engine).get_columns("monitored_repos")
+            if item["name"] == "required_checks"
+        )
+        assert required_column["nullable"] is False
+        assert required_column["default"] is None
         engine.dispose()
+
+    @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
+    def test_pr_panel_migration_compiles_portable_schema(self, dialect_name):
+        """The Panel schema uses portable Boolean/JSON defaults and bigint IDs."""
+
+        migration_path = (
+            PROJECT_ROOT
+            / "alembic"
+            / "versions"
+            / "7a1d4e9c2b60_add_pr_review_panel.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            f"pr_panel_migration_for_{dialect_name}", migration_path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name=dialect_name,
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(context)):
+            module.upgrade()
+        ddl = output.getvalue().lower()
+        if dialect_name == "postgresql":
+            assert "boolean default false not null" in ddl
+            assert "required_checks set not null" in ddl
+            assert "cast('[]' as json)" in ddl
+        else:
+            assert "bool not null default false" in ddl
+            assert "modify required_checks json not null" in ddl
+            assert "required_checks = json_array()" in ddl
+        assert "boolean default 0" not in ddl
+        assert all(
+            "default" not in line
+            for line in ddl.splitlines()
+            if "required_checks" in line
+        )
+        assert "github_comment_id bigint" in ddl
 
     def test_base_sha_migration_preserves_existing_snapshot_keys(self, tmp_path):
         db_path = str(tmp_path / "existing_pr_review_snapshot.db")
@@ -618,11 +714,11 @@ class TestAlreadyMigratedDb:
             conn.execute(text("""
                 INSERT INTO monitored_repos (
                     repo_full_name, enabled, auto_merge, webhook_secret,
-                    provider, default_branch, allowed_authors, status,
+                    provider, default_branch, allowed_authors, required_checks, status,
                     created_at, updated_at
                 ) VALUES (
                     'owner/rollback', 1, 0, 'secret', 'claude', 'main', '[]',
-                    'active', '2026-07-31 00:00:00',
+                    '[]', 'active', '2026-07-31 00:00:00',
                     '2026-07-31 00:00:00'
                 )
             """))
@@ -807,12 +903,16 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_merge_head(self, tmp_path):
+    def test_migration_graph_has_one_head_after_published_merge(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
-        assert script.get_heads() == [PUBLISHED_BRANCH_MERGE_REVISION]
-        assert script.get_current_head() == PUBLISHED_BRANCH_MERGE_REVISION
+        assert script.get_heads() == [CURRENT_HEAD_REVISION]
+        assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == PUBLISHED_BRANCH_MERGE_REVISION
+        )
 
     @pytest.mark.parametrize(
         ("start_revision", "plan_schema_present", "snapshot_schema_present"),
@@ -845,7 +945,7 @@ class TestPublishedMigrationHistory:
 
         # The no-op merge applies the missing sibling branch and converges all
         # deployed states on one schema/head.
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         engine = create_engine(f"sqlite:///{db_path}")
         self._assert_revision_schema(
             engine,
@@ -859,7 +959,7 @@ class TestPublishedMigrationHistory:
         db_path = str(tmp_path / "merge-roundtrip.db")
         cfg = _alembic_cfg(db_path)
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         # Relative ``-1`` is ambiguous at a mergepoint, so select either
         # published parent explicitly; Alembic retains the sibling head.
         _run_alembic(cfg, command.downgrade, PLAN_CLEANUP_REVISION)
@@ -876,7 +976,7 @@ class TestPublishedMigrationHistory:
         )
         engine.dispose()
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         engine = create_engine(f"sqlite:///{db_path}")
         self._assert_revision_schema(
             engine,
@@ -890,7 +990,7 @@ class TestPublishedMigrationHistory:
         db_path = str(tmp_path / "plan-cleanup-roundtrip.db")
         cfg = _alembic_cfg(db_path)
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         _run_alembic(cfg, command.downgrade, PUBLISHED_PLAN_REVISION)
 
         engine = create_engine(f"sqlite:///{db_path}")
@@ -905,7 +1005,7 @@ class TestPublishedMigrationHistory:
         )
         engine.dispose()
 
-        _run_alembic(cfg, command.upgrade, "head")
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
         engine = create_engine(f"sqlite:///{db_path}")
         self._assert_revision_schema(
             engine,

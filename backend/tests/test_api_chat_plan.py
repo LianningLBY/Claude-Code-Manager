@@ -1181,7 +1181,11 @@ async def test_shared_pr_review_chat_waits_for_terminal_owner_state(
     from backend.api.shared_access import SharedChatMessage, shared_chat
     from backend.models.pr_monitor import MonitoredRepo, PRReview
 
-    task_id = await _create_task_with_session(client, session_factory)
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+    )
     async with session_factory() as db:
         repo = MonitoredRepo(
             repo_full_name="owner/shared-review",
@@ -2134,7 +2138,9 @@ async def test_process_queued_message_uses_task_model(db_factory, fake_session_o
     kwargs = dispatcher.instance_manager.launch.call_args.kwargs
     assert kwargs["model"] == "claude-opus-4-6"
     assert kwargs["resume_session_id"] == "sess-1"
-    assert kwargs["prompt"] == "hi"
+    assert kwargs["prompt"].endswith(
+        "</ccm_task_artifact_policy>\n\nhi"
+    )
     assert kwargs["chat_initiated"] is True
 
 

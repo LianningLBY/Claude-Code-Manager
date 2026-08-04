@@ -9,13 +9,14 @@ import secrets
 import signal
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.log_entry import LogEntry
-from backend.models.pr_monitor import MonitoredRepo, PRReview
+from backend.models.pr_monitor import MonitoredRepo, PRFinding, PRReview, PRReviewerRun
 from backend.models.task import Task
 from backend.services.task_queue import (
     task_is_pr_review_superseded,
@@ -49,13 +50,25 @@ _PATCH_COMMIT_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 _GUIDANCE_NAMES = ("CLAUDE.md", "PROGRESS.md")
+_GUIDANCE_MANIFEST_PATH = ".ccm/review-guides.json"
+_GUIDANCE_ROLE_MAP_KEY = "__ccm_review_guide_roles__"
+_MAX_GUIDANCE_DOCUMENTS = 12
+_GUIDANCE_ROLES = {
+    "principal_engineer",
+    "senior_engineer",
+    "qa_engineer",
+}
 _REGULAR_BLOB_MODES = {"100644", "100755"}
 _MAX_GUIDANCE_FILE_BYTES = 256 * 1024
 _MAX_GUIDANCE_TOTAL_BYTES = 384 * 1024
+_MAX_CHANGED_FILES = 300
+_MAX_CHANGED_FILE_BYTES = 256 * 1024
+_MAX_CHANGED_FILES_TOTAL_BYTES = 2 * 1024 * 1024
 _MAX_GH_COMMIT_RESPONSE_BYTES = 1024 * 1024
 _MAX_GH_TREE_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_GH_BLOB_RESPONSE_BYTES = 1024 * 1024
 _MAX_GH_PR_VIEW_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_GH_PR_FILES_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_GH_PR_DIFF_BYTES = 2 * 1024 * 1024
 _MAX_GH_COMPARE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_GH_REVIEWS_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -83,6 +96,44 @@ class GhError(Exception):
         low = message.lower()
         self.is_auth = any(marker in low for marker in GH_AUTH_ERROR_MARKERS)
 
+
+@dataclass(frozen=True, slots=True)
+class _FindingPublication:
+    """Scalar-only Finding snapshot safe across AsyncSession rollbacks."""
+
+    id: int
+    thread_nonce: str
+    head_sha: str
+    fingerprint: str
+    severity: str
+    title: str
+    role: str
+    category: str
+    evidence: str
+    impact: str
+    required_fix: str
+    test: str
+    path: str
+    line: int | None
+
+    @classmethod
+    def from_model(cls, finding: PRFinding) -> "_FindingPublication":
+        return cls(
+            id=finding.id,
+            thread_nonce=finding.thread_nonce,
+            head_sha=finding.head_sha,
+            fingerprint=finding.fingerprint,
+            severity=finding.severity,
+            title=finding.title,
+            role=finding.role,
+            category=finding.category,
+            evidence=finding.evidence,
+            impact=finding.impact,
+            required_fix=finding.required_fix,
+            test=finding.test,
+            path=finding.path,
+            line=finding.line,
+        )
 
 def pr_review_action_lock(review_id: int) -> asyncio.Lock:
     """Return the process-local companion to the durable review CAS fences."""
@@ -330,7 +381,7 @@ def _decode_guidance_blob(
 async def _fetch_base_guidance(
     repo_name: str,
     base_sha: str,
-) -> dict[str, str | None]:
+) -> dict[str, object]:
     """Fetch optional root guidance from the exact captured base commit."""
 
     if not _GITHUB_REPO_RE.fullmatch(repo_name):
@@ -369,10 +420,18 @@ async def _fetch_base_guidance(
         raise GhError("captured base root tree response is malformed or truncated")
 
     selected: dict[str, dict] = {}
+    ccm_tree_entry: dict | None = None
     for entry in entries:
         if not isinstance(entry, dict):
             raise GhError("captured base root tree contains a malformed entry")
         path = entry.get("path")
+        if path == ".ccm":
+            if ccm_tree_entry is not None:
+                raise GhError("captured base root tree contains duplicate .ccm")
+            if entry.get("type") != "tree" or entry.get("mode") != "040000":
+                raise GhError("unsafe root guidance entry: .ccm")
+            ccm_tree_entry = entry
+            continue
         if path not in _GUIDANCE_NAMES:
             continue
         if path in selected:
@@ -384,9 +443,112 @@ async def _fetch_base_guidance(
             raise GhError(f"unsafe root guidance entry: {path}")
         selected[path] = entry
 
-    documents: dict[str, str | None] = {}
+    manifest_paths: list[str] = []
+    manifest_roles: dict[str, list[str]] = {}
+    if ccm_tree_entry is not None:
+        ccm_sha = ccm_tree_entry.get("sha")
+        if not isinstance(ccm_sha, str) or _GITHUB_SHA_RE.fullmatch(ccm_sha.lower()) is None:
+            raise GhError("invalid .ccm tree SHA")
+        ccm_tree = await _gh_api_json(
+            f"repos/{repo_name}/git/trees/{ccm_sha.lower()}",
+            max_output_bytes=_MAX_GH_TREE_RESPONSE_BYTES,
+        )
+        ccm_entries = ccm_tree.get("tree")
+        returned_ccm_sha = ccm_tree.get("sha")
+        if (
+            not isinstance(returned_ccm_sha, str)
+            or returned_ccm_sha.lower() != ccm_sha.lower()
+            or ccm_tree.get("truncated") is not False
+            or not isinstance(ccm_entries, list)
+        ):
+            raise GhError("captured .ccm tree response is malformed or truncated")
+        manifests = [
+            item for item in ccm_entries
+            if isinstance(item, dict) and item.get("path") == "review-guides.json"
+        ]
+        if len(manifests) > 1:
+            raise GhError("captured .ccm tree contains duplicate review manifest")
+        if manifests:
+            manifest_entry = manifests[0]
+            if manifest_entry.get("type") != "blob" or manifest_entry.get("mode") not in _REGULAR_BLOB_MODES:
+                raise GhError("unsafe review guidance manifest")
+            manifest_sha = manifest_entry.get("sha")
+            if not isinstance(manifest_sha, str) or _GITHUB_SHA_RE.fullmatch(manifest_sha.lower()) is None:
+                raise GhError("invalid review guidance manifest SHA")
+            manifest_blob = await _gh_api_json(
+                f"repos/{repo_name}/git/blobs/{manifest_sha.lower()}",
+                max_output_bytes=_MAX_GH_BLOB_RESPONSE_BYTES,
+            )
+            manifest_text = _decode_guidance_blob(
+                name=_GUIDANCE_MANIFEST_PATH,
+                entry=manifest_entry,
+                blob=manifest_blob,
+            )
+            try:
+                manifest = json.loads(manifest_text)
+            except json.JSONDecodeError as exc:
+                raise GhError("review guidance manifest is invalid JSON") from exc
+            items = manifest.get("documents") if isinstance(manifest, dict) and manifest.get("version") == 1 else None
+            if not isinstance(items, list) or len(items) > _MAX_GUIDANCE_DOCUMENTS:
+                raise GhError("review guidance manifest has an invalid document list")
+            seen_paths: set[str] = set()
+            for item in items:
+                path = item.get("path") if isinstance(item, dict) else None
+                roles = item.get("roles") if isinstance(item, dict) else None
+                if (
+                    not isinstance(path, str)
+                    or not path
+                    or path.startswith(("/", "\\"))
+                    or "\\" in path
+                    or "\x00" in path
+                    or any(part in {"", ".", ".."} for part in path.split("/"))
+                    or path in _GUIDANCE_NAMES
+                    or path.startswith(".ccm/")
+                    or path in seen_paths
+                    or not isinstance(roles, list)
+                    or not roles
+                    or any(role not in _GUIDANCE_ROLES for role in roles)
+                    or len(set(roles)) != len(roles)
+                ):
+                    raise GhError("review guidance manifest contains an unsafe document")
+                seen_paths.add(path)
+                manifest_paths.append(path)
+                manifest_roles[path] = roles
+
+    if manifest_paths:
+        recursive = await _gh_api_json(
+            f"repos/{repo_name}/git/trees/{tree_sha}?recursive=1",
+            max_output_bytes=_MAX_GH_TREE_RESPONSE_BYTES,
+        )
+        recursive_entries = recursive.get("tree")
+        returned_recursive_sha = recursive.get("sha")
+        if (
+            not isinstance(returned_recursive_sha, str)
+            or returned_recursive_sha.lower() != tree_sha
+            or recursive.get("truncated") is not False
+            or not isinstance(recursive_entries, list)
+        ):
+            raise GhError("captured base recursive tree is malformed or truncated")
+        wanted = set(manifest_paths)
+        for entry in recursive_entries:
+            if not isinstance(entry, dict):
+                raise GhError("captured base recursive tree contains a malformed entry")
+            path = entry.get("path")
+            if path not in wanted:
+                continue
+            if path in selected:
+                raise GhError(f"captured base tree contains duplicate {path}")
+            if entry.get("type") != "blob" or entry.get("mode") not in _REGULAR_BLOB_MODES:
+                raise GhError(f"unsafe review guidance entry: {path}")
+            selected[path] = entry
+        missing = wanted - selected.keys()
+        if missing:
+            raise GhError("review guidance manifest references a missing document")
+
+    guidance_names = (*_GUIDANCE_NAMES, *manifest_paths)
+    documents: dict[str, object] = {}
     total_bytes = 0
-    for name in _GUIDANCE_NAMES:
+    for name in guidance_names:
         entry = selected.get(name)
         if entry is None:
             documents[name] = None
@@ -408,6 +570,8 @@ async def _fetch_base_guidance(
                 "captured base guidance exceeds the combined 393216-byte limit"
             )
         documents[name] = text
+    if manifest_roles:
+        documents[_GUIDANCE_ROLE_MAP_KEY] = manifest_roles
     return documents
 
 
@@ -541,6 +705,267 @@ async def _fetch_immutable_compare_patch(
     return diff_text
 
 
+async def _fetch_exact_tree_index(repo_name: str, commit_sha: str) -> dict[str, dict]:
+    """Return the complete regular-file tree for one immutable commit."""
+
+    commit = await _gh_api_json(
+        f"repos/{repo_name}/git/commits/{commit_sha}",
+        max_output_bytes=_MAX_GH_COMMIT_RESPONSE_BYTES,
+    )
+    tree = commit.get("tree")
+    returned_commit_sha = commit.get("sha")
+    tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+    if (
+        not isinstance(returned_commit_sha, str)
+        or returned_commit_sha.lower() != commit_sha
+        or not isinstance(tree_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(tree_sha.lower()) is None
+    ):
+        raise GhError("captured changed-file commit response is malformed")
+    response = await _gh_api_json(
+        f"repos/{repo_name}/git/trees/{tree_sha.lower()}?recursive=1",
+        max_output_bytes=_MAX_GH_TREE_RESPONSE_BYTES,
+    )
+    entries = response.get("tree")
+    returned_tree_sha = response.get("sha")
+    if (
+        response.get("truncated") is not False
+        or not isinstance(returned_tree_sha, str)
+        or returned_tree_sha.lower() != tree_sha.lower()
+        or not isinstance(entries, list)
+    ):
+        raise GhError("captured changed-file tree is malformed or truncated")
+    result: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise GhError("captured changed-file tree contains a malformed entry")
+        path = entry["path"]
+        if path in result:
+            raise GhError("captured changed-file tree contains a duplicate path")
+        result[path] = entry
+    return result
+
+
+def _validate_changed_path(path: object) -> str:
+    if (
+        not isinstance(path, str)
+        or not path
+        or path.startswith(("/", "\\"))
+        or "\\" in path
+        or "\x00" in path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise GhError("GitHub PR files metadata contains an unsafe path")
+    return path
+
+
+async def _fetch_pr_files(
+    *,
+    repo_name: str,
+    pr_number: int,
+    changed_files: int,
+) -> list[dict]:
+    """Fetch and normalize every REST PR-file page.
+
+    ``gh pr view --json files`` uses a fixed GraphQL ``first: 100`` selection
+    and silently truncates larger pull requests.  The scalar ``changedFiles``
+    is still authoritative, so use it as a strict bound/count fence around the
+    paginated REST endpoint instead.
+    """
+
+    if not _GITHUB_REPO_RE.fullmatch(repo_name):
+        raise ValueError("invalid GitHub repository name")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise ValueError("PR number must be a positive integer")
+    if type(changed_files) is not int or changed_files < 0:
+        raise GhError("GitHub PR changedFiles metadata is malformed")
+    if changed_files > _MAX_CHANGED_FILES:
+        raise GhError("GitHub PR changes more than 300 files")
+
+    result: list[dict] = []
+    seen_paths: set[str] = set()
+    page_count = (changed_files + 99) // 100
+    for page in range(1, page_count + 1):
+        value = await _gh_api_value(
+            f"repos/{repo_name}/pulls/{pr_number}/files?per_page=100&page={page}",
+            max_output_bytes=_MAX_GH_PR_FILES_PAGE_RESPONSE_BYTES,
+        )
+        if not isinstance(value, list):
+            raise GhError("GitHub PR files page is malformed")
+        expected_page_size = min(100, changed_files - len(result))
+        if len(value) != expected_page_size:
+            raise GhError(
+                "GitHub PR files pagination count does not match changedFiles"
+            )
+        for item in value:
+            if not isinstance(item, dict):
+                raise GhError("GitHub PR files metadata contains a malformed entry")
+            path = _validate_changed_path(item.get("filename"))
+            additions = item.get("additions")
+            deletions = item.get("deletions")
+            status = item.get("status")
+            if (
+                type(additions) is not int
+                or additions < 0
+                or type(deletions) is not int
+                or deletions < 0
+                or not isinstance(status, str)
+                or status not in {
+                    "added",
+                    "removed",
+                    "modified",
+                    "renamed",
+                    "copied",
+                    "changed",
+                    "unchanged",
+                }
+            ):
+                raise GhError(
+                    "GitHub PR files metadata contains a malformed entry"
+                )
+            previous_value = item.get("previous_filename")
+            previous_path = (
+                _validate_changed_path(previous_value)
+                if previous_value is not None
+                else None
+            )
+            if status == "renamed" and (
+                previous_path is None or previous_path == path
+            ):
+                raise GhError(
+                    "GitHub PR renamed-file metadata has no distinct previous path"
+                )
+            if path in seen_paths:
+                raise GhError("GitHub PR files metadata contains duplicate paths")
+            seen_paths.add(path)
+            normalized = {
+                "path": path,
+                "additions": additions,
+                "deletions": deletions,
+            }
+            if status == "renamed":
+                normalized["previous_path"] = previous_path
+            result.append(normalized)
+            if len(result) > _MAX_CHANGED_FILES:
+                raise GhError("GitHub PR changes more than 300 files")
+
+    if len(result) != changed_files:
+        raise GhError(
+            "GitHub PR files pagination count does not match changedFiles"
+        )
+    return result
+
+
+def _decode_changed_blob(path: str, entry: dict, blob: dict) -> tuple[str, bytes]:
+    entry_sha = entry.get("sha")
+    entry_size = entry.get("size")
+    blob_sha = blob.get("sha")
+    if (
+        not isinstance(entry_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(entry_sha.lower()) is None
+        or type(entry_size) is not int
+        or entry_size < 0
+        or entry_size > _MAX_CHANGED_FILE_BYTES
+        or not isinstance(blob_sha, str)
+        or blob_sha.lower() != entry_sha.lower()
+        or blob.get("size") != entry_size
+        or blob.get("encoding") != "base64"
+        or not isinstance(blob.get("content"), str)
+    ):
+        raise GhError(f"malformed changed-file blob response for {path}")
+    try:
+        raw = base64.b64decode(
+            re.sub(r"[ \t\r\n]", "", blob["content"]).encode("ascii"),
+            validate=True,
+        )
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise GhError(f"invalid changed-file blob content for {path}") from exc
+    if len(raw) != entry_size:
+        raise GhError(f"changed-file blob size mismatch for {path}")
+    if b"\x00" in raw:
+        raise UnicodeError
+    try:
+        return raw.decode("utf-8"), raw
+    except UnicodeDecodeError as exc:
+        raise UnicodeError from exc
+
+
+async def _fetch_changed_file_contents(
+    *,
+    repo_name: str,
+    base_sha: str,
+    head_sha: str,
+    files: list[dict],
+) -> list[dict]:
+    """Capture bounded exact-base/head text for every changed path."""
+
+    if len(files) > _MAX_CHANGED_FILES:
+        raise GhError("GitHub PR changes more than 300 files")
+    paths = [_validate_changed_path(item.get("path")) for item in files]
+    base_paths = [
+        _validate_changed_path(item.get("previous_path", item.get("path")))
+        for item in files
+    ]
+    if len(set(paths)) != len(paths):
+        raise GhError("GitHub PR files metadata contains duplicate paths")
+    base_tree, head_tree = await asyncio.gather(
+        _fetch_exact_tree_index(repo_name, base_sha),
+        _fetch_exact_tree_index(repo_name, head_sha),
+    )
+    blob_cache: dict[str, dict] = {}
+    captured_total = 0
+
+    async def capture(path: str, entry: dict | None) -> dict:
+        nonlocal captured_total
+        if entry is None:
+            return {"present": False}
+        mode = entry.get("mode")
+        size = entry.get("size")
+        sha = entry.get("sha")
+        identity = {
+            "present": True,
+            "mode": mode if isinstance(mode, str) else None,
+            "blob_sha": sha.lower() if isinstance(sha, str) else None,
+            "byte_length": size if type(size) is int else None,
+        }
+        if entry.get("type") != "blob" or mode not in _REGULAR_BLOB_MODES:
+            return {**identity, "available": False, "reason": "not_a_regular_file"}
+        if type(size) is not int or size < 0 or not isinstance(sha, str):
+            raise GhError(f"captured changed-file tree entry is malformed for {path}")
+        if size > _MAX_CHANGED_FILE_BYTES:
+            return {**identity, "available": False, "reason": "file_exceeds_262144_bytes"}
+        if captured_total + size > _MAX_CHANGED_FILES_TOTAL_BYTES:
+            return {**identity, "available": False, "reason": "combined_content_limit_reached"}
+        blob = blob_cache.get(sha.lower())
+        if blob is None:
+            blob = await _gh_api_json(
+                f"repos/{repo_name}/git/blobs/{sha.lower()}",
+                max_output_bytes=_MAX_GH_BLOB_RESPONSE_BYTES,
+            )
+            blob_cache[sha.lower()] = blob
+        try:
+            content, raw = _decode_changed_blob(path, entry, blob)
+        except UnicodeError:
+            return {**identity, "available": False, "reason": "binary_or_non_utf8"}
+        captured_total += len(raw)
+        return {
+            **identity,
+            "available": True,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "content": content,
+        }
+
+    result = []
+    for path, base_path in zip(paths, base_paths):
+        result.append({
+            "path": path,
+            **({"previous_path": base_path} if base_path != path else {}),
+            "base": await capture(base_path, base_tree.get(base_path)),
+            "head": await capture(path, head_tree.get(path)),
+        })
+    return result
+
+
 async def _fetch_pr_material(
     *,
     repo_name: str,
@@ -552,7 +977,7 @@ async def _fetch_pr_material(
 
     fields = (
         "number,title,body,author,baseRefName,baseRefOid,"
-        "headRefName,headRefOid,state,isDraft,files"
+        "headRefName,headRefOid,state,isDraft,changedFiles"
     )
     try:
         returncode, stdout, stderr = await _run_gh(
@@ -592,25 +1017,32 @@ async def _fetch_pr_material(
         if value is not None and not isinstance(value, str):
             raise GhError(f"GitHub PR metadata field {key} is malformed")
     author = metadata.get("author")
-    files = metadata.get("files")
+    changed_files = metadata.get("changedFiles")
     if (
         not isinstance(author, dict)
         or not isinstance(author.get("login"), str)
-        or not isinstance(files, list)
-        or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("path"), str)
-            or not isinstance(item.get("additions"), int)
-            or not isinstance(item.get("deletions"), int)
-            for item in files
-        )
+        or type(changed_files) is not int
+        or changed_files < 0
     ):
         raise GhError("GitHub PR author/files metadata is malformed")
-
-    diff_text = await _fetch_immutable_compare_patch(
+    files = await _fetch_pr_files(
         repo_name=repo_name,
-        base_sha=base_sha,
-        head_sha=head_sha,
+        pr_number=pr_number,
+        changed_files=changed_files,
+    )
+
+    diff_text, changed_file_contents = await asyncio.gather(
+        _fetch_immutable_compare_patch(
+            repo_name=repo_name,
+            base_sha=base_sha,
+            head_sha=head_sha,
+        ),
+        _fetch_changed_file_contents(
+            repo_name=repo_name,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            files=files,
+        ),
     )
 
     final_snapshot = _validated_pr_snapshot(
@@ -630,6 +1062,7 @@ async def _fetch_pr_material(
         "head_ref": metadata.get("headRefName") or "",
         "files": files,
         "patch": diff_text,
+        "changed_file_contents": changed_file_contents,
     }
 
 
@@ -681,11 +1114,37 @@ async def verify_pr_review_snapshot_current(
 
 
 def _render_guidance_documents(
-    documents: dict[str, str | None],
+    documents: dict[str, object],
+    *,
+    role: str | None = None,
 ) -> str:
     rendered: list[str] = []
     total_bytes = 0
-    for name in _GUIDANCE_NAMES:
+    role_map = documents.get(_GUIDANCE_ROLE_MAP_KEY)
+    if role_map is not None and not isinstance(role_map, dict):
+        raise ValueError("invalid injected guide role map")
+    if isinstance(role_map, dict) and any(
+        not isinstance(path, str)
+        or not isinstance(roles, list)
+        or not roles
+        or any(item not in _GUIDANCE_ROLES for item in roles)
+        for path, roles in role_map.items()
+    ):
+        raise ValueError("invalid injected guide role map")
+    names = [
+        *_GUIDANCE_NAMES,
+        *sorted(
+            name
+            for name in documents
+            if name not in (*_GUIDANCE_NAMES, _GUIDANCE_ROLE_MAP_KEY)
+            and (
+                role is None
+                or not isinstance(role_map, dict)
+                or role in role_map.get(name, [])
+            )
+        ),
+    ]
+    for name in names:
         value = documents.get(name)
         if value is None:
             rendered.append(json.dumps(
@@ -716,16 +1175,22 @@ def _render_guidance_documents(
     return "\n".join(rendered)
 
 
-def _render_pr_material(material: dict) -> str:
+def _render_pr_material(material: dict, *, include_full_files: bool = True) -> str:
     if not isinstance(material, dict):
         raise ValueError("invalid prepared PR material")
+    rendered_material = dict(material)
+    if not include_full_files:
+        rendered_material.pop("changed_file_contents", None)
     value = json.dumps(
-        material,
+        rendered_material,
         ensure_ascii=False,
         separators=(",", ":"),
     )
     if len(value.encode("utf-8")) > (
-        _MAX_GH_PR_VIEW_RESPONSE_BYTES + _MAX_GH_PR_DIFF_BYTES
+        _MAX_GH_PR_VIEW_RESPONSE_BYTES
+        + _MAX_GH_PR_DIFF_BYTES
+        + _MAX_CHANGED_FILES_TOTAL_BYTES
+        + 512 * 1024
     ):
         raise ValueError("prepared PR material exceeds the combined limit")
     return value
@@ -912,7 +1377,9 @@ async def _gh_authenticated_login() -> str:
 
 def _expected_review_states(result: str) -> set[str]:
     if result == "review_comments":
-        return {"CHANGES_REQUESTED"}
+        # COMMENTED is the self-PR fallback when GitHub refuses to let the
+        # publishing identity request changes on its own pull request.
+        return {"CHANGES_REQUESTED", "COMMENTED"}
     if result in {"lgtm_comment", "approved_merged"}:
         # COMMENTED is the fail-closed self-PR fallback. It is still a review
         # pinned to the captured head, never a free-standing issue comment.
@@ -1020,13 +1487,235 @@ async def _find_merge_evidence(
     return True
 
 
-def _is_self_approval_error(exc: GhError) -> bool:
+def _is_self_review_state_error(exc: GhError) -> bool:
     value = str(exc).lower()
     return (
         "approve your own pull request" in value
         or "can not approve your own" in value
         or "cannot approve your own" in value
+        or "request changes on your own pull request" in value
+        or "can not request changes on your own" in value
+        or "cannot request changes on your own" in value
     )
+
+
+def _finding_marker(finding: PRFinding | _FindingPublication) -> str:
+    return (
+        f"<!-- ccm-finding:{finding.thread_nonce};"
+        f"head:{finding.head_sha};fingerprint:{finding.fingerprint} -->"
+    )
+
+
+def _finding_thread_body(finding: PRFinding | _FindingPublication) -> str:
+    return (
+        f"**[{finding.severity.upper()}] {finding.title}**\n\n"
+        f"Reviewer: `{finding.role}` · Category: `{finding.category}`\n\n"
+        f"Evidence: {finding.evidence}\n\n"
+        f"Impact: {finding.impact}\n\n"
+        f"Required fix: {finding.required_fix}\n\n"
+        f"Verification: {finding.test}\n\n"
+        f"Finding fingerprint: `{finding.fingerprint}`\n"
+        f"{_finding_marker(finding)}"
+    )
+
+
+def _validate_finding_comment(
+    item: dict,
+    *,
+    finding: PRFinding | _FindingPublication,
+    actor: str,
+    inline: bool,
+) -> tuple[int, str | None]:
+    comment_id = item.get("id")
+    body = item.get("body")
+    user = item.get("user")
+    url = item.get("html_url")
+    if (
+        type(comment_id) is not int
+        or comment_id <= 0
+        or not isinstance(body, str)
+        or _finding_marker(finding) not in body
+        or not isinstance(user, dict)
+        or not isinstance(user.get("login"), str)
+        or user["login"].lower() != actor.lower()
+        or (url is not None and not isinstance(url, str))
+    ):
+        raise GhError("GitHub returned malformed Finding comment evidence")
+    if inline and (
+        item.get("commit_id", "").lower() != finding.head_sha
+        or item.get("path") != finding.path
+    ):
+        raise GhError("GitHub returned mismatched inline Finding evidence")
+    return comment_id, url
+
+
+async def _find_finding_comment(
+    *,
+    repo_name: str,
+    pr_number: int,
+    finding: PRFinding | _FindingPublication,
+    actor: str,
+    inline: bool,
+) -> tuple[int, str | None] | None:
+    endpoint = (
+        f"repos/{repo_name}/pulls/{pr_number}/comments?per_page=100"
+        if inline
+        else f"repos/{repo_name}/issues/{pr_number}/comments?per_page=100"
+    )
+    pages = await _gh_api_value(
+        endpoint,
+        max_output_bytes=_MAX_GH_REVIEWS_RESPONSE_BYTES,
+        paginate=True,
+    )
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise GhError("GitHub Finding comments response is malformed")
+    matches = []
+    marker = _finding_marker(finding)
+    for page in pages:
+        for item in page:
+            if not isinstance(item, dict):
+                raise GhError("GitHub Finding comments contain a malformed item")
+            if marker in (item.get("body") if isinstance(item.get("body"), str) else ""):
+                matches.append(item)
+    if not matches:
+        return None
+    evidence = [
+        _validate_finding_comment(item, finding=finding, actor=actor, inline=inline)
+        for item in matches
+    ]
+    if len(evidence) > 1:
+        logger.warning("Found duplicate GitHub Finding comments for %s", finding.fingerprint)
+    return evidence[0]
+
+
+def _invalid_inline_location(exc: GhError) -> bool:
+    value = str(exc).lower()
+    return any(marker in value for marker in (
+        "http 422",
+        "validation failed",
+        "line must be part of the diff",
+        "pull request review thread",
+    ))
+
+
+async def _publish_one_finding_thread(
+    *,
+    repo_name: str,
+    pr_number: int,
+    finding: PRFinding | _FindingPublication,
+    actor: str,
+    ensure_current: Callable[[], Awaitable[bool]],
+) -> tuple[str, int, str | None, str | None]:
+    existing = await _find_finding_comment(
+        repo_name=repo_name, pr_number=pr_number, finding=finding, actor=actor, inline=True
+    )
+    if existing is not None:
+        return "published_inline", existing[0], existing[1], None
+    use_fallback = finding.line is None
+    if not use_fallback:
+        if not await ensure_current():
+            raise GhError("Finding publication generation is no longer current")
+        try:
+            response = await _gh_api_json(
+                f"repos/{repo_name}/pulls/{pr_number}/comments",
+                method="POST",
+                payload={
+                    "body": _finding_thread_body(finding),
+                    "commit_id": finding.head_sha,
+                    "path": finding.path,
+                    "line": finding.line,
+                    "side": "RIGHT",
+                },
+            )
+            comment_id, url = _validate_finding_comment(
+                response, finding=finding, actor=actor, inline=True
+            )
+            return "published_inline", comment_id, url, None
+        except GhError as exc:
+            reconciled = await _find_finding_comment(
+                repo_name=repo_name, pr_number=pr_number, finding=finding, actor=actor, inline=True
+            )
+            if reconciled is not None:
+                return "published_inline", reconciled[0], reconciled[1], None
+            if not _invalid_inline_location(exc):
+                raise
+            use_fallback = True
+    assert use_fallback
+    existing_fallback = await _find_finding_comment(
+        repo_name=repo_name, pr_number=pr_number, finding=finding, actor=actor, inline=False
+    )
+    if existing_fallback is None:
+        if not await ensure_current():
+            raise GhError("Finding fallback publication generation is no longer current")
+        response = await _gh_api_json(
+            f"repos/{repo_name}/issues/{pr_number}/comments",
+            method="POST",
+            payload={"body": _finding_thread_body(finding)},
+        )
+        existing_fallback = _validate_finding_comment(
+            response, finding=finding, actor=actor, inline=False
+        )
+    return (
+        "published_fallback",
+        existing_fallback[0],
+        existing_fallback[1],
+        "GitHub could not anchor this Finding to an exact diff line; blocker remains open",
+    )
+
+
+async def _publish_blocking_finding_threads(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    repo_name: str,
+    pr_number: int,
+    actor: str,
+    ensure_current: Callable[[], Awaitable[bool]],
+) -> None:
+    findings = list((await db.execute(
+        select(PRFinding).where(
+            PRFinding.pr_review_id == review_id,
+            PRFinding.severity.in_(("critical", "high", "medium")),
+            PRFinding.status == "open",
+        ).order_by(PRFinding.id)
+    )).scalars())
+    frozen_findings = [
+        (finding.thread_status, _FindingPublication.from_model(finding))
+        for finding in findings
+    ]
+    for thread_status, finding in frozen_findings:
+        if thread_status in {"published_inline", "published_fallback", "resolved"}:
+            continue
+        status, comment_id, url, error = await _publish_one_finding_thread(
+            repo_name=repo_name,
+            pr_number=pr_number,
+            finding=finding,
+            actor=actor,
+            ensure_current=ensure_current,
+        )
+        updated = await db.execute(
+            update(PRFinding)
+            .where(
+                PRFinding.id == finding.id,
+                PRFinding.pr_review_id == review_id,
+                PRFinding.head_sha == finding.head_sha,
+                PRFinding.status == "open",
+                PRFinding.thread_status == "pending",
+            )
+            .values(
+                thread_status=status,
+                github_comment_id=comment_id,
+                github_comment_url=url,
+                thread_error=error,
+                thread_published_at=datetime.utcnow(),
+            )
+        )
+        if updated.rowcount != 1:
+            await db.rollback()
+            raise GhError(
+                "Finding publication was verified but its exact database generation changed"
+            )
+        await db.commit()
 
 
 async def _publish_review_action(
@@ -1120,11 +1809,13 @@ async def _publish_review_action(
             )
             if review_state is not None:
                 pass
-            elif not _is_self_approval_error(exc):
+            elif not _is_self_review_state_error(exc):
                 raise
             else:
-                # GitHub forbids self-approval. Re-check the exact snapshot and
-                # publish a COMMENT review pinned to the same captured head.
+                # GitHub forbids approval and REQUEST_CHANGES on self-authored
+                # PRs. Re-check the exact snapshot and publish a COMMENT review
+                # pinned to the same captured head. Blocking findings must be
+                # preserved verbatim; only the review state is downgraded.
                 guarded = _validated_pr_snapshot(
                     await _gh_pr_view(pr_number, repo_name)
                 )
@@ -1137,9 +1828,14 @@ async def _publish_review_action(
                     raise GhError(
                         "PR review publication generation is no longer current"
                     )
+                fallback_text = (
+                    review_body
+                    if result == "review_comments"
+                    else "LGTM - automated review passed "
+                    "(self-PR, approval not permitted)"
+                )
                 fallback_body = _review_body_with_evidence(
-                    "LGTM - automated review passed "
-                    "(self-PR, approval not permitted)",
+                    fallback_text,
                     nonce,
                 )
                 response = await _gh_api_json(
@@ -1374,9 +2070,11 @@ def build_review_prompt(
     repo: MonitoredRepo,
     pr_data: dict,
     *,
-    guidance_documents: dict[str, str | None] | None = None,
+    guidance_documents: dict[str, object] | None = None,
     pr_material: dict | None = None,
 ) -> str:
+    from backend.services.pr_review_panel import ENGINEERING_DESIGN_STANDARD
+
     pr_number, repo_name, base_sha, head_sha = _validate_review_identifiers(
         repo,
         pr_data,
@@ -1428,8 +2126,8 @@ CCM already fetched the exact root tree of captured base commit `{base_sha}`
 through GitHub's Git Data API. It rejected authentication/network errors,
 truncated or malformed trees, symlinks and non-regular files, invalid base64 or
 UTF-8, NUL bytes, size mismatches, and oversized documents before creating this
-task. The following two JSON records are the complete verified result, in
-priority order. `present:false` means the exact root file did not exist;
+task. The following JSON records are the complete verified Guide Pack, in
+priority order. Optional root records use `present:false` when absent;
 `content` is the complete document text, not a summary:
 
 <ccm_verified_base_guidance>
@@ -1448,6 +2146,10 @@ merge. If this PR changes either document, review those head changes as ordinary
 diff content; they become guidance only after merge. Do not quote private
 guidance verbatim in public review comments unless strictly necessary.
 
+## Shared engineering design standard
+
+{ENGINEERING_DESIGN_STANDARD}
+
 ## Step 2: Read the backend-verified PR material
 
 CCM fetched the PR metadata and complete patch between two successful,
@@ -1462,14 +2164,54 @@ You MUST review the complete injected patch. You have intentionally been given
 no filesystem, shell, network, GitHub, or MCP tools. Do not ask for or attempt
 tool access; all required input is already above.
 
-Evaluate the changes for:
-- **Correctness**: Logic errors, edge cases, potential bugs
-- **Security**: Injection vulnerabilities, auth issues, data exposure
-- **Performance**: N+1 queries, unnecessary allocations, blocking calls
-- **Code quality**: Naming, structure, duplication
-- **Tests**: Are changes covered by tests?
+## Step 3: Run the three-lens review harness
 
-## Step 3: Return a recommendation; do not write to GitHub
+Review the same immutable snapshot from each lens independently before you
+synthesize the final recommendation. A clean result from one lens cannot cancel
+an evidenced finding from another lens.
+
+1. **Principal Engineer — architecture and system fit**
+   - Does the change fit the existing architecture and reuse the repository's
+     established capabilities instead of creating a second way to do the same
+     thing?
+   - Is it additive and narrowly placed, with concurrency, authorization,
+     state-machine, cross-module, and rollback invariants preserved?
+   - Focus on material system-design risk, not cosmetic line-level tidiness.
+2. **Senior Engineer — implementation correctness and maintainability**
+   - Trace changed control flow, state transitions, error paths, cancellation,
+     retries, input validation, security boundaries, and resource ownership.
+   - Check edge cases, performance hazards, duplication, and whether the code is
+     understandable and maintainable in the repository's existing style.
+3. **QA Engineer — behavior, regression, and proof**
+   - Derive the intended user-visible and operational behavior from the base
+     guidance and PR material, then look for regressions and production traps.
+   - Check that tests exercise the important success, failure, boundary, and
+     concurrency paths. Ask whether QA should block release because the change
+     does not do what it claims or cannot be verified safely.
+
+For every material finding, include all of:
+
+```text
+[critical|high|medium] [principal|senior|qa] path:line-or-hunk — short title
+Evidence: concrete behavior in the injected patch or missing required proof
+Impact: user, security, data, reliability, or operational consequence
+Required fix: the smallest verifiable correction
+Test: the regression test or validation that should prove the fix
+```
+
+Use `critical`, `high`, or `medium` only for defects that should block this
+snapshot. Do not invent paths or line numbers; use a file and hunk description
+when the injected patch has no reliable line number. Keep optional polish under
+a `Non-blocking suggestions` heading and do not disguise preferences as defects.
+If evidence is insufficient to validate a safety-critical claim, identify the
+missing proof as a finding instead of assuming the implementation is correct.
+
+Before returning, deduplicate findings by root cause and verify that each one is
+grounded in the supplied snapshot. If there are no blocking findings, briefly
+state what each of the three lenses checked and why the available tests are
+adequate.
+
+## Step 4: Return a recommendation; do not write to GitHub
 
 Do not run `gh pr review`, `gh pr comment`, `gh pr merge`, `gh api --method`,
 or any other GitHub write. CCM's backend owns all review/comment/merge writes.
@@ -1484,8 +2226,9 @@ PR_REVIEW_BODY_BEGIN
 PR_REVIEW_BODY_END
 PR_REVIEW_RESULT: <result>
 
-Use `PR_REVIEW_RESULT: {success_result}` when the review passes.
-Use `PR_REVIEW_RESULT: review_comments` when changes are required.
+Use `PR_REVIEW_RESULT: {success_result}` only when all three lenses have no
+blocking finding. Use `PR_REVIEW_RESULT: review_comments` when any lens has a
+`critical`, `high`, or `medium` finding.
 Use `PR_REVIEW_RESULT: error` if any snapshot/read/review check fails.
 The result line must be the final line, with no text after it.
 """
@@ -1533,6 +2276,48 @@ async def create_pr_review_task(
     *,
     prepared_context: dict | None = None,
 ) -> PRReview:
+    if (repo.review_mode or "single") == "panel":
+        from backend.services.pr_review_panel import (
+            create_pr_review_panel,
+            create_waiting_ci_review,
+            fetch_exact_head_ci,
+        )
+
+        if repo.wait_for_ci:
+            _number, repo_name, _base_sha, head_sha = (
+                _validate_review_identifiers(repo, pr_data)
+            )
+            ci_status, ci_summary, ci_details = await fetch_exact_head_ci(
+                repo_name,
+                head_sha,
+                repo.required_checks,
+            )
+            if ci_status != "passed":
+                review = await create_waiting_ci_review(
+                    db,
+                    repo,
+                    pr_data,
+                    ci_status=ci_status,
+                    ci_summary=ci_summary,
+                    ci_details=ci_details,
+                )
+                from backend.services.pr_monitor_loop import attach_review_to_run
+                await attach_review_to_run(db, repo=repo, review=review, pr_data=pr_data)
+                return review
+
+        review = await create_pr_review_panel(
+            db,
+            repo,
+            pr_data,
+            prepared_context=prepared_context,
+        )
+        from backend.services.pr_monitor_loop import attach_review_to_run
+        await attach_review_to_run(db, repo=repo, review=review, pr_data=pr_data)
+        # Review Tasks become dispatchable only after the same commit has made
+        # their exact PRMonitorRun subject durable.
+        from backend.services.pr_review_panel import _wake_dispatcher
+        _wake_dispatcher()
+        return review
     # Validate all prompt identifiers before staging any database row. The
     # webhook already canonicalizes these values, but this service is also
     # called directly by tests and internal code.
@@ -2373,6 +3158,25 @@ async def _resume_publishing_review_under_lease(
             )
         return
 
+    if action == "review_comments":
+        try:
+            await _publish_blocking_finding_threads(
+                db,
+                review_id=review_id,
+                repo_name=repo_full_name,
+                pr_number=pr_number,
+                actor=actor,
+                ensure_current=ensure_current,
+            )
+        except GhError as exc:
+            await _record_publication_pending(
+                db,
+                review_id=review_id,
+                summary=f"Finding Thread publication pending reconciliation: {exc}",
+                lease_token=lease_token,
+            )
+            return
+
     finalized = await _commit_exact_review_update(
         db,
         review_id=review_id,
@@ -2406,6 +3210,19 @@ async def _resume_publishing_review_under_lease(
             "will reconcile it",
             review_id,
         )
+    else:
+        from backend.services.pr_monitor_loop import (
+            record_blocking_evidence,
+            record_gate_pass,
+        )
+        if action == "review_comments":
+            await record_blocking_evidence(
+                db,
+                review_id=review_id,
+                reason_kind="review_blocked",
+            )
+        else:
+            await record_gate_pass(db, review_id)
 
 
 async def _resume_publishing_review(
@@ -2672,6 +3489,15 @@ async def recover_superseding_pr_reviews(
                             and review.id not in self_target_ids
                         )
                     }
+                    panel_task_ids = (await db.execute(
+                        select(PRReviewerRun.task_id).where(
+                            PRReviewerRun.pr_review_id.in_(
+                                set(review_ids) - self_target_ids
+                            ),
+                            PRReviewerRun.task_id.is_not(None),
+                        )
+                    )).scalars().all()
+                    task_ids.update(panel_task_ids)
                 from backend.services.task_termination import (
                     TaskTerminationConflict,
                     TaskTerminationResult,
@@ -2782,6 +3608,24 @@ async def recover_superseding_pr_reviews(
                                 )
                             )
                             changed_count += int(changed.rowcount or 0)
+                            await db.execute(
+                                update(PRReviewerRun)
+                                .where(
+                                    PRReviewerRun.pr_review_id.in_(
+                                        superseded_ids
+                                    ),
+                                    PRReviewerRun.status.in_((
+                                        "pending",
+                                        "reviewing",
+                                        "passed",
+                                        "changes_required",
+                                    )),
+                                )
+                                .values(
+                                    status="superseded",
+                                    completed_at=datetime.utcnow(),
+                                )
+                            )
                         if existing_target in review_ids:
                             restored = await db.execute(
                                 update(PRReview)
@@ -2863,6 +3707,9 @@ async def recover_incomplete_pr_reviews(
             .join(Task, Task.id == PRReview.task_id)
             .where(
                 PRReview.status == "reviewing",
+                ~select(PRReviewerRun.id)
+                .where(PRReviewerRun.pr_review_id == PRReview.id)
+                .exists(),
                 Task.status.in_(
                     ("completed", "failed", "cancelled", "conflict")
                 ),
@@ -3072,4 +3919,35 @@ async def recover_incomplete_pr_reviews(
             action_recovered,
             len(candidates),
         )
-    return recovered + action_recovered
+    from backend.services.pr_review_panel import (
+        reconcile_waiting_ci_reviews,
+        recover_panel_reviews,
+    )
+
+    panel_recovered = await recover_panel_reviews(db_factory)
+    ci_started = await reconcile_waiting_ci_reviews(db_factory)
+    from backend.main import dispatcher
+    from backend.services.pr_monitor_loop import (
+        reconcile_repair_wakes,
+        reconcile_terminal_review_runs,
+    )
+
+    terminal_runs_reconciled = await reconcile_terminal_review_runs(db_factory)
+    repair_queued = await reconcile_repair_wakes(db_factory, dispatcher)
+    from backend.services.pr_review_adjudication import (
+        recover_adjudications,
+        reconcile_fixed_finding_resolutions,
+        reconcile_rebuttal_resolutions,
+    )
+
+    adjudications_recovered = await recover_adjudications(db_factory)
+    rebuttals_resolved = await reconcile_rebuttal_resolutions(db_factory)
+    fixed_findings_resolved = await reconcile_fixed_finding_resolutions(db_factory)
+    from backend.services.pr_merge_queue import reconcile_merge_queue
+    merge_progressed = await reconcile_merge_queue(db_factory)
+    return (
+        recovered + action_recovered + panel_recovered + ci_started
+        + terminal_runs_reconciled + repair_queued
+        + adjudications_recovered + rebuttals_resolved
+        + fixed_findings_resolved + merge_progressed
+    )

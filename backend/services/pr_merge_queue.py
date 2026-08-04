@@ -147,6 +147,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                 continue
             if (
                 snapshot["state"] != "OPEN" or snapshot["is_draft"]
+                or snapshot["base_sha"] != action.trigger_base_sha
                 or snapshot["head_sha"] != action.trigger_head_sha
             ):
                 action.status = "paused"
@@ -208,13 +209,23 @@ async def reconcile_merge_queue(db_factory) -> int:
                 run.state_version += 1
                 progressed += 1
             elif action.status == "checking" and action.merge_group_sha:
-                ci_status, summary, details = await fetch_exact_head_ci(
-                    repo.repo_full_name,
-                    action.merge_group_sha,
-                    repo.required_checks,
-                )
+                try:
+                    ci_status, summary, details = await fetch_exact_head_ci(
+                        repo.repo_full_name,
+                        action.merge_group_sha,
+                        repo.required_checks,
+                    )
+                except Exception as exc:
+                    # One transient GitHub/CI read must not roll back or starve
+                    # unrelated durable queue actions in this reconciliation.
+                    action.last_error = (
+                        "merge_group_ci_read_failed:"
+                        f"{type(exc).__name__}:{str(exc)[:300]}"
+                    )
+                    continue
                 action.ci_status = ci_status
                 action.ci_details = details
+                action.last_error = None
                 if ci_status == "failed":
                     conclusions = {
                         item.get("conclusion")

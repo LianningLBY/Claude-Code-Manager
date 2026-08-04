@@ -336,9 +336,6 @@ async def create_pr_review_panel(
     db.add(review)
     await db.flush()
     await _add_panel_tasks(db, repo=repo, review=review, context=context)
-    await db.commit()
-    await db.refresh(review)
-    _wake_dispatcher()
     return review
 
 
@@ -371,8 +368,7 @@ async def create_waiting_ci_review(
         review_summary="Waiting for exact-head CI before starting reviewers",
     )
     db.add(review)
-    await db.commit()
-    await db.refresh(review)
+    await db.flush()
     return review
 
 

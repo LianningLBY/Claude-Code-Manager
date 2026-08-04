@@ -13,11 +13,13 @@ from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import (
     MonitoredRepo,
     PRFinding,
+    PRMonitorRun,
     PRReview,
     PRReviewerRun,
 )
 from backend.models.task import Task
 from backend.services import pr_review_panel
+from backend.services import pr_review_service
 
 
 BASE_SHA = "a" * 40
@@ -56,6 +58,58 @@ def _context():
             }],
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_panel_review_and_run_are_one_admission_transaction(db_session):
+    repo = MonitoredRepo(
+        repo_full_name="owner/repo", webhook_secret="s" * 64,
+        provider="claude", review_mode="panel", wait_for_ci=False,
+    )
+    db_session.add(repo)
+    await db_session.commit()
+
+    with patch.object(pr_review_panel, "_wake_dispatcher") as wake:
+        review = await pr_review_service.create_pr_review_task(
+            db_session, repo, PR_DATA, prepared_context=_context(),
+        )
+    run = (await db_session.execute(select(PRMonitorRun))).scalar_one()
+    assert review.monitor_run_id == run.id
+    assert run.current_review_id == review.id
+    assert run.current_base_sha == BASE_SHA
+    assert run.current_head_sha == HEAD_SHA
+    wake.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_panel_attach_failure_rolls_back_review_tasks_and_never_wakes(
+    db_session,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/repo", webhook_secret="s" * 64,
+        provider="claude", review_mode="panel", wait_for_ci=False,
+    )
+    db_session.add(repo)
+    await db_session.commit()
+
+    with (
+        patch(
+            "backend.services.pr_monitor_loop.attach_review_to_run",
+            AsyncMock(side_effect=RuntimeError("simulated attach crash")),
+        ),
+        patch.object(pr_review_panel, "_wake_dispatcher") as wake,
+    ):
+        with pytest.raises(RuntimeError, match="attach crash"):
+            await pr_review_service.create_pr_review_task(
+                db_session, repo, PR_DATA, prepared_context=_context(),
+            )
+    await db_session.rollback()
+
+    assert list((await db_session.execute(select(PRReview))).scalars()) == []
+    assert list((await db_session.execute(select(PRReviewerRun))).scalars()) == []
+    assert list((await db_session.execute(select(Task))).scalars()) == []
+    assert list((await db_session.execute(select(PRMonitorRun))).scalars()) == []
+    wake.assert_not_called()
 
 
 def _output(role: str, *, blocker: bool = False) -> str:
@@ -373,6 +427,7 @@ async def test_waiting_ci_reconciler_starts_panel_only_after_pass(
         ci_summary="Pending: tests",
         ci_details={"head_sha": HEAD_SHA, "required": [], "observed": []},
     )
+    await db_session.commit()
     with (
         patch.object(
             pr_review_panel,

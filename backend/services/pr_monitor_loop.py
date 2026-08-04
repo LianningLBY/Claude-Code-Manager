@@ -72,13 +72,14 @@ async def attach_review_to_run(
         db.add(run)
         await db.flush()
     else:
+        old_base = run.current_base_sha
         old_head = run.current_head_sha
         run.current_base_sha = review.base_sha
         run.current_head_sha = review.head_sha
         run.max_repair_attempts = repo.max_repair_attempts
         run.state_version += 1
         run.pause_reason = None
-        if old_head != review.head_sha:
+        if old_base != review.base_sha or old_head != review.head_sha:
             old_wakes = list((await db.execute(
                 select(PRRepairWake).where(
                     PRRepairWake.monitor_run_id == run.id,
@@ -86,7 +87,11 @@ async def attach_review_to_run(
                 )
             )).scalars())
             for wake in old_wakes:
-                wake.status = "completed" if wake.status == "awaiting_push" else "superseded"
+                wake.status = (
+                    "completed"
+                    if old_head != review.head_sha and wake.status == "awaiting_push"
+                    else "superseded"
+                )
                 wake.completed_at = datetime.utcnow()
             old_rebuttals = list((await db.execute(
                 select(PRFindingRebuttal).where(
@@ -227,6 +232,16 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
     run = await db.get(PRMonitorRun, review.monitor_run_id, populate_existing=True)
     if run is None or run.current_review_id != review.id or run.current_head_sha != review.head_sha:
         return
+    if review.status == "merged":
+        # Legacy auto-merge already obtained and verified the remote terminal.
+        # Do not demote that fact back to a pre-merge Gate or create a queue
+        # action for a PR that no longer exists as an open queue subject.
+        run.status = "merged"
+        run.pause_reason = None
+        run.completed_at = review.completed_at or datetime.utcnow()
+        run.state_version += 1
+        await db.commit()
+        return
     unresolved_published = list((await db.execute(
         select(PRFinding.id)
         .join(PRReview, PRReview.id == PRFinding.pr_review_id)
@@ -265,6 +280,66 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
             if repo.merge_queue_mode == "auto":
                 run.status = "merge_queue_pending"
     await db.commit()
+
+
+async def reconcile_terminal_review_runs(db_factory) -> int:
+    """Recover the commit gap between a terminal Review and its Run Gate.
+
+    GitHub publication is finalized in its own exact-generation transaction.
+    The process may exit before the subsequent monitor-run transition.  Only a
+    terminal Review that is still the Run's exact current base/head subject may
+    be replayed here.
+    """
+
+    async with db_factory() as db:
+        review_ids = list((await db.execute(
+            select(PRReview.id)
+            .join(PRMonitorRun, PRMonitorRun.current_review_id == PRReview.id)
+            .where(
+                PRMonitorRun.status == "reviewing",
+                PRMonitorRun.current_base_sha == PRReview.base_sha,
+                PRMonitorRun.current_head_sha == PRReview.head_sha,
+                PRReview.status.in_(("approved", "commented", "merged")),
+                PRReview.action_taken.in_((
+                    "lgtm_comment", "review_comments", "approved_merged",
+                )),
+            )
+            .order_by(PRReview.id)
+        )).scalars())
+
+    reconciled = 0
+    for review_id in review_ids:
+        async with db_factory() as db:
+            run = (await db.execute(
+                select(PRMonitorRun)
+                .where(PRMonitorRun.current_review_id == review_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            review = await db.get(PRReview, review_id, populate_existing=True)
+            if (
+                run is None
+                or review is None
+                or run.status != "reviewing"
+                or review.monitor_run_id != run.id
+                or run.current_base_sha != review.base_sha
+                or run.current_head_sha != review.head_sha
+                or review.status not in {"approved", "commented", "merged"}
+            ):
+                continue
+            if review.action_taken == "review_comments":
+                await record_blocking_evidence(
+                    db,
+                    review_id=review.id,
+                    reason_kind="review_blocked",
+                )
+            elif review.action_taken in {"lgtm_comment", "approved_merged"}:
+                await record_gate_pass(db, review.id)
+            else:
+                continue
+            refreshed = await db.get(PRMonitorRun, run.id, populate_existing=True)
+            if refreshed is not None and refreshed.status != "reviewing":
+                reconciled += 1
+    return reconciled
 
 
 def repair_wake_source(wake: PRRepairWake) -> str:

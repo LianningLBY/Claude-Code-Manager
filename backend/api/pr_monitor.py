@@ -186,10 +186,217 @@ async def _require_pr_monitor_access(
         raise HTTPException(403, "No access to this PR monitor")
 
 
+_ACTIVE_REVIEW_STATUSES = (
+    "pending",
+    "waiting_ci",
+    "reviewing",
+    "publishing",
+    "superseding",
+)
+_ACTIVE_ADJUDICATION_STATUSES = ("pending", "adjudicating", "accepted")
+_STARTED_REPAIR_STATUSES = (
+    "delivering",
+    "accepted",
+    "awaiting_push",
+    "running",  # compatibility with rows written by older deployments
+)
+_STARTED_MERGE_QUEUE_STATUSES = ("enqueuing", "queued", "checking")
+_EXTERNALLY_BUSY_RUN_STATUSES = ("resolving_fixed_threads", "repair_migrating")
+
+
+async def _quiesce_monitor_runs(
+    db: AsyncSession,
+    *,
+    repo_id: int,
+    run_id: int | None = None,
+    reason: str,
+) -> None:
+    """Atomically stop undispatched effects or reject an in-flight effect.
+
+    The caller must hold the repository row lock.  Pending Repair and Merge
+    Queue rows have not crossed an external-effect boundary and can therefore
+    be withdrawn.  Once a Task/publication/queue operation has started we
+    fail closed instead of presenting a pause/disable control that did not
+    actually stop work.
+    """
+
+    run_filter = (
+        PRMonitorRun.id == run_id
+        if run_id is not None
+        else PRMonitorRun.repo_id == repo_id
+    )
+    runs = list((await db.execute(
+        select(PRMonitorRun).where(run_filter).with_for_update()
+    )).scalars())
+    if run_id is not None and not runs:
+        raise HTTPException(404, "PR Monitor Run not found")
+    if run_id is not None and (
+        runs[0].status in {"merged", "closed"} or runs[0].completed_at is not None
+    ):
+        raise HTTPException(409, "Cannot pause a terminal PR Monitor Run")
+    run_ids = [item.id for item in runs]
+
+    review_filter = PRReview.repo_id == repo_id
+    if run_id is not None:
+        current_review_ids = [
+            item.current_review_id for item in runs if item.current_review_id is not None
+        ]
+        review_filter = or_(
+            PRReview.monitor_run_id == run_id,
+            PRReview.id.in_(current_review_ids) if current_review_ids else False,
+        )
+    active_review = (await db.execute(
+        select(PRReview.id)
+        .where(review_filter, PRReview.status.in_(_ACTIVE_REVIEW_STATUSES))
+        .limit(1)
+        .with_for_update()
+    )).scalar_one_or_none()
+
+    active_adjudication = active_repair = active_merge = None
+    if run_ids:
+        active_adjudication = (await db.execute(
+            select(PRFindingRebuttal.id)
+            .where(
+                PRFindingRebuttal.monitor_run_id.in_(run_ids),
+                PRFindingRebuttal.status.in_(_ACTIVE_ADJUDICATION_STATUSES),
+            )
+            .limit(1)
+            .with_for_update()
+        )).scalar_one_or_none()
+        active_repair = (await db.execute(
+            select(PRRepairWake.id)
+            .where(
+                PRRepairWake.monitor_run_id.in_(run_ids),
+                PRRepairWake.status.in_(_STARTED_REPAIR_STATUSES),
+            )
+            .limit(1)
+            .with_for_update()
+        )).scalar_one_or_none()
+        active_merge = (await db.execute(
+            select(PRMergeQueueAction.id)
+            .where(
+                PRMergeQueueAction.monitor_run_id.in_(run_ids),
+                PRMergeQueueAction.status.in_(_STARTED_MERGE_QUEUE_STATUSES),
+            )
+            .limit(1)
+            .with_for_update()
+        )).scalar_one_or_none()
+
+    busy_run = next(
+        (item for item in runs if item.status in _EXTERNALLY_BUSY_RUN_STATUSES),
+        None,
+    )
+    if any((active_review, active_adjudication, active_repair, active_merge, busy_run)):
+        raise HTTPException(
+            409,
+            "Cannot pause PR Monitor while review, adjudication, Repair, "
+            "thread resolution, or Merge Queue work is active",
+        )
+
+    if run_ids:
+        await db.execute(
+            sa_update(PRRepairWake)
+            .where(
+                PRRepairWake.monitor_run_id.in_(run_ids),
+                PRRepairWake.status == "pending",
+            )
+            .values(status="shadow", last_error=reason)
+        )
+        await db.execute(
+            sa_update(PRMergeQueueAction)
+            .where(
+                PRMergeQueueAction.monitor_run_id.in_(run_ids),
+                PRMergeQueueAction.status == "pending",
+            )
+            .values(status="paused", last_error=reason)
+        )
+    for run in runs:
+        if run.status not in {"merged", "closed"}:
+            run.status = "paused"
+            run.pause_reason = reason
+            run.state_version += 1
+
+
+async def _withdraw_pending_repairs(db: AsyncSession, *, repo_id: int) -> None:
+    """Withdraw automatic Repair work before disabling that policy."""
+
+    runs = list((await db.execute(
+        select(PRMonitorRun)
+        .where(PRMonitorRun.repo_id == repo_id)
+        .with_for_update()
+    )).scalars())
+    run_ids = [item.id for item in runs]
+    if not run_ids:
+        return
+    active = (await db.execute(
+        select(PRRepairWake.id)
+        .where(
+            PRRepairWake.monitor_run_id.in_(run_ids),
+            PRRepairWake.status.in_(_STARTED_REPAIR_STATUSES),
+        )
+        .limit(1)
+        .with_for_update()
+    )).scalar_one_or_none()
+    if active is not None or any(
+        item.status == "repair_migrating" for item in runs
+    ):
+        raise HTTPException(409, "Cannot disable automatic Repair while Repair work is active")
+    await db.execute(
+        sa_update(PRRepairWake)
+        .where(
+            PRRepairWake.monitor_run_id.in_(run_ids),
+            PRRepairWake.status == "pending",
+        )
+        .values(status="shadow", last_error="auto_repair_disabled")
+    )
+    for run in runs:
+        if run.status == "repair_pending":
+            run.status = "waiting_for_fix"
+            run.state_version += 1
+
+
+async def _withdraw_pending_merge_actions(db: AsyncSession, *, repo_id: int) -> None:
+    """Withdraw automatic queue admission before changing queue policy."""
+
+    runs = list((await db.execute(
+        select(PRMonitorRun)
+        .where(PRMonitorRun.repo_id == repo_id)
+        .with_for_update()
+    )).scalars())
+    run_ids = [item.id for item in runs]
+    if not run_ids:
+        return
+    active = (await db.execute(
+        select(PRMergeQueueAction.id)
+        .where(
+            PRMergeQueueAction.monitor_run_id.in_(run_ids),
+            PRMergeQueueAction.status.in_(_STARTED_MERGE_QUEUE_STATUSES),
+        )
+        .limit(1)
+        .with_for_update()
+    )).scalar_one_or_none()
+    if active is not None:
+        raise HTTPException(409, "Cannot change Merge Queue policy while queue work is active")
+    await db.execute(
+        sa_update(PRMergeQueueAction)
+        .where(
+            PRMergeQueueAction.monitor_run_id.in_(run_ids),
+            PRMergeQueueAction.status == "pending",
+        )
+        .values(status="shadow", last_error="merge_queue_policy_changed")
+    )
+    for run in runs:
+        if run.status == "merge_queue_pending":
+            run.status = "ready_to_merge"
+            run.state_version += 1
+
+
 @router.post("/repos", response_model=MonitoredRepoDetailResponse)
 async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSession = Depends(get_db)):
     if body.review_mode == "single" and body.wait_for_ci:
         raise HTTPException(400, "wait_for_ci requires review_mode=panel")
+    if body.review_mode == "single" and body.auto_repair:
+        raise HTTPException(400, "auto_repair requires review_mode=panel")
     if body.wait_for_ci and not body.required_checks:
         raise HTTPException(400, "wait_for_ci requires at least one required check")
     if body.auto_merge and body.merge_queue_mode != "manual":
@@ -271,65 +478,115 @@ async def update_repo(
     await _require_pr_monitor_access(request, db, repo)
 
     update_data = body.model_dump(exclude_unset=True)
-    effective_mode = update_data.get("review_mode", repo.review_mode)
-    effective_wait = update_data.get("wait_for_ci", repo.wait_for_ci)
-    effective_checks = update_data.get("required_checks", repo.required_checks or [])
-    if effective_mode == "single" and effective_wait:
-        raise HTTPException(400, "wait_for_ci requires review_mode=panel")
-    if effective_wait and not effective_checks:
-        raise HTTPException(400, "wait_for_ci requires at least one required check")
-    effective_auto_merge = update_data.get("auto_merge", repo.auto_merge)
-    effective_merge_queue = update_data.get("merge_queue_mode", repo.merge_queue_mode)
-    if effective_auto_merge and effective_merge_queue != "manual":
-        raise HTTPException(400, "legacy auto_merge and Merge Queue are mutually exclusive")
-    if effective_merge_queue != "manual" and (
-        effective_mode != "panel" or not effective_wait
-    ):
-        raise HTTPException(400, "Merge Queue requires panel review and exact-head CI")
     if "required_checks" in update_data:
         update_data["required_checks"] = [
             item.model_dump() if hasattr(item, "model_dump") else item
             for item in update_data["required_checks"]
         ]
-    if {"review_mode", "wait_for_ci"} & update_data.keys():
-        active_review = (await db.execute(
-            select(PRReview.id)
-            .where(
-                PRReview.repo_id == repo_id,
-                PRReview.status.in_((
-                    "pending",
-                    "waiting_ci",
-                    "reviewing",
-                    "publishing",
-                    "superseding",
-                )),
-            )
-            .limit(1)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        repo = (await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
         )).scalar_one_or_none()
-        if active_review is not None:
-            raise HTTPException(
-                409,
-                "Review harness mode cannot change while a PR review is active",
-            )
-    project_id = update_data.get("project_id")
-    if project_id is not None:
-        from backend.models.project import Project
+        if repo is None:
+            raise HTTPException(404, "Repository not found")
+        await _require_pr_monitor_access(request, db, repo)
 
-        project = await db.get(Project, project_id)
-        if project is None:
-            raise HTTPException(404, "Project not found")
-        await require_project_access(request, project_id, db)
-        if project.worker_id != repo.worker_id:
-            raise HTTPException(
-                400,
-                "PR monitor Worker must match the selected Project location",
-            )
-    for key, value in update_data.items():
-        setattr(repo, key, value)
+        effective_mode = update_data.get("review_mode", repo.review_mode)
+        effective_wait = update_data.get("wait_for_ci", repo.wait_for_ci)
+        effective_auto_repair = update_data.get("auto_repair", repo.auto_repair)
+        effective_checks = update_data.get("required_checks", repo.required_checks or [])
+        if effective_mode == "single" and effective_wait:
+            raise HTTPException(400, "wait_for_ci requires review_mode=panel")
+        if effective_mode == "single" and effective_auto_repair:
+            raise HTTPException(400, "auto_repair requires review_mode=panel")
+        if effective_wait and not effective_checks:
+            raise HTTPException(400, "wait_for_ci requires at least one required check")
+        effective_auto_merge = update_data.get("auto_merge", repo.auto_merge)
+        effective_merge_queue = update_data.get("merge_queue_mode", repo.merge_queue_mode)
+        if effective_auto_merge and effective_merge_queue != "manual":
+            raise HTTPException(400, "legacy auto_merge and Merge Queue are mutually exclusive")
+        if effective_merge_queue != "manual" and (
+            effective_mode != "panel" or not effective_wait
+        ):
+            raise HTTPException(400, "Merge Queue requires panel review and exact-head CI")
 
-    await db.commit()
-    await db.refresh(repo)
-    return repo
+        frozen_review_policy = {
+            "review_mode",
+            "wait_for_ci",
+            "required_checks",
+            "provider",
+            "review_model",
+            "review_effort",
+            "auto_merge",
+        }
+        changed_review_policy = {
+            key
+            for key in frozen_review_policy & update_data.keys()
+            if update_data[key] != getattr(repo, key)
+        }
+        if changed_review_policy:
+            active_review = (await db.execute(
+                select(PRReview.id)
+                .where(
+                    PRReview.repo_id == repo_id,
+                    PRReview.status.in_(_ACTIVE_REVIEW_STATUSES),
+                )
+                .limit(1)
+                .with_for_update()
+            )).scalar_one_or_none()
+            active_run = (await db.execute(
+                select(PRMonitorRun.id)
+                .where(
+                    PRMonitorRun.repo_id == repo_id,
+                    PRMonitorRun.status.not_in(("merged", "closed")),
+                )
+                .limit(1)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if active_review is not None or active_run is not None:
+                raise HTTPException(
+                    409,
+                    "Review policy is frozen for the lifetime of an active PR Monitor Run",
+                )
+
+        disabling = update_data.get("enabled") is False and repo.enabled
+        if disabling:
+            await _quiesce_monitor_runs(
+                db,
+                repo_id=repo_id,
+                reason="repo_disabled",
+            )
+        else:
+            if update_data.get("auto_repair") is False and repo.auto_repair:
+                await _withdraw_pending_repairs(db, repo_id=repo_id)
+            if (
+                "merge_queue_mode" in update_data
+                and effective_merge_queue != repo.merge_queue_mode
+            ) or "required_checks" in update_data:
+                await _withdraw_pending_merge_actions(db, repo_id=repo_id)
+
+        project_id = update_data.get("project_id")
+        if project_id is not None:
+            from backend.models.project import Project
+
+            project = await db.get(Project, project_id)
+            if project is None:
+                raise HTTPException(404, "Project not found")
+            await require_project_access(request, project_id, db)
+            if project.worker_id != repo.worker_id:
+                raise HTTPException(
+                    400,
+                    "PR monitor Worker must match the selected Project location",
+                )
+        for key, value in update_data.items():
+            setattr(repo, key, value)
+
+        await db.commit()
+        await db.refresh(repo)
+        return repo
 
 
 @router.delete("/repos/{repo_id}")
@@ -446,10 +703,26 @@ async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends
     if not repo:
         raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
-    repo.enabled = not repo.enabled
-    await db.commit()
-    await db.refresh(repo)
-    return repo
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        repo = (await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        if repo is None:
+            raise HTTPException(404, "Repository not found")
+        await _require_pr_monitor_access(request, db, repo)
+        if repo.enabled:
+            await _quiesce_monitor_runs(
+                db,
+                repo_id=repo_id,
+                reason="repo_disabled",
+            )
+        repo.enabled = not repo.enabled
+        await db.commit()
+        await db.refresh(repo)
+        return repo
 
 
 @router.post("/repos/{repo_id}/regenerate-secret", response_model=MonitoredRepoDetailResponse)
@@ -654,6 +927,7 @@ async def bind_monitor_developer(
 ):
     from backend.models.task import Task
     from backend.services.pr_review_service import _gh_pr_view, _validated_pr_snapshot
+    from backend.services.worker_proxy import get_task_operation_lock
 
     run = await db.get(PRMonitorRun, run_id)
     if run is None:
@@ -664,38 +938,107 @@ async def bind_monitor_developer(
         raise HTTPException(404, "Repository or Developer Task not found")
     await _require_pr_monitor_access(request, db, repo)
     await require_task_control(request, task, db)
-    if "pr-review" in (task.tags or []):
-        raise HTTPException(400, "A Reviewer Task cannot be bound as the Developer")
-    if task.project_id is None or (repo.project_id is not None and task.project_id != repo.project_id):
-        raise HTTPException(400, "Developer Task must belong to the monitored Project")
-    if not task.session_id or not task.last_cwd:
-        raise HTTPException(409, "Developer Task has no resumable session/cwd yet")
     snapshot = _validated_pr_snapshot(await _gh_pr_view(run.pr_number, repo.repo_full_name))
-    if snapshot.get("state") != "OPEN" or snapshot.get("head_sha") != run.current_head_sha:
-        raise HTTPException(409, "GitHub PR head changed while binding; wait for synchronize")
-    conflict = (await db.execute(select(PRMonitorRun.id).where(
-        PRMonitorRun.developer_task_id == task.id,
-        PRMonitorRun.id != run.id,
-        PRMonitorRun.status.not_in(("merged", "closed")),
-    ))).scalar_one_or_none()
-    if conflict is not None:
-        raise HTTPException(409, "Developer Task is already bound to another active PR")
-    run.developer_task_id = task.id
-    run.binding_verified_at = datetime.utcnow()
-    run.state_version += 1
-    shadows = list((await db.execute(select(PRRepairWake).where(
-        PRRepairWake.monitor_run_id == run.id,
-        PRRepairWake.trigger_head_sha == run.current_head_sha,
-        PRRepairWake.status == "shadow",
-    ))).scalars())
-    for wake in shadows:
-        wake.developer_task_id = task.id
-        if repo.auto_repair and run.repair_attempts < run.max_repair_attempts:
-            wake.status = "pending"
-    if repo.auto_repair and shadows and run.repair_attempts < run.max_repair_attempts:
-        run.status = "repair_pending"
-    await db.commit()
-    return await get_monitor_run(run.id, request, db)
+    repo_id = repo.id
+    task_id = task.id
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        async with get_task_operation_lock(task_id):
+            repo = (await db.execute(
+                select(MonitoredRepo)
+                .where(MonitoredRepo.id == repo_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            run = (await db.execute(
+                select(PRMonitorRun)
+                .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            task = (await db.execute(
+                select(Task).where(Task.id == task_id).with_for_update()
+            )).scalar_one_or_none()
+            if repo is None or run is None or task is None:
+                raise HTTPException(404, "Repository, Run, or Developer Task not found")
+            await _require_pr_monitor_access(request, db, repo)
+            await require_task_control(request, task, db)
+            if not repo.enabled:
+                raise HTTPException(409, "Cannot bind a Developer while the monitor is disabled")
+            if run.status in {"merged", "closed"} or run.completed_at is not None:
+                raise HTTPException(409, "Cannot bind a Developer to a terminal PR Monitor Run")
+            if run.status in _EXTERNALLY_BUSY_RUN_STATUSES:
+                raise HTTPException(409, "Cannot bind a Developer while monitor effects are active")
+            active_effect = (await db.execute(
+                select(PRRepairWake.id)
+                .where(
+                    PRRepairWake.monitor_run_id == run.id,
+                    PRRepairWake.status.in_(_STARTED_REPAIR_STATUSES),
+                )
+                .limit(1)
+                .with_for_update()
+            )).scalar_one_or_none()
+            active_adjudication = (await db.execute(
+                select(PRFindingRebuttal.id)
+                .where(
+                    PRFindingRebuttal.monitor_run_id == run.id,
+                    PRFindingRebuttal.status.in_(_ACTIVE_ADJUDICATION_STATUSES),
+                )
+                .limit(1)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if active_effect is not None or active_adjudication is not None:
+                raise HTTPException(409, "Cannot bind a Developer while monitor effects are active")
+            if "pr-review" in (task.tags or []):
+                raise HTTPException(400, "A Reviewer Task cannot be bound as the Developer")
+            if repo.project_id is None or task.project_id != repo.project_id:
+                raise HTTPException(400, "Developer Task must belong to the monitored Project")
+            if not task.session_id or not task.last_cwd:
+                raise HTTPException(409, "Developer Task has no resumable session/cwd yet")
+            if not run.head_branch or task.result_branch != run.head_branch:
+                raise HTTPException(409, "Developer Task branch does not match the PR head branch")
+            if repo.auto_repair and (
+                not run.head_repo_full_name
+                or run.head_repo_full_name.lower() != repo.repo_full_name.lower()
+            ):
+                raise HTTPException(
+                    409,
+                    "Automatic Repair requires a proven same-repository PR head",
+                )
+            if (
+                snapshot.get("state") != "OPEN"
+                or snapshot.get("is_draft") is not False
+                or snapshot.get("base_sha") != run.current_base_sha
+                or snapshot.get("head_sha") != run.current_head_sha
+            ):
+                raise HTTPException(409, "GitHub PR subject changed while binding; wait for synchronize")
+            conflict = (await db.execute(
+                select(PRMonitorRun.id)
+                .where(
+                    PRMonitorRun.developer_task_id == task.id,
+                    PRMonitorRun.id != run.id,
+                    PRMonitorRun.status.not_in(("merged", "closed")),
+                )
+                .limit(1)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if conflict is not None:
+                raise HTTPException(409, "Developer Task is already bound to another active PR")
+            run.developer_task_id = task.id
+            run.binding_verified_at = datetime.utcnow()
+            run.state_version += 1
+            shadows = list((await db.execute(select(PRRepairWake).where(
+                PRRepairWake.monitor_run_id == run.id,
+                PRRepairWake.trigger_head_sha == run.current_head_sha,
+                PRRepairWake.status == "shadow",
+            ).with_for_update())).scalars())
+            for wake in shadows:
+                wake.developer_task_id = task.id
+                if repo.auto_repair and run.repair_attempts < run.max_repair_attempts:
+                    wake.status = "pending"
+                    wake.last_error = None
+            if repo.auto_repair and shadows and run.repair_attempts < run.max_repair_attempts:
+                run.status = "repair_pending"
+            await db.commit()
+    return await get_monitor_run(run_id, request, db)
 
 
 @router.post("/runs/{run_id}/pause", response_model=PRMonitorRunResponse)
@@ -707,15 +1050,31 @@ async def pause_monitor_run(run_id: int, request: Request, db: AsyncSession = De
     if repo is None:
         raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
-    run.status = "paused"
-    run.pause_reason = "manual"
-    run.state_version += 1
-    await db.commit()
+    repo_id = repo.id
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        locked_repo = (await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        if locked_repo is None:
+            raise HTTPException(404, "Repository not found")
+        await _require_pr_monitor_access(request, db, locked_repo)
+        await _quiesce_monitor_runs(
+            db,
+            repo_id=repo_id,
+            run_id=run_id,
+            reason="manual",
+        )
+        await db.commit()
     return await get_monitor_run(run.id, request, db)
 
 
 @router.post("/runs/{run_id}/unbind-developer", response_model=PRMonitorRunResponse)
 async def unbind_monitor_developer(run_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+    from backend.services.worker_proxy import get_task_operation_lock
+
     run = await db.get(PRMonitorRun, run_id)
     if run is None:
         raise HTTPException(404, "PR Monitor Run not found")
@@ -723,25 +1082,70 @@ async def unbind_monitor_developer(run_id: int, request: Request, db: AsyncSessi
     if repo is None:
         raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
-    active = (await db.execute(select(PRRepairWake.id).where(
-        PRRepairWake.monitor_run_id == run.id,
-        PRRepairWake.status.in_(("accepted", "running")),
-    ))).scalar_one_or_none()
-    if active is not None:
-        raise HTTPException(409, "Cannot unbind while a Repair Turn is accepted/running")
-    wakes = list((await db.execute(select(PRRepairWake).where(
-        PRRepairWake.monitor_run_id == run.id,
-        PRRepairWake.status.in_(("pending", "shadow")),
-    ))).scalars())
-    for wake in wakes:
-        wake.developer_task_id = None
-        wake.status = "shadow"
-    run.developer_task_id = None
-    run.binding_verified_at = None
-    run.status = "waiting_for_fix"
-    run.state_version += 1
-    await db.commit()
-    return await get_monitor_run(run.id, request, db)
+    if run.developer_task_id is None:
+        raise HTTPException(409, "PR Monitor Run has no bound Developer")
+    repo_id = repo.id
+    task_id = run.developer_task_id
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        async with get_task_operation_lock(task_id):
+            repo = (await db.execute(
+                select(MonitoredRepo)
+                .where(MonitoredRepo.id == repo_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            run = (await db.execute(
+                select(PRMonitorRun)
+                .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if repo is None or run is None:
+                raise HTTPException(404, "Repository or PR Monitor Run not found")
+            await _require_pr_monitor_access(request, db, repo)
+            if run.developer_task_id != task_id:
+                raise HTTPException(409, "Developer binding changed concurrently")
+            if run.status in {"merged", "closed"} or run.completed_at is not None:
+                raise HTTPException(409, "Cannot unbind a terminal PR Monitor Run")
+            active_repair = (await db.execute(select(PRRepairWake.id).where(
+                PRRepairWake.monitor_run_id == run.id,
+                PRRepairWake.status.in_(_STARTED_REPAIR_STATUSES),
+            ).limit(1).with_for_update())).scalar_one_or_none()
+            active_adjudication = (await db.execute(
+                select(PRFindingRebuttal.id).where(
+                    PRFindingRebuttal.monitor_run_id == run.id,
+                    PRFindingRebuttal.status.in_(_ACTIVE_ADJUDICATION_STATUSES),
+                ).limit(1).with_for_update()
+            )).scalar_one_or_none()
+            active_merge = (await db.execute(
+                select(PRMergeQueueAction.id).where(
+                    PRMergeQueueAction.monitor_run_id == run.id,
+                    PRMergeQueueAction.status.in_(_STARTED_MERGE_QUEUE_STATUSES),
+                ).limit(1).with_for_update()
+            )).scalar_one_or_none()
+            active_publication = (await db.execute(
+                select(PRReview.id).where(
+                    PRReview.monitor_run_id == run.id,
+                    PRReview.status.in_(("publishing", "superseding")),
+                ).limit(1).with_for_update()
+            )).scalar_one_or_none()
+            if any((active_repair, active_adjudication, active_merge, active_publication)):
+                raise HTTPException(409, "Cannot unbind while monitor effects are active")
+            wakes = list((await db.execute(select(PRRepairWake).where(
+                PRRepairWake.monitor_run_id == run.id,
+                PRRepairWake.status.in_(("pending", "shadow")),
+            ).with_for_update())).scalars())
+            for wake in wakes:
+                wake.developer_task_id = None
+                wake.status = "shadow"
+                if wake.last_error is None:
+                    wake.last_error = "developer_unbound"
+            run.developer_task_id = None
+            run.binding_verified_at = None
+            if run.status == "repair_pending":
+                run.status = "waiting_for_fix"
+            run.state_version += 1
+            await db.commit()
+    return await get_monitor_run(run_id, request, db)
 
 
 @router.post("/runs/{run_id}/resume", response_model=PRMonitorRunResponse)
@@ -755,35 +1159,87 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
     if repo is None:
         raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
-    if run.status != "paused":
-        raise HTTPException(409, "Only a paused PR Monitor Run can be resumed")
-    current_wake = (await db.execute(select(PRRepairWake).where(
-        PRRepairWake.monitor_run_id == run.id,
-        PRRepairWake.trigger_head_sha == run.current_head_sha,
-        PRRepairWake.status.in_(("shadow", "failed")),
-    ).order_by(desc(PRRepairWake.id)))).scalars().first()
-    if current_wake is None:
-        run.status = "waiting_for_fix"
+    repo_id = repo.id
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        repo = (await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        run = (await db.execute(
+            select(PRMonitorRun)
+            .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        if repo is None or run is None:
+            raise HTTPException(404, "Repository or PR Monitor Run not found")
+        await _require_pr_monitor_access(request, db, repo)
+        if not repo.enabled:
+            raise HTTPException(409, "Enable the PR monitor before resuming a Run")
+        if run.status != "paused":
+            raise HTTPException(409, "Only a paused PR Monitor Run can be resumed")
+
+        current_action = (await db.execute(select(PRMergeQueueAction).where(
+            PRMergeQueueAction.monitor_run_id == run.id,
+            PRMergeQueueAction.trigger_base_sha == run.current_base_sha,
+            PRMergeQueueAction.trigger_head_sha == run.current_head_sha,
+            PRMergeQueueAction.status == "paused",
+            PRMergeQueueAction.last_error == "manual",
+        ).order_by(desc(PRMergeQueueAction.id)).with_for_update())).scalars().first()
+        current_wake = (await db.execute(select(PRRepairWake).where(
+            PRRepairWake.monitor_run_id == run.id,
+            PRRepairWake.trigger_base_sha == run.current_base_sha,
+            PRRepairWake.trigger_head_sha == run.current_head_sha,
+            PRRepairWake.status.in_(("shadow", "failed")),
+        ).order_by(desc(PRRepairWake.id)).with_for_update())).scalars().first()
+        if current_action is not None:
+            current_action.status = "pending"
+            current_action.last_error = None
+            run.status = "merge_queue_pending"
+        elif current_wake is not None and repo.auto_repair and run.developer_task_id is not None:
+            task = await db.get(Task, run.developer_task_id)
+            if task is None or not task.session_id or not task.last_cwd:
+                raise HTTPException(409, "Bound Developer Task is not resumable")
+            if run.repair_attempts >= run.max_repair_attempts:
+                raise HTTPException(409, "Automatic repair budget is exhausted")
+            current_wake.status = "pending"
+            current_wake.delivery_token = secrets.token_hex(24)
+            current_wake.last_error = None
+            current_wake.developer_task_id = task.id
+            run.status = "repair_pending"
+        else:
+            if current_wake is not None:
+                current_wake.status = "shadow"
+            review = (
+                await db.get(PRReview, run.current_review_id)
+                if run.current_review_id is not None
+                else None
+            )
+            blockers = []
+            if review is not None:
+                blockers = list((await db.execute(select(PRFinding.id).where(
+                    PRFinding.pr_review_id == review.id,
+                    PRFinding.severity.in_(("critical", "high", "medium")),
+                    or_(
+                        PRFinding.status == "open",
+                        PRFinding.thread_status != "resolved",
+                    ),
+                ))).scalars())
+            if review is None:
+                run.status = "observing"
+            elif review.status == "waiting_ci":
+                run.status = "waiting_ci"
+            elif review.status in {"pending", "reviewing"}:
+                run.status = "reviewing"
+            elif review.status in {"approved", "commented"} and not blockers:
+                run.status = "ready_to_merge"
+            else:
+                run.status = "waiting_for_fix"
         run.pause_reason = None
-    elif not repo.auto_repair or run.developer_task_id is None:
-        current_wake.status = "shadow"
-        run.status = "waiting_for_fix"
-        run.pause_reason = None
-    else:
-        task = await db.get(Task, run.developer_task_id)
-        if task is None or not task.session_id or not task.last_cwd:
-            raise HTTPException(409, "Bound Developer Task is not resumable")
-        if run.repair_attempts >= run.max_repair_attempts:
-            raise HTTPException(409, "Automatic repair budget is exhausted")
-        current_wake.status = "pending"
-        current_wake.delivery_token = secrets.token_hex(24)
-        current_wake.last_error = None
-        current_wake.developer_task_id = task.id
-        run.status = "repair_pending"
-        run.pause_reason = None
-    run.state_version += 1
-    await db.commit()
-    return await get_monitor_run(run.id, request, db)
+        run.state_version += 1
+        await db.commit()
+    return await get_monitor_run(run_id, request, db)
 
 
 @router.post("/runs/{run_id}/enqueue-merge", response_model=PRMonitorRunResponse)

@@ -338,6 +338,38 @@ async def test_create_repo_success(client):
 
 
 @pytest.mark.asyncio
+async def test_single_review_mode_rejects_auto_repair(client):
+    response = await client.post("/api/pr-monitor/repos", json={
+        "repo_full_name": "owner/single-repair",
+        "review_mode": "single",
+        "auto_repair": True,
+    })
+    assert response.status_code == 400
+    assert response.json()["detail"] == "auto_repair requires review_mode=panel"
+
+
+@pytest.mark.asyncio
+async def test_update_cannot_leave_auto_repair_enabled_in_single_mode(client):
+    created = await _create_repo(
+        client, "owner/panel-repair", review_mode="panel", auto_repair=True,
+    )
+    rejected = await client.put(
+        f"/api/pr-monitor/repos/{created['id']}",
+        json={"review_mode": "single"},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "auto_repair requires review_mode=panel"
+
+    disabled = await client.put(
+        f"/api/pr-monitor/repos/{created['id']}",
+        json={"review_mode": "single", "auto_repair": False},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["review_mode"] == "single"
+    assert disabled.json()["auto_repair"] is False
+
+
+@pytest.mark.asyncio
 async def test_create_repo_duplicate(client):
     await _create_repo(client, "owner/repo")
     resp = await client.post("/api/pr-monitor/repos", json={"repo_full_name": "owner/repo"})

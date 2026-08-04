@@ -459,6 +459,12 @@ async def reconcile_fixed_finding_resolutions(db_factory) -> int:
                 .order_by(PRFinding.id)
             )).scalars())
             if not finding_ids:
+                # The final Finding resolution is committed independently from
+                # the zero-thread Gate.  A process exit between those commits
+                # leaves no work items to revisit, so explicitly finish the
+                # durable ``resolving_fixed_threads`` state on recovery.
+                if run.status == "resolving_fixed_threads":
+                    await record_gate_pass(db, current.id)
                 continue
             if run.status == "ready_to_merge":
                 run.status = "resolving_fixed_threads"

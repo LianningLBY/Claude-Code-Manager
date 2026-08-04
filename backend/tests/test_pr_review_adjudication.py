@@ -229,3 +229,61 @@ async def test_green_new_head_resolves_old_thread_before_merge_gate(
     assert resolved.thread_resolved_at is not None
     assert ready.status == "ready_to_merge"
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_fixed_thread_recovery_advances_gate_after_last_resolution_commit(
+    db_session, db_factory
+):
+    """A crash after the final Finding commit must not strand the run."""
+
+    new_head = "c" * 40
+    repo = MonitoredRepo(
+        repo_full_name="fake/recovery", webhook_secret="s" * 64,
+        review_mode="panel", merge_queue_mode="manual",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id, pr_number=9, current_base_sha=BASE,
+        current_head_sha=new_head, status="resolving_fixed_threads",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    old_review = PRReview(
+        monitor_run_id=run.id, repo_id=repo.id, pr_number=9,
+        base_sha=BASE, head_sha=HEAD, pr_title="old", pr_author="bot",
+        pr_url="https://example.invalid/fake/recovery/pull/9",
+        status="commented",
+    )
+    current_review = PRReview(
+        monitor_run_id=run.id, repo_id=repo.id, pr_number=9,
+        base_sha=BASE, head_sha=new_head, pr_title="fixed", pr_author="bot",
+        pr_url="https://example.invalid/fake/recovery/pull/9",
+        status="approved", action_taken="lgtm_comment",
+    )
+    db_session.add_all([old_review, current_review])
+    await db_session.flush()
+    run.current_review_id = current_review.id
+    reviewer = PRReviewerRun(
+        pr_review_id=old_review.id, role="qa_engineer", provider="codex",
+        status="changes_required", prompt_policy_hash="1" * 64,
+        guide_pack_hash="2" * 64,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    db_session.add(PRFinding(
+        pr_review_id=old_review.id, reviewer_run_id=reviewer.id,
+        fingerprint="7" * 64, role="qa_engineer", severity="high",
+        category="correctness", path="app.py", line=3, title="fixed guard",
+        evidence="guard was missing", impact="unsafe", required_fix="add guard",
+        test="exercise invalid input", base_sha=BASE, head_sha=HEAD,
+        thread_nonce="6" * 48, status="resolved_fixed",
+        thread_status="resolved", github_comment_id=789,
+        thread_resolved_at=datetime.utcnow(),
+    ))
+    await db_session.commit()
+
+    assert await reconcile_fixed_finding_resolutions(db_factory) == 0
+    recovered = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    assert recovered.status == "ready_to_merge"

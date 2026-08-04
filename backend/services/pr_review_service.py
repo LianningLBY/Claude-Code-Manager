@@ -2211,6 +2211,10 @@ async def create_pr_review_task(
         )
         from backend.services.pr_monitor_loop import attach_review_to_run
         await attach_review_to_run(db, repo=repo, review=review, pr_data=pr_data)
+        # Review Tasks become dispatchable only after the same commit has made
+        # their exact PRMonitorRun subject durable.
+        from backend.services.pr_review_panel import _wake_dispatcher
+        _wake_dispatcher()
         return review
     # Validate all prompt identifiers before staging any database row. The
     # webhook already canonicalizes these values, but this service is also
@@ -3821,8 +3825,12 @@ async def recover_incomplete_pr_reviews(
     panel_recovered = await recover_panel_reviews(db_factory)
     ci_started = await reconcile_waiting_ci_reviews(db_factory)
     from backend.main import dispatcher
-    from backend.services.pr_monitor_loop import reconcile_repair_wakes
+    from backend.services.pr_monitor_loop import (
+        reconcile_repair_wakes,
+        reconcile_terminal_review_runs,
+    )
 
+    terminal_runs_reconciled = await reconcile_terminal_review_runs(db_factory)
     repair_queued = await reconcile_repair_wakes(db_factory, dispatcher)
     from backend.services.pr_review_adjudication import (
         recover_adjudications,
@@ -3837,6 +3845,7 @@ async def recover_incomplete_pr_reviews(
     merge_progressed = await reconcile_merge_queue(db_factory)
     return (
         recovered + action_recovered + panel_recovered + ci_started
-        + repair_queued + adjudications_recovered + rebuttals_resolved
+        + terminal_runs_reconciled + repair_queued
+        + adjudications_recovered + rebuttals_resolved
         + fixed_findings_resolved + merge_progressed
     )

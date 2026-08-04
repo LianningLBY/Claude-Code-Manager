@@ -158,7 +158,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
       await api.createMonitoredRepo({
         repo_full_name: repoName.trim(),
         auto_merge: autoMerge,
-        auto_repair: autoRepair,
+        auto_repair: reviewMode === 'panel' && autoRepair,
         max_repair_attempts: 3,
         merge_queue_mode: mergeQueueMode,
         provider,
@@ -210,7 +210,8 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
             </select>
           </div>
           <div className="flex items-center gap-2">
-            <input type="checkbox" id="autoRepair" checked={autoRepair} onChange={(e) => setAutoRepair(e.target.checked)} />
+            <input type="checkbox" id="autoRepair" checked={autoRepair}
+              disabled={reviewMode !== 'panel'} onChange={(e) => setAutoRepair(e.target.checked)} />
             <label htmlFor="autoRepair" className="text-sm text-gray-300">Auto-resume bound local Developer Task (max 3 heads)</label>
           </div>
           {reviewMode === 'panel' && waitForCi && (
@@ -225,7 +226,11 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
           <div>
             <label className="block text-xs text-gray-400 mb-1">Review Harness</label>
             <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2"
-              value={reviewMode} onChange={(e) => setReviewMode(e.target.value as 'single' | 'panel')}>
+              value={reviewMode} onChange={(e) => {
+                const value = e.target.value as 'single' | 'panel';
+                setReviewMode(value);
+                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+              }}>
               <option value="panel">Independent Principal / Senior / QA panel</option>
               <option value="single">Legacy single reviewer</option>
             </select>
@@ -362,7 +367,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
       }
       const updated = await api.updateMonitoredRepo(repo.id, {
         auto_merge: autoMerge,
-        auto_repair: autoRepair,
+        auto_repair: reviewMode === 'panel' && autoRepair,
         max_repair_attempts: maxRepairAttempts,
         merge_queue_mode: mergeQueueMode,
         provider,
@@ -371,7 +376,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
         review_model: reviewModel.trim() ? reviewModel.trim() : null,
         review_effort: reviewEffort || null,
         review_mode: reviewMode,
-        wait_for_ci: waitForCi,
+        wait_for_ci: reviewMode === 'panel' && waitForCi,
         required_checks: checks,
         default_branch: defaultBranch.trim() || 'main',
         allowed_authors: authors,
@@ -414,7 +419,8 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
             <label htmlFor="detailAutoMerge" className="text-sm text-gray-300">Auto-merge approved PRs</label>
           </div>
           <div className="flex items-center gap-2">
-            <input type="checkbox" id="detailAutoRepair" checked={autoRepair} onChange={(e) => setAutoRepair(e.target.checked)} />
+            <input type="checkbox" id="detailAutoRepair" checked={autoRepair}
+              disabled={reviewMode !== 'panel'} onChange={(e) => setAutoRepair(e.target.checked)} />
             <label htmlFor="detailAutoRepair" className="text-sm text-gray-300">Auto-resume bound Developer Task</label>
           </div>
           <div>
@@ -475,7 +481,11 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
           <div>
             <label className="block text-xs text-gray-400 mb-1">Review Harness</label>
             <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2"
-              value={reviewMode} onChange={(e) => setReviewMode(e.target.value as 'single' | 'panel')}>
+              value={reviewMode} onChange={(e) => {
+                const value = e.target.value as 'single' | 'panel';
+                setReviewMode(value);
+                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+              }}>
               <option value="panel">Independent Principal / Senior / QA panel</option>
               <option value="single">Legacy single reviewer</option>
             </select>

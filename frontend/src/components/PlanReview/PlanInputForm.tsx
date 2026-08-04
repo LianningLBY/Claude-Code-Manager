@@ -115,7 +115,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
                       ? Array.isArray(value) && value.includes(option.value)
                       : value === option.value;
                     return (
-                      <label key={option.value} className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 text-sm transition-colors ${selected ? 'border-indigo-500/60 bg-indigo-500/10 text-indigo-100' : 'border-gray-700 text-gray-300 hover:border-gray-600'}`}>
+                      <label key={option.value} className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 text-sm transition-colors ${selected ? 'border-indigo-500/60 bg-indigo-500/10 text-indigo-300' : 'border-gray-700 text-gray-300 hover:border-gray-600'}`}>
                         <input
                           type={multi ? 'checkbox' : 'radio'}
                           name={`plan-question-${request.id}-${question.id}`}

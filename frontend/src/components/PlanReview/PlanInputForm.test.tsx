@@ -92,4 +92,21 @@ describe('PlanInputForm', () => {
     const secondKey = vi.mocked(api.answerPlanInput).mock.calls[1][2].idempotency_key;
     expect(secondKey).toBe(firstKey);
   });
+
+  it('uses a light-theme-readable text color for a selected choice', async () => {
+    const request = requestWithQuestions(1);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'single_choice',
+      options: [{ label: 'Fix a bug', value: 'bug' }],
+    };
+    render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
+
+    const option = screen.getByText('Fix a bug').closest('label');
+    expect(option).not.toBeNull();
+    await userEvent.click(option!);
+
+    expect(option).toHaveClass('text-indigo-300');
+    expect(option).not.toHaveClass('text-indigo-100');
+  });
 });

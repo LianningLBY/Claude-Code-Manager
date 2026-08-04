@@ -102,6 +102,13 @@ class PlanAgentStep(Base):
     )
     output: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_delta_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    streamed_output_chars: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    last_event_type: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
     started_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )

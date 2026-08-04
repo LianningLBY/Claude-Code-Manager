@@ -19,6 +19,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -329,10 +330,30 @@ class CodexTurnProcess:
         self.stderr = asyncio.StreamReader(limit=1024 * 1024)
         self._interrupt = interrupt
         self._done = asyncio.get_running_loop().create_future()
+        # Lightweight per-turn stream telemetry. Auxiliary callers such as
+        # the Plan pipeline can persist this before deleting a disposable
+        # thread, and can distinguish slow initial reasoning from a response
+        # stream that stopped making progress after output began.
+        self.last_delta_at: datetime | None = None
+        self.last_delta_monotonic: float | None = None
+        self.streamed_output_chars = 0
+        self.last_event_type: str | None = None
 
     def feed(self, payload: dict[str, Any]) -> None:
         if self.returncode is not None:
             return
+        event_type = payload.get("type")
+        if isinstance(event_type, str) and event_type:
+            self.last_event_type = event_type
+        if event_type in {
+            "item.agent_message.delta",
+            "item.reasoning.delta",
+        }:
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                self.streamed_output_chars += len(delta)
+            self.last_delta_at = datetime.utcnow()
+            self.last_delta_monotonic = time.monotonic()
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         self.stdout.feed_data(line.encode("utf-8") + b"\n")
 

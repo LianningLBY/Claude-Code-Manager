@@ -1213,6 +1213,9 @@ async def apply_worker_plan_outcome(
                 status=item.status,
                 output=item.output,
                 error=item.error,
+                last_delta_at=item.last_delta_at,
+                streamed_output_chars=item.streamed_output_chars,
+                last_event_type=item.last_event_type,
                 started_at=item.started_at,
                 finished_at=item.finished_at,
             )
@@ -1231,6 +1234,9 @@ async def apply_worker_plan_outcome(
             or step.status != item.status
             or step.output != item.output
             or step.error != item.error
+            or step.last_delta_at != item.last_delta_at
+            or step.streamed_output_chars != item.streamed_output_chars
+            or step.last_event_type != item.last_event_type
         ):
             raise RuntimeError("Worker Plan Step mapping collides with another Run")
         step_by_remote[item.id] = step

@@ -920,6 +920,9 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
                     "status": "completed",
                     "output": "planner output",
                     "error": None,
+                    "last_delta_at": now.isoformat(),
+                    "streamed_output_chars": 42,
+                    "last_event_type": "turn.completed",
                     "started_at": now.isoformat(),
                     "finished_at": now.isoformat(),
                 },
@@ -1000,6 +1003,9 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
         assert run.draft_repo_revision == {"commit": "abc"}
         draft_step = await db.get(PlanAgentStep, run.draft_step_id)
         assert draft_step.worker_step_id == 701
+        assert draft_step.last_delta_at == now
+        assert draft_step.streamed_output_chars == 42
+        assert draft_step.last_event_type == "turn.completed"
         assert input_request.worker_input_request_id == 901
         assert input_request.status == "open"
         base = await db.get(PlanVersion, base_version_id)

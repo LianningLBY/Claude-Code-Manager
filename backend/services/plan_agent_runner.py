@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import signal
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,6 +50,7 @@ from backend.services.process_safety import require_safe_process_group_id
 logger = logging.getLogger(__name__)
 
 _CLEANUP_TIMEOUT_SECONDS = 5.0
+_CODEX_TELEMETRY_PERSIST_INTERVAL_SECONDS = 2.0
 _CLAUDE_AUTH_ENV_KEYS = (
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -205,6 +207,10 @@ class PlanAgentError(RuntimeError):
 
 class PlanAgentCleanupError(PlanAgentError):
     """A Plan Agent process tree could not be proven terminal."""
+
+
+class PlanAgentTimeout(PlanAgentError):
+    """A Plan route timed out after its runtime was safely reclaimed."""
 
 
 class PlanRouteUnavailable(PlanAgentError):
@@ -1225,12 +1231,16 @@ class PlanAgentRunner:
         prompt: str,
         schema: dict,
         timeout: int,
+        step_id: int | None = None,
+        delta_idle_timeout: float | None = None,
     ) -> tuple[bytes, bytes, int]:
         registry = self.instance_manager._ensure_codex_app_server_registry()
         process = None
         token = None
         retained = None
         delayed_cancellation = None
+        telemetry_stop = asyncio.Event()
+        telemetry_task: asyncio.Task[None] | None = None
         try:
             async with self.instance_manager.codex_home_app_server_guard(
                 home
@@ -1266,16 +1276,84 @@ class PlanAgentRunner:
             if self.codex_pool:
                 self.codex_pool.record_routed_account(home)
 
-            stdout_task = asyncio.create_task(process.stdout.read())
-            stderr_task = asyncio.create_task(process.stderr.read())
-            wait_task = asyncio.create_task(process.wait())
+            if step_id is not None:
+                telemetry_task = asyncio.create_task(
+                    self._track_codex_step_telemetry(
+                        step_id,
+                        process,
+                        telemetry_stop,
+                    )
+                )
+
+            async def collect_output() -> tuple[bytes, bytes, int]:
+                stdout_task = asyncio.create_task(process.stdout.read())
+                stderr_task = asyncio.create_task(process.stderr.read())
+                wait_task = asyncio.create_task(process.wait())
+                try:
+                    stdout, stderr, returncode = await asyncio.gather(
+                        stdout_task,
+                        stderr_task,
+                        wait_task,
+                    )
+                    return stdout, stderr, int(returncode)
+                finally:
+                    pending = [
+                        task
+                        for task in (stdout_task, stderr_task, wait_task)
+                        if not task.done()
+                    ]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+
+            async def collect_with_idle_watchdog() -> tuple[bytes, bytes, int]:
+                collection = asyncio.create_task(collect_output())
+                idle_watchdog = (
+                    asyncio.create_task(
+                        self._wait_for_codex_delta_stall(
+                            process,
+                            float(delta_idle_timeout),
+                        )
+                    )
+                    if delta_idle_timeout is not None
+                    and delta_idle_timeout > 0
+                    else None
+                )
+                try:
+                    if idle_watchdog is None:
+                        return await collection
+                    done, _pending = await asyncio.wait(
+                        {collection, idle_watchdog},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if collection in done:
+                        return collection.result()
+                    await idle_watchdog
+                    # The process may become terminal just before its stdout
+                    # reader drains EOF. A normally-returned watchdog means
+                    # completion won that race, not a stall.
+                    return await collection
+                finally:
+                    for task in (collection, idle_watchdog):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *(
+                            task
+                            for task in (collection, idle_watchdog)
+                            if task is not None
+                        ),
+                        return_exceptions=True,
+                    )
+
             try:
                 stdout, stderr, returncode = await asyncio.wait_for(
-                    asyncio.gather(stdout_task, stderr_task, wait_task),
+                    collect_with_idle_watchdog(),
                     timeout=max(1, timeout),
                 )
             except asyncio.TimeoutError as exc:
-                raise PlanAgentError(
+                raise PlanAgentTimeout(
                     "Codex Plan Agent timed out",
                     provider="codex",
                 ) from exc
@@ -1284,6 +1362,9 @@ class PlanAgentRunner:
             delayed_cancellation = exc
             raise
         finally:
+            telemetry_stop.set()
+            if telemetry_task is not None:
+                await asyncio.gather(telemetry_task, return_exceptions=True)
             if (
                 token is not None
                 and retained is not None
@@ -1294,6 +1375,83 @@ class PlanAgentRunner:
                     retained,
                     delayed_cancellation=delayed_cancellation,
                 )
+
+    @staticmethod
+    async def _wait_for_codex_delta_stall(
+        process: CodexTurnProcess,
+        idle_timeout: float,
+    ) -> None:
+        """Fail only after output began and then stopped making progress."""
+
+        poll_interval = min(1.0, max(0.01, idle_timeout / 10))
+        while process.returncode is None:
+            last_delta = process.last_delta_monotonic
+            if (
+                last_delta is not None
+                and time.monotonic() - last_delta >= idle_timeout
+            ):
+                last_at = (
+                    process.last_delta_at.isoformat(timespec="milliseconds")
+                    if process.last_delta_at is not None
+                    else "none"
+                )
+                raise PlanAgentTimeout(
+                    "Codex Plan Agent stream stalled after "
+                    f"{idle_timeout:g}s without a delta "
+                    f"(last_delta_at={last_at}, "
+                    f"streamed_output_chars={process.streamed_output_chars}, "
+                    f"last_event_type={process.last_event_type or 'none'})",
+                    provider="codex",
+                )
+            await asyncio.sleep(poll_interval)
+
+    async def _persist_codex_step_telemetry(
+        self,
+        step_id: int,
+        process: CodexTurnProcess,
+    ) -> None:
+        async with self.db_factory() as db:
+            step = await db.get(PlanAgentStep, step_id)
+            if step is None:
+                return
+            step.last_delta_at = process.last_delta_at
+            step.streamed_output_chars = process.streamed_output_chars
+            step.last_event_type = process.last_event_type
+            await db.commit()
+
+    async def _track_codex_step_telemetry(
+        self,
+        step_id: int,
+        process: CodexTurnProcess,
+        stop: asyncio.Event,
+    ) -> None:
+        """Coalesce live stream telemetry and always flush before cleanup."""
+
+        last_snapshot: tuple[datetime | None, int, str | None] | None = None
+        while True:
+            snapshot = (
+                process.last_delta_at,
+                process.streamed_output_chars,
+                process.last_event_type,
+            )
+            if snapshot != last_snapshot:
+                try:
+                    await self._persist_codex_step_telemetry(step_id, process)
+                    last_snapshot = snapshot
+                except Exception:
+                    logger.exception(
+                        "Failed to persist Codex Plan Step %s stream telemetry",
+                        step_id,
+                    )
+            if stop.is_set():
+                return
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=_CODEX_TELEMETRY_PERSIST_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                continue
 
     async def _run_process(
         self,
@@ -1307,6 +1465,8 @@ class PlanAgentRunner:
         schema: dict,
         timeout: int,
         home: str | None,
+        step_id: int | None = None,
+        step_type: str | None = None,
     ) -> tuple[dict, str]:
         env = {
             key: value
@@ -1353,6 +1513,12 @@ class PlanAgentRunner:
                         prompt=prompt,
                         schema=schema,
                         timeout=timeout,
+                        step_id=step_id,
+                        delta_idle_timeout=(
+                            settings.plan_reviewer_delta_idle_timeout
+                            if step_type == "reviewer"
+                            else None
+                        ),
                     )
                 except CodexAppServerBusyError as exc:
                     raise PlanRouteUnavailable(
@@ -1468,7 +1634,7 @@ class PlanAgentRunner:
                         retained,
                         communicate_task,
                     )
-                raise PlanAgentError(
+                raise PlanAgentTimeout(
                     f"{provider.title()} Plan Agent timed out",
                     provider=provider,
                 ) from exc
@@ -1542,6 +1708,7 @@ class PlanAgentRunner:
             except PlanAgentError as exc:
                 if (
                     attempt >= attempts
+                    or isinstance(exc, PlanAgentTimeout)
                     or not is_transient_for(
                         kwargs["provider"],
                         exc.combined_output,
@@ -1574,6 +1741,8 @@ class PlanAgentRunner:
         prompt: str,
         schema: dict,
         timeout: int,
+        step_id: int | None = None,
+        step_type: str | None = None,
     ) -> tuple[dict, str, str | None]:
         """Exhaust accounts for one model before declaring the route unavailable."""
 
@@ -1604,12 +1773,20 @@ class PlanAgentRunner:
                     schema=schema,
                     timeout=timeout,
                     home=home,
+                    step_id=step_id,
+                    step_type=step_type,
                 )
                 return result, raw, account_id
             except PlanRouteUnavailable as exc:
                 reasons.append(str(exc))
                 excluded.add(account_id or "__default__")
                 continue
+            except PlanAgentTimeout:
+                # The provider-specific runner only raises this after its
+                # exact process/thread cleanup has completed. Do not retry a
+                # stalled route or rotate sibling accounts; let _run_stage
+                # advance directly to the configured fallback route.
+                raise
             except PlanAgentError as exc:
                 if self._record_unavailable_account(
                     provider=route.provider,
@@ -1672,11 +1849,19 @@ class PlanAgentRunner:
                     prompt=prompt,
                     schema=schema,
                     timeout=timeout,
+                    step_id=step_id,
+                    step_type=step_type,
                 )
             except PlanRouteUnavailable as exc:
                 unavailable.append(str(exc))
                 await self._finish_step(step_id, error=str(exc))
                 continue
+            except PlanAgentTimeout as exc:
+                await self._finish_step(step_id, error=str(exc))
+                if route_slot == "primary":
+                    unavailable.append(str(exc))
+                    continue
+                raise
             except asyncio.CancelledError:
                 await self._finish_step(
                     step_id,

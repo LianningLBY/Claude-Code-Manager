@@ -79,6 +79,9 @@ class PlanAgentStepResponse(BaseModel):
     status: str
     output: str | None
     error: str | None
+    last_delta_at: datetime | None = None
+    streamed_output_chars: int = 0
+    last_event_type: str | None = None
     started_at: datetime
     finished_at: datetime | None
 

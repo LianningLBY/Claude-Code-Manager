@@ -296,7 +296,23 @@ describe('PlanDetail', () => {
       created_at: '2026-08-03T10:27:22Z',
       updated_at: '2026-08-03T10:27:26Z',
       finished_at: '2026-08-03T10:27:26Z',
-      steps: [],
+      steps: [{
+        id: 51,
+        step_type: 'reviewer',
+        round: 1,
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+        route_slot: 'primary',
+        status: 'failed',
+        output: null,
+        error: 'Codex stream stalled after 90s without a delta',
+        last_delta_at: '2026-08-03T10:25:56Z',
+        streamed_output_chars: 381,
+        last_event_type: 'item.agent_message.delta',
+        started_at: '2026-08-03T10:24:22Z',
+        finished_at: '2026-08-03T10:27:26Z',
+      }],
       input_requests: [],
     } satisfies PlanRun;
     const resource = plan(current, prior);
@@ -317,6 +333,11 @@ describe('PlanDetail', () => {
     expect(screen.queryByRole('region', { name: 'Plan activity' })).not.toBeInTheDocument();
     const debug = screen.getByText('Debug information').closest('details');
     expect(within(debug!).getByText(rawError)).toBeInTheDocument();
+    expect(within(debug!).getByText(/streamed chars: 381/)).toBeInTheDocument();
+    expect(within(debug!).getByText(/last event: item\.agent_message\.delta/))
+      .toBeInTheDocument();
+    expect(within(debug!).getByText(/Codex stream stalled after 90s/))
+      .toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Retry planning' }));
     expect(api.createPlanRun).toHaveBeenCalledWith(4, {

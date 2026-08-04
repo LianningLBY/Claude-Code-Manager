@@ -396,6 +396,9 @@ export interface PlanAgentStep {
   status: string;
   output: string | null;
   error: string | null;
+  last_delta_at?: string | null;
+  streamed_output_chars?: number;
+  last_event_type?: string | null;
   started_at: string;
   finished_at: string | null;
 }

@@ -219,6 +219,11 @@ class TestLegacyMigration:
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
 
+        plan_step_cols = _get_table_columns(engine, "plan_agent_steps")
+        assert "last_delta_at" in plan_step_cols
+        assert "streamed_output_chars" in plan_step_cols
+        assert "last_event_type" in plan_step_cols
+
         project_cols = _get_table_columns(engine, "projects")
         assert "sort_order" in project_cols
         assert "tags" in project_cols

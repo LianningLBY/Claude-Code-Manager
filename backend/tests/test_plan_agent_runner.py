@@ -17,6 +17,7 @@ from backend.services.plan_agent_runner import (
     REVIEWER_SCHEMA_V2,
     PlanAgentError,
     PlanAgentRunner,
+    PlanAgentTimeout,
     PlanRouteUnavailable,
     _build_command,
     _extract_provider_content,
@@ -364,6 +365,145 @@ async def test_codex_plan_uses_disposable_read_only_app_server_thread(
     assert kwargs["disable_autonomous_features"] is True
     assert kwargs["output_schema"] == PLANNER_SCHEMA
     assert kwargs["resume_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_codex_reviewer_delta_stall_is_persisted_and_cleaned(
+    db_factory,
+):
+    async with db_factory() as db:
+        step = PlanAgentStep(
+            run_id=701,
+            step_type="reviewer",
+            round=1,
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort="xhigh",
+            route_slot="primary",
+            status="running",
+        )
+        db.add(step)
+        await db.commit()
+        await db.refresh(step)
+        step_id = step.id
+
+    process: CodexTurnProcess | None = None
+
+    async def interrupt():
+        assert process is not None
+        process.finish(130)
+
+    process = CodexTurnProcess(123, interrupt, thread_id="stalled-review")
+    process.feed({"type": "item.reasoning.delta", "delta": "分析"})
+    process.feed({"type": "item.agent_message.delta", "delta": "{"})
+
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(
+        return_value=(process, "stalled-review")
+    )
+    registry.delete_thread = AsyncMock()
+
+    class Manager:
+        @asynccontextmanager
+        async def codex_home_app_server_guard(self, home):
+            yield home
+
+        def _ensure_codex_app_server_registry(self):
+            return registry
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=Manager(),
+    )
+
+    with pytest.raises(
+        PlanAgentTimeout,
+        match=(
+            r"stream stalled after 0\.05s without a delta .*"
+            r"streamed_output_chars=3.*"
+            r"last_event_type=item\.agent_message\.delta"
+        ),
+    ):
+        await runner._run_codex_turn(
+            task_id=-701,
+            home="/canonical/default-codex-home",
+            model="gpt-5.6-sol",
+            effort="xhigh",
+            cwd="/tmp",
+            prompt="review safely",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=2,
+            step_id=step_id,
+            delta_idle_timeout=0.05,
+        )
+
+    registry.delete_thread.assert_awaited_once_with(
+        "/canonical/default-codex-home",
+        "stalled-review",
+    )
+    async with db_factory() as db:
+        persisted = await db.get(PlanAgentStep, step_id)
+    assert persisted.last_delta_at is not None
+    assert persisted.streamed_output_chars == 3
+    assert persisted.last_event_type == "item.agent_message.delta"
+
+
+@pytest.mark.asyncio
+async def test_codex_delta_idle_watchdog_allows_long_initial_reasoning(
+    db_factory,
+):
+    process: CodexTurnProcess | None = None
+
+    async def interrupt():
+        assert process is not None
+        process.finish(130)
+
+    process = CodexTurnProcess(123, interrupt, thread_id="slow-first-delta")
+
+    async def complete_after_initial_reasoning():
+        await asyncio.sleep(0.08)
+        assert process is not None
+        process.feed({"type": "item.agent_message.delta", "delta": "{}"})
+        process.feed({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "{}"},
+        })
+        process.finish(0)
+
+    completion = asyncio.create_task(complete_after_initial_reasoning())
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(
+        return_value=(process, "slow-first-delta")
+    )
+    registry.delete_thread = AsyncMock()
+
+    class Manager:
+        @asynccontextmanager
+        async def codex_home_app_server_guard(self, home):
+            yield home
+
+        def _ensure_codex_app_server_registry(self):
+            return registry
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=Manager(),
+    )
+    stdout, _stderr, returncode = await runner._run_codex_turn(
+        task_id=-702,
+        home="/canonical/default-codex-home",
+        model="gpt-5.6-sol",
+        effort="xhigh",
+        cwd="/tmp",
+        prompt="review safely",
+        schema=REVIEWER_SCHEMA_V2,
+        timeout=2,
+        delta_idle_timeout=0.05,
+    )
+    await completion
+
+    assert returncode == 0
+    assert b'item.completed' in stdout
 
 
 def test_retained_plan_agent_is_exposed_as_update_blocker(monkeypatch):
@@ -720,6 +860,93 @@ async def test_stage_uses_fallback_only_after_primary_route_is_unavailable(
     assert task_state.plan_stage_provider == "codex"
     assert task_state.plan_stage_model == "gpt-5.6-terra"
     assert task_state.plan_stage_route_slot == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_stage_switches_to_fallback_after_confirmed_primary_timeout(
+    db_factory,
+):
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 0,
+    })
+    task = Task(
+        id=702,
+        title="Reviewer fallback",
+        description="review",
+        mode="plan",
+    )
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    run_id = await runner._create_run(task=task, pipeline=pipeline)
+    runner._run_route = AsyncMock(side_effect=[
+        PlanAgentTimeout(
+            "Codex Plan Agent stream stalled",
+            provider="codex",
+        ),
+        (
+            {"action": "approve", "feedback": ""},
+            '{"action":"approve","feedback":""}',
+            "claude-1",
+        ),
+    ])
+
+    result, _raw, route, route_slot, account_id = await runner._run_stage(
+        run_id=run_id,
+        task_id=task.id,
+        step_type="reviewer",
+        round_number=1,
+        routes=pipeline.reviewer,
+        cwd="/tmp",
+        prompt="review",
+        schema=REVIEWER_SCHEMA_V2,
+        timeout=900,
+    )
+
+    assert result == {"action": "approve", "feedback": ""}
+    assert route.provider == "claude"
+    assert route_slot == "fallback"
+    assert account_id == "claude-1"
+    async with db_factory() as db:
+        steps = list(
+            (
+                await db.execute(
+                    select(PlanAgentStep)
+                    .where(PlanAgentStep.run_id == run_id)
+                    .order_by(PlanAgentStep.id)
+                )
+            ).scalars()
+        )
+    assert [step.route_slot for step in steps] == ["primary", "fallback"]
+    assert [step.status for step in steps] == ["failed", "completed"]
+    assert "stream stalled" in steps[0].error
 
 
 @pytest.mark.asyncio

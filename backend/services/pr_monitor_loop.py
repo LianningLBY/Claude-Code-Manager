@@ -8,7 +8,7 @@ import secrets
 import re
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.pr_monitor import (
@@ -134,14 +134,41 @@ async def attach_review_to_run(
             Task.status.in_(("completed", "in_progress", "executing")),
         ).order_by(Task.id.desc()).limit(2))).scalars())
         if len(candidates) == 1 and "pr-review" not in (candidates[0].tags or []):
-            conflict = (await db.execute(select(PRMonitorRun.id).where(
-                PRMonitorRun.developer_task_id == candidates[0].id,
-                PRMonitorRun.id != run.id,
-                PRMonitorRun.status.not_in(("merged", "closed")),
-            ))).scalar_one_or_none()
-            if conflict is None:
-                run.developer_task_id = candidates[0].id
-                run.binding_verified_at = datetime.utcnow()
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            candidate_id = candidates[0].id
+            async with get_task_operation_lock(candidate_id):
+                candidate = (await db.execute(
+                    select(Task)
+                    .where(Task.id == candidate_id)
+                    .with_for_update()
+                )).scalar_one_or_none()
+                if (
+                    candidate is not None
+                    and candidate.project_id == repo.project_id
+                    and candidate.result_branch == run.head_branch
+                    and candidate.session_id
+                    and candidate.last_cwd
+                    and candidate.status in {"completed", "in_progress", "executing"}
+                    and "pr-review" not in (candidate.tags or [])
+                ):
+                    conflict = (await db.execute(
+                        select(PRMonitorRun.id)
+                        .where(
+                            PRMonitorRun.developer_task_id == candidate.id,
+                            PRMonitorRun.id != run.id,
+                            PRMonitorRun.status.not_in(("merged", "closed")),
+                        )
+                        .limit(1)
+                        .with_for_update()
+                    )).scalar_one_or_none()
+                    if conflict is None:
+                        run.developer_task_id = candidate.id
+                        run.binding_verified_at = datetime.utcnow()
+                run.status = "waiting_ci" if review.status == "waiting_ci" else "reviewing"
+                await db.commit()
+                await db.refresh(run)
+                return run
     run.status = "waiting_ci" if review.status == "waiting_ci" else "reviewing"
     await db.commit()
     await db.refresh(run)
@@ -383,34 +410,128 @@ async def admit_repair_wake(
     delivery_token: str,
     task: Task,
 ) -> bool:
-    wake = await db.get(PRRepairWake, wake_id, populate_existing=True)
-    if wake is None or wake.delivery_token != delivery_token:
+    preliminary_wake = await db.get(PRRepairWake, wake_id, populate_existing=True)
+    if preliminary_wake is None or preliminary_wake.delivery_token != delivery_token:
         return False
-    run = await db.get(PRMonitorRun, wake.monitor_run_id, populate_existing=True)
-    repo = await db.get(MonitoredRepo, run.repo_id, populate_existing=True) if run else None
+    preliminary_run = await db.get(
+        PRMonitorRun,
+        preliminary_wake.monitor_run_id,
+        populate_existing=True,
+    )
+    if preliminary_run is None:
+        return False
+    # Repository is the cross-process lifecycle barrier. Re-read every
+    # dependent row only after owning it so a pause/synchronize or duplicate
+    # admission cannot pass with stale ORM state.
+    repo = (await db.execute(
+        select(MonitoredRepo)
+        .where(MonitoredRepo.id == preliminary_run.repo_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    run = (await db.execute(
+        select(PRMonitorRun)
+        .where(PRMonitorRun.id == preliminary_run.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    wake = (await db.execute(
+        select(PRRepairWake)
+        .where(PRRepairWake.id == wake_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    locked_task = (await db.execute(
+        select(Task)
+        .where(Task.id == task.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     if (
         run is None
         or repo is None
+        or wake is None
+        or locked_task is None
+        or not repo.enabled
         or not repo.auto_repair
-        or wake.status not in {"delivering", "accepted"}
-        or wake.developer_task_id != task.id
-        or run.developer_task_id != task.id
+        or wake.delivery_token != delivery_token
+        or wake.status != "delivering"
+        or wake.developer_task_id != locked_task.id
+        or run.developer_task_id != locked_task.id
+        or run.current_base_sha != wake.trigger_base_sha
         or run.current_head_sha != wake.trigger_head_sha
         or run.current_review_id != wake.review_id
         or run.status not in {"repair_pending", "repairing"}
-        or not task.session_id
-        or not task.last_cwd
+        or locked_task.status not in {"completed", "failed", "cancelled", "conflict"}
+        or locked_task.pty_background_generation is not None
+        or not locked_task.session_id
+        or not locked_task.last_cwd
     ):
         return False
-    wake.status = "accepted"
-    wake.accepted_worker_id = task.worker_id
-    wake.accepted_task_retry_count = task.retry_count
-    wake.accepted_session_id = task.session_id
-    wake.last_error = None
+    accepted = await db.execute(
+        update(PRRepairWake)
+        .where(
+            PRRepairWake.id == wake.id,
+            PRRepairWake.delivery_token == delivery_token,
+            PRRepairWake.status == "delivering",
+        )
+        .values(
+            status="accepted",
+            accepted_worker_id=locked_task.worker_id,
+            accepted_task_retry_count=locked_task.retry_count,
+            accepted_session_id=locked_task.session_id,
+            accepted_task_started_at=locked_task.started_at,
+            accepted_task_completed_at=locked_task.completed_at,
+            last_error=None,
+        )
+    )
+    if accepted.rowcount != 1:
+        await db.rollback()
+        return False
     run.status = "repairing"
     run.state_version += 1
     await db.commit()
     return True
+
+
+def _repair_task_identity_matches(wake: PRRepairWake, task: Task) -> bool:
+    return bool(
+        wake.developer_task_id == task.id
+        and wake.accepted_worker_id == task.worker_id
+        and wake.accepted_task_retry_count == task.retry_count
+        and wake.accepted_session_id == task.session_id
+    )
+
+
+def _repair_has_new_terminal(wake: PRRepairWake, task: Task) -> bool:
+    """Prove a terminal was published after this exact Wake admission."""
+
+    return bool(
+        task.status in {"completed", "failed", "cancelled", "conflict"}
+        and task.completed_at is not None
+        and task.completed_at != wake.accepted_task_completed_at
+        and _repair_task_identity_matches(wake, task)
+    )
+
+
+def _apply_repair_terminal(
+    wake: PRRepairWake,
+    run: PRMonitorRun,
+    task: Task,
+) -> None:
+    if task.status == "completed":
+        wake.status = "awaiting_push"
+        wake.last_error = None
+        run.status = "repairing"
+        run.repair_attempts += 1
+        run.state_version += 1
+        return
+    wake.status = "failed"
+    wake.last_error = f"developer_turn_{task.status}"
+    wake.completed_at = datetime.utcnow()
+    run.status = "paused"
+    run.pause_reason = wake.last_error
+    run.state_version += 1
 
 
 async def finish_repair_wake(
@@ -421,21 +542,21 @@ async def finish_repair_wake(
         return
     run = await db.get(PRMonitorRun, wake.monitor_run_id, populate_existing=True)
     task = await db.get(Task, task_id, populate_existing=True)
-    if run is None or run.current_head_sha != wake.trigger_head_sha:
+    if (
+        run is None
+        or run.current_base_sha != wake.trigger_base_sha
+        or run.current_head_sha != wake.trigger_head_sha
+    ):
         wake.status = "superseded"
         wake.completed_at = datetime.utcnow()
+    elif task is None or not _repair_has_new_terminal(wake, task):
+        # Admission happens before the queued turn's launch claim.  The Task
+        # may therefore still expose the previous completed generation here.
+        # Leave the Wake accepted; recovery will either observe the new exact
+        # terminal or safely re-deliver without consuming repair budget.
+        return
     else:
-        if task is not None and task.status == "completed":
-            wake.status = "awaiting_push"
-            run.status = "repairing"
-            run.repair_attempts += 1
-            run.state_version += 1
-        else:
-            wake.status = "failed"
-            wake.last_error = "developer_turn_failed"
-            wake.completed_at = datetime.utcnow()
-            run.status = "paused"
-            run.pause_reason = wake.last_error
+        _apply_repair_terminal(wake, run, task)
     await db.commit()
 
 
@@ -509,24 +630,70 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
         )).scalars())
         for wake in incomplete:
             task = await db.get(Task, wake.developer_task_id) if wake.developer_task_id else None
+            run = await db.get(PRMonitorRun, wake.monitor_run_id)
+            repo = await db.get(MonitoredRepo, run.repo_id) if run is not None else None
             if task is None:
                 wake.status = "failed"
                 wake.last_error = "developer_task_missing"
+                wake.completed_at = now
+                if run is not None:
+                    run.status = "paused"
+                    run.pause_reason = wake.last_error
+                    run.state_version += 1
+                continue
+            if (
+                run is None
+                or run.current_base_sha != wake.trigger_base_sha
+                or run.current_head_sha != wake.trigger_head_sha
+                or run.current_review_id != wake.review_id
+            ):
+                wake.status = "superseded"
+                wake.completed_at = now
+                continue
+            if repo is None or not repo.enabled or not repo.auto_repair:
+                wake.status = "shadow" if wake.status == "delivering" else "failed"
+                wake.last_error = (
+                    "repo_disabled"
+                    if repo is not None and not repo.enabled
+                    else "auto_repair_disabled"
+                )
+                if wake.status == "failed":
+                    wake.completed_at = now
+                run.status = "paused" if repo is not None and not repo.enabled else "waiting_for_fix"
+                run.pause_reason = wake.last_error if run.status == "paused" else None
+                run.state_version += 1
                 continue
             restore_repair_developer_task(task)
             if await dispatcher.has_task_queue_work(task.id):
                 continue
             if task.status in {"in_progress", "executing"}:
                 continue
-            # No queue or active-turn evidence exists in this Manager process.
-            # Recover the restart gap after durable delivery admission but
-            # before an authoritative Developer turn terminal was recorded.
+            if wake.status == "accepted":
+                if not _repair_task_identity_matches(wake, task):
+                    wake.status = "failed"
+                    wake.last_error = "repair_task_generation_changed"
+                    wake.completed_at = now
+                    run.status = "paused"
+                    run.pause_reason = wake.last_error
+                    run.state_version += 1
+                    continue
+                if _repair_has_new_terminal(wake, task):
+                    _apply_repair_terminal(wake, run, task)
+                    continue
+            # No queued/active generation and no post-admission terminal:
+            # either delivery was never admitted or the Manager died after
+            # acceptance but before launch. Rotate the nonce and re-deliver;
+            # the previous completed Task row must not consume repair budget.
             wake.status = "pending"
             wake.last_error = "recovered_interrupted_delivery"
-            run = await db.get(PRMonitorRun, wake.monitor_run_id)
-            if run is not None and run.current_head_sha == wake.trigger_head_sha:
-                run.status = "repair_pending"
-                run.state_version += 1
+            wake.delivery_token = secrets.token_hex(24)
+            wake.accepted_worker_id = None
+            wake.accepted_task_retry_count = None
+            wake.accepted_session_id = None
+            wake.accepted_task_started_at = None
+            wake.accepted_task_completed_at = None
+            run.status = "repair_pending"
+            run.state_version += 1
         await db.commit()
 
         wake_ids = list((await db.execute(
@@ -544,6 +711,23 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
             if task is None or run is None:
                 wake.status = "failed"
                 wake.last_error = "developer_task_missing"
+                continue
+            repo = (await db.execute(
+                select(MonitoredRepo)
+                .where(MonitoredRepo.id == run.repo_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if repo is None or not repo.enabled or not repo.auto_repair:
+                wake.status = "shadow"
+                wake.last_error = (
+                    "repo_disabled"
+                    if repo is not None and not repo.enabled
+                    else "auto_repair_disabled"
+                )
+                if run.status == "repair_pending":
+                    run.status = "paused" if repo is not None and not repo.enabled else "waiting_for_fix"
+                    run.pause_reason = "repo_disabled" if run.status == "paused" else None
+                    run.state_version += 1
                 continue
             if task.worker_id is not None:
                 from backend.main import task_migrator
@@ -592,9 +776,21 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
                         run.status = "paused"
                         run.pause_reason = "repair_migration_not_authoritative"
                     continue
-            wake.status = "delivering"
-            wake.last_error = None
+            claimed = await db.execute(
+                update(PRRepairWake)
+                .where(
+                    PRRepairWake.id == wake.id,
+                    PRRepairWake.status == "pending",
+                )
+                .values(status="delivering", last_error=None)
+            )
+            if claimed.rowcount != 1:
+                await db.rollback()
+                continue
             await db.commit()
+            wake = await db.get(PRRepairWake, wake_id_candidate, populate_existing=True)
+            if wake is None or wake.status != "delivering":
+                continue
             try:
                 await dispatcher.enqueue_message(
                     task_id=task.id,

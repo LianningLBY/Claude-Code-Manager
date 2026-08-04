@@ -16,6 +16,7 @@ from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import (
     MonitoredRepo,
     PRFinding,
+    PRMonitorRun,
     PRReview,
     PRReviewerRun,
 )
@@ -676,21 +677,58 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     continue
                 await verify_pr_review_snapshot_current(repo, pr_data)
                 context = await prepare_pr_review_context(repo, pr_data)
+                locked_repo = (await db.execute(
+                    select(MonitoredRepo)
+                    .where(MonitoredRepo.id == repo.id)
+                    .with_for_update()
+                )).scalar_one_or_none()
                 locked = (await db.execute(
                     select(PRReview)
                     .where(PRReview.id == review_id, PRReview.status == "waiting_ci")
                     .with_for_update()
                 )).scalar_one_or_none()
-                if locked is None:
+                locked_run = (
+                    (await db.execute(
+                        select(PRMonitorRun)
+                        .where(PRMonitorRun.id == locked.monitor_run_id)
+                        .with_for_update()
+                    )).scalar_one_or_none()
+                    if locked is not None and locked.monitor_run_id is not None
+                    else None
+                )
+                if (
+                    locked_repo is None
+                    or not locked_repo.enabled
+                    or locked_repo.review_mode != "panel"
+                    or not locked_repo.wait_for_ci
+                    or locked is None
+                    or locked.base_sha != pr_data["base_sha"]
+                    or locked.head_sha != pr_data["head_sha"]
+                    or locked_run is None
+                    or locked_run.status != "waiting_ci"
+                    or locked_run.current_review_id != locked.id
+                    or locked_run.current_base_sha != locked.base_sha
+                    or locked_run.current_head_sha != locked.head_sha
+                ):
                     await db.rollback()
                     continue
+                # Context preparation may be slow. Verify the immutable remote
+                # subject once more while holding the same repository/run
+                # barrier used by disable and synchronize before creating any
+                # reviewer Tasks.
+                await verify_pr_review_snapshot_current(locked_repo, pr_data)
                 existing = (await db.execute(
                     select(PRReviewerRun.id).where(PRReviewerRun.pr_review_id == review_id)
                 )).scalar_one_or_none()
                 if existing is not None:
                     await db.rollback()
                     continue
-                await _add_panel_tasks(db, repo=repo, review=locked, context=context)
+                await _add_panel_tasks(
+                    db,
+                    repo=locked_repo,
+                    review=locked,
+                    context=context,
+                )
                 await db.commit()
                 started += 1
                 _wake_dispatcher()

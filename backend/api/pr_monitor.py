@@ -399,6 +399,8 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
         raise HTTPException(400, "auto_repair requires review_mode=panel")
     if body.wait_for_ci and not body.required_checks:
         raise HTTPException(400, "wait_for_ci requires at least one required check")
+    if body.auto_merge and body.review_mode != "single":
+        raise HTTPException(400, "legacy auto_merge requires review_mode=single")
     if body.auto_merge and body.merge_queue_mode != "manual":
         raise HTTPException(400, "legacy auto_merge and Merge Queue are mutually exclusive")
     if body.merge_queue_mode != "manual" and (
@@ -506,6 +508,8 @@ async def update_repo(
             raise HTTPException(400, "wait_for_ci requires at least one required check")
         effective_auto_merge = update_data.get("auto_merge", repo.auto_merge)
         effective_merge_queue = update_data.get("merge_queue_mode", repo.merge_queue_mode)
+        if effective_auto_merge and effective_mode != "single":
+            raise HTTPException(400, "legacy auto_merge requires review_mode=single")
         if effective_auto_merge and effective_merge_queue != "manual":
             raise HTTPException(400, "legacy auto_merge and Merge Queue are mutually exclusive")
         if effective_merge_queue != "manual" and (
@@ -521,6 +525,8 @@ async def update_repo(
             "review_model",
             "review_effort",
             "auto_merge",
+            "default_branch",
+            "project_id",
         }
         changed_review_policy = {
             key
@@ -565,7 +571,7 @@ async def update_repo(
             if (
                 "merge_queue_mode" in update_data
                 and effective_merge_queue != repo.merge_queue_mode
-            ) or "required_checks" in update_data:
+            ) or "required_checks" in changed_review_policy:
                 await _withdraw_pending_merge_actions(db, repo_id=repo_id)
 
         project_id = update_data.get("project_id")
@@ -636,21 +642,41 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
         if monitor_run_ids:
             active_wake = (await db.execute(select(PRRepairWake.id).where(
                 PRRepairWake.monitor_run_id.in_(monitor_run_ids),
-                PRRepairWake.status.in_(("pending", "delivering", "accepted")),
+                PRRepairWake.status.in_(("pending", *_STARTED_REPAIR_STATUSES)),
             ).limit(1))).scalar_one_or_none()
             active_merge = (await db.execute(select(PRMergeQueueAction.id).where(
                 PRMergeQueueAction.monitor_run_id.in_(monitor_run_ids),
-                PRMergeQueueAction.status.in_(("pending", "enqueuing", "queued", "checking")),
+                PRMergeQueueAction.status.in_(("pending", *_STARTED_MERGE_QUEUE_STATUSES)),
             ).limit(1))).scalar_one_or_none()
             active_rebuttal = (await db.execute(select(PRFindingRebuttal.id).where(
                 PRFindingRebuttal.monitor_run_id.in_(monitor_run_ids),
-                PRFindingRebuttal.status.in_(("pending", "adjudicating")),
+                PRFindingRebuttal.status.in_(_ACTIVE_ADJUDICATION_STATUSES),
             ).limit(1))).scalar_one_or_none()
-            if active_wake or active_merge or active_rebuttal:
+            resolving_run = (await db.execute(select(PRMonitorRun.id).where(
+                PRMonitorRun.id.in_(monitor_run_ids),
+                PRMonitorRun.status == "resolving_fixed_threads",
+            ).limit(1))).scalar_one_or_none()
+            unresolved_thread = None
+            if review_ids:
+                unresolved_thread = (await db.execute(select(PRFinding.id).where(
+                    PRFinding.pr_review_id.in_(review_ids),
+                    PRFinding.thread_status.in_((
+                        "published_inline",
+                        "published_fallback",
+                    )),
+                ).limit(1))).scalar_one_or_none()
+            if (
+                active_wake
+                or active_merge
+                or active_rebuttal
+                or resolving_run
+                or unresolved_thread
+            ):
                 await db.rollback()
                 raise HTTPException(
                     409,
-                    "Cannot delete a PR monitor while Repair, adjudication, or Merge Queue work is active",
+                    "Cannot delete a PR monitor while Repair, adjudication, "
+                    "Finding resolution, or Merge Queue work is active",
                 )
         if monitor_run_ids:
             await db.execute(
@@ -851,12 +877,6 @@ async def submit_finding_rebuttal(
     if developer is None:
         raise HTTPException(409, "Bound Developer Task no longer exists")
     await require_task_control(request, developer, db)
-    active = (await db.execute(select(PRFindingRebuttal.id).where(
-        PRFindingRebuttal.finding_id == finding.id,
-        PRFindingRebuttal.status.in_(("pending", "adjudicating")),
-    ))).scalar_one_or_none()
-    if active is not None:
-        raise HTTPException(409, "This Finding already has an active adjudication")
     snapshot = _validated_pr_snapshot(
         await _gh_pr_view(review.pr_number, repo.repo_full_name)
     )
@@ -874,17 +894,85 @@ async def submit_finding_rebuttal(
         "author": review.pr_author,
         "url": review.pr_url,
     })
-    rebuttal = await create_rebuttal_task(
-        db,
-        repo=repo,
-        run=run,
-        review=review,
-        finding=finding,
-        developer_task=developer,
-        evidence=body.evidence,
-        material=context["material"],
-    )
-    return rebuttal
+    repo_id = repo.id
+    review_id = review.id
+    run_id = run.id
+    developer_id = developer.id
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        repo = (await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        run = (await db.execute(
+            select(PRMonitorRun)
+            .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        review = (await db.execute(
+            select(PRReview)
+            .where(PRReview.id == review_id, PRReview.repo_id == repo_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        finding = (await db.execute(
+            select(PRFinding)
+            .where(PRFinding.id == finding_id, PRFinding.pr_review_id == review_id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        developer = (await db.execute(
+            select(Task).where(Task.id == developer_id).with_for_update()
+        )).scalar_one_or_none()
+        if repo is None or run is None or review is None or finding is None:
+            raise HTTPException(409, "Finding lifecycle changed before adjudication")
+        await _require_pr_monitor_access(request, db, repo)
+        if developer is None:
+            raise HTTPException(409, "Bound Developer Task no longer exists")
+        await require_task_control(request, developer, db)
+        if not repo.enabled:
+            raise HTTPException(409, "PR monitor is disabled")
+        if (
+            run.current_review_id != review.id
+            or run.current_base_sha != review.base_sha
+            or run.current_head_sha != review.head_sha
+            or finding.base_sha != review.base_sha
+            or finding.head_sha != review.head_sha
+            or run.developer_task_id != developer.id
+        ):
+            raise HTTPException(409, "Finding belongs to a superseded PR subject")
+        if finding.severity not in {"critical", "high", "medium"} or finding.status != "open":
+            raise HTTPException(409, "Only an open blocking Finding can be rebutted")
+        fresh_snapshot = _validated_pr_snapshot(
+            await _gh_pr_view(review.pr_number, repo.repo_full_name)
+        )
+        if (
+            fresh_snapshot.get("state") != "OPEN"
+            or fresh_snapshot.get("is_draft") is not False
+            or fresh_snapshot.get("base_sha") != review.base_sha
+            or fresh_snapshot.get("head_sha") != review.head_sha
+        ):
+            raise HTTPException(409, "GitHub PR subject changed before adjudication")
+        active = (await db.execute(
+            select(PRFindingRebuttal.id)
+            .where(
+                PRFindingRebuttal.finding_id == finding.id,
+                PRFindingRebuttal.status.in_(_ACTIVE_ADJUDICATION_STATUSES),
+            )
+            .limit(1)
+            .with_for_update()
+        )).scalar_one_or_none()
+        if active is not None:
+            raise HTTPException(409, "This Finding already has an active adjudication")
+        return await create_rebuttal_task(
+            db,
+            repo=repo,
+            run=run,
+            review=review,
+            finding=finding,
+            developer_task=developer,
+            evidence=body.evidence,
+            material=context["material"],
+        )
 
 
 @router.get("/runs/{run_id}", response_model=PRMonitorRunResponse)
@@ -1068,7 +1156,7 @@ async def pause_monitor_run(run_id: int, request: Request, db: AsyncSession = De
             reason="manual",
         )
         await db.commit()
-    return await get_monitor_run(run.id, request, db)
+    return await get_monitor_run(run_id, request, db)
 
 
 @router.post("/runs/{run_id}/unbind-developer", response_model=PRMonitorRunResponse)
@@ -1151,6 +1239,11 @@ async def unbind_monitor_developer(run_id: int, request: Request, db: AsyncSessi
 @router.post("/runs/{run_id}/resume", response_model=PRMonitorRunResponse)
 async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     from backend.models.task import Task
+    from backend.services.pr_merge_queue import (
+        _read_merge_group_ref,
+        _read_queue_entry,
+    )
+    from backend.services.pr_review_service import _gh_pr_view, _validated_pr_snapshot
 
     run = await db.get(PRMonitorRun, run_id)
     if run is None:
@@ -1185,7 +1278,6 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
             PRMergeQueueAction.trigger_base_sha == run.current_base_sha,
             PRMergeQueueAction.trigger_head_sha == run.current_head_sha,
             PRMergeQueueAction.status == "paused",
-            PRMergeQueueAction.last_error == "manual",
         ).order_by(desc(PRMergeQueueAction.id)).with_for_update())).scalars().first()
         current_wake = (await db.execute(select(PRRepairWake).where(
             PRRepairWake.monitor_run_id == run.id,
@@ -1194,9 +1286,58 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
             PRRepairWake.status.in_(("shadow", "failed")),
         ).order_by(desc(PRRepairWake.id)).with_for_update())).scalars().first()
         if current_action is not None:
-            current_action.status = "pending"
+            snapshot = _validated_pr_snapshot(
+                await _gh_pr_view(run.pr_number, repo.repo_full_name)
+            )
+            if (
+                snapshot.get("state") != "OPEN"
+                or snapshot.get("is_draft") is not False
+                or snapshot.get("base_sha") != current_action.trigger_base_sha
+                or snapshot.get("head_sha") != current_action.trigger_head_sha
+            ):
+                raise HTTPException(409, "GitHub PR subject changed while resuming Merge Queue")
+            entry = await _read_queue_entry(repo.repo_full_name, run.pr_number)
+            if entry is not None and (
+                entry.base_sha != current_action.trigger_base_sha
+                or entry.head_sha != current_action.trigger_head_sha
+            ):
+                raise HTTPException(409, "Remote Merge Queue entry is for another subject")
+            if entry is not None and entry.state in {"UNMERGEABLE", "LOCKED"}:
+                raise HTTPException(409, f"Remote Merge Queue entry is {entry.state.lower()}")
+            merge_group = (
+                await _read_merge_group_ref(
+                    repo.repo_full_name,
+                    default_branch=repo.default_branch,
+                    pr_number=run.pr_number,
+                )
+                if entry is not None
+                else None
+            )
+            if entry is None:
+                current_action.status = "pending"
+                current_action.github_queue_entry_id = None
+                current_action.merge_group_sha = None
+                current_action.merge_group_ref = None
+                current_action.ci_status = None
+                current_action.ci_details = None
+                run.status = "merge_queue_pending"
+            elif merge_group is None:
+                current_action.status = "queued"
+                current_action.github_queue_entry_id = entry.id
+                current_action.merge_group_sha = None
+                current_action.merge_group_ref = None
+                current_action.ci_status = None
+                current_action.ci_details = None
+                run.status = "merge_queued"
+            else:
+                current_action.status = "checking"
+                current_action.github_queue_entry_id = entry.id
+                current_action.merge_group_sha = merge_group[0]
+                current_action.merge_group_ref = merge_group[1]
+                current_action.ci_status = "pending"
+                current_action.ci_details = None
+                run.status = "merge_group_checking"
             current_action.last_error = None
-            run.status = "merge_queue_pending"
         elif current_wake is not None and repo.auto_repair and run.developer_task_id is not None:
             task = await db.get(Task, run.developer_task_id)
             if task is None or not task.session_id or not task.last_cwd:

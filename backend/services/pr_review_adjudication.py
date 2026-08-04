@@ -260,6 +260,12 @@ async def complete_adjudication(
         or run.current_review_id != review.id or run.current_head_sha != finding.head_sha
     ):
         return
+    repo_id = run.repo_id
+    run_id = run.id
+    review_id = review.id
+    finding_id = finding.id
+    expected_started_at = task.started_at
+    expected_completed_at = task.completed_at
     rows = (await db.execute(select(LogEntry.content).where(
         LogEntry.task_id == task.id,
         LogEntry.task_retry_count == task.retry_count,
@@ -277,25 +283,194 @@ async def complete_adjudication(
         except ValueError:
             continue
         parsed_by_hash[_hash(parsed)] = parsed
-    if len(parsed_by_hash) != 1:
-        rebuttal.status = "error"
-        rebuttal.error_message = "adjudication generation has no unique strict terminal"
-        run.status = "paused"
-        run.pause_reason = rebuttal.error_message
+    parsed = (
+        next(iter(parsed_by_hash.values()))
+        if len(parsed_by_hash) == 1 else None
+    )
+
+    # Discard every pre-terminal ORM snapshot, then serialize with the
+    # synchronize cleanup order.  In particular, a new-head webhook may have
+    # marked the review/rebuttal superseded while the log scan above ran.
+    await db.rollback()
+    task = (await db.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    repo = (await db.execute(
+        select(MonitoredRepo)
+        .where(MonitoredRepo.id == repo_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    run = (await db.execute(
+        select(PRMonitorRun)
+        .where(
+            PRMonitorRun.id == run_id,
+            PRMonitorRun.repo_id == repo_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    review = (await db.execute(
+        select(PRReview)
+        .where(
+            PRReview.id == review_id,
+            PRReview.repo_id == repo_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    finding = (await db.execute(
+        select(PRFinding)
+        .where(
+            PRFinding.id == finding_id,
+            PRFinding.pr_review_id == review_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    rebuttal = (await db.execute(
+        select(PRFindingRebuttal)
+        .where(
+            PRFindingRebuttal.id == adjudication_id,
+            PRFindingRebuttal.monitor_run_id == run_id,
+            PRFindingRebuttal.pr_review_id == review_id,
+            PRFindingRebuttal.finding_id == finding_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if (
+        task is None or repo is None or run is None or review is None
+        or finding is None or rebuttal is None or not repo.enabled
+        or task.status != "completed" or task.retry_count != retry_count
+        or task.started_at != expected_started_at
+        or task.completed_at != expected_completed_at
+        or task.pty_background_generation is not None
+        or rebuttal.task_id != task.id
+        or rebuttal.status != "adjudicating"
+        or rebuttal.base_sha != review.base_sha
+        or rebuttal.head_sha != review.head_sha
+        or review.monitor_run_id != run.id
+        or review.status not in {"commented", "approved"}
+        or run.status != "adjudicating"
+        or run.current_review_id != review.id
+        or run.current_base_sha != review.base_sha
+        or run.current_head_sha != review.head_sha
+        or finding.status != "open"
+        or finding.base_sha != review.base_sha
+        or finding.head_sha != review.head_sha
+    ):
+        await db.commit()
+        return
+
+    task_guard = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task.id,
+            Task.status == "completed",
+            Task.retry_count == retry_count,
+            Task.started_at == expected_started_at,
+            (
+                Task.completed_at.is_(None)
+                if expected_completed_at is None
+                else Task.completed_at == expected_completed_at
+            ),
+            Task.pty_background_generation.is_(None),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if task_guard.rowcount != 1:
+        await db.rollback()
+        return
+
+    now = datetime.utcnow()
+    if parsed is None:
+        rebuttal_values = {
+            "status": "error",
+            "error_message": (
+                "adjudication generation has no unique strict terminal"
+            ),
+            "completed_at": now,
+        }
+        run_values = {
+            "status": "paused",
+            "pause_reason": rebuttal_values["error_message"],
+            "state_version": PRMonitorRun.state_version + 1,
+        }
     else:
-        parsed = next(iter(parsed_by_hash.values()))
-        rebuttal.verdict = parsed["verdict"]
-        rebuttal.result_body = parsed["reason"]
-        rebuttal.result_json = parsed
-        rebuttal.status = parsed["verdict"]
+        rebuttal_values = {
+            "verdict": parsed["verdict"],
+            "result_body": parsed["reason"],
+            "result_json": parsed,
+            "status": parsed["verdict"],
+            "error_message": None,
+            "completed_at": now,
+        }
+        run_values = {
+            "status": (
+                "adjudicating"
+                if parsed["verdict"] == "accepted"
+                else "waiting_for_fix"
+            ),
+            "pause_reason": None,
+            "state_version": PRMonitorRun.state_version + 1,
+        }
         if parsed["verdict"] == "accepted":
-            finding.status = "resolved_rebutted"
-            run.status = "adjudicating"
-        else:
-            finding.status = "open"
-            run.status = "waiting_for_fix"
-    rebuttal.completed_at = datetime.utcnow()
-    run.state_version += 1
+            finding_changed = await db.execute(
+                update(PRFinding)
+                .where(
+                    PRFinding.id == finding.id,
+                    PRFinding.pr_review_id == review.id,
+                    PRFinding.status == "open",
+                    PRFinding.base_sha == review.base_sha,
+                    PRFinding.head_sha == review.head_sha,
+                )
+                .values(status="resolved_rebutted")
+                .execution_options(synchronize_session=False)
+            )
+            if finding_changed.rowcount != 1:
+                await db.rollback()
+                return
+
+    rebuttal_changed = await db.execute(
+        update(PRFindingRebuttal)
+        .where(
+            PRFindingRebuttal.id == rebuttal.id,
+            PRFindingRebuttal.task_id == task.id,
+            PRFindingRebuttal.monitor_run_id == run.id,
+            PRFindingRebuttal.pr_review_id == review.id,
+            PRFindingRebuttal.finding_id == finding.id,
+            PRFindingRebuttal.base_sha == review.base_sha,
+            PRFindingRebuttal.head_sha == review.head_sha,
+            PRFindingRebuttal.status == "adjudicating",
+        )
+        .values(**rebuttal_values)
+        .execution_options(synchronize_session=False)
+    )
+    if rebuttal_changed.rowcount != 1:
+        await db.rollback()
+        return
+    run_changed = await db.execute(
+        update(PRMonitorRun)
+        .where(
+            PRMonitorRun.id == run.id,
+            PRMonitorRun.repo_id == repo.id,
+            PRMonitorRun.status == "adjudicating",
+            PRMonitorRun.state_version == run.state_version,
+            PRMonitorRun.current_review_id == review.id,
+            PRMonitorRun.current_base_sha == review.base_sha,
+            PRMonitorRun.current_head_sha == review.head_sha,
+        )
+        .values(**run_values)
+        .execution_options(synchronize_session=False)
+    )
+    if run_changed.rowcount != 1:
+        await db.rollback()
+        return
     await db.commit()
 
 
@@ -305,14 +480,93 @@ async def fail_adjudication(
     rebuttal = await db.get(PRFindingRebuttal, adjudication_id, populate_existing=True)
     if rebuttal is None or rebuttal.task_id != task_id or rebuttal.status != "adjudicating":
         return
-    rebuttal.status = "error"
-    rebuttal.error_message = error[:1000]
-    rebuttal.completed_at = datetime.utcnow()
-    run = await db.get(PRMonitorRun, rebuttal.monitor_run_id)
-    if run is not None:
-        run.status = "paused"
-        run.pause_reason = "rebuttal_adjudicator_failed"
-        run.state_version += 1
+    run = await db.get(
+        PRMonitorRun, rebuttal.monitor_run_id, populate_existing=True
+    )
+    if run is None:
+        return
+    repo_id = run.repo_id
+    run_id = run.id
+    review_id = rebuttal.pr_review_id
+    await db.rollback()
+    task = (await db.execute(
+        select(Task).where(Task.id == task_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    repo = (await db.execute(
+        select(MonitoredRepo).where(MonitoredRepo.id == repo_id)
+        .with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    run = (await db.execute(
+        select(PRMonitorRun).where(
+            PRMonitorRun.id == run_id,
+            PRMonitorRun.repo_id == repo_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    review = (await db.execute(
+        select(PRReview).where(
+            PRReview.id == review_id,
+            PRReview.repo_id == repo_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    rebuttal = (await db.execute(
+        select(PRFindingRebuttal).where(
+            PRFindingRebuttal.id == adjudication_id,
+            PRFindingRebuttal.monitor_run_id == run_id,
+            PRFindingRebuttal.pr_review_id == review_id,
+            PRFindingRebuttal.task_id == task_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if (
+        task is None or repo is None or run is None or review is None
+        or rebuttal is None or not repo.enabled
+        or task.status not in {"failed", "cancelled", "conflict"}
+        or task.pty_background_generation is not None
+        or rebuttal.status != "adjudicating"
+        or rebuttal.base_sha != review.base_sha
+        or rebuttal.head_sha != review.head_sha
+        or review.monitor_run_id != run.id
+        or review.status not in {"commented", "approved"}
+        or run.status != "adjudicating"
+        or run.current_review_id != review.id
+        or run.current_base_sha != review.base_sha
+        or run.current_head_sha != review.head_sha
+    ):
+        await db.commit()
+        return
+    message = error[:1000]
+    rebuttal_changed = await db.execute(
+        update(PRFindingRebuttal).where(
+            PRFindingRebuttal.id == rebuttal.id,
+            PRFindingRebuttal.task_id == task.id,
+            PRFindingRebuttal.status == "adjudicating",
+        ).values(
+            status="error",
+            error_message=message,
+            completed_at=datetime.utcnow(),
+        ).execution_options(synchronize_session=False)
+    )
+    if rebuttal_changed.rowcount != 1:
+        await db.rollback()
+        return
+    run_changed = await db.execute(
+        update(PRMonitorRun).where(
+            PRMonitorRun.id == run.id,
+            PRMonitorRun.repo_id == repo.id,
+            PRMonitorRun.status == "adjudicating",
+            PRMonitorRun.state_version == run.state_version,
+            PRMonitorRun.current_review_id == review.id,
+            PRMonitorRun.current_base_sha == review.base_sha,
+            PRMonitorRun.current_head_sha == review.head_sha,
+        ).values(
+            status="paused",
+            pause_reason="rebuttal_adjudicator_failed",
+            state_version=PRMonitorRun.state_version + 1,
+        ).execution_options(synchronize_session=False)
+    )
+    if run_changed.rowcount != 1:
+        await db.rollback()
+        return
     await db.commit()
 
 

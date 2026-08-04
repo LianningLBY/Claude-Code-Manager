@@ -44,6 +44,16 @@ class QueueEntry:
     state: str
     base_sha: str
     head_sha: str
+    created_by_call: bool = False
+    pull_request_id: str | None = None
+
+
+class QueueEntryCleanupError(RuntimeError):
+    """A new remote queue entry could not be proven removed."""
+
+    def __init__(self, message: str, *, entry_id: str):
+        super().__init__(message)
+        self.entry_id = entry_id
 
 
 async def _read_queue_entry(repo_name: str, pr_number: int) -> QueueEntry | None:
@@ -57,17 +67,23 @@ async def _read_queue_entry(repo_name: str, pr_number: int) -> QueueEntry | None
     })
     try:
         pr = result["data"]["repository"]["pullRequest"]
+        if not isinstance(pr, dict):
+            raise TypeError
         entry = pr.get("mergeQueueEntry")
     except (KeyError, TypeError) as exc:
         raise ValueError("GitHub Merge Queue query is malformed") from exc
     if entry is None:
         return None
+    if not isinstance(entry, dict):
+        raise ValueError("GitHub Merge Queue entry is malformed")
     base_commit = entry.get("baseCommit")
     head_commit = entry.get("headCommit")
     base_sha = base_commit.get("oid") if isinstance(base_commit, dict) else None
     head_sha = head_commit.get("oid") if isinstance(head_commit, dict) else None
     if (
-        not isinstance(entry.get("id"), str)
+        not isinstance(pr.get("id"), str)
+        or not pr["id"]
+        or not isinstance(entry.get("id"), str)
         or not entry["id"]
         or not isinstance(entry.get("state"), str)
         or entry["state"].upper() not in _QUEUE_ENTRY_STATES
@@ -82,6 +98,7 @@ async def _read_queue_entry(repo_name: str, pr_number: int) -> QueueEntry | None
         state=entry["state"].upper(),
         base_sha=base_sha.lower(),
         head_sha=head_sha.lower(),
+        pull_request_id=pr["id"],
     )
 
 
@@ -127,6 +144,52 @@ async def _read_merge_group_ref(
     return matches[0]
 
 
+async def _dequeue_queue_entry(
+    repo_name: str,
+    pr_number: int,
+    pull_request_id: str,
+    entry_id: str,
+) -> None:
+    """Remove one exact queue entry and prove that exact id disappeared."""
+
+    from backend.services.pr_review_service import _gh_api_value
+
+    mutation = """mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}"""
+    result = await _gh_api_value("graphql", payload={
+        "query": mutation,
+        "variables": {"id": pull_request_id},
+    })
+    try:
+        payload = result["data"]["dequeuePullRequest"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("GitHub dequeuePullRequest response is malformed") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub did not confirm Merge Queue dequeue")
+    remaining = await _read_queue_entry(repo_name, pr_number)
+    if remaining is not None and remaining.id == entry_id:
+        raise ValueError("GitHub Merge Queue entry remained after dequeue")
+
+
+async def _remove_new_queue_entry_or_raise(
+    repo_name: str,
+    pr_number: int,
+    pull_request_id: str,
+    entry_id: str,
+    *,
+    reason: str,
+) -> None:
+    try:
+        await _dequeue_queue_entry(
+            repo_name, pr_number, pull_request_id, entry_id
+        )
+    except Exception as exc:
+        raise QueueEntryCleanupError(
+            f"{reason}; exact remote cleanup failed: "
+            f"{type(exc).__name__}:{str(exc)[:300]}",
+            entry_id=entry_id,
+        ) from exc
+
+
 async def _enqueue(
     repo_name: str,
     pr_number: int,
@@ -141,17 +204,26 @@ async def _enqueue(
             raise ValueError("Existing Merge Queue entry is not the exact subject")
         return existing
     owner, name = repo_name.split("/", 1)
-    node_query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid}}}"""
+    node_query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id baseRefOid headRefOid}}}"""
     node_result = await _gh_api_value("graphql", payload={
         "query": node_query,
         "variables": {"owner": owner, "name": name, "number": pr_number},
     })
     try:
         pr = node_result["data"]["repository"]["pullRequest"]
+        if not isinstance(pr, dict):
+            raise TypeError
     except (KeyError, TypeError) as exc:
         raise ValueError("GitHub pull request node response is malformed") from exc
-    if pr.get("headRefOid", "").lower() != head_sha or not isinstance(pr.get("id"), str):
-        raise ValueError("GitHub pull request node is not the exact queued head")
+    if (
+        not isinstance(pr.get("id"), str)
+        or not pr["id"]
+        or not isinstance(pr.get("baseRefOid"), str)
+        or pr["baseRefOid"].lower() != base_sha
+        or not isinstance(pr.get("headRefOid"), str)
+        or pr["headRefOid"].lower() != head_sha
+    ):
+        raise ValueError("GitHub pull request node is not the exact queued subject")
     mutation = """mutation($pullRequestId:ID!,$expectedHeadOid:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$pullRequestId,expectedHeadOid:$expectedHeadOid}){mergeQueueEntry{id state}}}"""
     result = await _gh_api_value("graphql", payload={
         "query": mutation,
@@ -159,6 +231,8 @@ async def _enqueue(
     })
     try:
         entry = result["data"]["enqueuePullRequest"]["mergeQueueEntry"]
+        if not isinstance(entry, dict):
+            raise TypeError
     except (KeyError, TypeError) as exc:
         raise ValueError("GitHub enqueuePullRequest response is malformed") from exc
     if (
@@ -171,15 +245,46 @@ async def _enqueue(
     # Re-read the durable entry because the mutation response does not expose
     # its exact base/head commits.  Queue admission is not accepted without
     # proving both immutable subject components.
-    confirmed = await _read_queue_entry(repo_name, pr_number)
+    try:
+        confirmed = await _read_queue_entry(repo_name, pr_number)
+    except Exception as exc:
+        await _remove_new_queue_entry_or_raise(
+            repo_name,
+            pr_number,
+            pr["id"],
+            entry["id"],
+            reason=(
+                "GitHub queue subject confirmation failed: "
+                f"{type(exc).__name__}:{str(exc)[:300]}"
+            ),
+        )
+        raise ValueError(
+            "GitHub queue subject confirmation failed; new entry was removed"
+        ) from exc
     if (
         confirmed is None
         or confirmed.id != entry["id"]
         or confirmed.base_sha != base_sha
         or confirmed.head_sha != head_sha
     ):
-        raise ValueError("GitHub did not confirm the exact queued subject")
-    return confirmed
+        await _remove_new_queue_entry_or_raise(
+            repo_name,
+            pr_number,
+            pr["id"],
+            entry["id"],
+            reason="GitHub did not confirm the exact queued subject",
+        )
+        raise ValueError(
+            "GitHub did not confirm the exact queued subject; new entry was removed"
+        )
+    return QueueEntry(
+        id=confirmed.id,
+        state=confirmed.state,
+        base_sha=confirmed.base_sha,
+        head_sha=confirmed.head_sha,
+        created_by_call=True,
+        pull_request_id=pr["id"],
+    )
 
 
 async def bind_merge_group(
@@ -220,6 +325,188 @@ async def bind_merge_group(
     run.state_version += 1
     await db.commit()
     return True
+
+
+async def _lock_queue_effect_rows(
+    db,
+    *,
+    repo_id: int,
+    action_id: int,
+    run_id: int,
+    review_id: int,
+):
+    """Fresh ``Repo -> Action -> Run -> Review`` effect barrier."""
+
+    await db.rollback()
+    repo = (await db.execute(
+        select(MonitoredRepo)
+        .where(MonitoredRepo.id == repo_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    action = (await db.execute(
+        select(PRMergeQueueAction)
+        .where(PRMergeQueueAction.id == action_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    run = (await db.execute(
+        select(PRMonitorRun)
+        .where(PRMonitorRun.id == run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    review = (await db.execute(
+        select(PRReview)
+        .where(PRReview.id == review_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    return repo, action, run, review
+
+
+async def _record_enqueue_failure(
+    db,
+    *,
+    repo_id: int,
+    action_id: int,
+    run_id: int,
+    review_id: int,
+    lease_token: str,
+    message: str,
+    unsafe_entry_id: str | None = None,
+) -> None:
+    repo, action, run, review = await _lock_queue_effect_rows(
+        db,
+        repo_id=repo_id,
+        action_id=action_id,
+        run_id=run_id,
+        review_id=review_id,
+    )
+    if action is None:
+        await db.rollback()
+        return
+    if unsafe_entry_id is not None:
+        # Remote state could still merge.  Keep that risk explicit and never
+        # let a later retry create a second queue effect automatically.
+        if action.status not in {"merged", "superseded"}:
+            action.status = "paused"
+            action.last_error = message[:1000]
+            action.github_queue_entry_id = unsafe_entry_id
+            action.lease_token = None
+            action.lease_expires_at = None
+        if (
+            run is not None
+            and run.status not in {"merged", "closed"}
+            and run.completed_at is None
+        ):
+            run.status = "paused"
+            run.pause_reason = message[:1000]
+            run.state_version += 1
+        await db.commit()
+        return
+    if action.status == "enqueuing" and action.lease_token == lease_token:
+        action.last_error = message[:1000]
+        action.lease_token = None
+        action.lease_expires_at = None
+        await db.commit()
+    else:
+        await db.rollback()
+
+
+async def _abort_enqueue_after_lifecycle_change(
+    db,
+    *,
+    repo_id: int,
+    action_id: int,
+    run_id: int,
+    review_id: int,
+    repo_name: str,
+    pr_number: int,
+    lease_token: str,
+    entry: QueueEntry,
+    reason: str,
+) -> None:
+    cleanup_error: str | None = None
+    if entry.created_by_call:
+        try:
+            if entry.pull_request_id is None:
+                raise ValueError("new queue entry has no pull request node id")
+            await _dequeue_queue_entry(
+                repo_name, pr_number, entry.pull_request_id, entry.id
+            )
+        except Exception as exc:
+            cleanup_error = (
+                "merge_queue_remote_cleanup_failed:"
+                f"{type(exc).__name__}:{str(exc)[:500]}"
+            )
+
+    repo, action, run, review = await _lock_queue_effect_rows(
+        db,
+        repo_id=repo_id,
+        action_id=action_id,
+        run_id=run_id,
+        review_id=review_id,
+    )
+    if action is None:
+        await db.rollback()
+        return
+    if cleanup_error is not None:
+        if action.status not in {"merged", "superseded"}:
+            action.status = "paused"
+            action.last_error = cleanup_error
+            action.github_queue_entry_id = entry.id
+            action.lease_token = None
+            action.lease_expires_at = None
+        if (
+            run is not None
+            and run.status not in {"merged", "closed"}
+            and run.completed_at is None
+        ):
+            run.status = "paused"
+            run.pause_reason = cleanup_error
+            run.state_version += 1
+        await db.commit()
+        return
+
+    if not entry.created_by_call:
+        # This exact entry predated CCM's call (for example a manual enqueue),
+        # so ownership is not ours to revoke.  Surface it without pretending
+        # the local pause disabled the remote entry.
+        message = f"merge_queue_existing_entry_lifecycle_changed:{reason}"
+        if action.status not in {"merged", "superseded"}:
+            action.status = "paused"
+            action.last_error = message[:1000]
+            action.github_queue_entry_id = entry.id
+            action.lease_token = None
+            action.lease_expires_at = None
+        if (
+            run is not None
+            and run.status not in {"merged", "closed"}
+            and run.completed_at is None
+        ):
+            run.status = "paused"
+            run.pause_reason = message[:1000]
+            run.state_version += 1
+        await db.commit()
+        return
+
+    # Our new entry was proven absent.  Preserve a concurrent pause/disable;
+    # only withdraw the exact lease still owned by this reconciler.
+    if action.status == "enqueuing" and action.lease_token == lease_token:
+        action.status = "paused"
+        action.last_error = f"merge_queue_enqueue_aborted:{reason}"[:1000]
+        action.lease_token = None
+        action.lease_expires_at = None
+        if (
+            run is not None
+            and run.status not in {"paused", "merged", "closed"}
+            and run.completed_at is None
+        ):
+            run.status = "paused"
+            run.pause_reason = action.last_error
+            run.state_version += 1
+    await db.commit()
 
 
 async def reconcile_merge_queue(db_factory) -> int:
@@ -330,10 +617,15 @@ async def reconcile_merge_queue(db_factory) -> int:
                 lease_token = secrets.token_hex(24)
                 action_id = action.id
                 run_id = run.id
+                repo_id = repo.id
+                review_id = review.id
                 enqueue_repo_name = repo.repo_full_name
                 enqueue_pr_number = run.pr_number
                 enqueue_base_sha = action.trigger_base_sha
                 enqueue_head_sha = action.trigger_head_sha
+                expected_run_status = run.status
+                expected_run_state_version = run.state_version
+                expected_review_status = review.status
                 claimed = await db.execute(update(PRMergeQueueAction).where(
                     PRMergeQueueAction.id == action_id,
                     PRMergeQueueAction.status.in_(("pending", "enqueuing")),
@@ -358,48 +650,191 @@ async def reconcile_merge_queue(db_factory) -> int:
                         enqueue_base_sha,
                         enqueue_head_sha,
                     )
+                except QueueEntryCleanupError as exc:
+                    await _record_enqueue_failure(
+                        db,
+                        repo_id=repo_id,
+                        action_id=action_id,
+                        run_id=run_id,
+                        review_id=review_id,
+                        lease_token=lease_token,
+                        message=(
+                            "merge_queue_remote_cleanup_failed:"
+                            f"{type(exc).__name__}:{str(exc)[:700]}"
+                        ),
+                        unsafe_entry_id=exc.entry_id,
+                    )
+                    continue
                 except Exception as exc:
-                    action = await db.get(PRMergeQueueAction, action_id, populate_existing=True)
-                    if action is not None and action.lease_token == lease_token:
-                        action.last_error = (
+                    await _record_enqueue_failure(
+                        db,
+                        repo_id=repo_id,
+                        action_id=action_id,
+                        run_id=run_id,
+                        review_id=review_id,
+                        lease_token=lease_token,
+                        message=(
                             f"merge_queue_enqueue_failed:{type(exc).__name__}:"
                             f"{str(exc)[:300]}"
-                        )
-                        action.lease_token = None
-                        action.lease_expires_at = None
-                        await db.commit()
-                    else:
-                        await db.rollback()
+                        ),
+                    )
                     continue
-                action = await db.get(PRMergeQueueAction, action_id, populate_existing=True)
-                run = await db.get(PRMonitorRun, run_id, populate_existing=True)
-                if action is None or action.lease_token != lease_token:
-                    await db.rollback()
-                    continue
-                if (
-                    run is None
+                repo, action, run, review = await _lock_queue_effect_rows(
+                    db,
+                    repo_id=repo_id,
+                    action_id=action_id,
+                    run_id=run_id,
+                    review_id=review_id,
+                )
+                finalize_now = await _database_now(db)
+                lifecycle_error = None
+                if repo is None or action is None or run is None or review is None:
+                    lifecycle_error = "lifecycle_missing"
+                elif not repo.enabled:
+                    lifecycle_error = "repo_disabled"
+                elif repo.merge_queue_mode != "auto":
+                    lifecycle_error = "merge_queue_policy_changed"
+                elif action.status != "enqueuing":
+                    lifecycle_error = f"action_{action.status}"
+                elif action.lease_token != lease_token:
+                    lifecycle_error = "lease_owner_changed"
+                elif (
+                    action.lease_expires_at is None
+                    or action.lease_expires_at <= finalize_now
+                ):
+                    lifecycle_error = "lease_expired"
+                elif (
+                    action.monitor_run_id != run.id
+                    or action.review_id != review.id
+                    or action.trigger_base_sha != enqueue_base_sha
+                    or action.trigger_head_sha != enqueue_head_sha
+                ):
+                    lifecycle_error = "action_subject_changed"
+                elif (
+                    run.status != expected_run_status
+                    or run.state_version != expected_run_state_version
                     or run.current_base_sha != enqueue_base_sha
                     or run.current_head_sha != enqueue_head_sha
+                    or run.current_review_id != review.id
                 ):
-                    action.status = "superseded"
-                    action.lease_token = None
-                    action.lease_expires_at = None
+                    lifecycle_error = "run_changed"
+                elif (
+                    review.monitor_run_id != run.id
+                    or review.status != expected_review_status
+                    or review.base_sha != enqueue_base_sha
+                    or review.head_sha != enqueue_head_sha
+                ):
+                    lifecycle_error = "review_changed"
+                if lifecycle_error is not None:
+                    # A newer lease owner may already have adopted this exact
+                    # entry.  It alone decides the effect; the stale caller
+                    # must neither finalize nor dequeue it.
+                    newer_owner = bool(
+                        action is not None
+                        and action.status == "enqueuing"
+                        and action.lease_token not in {None, lease_token}
+                    )
                     await db.commit()
+                    if not newer_owner:
+                        await _abort_enqueue_after_lifecycle_change(
+                            db,
+                            repo_id=repo_id,
+                            action_id=action_id,
+                            run_id=run_id,
+                            review_id=review_id,
+                            repo_name=enqueue_repo_name,
+                            pr_number=enqueue_pr_number,
+                            lease_token=lease_token,
+                            entry=entry,
+                            reason=lifecycle_error,
+                        )
                     continue
-                action.github_queue_entry_id = entry.id
-                action.lease_token = None
-                action.lease_expires_at = None
-                if entry.state in _QUEUE_ENTRY_BLOCKED_STATES:
-                    action.status = "paused"
-                    action.last_error = f"merge_queue_entry_{entry.state.lower()}"
-                    run.status = "paused"
-                    run.pause_reason = action.last_error
-                else:
-                    action.status = "queued"
-                    action.last_error = None
-                    run.status = "merge_queued"
-                    run.pause_reason = None
-                run.state_version += 1
+
+                action_status = (
+                    "paused"
+                    if entry.state in _QUEUE_ENTRY_BLOCKED_STATES
+                    else "queued"
+                )
+                action_error = (
+                    f"merge_queue_entry_{entry.state.lower()}"
+                    if entry.state in _QUEUE_ENTRY_BLOCKED_STATES
+                    else None
+                )
+                action_changed = await db.execute(
+                    update(PRMergeQueueAction)
+                    .where(
+                        PRMergeQueueAction.id == action.id,
+                        PRMergeQueueAction.monitor_run_id == run.id,
+                        PRMergeQueueAction.review_id == review.id,
+                        PRMergeQueueAction.status == "enqueuing",
+                        PRMergeQueueAction.lease_token == lease_token,
+                        PRMergeQueueAction.lease_expires_at.is_not(None),
+                        PRMergeQueueAction.lease_expires_at > finalize_now,
+                        PRMergeQueueAction.trigger_base_sha == enqueue_base_sha,
+                        PRMergeQueueAction.trigger_head_sha == enqueue_head_sha,
+                    )
+                    .values(
+                        github_queue_entry_id=entry.id,
+                        lease_token=None,
+                        lease_expires_at=None,
+                        status=action_status,
+                        last_error=action_error,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if action_changed.rowcount != 1:
+                    await db.rollback()
+                    await _abort_enqueue_after_lifecycle_change(
+                        db,
+                        repo_id=repo_id,
+                        action_id=action_id,
+                        run_id=run_id,
+                        review_id=review_id,
+                        repo_name=enqueue_repo_name,
+                        pr_number=enqueue_pr_number,
+                        lease_token=lease_token,
+                        entry=entry,
+                        reason="action_cas_lost",
+                    )
+                    continue
+                run_status = (
+                    "paused"
+                    if entry.state in _QUEUE_ENTRY_BLOCKED_STATES
+                    else "merge_queued"
+                )
+                run_changed = await db.execute(
+                    update(PRMonitorRun)
+                    .where(
+                        PRMonitorRun.id == run.id,
+                        PRMonitorRun.repo_id == repo.id,
+                        PRMonitorRun.status == expected_run_status,
+                        PRMonitorRun.state_version == expected_run_state_version,
+                        PRMonitorRun.current_base_sha == enqueue_base_sha,
+                        PRMonitorRun.current_head_sha == enqueue_head_sha,
+                        PRMonitorRun.current_review_id == review.id,
+                    )
+                    .values(
+                        status=run_status,
+                        pause_reason=action_error,
+                        state_version=PRMonitorRun.state_version + 1,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if run_changed.rowcount != 1:
+                    await db.rollback()
+                    await _abort_enqueue_after_lifecycle_change(
+                        db,
+                        repo_id=repo_id,
+                        action_id=action_id,
+                        run_id=run_id,
+                        review_id=review_id,
+                        repo_name=enqueue_repo_name,
+                        pr_number=enqueue_pr_number,
+                        lease_token=lease_token,
+                        entry=entry,
+                        reason="run_cas_lost",
+                    )
+                    continue
                 await db.commit()
                 progressed += 1
                 continue

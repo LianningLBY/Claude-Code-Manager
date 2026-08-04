@@ -245,6 +245,130 @@ async def test_accepted_rebuttal_resolves_exact_github_thread_and_gate(
     assert len(calls) == 2
 
 
+@pytest.mark.asyncio
+async def test_stale_adjudicator_terminal_cannot_resurrect_superseded_run(
+    db_session, db_factory, monkeypatch
+):
+    repo = MonitoredRepo(
+        repo_full_name="fake/adjudication-race",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+    )
+    developer = Task(
+        title="Developer", description="change", status="completed",
+        session_id="developer-race", last_cwd="/fake/race",
+    )
+    db_session.add_all([repo, developer])
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id, pr_number=71, current_base_sha=BASE,
+        current_head_sha=HEAD, developer_task_id=developer.id,
+        status="adjudicating",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id, repo_id=repo.id, pr_number=71,
+        base_sha=BASE, head_sha=HEAD, pr_title="race", pr_author="bot",
+        pr_url="https://example.invalid/fake/adjudication-race/pull/71",
+        status="commented",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    reviewer = PRReviewerRun(
+        pr_review_id=review.id, role="senior_engineer", provider="codex",
+        status="changes_required", prompt_policy_hash="1" * 64,
+        guide_pack_hash="2" * 64,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    finding = PRFinding(
+        pr_review_id=review.id, reviewer_run_id=reviewer.id,
+        fingerprint="f" * 64, role="senior_engineer", severity="high",
+        category="correctness", path="app.py", line=3, title="bad guard",
+        evidence="guard missing", impact="unsafe", required_fix="add guard",
+        test="exercise invalid input", base_sha=BASE, head_sha=HEAD,
+        thread_nonce="3" * 48, thread_status="published_inline",
+        github_comment_id=123,
+    )
+    db_session.add(finding)
+    await db_session.flush()
+    started = datetime.utcnow() - timedelta(seconds=1)
+    adjudicator = Task(
+        title="Adjudicator", description="judge", status="completed",
+        retry_count=0, started_at=started, completed_at=datetime.utcnow(),
+        metadata_={"pr_review_id": review.id}, tags=["pr-review"],
+    )
+    db_session.add(adjudicator)
+    await db_session.flush()
+    rebuttal = PRFindingRebuttal(
+        finding_id=finding.id, pr_review_id=review.id,
+        monitor_run_id=run.id, developer_task_id=developer.id,
+        task_id=adjudicator.id, attempt=1, base_sha=BASE, head_sha=HEAD,
+        evidence="Concrete exact code evidence.", evidence_hash="4" * 64,
+        status="adjudicating", resolution_nonce="5" * 48,
+    )
+    db_session.add(rebuttal)
+    db_session.add(LogEntry(
+        task_id=adjudicator.id, task_retry_count=0, event_type="result",
+        role="assistant", content=_output(finding.fingerprint),
+        timestamp=datetime.utcnow(), is_error=False,
+    ))
+    await db_session.commit()
+    ids = {
+        "run": run.id, "review": review.id, "finding": finding.id,
+        "rebuttal": rebuttal.id, "task": adjudicator.id,
+    }
+
+    async with db_factory() as stale_db:
+        original_execute = stale_db.execute
+        raced = False
+
+        async def execute_with_synchronize(statement, *args, **kwargs):
+            nonlocal raced
+            result = await original_execute(statement, *args, **kwargs)
+            if not raced and "log_entries.content" in str(statement):
+                raced = True
+                async with db_factory() as winner:
+                    winner_rebuttal = await winner.get(
+                        PRFindingRebuttal, ids["rebuttal"]
+                    )
+                    winner_review = await winner.get(PRReview, ids["review"])
+                    winner_run = await winner.get(PRMonitorRun, ids["run"])
+                    winner_rebuttal.status = "superseded"
+                    winner_rebuttal.completed_at = datetime.utcnow()
+                    winner_review.status = "superseded"
+                    winner_run.status = "reviewing"
+                    winner_run.current_head_sha = "c" * 40
+                    winner_run.state_version += 1
+                    await winner.commit()
+            return result
+
+        monkeypatch.setattr(stale_db, "execute", execute_with_synchronize)
+        await complete_adjudication(
+            stale_db,
+            adjudication_id=ids["rebuttal"],
+            task_id=ids["task"],
+            retry_count=0,
+        )
+
+    assert raced is True
+    stale_rebuttal = await db_session.get(
+        PRFindingRebuttal, ids["rebuttal"], populate_existing=True
+    )
+    stale_finding = await db_session.get(
+        PRFinding, ids["finding"], populate_existing=True
+    )
+    stale_run = await db_session.get(
+        PRMonitorRun, ids["run"], populate_existing=True
+    )
+    assert stale_rebuttal.status == "superseded"
+    assert stale_finding.status == "open"
+    assert stale_run.status == "reviewing"
+    assert stale_run.current_head_sha == "c" * 40
+
+
 def test_adjudication_rejects_wrong_subject():
     finding = type("Finding", (), {
         "base_sha": BASE, "head_sha": HEAD, "fingerprint": "f" * 64,

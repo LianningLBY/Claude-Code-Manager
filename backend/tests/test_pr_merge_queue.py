@@ -9,6 +9,8 @@ from backend.models.pr_monitor import (
 )
 from backend.services.pr_merge_queue import (
     QueueEntry,
+    QueueEntryCleanupError,
+    _enqueue,
     bind_merge_group,
     reconcile_merge_queue,
 )
@@ -543,3 +545,191 @@ async def test_enqueue_lease_uses_database_clock_and_covers_confirmation(
     assert refreshed.status == "queued"
     assert refreshed.lease_token is None
     assert refreshed.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_rechecks_base_before_mutation(monkeypatch):
+    calls = []
+
+    async def no_existing(_repo_name, _number):
+        return None
+
+    async def fake_gh(_endpoint, *, payload, **_kwargs):
+        calls.append(payload)
+        query = payload["query"]
+        assert "baseRefOid" in query
+        assert "enqueuePullRequest" not in query
+        return {"data": {"repository": {"pullRequest": {
+            "id": "PR-node", "baseRefOid": "d" * 40,
+            "headRefOid": HEAD,
+        }}}}
+
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", no_existing
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    with pytest.raises(ValueError, match="exact queued subject"):
+        await _enqueue("fake/base-race", 41, BASE, HEAD)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_new_wrong_subject_entry_is_dequeued_but_manual_entry_is_not(
+    monkeypatch
+):
+    queue_reads = iter((
+        None,
+        QueueEntry("MQ-new", "QUEUED", "d" * 40, HEAD),
+        None,
+    ))
+    mutations = []
+
+    async def read_queue(_repo_name, _number):
+        return next(queue_reads)
+
+    async def fake_gh(_endpoint, *, payload, **_kwargs):
+        query = payload["query"]
+        if "enqueuePullRequest" in query:
+            mutations.append("enqueue")
+            return {"data": {"enqueuePullRequest": {
+                "mergeQueueEntry": {"id": "MQ-new", "state": "QUEUED"}
+            }}}
+        if "dequeuePullRequest" in query:
+            mutations.append(("dequeue", payload["variables"]["id"]))
+            return {"data": {"dequeuePullRequest": {
+                "mergeQueueEntry": {"id": "MQ-new"}
+            }}}
+        return {"data": {"repository": {"pullRequest": {
+            "id": "PR-node", "baseRefOid": BASE, "headRefOid": HEAD,
+        }}}}
+
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", read_queue
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    with pytest.raises(ValueError, match="new entry was removed"):
+        await _enqueue("fake/post-mutation-race", 42, BASE, HEAD)
+    assert mutations == ["enqueue", ("dequeue", "PR-node")]
+
+    async def manual_entry(_repo_name, _number):
+        return QueueEntry("MQ-manual", "QUEUED", BASE, HEAD)
+
+    async def unexpected_gh(*_args, **_kwargs):
+        raise AssertionError("a pre-existing manual entry must not be mutated")
+
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", manual_entry
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", unexpected_gh
+    )
+    existing = await _enqueue("fake/manual", 43, BASE, HEAD)
+    assert existing.id == "MQ-manual"
+    assert existing.created_by_call is False
+
+
+@pytest.mark.asyncio
+async def test_failed_wrong_subject_cleanup_pauses_high_risk_action(
+    db_session, db_factory, monkeypatch
+):
+    _repo, run, _review, action = await _seed_queue_action(
+        db_session, name="cleanup-failed", number=44, status="pending",
+    )
+
+    async def fake_pr_view(_number, _repo_name):
+        return {
+            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
+        }
+
+    async def unsafe_enqueue(*_args, **_kwargs):
+        raise QueueEntryCleanupError(
+            "wrong subject; dequeue could not be confirmed",
+            entry_id="MQ-risk",
+        )
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", fake_pr_view
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._enqueue", unsafe_enqueue
+    )
+    assert await reconcile_merge_queue(db_factory) == 0
+    refreshed = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    refreshed_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert refreshed.status == "paused"
+    assert refreshed.github_queue_entry_id == "MQ-risk"
+    assert refreshed.last_error.startswith("merge_queue_remote_cleanup_failed:")
+    assert refreshed_run.status == "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["disable", "pause"])
+async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
+    db_session, db_factory, monkeypatch, change
+):
+    repo, run, _review, action = await _seed_queue_action(
+        db_session, name=f"finalize-{change}", number=45 if change == "disable" else 46,
+        status="pending",
+    )
+    dequeued = []
+
+    async def fake_pr_view(_number, _repo_name):
+        return {
+            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
+        }
+
+    async def fake_enqueue(*_args, **_kwargs):
+        async with db_factory() as concurrent:
+            changed_repo = await concurrent.get(MonitoredRepo, repo.id)
+            changed_action = await concurrent.get(PRMergeQueueAction, action.id)
+            changed_run = await concurrent.get(PRMonitorRun, run.id)
+            if change == "disable":
+                changed_repo.enabled = False
+            else:
+                changed_action.status = "paused"
+                changed_action.last_error = "manual_pause"
+                changed_action.lease_token = None
+                changed_action.lease_expires_at = None
+            changed_run.status = "paused"
+            changed_run.pause_reason = f"concurrent_{change}"
+            changed_run.state_version += 1
+            await concurrent.commit()
+        return QueueEntry(
+            "MQ-owned", "QUEUED", BASE, HEAD, True, "PR-owned"
+        )
+
+    async def fake_dequeue(_repo_name, _number, pull_request_id, entry_id):
+        assert pull_request_id == "PR-owned"
+        dequeued.append(entry_id)
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", fake_pr_view
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._enqueue", fake_enqueue
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._dequeue_queue_entry", fake_dequeue
+    )
+    assert await reconcile_merge_queue(db_factory) == 0
+    refreshed = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    refreshed_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert dequeued == ["MQ-owned"]
+    assert refreshed.status == "paused"
+    assert refreshed.status != "queued"
+    assert refreshed_run.status == "paused"
+    assert refreshed_run.status != "merge_queued"

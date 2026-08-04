@@ -410,6 +410,34 @@ async def admit_repair_wake(
     delivery_token: str,
     task: Task,
 ) -> bool:
+    """Admit one Repair delivery under the shared Task operation fence."""
+
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    task_id = task.id
+    async with get_task_operation_lock(task_id):
+        # A caller may have loaded Task/Wake before waiting for this in-process
+        # fence. Start a fresh transaction so the subsequent durable locks and
+        # CAS cannot operate on that stale snapshot.
+        await db.rollback()
+        locked_task = await db.get(Task, task_id, populate_existing=True)
+        if locked_task is None:
+            return False
+        return await _admit_repair_wake_locked(
+            db,
+            wake_id=wake_id,
+            delivery_token=delivery_token,
+            task=locked_task,
+        )
+
+
+async def _admit_repair_wake_locked(
+    db: AsyncSession,
+    *,
+    wake_id: int,
+    delivery_token: str,
+    task: Task,
+) -> bool:
     preliminary_wake = await db.get(PRRepairWake, wake_id, populate_existing=True)
     if preliminary_wake is None or preliminary_wake.delivery_token != delivery_token:
         return False
@@ -514,50 +542,244 @@ def _repair_has_new_terminal(wake: PRRepairWake, task: Task) -> bool:
     )
 
 
-def _apply_repair_terminal(
-    wake: PRRepairWake,
+def _exact_column_value(column, value):
+    return column.is_(None) if value is None else column == value
+
+
+async def _lock_repair_effect_rows(
+    db: AsyncSession,
+    *,
+    wake_id: int,
+    task_id: int | None,
+) -> tuple[MonitoredRepo, PRMonitorRun, PRRepairWake, Task] | None:
+    """Lock one exact Repair lifecycle in the global effect order.
+
+    The preliminary reads only discover immutable foreign keys.  Rolling the
+    read transaction back before taking ``Repo -> Run -> Wake -> Task`` locks
+    prevents an old session snapshot from surviving a concurrent webhook.
+    """
+
+    preliminary_wake = await db.get(
+        PRRepairWake, wake_id, populate_existing=True
+    )
+    if preliminary_wake is None:
+        await db.rollback()
+        return None
+    run_id = preliminary_wake.monitor_run_id
+    expected_task_id = (
+        task_id if task_id is not None else preliminary_wake.developer_task_id
+    )
+    preliminary_run = await db.get(
+        PRMonitorRun, run_id, populate_existing=True
+    )
+    if preliminary_run is None or expected_task_id is None:
+        await db.rollback()
+        return None
+    repo_id = preliminary_run.repo_id
+    await db.rollback()
+
+    repo = (await db.execute(
+        select(MonitoredRepo)
+        .where(MonitoredRepo.id == repo_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    run = (await db.execute(
+        select(PRMonitorRun)
+        .where(
+            PRMonitorRun.id == run_id,
+            PRMonitorRun.repo_id == repo_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    wake = (await db.execute(
+        select(PRRepairWake)
+        .where(
+            PRRepairWake.id == wake_id,
+            PRRepairWake.monitor_run_id == run_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    task = (await db.execute(
+        select(Task)
+        .where(Task.id == expected_task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if (
+        repo is None
+        or run is None
+        or wake is None
+        or task is None
+        or wake.developer_task_id != task.id
+        or run.developer_task_id != task.id
+    ):
+        await db.rollback()
+        return None
+    return repo, run, wake, task
+
+
+def _repair_task_cas_predicates(wake: PRRepairWake, task: Task) -> tuple:
+    return (
+        Task.id == task.id,
+        Task.status == task.status,
+        Task.retry_count == task.retry_count,
+        _exact_column_value(Task.worker_id, task.worker_id),
+        _exact_column_value(Task.session_id, task.session_id),
+        _exact_column_value(Task.started_at, task.started_at),
+        _exact_column_value(Task.completed_at, task.completed_at),
+        Task.pty_background_generation.is_(None),
+        _exact_column_value(
+            PRRepairWake.accepted_worker_id, wake.accepted_worker_id
+        ),
+        _exact_column_value(
+            PRRepairWake.accepted_task_retry_count,
+            wake.accepted_task_retry_count,
+        ),
+        _exact_column_value(
+            PRRepairWake.accepted_session_id, wake.accepted_session_id
+        ),
+        _exact_column_value(
+            PRRepairWake.accepted_task_started_at,
+            wake.accepted_task_started_at,
+        ),
+        _exact_column_value(
+            PRRepairWake.accepted_task_completed_at,
+            wake.accepted_task_completed_at,
+        ),
+    )
+
+
+async def _cas_repair_terminal(
+    db: AsyncSession,
+    *,
+    repo: MonitoredRepo,
     run: PRMonitorRun,
+    wake: PRRepairWake,
     task: Task,
-) -> None:
+) -> bool:
+    """Consume one exact post-admission Task terminal at most once."""
+
+    if not _repair_has_new_terminal(wake, task):
+        return False
+    # Revalidate the Task tuple with a no-op CAS.  The row lock is the normal
+    # cross-process fence; the predicates also make this safe on databases
+    # whose SELECT FOR UPDATE support is weaker.
+    task_guard = await db.execute(
+        update(Task)
+        .where(*_repair_task_cas_predicates(wake, task)[:8])
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if task_guard.rowcount != 1:
+        return False
+
+    now = datetime.utcnow()
+    wake_values = {
+        "status": "awaiting_push" if task.status == "completed" else "failed",
+        "last_error": (
+            None if task.status == "completed"
+            else f"developer_turn_{task.status}"
+        ),
+        "completed_at": None if task.status == "completed" else now,
+    }
+    wake_changed = await db.execute(
+        update(PRRepairWake)
+        .where(
+            PRRepairWake.id == wake.id,
+            PRRepairWake.monitor_run_id == run.id,
+            PRRepairWake.developer_task_id == task.id,
+            PRRepairWake.delivery_token == wake.delivery_token,
+            PRRepairWake.status == "accepted",
+            *_repair_task_cas_predicates(wake, task)[8:],
+        )
+        .values(**wake_values)
+        .execution_options(synchronize_session=False)
+    )
+    if wake_changed.rowcount != 1:
+        return False
+
+    expected_run_status = "repairing"
+    run_values = {
+        "state_version": PRMonitorRun.state_version + 1,
+    }
     if task.status == "completed":
-        wake.status = "awaiting_push"
-        wake.last_error = None
-        run.status = "repairing"
-        run.repair_attempts += 1
-        run.state_version += 1
-        return
-    wake.status = "failed"
-    wake.last_error = f"developer_turn_{task.status}"
-    wake.completed_at = datetime.utcnow()
-    run.status = "paused"
-    run.pause_reason = wake.last_error
-    run.state_version += 1
+        run_values.update(
+            status="repairing",
+            repair_attempts=PRMonitorRun.repair_attempts + 1,
+        )
+    else:
+        run_values.update(
+            status="paused",
+            pause_reason=wake_values["last_error"],
+        )
+    run_changed = await db.execute(
+        update(PRMonitorRun)
+        .where(
+            PRMonitorRun.id == run.id,
+            PRMonitorRun.repo_id == repo.id,
+            PRMonitorRun.status == expected_run_status,
+            PRMonitorRun.state_version == run.state_version,
+            PRMonitorRun.current_base_sha == wake.trigger_base_sha,
+            PRMonitorRun.current_head_sha == wake.trigger_head_sha,
+            PRMonitorRun.current_review_id == wake.review_id,
+            PRMonitorRun.developer_task_id == task.id,
+        )
+        .values(**run_values)
+        .execution_options(synchronize_session=False)
+    )
+    return run_changed.rowcount == 1
 
 
 async def finish_repair_wake(
     db: AsyncSession, *, wake_id: int, delivery_token: str, task_id: int
 ) -> None:
-    wake = await db.get(PRRepairWake, wake_id, populate_existing=True)
-    if wake is None or wake.delivery_token != delivery_token or wake.status != "accepted":
+    locked = await _lock_repair_effect_rows(
+        db, wake_id=wake_id, task_id=task_id
+    )
+    if locked is None:
         return
-    run = await db.get(PRMonitorRun, wake.monitor_run_id, populate_existing=True)
-    task = await db.get(Task, task_id, populate_existing=True)
+    repo, run, wake, task = locked
+    if wake.delivery_token != delivery_token or wake.status != "accepted":
+        # Release row locks without expiring the freshly populated identity
+        # map; callers may still hold these ORM objects after this no-op.
+        await db.commit()
+        return
     if (
-        run is None
-        or run.current_base_sha != wake.trigger_base_sha
+        run.current_base_sha != wake.trigger_base_sha
         or run.current_head_sha != wake.trigger_head_sha
+        or run.current_review_id != wake.review_id
     ):
-        wake.status = "superseded"
-        wake.completed_at = datetime.utcnow()
-    elif task is None or not _repair_has_new_terminal(wake, task):
+        superseded = await db.execute(
+            update(PRRepairWake)
+            .where(
+                PRRepairWake.id == wake.id,
+                PRRepairWake.delivery_token == delivery_token,
+                PRRepairWake.status == "accepted",
+            )
+            .values(status="superseded", completed_at=datetime.utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        if superseded.rowcount == 1:
+            await db.commit()
+        else:
+            await db.rollback()
+        return
+    if not _repair_has_new_terminal(wake, task):
         # Admission happens before the queued turn's launch claim.  The Task
         # may therefore still expose the previous completed generation here.
         # Leave the Wake accepted; recovery will either observe the new exact
         # terminal or safely re-deliver without consuming repair budget.
+        await db.commit()
         return
+    if await _cas_repair_terminal(
+        db, repo=repo, run=run, wake=wake, task=task
+    ):
+        await db.commit()
     else:
-        _apply_repair_terminal(wake, run, task)
-    await db.commit()
+        await db.rollback()
 
 
 async def record_repair_push_observed(
@@ -578,22 +800,160 @@ async def record_repair_push_observed(
 
     if new_head_sha == previous_head_sha:
         return False
-    wake = await db.get(PRRepairWake, wake_id, populate_existing=True)
-    if wake is None or wake.trigger_head_sha != previous_head_sha:
+    locked = await _lock_repair_effect_rows(
+        db, wake_id=wake_id, task_id=None
+    )
+    if locked is None:
         return False
-    run = await db.get(PRMonitorRun, wake.monitor_run_id, populate_existing=True)
+    repo, run, wake, task = locked
     if (
-        run is None
-        or run.current_head_sha != previous_head_sha
+        wake.trigger_head_sha != previous_head_sha
         or wake.status not in {"accepted", "awaiting_push"}
+        or not _repair_task_identity_matches(wake, task)
+        or run.repo_id != repo.id
+        or run.current_base_sha != wake.trigger_base_sha
+        or run.current_head_sha != previous_head_sha
+        or run.current_review_id != wake.review_id
+        or run.developer_task_id != task.id
+        or run.status != "repairing"
     ):
+        await db.commit()
         return False
-    if wake.status == "accepted":
-        run.repair_attempts += 1
-    wake.status = "completed"
-    wake.last_error = None
-    wake.completed_at = datetime.utcnow()
-    run.state_version += 1
+    observed_status = wake.status
+    wake_changed = await db.execute(
+        update(PRRepairWake)
+        .where(
+            PRRepairWake.id == wake.id,
+            PRRepairWake.monitor_run_id == run.id,
+            PRRepairWake.developer_task_id == task.id,
+            PRRepairWake.delivery_token == wake.delivery_token,
+            PRRepairWake.trigger_head_sha == previous_head_sha,
+            PRRepairWake.status == observed_status,
+        )
+        .values(
+            status="completed",
+            last_error=None,
+            completed_at=datetime.utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if wake_changed.rowcount != 1:
+        await db.rollback()
+        return False
+    run_changed = await db.execute(
+        update(PRMonitorRun)
+        .where(
+            PRMonitorRun.id == run.id,
+            PRMonitorRun.repo_id == repo.id,
+            PRMonitorRun.status == "repairing",
+            PRMonitorRun.state_version == run.state_version,
+            PRMonitorRun.current_base_sha == wake.trigger_base_sha,
+            PRMonitorRun.current_head_sha == previous_head_sha,
+            PRMonitorRun.current_review_id == wake.review_id,
+            PRMonitorRun.developer_task_id == task.id,
+        )
+        .values(
+            repair_attempts=(
+                PRMonitorRun.repair_attempts + 1
+                if observed_status == "accepted"
+                else PRMonitorRun.repair_attempts
+            ),
+            state_version=PRMonitorRun.state_version + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if run_changed.rowcount != 1:
+        await db.rollback()
+        return False
+    await db.commit()
+    return True
+
+
+async def _expire_repair_push_timeout(
+    db: AsyncSession,
+    *,
+    wake_id: int,
+    now: datetime,
+) -> bool:
+    """Fail one still-current awaiting-push Wake without racing a webhook."""
+
+    locked = await _lock_repair_effect_rows(
+        db, wake_id=wake_id, task_id=None
+    )
+    if locked is None:
+        return False
+    repo, run, wake, task = locked
+    if (
+        wake.status != "awaiting_push"
+        or wake.updated_at is None
+        or now - wake.updated_at < _REPAIR_PUSH_TIMEOUT
+    ):
+        await db.commit()
+        return False
+    if (
+        run.current_base_sha != wake.trigger_base_sha
+        or run.current_head_sha != wake.trigger_head_sha
+        or run.current_review_id != wake.review_id
+    ):
+        superseded = await db.execute(
+            update(PRRepairWake)
+            .where(
+                PRRepairWake.id == wake.id,
+                PRRepairWake.status == "awaiting_push",
+            )
+            .values(status="superseded", completed_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        if superseded.rowcount == 1:
+            await db.commit()
+            return True
+        await db.rollback()
+        return False
+    if (
+        run.status != "repairing"
+        or run.developer_task_id != task.id
+        or not _repair_task_identity_matches(wake, task)
+    ):
+        await db.commit()
+        return False
+    error = "repair_push_timeout_no_new_head"
+    wake_changed = await db.execute(
+        update(PRRepairWake)
+        .where(
+            PRRepairWake.id == wake.id,
+            PRRepairWake.monitor_run_id == run.id,
+            PRRepairWake.status == "awaiting_push",
+            PRRepairWake.delivery_token == wake.delivery_token,
+        )
+        .values(status="failed", last_error=error, completed_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if wake_changed.rowcount != 1:
+        await db.rollback()
+        return False
+    run_changed = await db.execute(
+        update(PRMonitorRun)
+        .where(
+            PRMonitorRun.id == run.id,
+            PRMonitorRun.repo_id == repo.id,
+            PRMonitorRun.status == "repairing",
+            PRMonitorRun.state_version == run.state_version,
+            PRMonitorRun.current_base_sha == wake.trigger_base_sha,
+            PRMonitorRun.current_head_sha == wake.trigger_head_sha,
+            PRMonitorRun.current_review_id == wake.review_id,
+            PRMonitorRun.developer_task_id == task.id,
+        )
+        .values(
+            no_progress_count=PRMonitorRun.no_progress_count + 1,
+            status="paused",
+            pause_reason=error,
+            state_version=PRMonitorRun.state_version + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if run_changed.rowcount != 1:
+        await db.rollback()
+        return False
     await db.commit()
     return True
 
@@ -603,35 +963,39 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
 
     async with db_factory() as db:
         now = datetime.utcnow()
-        awaiting_push = list((await db.execute(
-            select(PRRepairWake).where(PRRepairWake.status == "awaiting_push")
+        awaiting_push_ids = list((await db.execute(
+            select(PRRepairWake.id).where(
+                PRRepairWake.status == "awaiting_push"
+            )
         )).scalars())
-        for wake in awaiting_push:
-            if wake.updated_at is None or now - wake.updated_at < _REPAIR_PUSH_TIMEOUT:
-                continue
-            run = await db.get(PRMonitorRun, wake.monitor_run_id)
-            if run is None or run.current_head_sha != wake.trigger_head_sha:
-                wake.status = "superseded"
-                wake.completed_at = now
-                continue
-            wake.status = "failed"
-            wake.last_error = "repair_push_timeout_no_new_head"
-            wake.completed_at = now
-            run.no_progress_count += 1
-            run.status = "paused"
-            run.pause_reason = wake.last_error
-            run.state_version += 1
-        await db.commit()
+        await db.rollback()
+        for awaiting_push_id in awaiting_push_ids:
+            await _expire_repair_push_timeout(
+                db, wake_id=awaiting_push_id, now=now
+            )
 
-        incomplete = list((await db.execute(
-            select(PRRepairWake).where(
+        incomplete_ids = list((await db.execute(
+            select(PRRepairWake.id).where(
                 PRRepairWake.status.in_(("delivering", "accepted"))
             ).order_by(PRRepairWake.id)
         )).scalars())
-        for wake in incomplete:
-            task = await db.get(Task, wake.developer_task_id) if wake.developer_task_id else None
-            run = await db.get(PRMonitorRun, wake.monitor_run_id)
-            repo = await db.get(MonitoredRepo, run.repo_id) if run is not None else None
+        for incomplete_id in incomplete_ids:
+            wake = await db.get(
+                PRRepairWake, incomplete_id, populate_existing=True
+            )
+            if wake is None or wake.status not in {"delivering", "accepted"}:
+                continue
+            task = (
+                await db.get(Task, wake.developer_task_id, populate_existing=True)
+                if wake.developer_task_id else None
+            )
+            run = await db.get(
+                PRMonitorRun, wake.monitor_run_id, populate_existing=True
+            )
+            repo = (
+                await db.get(MonitoredRepo, run.repo_id, populate_existing=True)
+                if run is not None else None
+            )
             if task is None:
                 wake.status = "failed"
                 wake.last_error = "developer_task_missing"
@@ -678,7 +1042,18 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
                     run.state_version += 1
                     continue
                 if _repair_has_new_terminal(wake, task):
-                    _apply_repair_terminal(wake, run, task)
+                    terminal_wake_id = wake.id
+                    terminal_token = wake.delivery_token
+                    terminal_task_id = task.id
+                    # Flush unrelated recovery rows before the exact terminal
+                    # consumer starts its own fresh lock/CAS transaction.
+                    await db.commit()
+                    await finish_repair_wake(
+                        db,
+                        wake_id=terminal_wake_id,
+                        delivery_token=terminal_token,
+                        task_id=terminal_task_id,
+                    )
                     continue
             # No queued/active generation and no post-admission terminal:
             # either delivery was never admitted or the Manager died after

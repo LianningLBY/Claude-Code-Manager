@@ -21,6 +21,7 @@ from backend.models.pr_monitor import (
 from backend.models.task import Task
 from backend.services import pr_review_panel
 from backend.services import pr_review_service
+from backend.services.pr_monitor_loop import attach_review_to_run
 
 
 BASE_SHA = "a" * 40
@@ -879,8 +880,6 @@ async def test_waiting_ci_reconciler_starts_panel_only_after_pass(
         ci_summary="Pending: tests",
         ci_details={"head_sha": HEAD_SHA, "required": [], "observed": []},
     )
-    from backend.services.pr_monitor_loop import attach_review_to_run
-
     await attach_review_to_run(
         db_session,
         repo=repo,
@@ -974,3 +973,96 @@ async def test_waiting_ci_reconciler_requires_exact_monitor_run_fence(
     )).scalars())
     assert refreshed.status == "waiting_ci"
     assert runs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle_change", ["disable", "supersede"])
+async def test_waiting_ci_reconciler_rechecks_lifecycle_after_context_fetch(
+    db_session,
+    db_factory,
+    lifecycle_change,
+):
+    repo = MonitoredRepo(
+        repo_full_name=f"owner/waiting-{lifecycle_change}",
+        webhook_secret="s" * 64,
+        provider="claude",
+        review_model="claude-sonnet-4-6",
+        review_mode="panel",
+        wait_for_ci=True,
+        enabled=True,
+        default_branch="main",
+        allowed_authors=[],
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    review = await pr_review_panel.create_waiting_ci_review(
+        db_session,
+        repo,
+        PR_DATA,
+        ci_status="pending",
+        ci_summary="Pending: tests",
+        ci_details={"head_sha": HEAD_SHA, "required": [], "observed": []},
+    )
+    run = await attach_review_to_run(
+        db_session,
+        repo=repo,
+        review=review,
+        pr_data=PR_DATA,
+    )
+    ids = {"repo": repo.id, "review": review.id, "run": run.id}
+
+    async def change_lifecycle(*_args, **_kwargs):
+        async with db_factory() as concurrent:
+            changed_repo = await concurrent.get(MonitoredRepo, ids["repo"])
+            changed_review = await concurrent.get(PRReview, ids["review"])
+            changed_run = await concurrent.get(PRMonitorRun, ids["run"])
+            if lifecycle_change == "disable":
+                changed_repo.enabled = False
+            else:
+                changed_review.status = "superseded"
+                changed_run.status = "reviewing"
+                changed_run.current_head_sha = "c" * 40
+                changed_run.state_version += 1
+            await concurrent.commit()
+        return _context()
+
+    with (
+        patch.object(
+            pr_review_panel,
+            "fetch_exact_head_ci",
+            AsyncMock(return_value=(
+                "passed",
+                "1 required exact-head CI checks passed",
+                {"head_sha": HEAD_SHA, "required": [], "observed": []},
+            )),
+        ),
+        patch(
+            "backend.services.pr_review_service.verify_pr_review_snapshot_current",
+            AsyncMock(),
+        ),
+        patch(
+            "backend.services.pr_review_service.prepare_pr_review_context",
+            change_lifecycle,
+        ),
+    ):
+        assert await pr_review_panel.reconcile_waiting_ci_reviews(db_factory) == 0
+
+    reviewer_runs = list((await db_session.execute(
+        select(PRReviewerRun).where(PRReviewerRun.pr_review_id == ids["review"])
+    )).scalars())
+    refreshed_repo = await db_session.get(
+        MonitoredRepo,
+        ids["repo"],
+        populate_existing=True,
+    )
+    refreshed_review = await db_session.get(
+        PRReview,
+        ids["review"],
+        populate_existing=True,
+    )
+    assert reviewer_runs == []
+    if lifecycle_change == "disable":
+        assert refreshed_repo.enabled is False
+        assert refreshed_review.status == "waiting_ci"
+    else:
+        assert refreshed_review.status == "superseded"

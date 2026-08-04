@@ -1336,9 +1336,17 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
             PRRepairWake.status.in_(("shadow", "failed")),
         ).order_by(desc(PRRepairWake.id)).with_for_update())).scalars().first()
         if current_action is not None:
-            snapshot = _validated_pr_snapshot(
-                await _gh_pr_view(run.pr_number, repo.repo_full_name)
-            )
+            try:
+                snapshot = _validated_pr_snapshot(
+                    await _gh_pr_view(run.pr_number, repo.repo_full_name)
+                )
+            except Exception as exc:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "GitHub PR state could not be confirmed while resuming "
+                    "Merge Queue",
+                ) from exc
             if (
                 snapshot.get("state") != "OPEN"
                 or snapshot.get("is_draft") is not False
@@ -1346,7 +1354,16 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                 or snapshot.get("head_sha") != current_action.trigger_head_sha
             ):
                 raise HTTPException(409, "GitHub PR subject changed while resuming Merge Queue")
-            entry = await _read_queue_entry(repo.repo_full_name, run.pr_number)
+            try:
+                entry = await _read_queue_entry(
+                    repo.repo_full_name, run.pr_number
+                )
+            except Exception as exc:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Remote Merge Queue state could not be confirmed",
+                ) from exc
             if entry is not None and (
                 entry.base_sha != current_action.trigger_base_sha
                 or entry.head_sha != current_action.trigger_head_sha
@@ -1354,15 +1371,22 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                 raise HTTPException(409, "Remote Merge Queue entry is for another subject")
             if entry is not None and entry.state in {"UNMERGEABLE", "LOCKED"}:
                 raise HTTPException(409, f"Remote Merge Queue entry is {entry.state.lower()}")
-            merge_group = (
-                await _read_merge_group_ref(
-                    repo.repo_full_name,
-                    default_branch=repo.default_branch,
-                    pr_number=run.pr_number,
-                )
-                if entry is not None
-                else None
-            )
+            if entry is not None:
+                try:
+                    merge_group = await _read_merge_group_ref(
+                        repo.repo_full_name,
+                        default_branch=repo.default_branch,
+                        pr_number=run.pr_number,
+                    )
+                except Exception as exc:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "Remote Merge Queue merge-group state could not be "
+                        "confirmed",
+                    ) from exc
+            else:
+                merge_group = None
             if entry is None:
                 current_action.status = "pending"
                 current_action.github_queue_entry_id = None

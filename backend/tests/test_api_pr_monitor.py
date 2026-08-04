@@ -18,6 +18,7 @@ from backend.database import Base, get_db
 from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import (
     MonitoredRepo,
+    PRMergeQueueAction,
     PRMonitorRun,
     PRRepairWake,
     PRReview,
@@ -309,6 +310,89 @@ async def test_resume_remote_repair_defers_authoritative_migration_to_reconciler
         developer = await db.get(Task, resumed.developer_task_id)
         assert resumed.status == "pending"
         assert developer.worker_id == worker_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["entry", "merge_group"])
+async def test_resume_merge_queue_returns_conflict_when_remote_state_unknown(
+    client, session_factory, monkeypatch, failure
+):
+    repo = await _create_repo(
+        client,
+        f"owner/resume-queue-{failure}",
+        review_mode="panel",
+        wait_for_ci=True,
+        required_checks=[{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+        merge_queue_mode="auto",
+    )
+    async with session_factory() as db:
+        run = PRMonitorRun(
+            repo_id=repo["id"], pr_number=43,
+            current_base_sha=BASE_SHA_1, current_head_sha=HEAD_SHA_1,
+            status="paused", pause_reason="infrastructure",
+        )
+        db.add(run)
+        await db.flush()
+        review = PRReview(
+            monitor_run_id=run.id, repo_id=repo["id"], pr_number=43,
+            base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
+            pr_title="resume queue", pr_author="alice",
+            pr_url="https://github.com/owner/resume/pull/43",
+            status="commented",
+        )
+        db.add(review)
+        await db.flush()
+        run.current_review_id = review.id
+        action = PRMergeQueueAction(
+            monitor_run_id=run.id, review_id=review.id,
+            trigger_base_sha=BASE_SHA_1, trigger_head_sha=HEAD_SHA_1,
+            status="paused", action_nonce="q" * 48,
+            last_error="infrastructure",
+        )
+        db.add(action)
+        await db.commit()
+        run_id = run.id
+        action_id = action.id
+
+    async def exact_pr(_number, _repo_name):
+        return {
+            "state": "OPEN", "mergedAt": None,
+            "baseRefOid": BASE_SHA_1, "headRefOid": HEAD_SHA_1,
+            "isDraft": False, "mergeCommit": None,
+        }
+
+    async def read_entry(_repo_name, _number):
+        if failure == "entry":
+            raise RuntimeError("queue read unavailable")
+        return SimpleNamespace(
+            id="MQ-resume", state="QUEUED",
+            base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
+        )
+
+    async def read_group(*_args, **_kwargs):
+        raise RuntimeError("matching refs unavailable")
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", exact_pr
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", read_entry
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_merge_group_ref", read_group
+    )
+    response = await client.post(f"/api/pr-monitor/runs/{run_id}/resume")
+    assert response.status_code == 409
+    assert "could not be confirmed" in response.json()["detail"]
+    async with session_factory() as db:
+        preserved_run = await db.get(PRMonitorRun, run_id)
+        preserved_action = await db.get(PRMergeQueueAction, action_id)
+        assert preserved_run.status == "paused"
+        assert preserved_action.status == "paused"
 
 
 @pytest.mark.asyncio

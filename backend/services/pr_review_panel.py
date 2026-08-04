@@ -694,9 +694,14 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     continue
                 await verify_pr_review_snapshot_current(repo, pr_data)
                 context = await prepare_pr_review_context(repo, pr_data)
+                # Context preparation is network-bound. Drop the old read
+                # snapshot before locking so disable/synchronize commits made
+                # during that call cannot survive in the ORM identity map.
+                repo_id = repo.id
+                await db.rollback()
                 locked_repo = (await db.execute(
                     select(MonitoredRepo)
-                    .where(MonitoredRepo.id == repo.id)
+                    .where(MonitoredRepo.id == repo_id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )).scalar_one_or_none()

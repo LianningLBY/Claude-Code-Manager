@@ -1023,6 +1023,16 @@ class TestQuotaAwareSelection:
             "secondary_used_percent": 40,
         })
 
+    def test_api_unlimited_window_does_not_trigger_threshold(self):
+        assert not codex_pool_module.api_quota_at_or_above({
+            "known": True,
+            "available": True,
+            "windows": [{
+                "unlimited": True,
+                "key_used": 1_000_000,
+            }],
+        })
+
     def test_cooldown_uses_later_reset_of_all_high_windows(self):
         now = 1_700_000_000
         assert quota_cooldown_seconds({

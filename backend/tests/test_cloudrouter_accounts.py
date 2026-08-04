@@ -336,6 +336,146 @@ async def test_apex_usage_separates_key_usage_from_shared_group_quota(
 
 
 @pytest.mark.asyncio
+async def test_apex_null_quota_windows_are_known_unlimited(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "key_name": "unlimited-key",
+            "group_name": "unlimited-group",
+            "used": {
+                "requests_5h": 3,
+                "requests_day": 7,
+                "tokens_day": 1_000,
+                "tokens_month": 2_000,
+            },
+            "remaining": {
+                "requests_5h": None,
+                "requests_day": None,
+                "tokens_day": None,
+                "tokens_month": None,
+            },
+            "limits": {
+                "requests_5h": None,
+                "requests_day": None,
+                "tokens_day": None,
+                "tokens_month": None,
+                "concurrency": 20,
+            },
+        }),
+    )
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["state"] == "active"
+    assert snapshot["known"] is True
+    assert snapshot["available"] is True
+    assert snapshot["concurrency"] == 20
+    assert snapshot["key_usage"] == {
+        "requests_5h": 3,
+        "requests_day": 7,
+        "tokens_day": 1_000,
+        "tokens_month": 2_000,
+    }
+    assert len(snapshot["windows"]) == 4
+    assert all(window["unlimited"] is True for window in snapshot["windows"])
+    assert all("limit" not in window for window in snapshot["windows"])
+    assert all("remaining" not in window for window in snapshot["windows"])
+    assert all("utilization" not in window for window in snapshot["windows"])
+    assert store.cached_quota_decision(account.id) == {
+        "available": True,
+        "known": True,
+        "reason": "active",
+    }
+
+
+def test_apex_usage_supports_mixed_limited_and_unlimited_windows():
+    snapshot = cloudrouter_module._normalise_apex_usage("apex-1", {
+        "used": {
+            "requests_5h": 3,
+            "requests_day": 7,
+            "tokens_day": 1_000,
+            "tokens_month": 2_000,
+        },
+        "remaining": {
+            "requests_5h": None,
+            "requests_day": 93,
+            "tokens_day": None,
+            "tokens_month": 8_000,
+        },
+        "limits": {
+            "requests_5h": None,
+            "requests_day": 100,
+            "tokens_day": None,
+            "tokens_month": 10_000,
+            "concurrency": 5,
+        },
+    })
+
+    windows = {window["id"]: window for window in snapshot["windows"]}
+    assert windows["requests_5h"]["unlimited"] is True
+    assert windows["requests_5h"]["key_used"] == 3
+    assert windows["tokens_day"]["unlimited"] is True
+    assert windows["requests_day"]["limit"] == 100
+    assert windows["requests_day"]["remaining"] == 93
+    assert windows["tokens_month"]["used"] == 2_000
+    assert snapshot["state"] == "active"
+    assert snapshot["available"] is True
+
+
+@pytest.mark.parametrize(
+    ("remaining", "limit"),
+    [
+        (None, 100),
+        (100, None),
+        ("invalid", 100),
+        (100, "invalid"),
+    ],
+)
+def test_apex_usage_rejects_asymmetric_or_invalid_window_values(
+    remaining, limit,
+):
+    payload = {
+        "used": {
+            "requests_5h": 3,
+            "requests_day": 7,
+            "tokens_day": 1_000,
+            "tokens_month": 2_000,
+        },
+        "remaining": {
+            "requests_5h": remaining,
+            "requests_day": 93,
+            "tokens_day": 9_000,
+            "tokens_month": 8_000,
+        },
+        "limits": {
+            "requests_5h": limit,
+            "requests_day": 100,
+            "tokens_day": 10_000,
+            "tokens_month": 10_000,
+            "concurrency": 5,
+        },
+    }
+
+    with pytest.raises(
+        CloudRouterUpstreamError,
+        match="invalid_usage_response",
+    ):
+        cloudrouter_module._normalise_apex_usage("apex-1", payload)
+
+
+@pytest.mark.asyncio
 async def test_partial_apex_group_usage_cannot_replace_known_exhaustion(
     tmp_path, monkeypatch,
 ):

@@ -541,6 +541,8 @@ export interface CloudRouterQuotaWindow {
   resets_at?: string | number | null;
   currency?: string | null;
   scope?: string | null;
+  /** This quota window has no configured limit. */
+  unlimited?: boolean;
   /** Usage attributed to this individual API key for a shared window. */
   key_used?: number | null;
 }

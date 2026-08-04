@@ -4,11 +4,12 @@ import logging
 from collections.abc import Callable
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.pr_monitor import MonitoredRepo, PRReview
 from backend.models.task import Task
+from backend.services.task_creation import stage_task_record
 from backend.services.task_queue import (
     task_retry_not_superseded_predicate,
 )
@@ -152,26 +153,19 @@ async def create_pr_review_task(
     prompt = build_review_prompt(repo, pr_data)
 
     provider = (repo.provider or "claude").lower()
-    # 直接构造 ORM 会绕过 POST /api/tasks 的 per-provider 默认模型逻辑，
-    # codex 且未配 review_model 时补上默认，避免 CLI 侧模型漂移
-    model = repo.review_model
-    if not model and provider == "codex":
-        from backend.config import settings as app_settings
-        model = app_settings.default_codex_model
-    task = Task(
+    task = await stage_task_record(
+        db,
         title=f"PR Review: {repo.repo_full_name}#{pr_data['number']}",
         description=prompt,
         mode="auto",
         tags=["pr-review"],
         metadata_={"pr_review_id": review.id},
         provider=provider,
-        model=model,
+        model=repo.review_model,
         effort_level=repo.review_effort,
         project_id=await _get_or_create_pr_monitor_project(db),
         worker_id=repo.worker_id,
     )
-    db.add(task)
-    await db.flush()
 
     review.task_id = task.id
     review.status = "reviewing"

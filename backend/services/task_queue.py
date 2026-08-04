@@ -2,15 +2,15 @@ import errno
 import os
 from datetime import datetime
 
-from sqlalchemy import Float, and_, case, delete as sa_delete, func, select, update
+from sqlalchemy import Float, and_, delete as sa_delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
-from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.services.task_creation import stage_task_record
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
@@ -233,8 +233,7 @@ class TaskQueue:
         self.db = db
 
     async def create(self, **kwargs) -> Task:
-        task = Task(**kwargs)
-        self.db.add(task)
+        task = await stage_task_record(self.db, **kwargs)
         await self.db.commit()
         await self.db.refresh(task)
         return task
@@ -260,9 +259,9 @@ class TaskQueue:
         effective_key = _effective_key_expr(auto_sort)
         stmt = select(Task).where(Task.shared_from_id.is_(None)).order_by(Task.starred.desc(), effective_key.desc(), Task.id.desc())
         if archived_only:
-            stmt = stmt.where(Task.archived == True)
+            stmt = stmt.where(Task.archived.is_(True))
         elif not include_archived:
-            stmt = stmt.where(Task.archived == False)
+            stmt = stmt.where(Task.archived.is_(False))
         if status:
             parts = [s.strip() for s in status.split(",") if s.strip()]
             stmt = stmt.where(Task.status.in_(parts)) if len(parts) > 1 else stmt.where(Task.status == parts[0])
@@ -309,9 +308,9 @@ class TaskQueue:
     ) -> int:
         stmt = select(func.count(Task.id)).where(Task.shared_from_id.is_(None))
         if archived_only:
-            stmt = stmt.where(Task.archived == True)
+            stmt = stmt.where(Task.archived.is_(True))
         elif not include_archived:
-            stmt = stmt.where(Task.archived == False)
+            stmt = stmt.where(Task.archived.is_(False))
         if status:
             parts = [s.strip() for s in status.split(",") if s.strip()]
             stmt = stmt.where(Task.status.in_(parts)) if len(parts) > 1 else stmt.where(Task.status == parts[0])

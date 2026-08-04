@@ -28,6 +28,7 @@ from backend.api.uploads import (
     validate_upload_attachments,
 )
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
+from backend.services.task_creation import stage_task_record
 from backend.services.task_queue import task_is_pr_review_superseded
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import (
@@ -1063,7 +1064,8 @@ async def fork_codex_task(
             else f"Fork of #{source.id}"
         )
         now = datetime.utcnow()
-        forked_task = Task(
+        forked_task = await stage_task_record(
+            db,
             title=(body.title.strip() if body.title and body.title.strip() else default_title)[:200],
             description=(
                 source.description
@@ -1097,9 +1099,6 @@ async def fork_codex_task(
             started_at=now,
             completed_at=now,
         )
-        db.add(forked_task)
-        await db.flush()
-
         for row in rows:
             if row.id > cutoff:
                 break

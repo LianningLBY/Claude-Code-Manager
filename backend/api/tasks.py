@@ -34,11 +34,14 @@ from backend.services.task_queue import (
     is_task_status_deletable,
     task_delete_fence,
 )
-from backend.services.task_defaults import resolve_task_runtime_defaults
+from backend.services.task_creation import (
+    prepare_task_create_values,
+    stage_task_record,
+    validate_task_service_tier_configuration,
+)
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
-from backend.services.codex_models import validate_codex_service_tier
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
     _finish_despite_cancellation as _finish_task_operation,
@@ -140,54 +143,6 @@ def _require_expected_task_routing(
             "loaded; refresh before starting another turn",
         )
     return actual
-
-
-def _validate_task_service_tier_configuration(
-    *,
-    provider: str | None,
-    model: str | None,
-    codex_service_tier: str | None,
-    mode: str | None,
-    goal_evaluator_model: str | None,
-) -> None:
-    """Validate every model request hidden behind one Task configuration."""
-
-    validate_codex_service_tier(provider, model, codex_service_tier)
-    if (
-        (provider or "claude").lower() == "codex"
-        and (codex_service_tier or "default") == "priority"
-        and mode == "plan"
-    ):
-        raise ValueError(
-            "Codex Fast is not supported for read-only Plan Agent tasks; "
-            "use Standard"
-        )
-    if not (
-        (provider or "claude").lower() == "codex"
-        and (codex_service_tier or "default") == "priority"
-        and mode == "goal"
-    ):
-        return
-
-    # A separate evaluator model may be statically Fast-capable yet absent
-    # from the account admitted for the main turn. Requiring the same model
-    # lets admission prove both requests before any Goal work starts.
-    task_model = model
-    if not task_model or task_model == "default":
-        task_model = settings.default_codex_model
-    evaluator_model = goal_evaluator_model
-    if not evaluator_model or evaluator_model == "default":
-        evaluator_model = task_model
-    if evaluator_model != task_model:
-        raise ValueError(
-            "Codex Fast Goal tasks must use the Task model for goal "
-            "evaluation; clear goal_evaluator_model or select the same model"
-        )
-    validate_codex_service_tier(
-        "codex",
-        evaluator_model,
-        "priority",
-    )
 
 
 def _explicit_command_skills(message: str | None) -> dict[str, bool]:
@@ -702,16 +657,6 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
             data["session_id"] = cloned["session_id"]
             data["last_cwd"] = cloned["last_cwd"]
 
-    # 设置归 Task：创建时填入全局默认值，后续不再依赖 instance fallback
-    (
-        data["provider"],
-        data["model"],
-        data["effort_level"],
-    ) = resolve_task_runtime_defaults(
-        provider=data.get("provider"),
-        model=data.get("model"),
-        effort_level=data.get("effort_level"),
-    )
     if data.get("mode") == "plan" and data.get("plan_repo_revision") is None:
         from backend.services.plan_tasks import capture_repo_revision
 
@@ -734,7 +679,7 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         metadata=data.get("metadata_"),
     )
     try:
-        _validate_task_service_tier_configuration(
+        validate_task_service_tier_configuration(
             provider=data.get("provider"),
             model=data.get("model"),
             codex_service_tier=data.get("codex_service_tier"),
@@ -753,7 +698,7 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
                 pipeline.reviewer.primary,
                 pipeline.reviewer.fallback,
             ):
-                _validate_task_service_tier_configuration(
+                validate_task_service_tier_configuration(
                     provider=route.provider,
                     model=route.model,
                     codex_service_tier="default",
@@ -770,9 +715,7 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         metadata = dict(data.get("metadata_") or {})
         metadata["revised_from_plan_task_id"] = superseded_id
         data["metadata_"] = metadata
-        task = Task(**data)
-        db.add(task)
-        await db.flush()
+        task = await stage_task_record(db, **data)
         from backend.services.plan_tasks import mark_plan_superseded
 
         if not await mark_plan_superseded(
@@ -862,15 +805,7 @@ async def import_migrated_task(
         created_by=get_current_user_id(request),
     )
 
-    (
-        data["provider"],
-        data["model"],
-        data["effort_level"],
-    ) = resolve_task_runtime_defaults(
-        provider=data.get("provider"),
-        model=data.get("model"),
-        effort_level=data.get("effort_level"),
-    )
+    data = prepare_task_create_values(data)
     validation_skills = dict(data.get("enabled_skills") or {})
     validation_skills.update(
         _explicit_command_skills(data.get("description"))
@@ -886,7 +821,7 @@ async def import_migrated_task(
         metadata=data.get("metadata_"),
     )
     try:
-        _validate_task_service_tier_configuration(
+        validate_task_service_tier_configuration(
             provider=data.get("provider"),
             model=data.get("model"),
             codex_service_tier=data.get("codex_service_tier"),
@@ -1214,7 +1149,7 @@ async def stage_worker_routing_config(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, observed, db)
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=candidate.provider,
                 model=candidate.model,
                 codex_service_tier=candidate.codex_service_tier,
@@ -1447,7 +1382,7 @@ async def reconcile_worker_routing_config(
             safe_status_required=True,
         )
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=authoritative.provider,
                 model=authoritative.model,
                 codex_service_tier=authoritative.codex_service_tier,
@@ -1756,7 +1691,7 @@ async def _update_local_task_with_routing_config(
             ),
         )
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=candidate.provider,
                 model=candidate.model,
                 codex_service_tier=candidate.codex_service_tier,
@@ -1878,7 +1813,7 @@ async def _update_worker_task_with_routing_config(
             ),
         )
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=candidate.provider,
                 model=candidate.model,
                 codex_service_tier=candidate.codex_service_tier,
@@ -2051,7 +1986,7 @@ async def update_task(
     if user_skill_snapshots is not None:
         require_admin(request)
     try:
-        _validate_task_service_tier_configuration(
+        validate_task_service_tier_configuration(
             provider=updates.get("provider", task.provider),
             model=updates.get("model", task.model),
             codex_service_tier=updates.get(

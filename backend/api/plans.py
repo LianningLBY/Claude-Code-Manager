@@ -33,6 +33,10 @@ from backend.services.plan_tasks import (
     plan_staleness,
 )
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
+from backend.services.task_creation import (
+    stage_task_record,
+    validate_task_service_tier_configuration,
+)
 from backend.services.task_queue import TaskQueue
 from backend.services.worker_proxy import get_task_operation_lock
 
@@ -211,8 +215,6 @@ async def _create_related_plan(
     # Plan Agents use isolated read-only turns. Fast requires the app-server
     # proof chain and must never be silently downgraded.
     codex_service_tier = "default"
-    from backend.api.tasks import _validate_task_service_tier_configuration
-
     try:
         routes = (
             pipeline.planner.primary,
@@ -221,7 +223,7 @@ async def _create_related_plan(
             pipeline.reviewer.fallback,
         )
         for route in routes:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=route.provider,
                 model=route.model,
                 codex_service_tier=codex_service_tier,
@@ -242,7 +244,8 @@ async def _create_related_plan(
         if target.worker_id is not None
         else await capture_repo_revision(target.last_cwd or target.target_repo)
     )
-    plan = Task(
+    plan = await stage_task_record(
+        db,
         title=(
             body.title.strip()
             if body.title and body.title.strip()
@@ -303,8 +306,6 @@ async def _create_related_plan(
         ),
         plan_pipeline_config=pipeline.model_dump(mode="json"),
     )
-    db.add(plan)
-    await db.flush()
     if supersedes is not None and not await mark_plan_superseded(
         db,
         supersedes,
@@ -567,7 +568,8 @@ async def revise_plan(
             legacy_effort=current_source.effort_level,
         )
         if current_source.plan_target_task_id is None:
-            revision = Task(
+            revision = await stage_task_record(
+                db,
                 title=(
                     body.title.strip()
                     if body.title and body.title.strip()
@@ -605,8 +607,6 @@ async def revise_plan(
                 ),
                 supersedes_plan_task_id=current_source.id,
             )
-            db.add(revision)
-            await db.flush()
             if not await mark_plan_superseded(
                 db,
                 current_source,
@@ -688,7 +688,8 @@ async def create_plan_execution_task(
 
         metadata = deepcopy(plan.metadata_ or {})
         metadata["created_from_plan_task_id"] = plan.id
-        execution = Task(
+        execution = await stage_task_record(
+            db,
             title=f"Execute Plan #{plan.id}: {plan.title}"[:200],
             description=(
                 "[Approved implementation plan]\n"
@@ -722,8 +723,6 @@ async def create_plan_execution_task(
             tags=deepcopy(plan.tags),
             metadata_=metadata,
         )
-        db.add(execution)
-        await db.flush()
         linked = await db.execute(
             update(Task)
             .where(

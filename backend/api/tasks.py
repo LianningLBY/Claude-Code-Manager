@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -105,11 +105,19 @@ async def _require_no_pr_review_publication(
 ) -> None:
     """Fence Task generation changes while its GitHub outbox is publishing."""
 
-    from backend.models.pr_monitor import PRReview
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
 
     publishing = await db.execute(
-        select(PRReview.id).where(
-            PRReview.task_id == task_id,
+        select(PRReview.id).distinct()
+        .outerjoin(
+            PRReviewerRun,
+            PRReviewerRun.pr_review_id == PRReview.id,
+        )
+        .where(
+            or_(
+                PRReview.task_id == task_id,
+                PRReviewerRun.task_id == task_id,
+            ),
             PRReview.status.in_(("publishing", "superseding")),
         )
     )
@@ -129,7 +137,7 @@ async def _require_not_pr_review_task_mutation(
 ) -> None:
     """Keep automated review Tasks immutable outside their backend workflow."""
 
-    from backend.models.pr_monitor import PRReview
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
 
     linked = await db.execute(
         select(PRReview.id)
@@ -180,7 +188,7 @@ async def _require_pr_review_chat_allowed(
     Returns ``True`` for a PR review Task and ``False`` for an ordinary Task.
     """
 
-    from backend.models.pr_monitor import PRReview
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
 
     task = await db.get(Task, task_id)
     if task is None:
@@ -194,8 +202,31 @@ async def _require_pr_review_chat_allowed(
     )
     task_marker = metadata_marker or tag_marker
 
+    def allow_terminal_discussion() -> bool:
+        if task.provider == "codex":
+            # Automated Codex reviews run in a tool-free isolated thread.
+            # That transport intentionally refuses native resume, so a
+            # terminal follow-up would otherwise open a context-less thread
+            # containing only the user's new message.
+            raise HTTPException(
+                409,
+                "Terminal discussion is unavailable for isolated Codex PR "
+                "review Tasks; start a separate Task with the review context",
+            )
+        return True
+
     linked = list((await db.execute(
-        select(PRReview.status).where(PRReview.task_id == task_id)
+        select(PRReview.status).distinct()
+        .outerjoin(
+            PRReviewerRun,
+            PRReviewerRun.pr_review_id == PRReview.id,
+        )
+        .where(
+            or_(
+                PRReview.task_id == task_id,
+                PRReviewerRun.task_id == task_id,
+            )
+        )
     )).scalars().all())
     if linked:
         # One Task belongs to exactly one immutable review snapshot.  Multiple
@@ -206,7 +237,7 @@ async def _require_pr_review_chat_allowed(
             and linked[0] in _PR_REVIEW_CHAT_TERMINAL_STATUSES
             and metadata.get("pr_review_superseded") is not True
         ):
-            return True
+            return allow_terminal_discussion()
         raise HTTPException(
             409,
             "Automated PR review discussion is available only after its "
@@ -220,7 +251,7 @@ async def _require_pr_review_chat_allowed(
         and tag_marker
         and metadata.get("pr_review_superseded") is not True
     ):
-        return True
+        return allow_terminal_discussion()
     raise HTTPException(
         409,
         "Automated PR review Task has no locally verified terminal review "
@@ -234,11 +265,20 @@ async def _require_pr_review_retryable(
 ) -> None:
     """Do not run a Task generation whose linked review is already terminal."""
 
-    from backend.models.pr_monitor import PRReview
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
 
     result = await db.execute(
-        select(PRReview.status)
-        .where(PRReview.task_id == task_id)
+        select(PRReview.status).distinct()
+        .outerjoin(
+            PRReviewerRun,
+            PRReviewerRun.pr_review_id == PRReview.id,
+        )
+        .where(
+            or_(
+                PRReview.task_id == task_id,
+                PRReviewerRun.task_id == task_id,
+            )
+        )
         .limit(1)
     )
     review_status = result.scalar_one_or_none()
@@ -254,7 +294,7 @@ async def _require_pr_review_retryable(
         )
     )
     if review_status is not None:
-        if review_status in {"pending", "reviewing"}:
+        if review_status in {"pending", "waiting_ci", "reviewing"}:
             detail = (
                 "Automated PR review Tasks cannot be manually retried; push a "
                 "new PR snapshot instead"

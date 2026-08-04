@@ -656,7 +656,7 @@ async def test_tool_free_profile_clears_inherited_mcp_and_native_tools():
     assert thread_params["runtimeWorkspaceRoots"] == []
     assert thread_params["selectedCapabilityRoots"] == []
     assert thread_params["dynamicTools"] == []
-    assert thread_params["permissions"] == "ccm_pr_review_no_access_v1"
+    assert "permissions" not in thread_params
     assert thread_params["baseInstructions"] == ""
     assert thread_params["developerInstructions"] == ""
     assert "sandbox" not in thread_params
@@ -709,7 +709,7 @@ async def test_tool_free_profile_clears_inherited_mcp_and_native_tools():
     turn_params = turn_call.args[1]
     assert turn_params["environments"] == []
     assert turn_params["runtimeWorkspaceRoots"] == []
-    assert turn_params["permissions"] == "ccm_pr_review_no_access_v1"
+    assert "permissions" not in turn_params
     assert "sandboxPolicy" not in turn_params
 
 

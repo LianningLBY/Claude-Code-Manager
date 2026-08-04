@@ -2535,10 +2535,12 @@ class CodexAppServer:
         if tools_disabled:
             # Clear config-level developer instructions. Project/user
             # instruction files are independently proven absent through
-            # ``instructionSources`` in the thread response.
+            # ``instructionSources`` in the thread response. Do not also set
+            # the type-safe ``permissions`` selector here: Codex 0.144.6
+            # resolves it before the request-local profile table. The config
+            # layer above defines and selects the profile atomically.
             common["baseInstructions"] = ""
             common["developerInstructions"] = ""
-            common["permissions"] = _TOOL_FREE_PERMISSION_PROFILE
         else:
             common["sandbox"] = sandbox_mode
         if model and model != "default":
@@ -2805,10 +2807,12 @@ class CodexAppServer:
         if tools_disabled:
             # A turn-level cwd without an explicit empty environment causes
             # Codex to silently restore its default local environment. Repeat
-            # both empty selections and the deny-all profile on every turn.
+            # both empty selections. Do not repeat the named permission
+            # selector: Codex 0.144.6 rebuilds turn overrides without the
+            # thread's request-local profile table and rejects that selector.
+            # The audited thread profile remains active for this first turn.
             turn_params["environments"] = []
             turn_params["runtimeWorkspaceRoots"] = []
-            turn_params["permissions"] = _TOOL_FREE_PERMISSION_PROFILE
         elif sandbox_mode == "read-only":
             # Repeat the policy at turn/start.  This is a schema-backed field
             # and prevents a resumed thread's sticky/default settings from

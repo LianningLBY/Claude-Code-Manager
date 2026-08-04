@@ -175,6 +175,10 @@ Task 为载体的用例只验证 contract 期 legacy API；新产品路径以 `t
 | `test_execution_task_materializer_is_directly_callable_and_idempotent` | Auto/内部调用方可直接经 `plan_service` 物化 exact Version，重放返回同一 Task/Application，且 Plan 审计 metadata 不可覆盖 |
 | `test_claude_plan_command_is_read_only` / `test_codex_plan_uses_disposable_read_only_app_server_thread` | Claude 禁 Bash/MCP/子 agent；Codex 复用 App Server 但使用 disposable read-only thread、空 MCP/禁 autonomous features，终态删除 thread |
 | `test_pipeline_revises_then_persists_audited_approval` | Planner → Reviewer revise → Planner → approve 的 run/step、模型与 feedback 全量审计 |
+| `test_interactive_planner_accepts_all_known_questions_without_count_limit` | 模型侧 question schema 使用非关键字 `is_required`，校验边界精确映射回领域/API 的 `required`，且不限制有效问题数 |
+| `test_interactive_question_wire_contract_requires_is_required` / `test_interactive_question_wire_contract_rejects_invalid_is_required` / `test_interactive_question_wire_contract_rejects_required_alias` | `is_required` 必须存在且为严格 bool；模型线协议拒绝旧 `required` 别名和双字段歧义 |
+| `test_structured_json_whitespace_guard_ignores_string_content_and_escapes` | 连续空白保护只统计 JSON 字符串外的空白，不误伤 Plan/问题字符串内容与 escape |
+| `test_codex_plan_json_whitespace_runaway_is_interrupted_and_cleaned` | Codex 结构化输出连续空白超限时精确 interrupt，删除 disposable thread 并抛出可审计错误 |
 | `test_stage_uses_fallback_only_after_primary_route_is_unavailable` | primary 不可用后才尝试 fallback，并审计 route slot 与实际成功模型 |
 | `test_route_exhausts_quota_limited_accounts_before_model_fallback` | 额度/认证失败先标记并轮换同 route 的兼容账号，不提前切模型 |
 | `test_stage_fails_after_primary_and_fallback_are_unavailable` | 两条 route 均不可用时保留双失败审计并终止 Plan |

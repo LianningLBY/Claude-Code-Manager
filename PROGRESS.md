@@ -977,3 +977,12 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **问题**：SQLite 停服独占检查本意只忽略固定的 systemd user-manager，但匹配条件要求命令行以 `systemd --user` 结尾；真实宿主 PID 1 拉起的进程是 `systemd --user --deserialize=19`，同 UID `/proc/<pid>/fd` 因内核保护不可读，导致每次迁移都误判无法证明独占并回滚。
 - **解决**：把允许项收窄为 basename 精确等于 `systemd`、首参数精确 `--user`，并且只允许无额外参数或单个数字形式 `--deserialize=N`；仍要求进程位于该 UID 的 `init.scope`，任何额外/非数字参数继续 fail closed。
 - **验证**：新增正反例分类回归并运行 `test_update_migrate_hardening.py`，`27 passed`；Shell 语法检查通过。
+
+### 2026-08-04 — Codex Plan `request_input` 结构化输出空白失控（commit：本提交）
+
+- **现象与误诊风险**：Plan 40 的 Codex Planner primary 在 30 分钟内流出 1,517,893 字符后超时；fallback 虽完成，但 10,768 字符中有 9,980 个空白，最长连续空白 9,961 个，精确位于首个问题的 `options` 数组结束与下一个 `"required"` 属性之间。Plan 34 的同类提问请求也在 1,543 秒内流出 653,706 字符后被取消。该路径没有 MCP/tool，CCM 又原样转发 app-server delta 和权威 `item/completed`，因此不是工具循环或本地字符串拼接。
+- **真实 A/B**：固定 `codex-cli 0.144.6`、`gpt-5.6-sol`、`effort=medium`、同一 prompt/cwd/只读配置及隔离临时 `CODEX_HOME`。原 wire schema 在 app-server 5 次中 4 次达到 1,024 连续空白，唯一成功样本仍出现 19 个连续格式空白；旧 `codex exec --output-schema` 对同一 schema 150 秒无终态。只把模型字段 `required` 改为 `is_required` 后，app-server 5/5 正常，连同 exec 共 6/6 正常、8.2–12.9 秒、连续空白为 0；只把 `required` 移到 `options` 前也跨两路 3/3 正常。故 transport 切换不是根因，触发点是嵌套 `options` 后紧跟 JSON Schema 关键字同名属性 `required` 的约束生成状态。
+- **根因修复**：模型-facing `_QUESTION_SCHEMA` 使用 `is_required`；`_validate_structured_v2` 在唯一解析边界严格要求布尔值、拒绝旧 `required` alias 或两者并存，再映射回领域/API 的 `PlanQuestion.required`。数据库、API、前端与历史持久数据契约不变，无需迁移。改名优于仅换序，因为 JSON Schema 的对象属性顺序不是应依赖的语义。
+- **纵深保护**：Codex 结构化 assistant JSON 在字符串外连续输出达到 `PLAN_STRUCTURED_OUTPUT_WHITESPACE_LIMIT`（默认 4,096）时，精确 interrupt 并删除 disposable thread 后才允许 route fallback；JSON 字符串内的长 Plan/问题及 reasoning 不计入。不要用总输出上限或缩短复杂 Plan 的阶段预算代替该保护，也不要回滚 `codex exec` 作为修复。
+- **长期约定**：模型 wire schema 与领域/API schema 必须允许使用不同字段名；遇到可能与 JSON Schema 关键字冲突的模型-facing 属性，应在边界显式映射并用真实 provider A/B 验证，不能只靠 mock/本地 schema validation 推断生成稳定性。真实模型回归是手工测试，不进入 CI；CI 固定 schema alias、映射、歧义输入拒绝及 runaway cleanup。
+- **验证**：先以旧实现跑出 2 个确定性红测，再完成 schema/映射/非法输入覆盖；`backend/tests/test_plan_agent_runner.py` 最终 `25 passed`。未限制合法问题数量、Plan 正文长度或 reasoning，未触碰生产服务。

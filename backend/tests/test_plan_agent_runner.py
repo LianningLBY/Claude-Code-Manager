@@ -16,9 +16,11 @@ from backend.services.plan_agent_runner import (
     PLANNER_SCHEMA_V2,
     REVIEWER_SCHEMA_V2,
     PlanAgentError,
+    PlanAgentOutputRunaway,
     PlanAgentRunner,
     PlanAgentTimeout,
     PlanRouteUnavailable,
+    _StructuredJsonWhitespaceGuard,
     _build_command,
     _extract_provider_content,
     _plan_request_with_attachments,
@@ -79,7 +81,7 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
             "question": f"Required decision {index}",
             "response_type": "text",
             "options": [],
-            "required": True,
+            "is_required": index % 2 == 0,
         }
         for index in range(12)
     ]
@@ -89,7 +91,21 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
         "reason": "All decisions materially affect the Plan",
         "questions": questions,
     }
-    expected = {key: value for key, value in payload.items() if key != "plan"}
+    expected = {
+        "action": "request_input",
+        "reason": payload["reason"],
+        "questions": [
+            {
+                **{
+                    key: value
+                    for key, value in question.items()
+                    if key != "is_required"
+                },
+                "required": question["is_required"],
+            }
+            for question in questions
+        ],
+    }
 
     assert PLANNER_SCHEMA_V2["type"] == "object"
     assert REVIEWER_SCHEMA_V2["type"] == "object"
@@ -111,7 +127,13 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
     assert_portable_schema(REVIEWER_SCHEMA_V2)
     planner_response = PLANNER_SCHEMA_V2["properties"]["response"]
     reviewer_response = REVIEWER_SCHEMA_V2["properties"]["response"]
+    question_schema = planner_response["properties"]["questions"]["items"]
     assert "maxItems" not in planner_response["properties"]["questions"]
+    assert "is_required" in question_schema["properties"]
+    assert "required" not in question_schema["properties"]
+    assert question_schema["required"] == [
+        "id", "header", "question", "response_type", "options", "is_required",
+    ]
     assert planner_response["required"] == ["action", "plan", "reason", "questions"]
     assert reviewer_response["required"] == [
         "action", "feedback", "reason", "questions",
@@ -150,6 +172,72 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
         )
 
 
+@pytest.mark.parametrize("wire_required", [None, "true", 1])
+def test_interactive_question_wire_contract_rejects_invalid_is_required(
+    wire_required,
+):
+    question = {
+        "id": "window",
+        "header": "Rollout",
+        "question": "Which rollout window should be used?",
+        "response_type": "text",
+        "options": [],
+        "is_required": wire_required,
+    }
+    payload = {
+        "action": "request_input",
+        "plan": "",
+        "reason": "Choose a rollout window",
+        "questions": [question],
+    }
+
+    with pytest.raises(ValueError, match="invalid questions"):
+        _validate_structured_v2("planner", json.dumps(payload))
+
+
+def test_interactive_question_wire_contract_requires_is_required():
+    payload = {
+        "action": "request_input",
+        "plan": "",
+        "reason": "Choose a rollout window",
+        "questions": [{
+            "id": "window",
+            "header": "Rollout",
+            "question": "Which rollout window should be used?",
+            "response_type": "text",
+            "options": [],
+        }],
+    }
+
+    with pytest.raises(ValueError, match="invalid questions"):
+        _validate_structured_v2("planner", json.dumps(payload))
+
+
+@pytest.mark.parametrize("include_wire_field", [False, True])
+def test_interactive_question_wire_contract_rejects_required_alias(
+    include_wire_field,
+):
+    question = {
+        "id": "window",
+        "header": "Rollout",
+        "question": "Which rollout window should be used?",
+        "response_type": "text",
+        "options": [],
+        "required": True,
+    }
+    if include_wire_field:
+        question["is_required"] = True
+    payload = {
+        "action": "request_input",
+        "plan": "",
+        "reason": "Choose a rollout window",
+        "questions": [question],
+    }
+
+    with pytest.raises(ValueError, match="invalid questions"):
+        _validate_structured_v2("planner", json.dumps(payload))
+
+
 def test_interactive_schema_rejects_inactive_action_fields():
     with pytest.raises(ValueError, match="propose or request_input"):
         _validate_structured_v2(
@@ -175,7 +263,7 @@ def test_interactive_schema_rejects_inactive_action_fields():
                     "question": "Which rollout window should be used?",
                     "response_type": "text",
                     "options": [],
-                    "required": True,
+                    "is_required": True,
                 }],
             }),
         )
@@ -365,6 +453,89 @@ async def test_codex_plan_uses_disposable_read_only_app_server_thread(
     assert kwargs["disable_autonomous_features"] is True
     assert kwargs["output_schema"] == PLANNER_SCHEMA
     assert kwargs["resume_session_id"] is None
+
+
+def test_structured_json_whitespace_guard_ignores_string_content_and_escapes():
+    leading_guard = _StructuredJsonWhitespaceGuard(limit=4)
+    assert not leading_guard.feed(" \n")
+    assert leading_guard.feed("\t ")
+
+    guard = _StructuredJsonWhitespaceGuard(limit=8)
+
+    assert not guard.feed('{"plan":"long        markdown\\')
+    assert not guard.feed('" still inside        string",')
+    assert guard.consecutive == 0
+    assert not guard.feed(" \r\n   ")
+    assert guard.consecutive == 6
+    assert guard.feed("  ")
+    assert guard.maximum == 8
+
+
+@pytest.mark.asyncio
+async def test_codex_plan_json_whitespace_runaway_is_interrupted_and_cleaned(
+    db_factory,
+):
+    process: CodexTurnProcess | None = None
+    interrupted = asyncio.Event()
+
+    async def interrupt():
+        interrupted.set()
+        assert process is not None
+        process.finish(130)
+
+    process = CodexTurnProcess(123, interrupt, thread_id="runaway-plan")
+    process.feed({
+        "type": "item.agent_message.delta",
+        "delta": '{"response":{"action":"request_input",',
+    })
+    process.feed({
+        "type": "item.agent_message.delta",
+        "delta": " \r    \r    \r    ",
+    })
+
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(
+        return_value=(process, "runaway-plan")
+    )
+    registry.delete_thread = AsyncMock()
+
+    class Manager:
+        @asynccontextmanager
+        async def codex_home_app_server_guard(self, home):
+            yield home
+
+        def _ensure_codex_app_server_registry(self):
+            return registry
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=Manager(),
+    )
+
+    with pytest.raises(
+        PlanAgentOutputRunaway,
+        match=(
+            r"16 consecutive JSON whitespace characters outside a string .*"
+            r"limit=16"
+        ),
+    ):
+        await runner._run_codex_turn(
+            task_id=-703,
+            home="/canonical/default-codex-home",
+            model="gpt-5.6-sol",
+            effort="medium",
+            cwd="/tmp",
+            prompt="plan safely",
+            schema=PLANNER_SCHEMA_V2,
+            timeout=2,
+            json_whitespace_limit=16,
+        )
+
+    assert interrupted.is_set()
+    registry.delete_thread.assert_awaited_once_with(
+        "/canonical/default-codex-home",
+        "runaway-plan",
+    )
 
 
 @pytest.mark.asyncio

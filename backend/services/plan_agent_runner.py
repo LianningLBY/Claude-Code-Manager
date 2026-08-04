@@ -118,9 +118,18 @@ _QUESTION_SCHEMA = {
             },
             "maxItems": 5,
         },
-        "required": {"type": "boolean"},
+        # Keep the model-facing name distinct from JSON Schema's ``required``
+        # keyword. The domain/API field is restored at the validation boundary.
+        "is_required": {"type": "boolean"},
     },
-    "required": ["id", "header", "question", "response_type", "options", "required"],
+    "required": [
+        "id",
+        "header",
+        "question",
+        "response_type",
+        "options",
+        "is_required",
+    ],
     "additionalProperties": False,
 }
 
@@ -213,8 +222,65 @@ class PlanAgentTimeout(PlanAgentError):
     """A Plan route timed out after its runtime was safely reclaimed."""
 
 
+class PlanAgentOutputRunaway(PlanAgentTimeout):
+    """A structured Plan response emitted pathological JSON whitespace."""
+
+
 class PlanRouteUnavailable(PlanAgentError):
     """Every compatible account for one configured model route was unavailable."""
+
+
+class _StructuredJsonWhitespaceGuard:
+    """Track consecutive insignificant JSON whitespace across stream chunks.
+
+    Only whitespace outside JSON strings counts. This deliberately leaves
+    long Markdown plans, question text, and escaped string content unlimited.
+    """
+
+    _WHITESPACE = frozenset(" \t\r\n")
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self.started = False
+        self.in_string = False
+        self.escape = False
+        self.consecutive = 0
+        self.maximum = 0
+
+    def feed(self, delta: str) -> bool:
+        for char in delta:
+            if not self.started:
+                if char in "{[":
+                    self.started = True
+                    self.consecutive = 0
+                elif char in self._WHITESPACE:
+                    self.consecutive += 1
+                    self.maximum = max(self.maximum, self.consecutive)
+                    if self.consecutive >= self.limit:
+                        return True
+                else:
+                    self.consecutive = 0
+                continue
+            if self.in_string:
+                self.consecutive = 0
+                if self.escape:
+                    self.escape = False
+                elif char == "\\":
+                    self.escape = True
+                elif char == '"':
+                    self.in_string = False
+                continue
+            if char == '"':
+                self.in_string = True
+                self.consecutive = 0
+            elif char in self._WHITESPACE:
+                self.consecutive += 1
+                self.maximum = max(self.maximum, self.consecutive)
+                if self.consecutive >= self.limit:
+                    return True
+            else:
+                self.consecutive = 0
+        return False
 
 
 @dataclass
@@ -736,6 +802,22 @@ def _validate_structured(step_type: str, content: str) -> dict:
     return {"verdict": verdict, "feedback": feedback.strip()}
 
 
+def _normalize_plan_question_wire(question: object) -> dict[str, Any]:
+    """Map the model-only question contract to the public PlanQuestion shape."""
+
+    if not isinstance(question, dict):
+        raise ValueError("question must be an object")
+    if "required" in question:
+        raise ValueError("question must not use the reserved wire field 'required'")
+    is_required = question.get("is_required")
+    if not isinstance(is_required, bool):
+        raise ValueError("question is_required must be a boolean")
+    normalized = dict(question)
+    normalized.pop("is_required")
+    normalized["required"] = is_required
+    return normalized
+
+
 def _validate_structured_v2(step_type: str, content: str) -> dict:
     from backend.schemas.plan_resource import PlanQuestion
 
@@ -763,7 +845,9 @@ def _validate_structured_v2(step_type: str, content: str) -> dict:
             raise ValueError("request_input requires at least one question")
         try:
             parsed = [
-                PlanQuestion.model_validate(question).model_dump(mode="json")
+                PlanQuestion.model_validate(
+                    _normalize_plan_question_wire(question)
+                ).model_dump(mode="json")
                 for question in questions
             ]
         except Exception as exc:
@@ -1233,6 +1317,7 @@ class PlanAgentRunner:
         timeout: int,
         step_id: int | None = None,
         delta_idle_timeout: float | None = None,
+        json_whitespace_limit: int | None = None,
     ) -> tuple[bytes, bytes, int]:
         registry = self.instance_manager._ensure_codex_app_server_registry()
         process = None
@@ -1285,8 +1370,44 @@ class PlanAgentRunner:
                     )
                 )
 
+            async def read_stdout() -> bytes:
+                chunks: list[bytes] = []
+                whitespace_guard = (
+                    _StructuredJsonWhitespaceGuard(json_whitespace_limit)
+                    if json_whitespace_limit is not None
+                    and json_whitespace_limit > 0
+                    else None
+                )
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        return b"".join(chunks)
+                    chunks.append(line)
+                    if whitespace_guard is None:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") != "item.agent_message.delta":
+                        continue
+                    delta = event.get("delta")
+                    if not isinstance(delta, str):
+                        continue
+                    if whitespace_guard.feed(delta):
+                        raise PlanAgentOutputRunaway(
+                            "Codex Plan Agent structured output emitted "
+                            f"{whitespace_guard.consecutive} consecutive "
+                            "JSON whitespace characters outside a string "
+                            f"(limit={whitespace_guard.limit}, "
+                            f"streamed_output_chars={process.streamed_output_chars})",
+                            provider="codex",
+                        )
+
             async def collect_output() -> tuple[bytes, bytes, int]:
-                stdout_task = asyncio.create_task(process.stdout.read())
+                stdout_task = asyncio.create_task(read_stdout())
                 stderr_task = asyncio.create_task(process.stderr.read())
                 wait_task = asyncio.create_task(process.wait())
                 try:
@@ -1518,6 +1639,9 @@ class PlanAgentRunner:
                             settings.plan_reviewer_delta_idle_timeout
                             if step_type == "reviewer"
                             else None
+                        ),
+                        json_whitespace_limit=(
+                            settings.plan_structured_output_whitespace_limit
                         ),
                     )
                 except CodexAppServerBusyError as exc:

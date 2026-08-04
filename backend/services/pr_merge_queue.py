@@ -600,6 +600,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                 continue
             if (
                 snapshot["state"] != "OPEN"
+                or snapshot["merged_at"] is not None
                 or snapshot["is_draft"]
                 or snapshot["base_sha"] != action.trigger_base_sha
                 or snapshot["head_sha"] != action.trigger_head_sha

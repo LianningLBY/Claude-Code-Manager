@@ -930,6 +930,8 @@ async def submit_finding_rebuttal(
     )
     if (
         snapshot.get("state") != "OPEN"
+        or snapshot.get("merged_at") is not None
+        or snapshot.get("is_draft") is not False
         or snapshot.get("base_sha") != review.base_sha
         or snapshot.get("head_sha") != review.head_sha
     ):
@@ -995,6 +997,7 @@ async def submit_finding_rebuttal(
         )
         if (
             fresh_snapshot.get("state") != "OPEN"
+            or fresh_snapshot.get("merged_at") is not None
             or fresh_snapshot.get("is_draft") is not False
             or fresh_snapshot.get("base_sha") != review.base_sha
             or fresh_snapshot.get("head_sha") != review.head_sha
@@ -1143,6 +1146,7 @@ async def bind_monitor_developer(
             )
             if (
                 snapshot.get("state") != "OPEN"
+                or snapshot.get("merged_at") is not None
                 or snapshot.get("is_draft") is not False
                 or snapshot.get("base_sha") != run.current_base_sha
                 or snapshot.get("head_sha") != run.current_head_sha
@@ -1349,6 +1353,7 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                 ) from exc
             if (
                 snapshot.get("state") != "OPEN"
+                or snapshot.get("merged_at") is not None
                 or snapshot.get("is_draft") is not False
                 or snapshot.get("base_sha") != current_action.trigger_base_sha
                 or snapshot.get("head_sha") != current_action.trigger_head_sha
@@ -1423,6 +1428,7 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
             )
             if (
                 snapshot.get("state") != "OPEN"
+                or snapshot.get("merged_at") is not None
                 or snapshot.get("is_draft") is not False
                 or snapshot.get("base_sha") != current_wake.trigger_base_sha
                 or snapshot.get("head_sha") != current_wake.trigger_head_sha

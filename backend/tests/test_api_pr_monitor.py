@@ -169,14 +169,15 @@ def _open_pr_snapshot(
     *,
     base_sha: str = BASE_SHA_1,
     head_sha: str = HEAD_SHA_1,
+    merged_at: str | None = None,
 ) -> dict:
     return {
         "state": "OPEN",
-        "mergedAt": None,
+        "mergedAt": merged_at,
         "baseRefOid": base_sha,
         "headRefOid": head_sha,
         "isDraft": False,
-        "mergeCommit": None,
+        "mergeCommit": {"oid": "f" * 40} if merged_at else None,
     }
 
 
@@ -302,7 +303,12 @@ async def test_resume_remote_repair_defers_authoritative_migration_to_reconciler
         wake_id = wake.id
         worker_id = worker.id
 
-    response = await client.post(f"/api/pr-monitor/runs/{run_id}/resume")
+    with patch.object(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value=_open_pr_snapshot()),
+    ):
+        response = await client.post(f"/api/pr-monitor/runs/{run_id}/resume")
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "repair_pending"
     async with session_factory() as db:
@@ -672,9 +678,23 @@ async def test_bind_developer_reads_remote_subject_inside_task_barrier(
 
 
 @pytest.mark.asyncio
-async def test_resume_repair_rejects_remote_subject_drift(
+@pytest.mark.parametrize(
+    "remote_snapshot",
+    [
+        pytest.param(
+            _open_pr_snapshot(head_sha=HEAD_SHA_2),
+            id="head-drift",
+        ),
+        pytest.param(
+            _open_pr_snapshot(merged_at="2026-08-04T00:00:00Z"),
+            id="open-with-merged-at",
+        ),
+    ],
+)
+async def test_resume_repair_rejects_remote_subject_change(
     client,
     session_factory,
+    remote_snapshot,
 ):
     repo = await _create_repo(
         client,
@@ -722,7 +742,7 @@ async def test_resume_repair_rejects_remote_subject_drift(
     with patch.object(
         pr_review_service,
         "_gh_pr_view",
-        AsyncMock(return_value=_open_pr_snapshot(head_sha=HEAD_SHA_2)),
+        AsyncMock(return_value=remote_snapshot),
     ):
         response = await client.post(
             f"/api/pr-monitor/runs/{run_id}/resume"

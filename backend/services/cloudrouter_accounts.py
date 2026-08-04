@@ -1143,16 +1143,47 @@ def _normalise_apex_usage(
     exhausted = False
     for window_id, label, unit in definitions:
         key_used = _decimal(raw_used.get(window_id))
-        remaining = _decimal(raw_remaining.get(window_id))
-        limit = _decimal(raw_limits.get(window_id))
+        has_remaining = window_id in raw_remaining
+        has_limit = window_id in raw_limits
+        raw_window_remaining = raw_remaining.get(window_id)
+        raw_window_limit = raw_limits.get(window_id)
+        unlimited = (
+            has_remaining
+            and has_limit
+            and raw_window_remaining is None
+            and raw_window_limit is None
+        )
         # Availability is governed by the shared group, so a partial response
         # must never become a known-healthy snapshot based only on this Key's
-        # own usage. Apex documents all three values for every fixed window.
+        # own usage. Apex documents every fixed window, using explicit null
+        # limit/remaining pairs for windows without a quota.
         if (
             key_used is None
-            or remaining is None
-            or limit is None
             or key_used < 0
+            or not has_remaining
+            or not has_limit
+        ):
+            raise CloudRouterUpstreamError("invalid_usage_response")
+        if unlimited:
+            parsed_key_used = _json_number(key_used)
+            item = {
+                "id": window_id,
+                "label": label,
+                "currency": unit,
+                "scope": "group",
+                "unlimited": True,
+                "key_used": parsed_key_used,
+            }
+            windows.append(item)
+            if parsed_key_used is not None:
+                key_usage[window_id] = parsed_key_used
+            continue
+
+        remaining = _decimal(raw_window_remaining)
+        limit = _decimal(raw_window_limit)
+        if (
+            remaining is None
+            or limit is None
             or remaining < 0
             or limit < 0
             or remaining > limit

@@ -523,6 +523,25 @@ describe('ChatView', () => {
   });
 
   describe('PTY background activity', () => {
+    it.each([
+      ['claude', 'executing', 'Claude'],
+      ['codex', 'in_progress', 'Codex'],
+    ] as const)(
+      'restores the %s thinking indicator when an already-running task is opened',
+      (provider, status, label) => {
+        render(
+          <ChatView
+            task={makeTask({ id: provider === 'claude' ? 301 : 302, provider, status })}
+            projects={projects}
+            onBack={onBack}
+          />,
+        );
+
+        expect(screen.getByText(`${label} is thinking...`)).toBeInTheDocument();
+        expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
+      },
+    );
+
     it('shows the background badge while the foreground status is still executing', () => {
       const task = makeTask({ id: 31, status: 'executing', background_active: false });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
@@ -2609,6 +2628,58 @@ describe('Codex app-server 增量消息', () => {
       });
     });
     expect(screen.getAllByText('Hello')).toHaveLength(1);
+  });
+
+  it('切走再切回运行中的 task 后保留并继续合并未完成 thinking', async () => {
+    const task = makeTask({ id: 2101, provider: 'codex', status: 'executing' });
+    const first = render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:2101',
+        data: {
+          event_type: 'thinking_delta',
+          item_id: 'reasoning-1',
+          content: 'first half',
+        },
+      });
+    });
+    expect(screen.getByText('first half')).toBeInTheDocument();
+    first.unmount();
+
+    const second = render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    expect(screen.getByText('first half')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:2101',
+        data: {
+          event_type: 'thinking_delta',
+          item_id: 'reasoning-1',
+          content: ' second half',
+        },
+      });
+    });
+    expect(screen.getByText('first half second half')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:2101',
+        data: {
+          id: 991,
+          event_type: 'thinking',
+          item_id: 'reasoning-1',
+          role: 'assistant',
+          content: 'first half second half',
+        },
+      });
+    });
+    expect(screen.getAllByText('first half second half')).toHaveLength(1);
+    second.unmount();
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    expect(screen.queryByText('first half second half')).not.toBeInTheDocument();
   });
 });
 

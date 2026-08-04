@@ -44,6 +44,74 @@ interface QueuedMessage {
   uploadResults?: UploadResult[];
 }
 
+interface LiveStreamCacheEntry {
+  messages: ChatMessage[];
+  updatedAt: number;
+}
+
+const LIVE_STREAM_CACHE_MAX_TASKS = 16;
+const LIVE_STREAM_CACHE_MAX_ITEMS = 8;
+const LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM = 200_000;
+const LIVE_STREAM_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const liveStreamCache = new Map<number, LiveStreamCacheEntry>();
+
+function taskHasActiveStream(task: Task): boolean {
+  return (
+    task.background_active === true
+    || task.status === 'in_progress'
+    || task.status === 'executing'
+  );
+}
+
+function clearLiveStreamCache(taskId: number): void {
+  liveStreamCache.delete(taskId);
+}
+
+function pruneLiveStreamCache(now: number): void {
+  for (const [taskId, entry] of liveStreamCache) {
+    if (now - entry.updatedAt > LIVE_STREAM_CACHE_TTL_MS) {
+      liveStreamCache.delete(taskId);
+    }
+  }
+  while (liveStreamCache.size > LIVE_STREAM_CACHE_MAX_TASKS) {
+    const oldestTaskId = liveStreamCache.keys().next().value as number | undefined;
+    if (oldestTaskId === undefined) break;
+    liveStreamCache.delete(oldestTaskId);
+  }
+}
+
+function syncLiveStreamCache(taskId: number, messages: ChatMessage[]): void {
+  const liveMessages = messages
+    .filter((message) => (
+      !message.persisted
+      && Boolean(message.stream_item_id)
+      && (message.event_type === 'message' || message.event_type === 'thinking')
+    ))
+    .slice(-LIVE_STREAM_CACHE_MAX_ITEMS)
+    .map((message) => ({
+      ...message,
+      content: message.content?.slice(-LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM) ?? null,
+    }));
+  if (liveMessages.length === 0) {
+    clearLiveStreamCache(taskId);
+    return;
+  }
+
+  const now = Date.now();
+  liveStreamCache.delete(taskId);
+  liveStreamCache.set(taskId, { messages: liveMessages, updatedAt: now });
+  pruneLiveStreamCache(now);
+}
+
+function restoreLiveStreamCache(task: Task): ChatMessage[] {
+  if (!taskHasActiveStream(task)) {
+    clearLiveStreamCache(task.id);
+    return [];
+  }
+  pruneLiveStreamCache(Date.now());
+  return (liveStreamCache.get(task.id)?.messages || []).map((message) => ({ ...message }));
+}
+
 function loadStoredUploadResults(key: string): UploadResult[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(key) || '[]');
@@ -175,7 +243,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return p?.name ?? null;
   }, [task.project_id, projects]);
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
   const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
   const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
   const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
@@ -883,6 +951,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
 
     if (eventType === 'process_exit') {
+      clearLiveStreamCache(task.id);
       // Small delay so any final output messages queued just before
       // process_exit are rendered before the "thinking" indicator hides.
       setTimeout(() => {
@@ -1005,14 +1074,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         if (index >= 0) {
           const next = [...prev];
           next[index] = { ...next[index], content: `${next[index].content || ''}${delta}` };
+          syncLiveStreamCache(task.id, next);
           return next;
         }
-        return [...prev, {
+        const next = [...prev, {
           id: Date.now() + Math.random(), role: 'assistant', event_type: renderedType,
           content: delta, tool_name: null, tool_input: null, tool_output: null,
           is_error: false, loop_iteration: null, timestamp: new Date().toISOString(),
           image_urls: null, attachments: null, stream_item_id: itemId,
         }];
+        syncLiveStreamCache(task.id, next);
+        return next;
       });
       return;
     }
@@ -1065,17 +1137,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         ? prev.filter((candidate) => !candidate.pty_cold_start)
         : prev;
       if (isPersisted) {
-        return mergeChatHistory([entry], current);
+        const next = mergeChatHistory([entry], current);
+        syncLiveStreamCache(task.id, next);
+        return next;
       }
       if (itemId) {
         const index = current.findIndex((candidate) => candidate.stream_item_id === itemId);
         if (index >= 0) {
           const next = [...current];
           next[index] = entry;
+          syncLiveStreamCache(task.id, next);
           return next;
         }
       }
-      return [...current, entry];
+      const next = [...current, entry];
+      syncLiveStreamCache(task.id, next);
+      return next;
     });
   }, [markAskUserResolved, task.id, task.worker_id]);
 
@@ -1134,7 +1211,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           ask_status: 'pending',
         }));
       const snapshot = cards.length ? [...filtered, ...cards] : filtered;
-      setMessages((current) => mergeChatHistory(snapshot, current));
+      setMessages((current) => {
+        const next = mergeChatHistory(snapshot, current);
+        syncLiveStreamCache(task.id, next);
+        return next;
+      });
     }).catch(() => {}).finally(() => setHistoryLoading(false));
   }, [task.id]);
   useEffect(() => {
@@ -1259,10 +1340,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       !backgroundActive
       && ['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)
     ) {
+      clearLiveStreamCache(task.id);
       setSending(false);
       setAutoDequeueFlag(f => f + 1);
     }
-  }, [backgroundActive, effectiveStatus]);
+  }, [backgroundActive, effectiveStatus, task.id]);
 
   // Load chat history
   useEffect(() => {
@@ -2107,7 +2189,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
           )
         )}
-        {sending && (
+        {isProcessing && (
           <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
             <span>{providerLabel} is thinking...</span>

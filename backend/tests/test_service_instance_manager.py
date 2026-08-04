@@ -704,6 +704,22 @@ def test_parse_codex_app_server_message_delta():
     assert event["item_id"] == "msg-1"
 
 
+def test_parse_codex_app_server_reasoning_completion_keeps_item_id():
+    im = InstanceManager(MagicMock(), MagicMock())
+    event = im._parse_codex_line(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "id": "reasoning-1",
+            "type": "reasoning",
+            "text": "final reasoning summary",
+        },
+    }))
+
+    assert event["event_type"] == "thinking"
+    assert event["content"] == "final reasoning summary"
+    assert event["item_id"] == "reasoning-1"
+
+
 # === _build_command tests ===
 
 

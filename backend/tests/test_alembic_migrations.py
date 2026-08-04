@@ -16,7 +16,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import BigInteger, create_engine, inspect, text
 
 # All ORM models must be imported so Base.metadata is complete.
 from backend.database import Base
@@ -455,6 +455,24 @@ class TestFreshMigration:
         assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         assert ("repo_id", "delivery_id") in unique_column_sets
 
+        pr_finding_cols = {
+            item["name"]: item
+            for item in inspect(engine).get_columns("pr_findings")
+        }
+        assert "resolution_lease_token" in pr_finding_cols
+        assert "resolution_lease_expires_at" in pr_finding_cols
+        assert "fixed_resolution_actor" in pr_finding_cols
+        assert "BIGINT" in str(pr_finding_cols["github_comment_id"]["type"]).upper()
+        assert isinstance(
+            Base.metadata.tables["pr_findings"].c.github_comment_id.type,
+            BigInteger,
+        )
+        assert (
+            Base.metadata.tables["monitored_repos"]
+            .c.required_checks.server_default
+            is None
+        )
+
         # Verify alembic_version at head
         with engine.connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
@@ -551,11 +569,11 @@ class TestAlreadyMigratedDb:
             conn.execute(text("""
                 INSERT INTO monitored_repos (
                     repo_full_name, enabled, auto_merge, webhook_secret,
-                    provider, default_branch, allowed_authors, status,
+                    provider, default_branch, allowed_authors, required_checks, status,
                     created_at, updated_at
                 ) VALUES (
                     'owner/default-checks', 1, 0, 'secret', 'codex', 'main',
-                    '[]', 'active', '2026-07-22 00:02:00',
+                    '[]', '[]', 'active', '2026-07-22 00:02:00',
                     '2026-07-22 00:02:00'
                 )
             """))
@@ -571,10 +589,12 @@ class TestAlreadyMigratedDb:
             if item["name"] == "required_checks"
         )
         assert required_column["nullable"] is False
+        assert required_column["default"] is None
         engine.dispose()
 
-    def test_pr_panel_migration_compiles_postgresql_safe_defaults(self):
-        """The migration must never emit PostgreSQL's invalid BOOLEAN DEFAULT 0."""
+    @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
+    def test_pr_panel_migration_compiles_portable_schema(self, dialect_name):
+        """The Panel schema uses portable Boolean/JSON defaults and bigint IDs."""
 
         migration_path = (
             PROJECT_ROOT
@@ -583,7 +603,7 @@ class TestAlreadyMigratedDb:
             / "7a1d4e9c2b60_add_pr_review_panel.py"
         )
         spec = importlib.util.spec_from_file_location(
-            "pr_panel_migration_for_postgresql", migration_path
+            f"pr_panel_migration_for_{dialect_name}", migration_path
         )
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
@@ -594,16 +614,27 @@ class TestAlreadyMigratedDb:
 
         output = io.StringIO()
         context = MigrationContext.configure(
-            dialect_name="postgresql",
+            dialect_name=dialect_name,
             opts={"as_sql": True, "output_buffer": output},
         )
         with patch.object(module, "op", Operations(context)):
             module.upgrade()
         ddl = output.getvalue().lower()
-        assert "boolean default false not null" in ddl
+        if dialect_name == "postgresql":
+            assert "boolean default false not null" in ddl
+            assert "required_checks set not null" in ddl
+            assert "cast('[]' as json)" in ddl
+        else:
+            assert "bool not null default false" in ddl
+            assert "modify required_checks json not null" in ddl
+            assert "required_checks = json_array()" in ddl
         assert "boolean default 0" not in ddl
-        assert "required_checks set not null" in ddl
-        assert "required_checks set default '[]'" in ddl
+        assert all(
+            "default" not in line
+            for line in ddl.splitlines()
+            if "required_checks" in line
+        )
+        assert "github_comment_id bigint" in ddl
 
     def test_base_sha_migration_preserves_existing_snapshot_keys(self, tmp_path):
         db_path = str(tmp_path / "existing_pr_review_snapshot.db")
@@ -683,11 +714,11 @@ class TestAlreadyMigratedDb:
             conn.execute(text("""
                 INSERT INTO monitored_repos (
                     repo_full_name, enabled, auto_merge, webhook_secret,
-                    provider, default_branch, allowed_authors, status,
+                    provider, default_branch, allowed_authors, required_checks, status,
                     created_at, updated_at
                 ) VALUES (
                     'owner/rollback', 1, 0, 'secret', 'claude', 'main', '[]',
-                    'active', '2026-07-31 00:00:00',
+                    '[]', 'active', '2026-07-31 00:00:00',
                     '2026-07-31 00:00:00'
                 )
             """))

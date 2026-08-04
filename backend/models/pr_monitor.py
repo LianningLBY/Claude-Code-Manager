@@ -1,5 +1,6 @@
 from datetime import datetime
 from sqlalchemy import (
+    BigInteger,
     Integer,
     String,
     Text,
@@ -34,7 +35,7 @@ class MonitoredRepo(Base):
         Boolean, default=False, server_default=false()
     )
     required_checks: Mapped[list] = mapped_column(
-        JSON, default=list, nullable=False, server_default="[]"
+        JSON, default=list, nullable=False
     )
     auto_repair: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=false()
@@ -219,7 +220,8 @@ class PRFinding(Base):
     thread_status: Mapped[str] = mapped_column(
         String(30), nullable=False, default="pending", server_default="pending"
     )
-    github_comment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # GitHub database IDs are not bounded by a signed 32-bit SQL INTEGER.
+    github_comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     github_comment_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     github_thread_node_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     thread_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -232,6 +234,11 @@ class PRFinding(Base):
     )
     resolution_lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
+    )
+    # Freeze the authenticated identity before a fixed-head fallback comment
+    # is attempted so crash recovery can authenticate an existing marker.
+    fixed_resolution_actor: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
     )
     base_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     head_sha: Mapped[str] = mapped_column(String(64), nullable=False)

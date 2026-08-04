@@ -65,7 +65,6 @@ def upgrade() -> None:
             "required_checks",
             existing_type=sa.JSON(),
             nullable=False,
-            server_default="[]",
         )
 
     op.create_table(
@@ -154,7 +153,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=30), server_default="open", nullable=False),
         sa.Column("thread_nonce", sa.String(length=64), nullable=False),
         sa.Column("thread_status", sa.String(length=30), server_default="pending", nullable=False),
-        sa.Column("github_comment_id", sa.Integer(), nullable=True),
+        sa.Column("github_comment_id", sa.BigInteger(), nullable=True),
         sa.Column("github_comment_url", sa.String(length=1000), nullable=True),
         sa.Column("github_thread_node_id", sa.String(length=200), nullable=True),
         sa.Column("thread_error", sa.Text(), nullable=True),
@@ -162,6 +161,7 @@ def upgrade() -> None:
         sa.Column("thread_resolved_at", sa.DateTime(), nullable=True),
         sa.Column("resolution_lease_token", sa.String(length=64), nullable=True),
         sa.Column("resolution_lease_expires_at", sa.DateTime(), nullable=True),
+        sa.Column("fixed_resolution_actor", sa.String(length=200), nullable=True),
         sa.Column("base_sha", sa.String(length=64), nullable=False),
         sa.Column("head_sha", sa.String(length=64), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),

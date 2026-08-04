@@ -2,12 +2,14 @@ import asyncio
 from datetime import datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 
 from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import (
     MonitoredRepo,
     PRFinding,
     PRFindingRebuttal,
+    PRMergeQueueAction,
     PRMonitorRun,
     PRReview,
     PRReviewerRun,
@@ -134,6 +136,93 @@ async def _accepted_resolution_fixture(
     db_session.add(rebuttal)
     await db_session.commit()
     return repo, run, review, finding, rebuttal
+
+
+async def _fixed_resolution_fixture(
+    db_session,
+    *,
+    repo_name: str,
+    thread_status: str = "published_fallback",
+    fixed_resolution_actor: str | None = None,
+):
+    new_head = "c" * 40
+    repo = MonitoredRepo(
+        repo_full_name=repo_name,
+        webhook_secret="s" * 64,
+        review_mode="panel",
+        merge_queue_mode="auto",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=29,
+        current_base_sha=BASE,
+        current_head_sha=new_head,
+        status="resolving_fixed_threads",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    old_review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=29,
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="old",
+        pr_author="bot",
+        pr_url=f"https://example.invalid/{repo_name}/pull/29",
+        status="commented",
+    )
+    current_review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=29,
+        base_sha=BASE,
+        head_sha=new_head,
+        pr_title="fixed",
+        pr_author="bot",
+        pr_url=f"https://example.invalid/{repo_name}/pull/29",
+        status="approved",
+        action_taken="lgtm_comment",
+    )
+    db_session.add_all([old_review, current_review])
+    await db_session.flush()
+    run.current_review_id = current_review.id
+    reviewer = PRReviewerRun(
+        pr_review_id=old_review.id,
+        role="qa_engineer",
+        provider="codex",
+        status="changes_required",
+        prompt_policy_hash="8" * 64,
+        guide_pack_hash="9" * 64,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    finding = PRFinding(
+        pr_review_id=old_review.id,
+        reviewer_run_id=reviewer.id,
+        fingerprint="6" * 64,
+        role="qa_engineer",
+        severity="high",
+        category="correctness",
+        path="app.py",
+        line=None if thread_status == "published_fallback" else 3,
+        title="old bug",
+        evidence="bug existed",
+        impact="unsafe",
+        required_fix="fix it",
+        test="regression",
+        base_sha=BASE,
+        head_sha=HEAD,
+        thread_nonce="7" * 48,
+        thread_status=thread_status,
+        github_comment_id=990,
+        fixed_resolution_actor=fixed_resolution_actor,
+    )
+    db_session.add(finding)
+    await db_session.commit()
+    return repo, run, old_review, current_review, finding
 
 
 @pytest.mark.asyncio
@@ -539,11 +628,22 @@ async def test_rebuttal_fallback_resolution_lease_allows_exactly_one_post(
             post_calls += 1
             post_started.set()
             await allow_post.wait()
-            return {"id": 9001}
+            return {
+                "id": 9001,
+                "body": payload["body"],
+                "user": {"login": "ccm-bot"},
+            }
         return [[]]
 
     monkeypatch.setattr(
         "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    async def fake_login():
+        return "ccm-bot"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
     )
     first = asyncio.create_task(reconcile_rebuttal_resolutions(db_factory))
     await asyncio.wait_for(post_started.wait(), timeout=2)
@@ -583,6 +683,13 @@ async def test_cancelled_resolution_leaves_lease_for_expiry_recovery(
 
     monkeypatch.setattr(
         "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    async def fake_login():
+        return "ccm-bot"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
     )
     reconciliation = asyncio.create_task(
         reconcile_rebuttal_resolutions(db_factory)
@@ -761,3 +868,516 @@ async def test_expired_rebuttal_resolution_lease_recovers_existing_effect(
     assert resolved.thread_status == "resolved"
     assert resolved.resolution_lease_token is None
     assert terminal.status == "resolved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("repo_enabled", "run_status"),
+    ((False, "adjudicating"), (True, "paused")),
+)
+async def test_resolved_rebuttal_shortcut_obeys_policy_fence(
+    db_session, db_factory, repo_enabled, run_status
+):
+    repo, run, _, finding, rebuttal = await _accepted_resolution_fixture(
+        db_session,
+        repo_name=f"fake/shortcut-{repo_enabled}-{run_status}",
+        thread_status="published_fallback",
+        github_comment_id=805,
+    )
+    repo.enabled = repo_enabled
+    repo.merge_queue_mode = "auto"
+    run.status = run_status
+    finding.thread_status = "resolved"
+    await db_session.commit()
+
+    assert await reconcile_rebuttal_resolutions(db_factory) == 0
+    terminal = await db_session.get(
+        PRFindingRebuttal, rebuttal.id, populate_existing=True
+    )
+    unchanged_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    actions = list((await db_session.execute(
+        select(PRMergeQueueAction).where(
+            PRMergeQueueAction.monitor_run_id == run.id
+        )
+    )).scalars())
+    assert terminal.status == "accepted"
+    assert unchanged_run.status == run_status
+    assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_fixed_fallback_crash_recovery_uses_frozen_actor(
+    db_session, db_factory, monkeypatch
+):
+    _, _, _, _, finding = await _fixed_resolution_fixture(
+        db_session,
+        repo_name="fake/fixed-actor-recovery",
+        fixed_resolution_actor="account-a",
+    )
+    finding.resolution_lease_token = "b" * 48
+    finding.resolution_lease_expires_at = datetime.utcnow() - timedelta(minutes=1)
+    await db_session.commit()
+    post_calls = login_calls = 0
+    marker = (
+        f"<!-- ccm-finding-fixed:{finding.thread_nonce};"
+        f"finding-head:{finding.head_sha};fixed-head:{'c' * 40} -->"
+    )
+
+    async def fake_gh(_endpoint, *, method="GET", **_kwargs):
+        nonlocal post_calls
+        if method == "POST":
+            post_calls += 1
+            return {"id": 9999}
+        return [[{
+            "id": 9998,
+            "body": marker,
+            "user": {"login": "account-a"},
+        }]]
+
+    async def fake_login():
+        nonlocal login_calls
+        login_calls += 1
+        return "account-b"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile_fixed_finding_resolutions(db_factory) == 1
+    resolved = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    assert resolved.thread_status == "resolved"
+    assert resolved.status == "resolved_fixed"
+    assert resolved.fixed_resolution_actor == "account-a"
+    assert resolved.resolution_lease_token is None
+    assert post_calls == 0
+    assert login_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fixed_fallback_actor_change_refuses_new_post(
+    db_session, db_factory, monkeypatch
+):
+    _, run, _, _, finding = await _fixed_resolution_fixture(
+        db_session,
+        repo_name="fake/fixed-actor-change",
+        fixed_resolution_actor="account-a",
+    )
+    post_calls = 0
+
+    async def fake_gh(_endpoint, *, method="GET", **_kwargs):
+        nonlocal post_calls
+        if method == "POST":
+            post_calls += 1
+            return {"id": 9999}
+        return [[]]
+
+    async def fake_login():
+        return "account-b"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile_fixed_finding_resolutions(db_factory) == 0
+    pending = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    unchanged_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert pending.thread_status == "published_fallback"
+    assert pending.fixed_resolution_actor == "account-a"
+    assert pending.resolution_lease_token is None
+    assert "actor changed" in pending.thread_error
+    assert unchanged_run.status == "resolving_fixed_threads"
+    assert post_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_rebuttal_fallback_actor_change_refuses_new_post(
+    db_session, db_factory, monkeypatch
+):
+    _, _, _, finding, rebuttal = await _accepted_resolution_fixture(
+        db_session,
+        repo_name="fake/rebuttal-actor-change",
+        thread_status="published_fallback",
+        github_comment_id=806,
+    )
+    rebuttal.resolution_actor = "account-a"
+    await db_session.commit()
+    post_calls = 0
+
+    async def fake_gh(_endpoint, *, method="GET", **_kwargs):
+        nonlocal post_calls
+        if method == "POST":
+            post_calls += 1
+            return {"id": 9999}
+        return [[]]
+
+    async def fake_login():
+        return "account-b"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile_rebuttal_resolutions(db_factory) == 0
+    pending = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    accepted = await db_session.get(
+        PRFindingRebuttal, rebuttal.id, populate_existing=True
+    )
+    assert pending.thread_status == "published_fallback"
+    assert pending.resolution_lease_token is None
+    assert "actor changed" in pending.thread_error
+    assert accepted.status == "accepted"
+    assert accepted.resolution_actor == "account-a"
+    assert post_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_rebuttal_fallback_crash_recovery_uses_frozen_actor(
+    db_session, db_factory, monkeypatch
+):
+    _, _, _, finding, rebuttal = await _accepted_resolution_fixture(
+        db_session,
+        repo_name="fake/rebuttal-actor-recovery",
+        thread_status="published_fallback",
+        github_comment_id=807,
+    )
+    rebuttal.resolution_actor = "account-a"
+    finding.resolution_lease_token = "c" * 48
+    finding.resolution_lease_expires_at = datetime.utcnow() - timedelta(minutes=1)
+    await db_session.commit()
+    post_calls = login_calls = 0
+    marker = (
+        f"<!-- ccm-finding-resolution:{rebuttal.resolution_nonce};"
+        f"head:{finding.head_sha};fingerprint:{finding.fingerprint} -->"
+    )
+
+    async def fake_gh(_endpoint, *, method="GET", **_kwargs):
+        nonlocal post_calls
+        if method == "POST":
+            post_calls += 1
+            return {"id": 9999}
+        return [[{
+            "id": 9998,
+            "body": marker,
+            "user": {"login": "account-a"},
+        }]]
+
+    async def fake_login():
+        nonlocal login_calls
+        login_calls += 1
+        return "account-b"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile_rebuttal_resolutions(db_factory) == 1
+    resolved = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    terminal = await db_session.get(
+        PRFindingRebuttal, rebuttal.id, populate_existing=True
+    )
+    assert resolved.thread_status == "resolved"
+    assert terminal.status == "resolved"
+    assert post_calls == 0
+    assert login_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("rebuttal", "fixed"))
+async def test_fallback_resolution_requires_remote_marker_evidence(
+    db_session, db_factory, monkeypatch, kind
+):
+    if kind == "rebuttal":
+        _, _, _, finding, rebuttal = await _accepted_resolution_fixture(
+            db_session,
+            repo_name="fake/rebuttal-malformed-response",
+            thread_status="published_fallback",
+            github_comment_id=808,
+        )
+        reconcile = reconcile_rebuttal_resolutions
+    else:
+        _, _, _, _, finding = await _fixed_resolution_fixture(
+            db_session,
+            repo_name="fake/fixed-malformed-response",
+        )
+        rebuttal = None
+        reconcile = reconcile_fixed_finding_resolutions
+    post_calls = list_calls = 0
+
+    async def fake_gh(_endpoint, *, method="GET", **_kwargs):
+        nonlocal post_calls, list_calls
+        if method == "POST":
+            post_calls += 1
+            # An id alone is not proof that the exact marker was durably
+            # published by the frozen identity.
+            return {"id": 12345}
+        list_calls += 1
+        return [[]]
+
+    async def fake_login():
+        return "ccm-bot"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile(db_factory) == 0
+    pending = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    assert pending.thread_status == "published_fallback"
+    assert pending.resolution_lease_token is None
+    assert "malformed" in pending.thread_error
+    if rebuttal is not None:
+        accepted = await db_session.get(
+            PRFindingRebuttal, rebuttal.id, populate_existing=True
+        )
+        assert accepted.status == "accepted"
+    assert post_calls == 1
+    assert list_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_near_expiry_resolution_lease_cannot_start_post(
+    db_session, db_factory, monkeypatch
+):
+    _, _, _, finding, rebuttal = await _accepted_resolution_fixture(
+        db_session,
+        repo_name="fake/near-expiry",
+        thread_status="published_fallback",
+        github_comment_id=809,
+    )
+    list_calls = post_calls = login_calls = 0
+
+    async def fake_gh(_endpoint, *, method="GET", **_kwargs):
+        nonlocal list_calls, post_calls
+        if method == "POST":
+            post_calls += 1
+            return {"id": 9999}
+        list_calls += 1
+        async with db_factory() as other_db:
+            leased = await other_db.get(PRFinding, finding.id)
+            leased.resolution_lease_expires_at = (
+                datetime.utcnow() + timedelta(seconds=5)
+            )
+            await other_db.commit()
+        return [[]]
+
+    async def fake_login():
+        nonlocal login_calls
+        login_calls += 1
+        return "ccm-bot"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile_rebuttal_resolutions(db_factory) == 0
+    pending = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    accepted = await db_session.get(
+        PRFindingRebuttal, rebuttal.id, populate_existing=True
+    )
+    assert pending.thread_status == "published_fallback"
+    assert pending.resolution_lease_token is None
+    assert accepted.status == "accepted"
+    assert list_calls == 1
+    assert login_calls == 0
+    assert post_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fixed_finish_rechecks_repo_after_remote_effect(
+    db_session, db_factory, monkeypatch
+):
+    repo, run, _, _, finding = await _fixed_resolution_fixture(
+        db_session,
+        repo_name="fake/fixed-finish-fence",
+    )
+
+    async def fake_gh(_endpoint, *, method="GET", payload=None, **_kwargs):
+        if method != "POST":
+            return [[]]
+        async with db_factory() as other_db:
+            changed_repo = await other_db.get(MonitoredRepo, repo.id)
+            changed_repo.enabled = False
+            await other_db.commit()
+        return {
+            "id": 12346,
+            "body": payload["body"],
+            "user": {"login": "ccm-bot"},
+        }
+
+    async def fake_login():
+        return "ccm-bot"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile_fixed_finding_resolutions(db_factory) == 0
+    pending = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    unchanged_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert pending.thread_status == "published_fallback"
+    assert pending.resolution_lease_token is None
+    assert unchanged_run.status == "resolving_fixed_threads"
+
+
+@pytest.mark.asyncio
+async def test_rebuttal_finish_rechecks_run_after_remote_effect(
+    db_session, db_factory, monkeypatch
+):
+    _, run, _, finding, rebuttal = await _accepted_resolution_fixture(
+        db_session,
+        repo_name="fake/rebuttal-finish-fence",
+        thread_status="published_fallback",
+        github_comment_id=810,
+    )
+
+    async def fake_gh(_endpoint, *, method="GET", payload=None, **_kwargs):
+        if method != "POST":
+            return [[]]
+        async with db_factory() as other_db:
+            changed_run = await other_db.get(PRMonitorRun, run.id)
+            changed_run.status = "paused"
+            await other_db.commit()
+        return {
+            "id": 12347,
+            "body": payload["body"],
+            "user": {"login": "ccm-bot"},
+        }
+
+    async def fake_login():
+        return "ccm-bot"
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        fake_login,
+    )
+
+    assert await reconcile_rebuttal_resolutions(db_factory) == 0
+    pending = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    accepted = await db_session.get(
+        PRFindingRebuttal, rebuttal.id, populate_existing=True
+    )
+    unchanged_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert pending.thread_status == "published_fallback"
+    assert pending.resolution_lease_token is None
+    assert accepted.status == "accepted"
+    assert unchanged_run.status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_fixed_gate_rechecks_repo_after_finding_commit(
+    db_session, db_factory, monkeypatch
+):
+    from backend.services import pr_review_adjudication as adjudication_service
+
+    repo, run, _, _, finding = await _fixed_resolution_fixture(
+        db_session,
+        repo_name="fake/fixed-gate-fence",
+        thread_status="published_inline",
+    )
+    original_finish = adjudication_service._finish_fixed_resolution
+
+    async def finish_then_disable(*args, **kwargs):
+        finished = await original_finish(*args, **kwargs)
+        if finished:
+            async with db_factory() as other_db:
+                changed_repo = await other_db.get(MonitoredRepo, repo.id)
+                changed_repo.enabled = False
+                await other_db.commit()
+        return finished
+
+    async def fake_gh(_endpoint, *, payload=None, **_kwargs):
+        if "mutation" in payload["query"]:
+            return {"data": {"resolveReviewThread": {"thread": {
+                "id": "FIXED-T1", "isResolved": True,
+            }}}}
+        return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "nodes": [{
+                "id": "FIXED-T1",
+                "isResolved": False,
+                "comments": {"nodes": [{"databaseId": 990}]},
+            }],
+            "pageInfo": {"hasNextPage": False},
+        }}}}}
+
+    monkeypatch.setattr(
+        adjudication_service, "_finish_fixed_resolution", finish_then_disable
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_api_value", fake_gh
+    )
+
+    assert await reconcile_fixed_finding_resolutions(db_factory) == 1
+    resolved = await db_session.get(PRFinding, finding.id, populate_existing=True)
+    held_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    actions = list((await db_session.execute(
+        select(PRMergeQueueAction).where(
+            PRMergeQueueAction.monitor_run_id == run.id
+        )
+    )).scalars())
+    assert resolved.thread_status == "resolved"
+    assert held_run.status == "resolving_fixed_threads"
+    assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_fixed_no_finding_recovery_obeys_disabled_repo_fence(
+    db_session, db_factory
+):
+    repo, run, _, _, finding = await _fixed_resolution_fixture(
+        db_session,
+        repo_name="fake/fixed-empty-gate-fence",
+    )
+    repo.enabled = False
+    finding.status = "resolved_fixed"
+    finding.thread_status = "resolved"
+    finding.thread_resolved_at = datetime.utcnow()
+    await db_session.commit()
+
+    assert await reconcile_fixed_finding_resolutions(db_factory) == 0
+    held_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    actions = list((await db_session.execute(
+        select(PRMergeQueueAction).where(
+            PRMergeQueueAction.monitor_run_id == run.id
+        )
+    )).scalars())
+    assert held_run.status == "resolving_fixed_threads"
+    assert actions == []

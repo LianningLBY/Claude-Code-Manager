@@ -1212,6 +1212,68 @@ async def test_safety_reset_does_not_complete_unbound_recovery_task(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_safety_reset_releases_dead_owner_after_retry_advanced(db_factory):
+    """A completed retry transition must not strand its previous Instance."""
+
+    from backend.services.instance_manager import InstanceManager
+
+    d = _make_dispatcher(db_factory)
+    d.instance_manager = InstanceManager(db_factory, d.broadcaster)
+    old_task_started = datetime.utcnow()
+    old_instance_started = datetime.utcnow()
+    async with db_factory() as db:
+        task = Task(
+            title="retry-advanced",
+            status="executing",
+            retry_count=0,
+            started_at=old_task_started,
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="dead-first-attempt",
+            status="running",
+            pid=812_202,
+            current_task_id=task.id,
+            started_at=old_instance_started,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        old_generation = d._task_lifecycle_generation(task)
+        task_id, instance_id = task.id, instance.id
+
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status="pending",
+                retry_count=1,
+                instance_id=None,
+                started_at=None,
+            )
+        )
+        await db.commit()
+
+    with patch(
+        "backend.services.instance_manager.os.kill",
+        side_effect=ProcessLookupError,
+    ):
+        await d._reset_instance_if_stale(instance_id, old_generation)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == "pending"
+        assert task.retry_count == 1
+        assert task.instance_id is None
+        assert instance.status == "idle"
+        assert instance.pid is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_safety_reset_skips_already_idle_instance(db_factory):
     """If instance is already idle (consume_output cleaned up), safety net is a no-op."""
     d = _make_dispatcher(db_factory)

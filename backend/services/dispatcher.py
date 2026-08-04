@@ -6615,6 +6615,79 @@ class GlobalDispatcher:
                 instance_id,
                 generation.task_id,
             )
+        finally:
+            await self._reconcile_superseded_reverse_task_owners(
+                generation.task_id
+            )
+
+    async def _reconcile_superseded_reverse_task_owners(
+        self,
+        task_id: int,
+    ) -> None:
+        """Release dead retry owners after Task authority moved elsewhere.
+
+        A failed lifecycle can durably advance a Task to its next retry before
+        its own ``finally`` runs. The ordinary exact-generation reset must then
+        refuse to adopt the newer Task row, but its dead reverse Instance owner
+        still needs a later exact cleanup. Snapshot only non-authoritative
+        reverse owners here; ``InstanceManager`` revalidates the Task, PID,
+        start identity, runtime maps, and launch reservations under its
+        per-instance lock before changing anything.
+        """
+
+        try:
+            async with self.db_factory() as db:
+                task = await db.get(Task, task_id)
+                if (
+                    task is None
+                    or task.worker_id is not None
+                    or task.shared_from_id is not None
+                    or (
+                        task.status in {"in_progress", "executing"}
+                        and task.instance_id is None
+                    )
+                ):
+                    return
+                authoritative_instance_id = task.instance_id
+                candidate_predicates = [
+                    Instance.current_task_id == task_id,
+                ]
+                if authoritative_instance_id is not None:
+                    candidate_predicates.append(
+                        Instance.id != authoritative_instance_id
+                    )
+                candidates = list(
+                    (
+                        await db.execute(
+                            select(
+                                Instance.id,
+                                Instance.pid,
+                                Instance.started_at,
+                            )
+                            .where(*candidate_predicates)
+                            .order_by(Instance.id)
+                        )
+                    ).all()
+                )
+                await db.rollback()
+
+            for candidate in candidates:
+                await (
+                    self.instance_manager
+                    .reconcile_dead_reverse_task_owner(
+                        candidate.id,
+                        expected_task_id=task_id,
+                        expected_pid=candidate.pid,
+                        expected_started_at=candidate.started_at,
+                    )
+                )
+        except Exception:
+            # The stale row remains a deployment/capacity blocker, so a failed
+            # reconciliation is fail-closed and can be retried safely.
+            logger.exception(
+                "Failed to reconcile superseded reverse owners for task %s",
+                task_id,
+            )
 
     async def _run_pool_retry(
         self,

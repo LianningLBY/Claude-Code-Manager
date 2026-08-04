@@ -460,6 +460,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
+  useEffect(() => {
+    if (!stillRunning) return;
+    const timer = window.setTimeout(() => {
+      setStillRunning(false);
+      onTaskUpdated?.();
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [onTaskUpdated, stillRunning]);
   const planAttentionCount = versionedPlans.filter((plan) =>
     ['waiting_user', 'awaiting_review', 'planner', 'reviewer', 'queued', 'running'].includes(plan.display_state)
     || (plan.display_state === 'approved' && Boolean(plan.current_version && !plan.current_version.applied))
@@ -731,6 +739,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     );
     if (isStatusChange) {
       const newStatus = (msg.data!.new_status as string) || '';
+      const nextBackground = msg.data!.background_active;
       if (typeof msg.data!.background_active === 'boolean') {
         lastWsBackgroundAt.current = Date.now();
         setLocalBackgroundActive(msg.data!.background_active);
@@ -738,6 +747,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (newStatus) {
         lastWsStatusAt.current = Date.now();
         setLocalStatus(newStatus);
+      }
+      if (
+        ['completed', 'failed', 'cancelled', 'conflict'].includes(newStatus)
+        && nextBackground !== true
+      ) {
+        setStillRunning(false);
       }
       return;
     }
@@ -959,6 +974,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           return;
         }
         setSending(false);
+        setStillRunning(false);
         setLocalStatus(null);  // Reset — status_change WS may have been missed
         setAutoDequeueFlag(f => f + 1);
         // Replace live-only bubbles with their persisted LogEntry ids so every
@@ -1872,12 +1888,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     }
                   } catch (interruptError) {
                     setSending(false);
-                    setStillRunning(true);
+                    const noRunningSession = isApiRequestError(interruptError)
+                      && interruptError.status === 400
+                      && String(interruptError.detail || '').toLowerCase().includes('no running session');
+                    setStillRunning(!noRunningSession);
                     setLocalStatus(null);
                     setError(
-                      `Interrupt failed: ${interruptError instanceof Error
-                        ? interruptError.message
-                        : String(interruptError)}`,
+                      noRunningSession
+                        ? 'Interrupt: the session had already finished before the stop request arrived.'
+                        : `Interrupt failed: ${interruptError instanceof Error
+                          ? interruptError.message
+                          : String(interruptError)}`,
                     );
                   }
                   finally { setInterrupting(false); }

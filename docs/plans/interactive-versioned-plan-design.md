@@ -60,9 +60,11 @@ Standalone Plan
 
 1. **Task 是主 Session/执行工作，Plan 是规划制品，Run 是后台执行。** 三者不共享状态。
 2. **Plan ID 稳定。** 普通 Revise 不再创建新 Plan；只有用户明确新建/分叉规划目标时才创建。
-3. **Version 不可变。** 每次 Planner 成功输出完整 Markdown 都创建一个新 Version。
-4. **Reviewer 审查精确 Version。** Reviewer 结论、用户审批、应用和执行 Task 都绑定
-   `plan_version_id`。
+3. **Version 不可变且只代表完整 Pipeline 产物。** Planner 的中间输出先作为 Run-scoped
+   candidate draft 保存；Reviewer 的内部对抗轮次只替换 candidate。Pipeline 完成时才原子创建
+   一个 Version。
+4. **Reviewer 审查精确 candidate，用户操作绑定精确 Version。** Reviewer 最终结论与 candidate
+   一起发布；用户审批、应用和执行 Task 都绑定 `plan_version_id`。
 5. **澄清不是修订。** Planner/Reviewer 缺少必要输入时暂停当前 Run；回答后恢复同一 Run，
    不创建新 Plan，也不创建新 Run。
 6. **成品 Revise 是新 Run。** 用户对 reviewable/approved/rejected Version 提交修改意见时，
@@ -86,7 +88,8 @@ Standalone Plan
 - 用户回答可带文本、选项和最多 10 个现有安全上传附件；
 - 服务重启、WebSocket 断线、Worker 短暂离线后仍能恢复等待状态；
 - 用户 Revise 不再制造新的用户可见 Plan/Task；
-- Reviewer 自动 revision round 与用户主动 revision 统一进入同一版本图；
+- Reviewer 自动 revision round 留在同一个 Run 内；只有用户主动 revision/refresh Run 才产出
+  下一个 Version；
 - 审批、拒绝、应用、创建执行 Task 都有精确 Version 审计；
 - 保留当前 primary/fallback 选号、只读沙箱、staleness、ACL、Worker 和部署安全约束；
 - 精确迁移 `origin/main` 可产生的单 carrier Plan Task、审批和执行状态，不承诺保留本功能分支
@@ -128,7 +131,7 @@ Plan 不保存“planning/reviewing/waiting”这类运行状态；API 根据 ac
 
 ### 2.3 PlanVersion
 
-一次 Planner 成功输出的完整、不可变方案快照。它保存：
+一次完整 Planner/Reviewer Pipeline 的最终、不可变方案快照。它保存：
 
 - `plan_id`、单调递增的 `version_number`；
 - `parent_version_id`；
@@ -140,8 +143,9 @@ Plan 不保存“planning/reviewing/waiting”这类运行状态；API 根据 ac
 - `superseded_by_version_id`（仅表达“不是当前版本”，不删除历史决策）。
 
 同一 Plan 下 `(plan_id, version_number)` 唯一。Version 正文和上下文一经创建不得更新；
-Reviewer 结果、人类 decision 和 superseded 指针只允许各自完成一次受 CAS 保护的状态转换。
-任何会改变方案正文的操作都创建下一个 Version。
+Reviewer 结果与正文在 Version 发布时一并确定；人类 decision 和 superseded 指针只允许各自完成
+一次受 CAS 保护的状态转换。Reviewer 在同一 Run 内要求修改只替换 candidate，不创建 Version；
+用户显式启动会改变成品正文的新 Run 才创建下一个 Version。
 
 ### 2.4 PlanRun / Pipeline Run
 
@@ -153,7 +157,8 @@ Reviewer 结果、人类 decision 和 superseded 指针只允许各自完成一�
 - `retry`：仅用于管理员显式重跑 terminal operational failure，保留来源 Run。
 
 Run 保存冻结的 Pipeline 配置、request/feedback、base Version、上下文快照、Worker 路由、
-当前 stage/round、generation、结果 Version 和错误。一个 Plan 同时最多一个 active Run。
+当前 stage/round、generation、完整 candidate draft/来源 Step/repo 指纹、结果 Version 和错误。
+一个 Plan 同时最多一个 active Run。
 
 “Pipeline”专指 Planner/Reviewer 的定义和配置；“PlanRun”才是这套定义的一次执行实例。
 修改全局 Pipeline 设置不会漂移已创建 Run。
@@ -161,8 +166,8 @@ Run 保存冻结的 Pipeline 配置、request/feedback、base Version、上下�
 ### 2.5 PlanStep
 
 单次 Planner 或 Reviewer 模型调用，继续沿用当前 route、account、provider/model/effort、
-output/error 和起止时间审计。Step 的原始输出可截断用于诊断；完整方案必须进入
-PlanVersion，不能依赖 step 日志恢复。
+output/error 和起止时间审计。Step 的原始输出可截断用于诊断；当前完整候选保存在 Run，
+Pipeline 完成后复制到 PlanVersion，不能依赖 step 日志恢复。
 
 ### 2.6 PlanInputRequest
 
@@ -222,21 +227,23 @@ Planner 返回 `request_input` 后：
    Instance owner；
 5. 前端在 `Plans requiring action` 的 `Input needed` 分组显示请求；
 6. 用户回答后 Run 原子地回到 `queued`；
-7. 新 Planner Step 使用原请求、冻结上下文、全部既有问答和已有 Version 继续规划。
+7. 新 Planner Step 使用原请求、冻结上下文、全部既有问答、base Version 和当前 candidate
+   继续规划。
 
 如果提问发生在第一版方案之前，不创建空 Version。
 
 ### 3.4 Reviewer 请求输入
 
-Reviewer 只能在某个明确 Version 上提问。回答后统一回到 Planner，由 Planner 把用户决定写进
-一个新的完整 Version，再交 Reviewer 复审。这样批准的 Markdown 本身包含所有关键决定，
-不会依赖不可见的问答历史才能正确实施。
+Reviewer 只能在某个明确 candidate 上提问。回答后回到同一个 Run，由 Planner 把用户决定写进
+更新后的完整 candidate，再交 Reviewer 复审。回答在 active Run 详情即时展示；Pipeline 完成后
+通过 `produced_by_run_id` 成为最终 Version 的输入审计。这样批准的 Markdown 本身包含所有关键
+决定，不会依赖不可见的问答历史才能正确实施。
 
 ### 3.5 Reviewer 要求修改
 
-Reviewer 的 `revise` 反馈仍在同一个 Run 内返回 Planner；Planner 下一次成功输出创建新的
-Version。达到 `max_revision_cycles` 后，最新 Version 标记 `review_exhausted` 并交给用户，
-不自动失败。
+Reviewer 的 `revise` 反馈仍在同一个 Run 内返回 Planner；Planner 下一次成功输出覆盖 Run 的
+candidate，不增加 Version number。达到 `max_revision_cycles` 后，最新 candidate 以一个
+`review_exhausted` Version 发布并交给用户，不自动失败。
 
 ### 3.6 用户请求 Revise
 
@@ -301,7 +308,7 @@ queued
 - `waiting_user` 不得有任何运行 owner；
 - `waiting_user` 必须引用一个 `open` InputRequest；
 - `completed` 必须引用 `result_version_id`；
-- `failed/cancelled` 可以没有 Version；已生成的旧 Version 仍保留；
+- `failed/cancelled` 不发布本 Run 的 candidate Version；Run 审计和此前 Version 仍保留；
 - terminal Run 永不复活，重试创建新 Run；
 - 一个 Plan 最多一个 `queued|running|waiting_user` Run。
 
@@ -309,7 +316,7 @@ queued
 
 Version 内容不可变，两个正交维度分别记录：
 
-- Reviewer：`unreviewed|approve|revise|request_input|exhausted|disabled`；
+- Reviewer：`approve|exhausted|disabled`（旧迁移数据可以保留 `unreviewed|revise`）；
 - 人类 decision：`pending|approved|rejected`。
 
 新 Version 成为 `plans.current_version_id` 时，旧 current Version 写
@@ -317,9 +324,9 @@ Version 内容不可变，两个正交维度分别记录：
 全局 `Plans requiring action` 的 review/execute 分组。
 
 API 另行派生 Version 的用户可见 `display_state`，不得把正交字段直接拼成标签。优先级为
-`applied → rejected → approved → superseded → awaiting_review → draft`。因此未经人类决定就被
-Revise 的历史 Version 保留 `human_decision=pending` 审计事实，但显示为
-`Superseded (not decided)`；`pending + applied` 属于数据不变量破坏，必须修复而不能展示。
+`applied → rejected → approved → superseded → awaiting_review → draft`。`draft` 仅用于兼容旧迁移
+数据；新 Pipeline 的中间 candidate 不进入 Version 列表。`pending + applied` 属于数据不变量
+破坏，必须修复而不能展示。
 
 ### 4.3 Plan 展示状态
 
@@ -394,7 +401,8 @@ Reviewer verdict：
 - header 最长 20、question 最长 2,000、reason 最长 4,000；
 - 仅使用结构化输出总大小、单字段长度和现有模型输出上限保护传输/存储，不以问题条数拒绝；
 - 每个 Run 默认最多 3 次用户交互，可在全局 Pipeline 设置中配置 0–5；
-- 达到上限仍请求输入时 Run 失败并保留最新 Version，不伪装成 reviewable；
+- 达到上限仍请求输入时 Run 失败并保留 candidate 审计，但不发布新 Version、不伪装成
+  reviewable；
 - prompt 明确禁止询问能从 repo 获取的信息、无关偏好、secret 或扩大任务权限的问题。
 
 ### 5.4 恢复 Prompt
@@ -404,12 +412,12 @@ Reviewer verdict：
 1. Plan 初始请求及附件清单；
 2. Run 类型、用户 revision feedback、base Version；
 3. 冻结的主 Task transcript；
-4. 已生成 Version 和 Reviewer feedback；
+4. base Version、当前 candidate 和 Reviewer feedback；
 5. 按时间排序的全部 InputRequest/answers；
 6. 当前 repo 指纹及与 Run 开始时的变化提示。
 
 Plan 答案不写回主 Task LogEntry；它只属于 Plan。等待期间主 Session 的新消息不会静默进入
-当前 Run。用户需要纳入最新对话时显式选择 `Refresh context`，创建新 Run。
+当前 Run。用户需要纳入最新对话时显式选择 `Refresh contexts and regenerate Plan`，创建新 Run。
 
 ## 6. 数据模型
 
@@ -462,6 +470,7 @@ UPDATE API。
 第一阶段保留物理表名以降低迁移风险，领域和 API 名称统一为 PlanRun：
 
 - 新增 `plan_id`、`run_type`、`base_version_id`、`result_version_id`；
+- 新增 `draft_content/draft_step_id/draft_repo_revision` 保存完整 Run-scoped candidate；
 - 新增 `request_text`、附件、context snapshot/repo revision；
 - 新增 `current_stage`、`generation`、`worker_id`、`instance_id`；
 - 新增 `open_input_request_id`、`interaction_count`；
@@ -475,7 +484,8 @@ UPDATE API。
 - 新增 `plan_id`、`version_id`、`input_request_id`、`generation`；
 - `step_type=planner|reviewer`；
 - step 状态增加 `cancelled`，不得用 process exit 0 掩盖结构化 fatal error；
-- output 仍为有界诊断副本，Version content 为完整权威数据。
+- output 仍为有界诊断副本；active Run 的 `draft_content` 是完整候选，completed Run 的 Version
+  content 是最终权威数据。
 
 ### 6.5 `plan_input_requests`
 
@@ -544,14 +554,17 @@ target_session_id, user_log_id, execution_task_id, applied_by, created_at`。
 
 ### 7.4 Version exactly-once
 
-Planner Step 成功解析后，在同一事务中：
+Reviewer 最终 approve/disabled/exhausted 后，在同一事务中：
 
 1. 按 Plan counter/CAS 分配下一个 `version_number`；
 2. 插入 Version，`produced_by_step_id` 唯一；
 3. 链接旧 current 的 `superseded_by_version_id`；
-4. 更新 `plans.current_version_id` 和 step.version_id。
+4. 写入最终 Reviewer 结论并更新 `plans.current_version_id`、`run.result_version_id` 和
+   planner step.version_id；
+5. Run → completed，释放 `active_run_id`。
 
-服务重启重放同一 Step 时通过 `produced_by_step_id` 找回既有 Version，不能重复创建 vN/vN+1。
+Planner 每轮 propose 只更新 Run candidate。服务重启重放最终提交时通过 `produced_by_step_id`
+找回既有 Version，不能重复创建 vN/vN+1。
 
 ### 7.5 恢复规则
 
@@ -564,11 +577,13 @@ Planner Step 成功解析后，在同一事务中：
   严格只读，可以安全重新调用，但必须保留失败尝试与成本审计；
 - owner 证据不确定：fail closed，禁止启动重复 Step；
 - InputRequest 已 answered 但 wake 丢失：reconciler 把合法 Run 恢复为 queued；
-- Run 已产生 Version 但 terminal update 中断：按 step/version 唯一键完成对账，不重新调用模型。
+- 最终 Version/terminal commit 是同一数据库事务，不存在用户可见的半完成 Version；提交结果未知
+  时按 step/version 唯一键对账，不重新调用模型。
 
 ### 7.6 取消
 
-- Cancel Run：精确停止当前 Step，取消 open InputRequest，Run → cancelled，保留已有 Version；
+- Cancel Run：精确停止当前 Step，取消 open InputRequest，Run → cancelled，保留 candidate 审计但
+  不发布为 Version；
 - Archive Plan：有 active Run 时先要求用户显式 Cancel，不能隐式强杀；
 - Stop/Interrupt 主 Task 不影响 PlanRun；Cancel PlanRun 不影响主 Task；
 - 所有停止都沿用 exact PID/start identity、Codex turn id 和 generation 安全规则。
@@ -626,7 +641,7 @@ advance(run_id, generation)
 ```
 
 每次 `advance` 至多运行一个模型 Step，随后把下一个状态持久化并重新入队；不要在一个巨大
-协程里跨多个模型调用和长期用户等待。Planner 产出待审 Version 后设置
+协程里跨多个模型调用和长期用户等待。Planner 更新待审 candidate 后设置
 `queued/current_stage=reviewer`，Reviewer revise 后设置 `queued/current_stage=planner`；两者都在
 确认当前 Step 的原生资源已清理后释放 owner。这使 shutdown、Worker relay、重启恢复和测试
 更简单。
@@ -647,8 +662,8 @@ Provider 约束保持不变：
 - 初始/refresh/user_revision Run 创建时冻结主 Task 对话和 session 快照；
 - 同一 Run 内的用户问答追加到 Plan context，不写主 Task LogEntry；
 - 等待期间主 Task 新消息不自动并入；
-- 每次 Planner 输出 Version 时重新记录当时 repo 指纹；
-- Reviewer 只审查 Version 对应内容和实际 repo 状态，并记录审查时指纹变化。
+- 每次 Planner 更新 candidate 时重新记录当时 repo 指纹；
+- Reviewer 只审查 candidate 对应内容和实际 repo 状态，并记录审查时指纹变化。
 
 ### 10.2 附件
 
@@ -669,7 +684,8 @@ Approve、Apply、创建 execution Task 时基于**目标 Version 的** context/
   不强制 Refresh/Re-plan；
 - 目标 Task/Project/Worker 不可用 → hard conflict；
 - 普通过期或迁移快照缺失首次 409，用户显式确认后继续；Reject 不要求确认；
-- `Refresh context` 不修改旧 Version，而是同一 Plan 下创建新 Run/Version。
+- `Refresh contexts and regenerate Plan` 仅在检测到 stale 时展示；它不修改旧 Version，而是在
+  同一 Plan 下创建新 Run，并在 Pipeline 完成后发布新 Version。
 
 ## 11. Worker 与分布式协议
 
@@ -691,8 +707,9 @@ Approve、Apply、创建 execution Task 时基于**目标 Version 的** context/
 - Pipeline config；
 - 已有 Version/Reviewer/Input history 的有界恢复上下文。
 
-Step outcome 回传使用 exact generation 和 idempotency key。Manager 只有在 Worker 结果与当前
-Plan.active_run_id、Run generation 同时匹配时才提交。
+Worker protocol v2 同步 Run candidate 与最终 Version 的边界。Step outcome 回传使用 exact
+generation 和 idempotency key。Manager 只有在 Worker 结果与当前 Plan.active_run_id、Run
+generation 同时匹配时才提交；protocol v1 Worker 必须 fail closed，避免把中间草稿导入 Version。
 
 ### 11.3 Worker 迁移
 
@@ -1000,10 +1017,11 @@ thread、Instance owner 或部署 blocker。
 - 一个 Task 创建多个 Plan，Plan id 稳定且互不覆盖；
 - 同一 Plan 的 Version number 严格单调且 content 不可更新；
 - 同一 Plan 并发创建 Run 只有一个成功；
-- Planner propose 创建 Version；非法 union 不创建 Version；
+- Planner propose 更新 Run candidate，不创建 Version；非法 union 不更新 candidate；
 - Planner request_input：Run waiting、无 Version、open request；
-- Reviewer request_input：answer 后回 Planner并产出包含回答的新 Version；
-- Reviewer revise 多轮 Version 链和上限；
+- Reviewer request_input：answer 后回 Planner并更新包含回答的 candidate，最终只产出一个
+  Version；
+- Reviewer revise 多轮只覆盖 candidate，达到上限才发布一个 exhausted Version；
 - 用户 Revise 新 Run/Version但 Plan 不变；Fork 创建新 Plan；
 - answer CAS、idempotency、错误 schema、重复/竞态回答；
 - terminal Run 不可复活；cancel 保留旧 Version；
@@ -1034,7 +1052,7 @@ thread、Instance owner 或部署 blocker。
 - read-only repo fingerprint 前后相同；
 - cleanup 不确定时 fail closed；
 - 恢复 prompt 包含全部问答但不包含等待期间未显式刷新的主消息；
-- step output 截断不影响完整 Version；
+- step output 截断不影响完整 Run candidate/最终 Version；
 - 重放 step outcome 不重复创建 Version。
 
 ### 19.4 Dispatcher/termination/update 测试
@@ -1156,8 +1174,9 @@ thread、Instance owner 或部署 blocker。
 - Main-compatible 旧 Plan Task 的 v1/decision/carrier application 无丢失且 legacy URL 可解析；
 - 旧 Plan Task 继续出现在 Tasks list/count/search，且 Plan 决策只允许在 canonical Plan 执行；
 - 本机与 Worker 行为对等；
-- Worker protocol v1 先握手，再以 attachment size/SHA-256 manifest、generation CAS 和 durable
-  application receipt 验证导入/回答/应用；丢失 HTTP ACK 可按 receipt 查询恢复，不能重复应用；
+- Worker protocol v2 先握手并同步 Run candidate/final Version 边界，再以 attachment
+  size/SHA-256 manifest、generation CAS 和 durable application receipt 验证导入/回答/应用；
+  protocol v1 必须拒绝，丢失 HTTP ACK 可按 receipt 查询恢复，不能重复应用；
 - 后端全量测试、前端全量测试、生产构建、Ruff、ESLint、Alembic current/head 通过；
 - SQLite 自动迁移在备份副本完成，PostgreSQL/MySQL 依项目部署规范人工演练；
 - 完成本文 20 节手工验收；
@@ -1173,7 +1192,7 @@ thread、Instance owner 或部署 blocker。
 | 本分支中间 Plan schema 污染生产事实 | 只认 Main-compatible carrier；reconciliation 删除 canonical 分支数据但保留旧 Task |
 | Task/PlanRun 抢 Instance 产生 owner 竞态 | 同一 capacity/admission lock、DB CAS、owner XOR、exact generation |
 | 用户回答不进入最终方案 | Reviewer question 回 Planner；最终批准 Version 必须自包含 |
-| 等待期间主对话/repo 改变 | 对话不隐式刷新；Version 输出时重记 repo；审批/application stale 检查 |
+| 等待期间主对话/repo 改变 | 对话不隐式刷新；candidate 更新时重记 repo；审批/application stale 检查 |
 | 多版本审批/应用含义不清 | 所有按钮和审计显示 vN；application 对 Version 唯一 |
 | Worker 滚动升级协议不一致 | capability handshake，未知版本 409/fail closed |
 | 大范围一次改造难回滚 | expand/backfill/dual-read/cutover/contract 分阶段，每阶段独立验收 |
@@ -1183,8 +1202,8 @@ thread、Instance owner 或部署 blocker。
 ```text
 创建 Plan       = 新的规划主题
 Planner 提问    = 当前 Run 暂停，回答后继续当前 Run
-Reviewer 提问   = 当前 Run 暂停，回答后回 Planner 并形成自包含新 Version
-Reviewer revise = 当前 Run 内的新 Planner round / 新 Version
+Reviewer 提问   = 当前 Run 暂停，回答后回 Planner 更新 candidate，Pipeline 结束才发布 Version
+Reviewer revise = 当前 Run 内的新 Planner round / 覆盖 candidate，不创建 Version
 用户 Revise     = 同一 Plan 下的新 Run / 新 Version
 Fork            = 新 Plan
 Approve/Reject  = 对 exact Version 做决定

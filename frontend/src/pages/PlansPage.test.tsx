@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -16,7 +17,7 @@ vi.mock('../api/client', () => ({
 
 vi.mock('../components/PlanReview/PlanCreateForm', () => ({
   PlanCreateForm: ({ onCreated }: { onCreated: (plan: PlanResource) => void }) => (
-    <button type="button" onClick={() => onCreated(plan)}>Create standalone Plan</button>
+    <button type="button" onClick={() => onCreated(createdPlan)}>Create standalone Plan</button>
   ),
 }));
 vi.mock('../components/PlanReview/PlanNeedsInputPanel', () => ({
@@ -48,7 +49,10 @@ vi.mock('../components/PlanReview/PlanCatalog', () => ({
   ))}</div>,
 }));
 vi.mock('../components/PlanReview/PlanDetail', () => ({
-  PlanDetail: ({ plan }: { plan: PlanResource }) => <div>Detail for {plan.title}</div>,
+  PlanDetail: ({ plan, onClose }: { plan: PlanResource; onClose?: () => void }) => <div>
+    <span>Detail for {plan.title}</span>
+    <button type="button" onClick={onClose}>Close detail</button>
+  </div>,
 }));
 vi.mock('../components/PlanReview/usePlanEvents', () => ({
   usePlanEvents: vi.fn(),
@@ -93,6 +97,18 @@ const plan = {
   open_input_request: null,
 } as PlanResource;
 
+const createdPlan = {
+  ...plan,
+  id: 15,
+  title: 'Newly created plan',
+  initial_request: 'Plan the next iteration',
+} as PlanResource;
+
+function StatefulPlansPage() {
+  const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
+  return <PlansPage selectedPlanId={selectedPlanId} onSelectedPlanChange={setSelectedPlanId} />;
+}
+
 describe('PlansPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -136,5 +152,48 @@ describe('PlansPage', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Create standalone Plan' }));
     expect(onSelectedPlanChange).not.toHaveBeenCalled();
     expect(screen.queryByText(`Detail for ${plan.title}`)).not.toBeInTheDocument();
+  });
+
+  it('keeps the existing catalog visible while Plan detail opens and closes', async () => {
+    let resolveRefresh!: (rows: PlanResource[]) => void;
+    const pendingRefresh = new Promise<PlanResource[]>((resolve) => { resolveRefresh = resolve; });
+    vi.mocked(api.listPlans)
+      .mockResolvedValueOnce([plan])
+      .mockReturnValueOnce(pendingRefresh)
+      .mockResolvedValue([plan]);
+
+    render(<StatefulPlansPage />);
+    await screen.findByRole('button', { name: plan.title });
+
+    await userEvent.click(screen.getByRole('button', { name: plan.title }));
+    expect(screen.getByText(`Detail for ${plan.title}`)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: plan.title })).toBeInTheDocument();
+    expect(screen.queryByText('Loading Plans…')).not.toBeInTheDocument();
+
+    resolveRefresh([plan]);
+    await waitFor(() => expect(api.listPlans).toHaveBeenCalledTimes(2));
+    await userEvent.click(screen.getByRole('button', { name: 'Close detail' }));
+    expect(screen.queryByText(`Detail for ${plan.title}`)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: plan.title })).toBeInTheDocument();
+    expect(screen.queryByText('Loading Plans…')).not.toBeInTheDocument();
+  });
+
+  it('inserts a newly created Plan without blanking the catalog during reconciliation', async () => {
+    let resolveRefresh!: (rows: PlanResource[]) => void;
+    const pendingRefresh = new Promise<PlanResource[]>((resolve) => { resolveRefresh = resolve; });
+    vi.mocked(api.listPlans)
+      .mockResolvedValueOnce([plan])
+      .mockReturnValueOnce(pendingRefresh);
+
+    render(<StatefulPlansPage />);
+    await screen.findByRole('button', { name: plan.title });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Create standalone Plan' }));
+    expect(screen.getByRole('button', { name: createdPlan.title })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: plan.title })).toBeInTheDocument();
+    expect(screen.queryByText('Loading Plans…')).not.toBeInTheDocument();
+
+    resolveRefresh([createdPlan, plan]);
+    await waitFor(() => expect(api.listPlans).toHaveBeenCalledTimes(2));
   });
 });

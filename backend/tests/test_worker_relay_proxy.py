@@ -2020,7 +2020,7 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
 
     proxy = AsyncMock()
     proxy.run_versioned_plan_until_pause.return_value = {
-        "protocol": 1,
+        "protocol": 2,
         "run": {
             "id": run_id,
             "plan_id": plan_id,

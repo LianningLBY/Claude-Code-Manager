@@ -745,11 +745,19 @@ html[data-theme='rose'] {
 
 /* Markdown body styles */
 .markdown-body {
+  min-width: 0;
+  max-width: 100%;
   line-height: 1.6;
   word-wrap: break-word;
   overflow-wrap: break-word;
   -webkit-user-select: text;
   user-select: text;
+}
+
+.markdown-body pre code {
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 
 .markdown-body > *:first-child {

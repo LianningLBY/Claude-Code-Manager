@@ -172,6 +172,9 @@ async def test_plan_catalog_search_and_archived_only_match_list_and_count(client
     assert cancelled.status_code == 200, cancelled.text
     current = await client.get(f"/api/plans/{archived_payload['id']}")
     assert current.status_code == 200, current.text
+    assert current.json()["display_state"] == "cancelled"
+    assert current.json()["latest_run_status"] == "cancelled"
+    assert current.json()["latest_run_error"] is None
     archived_result = await client.patch(
         f"/api/plans/{archived_payload['id']}",
         json={
@@ -682,7 +685,7 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
 async def test_worker_import_creates_idempotent_inert_mirror(client, session_factory):
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     body = {
-        "protocol": 1,
+        "protocol": 2,
         "plan_id": 5101,
         "run_id": 5201,
         "run_generation": 4,
@@ -722,7 +725,7 @@ async def test_worker_import_requires_exact_attachment_digest(client):
     item = uploaded.json()[0]
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     body = {
-        "protocol": 1,
+        "protocol": 2,
         "plan_id": 5151,
         "run_id": 5251,
         "run_generation": 0,
@@ -762,7 +765,7 @@ async def test_worker_import_requires_exact_attachment_digest(client):
 async def test_worker_materializes_exact_version_idempotently(client, session_factory):
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     body = {
-        "protocol": 1,
+        "protocol": 2,
         "plan_id": 5301,
         "title": "Migrated Plan",
         "initial_request": "Plan before migration",
@@ -856,7 +859,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
         base_version_id = base.id
 
     payload = {
-        "protocol": 1,
+        "protocol": 2,
         "base_worker_version_id": 800,
         "run": {
             "id": run_id,
@@ -865,7 +868,10 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
             "status": "waiting_user",
             "current_stage": "reviewer",
             "base_version_id": None,
-            "result_version_id": 801,
+            "result_version_id": None,
+            "draft_content": "# Worker candidate",
+            "draft_step_id": 701,
+            "draft_repo_revision": {"commit": "abc"},
             "request_text": "Plan this",
             "round": 1,
             "generation": 3,
@@ -888,7 +894,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
                     "id": 701,
                     "run_id": run_id,
                     "plan_id": plan_id,
-                    "plan_version_id": 801,
+                    "plan_version_id": None,
                     "input_request_id": None,
                     "step_type": "planner",
                     "round": 1,
@@ -952,31 +958,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
                 }
             ],
         },
-        "versions": [
-            {
-                "id": 801,
-                "plan_id": plan_id,
-                "version_number": 2,
-                "parent_version_id": 800,
-                "produced_by_run_id": run_id,
-                "produced_by_step_id": 701,
-                "content": "# Worker version",
-                "context_session_id": "worker-session",
-                "context_log_id": 1234,
-                "repo_revision": {"commit": "abc"},
-                "review_verdict": None,
-                "review_feedback": None,
-                "reviewed_by_step_id": 702,
-                "review_exhausted": False,
-                "reviewed_at": None,
-                "human_decision": "pending",
-                "decided_at": None,
-                "decided_by": None,
-                "superseded_by_version_id": None,
-                "applied": False,
-                "created_at": now.isoformat(),
-            }
-        ],
+        "versions": [],
     }
     async with session_factory() as db:
         plan = await db.get(Plan, plan_id)
@@ -997,16 +979,17 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
         input_request = await db.get(PlanInputRequest, run.open_input_request_id)
         assert run.status == "waiting_user"
         assert run.generation == 3
-        assert version.worker_id == 7
-        assert version.worker_version_id == 801
-        assert version.parent_version_id == base_version_id
-        assert version.context_session_id == "manager-session"
-        assert version.context_log_id == 91
-        assert version.context_snapshot == "manager-only context"
+        assert plan.current_version_id == base_version_id
+        assert version.id == base_version_id
+        assert run.result_version_id is None
+        assert run.draft_content == "# Worker candidate"
+        assert run.draft_repo_revision == {"commit": "abc"}
+        draft_step = await db.get(PlanAgentStep, run.draft_step_id)
+        assert draft_step.worker_step_id == 701
         assert input_request.worker_input_request_id == 901
         assert input_request.status == "open"
         base = await db.get(PlanVersion, base_version_id)
-        assert base.superseded_by_version_id == version.id
+        assert base.superseded_by_version_id is None
 
 
 @pytest.mark.asyncio
@@ -1555,6 +1538,15 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
 
     await claim_current_run()
     assert await runner.advance_versioned(run_id, cwd="/tmp") == "queued"
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        run = await db.get(PlanAgentRun, run_id)
+        assert plan.current_version_id is None
+        assert run.result_version_id is None
+        assert run.draft_content == "# Version 1\nInitial decisions included."
+        assert await db.scalar(
+            select(func.count(PlanVersion.id)).where(PlanVersion.plan_id == plan_id)
+        ) == 0
     await claim_current_run()
     assert await runner.advance_versioned(run_id, cwd="/tmp") == "waiting_user"
     async with session_factory() as db:
@@ -1596,11 +1588,14 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
             .order_by(PlanInputRequest.id)
         )).scalars())
         assert plan.active_run_id is None
-        assert plan.current_version_id == versions[1].id
+        assert plan.current_version_id == versions[0].id
         assert run.status == "completed"
+        assert run.result_version_id == versions[0].id
+        assert run.draft_content == "# Version 2\nIncludes every decision and the Sunday window."
         assert run.interaction_count == 2
         assert [item.status for item in requests] == ["answered", "answered"]
-        assert [item.version_number for item in versions] == [1, 2]
-        assert versions[0].superseded_by_version_id == versions[1].id
-        assert versions[1].review_verdict == "approve"
-        assert versions[1].human_decision == "pending"
+        assert [item.version_number for item in versions] == [1]
+        assert versions[0].content == run.draft_content
+        assert versions[0].superseded_by_version_id is None
+        assert versions[0].review_verdict == "approve"
+        assert versions[0].human_decision == "pending"

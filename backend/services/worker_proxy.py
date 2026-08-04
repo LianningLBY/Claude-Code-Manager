@@ -113,10 +113,10 @@ class WorkerProxy:
         payload = response.json()
         if (
             not isinstance(payload, dict)
-            or payload.get("versioned_plan_worker_protocol") != 1
+            or payload.get("versioned_plan_worker_protocol") != 2
         ):
             raise RuntimeError(
-                f"Worker {worker.name} does not support versioned Plan protocol 1"
+                f"Worker {worker.name} does not support versioned Plan protocol 2"
             )
 
     async def get_plan_repo_revision(
@@ -302,7 +302,7 @@ class WorkerProxy:
             base_seed = None
 
         payload = {
-            "protocol": 1,
+            "protocol": 2,
             "plan_id": plan.id,
             "run_id": run.id,
             "run_generation": run.generation,
@@ -435,7 +435,7 @@ class WorkerProxy:
             and version.get("produced_by_run_id") == run.id
         ]
         return {
-            "protocol": 1,
+            "protocol": 2,
             "base_worker_version_id": base_worker_version_id,
             "run": remote_run,
             "versions": versions,
@@ -461,7 +461,7 @@ class WorkerProxy:
                 self._api(worker, "/api/plans/worker-materialize-version"),
                 headers=self._headers(worker),
                 json={
-                    "protocol": 1,
+                    "protocol": 2,
                     "plan_id": plan.id,
                     "title": plan.title,
                     "initial_request": plan.initial_request,

@@ -173,7 +173,7 @@ class WorkerPlanRunImportRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    protocol: Literal[1]
+    protocol: Literal[2]
     plan_id: int = Field(gt=0)
     run_id: int = Field(gt=0)
     run_generation: int = Field(ge=0)
@@ -205,7 +205,7 @@ class WorkerPlanVersionImportRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    protocol: Literal[1]
+    protocol: Literal[2]
     plan_id: int = Field(gt=0)
     title: str = Field(min_length=1, max_length=200)
     initial_request: str = Field(min_length=1, max_length=200_000)
@@ -271,6 +271,9 @@ class PlanRunResource(BaseModel):
     current_stage: str
     base_version_id: int | None
     result_version_id: int | None
+    draft_content: str | None = None
+    draft_step_id: int | None = None
+    draft_repo_revision: dict | None = None
     request_text: str | None
     round: int
     generation: int

@@ -5,13 +5,21 @@ function answerText(value: string | string[] | null | undefined) {
   return value == null || value === '' ? '—' : value;
 }
 
-export function PlanRunInputAudit({ runs, version }: { runs: PlanRun[]; version: PlanVersion }) {
-  const run = runs.find((item) => item.id === version.produced_by_run_id);
+interface Props {
+  runs?: PlanRun[];
+  version?: PlanVersion;
+  run?: PlanRun;
+  title?: string;
+  defaultOpen?: boolean;
+}
+
+export function PlanRunInputAudit({ runs = [], version, run: exactRun, title = 'Input history', defaultOpen = false }: Props) {
+  const run = exactRun || runs.find((item) => item.id === version?.produced_by_run_id);
   const requests = run?.input_requests.filter((item) => item.status === 'answered') || [];
   if (requests.length === 0) return null;
   return (
-    <details className="mt-4 rounded-xl border border-dashed border-gray-700 bg-gray-800/35 p-3 text-xs text-gray-400">
-      <summary className="cursor-pointer font-semibold text-gray-300">Input history ({requests.length})</summary>
+    <details open={defaultOpen} className="mt-4 rounded-xl border border-dashed border-gray-700 bg-gray-800/35 p-3 text-xs text-gray-400">
+      <summary className="cursor-pointer font-semibold text-gray-300">{title} ({requests.length})</summary>
       <div className="mt-3 space-y-3">
         {requests.map((request) => {
           const answers = new Map((request.answers || []).map((item) => [item.question_id, item.value]));

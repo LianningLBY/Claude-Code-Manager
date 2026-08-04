@@ -37,9 +37,9 @@ const markdownComponents: Components = {
         : '';
     }
     return (
-      <div className="group relative my-2">
+      <div className="group relative my-2 min-w-0 max-w-full">
         {codeText && <CopyButton text={codeText} />}
-        <pre className="overflow-x-auto rounded-lg bg-gray-900 p-3 text-xs">{children}</pre>
+        <pre className="max-w-full overflow-x-auto rounded-lg bg-gray-900 p-3 text-xs">{children}</pre>
       </div>
     );
   },
@@ -91,7 +91,7 @@ export const MarkdownContent = memo(function MarkdownContent({
   className,
 }: MarkdownContentProps) {
   return (
-    <div className={`markdown-body ${className || ''}`}>
+    <div className={`markdown-body min-w-0 max-w-full ${className || ''}`}>
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
         components={markdownComponents}

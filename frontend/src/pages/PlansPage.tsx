@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useState } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, type PlanResource, type Project } from '../api/client';
 import { PlanCatalog } from '../components/PlanReview/PlanCatalog';
@@ -57,7 +57,10 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [needsInputVisible, setNeedsInputVisible] = useState(false);
   const [reviewVisible, setReviewVisible] = useState(false);
+  const loadedOnceRef = useRef(false);
+  const refreshRequestRef = useRef(0);
   const close = useCallback(() => {
+    refreshRequestRef.current += 1;
     setExpanded(false);
     setSelectedPlan(null);
     onSelectedPlanChange(null);
@@ -73,7 +76,9 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
   }), [archivedOnly, deferredSearch, kind, projectId, status]);
 
   const refresh = useCallback(async (showLoading = false) => {
-    if (showLoading) setLoading(true);
+    const requestId = ++refreshRequestRef.current;
+    const showInitialLoading = showLoading && !loadedOnceRef.current;
+    if (showInitialLoading) setLoading(true);
     try {
       const offset = (page - 1) * PAGE_SIZE;
       const [rows, count, projectRows, detail] = await Promise.all([
@@ -82,15 +87,20 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
         api.listProjects(),
         selectedPlanId != null ? api.getPlan(selectedPlanId) : Promise.resolve(null),
       ]);
+      if (requestId !== refreshRequestRef.current) return;
       setPlans(rows);
       setTotal(count.total);
       setProjects(projectRows);
       setSelectedPlan(detail);
       setError(null);
     } catch (reason) {
+      if (requestId !== refreshRequestRef.current) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      if (showLoading) setLoading(false);
+      if (requestId === refreshRequestRef.current) {
+        loadedOnceRef.current = true;
+        setLoading(false);
+      }
     }
   }, [page, query, selectedPlanId]);
 
@@ -108,9 +118,25 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
     if (local) setSelectedPlan(local);
     onSelectedPlanChange(planId);
   };
-  const created = () => {
-    if (page === 1) void refresh(true);
-    else setPage(1);
+  const created = (createdPlan: PlanResource) => {
+    const requestedStates = DISPLAY_STATE_QUERY[status]?.split(',');
+    const normalizedSearch = deferredSearch.trim().toLowerCase();
+    const matchesCurrentCatalog = (
+      (kind === 'all' || (kind === 'standalone') === (createdPlan.target_task_id == null))
+      && (projectId == null || createdPlan.project_id === projectId)
+      && (archivedOnly ? createdPlan.archived_at != null : createdPlan.archived_at == null)
+      && (!requestedStates || requestedStates.includes(createdPlan.display_state))
+      && (!normalizedSearch || `${createdPlan.title}\n${createdPlan.initial_request}`.toLowerCase().includes(normalizedSearch))
+    );
+    if (page === 1 && matchesCurrentCatalog) {
+      setPlans((current) => [createdPlan, ...current.filter((item) => item.id !== createdPlan.id)]);
+      setTotal((current) => current + 1);
+      void refresh();
+    } else if (matchesCurrentCatalog) {
+      setPage(1);
+    } else {
+      void refresh();
+    }
   };
 
   return <div className="space-y-6">
@@ -139,6 +165,6 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange }: Props) {
       {totalPages > 1 && <div className="flex items-center justify-center gap-3 py-2"><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Previous Plans page"><ChevronLeft size={17} /></button><span className="text-xs text-gray-500">{page} / {totalPages} · {total} Plans</span><button type="button" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Next Plans page"><ChevronRight size={17} /></button></div>}
     </section>
 
-    {selectedPlan && <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && close()}><div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plan #${selectedPlan.id}`} className={`w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(88vh,860px)] sm:max-w-5xl sm:rounded-2xl ${expanded ? 'h-[100dvh]' : 'h-[70dvh]'}`}><button type="button" onClick={() => setExpanded((value) => !value)} className="absolute left-1/2 top-2 z-10 h-1.5 w-12 -translate-x-1/2 rounded-full bg-gray-600 sm:hidden" aria-label={expanded ? 'Collapse Plan detail' : 'Expand Plan detail'} /><PlanDetail plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={(taskId) => { window.location.hash = `#/tasks/chat/${taskId}`; }} /></div></div>}
+    {selectedPlan && <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && close()}><div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plan #${selectedPlan.id}`} className={`min-w-0 w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(88vh,860px)] sm:max-w-5xl sm:rounded-2xl ${expanded ? 'h-[100dvh]' : 'h-[70dvh]'}`}><button type="button" onClick={() => setExpanded((value) => !value)} className="absolute left-1/2 top-2 z-10 h-1.5 w-12 -translate-x-1/2 rounded-full bg-gray-600 sm:hidden" aria-label={expanded ? 'Collapse Plan detail' : 'Expand Plan detail'} /><PlanDetail plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={(taskId) => { window.location.hash = `#/tasks/chat/${taskId}`; }} /></div></div>}
   </div>;
 }

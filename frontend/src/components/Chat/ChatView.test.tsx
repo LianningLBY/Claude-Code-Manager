@@ -736,6 +736,30 @@ describe('ChatView', () => {
       expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
     });
 
+    it('treats an already-finished stop race as a resolved Interrupt', async () => {
+      const sendConflict = Object.assign(new Error('currently being processed'), {
+        status: 409,
+        detail: 'Task is currently being processed',
+      });
+      const noSession = Object.assign(new Error('No running session found for this task'), {
+        status: 400,
+        detail: 'No running session found for this task',
+      });
+      (api.sendTaskChat as ReturnType<typeof vi.fn>).mockRejectedValueOnce(sendConflict);
+      (api.stopTaskSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(noSession);
+      const task = makeTask({ id: 39, status: 'completed' });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(screen.getByRole('textbox'), 'follow up');
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await userEvent.click(await screen.findByTitle('Interrupt session'));
+
+      expect(await screen.findByText(
+        'Interrupt: the session had already finished before the stop request arrived.',
+      )).toBeInTheDocument();
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    });
+
     it('does not finish or dequeue at terminal/process_exit until the marker clears', async () => {
       const task = makeTask({
         id: 35,

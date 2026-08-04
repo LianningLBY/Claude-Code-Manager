@@ -519,7 +519,7 @@ async def import_worker_plan_run(
             raise HTTPException(409, "Worker Plan Run id collides with local data")
         await db.commit()
         return {
-            "protocol": 1,
+            "protocol": 2,
             "base_worker_version_id": existing.base_version_id,
             "attachment_receipt": attachment_receipt,
             "run": (await run_resource(db, existing)).model_dump(mode="json"),
@@ -568,7 +568,7 @@ async def import_worker_plan_run(
     await db.commit()
     await _wake_dispatcher()
     return {
-        "protocol": 1,
+        "protocol": 2,
         "base_worker_version_id": run.base_version_id,
         "attachment_receipt": attachment_receipt,
         "run": (await run_resource(db, run)).model_dump(mode="json"),

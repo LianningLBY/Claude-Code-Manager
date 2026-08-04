@@ -495,6 +495,9 @@ export interface PlanRun {
   base_version_id: number | null;
   source_run_id: number | null;
   result_version_id: number | null;
+  draft_content?: string | null;
+  draft_step_id?: number | null;
+  draft_repo_revision?: Record<string, unknown> | null;
   request_text: string | null;
   round: number;
   generation: number;

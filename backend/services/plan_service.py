@@ -268,60 +268,64 @@ async def create_plan_run(
     return run
 
 
-async def create_version_for_step(
+async def complete_plan_run_with_version(
     db: AsyncSession,
     *,
     plan: Plan,
     run: PlanAgentRun,
-    step: PlanAgentStep,
+    planner_step: PlanAgentStep,
     content: str,
     repo_revision: dict | None,
+    reviewer_step_id: int | None,
+    verdict: str,
+    feedback: str,
+    exhausted: bool,
+    reviewer_repo_revision: dict | None,
+    completed_at: datetime,
 ) -> PlanVersion:
-    """Persist a Planner result exactly once and advance current Version."""
+    """Atomically publish one completed pipeline candidate as a Version."""
 
     existing = (
         await db.execute(
-            select(PlanVersion).where(PlanVersion.produced_by_step_id == step.id)
+            select(PlanVersion).where(
+                PlanVersion.produced_by_step_id == planner_step.id
+            )
         )
     ).scalar_one_or_none()
     if existing is not None:
-        return existing
-    next_number = int(
-        await db.scalar(
-            select(func.coalesce(func.max(PlanVersion.version_number), 0)).where(
-                PlanVersion.plan_id == plan.id
+        if (
+            existing.plan_id != plan.id
+            or existing.produced_by_run_id != run.id
+            or existing.content != content
+        ):
+            raise RuntimeError("Planner Step Version identity changed")
+        version = existing
+    else:
+        next_number = int(
+            await db.scalar(
+                select(func.coalesce(func.max(PlanVersion.version_number), 0)).where(
+                    PlanVersion.plan_id == plan.id
+                )
             )
+            or 0
+        ) + 1
+        version = PlanVersion(
+            plan_id=plan.id,
+            version_number=next_number,
+            parent_version_id=plan.current_version_id,
+            produced_by_run_id=run.id,
+            produced_by_step_id=planner_step.id,
+            content=content,
+            context_session_id=run.context_session_id,
+            context_log_id=run.context_log_id,
+            context_snapshot=run.context_snapshot,
+            repo_revision=repo_revision,
+            human_decision="pending",
         )
-        or 0
-    ) + 1
-    previous_id = plan.current_version_id
-    version = PlanVersion(
-        plan_id=plan.id,
-        version_number=next_number,
-        parent_version_id=previous_id,
-        produced_by_run_id=run.id,
-        produced_by_step_id=step.id,
-        content=content,
-        context_session_id=run.context_session_id,
-        context_log_id=run.context_log_id,
-        context_snapshot=run.context_snapshot,
-        repo_revision=repo_revision,
-        human_decision="pending",
-    )
-    db.add(version)
-    try:
+        db.add(version)
         await db.flush()
-    except IntegrityError:
-        await db.rollback()
-        found = (
-            await db.execute(
-                select(PlanVersion).where(PlanVersion.produced_by_step_id == step.id)
-            )
-        ).scalar_one_or_none()
-        if found is None:
-            raise
-        return found
-    if previous_id is not None:
+    previous_id = version.parent_version_id
+    if previous_id is not None and previous_id != version.id:
         await db.execute(
             update(PlanVersion)
             .where(
@@ -331,20 +335,26 @@ async def create_version_for_step(
             )
             .values(superseded_by_version_id=version.id)
         )
-    changed = await db.execute(
-        update(Plan)
-        .where(Plan.id == plan.id, Plan.active_run_id == run.id)
-        .values(
-            current_version_id=version.id,
-            lock_version=Plan.lock_version + 1,
-            updated_at=datetime.utcnow(),
-        )
-    )
-    if changed.rowcount != 1:
-        await db.rollback()
-        raise RuntimeError("Plan Run lost ownership before Version commit")
-    step.plan_version_id = version.id
+
+    version.review_verdict = "exhausted" if exhausted else verdict
+    version.review_feedback = feedback
+    version.reviewed_by_step_id = reviewer_step_id
+    version.review_exhausted = exhausted
+    version.reviewed_at = completed_at
+    version.reviewer_repo_revision = reviewer_repo_revision
+    planner_step.plan_version_id = version.id
     run.result_version_id = version.id
+    run.status = "completed"
+    run.current_stage = "complete"
+    run.review_verdict = verdict
+    run.review_feedback = feedback
+    run.review_exhausted = exhausted
+    run.finished_at = completed_at
+    run.updated_at = completed_at
+    plan.current_version_id = version.id
+    plan.active_run_id = None
+    plan.lock_version += 1
+    plan.updated_at = completed_at
     await db.commit()
     await db.refresh(version)
     return version
@@ -1090,7 +1100,9 @@ async def plan_resource(
         display_state=display_state,
         legacy=legacy,
         latest_run_status=latest.status if latest else None,
-        latest_run_error=latest.error if latest else None,
+        latest_run_error=(
+            latest.error if latest is not None and latest.status == "failed" else None
+        ),
         application=(
             next(
                 (
@@ -1139,7 +1151,7 @@ async def apply_worker_plan_outcome(
 ) -> PlanAgentRun:
     """Import one exact Worker pause while keeping Manager ids authoritative."""
 
-    if payload.get("protocol") != 1:
+    if payload.get("protocol") != 2:
         raise RuntimeError("Worker Plan outcome protocol mismatch")
     base_worker_version_id = payload.get("base_worker_version_id")
     if isinstance(base_worker_version_id, bool) or (
@@ -1351,6 +1363,12 @@ async def apply_worker_plan_outcome(
     run.execution_seconds = remote.execution_seconds
     run.last_execution_started_at = None
     run.result_version_id = result_version.id if result_version is not None else None
+    run.draft_content = remote.draft_content
+    draft_step = step_by_remote.get(remote.draft_step_id)
+    if remote.draft_step_id is not None and draft_step is None:
+        raise RuntimeError("Worker Plan draft has no imported Planner Step")
+    run.draft_step_id = draft_step.id if draft_step is not None else None
+    run.draft_repo_revision = remote.draft_repo_revision
     run.interaction_count = remote.interaction_count
     run.review_verdict = remote.review_verdict
     run.review_feedback = remote.review_feedback

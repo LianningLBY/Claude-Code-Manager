@@ -21,6 +21,12 @@ class PlanAgentRun(Base):
     source_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     result_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Planner proposals remain mutable Run-scoped candidates until the
+    # Planner/Reviewer pipeline reaches a terminal review outcome. Only then
+    # is the final candidate materialized as an immutable PlanVersion.
+    draft_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    draft_step_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    draft_repo_revision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     request_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     attachments: Mapped[list | None] = mapped_column(JSON, nullable=True)
     context_session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)

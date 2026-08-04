@@ -53,17 +53,20 @@ function confirmableStaleness(error: unknown): PlanStaleness | null {
 
 const ACTIVE_RUN_STATUSES = new Set<PlanRun['status']>(['queued', 'running', 'waiting_user']);
 
-function planStatusText(plan: PlanResource) {
+function planStatusText(plan: PlanResource, candidateVersionNumber: number) {
   const run = plan.active_run;
   if (!run || !ACTIVE_RUN_STATUSES.has(run.status)) {
     return planDisplayStateLabel(plan.display_state);
   }
-  if (run.status === 'waiting_user') return 'Needs your input';
+  if (run.status === 'waiting_user') return `v${candidateVersionNumber} needs your input`;
   if (run.current_stage === 'reviewer' || plan.display_state === 'reviewer') {
-    return 'Reviewing draft · actions unlock when review finishes';
+    return `Reviewing v${candidateVersionNumber} candidate · actions unlock when review finishes`;
   }
-  if (run.status === 'queued') return 'Queued';
-  return 'Creating draft';
+  if (run.status === 'queued') return `v${candidateVersionNumber} generation queued`;
+  const base = plan.current_version?.version_number;
+  return base == null
+    ? `Creating v${candidateVersionNumber} draft`
+    : `Creating v${candidateVersionNumber} draft from v${base}`;
 }
 
 export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onNavigateTask }: Props) {
@@ -99,9 +102,14 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const appliedVersion = versions.find((item) => item.applied) || null;
   const executionApplications = (plan.applications || []).filter((item) => item.execution_task_id != null);
   const latestFailedRun = runs.find((run) => run.status === 'failed') || null;
-  const activeRun = plan.active_run && ACTIVE_RUN_STATUSES.has(plan.active_run.status)
-    ? plan.active_run
+  const activeRunSnapshot = runs.find((run) => run.id === plan.active_run_id) || plan.active_run;
+  const activeRun = activeRunSnapshot && ACTIVE_RUN_STATUSES.has(activeRunSnapshot.status)
+    ? activeRunSnapshot
     : null;
+  const candidateVersionNumber = Math.max(
+    plan.current_version?.version_number || 0,
+    ...versions.map((version) => version.version_number),
+  ) + 1;
 
   useEffect(() => {
     if (!shown) { setStaleness(null); return; }
@@ -164,13 +172,13 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const route = plan.pipeline_config;
   const staleMessages = planStalenessMessages(staleness);
   const hardConflictMessages = planHardConflictMessages(staleness);
-  return <div className="flex h-full min-h-0 flex-col">
+  return <div className="flex h-full min-h-0 min-w-0 flex-col overflow-x-hidden">
     <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-3">
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-semibold text-gray-100">Plan #{plan.id} · {plan.title}</div>
         <div role={activeRun ? 'status' : undefined} aria-live={activeRun ? 'polite' : undefined} className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-gray-400">
           {activeRun && activeRun.status !== 'waiting_user' && <Loader2 size={11} className="animate-spin text-indigo-300" />}
-          <span className={activeRun ? 'text-indigo-300' : ''}>{planStatusText(plan)}</span>
+          <span className={activeRun ? 'text-indigo-300' : ''}>{planStatusText(plan, candidateVersionNumber)}</span>
           {plan.current_version && <span>· v{plan.current_version.version_number} current</span>}
           {appliedVersion && appliedVersion.id !== plan.current_version_id && <span className="text-teal-300">· v{appliedVersion.version_number} applied</span>}
           {staleness?.stale && <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-300">stale context</span>}
@@ -180,9 +188,9 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       {onClose && <button type="button" onClick={onClose} aria-label="Close Plan" className="rounded-lg p-1.5 text-gray-500 hover:bg-gray-800"><X size={16} /></button>}
     </header>
 
-    <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+    <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
-      {plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> You can retry it; technical details are available in Debug information.</div>}
+      {plan.latest_run_status === 'failed' && plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> You can retry it; technical details are available in Debug information.</div>}
       {staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
         <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-400" />
         <div className="min-w-0">
@@ -194,6 +202,12 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       <CollapsiblePlanningRequest content={plan.initial_request} />
 
       {plan.active_run?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm run={plan.active_run} request={plan.open_input_request} onAnswered={onRefresh} /></div>}
+      {activeRun && <PlanRunInputAudit run={activeRun} title={`v${candidateVersionNumber} input history`} defaultOpen />}
+
+      {activeRun?.draft_content && <section className="mt-4 min-w-0 rounded-xl border border-indigo-500/35 bg-indigo-500/5 p-4">
+        <div className="mb-2 text-xs font-semibold text-indigo-300">v{candidateVersionNumber} candidate · not a Version yet</div>
+        <MarkdownContent content={activeRun.draft_content} />
+      </section>}
 
       {shown ? <>
         {!current && <div className="mt-4 rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-2 text-xs text-gray-400">Historical Version. You can revise or fork it explicitly; approval remains limited to the current Version.</div>}
@@ -203,9 +217,9 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           </select>
           {previous && <button type="button" onClick={() => setCompare((value) => !value)} className="rounded-lg border border-gray-700 px-2.5 py-1.5 text-xs text-gray-300">{compare ? 'Hide comparison' : `Compare with v${previous.version_number}`}</button>}
         </div>
-        <div className={`mt-3 grid gap-3 ${compare && previous ? 'lg:grid-cols-2' : ''}`}>
-          {compare && previous && <div className="rounded-xl border border-gray-700 bg-gray-950/60 p-4"><div className="mb-2 text-xs text-gray-500">v{previous.version_number}</div><MarkdownContent content={previous.content} /></div>}
-          <div className="rounded-xl border border-gray-700 bg-gray-950/60 p-4"><div className="mb-2 text-xs text-indigo-300">v{shown.version_number} · {planVersionDisplayLabel(shown)}{current ? ' · Current' : ''}</div><MarkdownContent content={shown.content} /></div>
+        <div className={`mt-3 grid min-w-0 gap-3 ${compare && previous ? 'lg:grid-cols-2' : ''}`}>
+          {compare && previous && <div className="min-w-0 rounded-xl border border-gray-700 bg-gray-950/60 p-4"><div className="mb-2 text-xs text-gray-500">v{previous.version_number}</div><MarkdownContent content={previous.content} /></div>}
+          <div className="min-w-0 rounded-xl border border-gray-700 bg-gray-950/60 p-4"><div className="mb-2 text-xs text-indigo-300">v{shown.version_number} · {planVersionDisplayLabel(shown)}{current ? ' · Current' : ''}</div><MarkdownContent content={shown.content} /></div>
         </div>
         {shown.review_feedback && <div className="mt-3 rounded-xl border border-gray-700 bg-gray-800/60 p-3 text-sm text-gray-300"><div className="mb-1 text-xs font-semibold text-gray-500">Reviewer feedback</div>{shown.review_feedback}</div>}
         <PlanRunInputAudit runs={runs} version={shown} />
@@ -253,7 +267,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           ? <span key={application.id} className="rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-2 text-xs text-gray-400">v{applied?.version_number || '?'} applied · execution Task #{application.execution_task_id} unavailable</span>
           : <button key={application.id} type="button" onClick={() => onNavigateTask?.(application.execution_task_id!)} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300">Open v{applied?.version_number || '?'} execution Task #{application.execution_task_id}</button>; })}
         {shown && current && plan.target_task_id != null && shown.human_decision === 'approved' && !shown.applied && onToggleVersion && <button type="button" onClick={() => onToggleVersion(shown.id)} className="rounded-lg border border-teal-500/40 px-3 py-2 text-xs text-teal-300">{selectedVersionIds.includes(shown.id) ? 'Detach from next message' : 'Attach to next message'}</button>}
-        {shown && current && !plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.createPlanRun(plan.id, { run_type: 'refresh_context', request: 'Refresh this Plan using the latest task context and repository state.', base_version_id: shown.id, expected_current_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><RefreshCw size={12} /> Refresh context</button>}
+        {shown && current && !plan.active_run_id && staleness?.stale && <button type="button" disabled={busy} onClick={() => void mutate(() => api.createPlanRun(plan.id, { run_type: 'refresh_context', request: 'Refresh all contexts and regenerate this Plan using the latest task conversation and repository state.', base_version_id: shown.id, expected_current_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><RefreshCw size={12} /> Refresh contexts and regenerate Plan</button>}
         {shown && !plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.forkPlan(plan.id, { base_version_id: shown.id }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300"><GitBranch size={12} /> Fork</button>}
         {plan.active_run && ['queued', 'running', 'waiting_user'].includes(plan.active_run.status) && <button type="button" disabled={busy} onClick={() => void mutate(() => api.cancelPlanRun(plan.active_run!.id))} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300">Cancel planning</button>}
         {!plan.active_run_id && <button type="button" disabled={busy} onClick={() => void mutate(() => api.updatePlan(plan.id, { archived: plan.archived_at == null, expected_lock_version: plan.lock_version }))} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-400">{plan.archived_at ? <ArchiveRestore size={12} /> : <Archive size={12} />}{plan.archived_at ? 'Restore' : 'Archive'}</button>}

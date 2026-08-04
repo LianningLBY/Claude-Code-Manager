@@ -1887,8 +1887,6 @@ class PlanAgentRunner:
     async def _versioned_history(
         self, run_id: int
     ) -> tuple[str, str | None]:
-        from backend.models.plan import PlanInputRequest, PlanVersion
-
         async with self.db_factory() as db:
             run = await db.get(PlanAgentRun, run_id)
             if run is None or run.plan_id is None:
@@ -1896,8 +1894,9 @@ class PlanAgentRunner:
                     "Plan Run disappeared",
                     provider="unknown",
                 )
-            base_id = run.result_version_id or run.base_version_id
+            base_id = run.base_version_id
             base = await db.get(PlanVersion, base_id) if base_id else None
+            draft_content = run.draft_content
             requests = list(
                 (
                     await db.execute(
@@ -1920,7 +1919,12 @@ class PlanAgentRunner:
                 f"Additional response: {item.response_text or ''}\n"
                 f"Attachments: {json.dumps(item.attachments or [], ensure_ascii=False)}"
             )
-        return "\n\n".join(audit), base.content if base is not None else None
+        return (
+            "\n\n".join(audit),
+            draft_content if draft_content is not None else (
+                base.content if base is not None else None
+            ),
+        )
 
     async def _latest_completed_step(
         self,
@@ -2123,61 +2127,76 @@ class PlanAgentRunner:
         *,
         run_id: int,
         generation: int,
-        version_id: int,
-        step_id: int | None,
+        reviewer_step_id: int | None,
         verdict: str,
         feedback: str,
         exhausted: bool,
         reviewer_repo_revision: dict | None,
-    ) -> bool:
+    ) -> int | None:
+        from backend.services.plan_service import complete_plan_run_with_version
+
         now = datetime.utcnow()
         async with self.db_factory() as db:
             run = await db.get(PlanAgentRun, run_id, with_for_update=True)
-            version = await db.get(PlanVersion, version_id, with_for_update=True)
             if (
                 run is None
                 or run.plan_id is None
                 or run.status != "running"
                 or run.generation != generation
-                or version is None
-                or version.plan_id != run.plan_id
-                or run.result_version_id != version.id
+                or run.result_version_id is not None
+                or run.draft_content is None
+                or run.draft_step_id is None
             ):
                 await db.rollback()
-                return False
+                return None
             plan = await db.get(Plan, run.plan_id, with_for_update=True)
-            if plan is None or plan.active_run_id != run.id or plan.current_version_id != version.id:
+            planner_step = await db.get(
+                PlanAgentStep, run.draft_step_id, with_for_update=True
+            )
+            if (
+                plan is None
+                or plan.active_run_id != run.id
+                or planner_step is None
+                or planner_step.run_id != run.id
+                or planner_step.plan_id != plan.id
+                or planner_step.step_type != "planner"
+                or planner_step.status != "completed"
+            ):
                 await db.rollback()
-                return False
+                return None
             await self._release_versioned_instance(db, run=run)
-            version.review_verdict = "exhausted" if exhausted else verdict
-            version.review_feedback = feedback
-            version.reviewed_by_step_id = step_id
-            version.review_exhausted = exhausted
-            version.reviewed_at = now
-            version.reviewer_repo_revision = reviewer_repo_revision
-            run.status = "completed"
-            run.current_stage = "complete"
-            run.review_verdict = verdict
-            run.review_feedback = feedback
-            run.review_exhausted = exhausted
-            run.finished_at = now
-            run.updated_at = now
-            plan.active_run_id = None
-            plan.lock_version += 1
-            plan.updated_at = now
-            await db.commit()
+            version = await complete_plan_run_with_version(
+                db,
+                plan=plan,
+                run=run,
+                planner_step=planner_step,
+                content=run.draft_content,
+                repo_revision=run.draft_repo_revision,
+                reviewer_step_id=reviewer_step_id,
+                verdict=verdict,
+                feedback=feedback,
+                exhausted=exhausted,
+                reviewer_repo_revision=reviewer_repo_revision,
+                completed_at=now,
+            )
             plan_id = plan.id
             target_task_id = plan.target_task_id
             round_number = run.round
         from backend.services.plan_events import broadcast_plan_event
 
         await broadcast_plan_event(
+            event="plan_version_created",
+            plan_id=plan_id,
+            target_task_id=target_task_id,
+            run_id=run_id,
+            version_id=version.id,
+        )
+        await broadcast_plan_event(
             event="plan_version_reviewed",
             plan_id=plan_id,
             target_task_id=target_task_id,
             run_id=run_id,
-            version_id=version_id,
+            version_id=version.id,
             verdict="exhausted" if exhausted else verdict,
         )
         await self._broadcast_versioned_run(
@@ -2187,12 +2206,11 @@ class PlanAgentRunner:
             stage="complete",
             round_number=round_number,
         )
-        return True
+        return version.id
 
     async def advance_versioned(self, run_id: int, *, cwd: str) -> str:
         """Advance one durable PlanRun by at most one model Step."""
 
-        from backend.services.plan_service import create_version_for_step
         from backend.services.plan_tasks import capture_repo_revision
 
         async with self.db_factory() as db:
@@ -2209,7 +2227,6 @@ class PlanAgentRunner:
             request_text = self._versioned_request_with_attachments(run)
             target_context = run.context_snapshot or ""
             plan_id = plan.id
-            result_version_id = run.result_version_id
             reviewer_feedback = run.review_feedback
             max_interactions = run.max_interactions
             db.expunge(run)
@@ -2280,33 +2297,28 @@ class PlanAgentRunner:
                     None if current_plan.worker_id is not None
                     else await capture_repo_revision(cwd)
                 )
-                version = await create_version_for_step(
-                    db,
-                    plan=current_plan,
-                    run=current_run,
-                    step=current_step,
-                    content=result["plan"],
-                    repo_revision=repo_revision,
-                )
-                result_version_id = version.id
+                current_run.draft_content = result["plan"]
+                current_run.draft_step_id = current_step.id
+                current_run.draft_repo_revision = repo_revision
+                current_run.updated_at = datetime.utcnow()
+                await db.commit()
                 target_task_id = current_plan.target_task_id
 
             from backend.services.plan_events import broadcast_plan_event
 
             await broadcast_plan_event(
-                event="plan_version_created",
+                event="plan_draft_updated",
                 plan_id=plan_id,
                 target_task_id=target_task_id,
                 run_id=run_id,
-                version_id=result_version_id,
+                round=round_number,
             )
 
             if not pipeline.reviewer.enabled:
                 await self._complete_version_review(
                     run_id=run_id,
                     generation=generation,
-                    version_id=result_version_id,
-                    step_id=step.id,
+                    reviewer_step_id=None,
                     verdict="disabled",
                     feedback="",
                     exhausted=False,
@@ -2321,16 +2333,21 @@ class PlanAgentRunner:
             )
             return "queued" if queued else "superseded"
 
-        if stage != "reviewer" or result_version_id is None:
+        if stage != "reviewer":
             raise PlanAgentError(
                 f"Plan Run has invalid stage {stage!r}",
                 provider="unknown",
             )
         async with self.db_factory() as db:
-            version = await db.get(PlanVersion, result_version_id)
-            if version is None or version.plan_id != plan_id:
-                raise PlanAgentError("Plan Version disappeared", provider="unknown")
-            content = version.content
+            current_run = await db.get(PlanAgentRun, run_id)
+            if (
+                current_run is None
+                or current_run.plan_id != plan_id
+                or current_run.draft_content is None
+                or current_run.draft_step_id is None
+            ):
+                raise PlanAgentError("Plan draft disappeared", provider="unknown")
+            content = current_run.draft_content
         review, _raw, reviewer_route, reviewer_slot, _account = await self._run_stage(
             run_id=run_id,
             task_id=runtime_key,
@@ -2368,8 +2385,7 @@ class PlanAgentRunner:
             await self._complete_version_review(
                 run_id=run_id,
                 generation=generation,
-                version_id=result_version_id,
-                step_id=step.id,
+                reviewer_step_id=step.id,
                 verdict="approve",
                 feedback=review["feedback"],
                 exhausted=False,
@@ -2382,8 +2398,7 @@ class PlanAgentRunner:
             await self._complete_version_review(
                 run_id=run_id,
                 generation=generation,
-                version_id=result_version_id,
-                step_id=step.id,
+                reviewer_step_id=step.id,
                 verdict="revise",
                 feedback=review["feedback"],
                 exhausted=True,
@@ -2392,18 +2407,12 @@ class PlanAgentRunner:
             return "completed"
         async with self.db_factory() as db:
             run = await db.get(PlanAgentRun, run_id, with_for_update=True)
-            version = await db.get(PlanVersion, result_version_id, with_for_update=True)
             if (
-                run is None or version is None or run.status != "running"
-                or run.generation != generation or run.result_version_id != version.id
+                run is None or run.status != "running"
+                or run.generation != generation or run.result_version_id is not None
             ):
                 await db.rollback()
                 return "superseded"
-            version.review_verdict = "revise"
-            version.review_feedback = review["feedback"]
-            version.reviewed_by_step_id = step.id
-            version.reviewed_at = datetime.utcnow()
-            version.reviewer_repo_revision = current_repo_revision
             run.review_verdict = "revise"
             run.review_feedback = review["feedback"]
             await db.commit()

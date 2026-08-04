@@ -342,4 +342,59 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.queryByRole('button', { name: 'Unbind Developer' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pause loop' })).not.toBeInTheDocument();
   });
+
+  it('keeps an accepted rebuttal locked until durable resolution finishes', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      reviewer_runs: [{
+        id: 31,
+        role: 'principal',
+        task_id: 301,
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+        status: 'changes_required',
+        verdict: 'changes_required',
+        error_message: null,
+        created_at: '2026-08-02T00:00:00Z',
+        completed_at: '2026-08-02T00:05:00Z',
+        findings: [{
+          id: 41,
+          reviewer_run_id: 31,
+          role: 'principal',
+          severity: 'medium',
+          category: 'correctness',
+          path: 'backend/service.py',
+          line: 10,
+          hunk: null,
+          title: 'Durable resolution pending',
+          evidence: 'The accepted rebuttal has not resolved its GitHub thread yet.',
+          impact: 'A duplicate adjudication could race durable publication.',
+          required_fix: 'Wait for the accepted effect to finish.',
+          test: 'Verify a second rebuttal cannot be submitted.',
+          status: 'open',
+          thread_status: 'published_inline',
+          github_comment_id: 100,
+          github_comment_url: 'https://github.com/acme/widgets/pull/42#discussion_r100',
+          thread_error: null,
+          rebuttals: [{
+            id: 51,
+            finding_id: 41,
+            task_id: 401,
+            attempt: 1,
+            evidence: 'Concrete accepted evidence',
+            status: 'accepted',
+            verdict: 'accepted',
+            result_body: 'Accepted; resolving the durable thread.',
+            error_message: null,
+          }],
+        }],
+      }],
+    });
+    await openReview(user, review, runFixture({ status: 'adjudicating' }));
+
+    expect(screen.getByPlaceholderText('Concrete code/test/policy evidence for this exact head')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Adjudicating…' })).toBeDisabled();
+    expect(api.submitPRFindingRebuttal).not.toHaveBeenCalled();
+  });
 });

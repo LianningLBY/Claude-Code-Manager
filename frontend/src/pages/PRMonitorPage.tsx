@@ -113,7 +113,7 @@ function FindingRebuttalForm({ finding, onSubmitted }: { finding: PRFinding; onS
   const [evidence, setEvidence] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const active = finding.rebuttals?.some(item => ['pending', 'adjudicating'].includes(item.status));
+  const active = finding.rebuttals?.some(item => ['pending', 'adjudicating', 'accepted'].includes(item.status));
   if (finding.status !== 'open' || finding.severity === 'low') return null;
   return (
     <div className="mt-2 space-y-1">

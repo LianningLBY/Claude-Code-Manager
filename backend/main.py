@@ -807,7 +807,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Refreshed-Token", "Content-Disposition"],
+    expose_headers=[
+        "X-Refreshed-Token",
+        "Content-Disposition",
+        "X-CCM-PR-Fix-Receipt",
+        "X-CCM-PR-Fix-Token",
+    ],
 )
 
 app.include_router(tasks_router)

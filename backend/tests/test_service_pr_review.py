@@ -2060,6 +2060,36 @@ async def test_recover_incomplete_review_claims_exact_completed_generation(
 
 
 @pytest.mark.asyncio
+async def test_periodic_pr_recovery_invokes_finding_action_recovery(
+    session_factory,
+    no_broadcast,
+    monkeypatch,
+):
+    import backend.main as main_module
+    from backend.services import pr_review_fix
+
+    relay = object()
+    recover_finding_actions = AsyncMock(return_value=3)
+    monkeypatch.setattr(main_module, "worker_relay", relay)
+    monkeypatch.setattr(
+        pr_review_fix,
+        "recover_incomplete_finding_actions",
+        recover_finding_actions,
+        raising=False,
+    )
+
+    recovered = await pr_review_service.recover_incomplete_pr_reviews(
+        session_factory
+    )
+
+    assert recovered == 3
+    recover_finding_actions.assert_awaited_once_with(
+        session_factory,
+        worker_relay=relay,
+    )
+
+
+@pytest.mark.asyncio
 async def test_recover_incomplete_worker_review_defers_missing_history(
     session_factory,
     no_broadcast,

@@ -3945,9 +3945,30 @@ async def recover_incomplete_pr_reviews(
     fixed_findings_resolved = await reconcile_fixed_finding_resolutions(db_factory)
     from backend.services.pr_merge_queue import reconcile_merge_queue
     merge_progressed = await reconcile_merge_queue(db_factory)
+    # Finding-fix Tasks have a separate durable action state machine. Keep it
+    # on the same periodic recovery producer as PR publication so Manager
+    # restarts and a missed Worker terminal callback cannot strand an action.
+    # The late import avoids a service cycle while the getattr keeps rolling
+    # upgrades compatible until the recovery implementation is available.
+    from backend.services import pr_review_fix
+
+    recover_finding_actions = getattr(
+        pr_review_fix,
+        "recover_incomplete_finding_actions",
+        None,
+    )
+    finding_actions_recovered = 0
+    if recover_finding_actions is not None:
+        from backend.main import worker_relay
+
+        finding_actions_recovered = await recover_finding_actions(
+            db_factory,
+            worker_relay=worker_relay,
+        )
     return (
         recovered + action_recovered + panel_recovered + ci_started
         + terminal_runs_reconciled + repair_queued
         + adjudications_recovered + rebuttals_resolved
         + fixed_findings_resolved + merge_progressed
+        + finding_actions_recovered
     )

@@ -2,8 +2,10 @@ import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api/client';
 import type { MonitoredRepo, PRFinding, PRMonitorRun, PRReview, RequiredCheckPolicy } from '../api/client';
 import { Plus, ArrowLeft, X, Copy, RefreshCw, ToggleLeft, ToggleRight, Trash2, GitPullRequest, Check } from '../components/icons';
+import { FindingActions } from '../components/PRReview/FindingActions';
 
 const DEFAULT_WEBHOOK_URL = `${window.location.origin}/api/github/webhook`;
+const FINDING_SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
 
 function parseRequiredChecks(value: string): RequiredCheckPolicy[] {
   return value.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
@@ -718,7 +720,10 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                   }}>Close</button>
                 </div>
                 <p className="text-xs text-gray-400">Review: {selectedReview.status}</p>
-                {selectedReview.review_summary && <p className="text-xs text-gray-300">{selectedReview.review_summary}</p>}
+                <div className="rounded bg-gray-900/40 p-3">
+                  <h6 className="mb-2 text-sm font-medium text-foreground">1. 总体评价</h6>
+                  <p className="text-xs text-gray-300">{selectedReview.review_summary || '评审仍在执行，暂无总体结论。'}</p>
+                </div>
                 {selectedReview.ci_summary && <p className="text-xs text-gray-400">CI: {selectedReview.ci_summary}</p>}
                 {monitorRun && (
                   <div className="rounded bg-gray-900/50 p-3 text-xs space-y-2">
@@ -780,14 +785,17 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                   <p className="text-xs text-gray-500">Reviewer panel has not started yet.</p>
                 )}
                 </div>
-                {reviewerRuns.map(run => (
+                {reviewerRuns.length > 0 && <h6 className="text-sm font-medium text-foreground">2. 问题清单（按风险等级排序）</h6>}
+                {[...reviewerRuns].map(run => (
                   <div key={run.id} className="rounded bg-gray-900/40 p-3">
                     <div className="flex justify-between text-sm">
                       <span className="font-medium text-gray-200">{run.role}</span>
                       <span className={STATUS_COLORS[run.status] || 'text-gray-400'}>{run.status}</span>
                     </div>
                     {run.error_message && <p className="text-xs text-red-400 mt-1">{run.error_message}</p>}
-                    {run.findings.map(finding => (
+                    {[...run.findings].sort((a, b) => (
+                      (FINDING_SEVERITY_ORDER[a.severity] ?? 9) - (FINDING_SEVERITY_ORDER[b.severity] ?? 9)
+                    )).map(finding => (
                       <div key={finding.id} className="mt-3 border-l-2 border-orange-500 pl-3 text-xs space-y-1">
                         <p className="text-orange-300">[{finding.severity}] {finding.path}{finding.line ? `:${finding.line}` : ''} — {finding.title}</p>
                         <p className="text-gray-300">Evidence: {finding.evidence}</p>
@@ -801,6 +809,13 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                           ) : finding.thread_status}
                         </p>
                         {finding.thread_error && <p className="text-yellow-500">{finding.thread_error}</p>}
+                        <FindingActions
+                          finding={finding}
+                          currentSnapshot={selectedReview.is_current_snapshot !== false}
+                          onChanged={async () => {
+                            setSelectedReview(await api.getReviewDetail(selectedReview.id));
+                          }}
+                        />
                         <FindingRebuttalForm finding={finding} onSubmitted={async () => {
                           const refreshed = await api.getReviewDetail(selectedReview.id);
                           setSelectedReview(refreshed);
@@ -809,6 +824,18 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                     ))}
                   </div>
                 ))}
+                {reviewerRuns.length > 0 && (
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded bg-gray-900/40 p-3">
+                      <h6 className="mb-2 text-sm font-medium text-foreground">3. 优化总结</h6>
+                      <p className="text-xs text-gray-300">优先处理高风险和中风险问题，并按每条 Finding 的 Required fix 验证修复。</p>
+                    </div>
+                    <div className="rounded bg-gray-900/40 p-3">
+                      <h6 className="mb-2 text-sm font-medium text-foreground">4. 额外建议</h6>
+                      <p className="text-xs text-gray-300">应用修复前下载并检查 Diff；推送后继续以 exact-head CI 和 Finding Gate 为准。</p>
+                    </div>
+                  </div>
+                )}
               </>
             )}
             <div className="flex gap-2 pt-2">

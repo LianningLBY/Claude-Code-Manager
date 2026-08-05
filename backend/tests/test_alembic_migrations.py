@@ -35,7 +35,8 @@ PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
 PLAN_CLEANUP_REVISION = "f7a1c3d9e5b2"
 PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
 PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
-CURRENT_HEAD_REVISION = "7a1d4e9c2b60"
+PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
+CURRENT_HEAD_REVISION = "b7c9e2f4a610"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -420,7 +421,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -467,6 +468,97 @@ class TestFreshMigration:
             Base.metadata.tables["pr_findings"].c.github_comment_id.type,
             BigInteger,
         )
+
+        action_columns = {
+            item["name"]
+            for item in inspect(engine).get_columns("pr_finding_actions")
+        }
+        assert {
+            "finding_id",
+            "action_type",
+            "status",
+            "idempotency_key",
+            "actor_user_id",
+            "human_advice",
+            "task_id",
+            "expected_head_sha",
+            "active_fix_finding_id",
+            "patch_sha256",
+            "download_receipt_hash",
+            "downloaded_by_user_id",
+            "downloaded_at",
+            "confirmed_by_user_id",
+            "confirmed_at",
+            "candidate_commit_sha",
+            "candidate_created_at",
+            "push_attempted_at",
+            "cancelled_by_user_id",
+            "cancelled_at",
+            "operation_token",
+            "operation_expires_at",
+            "result",
+            "error_message",
+            "created_at",
+            "updated_at",
+            "completed_at",
+        }.issubset(action_columns)
+        action_unique_constraints = {
+            (constraint["name"], tuple(constraint["column_names"]))
+            for constraint in inspect(engine).get_unique_constraints(
+                "pr_finding_actions"
+            )
+        }
+        assert (
+            "uq_pr_finding_actions_idempotency_key",
+            ("idempotency_key",),
+        ) in action_unique_constraints
+        assert (
+            "uq_pr_finding_actions_active_fix",
+            ("active_fix_finding_id",),
+        ) in action_unique_constraints
+        action_check_constraints = {
+            constraint["name"]: constraint.get("sqltext", "")
+            for constraint in inspect(engine).get_check_constraints(
+                "pr_finding_actions"
+            )
+        }
+        assert set(action_check_constraints) == {
+            "ck_pr_finding_actions_active_slot",
+            "ck_pr_finding_actions_status",
+            "ck_pr_finding_actions_type",
+        }
+        active_slot_sql = " ".join(
+            action_check_constraints["ck_pr_finding_actions_active_slot"]
+            .lower()
+            .split()
+        )
+        assert "active_fix_finding_id is not null" in active_slot_sql
+        assert "active_fix_finding_id = finding_id" in active_slot_sql
+        action_foreign_keys = {
+            (
+                tuple(constraint["constrained_columns"]),
+                constraint["referred_table"],
+                tuple(constraint["referred_columns"]),
+                (constraint.get("options") or {}).get("ondelete"),
+            )
+            for constraint in inspect(engine).get_foreign_keys(
+                "pr_finding_actions"
+            )
+        }
+        assert (("finding_id",), "pr_findings", ("id",), "CASCADE") in (
+            action_foreign_keys
+        )
+        assert (("task_id",), "tasks", ("id",), None) in action_foreign_keys
+        action_indexes = {
+            (index["name"], tuple(index["column_names"]))
+            for index in inspect(engine).get_indexes("pr_finding_actions")
+        }
+        assert {
+            ("ix_pr_finding_actions_finding_id", ("finding_id",)),
+            ("ix_pr_finding_actions_status", ("status",)),
+            ("ix_pr_finding_actions_actor_user_id", ("actor_user_id",)),
+            ("ix_pr_finding_actions_task_id", ("task_id",)),
+        }.issubset(action_indexes)
         assert (
             Base.metadata.tables["monitored_repos"]
             .c.required_checks.server_default
@@ -501,6 +593,37 @@ class TestFreshMigration:
         engine = create_engine(f"sqlite:///{db_path}")
         task_cols = _get_table_columns(engine, "tasks")
         assert "todo_file_path" in task_cols
+        engine.dispose()
+
+    def test_finding_actions_revision_downgrades_and_reupgrades(self, tmp_path):
+        """The finding-action table is owned by the new linear head."""
+
+        db_path = str(tmp_path / "finding-actions-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "pr_finding_actions" in _get_all_tables(engine)
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, PR_REVIEW_PANEL_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "pr_finding_actions" not in _get_all_tables(engine)
+        with engine.connect() as conn:
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+        assert revision == PR_REVIEW_PANEL_REVISION
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "pr_finding_actions" in _get_all_tables(engine)
+        with engine.connect() as conn:
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+        assert revision == CURRENT_HEAD_REVISION
         engine.dispose()
 
 
@@ -903,7 +1026,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_published_merge(self, tmp_path):
+    def test_migration_graph_has_one_head_after_finding_actions(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -911,6 +1034,10 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == PR_REVIEW_PANEL_REVISION
+        )
+        assert (
+            script.get_revision(PR_REVIEW_PANEL_REVISION).down_revision
             == PUBLISHED_BRANCH_MERGE_REVISION
         )
 

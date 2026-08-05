@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     plan_structured_output_whitespace_limit: int = 4_096
     plan_transcript_max_chars: int = 60_000
     plan_step_output_max_chars: int = 200_000
+    # Generic Plan/review capability admission. The storage/API can deploy
+    # dark; new invocations remain disabled until an executor adapter ships.
+    capability_core_enabled: bool = False
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---

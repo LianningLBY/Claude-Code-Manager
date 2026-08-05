@@ -698,6 +698,9 @@ async def test_ws_channels_apply_resource_acl_and_default_deny(db_factory):
         )
         assert not await _ws_channel_allowed("workers", owner_identity, db)
         assert not await _ws_channel_allowed(
+            "capabilities", owner_identity, db
+        )
+        assert not await _ws_channel_allowed(
             "task:1:spoofed",
             owner_identity,
             db,
@@ -711,3 +714,6 @@ async def test_ws_channels_apply_resource_acl_and_default_deny(db_factory):
         assert await _ws_channel_allowed("instance:1", admin_identity, db)
         assert await _ws_channel_allowed("workers", admin_identity, db)
         assert await _ws_channel_allowed("plans", admin_identity, db)
+        assert await _ws_channel_allowed(
+            "capabilities", admin_identity, db
+        )

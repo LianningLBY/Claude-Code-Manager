@@ -12,6 +12,7 @@ from backend.config import settings
 from backend.database import Base
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.capability import CapabilityExecution, CapabilityInvocation
 from backend.models.task import Task
 from backend.services.task_queue import (
     TaskQueue,
@@ -469,6 +470,97 @@ async def test_delete_running_task_rejected(queue):
     _ = await queue.dequeue()  # sets to in_progress
     result = await queue.delete(task.id)
     assert result is False
+
+
+def _capability_invocation_for_delete(
+    task_id: int,
+    *,
+    status: str,
+) -> CapabilityInvocation:
+    digest = "d" * 64
+    return CapabilityInvocation(
+        task_id=task_id,
+        capability_key="plan",
+        source="human_request",
+        purpose="advisory",
+        status=status,
+        state_version=1,
+        idempotency_key=f"delete-{status}",
+        input_payload={},
+        input_hash=digest,
+        subject_kind="task_generation",
+        subject_ref={"task_id": task_id},
+        subject_hash=digest,
+        executor_kind="fake",
+        executor_config={},
+        executor_config_hash=digest,
+        policy_snapshot={},
+        policy_hash=digest,
+        resume_policy="attach_only",
+        max_attempts=1,
+        active_task_id=task_id if status == "queued" else None,
+        error_code="finished" if status == "failed" else None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_task_rejects_active_capability(queue):
+    task = await queue.create(title="active capability", description="d")
+    task.status = "completed"
+    invocation = _capability_invocation_for_delete(task.id, status="queued")
+    queue.db.add(invocation)
+    await queue.db.flush()
+    execution = CapabilityExecution(
+        invocation_id=invocation.id,
+        attempt=1,
+        status="queued",
+        state_version=1,
+        active_invocation_id=invocation.id,
+        idempotency_key=f"{invocation.id}:1",
+        executor_kind="fake",
+        input_hash=invocation.input_hash,
+    )
+    queue.db.add(execution)
+    await queue.db.commit()
+    task_id = task.id
+    invocation_id = invocation.id
+    execution_id = execution.id
+
+    assert await queue.delete(task_id) is False
+    queue.db.expire_all()
+    assert await queue.db.get(Task, task_id) is not None
+    assert await queue.db.get(CapabilityInvocation, invocation_id) is not None
+    assert await queue.db.get(CapabilityExecution, execution_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_explicitly_removes_terminal_capability_history(queue):
+    task = await queue.create(title="terminal capability", description="d")
+    task.status = "completed"
+    invocation = _capability_invocation_for_delete(task.id, status="failed")
+    queue.db.add(invocation)
+    await queue.db.flush()
+    execution = CapabilityExecution(
+        invocation_id=invocation.id,
+        attempt=1,
+        status="failed",
+        state_version=2,
+        active_invocation_id=None,
+        idempotency_key=f"{invocation.id}:1",
+        executor_kind="fake",
+        input_hash=invocation.input_hash,
+        error_code="finished",
+    )
+    queue.db.add(execution)
+    await queue.db.commit()
+    task_id = task.id
+    invocation_id = invocation.id
+    execution_id = execution.id
+
+    assert await queue.delete(task_id) is True
+    assert await queue.db.get(Task, task_id) is None
+    assert await queue.db.get(CapabilityInvocation, invocation_id) is None
+    assert await queue.db.get(CapabilityExecution, execution_id) is None
 
 
 @pytest.mark.asyncio

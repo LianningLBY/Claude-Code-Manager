@@ -32,6 +32,7 @@ import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
 import backend.models.plan  # noqa: F401
+import backend.models.capability  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -42,7 +43,8 @@ PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
 PLAN_V2_REVISION = "3f2a9c8e7b10"
-CURRENT_HEAD_REVISION = PLAN_V2_REVISION
+CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
+CURRENT_HEAD_REVISION = CAPABILITY_CORE_REVISION
 PUBLISHED_PLAN_CLEANUP_SHA256 = (
     "dd8cce93f05599ebc580cb95cad5d7d8875f03415775312718d3e42ef4369d16"
 )
@@ -449,7 +451,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -500,6 +502,41 @@ class TestFreshMigration:
             Base.metadata.tables["pr_findings"].c.github_comment_id.type,
             BigInteger,
         )
+
+        capability_invocation_columns = set(
+            _get_table_columns(engine, "capability_invocations")
+        )
+        assert {
+            "active_task_id",
+            "idempotency_key",
+            "request_task_turn_generation",
+            "result_hash",
+        }.issubset(capability_invocation_columns)
+        capability_execution_columns = set(
+            _get_table_columns(engine, "capability_executions")
+        )
+        assert {
+            "active_invocation_id",
+            "lease_token",
+            "handle_generation",
+            "output_hash",
+        }.issubset(capability_execution_columns)
+        invocation_unique_columns = {
+            tuple(constraint["column_names"])
+            for constraint in inspect(engine).get_unique_constraints(
+                "capability_invocations"
+            )
+        }
+        assert ("task_id", "idempotency_key") in invocation_unique_columns
+        assert ("active_task_id",) in invocation_unique_columns
+        execution_unique_columns = {
+            tuple(constraint["column_names"])
+            for constraint in inspect(engine).get_unique_constraints(
+                "capability_executions"
+            )
+        }
+        assert ("invocation_id", "attempt") in execution_unique_columns
+        assert ("active_invocation_id",) in execution_unique_columns
 
         action_columns = {
             item["name"]
@@ -1231,6 +1268,52 @@ class TestSchemaConsistency:
             assert "ck_plan_application_target" in ddl
             assert "execution_task" in ddl
 
+    def test_capability_integrity_constraints_compile_on_all_dialects(self):
+        for table_name in (
+            "capability_invocations",
+            "capability_executions",
+        ):
+            table = Base.metadata.tables[table_name]
+            for dialect in (
+                sqlite.dialect(),
+                postgresql.dialect(),
+                mysql.dialect(),
+            ):
+                ddl = str(CreateTable(table).compile(dialect=dialect))
+                assert "active_slot" in ddl
+                assert "UNIQUE" in ddl
+
+    @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
+    def test_capability_migration_compiles_offline(self, dialect_name):
+        migration_path = (
+            PROJECT_ROOT
+            / "alembic"
+            / "versions"
+            / "6a4c2e9f1b73_add_capability_core.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            f"capability_migration_for_{dialect_name}", migration_path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name=dialect_name,
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(context)):
+            module.upgrade()
+        ddl = output.getvalue().lower()
+        assert "create table capability_invocations" in ddl
+        assert "create table capability_executions" in ddl
+        assert "ck_cap_inv_active_slot" in ddl
+        assert "ck_cap_exec_active_slot" in ddl
+
     def test_migrated_schema_matches_orm(self, tmp_path):
         """Compare columns from Alembic-migrated DB vs ORM metadata.create_all."""
         # DB 1: created by Alembic migrations
@@ -1344,6 +1427,10 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(CAPABILITY_CORE_REVISION).down_revision
+            == PLAN_V2_REVISION
+        )
         assert (
             script.get_revision(PLAN_V2_REVISION).down_revision
             == ATTENTION_TAG_REVISION

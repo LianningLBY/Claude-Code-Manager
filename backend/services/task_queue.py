@@ -483,6 +483,60 @@ class TaskQueue:
             await self.db.rollback()
             return False
 
+        # Capability lifecycle uses the same global Task -> Invocation ->
+        # Execution lock order. Active work owns an external adapter handle or
+        # an unconsumed result, so deletion must fail closed. Terminal history
+        # is removed explicitly below because SQLite deployments may have
+        # foreign-key enforcement disabled.
+        from backend.models.capability import (
+            ACTIVE_EXECUTION_STATUSES,
+            ACTIVE_INVOCATION_STATUSES,
+            CapabilityExecution,
+            CapabilityInvocation,
+        )
+
+        capability_invocations = list(
+            (
+                await self.db.execute(
+                    select(CapabilityInvocation)
+                    .where(CapabilityInvocation.task_id == task_id)
+                    .order_by(CapabilityInvocation.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        capability_invocation_ids = {
+            invocation.id for invocation in capability_invocations
+        }
+        capability_executions = []
+        if capability_invocation_ids:
+            capability_executions = list(
+                (
+                    await self.db.execute(
+                        select(CapabilityExecution)
+                        .where(
+                            CapabilityExecution.invocation_id.in_(
+                                capability_invocation_ids
+                            )
+                        )
+                        .order_by(
+                            CapabilityExecution.invocation_id,
+                            CapabilityExecution.id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+        if any(
+            invocation.status in ACTIVE_INVOCATION_STATUSES
+            for invocation in capability_invocations
+        ) or any(
+            execution.status in ACTIVE_EXECUTION_STATUSES
+            for execution in capability_executions
+        ):
+            await self.db.rollback()
+            return False
+
         # A failed task may be the only durable identity for an unmanaged
         # process retained by startup recovery. Never delete that evidence
         # while any reverse Instance owner may still be alive. A dead PID can
@@ -666,6 +720,19 @@ class TaskQueue:
                 return False
 
         await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
+        if capability_invocation_ids:
+            await self.db.execute(
+                sa_delete(CapabilityExecution).where(
+                    CapabilityExecution.invocation_id.in_(
+                        capability_invocation_ids
+                    )
+                )
+            )
+            await self.db.execute(
+                sa_delete(CapabilityInvocation).where(
+                    CapabilityInvocation.task_id == task_id
+                )
+            )
         from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 
         plan_run_ids = list(

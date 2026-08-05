@@ -18,6 +18,22 @@ async def test_health(client):
 
 
 @pytest.mark.asyncio
+async def test_cors_exposes_pr_fix_download_credentials(client):
+    resp = await client.get(
+        "/api/system/health",
+        headers={"Origin": "https://ccm.example.test"},
+    )
+
+    assert resp.status_code == 200
+    exposed = {
+        item.strip().lower()
+        for item in resp.headers["access-control-expose-headers"].split(",")
+    }
+    assert "x-ccm-pr-fix-receipt" in exposed
+    assert "x-ccm-pr-fix-token" in exposed
+
+
+@pytest.mark.asyncio
 async def test_stats_empty(client):
     resp = await client.get("/api/system/stats")
     assert resp.status_code == 200
@@ -215,7 +231,7 @@ async def test_config_returns_codex_service_tier_capabilities(client):
 async def test_config_declares_pr_review_snapshot_context_capability(client):
     resp = await client.get("/api/system/config")
     assert resp.status_code == 200
-    assert resp.json()["pr_review_snapshot_context_version"] == 2
+    assert resp.json()["pr_review_snapshot_context_version"] == 3
     assert resp.json()["pr_review_terminal_chat_version"] == 1
     assert resp.json()["task_artifact_scope_version"] == 1
 

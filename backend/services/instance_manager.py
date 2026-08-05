@@ -916,10 +916,10 @@ class InstanceManager:
                         f"Task {task_id} disappeared before launch"
                     )
                 from backend.services.pr_review_runtime import (
-                    is_pr_review_task,
+                    is_pr_sandbox_task,
                 )
 
-                pr_review_task = is_pr_review_task(task)
+                pr_review_task = is_pr_sandbox_task(task)
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )

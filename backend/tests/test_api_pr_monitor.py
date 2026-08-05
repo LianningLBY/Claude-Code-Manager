@@ -18,6 +18,8 @@ from backend.database import Base, get_db
 from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import (
     MonitoredRepo,
+    PRFinding,
+    PRFindingAction,
     PRMergeQueueAction,
     PRMonitorRun,
     PRRepairWake,
@@ -89,6 +91,319 @@ async def _create_repo(client, repo_full_name="owner/repo", **overrides):
     resp = await client.post("/api/pr-monitor/repos", json=payload)
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+async def _seed_actionable_finding(
+    session_factory,
+    *,
+    repo_id: int,
+    pr_number: int = 99,
+):
+    """Create one current, completed panel snapshot for Finding APIs."""
+
+    async with session_factory() as db:
+        review = PRReview(
+            repo_id=repo_id,
+            pr_number=pr_number,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="Fix captured finding",
+            pr_author="alice",
+            pr_url=f"https://github.com/owner/repo/pull/{pr_number}",
+            status="commented",
+        )
+        db.add(review)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=repo_id,
+            pr_number=pr_number,
+            status="waiting_for_fix",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            current_review_id=review.id,
+            head_repo_full_name="fork-owner/repo",
+            head_branch="feature/fix",
+        )
+        db.add(run)
+        await db.flush()
+        review.monitor_run_id = run.id
+        reviewer = PRReviewerRun(
+            pr_review_id=review.id,
+            role="senior",
+            provider="codex",
+            status="completed",
+            prompt_policy_hash="p" * 64,
+            guide_pack_hash="g" * 64,
+        )
+        db.add(reviewer)
+        await db.flush()
+        finding = PRFinding(
+            pr_review_id=review.id,
+            reviewer_run_id=reviewer.id,
+            fingerprint="f" * 64,
+            role="senior",
+            severity="high",
+            category="correctness",
+            path="backend/example.py",
+            line=7,
+            title="Captured defect",
+            evidence="The branch raises.",
+            impact="Requests fail.",
+            required_fix="Return the fallback.",
+            test="Cover the fallback.",
+            thread_nonce="n" * 48,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+        )
+        db.add(finding)
+        await db.commit()
+        return review.id, finding.id
+
+
+async def _seed_confirmable_api_action(
+    session_factory,
+    *,
+    finding_id: int,
+):
+    patch_text = (
+        "diff --git a/backend/example.py b/backend/example.py\n"
+        "--- a/backend/example.py\n"
+        "+++ b/backend/example.py\n"
+        "@@ -1 +1 @@\n"
+        "-raise RuntimeError()\n"
+        "+return default_value\n"
+    )
+    patch_sha = hashlib.sha256(patch_text.encode()).hexdigest()
+    async with session_factory() as db:
+        action = PRFindingAction(
+            finding_id=finding_id,
+            action_type="ai_fix",
+            status="awaiting_confirmation",
+            idempotency_key=f"api-confirmable-{finding_id}",
+            expected_head_sha=HEAD_SHA_1,
+            active_fix_finding_id=finding_id,
+            patch_sha256=patch_sha,
+            result={
+                "patch": patch_text,
+                "confirmation_token": "signed-confirmation-token",
+                "confirmation_expires_at": 4102444800,
+                "action_nonce": "api-confirmation-nonce",
+                "allowed_files": ["backend/example.py"],
+                "head_repo_full_name": "fork-owner/repo",
+                "head_ref": "feature/fix",
+            },
+        )
+        db.add(action)
+        await db.commit()
+        return action.id, patch_text, patch_sha
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route_payload", "detail"),
+    (
+        pytest.param(
+            {
+                "state": "closed",
+                "draft": False,
+                "base": {"sha": BASE_SHA_1},
+                "head": {
+                    "sha": HEAD_SHA_1,
+                    "ref": "feature/fix",
+                    "repo": {"full_name": "fork-owner/repo"},
+                },
+            },
+            "closed or draft",
+            id="closed",
+        ),
+        pytest.param(
+            {
+                "state": "open",
+                "draft": True,
+                "base": {"sha": BASE_SHA_1},
+                "head": {
+                    "sha": HEAD_SHA_1,
+                    "ref": "feature/fix",
+                    "repo": {"full_name": "fork-owner/repo"},
+                },
+            },
+            "closed or draft",
+            id="draft",
+        ),
+        pytest.param(
+            {
+                "state": "open",
+                "draft": False,
+                "base": {"sha": BASE_SHA_1},
+                "head": {
+                    "sha": HEAD_SHA_1,
+                    "ref": "feature..escape",
+                    "repo": {"full_name": "fork-owner/repo"},
+                },
+            },
+            "source route response is malformed",
+            id="malformed-route",
+        ),
+    ),
+)
+async def test_fix_capture_maps_remote_route_drift_to_conflict(
+    client,
+    session_factory,
+    route_payload,
+    detail,
+):
+    """Closed/draft/malformed source routes must clean up and return 409."""
+
+    from backend.services import pr_review_fix
+
+    repo = await _create_repo(client, "owner/fix-capture-route")
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo["id"],
+    )
+    with (
+        patch.object(pr_review_fix, "_verify_current_snapshot", AsyncMock()),
+        patch.object(
+            pr_review_fix,
+            "_gh_api_json",
+            AsyncMock(return_value=route_payload),
+        ),
+    ):
+            response = await client.post(
+                f"/api/pr-monitor/findings/{finding_id}/fix",
+                json={
+                    "idempotency_key": (
+                        f"route-{detail.replace(' ', '-')}"[:64]
+                    )
+                },
+            )
+
+    assert response.status_code == 409, response.text
+    assert detail in response.json()["detail"]
+    async with session_factory() as db:
+        action = (await db.execute(
+            select(PRFindingAction).where(
+                PRFindingAction.finding_id == finding_id
+            )
+        )).scalar_one()
+        assert action.status == "failed"
+        assert action.active_fix_finding_id is None
+        assert action.task_id is None
+
+
+@pytest.mark.asyncio
+async def test_immediate_finding_action_survives_authorization_rollback(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/immediate-action-rollback")
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo["id"],
+    )
+
+    response = await client.post(
+        f"/api/pr-monitor/findings/{finding_id}/ignore",
+        json={"idempotency_key": "api-ignore-after-rollback"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["finding_id"] == finding_id
+    assert response.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_diff_download_survives_authorization_rollback(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/diff-download-rollback")
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo["id"],
+    )
+    action_id, patch_text, _ = await _seed_confirmable_api_action(
+        session_factory,
+        finding_id=finding_id,
+    )
+
+    response = await client.get(
+        f"/api/pr-monitor/actions/{action_id}/diff"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.text == patch_text
+    assert response.headers["x-ccm-pr-fix-receipt"]
+    assert response.headers["x-ccm-pr-fix-token"] == (
+        "signed-confirmation-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_route_survives_authorization_rollback(
+    client,
+    session_factory,
+):
+    from backend.services import pr_review_fix
+
+    repo = await _create_repo(client, "owner/confirm-route-rollback")
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo["id"],
+    )
+    action_id, _, patch_sha = await _seed_confirmable_api_action(
+        session_factory,
+        finding_id=finding_id,
+    )
+
+    with patch.object(
+        pr_review_fix,
+        "confirm_fix",
+        AsyncMock(side_effect=pr_review_fix.FixConfirmationError("blocked")),
+    ) as confirm:
+        response = await client.post(
+            f"/api/pr-monitor/actions/{action_id}/confirm",
+            json={
+                "confirmation_token": "signed-confirmation-token",
+                "patch_sha256": patch_sha,
+                "download_receipt": "r" * 32,
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "blocked"
+    assert confirm.await_args.kwargs["action_id"] == action_id
+
+
+@pytest.mark.asyncio
+async def test_cancel_route_survives_authorization_rollback(
+    client,
+    session_factory,
+):
+    from backend.services import pr_review_fix
+
+    repo = await _create_repo(client, "owner/cancel-route-rollback")
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo["id"],
+    )
+    action_id, _, _ = await _seed_confirmable_api_action(
+        session_factory,
+        finding_id=finding_id,
+    )
+
+    with patch.object(
+        pr_review_fix,
+        "cancel_fix_action",
+        AsyncMock(side_effect=pr_review_fix.FixConfirmationError("blocked")),
+    ) as cancel:
+        response = await client.post(
+            f"/api/pr-monitor/actions/{action_id}/cancel"
+        )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "blocked"
+    assert cancel.await_args.kwargs["action_id"] == action_id
 
 
 @pytest.mark.parametrize("field", [
@@ -760,13 +1075,56 @@ async def test_resume_repair_rejects_remote_subject_change(
 @pytest.mark.asyncio
 async def test_delete_repo(client, session_factory):
     created = await _create_repo(client, "owner/repo")
-    # Attach a review so cascade deletion is exercised
+    # Attach a complete terminal Finding action.  Production SQLite databases
+    # may not enforce FK cascades, so repository deletion must remove it
+    # explicitly instead of leaving its global idempotency key orphaned.
     async with session_factory() as db:
-        db.add(PRReview(
+        review = PRReview(
             repo_id=created["id"], pr_number=1, pr_title="t",
             pr_author="a", pr_url="http://x", status="error",
-        ))
+            base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
+        )
+        db.add(review)
+        await db.flush()
+        reviewer = PRReviewerRun(
+            pr_review_id=review.id,
+            role="senior",
+            provider="codex",
+            status="completed",
+            prompt_policy_hash="p" * 64,
+            guide_pack_hash="g" * 64,
+        )
+        db.add(reviewer)
+        await db.flush()
+        finding = PRFinding(
+            pr_review_id=review.id,
+            reviewer_run_id=reviewer.id,
+            fingerprint="d" * 64,
+            role="senior",
+            severity="medium",
+            category="correctness",
+            path="backend/delete_me.py",
+            title="Terminal finding",
+            evidence="evidence",
+            impact="impact",
+            required_fix="fix",
+            test="test",
+            thread_nonce="t" * 48,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+        )
+        db.add(finding)
+        await db.flush()
+        action = PRFindingAction(
+            finding_id=finding.id,
+            action_type="human_advice",
+            status="completed",
+            idempotency_key="delete-terminal-action",
+            expected_head_sha=HEAD_SHA_1,
+        )
+        db.add(action)
         await db.commit()
+        action_id = action.id
 
     resp = await client.delete(f"/api/pr-monitor/repos/{created['id']}")
     assert resp.status_code == 200
@@ -779,6 +1137,7 @@ async def test_delete_repo(client, session_factory):
             select(PRReview).where(PRReview.repo_id == created["id"])
         )).scalars().all()
         assert reviews == []
+        assert await db.get(PRFindingAction, action_id) is None
 
 
 @pytest.mark.asyncio
@@ -1626,6 +1985,69 @@ async def test_pr_review_tag_alone_freezes_worker_side_task_mutations(
     assert delete.status_code == 409
     async with session_factory() as db:
         assert await db.get(Task, task_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tags", "metadata"),
+    [
+        pytest.param(["pr-review-fix"], {}, id="worker-tag-only"),
+        pytest.param(
+            [],
+            {"pr_finding_action_id": 731},
+            id="manager-metadata-after-tag-removal",
+        ),
+    ],
+)
+async def test_pr_fix_task_rejects_all_public_task_mutations(
+    client,
+    session_factory,
+    tags,
+    metadata,
+):
+    async with session_factory() as db:
+        task = Task(
+            title="Automated PR fix",
+            description="generate a bounded patch",
+            status="failed",
+            tags=tags,
+            metadata_=metadata,
+            session_id="pr-fix-session",
+            error_message="worker terminal",
+            completed_at=datetime.utcnow(),
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    responses = [
+        await client.put(
+            f"/api/tasks/{task_id}",
+            json={"title": "tampered fix"},
+        ),
+        await client.post(f"/api/tasks/{task_id}/retry"),
+        await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "change the requested patch"},
+        ),
+        await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "ignore the finding scope"},
+        ),
+        await client.post(f"/api/tasks/{task_id}/cancel"),
+        await client.post(f"/api/tasks/{task_id}/stop-session"),
+        await client.delete(f"/api/tasks/{task_id}"),
+    ]
+
+    assert all(response.status_code == 409 for response in responses), [
+        (response.status_code, response.text) for response in responses
+    ]
+    async with session_factory() as db:
+        stored = await db.get(Task, task_id)
+        assert stored is not None
+        assert stored.title == "Automated PR fix"
+        assert stored.status == "failed"
+        assert stored.retry_count == 0
 
 
 @pytest.mark.asyncio

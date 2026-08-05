@@ -209,6 +209,71 @@ class PRReviewResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class FindingActionRequest(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9._:-]+", value) is None:
+            raise ValueError("idempotency_key contains unsafe characters")
+        return value
+
+    model_config = {"extra": "forbid"}
+
+
+class HumanAdviceRequest(FindingActionRequest):
+    advice: str = Field(min_length=1, max_length=8000)
+
+    @field_validator("advice")
+    @classmethod
+    def normalize_advice(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("advice must not be blank")
+        if any(ord(char) < 32 and char not in "\n\r\t" for char in normalized):
+            raise ValueError("advice contains control characters")
+        return normalized
+
+
+class ConfirmFixRequest(BaseModel):
+    confirmation_token: str = Field(min_length=10, max_length=100)
+    patch_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    download_receipt: str = Field(min_length=32, max_length=128)
+
+    model_config = {"extra": "forbid"}
+
+
+class PRFindingActionResponse(BaseModel):
+    id: int
+    finding_id: int
+    action_type: str
+    status: str
+    idempotency_key: str
+    actor_user_id: int | None
+    human_advice: str | None
+    task_id: int | None
+    expected_head_sha: str
+    patch_sha256: str | None
+    downloaded_by_user_id: int | None
+    downloaded_at: datetime | None
+    confirmed_by_user_id: int | None
+    confirmed_at: datetime | None
+    candidate_commit_sha: str | None
+    candidate_created_at: datetime | None
+    push_attempted_at: datetime | None
+    cancelled_by_user_id: int | None
+    cancelled_at: datetime | None
+    result: dict | None
+    error_message: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    diff_download_url: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
 class PRFindingResponse(BaseModel):
     id: int
     reviewer_run_id: int
@@ -230,6 +295,7 @@ class PRFindingResponse(BaseModel):
     github_thread_node_id: str | None = None
     thread_error: str | None = None
     rebuttals: list["PRFindingRebuttalResponse"] = Field(default_factory=list)
+    latest_action: PRFindingActionResponse | None = None
 
     model_config = {"from_attributes": True}
 
@@ -284,6 +350,7 @@ class PRReviewerRunResponse(BaseModel):
 
 class PRReviewDetailResponse(PRReviewResponse):
     reviewer_runs: list[PRReviewerRunResponse] = Field(default_factory=list)
+    is_current_snapshot: bool = False
 
 
 class PRMonitorBindRequest(BaseModel):

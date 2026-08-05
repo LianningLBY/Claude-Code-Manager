@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     ForeignKey,
     UniqueConstraint,
+    CheckConstraint,
     false,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -245,6 +246,115 @@ class PRFinding(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
+
+
+class PRFindingAction(Base):
+    """Audited user decision or confirmed patch for one review Finding."""
+
+    __tablename__ = "pr_finding_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_pr_finding_actions_idempotency_key",
+        ),
+        UniqueConstraint(
+            "active_fix_finding_id",
+            name="uq_pr_finding_actions_active_fix",
+        ),
+        CheckConstraint(
+            "action_type IN ('ignore', 'human_advice', 'ai_fix')",
+            name="ck_pr_finding_actions_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'awaiting_confirmation', 'cancelling', "
+            "'completed', 'failed', 'cancelled', 'stale')",
+            name="ck_pr_finding_actions_status",
+        ),
+        CheckConstraint(
+            "(action_type = 'ai_fix' AND status IN ('pending', 'running', "
+            "'awaiting_confirmation', 'cancelling') AND "
+            "active_fix_finding_id IS NOT NULL AND "
+            "active_fix_finding_id = finding_id) OR "
+            "((action_type <> 'ai_fix' OR status NOT IN ('pending', 'running', "
+            "'awaiting_confirmation', 'cancelling')) AND "
+            "active_fix_finding_id IS NULL)",
+            name="ck_pr_finding_actions_active_slot",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    finding_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("pr_findings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    action_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(30),
+        default="pending",
+        server_default="pending",
+        nullable=False,
+        index=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    human_advice: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("tasks.id"),
+        nullable=True,
+        index=True,
+    )
+    expected_head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Non-NULL only while one AI fix owns the Finding's active slot.  A
+    # portable UNIQUE constraint supplies the cross-process fence that SQLite
+    # cannot provide with SELECT ... FOR UPDATE.
+    active_fix_finding_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    patch_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    download_receipt_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    downloaded_by_user_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    downloaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    confirmed_by_user_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Durable push outbox evidence.  ``candidate_commit_sha`` is committed
+    # before the first external push and is regenerated deterministically from
+    # ``confirmed_at`` after a crash.
+    candidate_commit_sha: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    candidate_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    push_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    cancelled_by_user_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    operation_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    operation_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class PRFindingRebuttal(Base):

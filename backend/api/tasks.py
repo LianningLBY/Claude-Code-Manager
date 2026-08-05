@@ -28,6 +28,11 @@ from backend.schemas.task import (
     WorkerRoutingConfigSnapshot,
 )
 from backend.services.task_queue import TaskQueue, task_delete_fence
+from backend.services.pr_review_runtime import (
+    is_pr_review_fix_task,
+    is_pr_review_task,
+    is_pr_sandbox_task,
+)
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
@@ -145,24 +150,14 @@ async def _require_not_pr_review_task_mutation(
         .limit(1)
     )
     task = await db.get(Task, task_id)
-    metadata_marker = (
-        task is not None
-        and type((task.metadata_ or {}).get("pr_review_id")) is int
-    )
-    tags = task.tags if task is not None else None
-    tag_marker = (
-        isinstance(tags, (list, tuple, set, dict))
-        and "pr-review" in tags
-    )
     if (
         linked.scalar_one_or_none() is not None
-        or metadata_marker
-        or tag_marker
+        or (task is not None and is_pr_sandbox_task(task))
     ):
         raise HTTPException(
             409,
-            f"Automated PR review Tasks cannot be manually {action}; wait for "
-            "the review outcome or a new PR snapshot",
+            f"Automated PR workflow Tasks cannot be manually {action}; wait "
+            "for the workflow outcome or a new PR snapshot",
         )
 
 
@@ -193,14 +188,19 @@ async def _require_pr_review_chat_allowed(
     task = await db.get(Task, task_id)
     if task is None:
         return False
+    if is_pr_review_fix_task(task):
+        raise HTTPException(
+            409,
+            "Automated PR fix Tasks cannot accept manual discussion or live "
+            "injection; wait for the generated patch outcome",
+        )
     metadata = task.metadata_ or {}
-    metadata_marker = type(metadata.get("pr_review_id")) is int
     tags = task.tags
     tag_marker = (
         isinstance(tags, (list, tuple, set, dict))
         and "pr-review" in tags
     )
-    task_marker = metadata_marker or tag_marker
+    task_marker = is_pr_review_task(task)
 
     def allow_terminal_discussion() -> bool:
         if task.provider == "codex":
@@ -283,16 +283,7 @@ async def _require_pr_review_retryable(
     )
     review_status = result.scalar_one_or_none()
     task = await db.get(Task, task_id)
-    task_marker = bool(
-        task is not None
-        and (
-            type((task.metadata_ or {}).get("pr_review_id")) is int
-            or (
-                isinstance(task.tags, (list, tuple, set, dict))
-                and "pr-review" in task.tags
-            )
-        )
-    )
+    task_marker = bool(task is not None and is_pr_sandbox_task(task))
     if review_status is not None:
         if review_status in {"pending", "waiting_ci", "reviewing"}:
             detail = (
@@ -311,8 +302,8 @@ async def _require_pr_review_retryable(
     if task_marker:
         raise HTTPException(
             409,
-            "Automated PR review Tasks cannot be manually retried; push a new "
-            "PR snapshot instead",
+            "Automated PR workflow Tasks cannot be manually retried; wait for "
+            "the workflow outcome or push a new PR snapshot instead",
         )
 
 
@@ -2820,16 +2811,10 @@ async def _internal_pr_review_termination_task(
         await _require_no_pr_review_publication(db, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    metadata_marker = type((task.metadata_ or {}).get("pr_review_id")) is int
-    tags = task.tags or []
-    tag_marker = (
-        isinstance(tags, (list, tuple, set, dict))
-        and "pr-review" in tags
-    )
-    if not (metadata_marker or tag_marker):
+    if not is_pr_sandbox_task(task):
         raise HTTPException(
             400,
-            "Exact-generation termination is restricted to PR review tasks",
+            "Exact-generation termination is restricted to PR workflow tasks",
         )
     return task
 

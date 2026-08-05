@@ -8,6 +8,7 @@ from datetime import datetime
 from weakref import WeakKeyDictionary
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import (
     and_,
     delete as sa_delete,
@@ -25,6 +26,7 @@ from backend.database import get_db
 from backend.models.pr_monitor import (
     MonitoredRepo,
     PRFinding,
+    PRFindingAction,
     PRFindingRebuttal,
     PRMergeQueueAction,
     PRReview,
@@ -33,6 +35,10 @@ from backend.models.pr_monitor import (
     PRRepairWake,
 )
 from backend.models.task import Task
+from backend.services.pr_review_actions import (
+    FindingActionConflict,
+    lock_pr_repo_action_boundary,
+)
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
@@ -50,6 +56,10 @@ from backend.schemas.pr_monitor import (
     PRReviewDetailResponse,
     PRReviewerRunResponse,
     PRFindingResponse,
+    PRFindingActionResponse,
+    FindingActionRequest,
+    HumanAdviceRequest,
+    ConfirmFixRequest,
     PRFindingRebuttalCreate,
     PRFindingRebuttalResponse,
     PRMonitorBindRequest,
@@ -74,6 +84,30 @@ def _pr_repo_write_lock(repo_id: int) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     locks = _PR_SYNCHRONIZE_LOCKS.setdefault(loop, {})
     return locks.setdefault(repo_id, asyncio.Lock())
+
+
+def _action_response_payload(action: PRFindingAction) -> dict:
+    """Expose repair metadata without leaking the stored patch or nonce."""
+
+    payload = PRFindingActionResponse.model_validate(action).model_dump()
+    raw_result = dict(action.result or {})
+    payload["result"] = {
+        key: value
+        for key, value in raw_result.items()
+        if key not in {
+            "patch",
+            "confirmation_token",
+            "action_nonce",
+            "push_owner_token",
+        }
+    } or None
+    if (
+        action.status == "awaiting_confirmation"
+        and action.confirmed_at is None
+        and action.task_id is not None
+    ):
+        payload["diff_download_url"] = f"/api/pr-monitor/actions/{action.id}/diff"
+    return payload
 
 
 def _parse_commit_sha(value: object, field_name: str) -> str:
@@ -232,6 +266,12 @@ _ACTIVE_REVIEW_STATUSES = (
     "superseding",
 )
 _ACTIVE_ADJUDICATION_STATUSES = ("pending", "adjudicating", "accepted")
+_ACTIVE_FINDING_ACTION_STATUSES = (
+    "pending",
+    "running",
+    "awaiting_confirmation",
+    "cancelling",
+)
 _STARTED_REPAIR_STATUSES = (
     "delivering",
     "accepted",
@@ -240,6 +280,29 @@ _STARTED_REPAIR_STATUSES = (
 )
 _STARTED_MERGE_QUEUE_STATUSES = ("enqueuing", "queued", "checking")
 _EXTERNALLY_BUSY_RUN_STATUSES = ("resolving_fixed_threads", "repair_migrating")
+
+
+async def _active_finding_action_for_repo(
+    db: AsyncSession,
+    repo_id: int,
+) -> int | None:
+    """Lock and return any action that still owns a Finding side effect."""
+
+    return (await db.execute(
+        select(PRFindingAction.id)
+        .join(PRFinding, PRFinding.id == PRFindingAction.finding_id)
+        .join(PRReview, PRReview.id == PRFinding.pr_review_id)
+        .where(
+            PRReview.repo_id == repo_id,
+            or_(
+                PRFindingAction.active_fix_finding_id.is_not(None),
+                PRFindingAction.status.in_(_ACTIVE_FINDING_ACTION_STATUSES),
+            ),
+        )
+        .order_by(PRFindingAction.id.asc())
+        .limit(1)
+        .with_for_update()
+    )).scalar_one_or_none()
 
 
 async def _quiesce_monitor_runs(
@@ -290,6 +353,7 @@ async def _quiesce_monitor_runs(
         .with_for_update()
     )).scalar_one_or_none()
 
+    active_fix_action = await _active_finding_action_for_repo(db, repo_id)
     active_adjudication = active_repair = active_merge = None
     if run_ids:
         active_adjudication = (await db.execute(
@@ -324,11 +388,18 @@ async def _quiesce_monitor_runs(
         (item for item in runs if item.status in _EXTERNALLY_BUSY_RUN_STATUSES),
         None,
     )
-    if any((active_review, active_adjudication, active_repair, active_merge, busy_run)):
+    if any((
+        active_review,
+        active_fix_action,
+        active_adjudication,
+        active_repair,
+        active_merge,
+        busy_run,
+    )):
         raise HTTPException(
             409,
-            "Cannot pause PR Monitor while review, adjudication, Repair, "
-            "thread resolution, or Merge Queue work is active",
+            "Cannot pause PR Monitor while review, Finding repair, "
+            "adjudication, Repair, thread resolution, or Merge Queue work is active",
         )
 
     if run_ids:
@@ -525,12 +596,9 @@ async def update_repo(
         ]
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
-        repo = (await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == repo_id)
-            .with_for_update()
-        )).scalar_one_or_none()
-        if repo is None:
+        try:
+            repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, repo)
 
@@ -642,16 +710,18 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
 
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
-        locked_repo = (
-            await db.execute(
-                select(MonitoredRepo)
-                .where(MonitoredRepo.id == repo_id)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if locked_repo is None:
+        try:
+            locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, locked_repo)
+        active_fix_action = await _active_finding_action_for_repo(db, repo_id)
+        if active_fix_action is not None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Cannot delete a PR monitor while a Finding repair action is active",
+            )
         reviews = (await db.execute(
             select(PRReview).where(PRReview.repo_id == repo_id)
         )).scalars().all()
@@ -733,15 +803,29 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
                     PRReviewerRun.pr_review_id.in_(review_ids)
                 )
             )).scalars())
-            if run_ids:
+            finding_ids = list((await db.execute(
+                select(PRFinding.id).where(
+                    PRFinding.pr_review_id.in_(review_ids)
+                )
+            )).scalars())
+            if finding_ids:
+                # Do not rely on database-level cascades here.  SQLite
+                # deployments may predate foreign_keys=ON, and orphaned
+                # terminal actions would retain globally unique idempotency
+                # keys after their monitor is deleted.
+                await db.execute(
+                    sa_delete(PRFindingAction).where(
+                        PRFindingAction.finding_id.in_(finding_ids)
+                    )
+                )
                 await db.execute(
                     sa_delete(PRFindingRebuttal).where(
-                        PRFindingRebuttal.pr_review_id.in_(review_ids)
+                        PRFindingRebuttal.finding_id.in_(finding_ids)
                     )
                 )
                 await db.execute(
                     sa_delete(PRFinding).where(
-                        PRFinding.reviewer_run_id.in_(run_ids)
+                        PRFinding.id.in_(finding_ids)
                     )
                 )
             await db.execute(
@@ -769,12 +853,9 @@ async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends
     await _require_pr_monitor_access(request, db, repo)
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
-        repo = (await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == repo_id)
-            .with_for_update()
-        )).scalar_one_or_none()
-        if repo is None:
+        try:
+            repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, repo)
         if repo.enabled:
@@ -797,14 +878,16 @@ async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = D
     await _require_pr_monitor_access(request, db, repo)
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
-        repo = (await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == repo_id)
-            .with_for_update()
-        )).scalar_one_or_none()
-        if repo is None:
+        try:
+            repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, repo)
+        if await _active_finding_action_for_repo(db, repo_id) is not None:
+            raise HTTPException(
+                409,
+                "Cannot rotate the webhook secret while a Finding repair action is active",
+            )
         repo.webhook_secret = secrets.token_hex(32)
         await db.commit()
         await db.refresh(repo)
@@ -863,13 +946,24 @@ async def get_review(
         .where(PRFindingRebuttal.pr_review_id == review.id)
         .order_by(PRFindingRebuttal.id)
     )).scalars())
+    actions = list((await db.execute(
+        select(PRFindingAction)
+        .where(PRFindingAction.finding_id.in_([item.id for item in findings]))
+        .order_by(PRFindingAction.id)
+    )).scalars()) if findings else []
     by_run: dict[int, list[PRFinding]] = {}
     by_finding: dict[int, list[PRFindingRebuttal]] = {}
+    latest_action: dict[int, PRFindingAction] = {}
+    for action in actions:
+        latest_action[action.finding_id] = action
     for rebuttal in rebuttals:
         by_finding.setdefault(rebuttal.finding_id, []).append(rebuttal)
     for finding in findings:
         by_run.setdefault(finding.reviewer_run_id, []).append(finding)
     payload = PRReviewResponse.model_validate(review).model_dump()
+    from backend.services.pr_review_actions import is_current_review_snapshot
+
+    payload["is_current_snapshot"] = await is_current_review_snapshot(db, review)
     payload["reviewer_runs"] = [
         PRReviewerRunResponse.model_validate(run).model_copy(
             update={"findings": [
@@ -877,7 +971,13 @@ async def get_review(
                     "rebuttals": [
                         PRFindingRebuttalResponse.model_validate(item)
                         for item in by_finding.get(finding.id, [])
-                    ]
+                    ],
+                    "latest_action": (
+                        PRFindingActionResponse.model_validate(
+                            _action_response_payload(latest_action[finding.id])
+                        )
+                        if finding.id in latest_action else None
+                    ),
                 })
                 for finding in by_run.get(run.id, [])
             ]}
@@ -885,6 +985,339 @@ async def get_review(
         for run in runs
     ]
     return payload
+
+
+async def _load_authorized_finding(
+    request: Request,
+    db: AsyncSession,
+    finding_id: int,
+) -> tuple[PRFinding, PRReview, MonitoredRepo]:
+    finding = await db.get(PRFinding, finding_id)
+    review = (
+        await db.get(PRReview, finding.pr_review_id)
+        if finding is not None else None
+    )
+    repo = (
+        await db.get(MonitoredRepo, review.repo_id)
+        if review is not None else None
+    )
+    if finding is None or review is None or repo is None:
+        raise HTTPException(404, "Finding not found")
+    await _require_pr_monitor_access(request, db, repo)
+    return finding, review, repo
+
+
+async def _perform_immediate_finding_action(
+    *,
+    request: Request,
+    db: AsyncSession,
+    finding_id: int,
+    action_type: str,
+    idempotency_key: str,
+    human_advice: str | None = None,
+) -> dict:
+    finding, review, repo = await _load_authorized_finding(
+        request, db, finding_id
+    )
+    from backend.services.pr_review_actions import (
+        FindingActionConflict,
+        create_immediate_finding_action,
+    )
+
+    finding_row_id = finding.id
+    review_row_id = review.id
+    repo_id = repo.id
+    actor_user_id = get_current_user_id(request)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        try:
+            action = await create_immediate_finding_action(
+                db,
+                finding_id=finding_row_id,
+                review_id=review_row_id,
+                action_type=action_type,
+                idempotency_key=idempotency_key,
+                actor_user_id=actor_user_id,
+                human_advice=human_advice,
+            )
+        except FindingActionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+    return _action_response_payload(action)
+
+
+@router.post(
+    "/findings/{finding_id}/ignore",
+    response_model=PRFindingActionResponse,
+)
+async def ignore_review_finding(
+    finding_id: int,
+    body: FindingActionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    return await _perform_immediate_finding_action(
+        request=request,
+        db=db,
+        finding_id=finding_id,
+        action_type="ignore",
+        idempotency_key=body.idempotency_key,
+    )
+
+
+@router.post(
+    "/findings/{finding_id}/advice",
+    response_model=PRFindingActionResponse,
+)
+async def save_review_finding_advice(
+    finding_id: int,
+    body: HumanAdviceRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    return await _perform_immediate_finding_action(
+        request=request,
+        db=db,
+        finding_id=finding_id,
+        action_type="human_advice",
+        idempotency_key=body.idempotency_key,
+        human_advice=body.advice,
+    )
+
+
+@router.post(
+    "/findings/{finding_id}/fix",
+    response_model=PRFindingActionResponse,
+)
+async def create_review_finding_fix(
+    finding_id: int,
+    body: FindingActionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    finding, review, repo = await _load_authorized_finding(
+        request, db, finding_id
+    )
+    from backend.services.pr_review_actions import FindingActionConflict
+    from backend.services.pr_review_fix import FixConfirmationError, create_fix_task
+    from backend.services.pr_review_service import GhError
+
+    finding_row_id = finding.id
+    review_row_id = review.id
+    repo_id = repo.id
+    actor_user_id = get_current_user_id(request)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        try:
+            action = await create_fix_task(
+                db,
+                finding_id=finding_row_id,
+                review_id=review_row_id,
+                repo_id=repo_id,
+                idempotency_key=body.idempotency_key,
+                actor_user_id=actor_user_id,
+            )
+        except (FindingActionConflict, FixConfirmationError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except GhError as exc:
+            raise HTTPException(409, f"PR repair input is no longer available: {exc}") from exc
+    return _action_response_payload(action)
+
+
+async def _load_authorized_finding_action(
+    request: Request,
+    db: AsyncSession,
+    action_id: int,
+) -> tuple[PRFindingAction, PRFinding, PRReview, MonitoredRepo]:
+    action = await db.get(PRFindingAction, action_id)
+    if action is None:
+        raise HTTPException(404, "Finding action not found")
+    finding, review, repo = await _load_authorized_finding(
+        request, db, action.finding_id
+    )
+    return action, finding, review, repo
+
+
+@router.get(
+    "/actions/{action_id}",
+    response_model=PRFindingActionResponse,
+)
+async def get_review_finding_action(
+    action_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    action, _, _, repo = await _load_authorized_finding_action(
+        request, db, action_id
+    )
+    await db.rollback()
+    try:
+        from backend.database import async_session
+        from backend.main import worker_relay
+        from backend.services.pr_review_fix import reconcile_finding_action
+
+        await reconcile_finding_action(
+            async_session,
+            action_id,
+            worker_relay=worker_relay,
+        )
+    except Exception:
+        # The periodic reconciler remains authoritative; a transient Worker or
+        # GitHub outage must not turn an otherwise readable audit row into 500.
+        logger.exception(
+            "On-read PR finding action recovery failed for action %s",
+            action_id,
+        )
+    db.expire_all()
+    action, _, _, _ = await _load_authorized_finding_action(
+        request,
+        db,
+        action_id,
+    )
+    return _action_response_payload(action)
+
+
+@router.get("/actions/{action_id}/diff", response_class=PlainTextResponse)
+async def download_review_finding_diff(
+    action_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    action, _, _, repo = await _load_authorized_finding_action(
+        request, db, action_id
+    )
+    patch_text = (action.result or {}).get("patch")
+    if (
+        action.status != "awaiting_confirmation"
+        or action.confirmed_at is not None
+        or not isinstance(patch_text, str)
+        or action.patch_sha256
+        != hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+    ):
+        raise HTTPException(409, "Validated PR fix diff is not available")
+    repo_id = repo.id
+    actor_user_id = get_current_user_id(request)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        from backend.services.pr_review_actions import (
+            FindingActionConflict,
+            lock_pr_repo_action_boundary,
+        )
+
+        try:
+            locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not locked_repo.enabled:
+            raise HTTPException(409, "PR monitor is disabled")
+        action = (
+            await db.execute(
+                select(PRFindingAction)
+                .where(PRFindingAction.id == action_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        patch_text = (action.result or {}).get("patch") if action else None
+        if (
+            action is None
+            or action.status != "awaiting_confirmation"
+            or action.confirmed_at is not None
+            or not isinstance(patch_text, str)
+            or action.patch_sha256
+            != hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+        ):
+            raise HTTPException(409, "Validated PR fix diff is not available")
+        confirmation_token = (action.result or {}).get("confirmation_token")
+        if not isinstance(confirmation_token, str):
+            raise HTTPException(409, "Validated PR fix confirmation is unavailable")
+        receipt = secrets.token_urlsafe(32)
+        action.download_receipt_hash = hashlib.sha256(
+            receipt.encode("utf-8")
+        ).hexdigest()
+        action.downloaded_by_user_id = actor_user_id
+        from backend.services.pr_review_service import _database_now
+
+        action.downloaded_at = await _database_now(db)
+        await db.commit()
+        return PlainTextResponse(
+            patch_text,
+            media_type="text/x-diff; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'inline; filename="pr-fix-{action_id}.diff"'
+                ),
+                "Cache-Control": "no-store",
+                "X-CCM-PR-Fix-Receipt": receipt,
+                "X-CCM-PR-Fix-Token": confirmation_token,
+            },
+        )
+
+
+@router.post(
+    "/actions/{action_id}/confirm",
+    response_model=PRFindingActionResponse,
+)
+async def confirm_review_finding_fix(
+    action_id: int,
+    body: ConfirmFixRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    action, _, _, repo = await _load_authorized_finding_action(
+        request, db, action_id
+    )
+    from backend.services.pr_review_fix import FixConfirmationError, confirm_fix
+
+    repo_id = repo.id
+    actor_user_id = get_current_user_id(request)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        try:
+            completed = await confirm_fix(
+                db,
+                action_id=action_id,
+                confirmation_token=body.confirmation_token,
+                patch_sha256=body.patch_sha256,
+                download_receipt=body.download_receipt,
+                confirmed_by_user_id=actor_user_id,
+            )
+        except FixConfirmationError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    return _action_response_payload(completed)
+
+
+@router.post(
+    "/actions/{action_id}/cancel",
+    response_model=PRFindingActionResponse,
+)
+async def cancel_review_finding_fix(
+    action_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    action, _, _, repo = await _load_authorized_finding_action(
+        request,
+        db,
+        action_id,
+    )
+    from backend.services.pr_review_fix import (
+        FixConfirmationError,
+        cancel_fix_action,
+    )
+
+    repo_id = repo.id
+    actor_user_id = get_current_user_id(request)
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        try:
+            cancelled = await cancel_fix_action(
+                db,
+                action_id=action_id,
+                cancelled_by_user_id=actor_user_id,
+            )
+        except FixConfirmationError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    return _action_response_payload(cancelled)
 
 
 @router.post(
@@ -915,7 +1348,12 @@ async def submit_finding_rebuttal(
     if review is None or run is None or repo is None:
         raise HTTPException(409, "Finding lifecycle is incomplete")
     await _require_pr_monitor_access(request, db, repo)
-    if run.current_review_id != review.id or run.current_head_sha != finding.head_sha:
+    if (
+        review.status not in {"commented", "approved"}
+        or run.status not in {"waiting_for_fix", "paused"}
+        or run.current_review_id != review.id
+        or run.current_head_sha != finding.head_sha
+    ):
         raise HTTPException(409, "Finding belongs to a superseded PR head")
     if finding.severity not in {"critical", "high", "medium"} or finding.status != "open":
         raise HTTPException(409, "Only an open blocking Finding can be rebutted")
@@ -944,17 +1382,31 @@ async def submit_finding_rebuttal(
         "author": review.pr_author,
         "url": review.pr_url,
     })
+    # Context preparation may perform remote reads.  Refresh the GitHub
+    # subject once more before entering the portable database writer fence;
+    # holding SQLite's global writer slot across network I/O would block
+    # unrelated writes without actually locking the remote PR.
+    snapshot = _validated_pr_snapshot(
+        await _gh_pr_view(review.pr_number, repo.repo_full_name)
+    )
+    if (
+        snapshot.get("state") != "OPEN"
+        or snapshot.get("merged_at") is not None
+        or snapshot.get("is_draft") is not False
+        or snapshot.get("base_sha") != review.base_sha
+        or snapshot.get("head_sha") != review.head_sha
+    ):
+        raise HTTPException(409, "GitHub PR subject changed before adjudication")
     repo_id = repo.id
     review_id = review.id
     run_id = run.id
     developer_id = developer.id
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
-        repo = (await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == repo_id)
-            .with_for_update()
-        )).scalar_one_or_none()
+        try:
+            repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict:
+            repo = None
         run = (await db.execute(
             select(PRMonitorRun)
             .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
@@ -982,7 +1434,9 @@ async def submit_finding_rebuttal(
         if not repo.enabled:
             raise HTTPException(409, "PR monitor is disabled")
         if (
-            run.current_review_id != review.id
+            review.status not in {"commented", "approved"}
+            or run.status not in {"waiting_for_fix", "paused"}
+            or run.current_review_id != review.id
             or run.current_base_sha != review.base_sha
             or run.current_head_sha != review.head_sha
             or finding.base_sha != review.base_sha
@@ -992,17 +1446,23 @@ async def submit_finding_rebuttal(
             raise HTTPException(409, "Finding belongs to a superseded PR subject")
         if finding.severity not in {"critical", "high", "medium"} or finding.status != "open":
             raise HTTPException(409, "Only an open blocking Finding can be rebutted")
-        fresh_snapshot = _validated_pr_snapshot(
-            await _gh_pr_view(review.pr_number, repo.repo_full_name)
-        )
-        if (
-            fresh_snapshot.get("state") != "OPEN"
-            or fresh_snapshot.get("merged_at") is not None
-            or fresh_snapshot.get("is_draft") is not False
-            or fresh_snapshot.get("base_sha") != review.base_sha
-            or fresh_snapshot.get("head_sha") != review.head_sha
-        ):
-            raise HTTPException(409, "GitHub PR subject changed before adjudication")
+        active_fix = (await db.execute(
+            select(PRFindingAction.id)
+            .where(
+                PRFindingAction.finding_id == finding.id,
+                or_(
+                    PRFindingAction.active_fix_finding_id == finding.id,
+                    PRFindingAction.status.in_(_ACTIVE_FINDING_ACTION_STATUSES),
+                ),
+            )
+            .limit(1)
+            .with_for_update()
+        )).scalar_one_or_none()
+        if active_fix is not None:
+            raise HTTPException(
+                409,
+                "This Finding already has an active AI repair",
+            )
         active = (await db.execute(
             select(PRFindingRebuttal.id)
             .where(
@@ -1195,12 +1655,9 @@ async def pause_monitor_run(run_id: int, request: Request, db: AsyncSession = De
     repo_id = repo.id
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
-        locked_repo = (await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == repo_id)
-            .with_for_update()
-        )).scalar_one_or_none()
-        if locked_repo is None:
+        try:
+            locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, locked_repo)
         await _quiesce_monitor_runs(

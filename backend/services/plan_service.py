@@ -6,24 +6,31 @@ import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from functools import wraps
+import json
 from typing import Iterable
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.plan import (
     Plan,
     PlanApplication,
+    PlanApplicationAttempt,
+    PlanApplicationReceipt,
     PlanInputRequest,
     PlanLegacyTaskLink,
     PlanVersion,
 )
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.services.task_creation import stage_task_record
+from backend.services.plan_tasks import MAX_ACTIVE_PLANS_PER_TASK
 from backend.schemas.plan_resource import (
+    PlanApplicationAttemptResource,
     PlanApplicationResource,
     PlanInputAnswer,
     PlanInputRequestResponse,
@@ -38,6 +45,7 @@ from backend.schemas.plan_resource import (
 ACTIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_user"})
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _plan_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_target_plan_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,368 @@ class PlanExecutionTaskResult:
 
 def plan_operation_lock(plan_id: int) -> asyncio.Lock:
     return _plan_locks[plan_id]
+
+
+async def _remove_receipt_applications(
+    db: AsyncSession,
+    receipt: PlanApplicationReceipt,
+    *,
+    delivery_status: str,
+    error: str,
+) -> list[int]:
+    applications = list(
+        (
+            await db.execute(
+                select(PlanApplication).where(
+                    PlanApplication.application_receipt_key == receipt.receipt_key
+                )
+            )
+        ).scalars()
+    )
+    plan_ids = list(dict.fromkeys(item.plan_id for item in applications))
+    existing_attempt_versions = set(
+        (
+            await db.execute(
+                select(PlanApplicationAttempt.plan_version_id).where(
+                    PlanApplicationAttempt.application_receipt_key
+                    == receipt.receipt_key
+                )
+            )
+        ).scalars()
+    )
+    released_at = datetime.utcnow()
+    for application in applications:
+        if application.plan_version_id in existing_attempt_versions:
+            continue
+        db.add(
+            PlanApplicationAttempt(
+                plan_id=application.plan_id,
+                plan_version_id=application.plan_version_id,
+                application_receipt_key=receipt.receipt_key,
+                application_type=application.application_type,
+                target_task_id=application.target_task_id,
+                target_session_id=application.target_session_id,
+                user_log_id=application.user_log_id,
+                execution_task_id=application.execution_task_id,
+                applied_by=application.applied_by,
+                application_created_at=application.created_at,
+                released_at=released_at,
+            )
+        )
+    # Persist the immutable attempt before deleting the active application.
+    # The receipt row lock serializes resolution; the unique key remains the
+    # final cross-process idempotency fence.
+    await db.flush()
+    await db.execute(
+        delete(PlanApplication).where(
+            PlanApplication.application_receipt_key == receipt.receipt_key
+        )
+    )
+    log = await db.get(LogEntry, receipt.manager_user_log_id)
+    if log is not None:
+        try:
+            metadata = json.loads(log.raw_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.pop("applied_plans", None)
+        metadata["plan_delivery"] = {
+            "status": delivery_status,
+            "error": error[:2000],
+        }
+        log.raw_json = json.dumps(metadata)
+    return plan_ids
+
+
+async def release_unstarted_plan_application(
+    db: AsyncSession,
+    *,
+    receipt_key: str,
+    delivery_status: str,
+    error: str,
+    expected_worker_id: int | None = None,
+) -> tuple[list[int], int | None] | None:
+    """Release a Version application only after prelaunch is proven.
+
+    The caller owns that proof. ``launching``/``uncertain`` receipts must never
+    enter here because an external turn may already exist.
+    """
+
+    query = (
+        select(PlanApplicationReceipt)
+        .where(
+            PlanApplicationReceipt.receipt_key == receipt_key,
+            PlanApplicationReceipt.delivery_status.in_(["pending", "queued"]),
+        )
+        .with_for_update()
+    )
+    if expected_worker_id is not None:
+        query = query.where(PlanApplicationReceipt.worker_id == expected_worker_id)
+    receipt = (await db.execute(query)).scalar_one_or_none()
+    if receipt is None:
+        return None
+
+    plan_ids = await _remove_receipt_applications(
+        db,
+        receipt,
+        delivery_status=delivery_status,
+        error=error,
+    )
+    receipt.delivery_status = delivery_status
+    receipt.delivery_error = error[:2000]
+    receipt.updated_at = datetime.utcnow()
+    return plan_ids, receipt.target_task_id
+
+
+async def release_unstarted_plan_applications_for_task(
+    db: AsyncSession,
+    *,
+    target_task_id: int,
+    delivery_status: str,
+    error: str,
+) -> list[tuple[str, list[int], int | None]]:
+    """Cancel every durable local outbox row not yet past queue admission."""
+
+    keys = list(
+        (
+            await db.execute(
+                select(PlanApplicationReceipt.receipt_key)
+                .where(
+                    PlanApplicationReceipt.target_task_id == target_task_id,
+                    PlanApplicationReceipt.outbox_payload.isnot(None),
+                    PlanApplicationReceipt.delivery_status.in_(["pending", "queued"]),
+                )
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    released: list[tuple[str, list[int], int | None]] = []
+    for receipt_key in keys:
+        result = await release_unstarted_plan_application(
+            db,
+            receipt_key=receipt_key,
+            delivery_status=delivery_status,
+            error=error,
+        )
+        if result is not None:
+            plan_ids, task_id = result
+            released.append((receipt_key, plan_ids, task_id))
+    return released
+
+
+async def preserve_uncertain_plan_application(
+    db: AsyncSession,
+    *,
+    receipt: PlanApplicationReceipt,
+    error: str,
+    launch_evidence: dict | None,
+    response: dict | None = None,
+    applied_by: int | None = None,
+) -> list[int]:
+    """Conservatively consume every Version while a Worker launch is ambiguous."""
+
+    version_ids = list(dict.fromkeys(receipt.plan_version_ids or []))
+    versions = list(
+        (
+            await db.execute(select(PlanVersion).where(PlanVersion.id.in_(version_ids)))
+        ).scalars()
+    )
+    versions_by_id = {version.id: version for version in versions}
+    if set(versions_by_id) != set(version_ids):
+        raise HTTPException(
+            409,
+            "Plan delivery receipt references a missing Version",
+        )
+    plans = list(
+        (
+            await db.execute(
+                select(Plan).where(
+                    Plan.id.in_({version.plan_id for version in versions})
+                )
+            )
+        ).scalars()
+    )
+    plans_by_id = {plan.id: plan for plan in plans}
+    target = await db.get(Task, receipt.target_task_id)
+    existing = {
+        application.plan_version_id: application
+        for application in (
+            await db.execute(
+                select(PlanApplication).where(
+                    PlanApplication.plan_version_id.in_(version_ids)
+                )
+            )
+        ).scalars()
+    }
+    approved: list[tuple[Plan, PlanVersion]] = []
+    for version_id in version_ids:
+        version = versions_by_id[version_id]
+        plan = plans_by_id.get(version.plan_id)
+        if plan is None:
+            raise HTTPException(409, "Plan delivery receipt lost its Plan")
+        approved.append((plan, version))
+        application = existing.get(version_id)
+        if application is not None:
+            if application.application_receipt_key != receipt.receipt_key:
+                raise HTTPException(
+                    409,
+                    "Plan Version has a different application receipt",
+                )
+            continue
+        db.add(
+            PlanApplication(
+                plan_id=plan.id,
+                plan_version_id=version.id,
+                application_type="chat_message",
+                target_task_id=receipt.target_task_id,
+                target_session_id=target.session_id if target is not None else None,
+                user_log_id=receipt.manager_user_log_id,
+                applied_by=applied_by,
+                application_receipt_key=receipt.receipt_key,
+            )
+        )
+
+    log = await db.get(LogEntry, receipt.manager_user_log_id)
+    if log is not None:
+        try:
+            metadata = json.loads(log.raw_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["applied_plans"] = versioned_plan_snapshots(approved)
+        metadata["plan_delivery"] = {
+            "status": "uncertain",
+            "error": error[:2000],
+        }
+        log.raw_json = json.dumps(metadata)
+
+    receipt.status = "committed" if response is not None else receipt.status
+    if response is not None:
+        receipt.response = response
+    receipt.delivery_status = "uncertain"
+    receipt.delivery_error = error[:2000]
+    if isinstance(launch_evidence, dict):
+        receipt.launch_evidence = launch_evidence
+    receipt.updated_at = datetime.utcnow()
+    await db.flush()
+    return list(dict.fromkeys(plan.id for plan, _version in approved))
+
+
+async def resolve_uncertain_plan_application(
+    db: AsyncSession,
+    *,
+    receipt_key: str,
+    action: str,
+    note: str,
+    actor_id: int | None,
+) -> tuple[list[int], int | None]:
+    """Resolve one ambiguous launch after an administrator checks evidence."""
+
+    if action not in {"confirm_launched", "release_for_retry"}:
+        raise HTTPException(422, "Unknown Plan delivery resolution action")
+    receipt = (
+        await db.execute(
+            select(PlanApplicationReceipt)
+            .where(PlanApplicationReceipt.receipt_key == receipt_key)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if receipt is None:
+        raise HTTPException(404, "Plan application receipt not found")
+    prior_resolution = receipt.delivery_resolution
+    if isinstance(prior_resolution, dict) and prior_resolution.get("action") == action:
+        if actor_id is not None and prior_resolution.get("resolved_by") is None:
+            enriched_resolution = dict(prior_resolution)
+            enriched_resolution["resolved_by"] = actor_id
+            enriched_resolution["note"] = note[:2000]
+            enriched_resolution["manager_confirmed_at"] = datetime.utcnow().isoformat()
+            receipt.delivery_resolution = enriched_resolution
+            receipt.updated_at = datetime.utcnow()
+        plan_ids = list(
+            dict.fromkeys(
+                (
+                    await db.execute(
+                        select(PlanVersion.plan_id).where(
+                            PlanVersion.id.in_(receipt.plan_version_ids or [])
+                        )
+                    )
+                ).scalars()
+            )
+        )
+        return plan_ids, receipt.target_task_id
+    if receipt.delivery_status != "uncertain":
+        raise HTTPException(
+            409,
+            f"Plan delivery is {receipt.delivery_status}, not uncertain",
+        )
+
+    now = datetime.utcnow()
+    resolution = {
+        "action": action,
+        "note": note[:2000],
+        "resolved_by": actor_id,
+        "resolved_at": now.isoformat(),
+        "previous_status": "uncertain",
+    }
+    if action == "confirm_launched":
+        plan_ids = list(
+            dict.fromkeys(
+                (
+                    await db.execute(
+                        select(PlanVersion.plan_id).where(
+                            PlanVersion.id.in_(receipt.plan_version_ids or [])
+                        )
+                    )
+                ).scalars()
+            )
+        )
+        receipt.delivery_status = "launched"
+        receipt.delivery_error = None
+    else:
+        plan_ids = await _remove_receipt_applications(
+            db,
+            receipt,
+            delivery_status="cancelled",
+            error=(
+                "Administrator confirmed that the ambiguous delivery did not launch: "
+                f"{note}"
+            ),
+        )
+        if not plan_ids:
+            plan_ids = list(
+                dict.fromkeys(
+                    (
+                        await db.execute(
+                            select(PlanVersion.plan_id).where(
+                                PlanVersion.id.in_(receipt.plan_version_ids or [])
+                            )
+                        )
+                    ).scalars()
+                )
+            )
+        receipt.delivery_status = "cancelled"
+        receipt.delivery_error = (
+            "Administrator confirmed that the ambiguous delivery did not launch"
+        )
+    receipt.delivery_resolution = resolution
+    receipt.updated_at = now
+    return plan_ids, receipt.target_task_id
+
+
+def _serialize_related_plan_creation(function):
+    """Keep the target fence through COUNT, INSERT, and commit in-process."""
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        target_task_id = kwargs.get("target_task_id")
+        if target_task_id is None:
+            return await function(*args, **kwargs)
+        async with _target_plan_locks[target_task_id]:
+            return await function(*args, **kwargs)
+
+    return wrapped
 
 
 async def _fence_target_task(
@@ -90,11 +460,7 @@ def _public_attachments(items: list[dict] | None) -> list[dict] | None:
     if not items:
         return None
     return [
-        {
-            key: item[key]
-            for key in ("url", "name", "is_image")
-            if key in item
-        }
+        {key: item[key] for key in ("url", "name", "is_image") if key in item}
         for item in items
         if isinstance(item, dict)
     ] or None
@@ -108,6 +474,7 @@ def input_request_resource(
     )
 
 
+@_serialize_related_plan_creation
 async def create_plan_with_run(
     db: AsyncSession,
     *,
@@ -137,6 +504,26 @@ async def create_plan_with_run(
         target_task_id=target_task_id,
         expected_worker_id=worker_id,
     )
+    if target_task_id is not None:
+        # The target Task write fence above serializes this COUNT -> INSERT
+        # boundary across processes and all supported databases. Both ordinary
+        # creation and Fork enter through this service boundary.
+        active_count = int(
+            await db.scalar(
+                select(func.count(Plan.id)).where(
+                    Plan.target_task_id == target_task_id,
+                    Plan.archived_at.is_(None),
+                    Plan.active_run_id.isnot(None),
+                )
+            )
+            or 0
+        )
+        if active_count >= MAX_ACTIVE_PLANS_PER_TASK:
+            await db.rollback()
+            raise HTTPException(
+                429,
+                f"Task already has {MAX_ACTIVE_PLANS_PER_TASK} active Plans",
+            )
     plan = Plan(
         title=title[:200],
         initial_request=initial_request,
@@ -302,14 +689,17 @@ async def complete_plan_run_with_version(
             raise RuntimeError("Planner Step Version identity changed")
         version = existing
     else:
-        next_number = int(
-            await db.scalar(
-                select(func.coalesce(func.max(PlanVersion.version_number), 0)).where(
-                    PlanVersion.plan_id == plan.id
+        next_number = (
+            int(
+                await db.scalar(
+                    select(
+                        func.coalesce(func.max(PlanVersion.version_number), 0)
+                    ).where(PlanVersion.plan_id == plan.id)
                 )
+                or 0
             )
-            or 0
-        ) + 1
+            + 1
+        )
         version = PlanVersion(
             plan_id=plan.id,
             version_number=next_number,
@@ -386,9 +776,7 @@ def validate_input_answers(
     normalized: list[dict] = []
     for question in parsed:
         value = values.get(question.id)
-        if question.required and (
-            value is None or value == "" or value == []
-        ):
+        if question.required and (value is None or value == "" or value == []):
             raise HTTPException(422, f"Question {question.id!r} requires an answer")
         if value is None:
             normalized.append({"question_id": question.id, "value": None})
@@ -399,15 +787,21 @@ def validate_input_answers(
         elif question.response_type == "single_choice":
             allowed = {option.value for option in question.options}
             if not isinstance(value, str) or value not in allowed:
-                raise HTTPException(422, f"Question {question.id!r} has an invalid choice")
+                raise HTTPException(
+                    422, f"Question {question.id!r} has an invalid choice"
+                )
         else:
             allowed = {option.value for option in question.options}
             if (
                 not isinstance(value, list)
-                or any(not isinstance(item, str) or item not in allowed for item in value)
+                or any(
+                    not isinstance(item, str) or item not in allowed for item in value
+                )
                 or len(value) != len(set(value))
             ):
-                raise HTTPException(422, f"Question {question.id!r} has invalid choices")
+                raise HTTPException(
+                    422, f"Question {question.id!r} has invalid choices"
+                )
         normalized.append({"question_id": question.id, "value": value})
     return normalized
 
@@ -425,7 +819,10 @@ async def answer_input_request(
     attachments: list[dict] | None,
     answered_by: int | None,
 ) -> PlanInputRequest:
-    if input_request.answer_idempotency_key == idempotency_key and input_request.status == "answered":
+    if (
+        input_request.answer_idempotency_key == idempotency_key
+        and input_request.status == "answered"
+    ):
         return input_request
     if plan.active_run_id != run.id or run.status != "waiting_user":
         raise HTTPException(409, "Plan Run is no longer waiting for input")
@@ -496,11 +893,17 @@ async def decide_version(
     decided_by: int | None,
     expected_current_version_id: int,
 ) -> PlanVersion:
-    if plan.current_version_id != expected_current_version_id or version.id != expected_current_version_id:
+    if (
+        plan.current_version_id != expected_current_version_id
+        or version.id != expected_current_version_id
+    ):
         raise HTTPException(409, "Plan current Version changed")
     if plan.active_run_id is not None:
         raise HTTPException(409, "Plan has an active Run")
-    if version.review_verdict not in {"approve", "disabled", "exhausted"} and not version.review_exhausted:
+    if (
+        version.review_verdict not in {"approve", "disabled", "exhausted"}
+        and not version.review_exhausted
+    ):
         raise HTTPException(409, "Version is not ready for a human decision")
     if version.human_decision != "pending":
         if version.human_decision == decision:
@@ -789,7 +1192,9 @@ async def cancel_run(
     return run
 
 
-async def resolve_legacy_task(db: AsyncSession, task_id: int) -> PlanLegacyTaskLink | None:
+async def resolve_legacy_task(
+    db: AsyncSession, task_id: int
+) -> PlanLegacyTaskLink | None:
     return await db.get(PlanLegacyTaskLink, task_id)
 
 
@@ -841,9 +1246,9 @@ async def approved_versions_for_message(
         if version.human_decision != "approved" or not version.content:
             raise ValueError(f"Plan Version #{version_id} is not approved and ready")
         applied = await db.scalar(
-            select(PlanApplication.id).where(
-                PlanApplication.plan_version_id == version.id
-            ).limit(1)
+            select(PlanApplication.id)
+            .where(PlanApplication.plan_version_id == version.id)
+            .limit(1)
         )
         if applied is not None:
             raise ValueError(f"Plan Version #{version_id} has already been applied")
@@ -912,9 +1317,9 @@ async def _version_resource(
         return None
     applied = (
         await db.scalar(
-            select(PlanApplication.id).where(
-                PlanApplication.plan_version_id == version.id
-            ).limit(1)
+            select(PlanApplication.id)
+            .where(PlanApplication.plan_version_id == version.id)
+            .limit(1)
         )
         is not None
     )
@@ -951,13 +1356,30 @@ async def _application_resources(
     available_execution_task_ids = (
         set(
             (
-                await db.execute(
-                    select(Task.id).where(Task.id.in_(execution_task_ids))
-                )
+                await db.execute(select(Task.id).where(Task.id.in_(execution_task_ids)))
             ).scalars()
         )
         if execution_task_ids
         else set()
+    )
+    receipt_keys = {
+        item.application_receipt_key
+        for item in applications
+        if item.application_receipt_key is not None
+    }
+    receipts = (
+        {
+            row.receipt_key: row
+            for row in (
+                await db.execute(
+                    select(PlanApplicationReceipt).where(
+                        PlanApplicationReceipt.receipt_key.in_(receipt_keys)
+                    )
+                )
+            ).scalars()
+        }
+        if receipt_keys
+        else {}
     )
     return [
         PlanApplicationResource.model_validate(item).model_copy(
@@ -967,10 +1389,74 @@ async def _application_resources(
                     if item.application_type == "execution_task"
                     and item.execution_task_id is not None
                     else None
-                )
+                ),
+                "delivery_status": (
+                    receipts[item.application_receipt_key].delivery_status
+                    if item.application_receipt_key in receipts
+                    else None
+                ),
+                "delivery_error": (
+                    receipts[item.application_receipt_key].delivery_error
+                    if item.application_receipt_key in receipts
+                    else None
+                ),
+                "launch_evidence": (
+                    receipts[item.application_receipt_key].launch_evidence
+                    if item.application_receipt_key in receipts
+                    else None
+                ),
+                "delivery_resolution": (
+                    receipts[item.application_receipt_key].delivery_resolution
+                    if item.application_receipt_key in receipts
+                    else None
+                ),
             }
         )
         for item in applications
+    ]
+
+
+async def _application_attempt_resources(
+    db: AsyncSession,
+    attempts: list[PlanApplicationAttempt],
+) -> list[PlanApplicationAttemptResource]:
+    receipt_keys = {item.application_receipt_key for item in attempts}
+    receipts = {
+        row.receipt_key: row
+        for row in (
+            await db.execute(
+                select(PlanApplicationReceipt).where(
+                    PlanApplicationReceipt.receipt_key.in_(receipt_keys)
+                )
+            )
+        ).scalars()
+    }
+    return [
+        PlanApplicationAttemptResource.model_validate(item).model_copy(
+            update={
+                "delivery_status": (
+                    receipts[item.application_receipt_key].delivery_status
+                    if item.application_receipt_key in receipts
+                    else "missing"
+                ),
+                "delivery_error": (
+                    receipts[item.application_receipt_key].delivery_error
+                    if item.application_receipt_key in receipts
+                    else "Plan application receipt is missing"
+                ),
+                "launch_evidence": (
+                    receipts[item.application_receipt_key].launch_evidence
+                    if item.application_receipt_key in receipts
+                    else None
+                ),
+                "delivery_resolution": (
+                    receipts[item.application_receipt_key].delivery_resolution
+                    if item.application_receipt_key in receipts
+                    else None
+                ),
+            }
+        )
+        for item in attempts
     ]
 
 
@@ -1010,119 +1496,294 @@ async def _run_resource(
 async def plan_resource(
     db: AsyncSession, plan: Plan, *, include_audit: bool = False
 ) -> PlanResource:
-    current = (
-        await db.get(PlanVersion, plan.current_version_id)
-        if plan.current_version_id is not None
-        else None
-    )
-    active = (
-        await db.get(PlanAgentRun, plan.active_run_id)
-        if plan.active_run_id is not None
-        else None
-    )
-    latest = (
-        await db.execute(
-            select(PlanAgentRun)
-            .where(PlanAgentRun.plan_id == plan.id)
-            .order_by(PlanAgentRun.id.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    open_input = None
-    if active is not None and active.open_input_request_id is not None:
-        open_input = await db.get(PlanInputRequest, active.open_input_request_id)
+    resources = await plan_resources(db, [plan], include_audit=include_audit)
+    return resources[0]
 
+
+async def plan_resources(
+    db: AsyncSession,
+    plans: list[Plan],
+    *,
+    include_audit: bool = False,
+) -> list[PlanResource]:
+    """Build a Plan list with a bounded set of aggregate preload queries."""
+
+    if not plans:
+        return []
+    plan_ids = [plan.id for plan in plans]
+    version_ids = {
+        plan.current_version_id for plan in plans if plan.current_version_id is not None
+    }
+    active_run_ids = {
+        plan.active_run_id for plan in plans if plan.active_run_id is not None
+    }
+    versions = (
+        {
+            row.id: row
+            for row in (
+                await db.execute(
+                    select(PlanVersion).where(PlanVersion.id.in_(version_ids))
+                )
+            ).scalars()
+        }
+        if version_ids
+        else {}
+    )
+    active_runs = (
+        {
+            row.id: row
+            for row in (
+                await db.execute(
+                    select(PlanAgentRun).where(PlanAgentRun.id.in_(active_run_ids))
+                )
+            ).scalars()
+        }
+        if active_run_ids
+        else {}
+    )
+    latest_run_ids = (
+        select(func.max(PlanAgentRun.id))
+        .where(PlanAgentRun.plan_id.in_(plan_ids))
+        .group_by(PlanAgentRun.plan_id)
+    )
+    latest_runs = {
+        row.plan_id: row
+        for row in (
+            await db.execute(
+                select(PlanAgentRun).where(PlanAgentRun.id.in_(latest_run_ids))
+            )
+        ).scalars()
+    }
+    open_input_ids = {
+        run.open_input_request_id
+        for run in active_runs.values()
+        if run.open_input_request_id is not None
+    }
+    open_inputs = (
+        {
+            row.id: row
+            for row in (
+                await db.execute(
+                    select(PlanInputRequest).where(
+                        PlanInputRequest.id.in_(open_input_ids)
+                    )
+                )
+            ).scalars()
+        }
+        if open_input_ids
+        else {}
+    )
     applications = list(
         (
             await db.execute(
                 select(PlanApplication)
-                .where(PlanApplication.plan_id == plan.id)
-                .order_by(PlanApplication.created_at, PlanApplication.id)
+                .where(PlanApplication.plan_id.in_(plan_ids))
+                .order_by(
+                    PlanApplication.plan_id,
+                    PlanApplication.created_at,
+                    PlanApplication.id,
+                )
             )
         ).scalars()
     )
+    applications_by_plan: defaultdict[int, list[PlanApplication]] = defaultdict(list)
+    for application in applications:
+        applications_by_plan[application.plan_id].append(application)
     application_resources = await _application_resources(db, applications)
-    application = None
-    applied = False
-    if current is not None:
-        application = next(
+    application_resource_by_id = {item.id: item for item in application_resources}
+    application_attempts = (
+        list(
+            (
+                await db.execute(
+                    select(PlanApplicationAttempt)
+                    .where(PlanApplicationAttempt.plan_id.in_(plan_ids))
+                    .order_by(
+                        PlanApplicationAttempt.plan_id,
+                        PlanApplicationAttempt.released_at,
+                        PlanApplicationAttempt.id,
+                    )
+                )
+            ).scalars()
+        )
+        if include_audit
+        else []
+    )
+    application_attempts_by_plan: defaultdict[int, list[PlanApplicationAttempt]] = (
+        defaultdict(list)
+    )
+    for attempt in application_attempts:
+        application_attempts_by_plan[attempt.plan_id].append(attempt)
+    application_attempt_resources = (
+        await _application_attempt_resources(
+            db,
+            application_attempts,
+        )
+        if application_attempts
+        else []
+    )
+    application_attempt_resource_by_id = {
+        item.id: item for item in application_attempt_resources
+    }
+    applied_version_ids = {item.plan_version_id for item in applications}
+    legacy_plan_ids = set(
+        (
+            await db.execute(
+                select(PlanLegacyTaskLink.plan_id).where(
+                    PlanLegacyTaskLink.plan_id.in_(plan_ids)
+                )
+            )
+        ).scalars()
+    )
+
+    steps_by_run: defaultdict[int, list[PlanStepResource]] = defaultdict(list)
+    inputs_by_run: defaultdict[int, list[PlanInputRequestResponse]] = defaultdict(list)
+    if include_audit and active_run_ids:
+        for row in (
+            await db.execute(
+                select(PlanAgentStep)
+                .where(PlanAgentStep.run_id.in_(active_run_ids))
+                .order_by(PlanAgentStep.run_id, PlanAgentStep.id)
+            )
+        ).scalars():
+            steps_by_run[row.run_id].append(PlanStepResource.model_validate(row))
+        for row in (
+            await db.execute(
+                select(PlanInputRequest)
+                .where(PlanInputRequest.run_id.in_(active_run_ids))
+                .order_by(PlanInputRequest.run_id, PlanInputRequest.id)
+            )
+        ).scalars():
+            inputs_by_run[row.run_id].append(input_request_resource(row))
+
+    result: list[PlanResource] = []
+    for plan in plans:
+        current = versions.get(plan.current_version_id)
+        active = active_runs.get(plan.active_run_id)
+        latest = latest_runs.get(plan.id)
+        plan_applications = applications_by_plan[plan.id]
+        current_application = next(
             (
                 item
-                for item in applications
-                if item.plan_version_id == current.id
+                for item in plan_applications
+                if current is not None and item.plan_version_id == current.id
             ),
             None,
         )
-        applied = application is not None
-    if plan.archived_at is not None:
-        display_state = "archived"
-    elif active is not None and active.status == "waiting_user":
-        display_state = "waiting_user"
-    elif active is not None and active.status in {"queued", "running"}:
-        display_state = active.current_stage or "running"
-    elif current is not None and applied:
-        display_state = "applied"
-    elif current is not None and current.human_decision == "approved":
-        display_state = "approved"
-    elif current is not None and current.human_decision == "rejected":
-        display_state = "rejected"
-    elif current is not None and (
-        current.review_verdict in {"approve", "disabled", "exhausted"}
-        or current.review_exhausted
-    ):
-        display_state = "awaiting_review"
-    elif latest is not None and latest.status in {"failed", "cancelled"}:
-        display_state = latest.status
-    else:
-        display_state = "draft"
-
-    payload = {
-        column: getattr(plan, column)
-        for column in (
-            "id", "title", "initial_request", "initial_attachments",
-            "target_task_id", "project_id", "target_repo", "target_branch",
-            "worker_id", "priority", "timeout_hours", "created_by",
-            "pipeline_config",
-            "current_version_id", "active_run_id", "forked_from_version_id",
-            "archived_at", "closed_at", "lock_version", "created_at", "updated_at",
-        )
-    }
-    payload["initial_attachments"] = _public_attachments(plan.initial_attachments)
-    legacy = (
-        await db.scalar(
-            select(PlanLegacyTaskLink.legacy_task_id)
-            .where(PlanLegacyTaskLink.plan_id == plan.id)
-            .limit(1)
-        )
-        is not None
-    )
-    return PlanResource(
-        **payload,
-        display_state=display_state,
-        legacy=legacy,
-        latest_run_status=latest.status if latest else None,
-        latest_run_error=(
-            latest.error if latest is not None and latest.status == "failed" else None
-        ),
-        application=(
-            next(
-                (
-                    item
-                    for item in application_resources
-                    if application is not None and item.id == application.id
-                ),
-                None,
+        if plan.archived_at is not None:
+            display_state = "archived"
+        elif active is not None and active.status == "waiting_user":
+            display_state = "waiting_user"
+        elif active is not None and active.status in {"queued", "running"}:
+            display_state = active.current_stage or "running"
+        elif current_application is not None:
+            display_state = "applied"
+        elif current is not None and current.human_decision == "approved":
+            display_state = "approved"
+        elif current is not None and current.human_decision == "rejected":
+            display_state = "rejected"
+        elif current is not None and (
+            current.review_verdict in {"approve", "disabled", "exhausted"}
+            or current.review_exhausted
+        ):
+            display_state = "awaiting_review"
+        elif latest is not None and latest.status in {"failed", "cancelled"}:
+            display_state = latest.status
+        else:
+            display_state = "draft"
+        payload = {
+            column: getattr(plan, column)
+            for column in (
+                "id",
+                "title",
+                "initial_request",
+                "initial_attachments",
+                "target_task_id",
+                "project_id",
+                "target_repo",
+                "target_branch",
+                "worker_id",
+                "priority",
+                "timeout_hours",
+                "created_by",
+                "pipeline_config",
+                "current_version_id",
+                "active_run_id",
+                "forked_from_version_id",
+                "archived_at",
+                "closed_at",
+                "lock_version",
+                "created_at",
+                "updated_at",
             )
-        ),
-        applications=application_resources,
-        current_version=await _version_resource(db, current),
-        active_run=await _run_resource(db, active, include_audit=include_audit),
-        open_input_request=(
-            input_request_resource(open_input)
-            if open_input is not None
-            else None
-        ),
-    )
+        }
+        payload["initial_attachments"] = _public_attachments(plan.initial_attachments)
+        current_resource = None
+        if current is not None:
+            if current.id in applied_version_ids:
+                version_state = "applied"
+            elif current.human_decision == "rejected":
+                version_state = "rejected"
+            elif current.human_decision == "approved":
+                version_state = "approved"
+            elif current.superseded_by_version_id is not None:
+                version_state = "superseded"
+            elif (
+                current.review_verdict in {"approve", "disabled", "exhausted"}
+                or current.review_exhausted
+            ):
+                version_state = "awaiting_review"
+            else:
+                version_state = "draft"
+            current_resource = PlanVersionResource.model_validate(current).model_copy(
+                update={
+                    "applied": current.id in applied_version_ids,
+                    "display_state": version_state,
+                }
+            )
+        active_resource = None
+        if active is not None:
+            active_resource = PlanRunResource.model_validate(active).model_copy(
+                update={
+                    "steps": steps_by_run[active.id] if include_audit else [],
+                    "input_requests": (
+                        inputs_by_run[active.id] if include_audit else []
+                    ),
+                }
+            )
+        result.append(
+            PlanResource(
+                **payload,
+                display_state=display_state,
+                legacy=plan.id in legacy_plan_ids,
+                latest_run_status=latest.status if latest else None,
+                latest_run_error=(
+                    latest.error
+                    if latest is not None and latest.status == "failed"
+                    else None
+                ),
+                application=(
+                    application_resource_by_id.get(current_application.id)
+                    if current_application is not None
+                    else None
+                ),
+                applications=[
+                    application_resource_by_id[item.id] for item in plan_applications
+                ],
+                application_attempts=[
+                    application_attempt_resource_by_id[item.id]
+                    for item in application_attempts_by_plan[plan.id]
+                ],
+                current_version=current_resource,
+                active_run=active_resource,
+                open_input_request=(
+                    input_request_resource(open_inputs[active.open_input_request_id])
+                    if active is not None
+                    and active.open_input_request_id in open_inputs
+                    else None
+                ),
+            )
+        )
+    return result
 
 
 async def run_resource(
@@ -1152,7 +1813,7 @@ async def apply_worker_plan_outcome(
 ) -> PlanAgentRun:
     """Import one exact Worker pause while keeping Manager ids authoritative."""
 
-    if payload.get("protocol") != 2:
+    if payload.get("protocol") != 3:
         raise RuntimeError("Worker Plan outcome protocol mismatch")
     base_worker_version_id = payload.get("base_worker_version_id")
     if isinstance(base_worker_version_id, bool) or (
@@ -1165,12 +1826,15 @@ async def apply_worker_plan_outcome(
         if run.base_version_id is not None
         else None
     )
-    if manager_base is not None and manager_base.plan_id != plan.id and run.run_type != "fork":
+    if (
+        manager_base is not None
+        and manager_base.plan_id != plan.id
+        and run.run_type != "fork"
+    ):
         raise RuntimeError("Plan Run base Version belongs to another Plan")
     remote = PlanRunResource.model_validate(payload.get("run"))
     remote_versions = [
-        PlanVersionResource.model_validate(item)
-        for item in payload.get("versions", [])
+        PlanVersionResource.model_validate(item) for item in payload.get("versions", [])
     ]
     if (
         plan.worker_id != worker_id
@@ -1181,7 +1845,6 @@ async def apply_worker_plan_outcome(
         or remote.id != run.id
         or remote.plan_id != plan.id
         or remote.status not in {"waiting_user", "completed", "failed", "cancelled"}
-        or remote.generation < expected_generation
     ):
         raise RuntimeError("Worker Plan outcome no longer owns this Run generation")
 
@@ -1340,7 +2003,9 @@ async def apply_worker_plan_outcome(
                 source_step_id=source.id,
                 requested_by=item.requested_by,
                 reason=item.reason,
-                questions=[question.model_dump(mode="json") for question in item.questions],
+                questions=[
+                    question.model_dump(mode="json") for question in item.questions
+                ],
                 status=item.status,
                 answers=item.answers,
                 response_text=item.response_text,
@@ -1366,7 +2031,8 @@ async def apply_worker_plan_outcome(
     result_version = version_by_remote.get(remote.result_version_id)
     run.current_stage = remote.current_stage
     run.round = remote.round
-    run.generation = remote.generation
+    # Keep the Manager claim generation authoritative on the Manager. The
+    # Worker generation only fences Worker-local execution/input operations.
     run.execution_seconds = remote.execution_seconds
     run.last_execution_started_at = None
     run.result_version_id = result_version.id if result_version is not None else None

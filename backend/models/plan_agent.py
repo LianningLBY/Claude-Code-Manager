@@ -38,6 +38,11 @@ class PlanAgentRun(Base):
     instance_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     worker_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     relay_origin: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Stable identity of a Manager -> Worker protocol import. Manager claim
+    # generations are deliberately excluded: the Worker Run owns its own
+    # local generation after the first import.
+    import_payload_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    import_attachment_receipt: Mapped[list | None] = mapped_column(JSON, nullable=True)
     open_input_request_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     interaction_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_interactions: Mapped[int] = mapped_column(Integer, nullable=False, default=3)

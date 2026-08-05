@@ -3,11 +3,12 @@
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+import json
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
-from sqlalchemy import func, or_, select, update
+from pydantic import BaseModel, Field
+from sqlalchemy import and_, case, exists, false, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import (
@@ -15,6 +16,7 @@ from backend.api.deps import (
     has_project_access,
     has_worker_access,
     is_admin,
+    require_admin,
     require_project_access,
     require_internal_service,
     require_task_access,
@@ -29,6 +31,7 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.plan import (
     Plan,
+    PlanApplication,
     PlanApplicationReceipt,
     PlanInputRequest,
     PlanVersion,
@@ -37,6 +40,9 @@ from backend.models.plan_agent import PlanAgentRun
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.project import Project
+from backend.models.team_share import TeamProjectShare, TeamTaskShare
+from backend.models.user_group import UserGroupMember
+from backend.models.worker import Worker
 from backend.schemas.plan import resolve_plan_pipeline_config
 from backend.schemas.plan_resource import (
     PlanCreateRequest,
@@ -67,12 +73,12 @@ from backend.services.plan_service import (
     materialize_execution_task,
     plan_operation_lock,
     plan_resource,
+    plan_resources,
     resolve_legacy_task,
     run_resource,
     version_resource,
 )
 from backend.services.plan_tasks import (
-    MAX_ACTIVE_PLANS_PER_TASK,
     capture_repo_revision,
     capture_task_context,
     latest_task_log_id,
@@ -88,6 +94,11 @@ router = APIRouter(tags=["plan-resources"])
 class _WorkerRepoRevisionRequest(BaseModel):
     project_id: int | None = None
     target_task_id: int | None = None
+
+
+class _PlanDeliveryResolutionRequest(BaseModel):
+    action: str = Field(pattern=r"^(confirm_launched|release_for_retry)$")
+    note: str = Field(min_length=1, max_length=2000)
 
 
 def _reject_durable_plan_secrets(*values: object) -> None:
@@ -209,6 +220,27 @@ def _validate_attachment_manifest(
     return receipt
 
 
+def _worker_run_import_digest(
+    body: WorkerPlanRunImportRequest,
+    attachment_receipt: list[dict],
+) -> str:
+    """Hash immutable import identity, excluding the Manager retry fence."""
+
+    payload = body.model_dump(
+        mode="json",
+        exclude={"manager_claim_generation", "attachment_manifest"},
+    )
+    payload["attachment_receipt"] = attachment_receipt
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 async def _has_plan_access(
     request: Request, plan: Plan, db: AsyncSession, *, control: bool
 ) -> bool:
@@ -234,6 +266,185 @@ async def _has_plan_access(
     if plan.project_id is not None and await has_project_access(request, plan.project_id, db):
         return True
     return False
+
+
+def _plan_list_acl(request: Request):
+    """SQL predicate matching the read-access rules used by detail APIs."""
+
+    if not settings.auth_token or is_admin(request):
+        return None
+    user_id = get_current_user_id(request)
+    if user_id is None:
+        return false()
+    group_ids = select(UserGroupMember.group_id).where(
+        UserGroupMember.user_id == user_id
+    )
+    worker_ids = select(Worker.id).where(Worker.owner_user_id == user_id)
+    project_share = exists(
+        select(TeamProjectShare.id).where(
+            TeamProjectShare.project_id == Project.id,
+            or_(
+                and_(
+                    TeamProjectShare.target_type == "user",
+                    TeamProjectShare.target_id == user_id,
+                ),
+                and_(
+                    TeamProjectShare.target_type == "group",
+                    TeamProjectShare.target_id.in_(group_ids),
+                ),
+            ),
+        )
+    )
+    project_ids = select(Project.id).where(
+        or_(Project.worker_id.in_(worker_ids), project_share)
+    )
+    task_share = exists(
+        select(TeamTaskShare.id).where(
+            TeamTaskShare.task_id == Task.id,
+            TeamTaskShare.permission == "chat",
+            or_(
+                and_(
+                    TeamTaskShare.target_type == "user",
+                    TeamTaskShare.target_id == user_id,
+                ),
+                and_(
+                    TeamTaskShare.target_type == "group",
+                    TeamTaskShare.target_id.in_(group_ids),
+                ),
+            ),
+        )
+    )
+    task_ids = select(Task.id).where(
+        or_(
+            Task.created_by == user_id,
+            Task.worker_id.in_(worker_ids),
+            Task.project_id.in_(project_ids),
+            task_share,
+        )
+    )
+    return or_(
+        and_(
+            Plan.target_task_id.isnot(None),
+            Plan.target_task_id.in_(task_ids),
+        ),
+        and_(
+            Plan.target_task_id.is_(None),
+            or_(
+                Plan.created_by == user_id,
+                Plan.worker_id.in_(worker_ids),
+                Plan.project_id.in_(project_ids),
+            ),
+        ),
+    )
+
+
+def _plan_display_state_expression():
+    active_status = (
+        select(PlanAgentRun.status)
+        .where(PlanAgentRun.id == Plan.active_run_id)
+        .correlate(Plan)
+        .scalar_subquery()
+    )
+    active_stage = (
+        select(PlanAgentRun.current_stage)
+        .where(PlanAgentRun.id == Plan.active_run_id)
+        .correlate(Plan)
+        .scalar_subquery()
+    )
+    latest_status = (
+        select(PlanAgentRun.status)
+        .where(PlanAgentRun.plan_id == Plan.id)
+        .order_by(PlanAgentRun.id.desc())
+        .limit(1)
+        .correlate(Plan)
+        .scalar_subquery()
+    )
+    human_decision = (
+        select(PlanVersion.human_decision)
+        .where(PlanVersion.id == Plan.current_version_id)
+        .correlate(Plan)
+        .scalar_subquery()
+    )
+    review_verdict = (
+        select(PlanVersion.review_verdict)
+        .where(PlanVersion.id == Plan.current_version_id)
+        .correlate(Plan)
+        .scalar_subquery()
+    )
+    review_exhausted = (
+        select(PlanVersion.review_exhausted)
+        .where(PlanVersion.id == Plan.current_version_id)
+        .correlate(Plan)
+        .scalar_subquery()
+    )
+    applied = exists(
+        select(PlanApplication.id).where(
+            PlanApplication.plan_version_id == Plan.current_version_id
+        )
+    )
+    return case(
+        (Plan.archived_at.isnot(None), "archived"),
+        (active_status == "waiting_user", "waiting_user"),
+        (
+            active_status.in_(["queued", "running"]),
+            func.coalesce(active_stage, "running"),
+        ),
+        (and_(Plan.current_version_id.isnot(None), applied), "applied"),
+        (human_decision == "approved", "approved"),
+        (human_decision == "rejected", "rejected"),
+        (
+            or_(
+                review_verdict.in_(["approve", "disabled", "exhausted"]),
+                review_exhausted.is_(True),
+            ),
+            "awaiting_review",
+        ),
+        (latest_status.in_(["failed", "cancelled"]), latest_status),
+        else_="draft",
+    )
+
+
+def _plan_collection_query(
+    request: Request,
+    *,
+    target_task_id: int | None,
+    kind: str | None,
+    project_id: int | None,
+    include_archived: bool,
+    archived_only: bool,
+    q: str | None,
+    display_states: set[str],
+):
+    query = select(Plan)
+    if target_task_id is not None:
+        query = query.where(Plan.target_task_id == target_task_id)
+    if project_id is not None:
+        query = query.where(Plan.project_id == project_id)
+    if kind == "standalone":
+        query = query.where(Plan.target_task_id.is_(None))
+    elif kind == "related":
+        query = query.where(Plan.target_task_id.isnot(None))
+    if archived_only:
+        query = query.where(Plan.archived_at.isnot(None))
+    elif not include_archived:
+        query = query.where(Plan.archived_at.is_(None))
+    if q and q.strip():
+        escaped = (
+            q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        query = query.where(
+            or_(
+                Plan.title.ilike(pattern, escape="\\"),
+                Plan.initial_request.ilike(pattern, escape="\\"),
+            )
+        )
+    acl = _plan_list_acl(request)
+    if acl is not None:
+        query = query.where(acl)
+    if display_states:
+        query = query.where(_plan_display_state_expression().in_(display_states))
+    return query
 
 
 async def _require_plan(
@@ -344,7 +555,83 @@ async def worker_application_receipt(
         "target_task_id": receipt.target_task_id,
         "plan_version_ids": receipt.plan_version_ids,
         "status": receipt.status,
+        "delivery_status": receipt.delivery_status,
+        "delivery_error": receipt.delivery_error,
+        "launch_evidence": receipt.launch_evidence,
+        "delivery_resolution": receipt.delivery_resolution,
         "response": receipt.response,
+    }
+
+
+async def _broadcast_delivery_resolution(
+    *,
+    receipt_key: str,
+    action: str,
+    note: str,
+    plan_ids: list[int],
+    target_task_id: int | None,
+) -> None:
+    for plan_id in plan_ids:
+        await broadcast_plan_event(
+            event="plan_application_delivery_resolved",
+            plan_id=plan_id,
+            target_task_id=target_task_id,
+            receipt_key=receipt_key,
+            action=action,
+        )
+    if target_task_id is not None:
+        from backend.main import broadcaster
+
+        await broadcaster.broadcast(
+            f"task:{target_task_id}",
+            {
+                "event_type": "plan_application_delivery_resolved",
+                "task_id": target_task_id,
+                "receipt_key": receipt_key,
+                "action": action,
+                "note": note,
+                "delivery_status": (
+                    "launched" if action == "confirm_launched" else "cancelled"
+                ),
+            },
+        )
+
+
+@router.post("/api/plans/worker-application-receipts/{receipt_key}/resolve")
+async def resolve_worker_application_receipt(
+    receipt_key: str,
+    body: _PlanDeliveryResolutionRequest,
+    request: Request,
+):
+    require_internal_service(request)
+    note = body.note.strip()
+    if not note:
+        raise HTTPException(422, "Resolution note cannot be blank")
+    from backend.main import dispatcher
+
+    if dispatcher is None:
+        raise HTTPException(503, "Dispatcher is unavailable")
+    try:
+        plan_ids, target_task_id = await dispatcher.resolve_uncertain_plan_delivery(
+            receipt_key=receipt_key,
+            action=body.action,
+            note=note,
+            actor_id=None,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await _broadcast_delivery_resolution(
+        receipt_key=receipt_key,
+        action=body.action,
+        note=note,
+        plan_ids=plan_ids,
+        target_task_id=target_task_id,
+    )
+    return {
+        "receipt_key": receipt_key,
+        "action": body.action,
+        "plan_ids": plan_ids,
+        "target_task_id": target_task_id,
     }
 
 
@@ -367,15 +654,6 @@ async def create_plan(
             raise HTTPException(409, "Shared shadow tasks cannot own Plans")
         if target.status == "migrating":
             raise HTTPException(409, "Plan target is changing execution location")
-        active_count = await db.scalar(
-            select(func.count(Plan.id)).where(
-                Plan.target_task_id == target.id,
-                Plan.archived_at.is_(None),
-                Plan.active_run_id.isnot(None),
-            )
-        )
-        if int(active_count or 0) >= MAX_ACTIVE_PLANS_PER_TASK:
-            raise HTTPException(429, f"Task already has {MAX_ACTIVE_PLANS_PER_TASK} active Plans")
         project_id = target.project_id
         target_repo = target.target_repo
         target_branch = target.target_branch
@@ -464,7 +742,10 @@ async def import_worker_plan_run(
     attachment_receipt = _validate_attachment_manifest(
         uploads, body.attachment_manifest
     )
-    project = await db.get(Project, body.project_id) if body.project_id is not None else None
+    import_digest = _worker_run_import_digest(body, attachment_receipt)
+    project = (
+        await db.get(Project, body.project_id) if body.project_id is not None else None
+    )
     if body.project_id is not None and project is None:
         raise HTTPException(409, "Worker Plan project is missing")
     target = await db.get(Task, body.target_task_id) if body.target_task_id is not None else None
@@ -515,13 +796,17 @@ async def import_worker_plan_run(
 
     existing = await db.get(PlanAgentRun, body.run_id)
     if existing is not None:
-        if existing.plan_id != plan.id or existing.relay_origin != "manager_v1":
+        if (
+            existing.plan_id != plan.id
+            or existing.relay_origin != "manager_v1"
+            or existing.import_payload_digest != import_digest
+        ):
             raise HTTPException(409, "Worker Plan Run id collides with local data")
         await db.commit()
         return {
-            "protocol": 2,
+            "protocol": 3,
             "base_worker_version_id": existing.base_version_id,
-            "attachment_receipt": attachment_receipt,
+            "attachment_receipt": existing.import_attachment_receipt or [],
             "run": (await run_resource(db, existing)).model_dump(mode="json"),
         }
     if plan.active_run_id is not None:
@@ -549,9 +834,11 @@ async def import_worker_plan_run(
         context_snapshot=body.context_snapshot,
         repo_revision=body.repo_revision,
         current_stage="planner",
-        generation=body.run_generation,
+        generation=0,
         worker_id=None,
         relay_origin="manager_v1",
+        import_payload_digest=import_digest,
+        import_attachment_receipt=attachment_receipt,
         max_interactions=body.max_interactions,
         pipeline_config=body.pipeline_config.model_dump(mode="json"),
         status="queued",
@@ -568,7 +855,7 @@ async def import_worker_plan_run(
     await db.commit()
     await _wake_dispatcher()
     return {
-        "protocol": 2,
+        "protocol": 3,
         "base_worker_version_id": run.base_version_id,
         "attachment_receipt": attachment_receipt,
         "run": (await run_resource(db, run)).model_dump(mode="json"),
@@ -666,42 +953,29 @@ async def list_plans(
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Plan)
-    if target_task_id is not None:
-        query = query.where(Plan.target_task_id == target_task_id)
-    if project_id is not None:
-        query = query.where(Plan.project_id == project_id)
-    if kind == "standalone":
-        query = query.where(Plan.target_task_id.is_(None))
-    elif kind == "related":
-        query = query.where(Plan.target_task_id.isnot(None))
-    if archived_only:
-        query = query.where(Plan.archived_at.isnot(None))
-    elif not include_archived:
-        query = query.where(Plan.archived_at.is_(None))
-    if q and q.strip():
-        escaped = (
-            q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
-        pattern = f"%{escaped}%"
-        query = query.where(
-            or_(
-                Plan.title.ilike(pattern, escape="\\"),
-                Plan.initial_request.ilike(pattern, escape="\\"),
-            )
-        )
-    rows = list((await db.execute(query.order_by(Plan.updated_at.desc(), Plan.id.desc()))).scalars())
     display_states = {
         state.strip() for state in (display_state or "").split(",") if state.strip()
     }
-    resources: list[PlanResource] = []
-    for plan in rows:
-        if not await _has_plan_access(request, plan, db, control=False):
-            continue
-        resource = await plan_resource(db, plan)
-        if not display_states or resource.display_state in display_states:
-            resources.append(resource)
-    return resources[offset:offset + limit]
+    query = _plan_collection_query(
+        request,
+        target_task_id=target_task_id,
+        kind=kind,
+        project_id=project_id,
+        include_archived=include_archived,
+        archived_only=archived_only,
+        q=q,
+        display_states=display_states,
+    )
+    rows = list(
+        (
+            await db.execute(
+                query.order_by(Plan.updated_at.desc(), Plan.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        ).scalars()
+    )
+    return await plan_resources(db, rows)
 
 
 @router.get("/api/plans/count")
@@ -718,43 +992,22 @@ async def count_plans(
 ):
     """Count the same ACL-filtered projection exposed by ``list_plans``."""
 
-    query = select(Plan)
-    if target_task_id is not None:
-        query = query.where(Plan.target_task_id == target_task_id)
-    if project_id is not None:
-        query = query.where(Plan.project_id == project_id)
-    if kind == "standalone":
-        query = query.where(Plan.target_task_id.is_(None))
-    elif kind == "related":
-        query = query.where(Plan.target_task_id.isnot(None))
-    if archived_only:
-        query = query.where(Plan.archived_at.isnot(None))
-    elif not include_archived:
-        query = query.where(Plan.archived_at.is_(None))
-    if q and q.strip():
-        escaped = (
-            q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
-        pattern = f"%{escaped}%"
-        query = query.where(
-            or_(
-                Plan.title.ilike(pattern, escape="\\"),
-                Plan.initial_request.ilike(pattern, escape="\\"),
-            )
-        )
-    rows = list((await db.execute(query)).scalars())
     display_states = {
         state.strip() for state in (display_state or "").split(",") if state.strip()
     }
-    total = 0
-    for plan in rows:
-        if not await _has_plan_access(request, plan, db, control=False):
-            continue
-        if display_states:
-            resource = await plan_resource(db, plan)
-            if resource.display_state not in display_states:
-                continue
-        total += 1
+    query = _plan_collection_query(
+        request,
+        target_task_id=target_task_id,
+        kind=kind,
+        project_id=project_id,
+        include_archived=include_archived,
+        archived_only=archived_only,
+        q=q,
+        display_states=display_states,
+    )
+    total = int(
+        await db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    )
     return {"total": total}
 
 
@@ -775,6 +1028,88 @@ async def get_plan_resource(
 ):
     plan = await _require_plan(request, db, plan_id)
     return await plan_resource(db, plan, include_audit=True)
+
+
+@router.post("/api/plans/{plan_id}/application-deliveries/{receipt_key}/resolve")
+async def resolve_plan_application_delivery(
+    plan_id: int,
+    receipt_key: str,
+    body: _PlanDeliveryResolutionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    require_admin(request)
+    note = body.note.strip()
+    if not note:
+        raise HTTPException(422, "Resolution note cannot be blank")
+    async with plan_operation_lock(plan_id):
+        await _require_plan(request, db, plan_id, control=True)
+        receipt = (
+            await db.execute(
+                select(PlanApplicationReceipt).where(
+                    PlanApplicationReceipt.receipt_key == receipt_key
+                )
+            )
+        ).scalar_one_or_none()
+        if receipt is None:
+            raise HTTPException(404, "Plan application receipt not found")
+        belongs_to_plan = await db.scalar(
+            select(func.count(PlanVersion.id)).where(
+                PlanVersion.plan_id == plan_id,
+                PlanVersion.id.in_(receipt.plan_version_ids or []),
+            )
+        )
+        if not belongs_to_plan:
+            raise HTTPException(409, "Receipt does not apply this Plan")
+        if receipt.delivery_status != "uncertain" and not (
+            isinstance(receipt.delivery_resolution, dict)
+            and receipt.delivery_resolution.get("action") == body.action
+        ):
+            raise HTTPException(
+                409,
+                f"Plan delivery is {receipt.delivery_status}, not uncertain",
+            )
+        if receipt.worker_id is not None:
+            from backend.main import worker_proxy
+
+            if worker_proxy is None:
+                raise HTTPException(503, "Worker proxy is unavailable")
+            worker = await worker_proxy.require_ready_worker(receipt.worker_id)
+            await worker_proxy.resolve_plan_application_receipt(
+                worker,
+                receipt_key,
+                action=body.action,
+                note=note,
+            )
+        await db.rollback()
+        from backend.main import dispatcher
+
+        if dispatcher is None:
+            raise HTTPException(503, "Dispatcher is unavailable")
+        try:
+            plan_ids, target_task_id = (
+                await dispatcher.resolve_uncertain_plan_delivery(
+                    receipt_key=receipt_key,
+                    action=body.action,
+                    note=note,
+                    actor_id=get_current_user_id(request),
+                )
+            )
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    await _broadcast_delivery_resolution(
+        receipt_key=receipt_key,
+        action=body.action,
+        note=note,
+        plan_ids=plan_ids,
+        target_task_id=target_task_id,
+    )
+    return {
+        "receipt_key": receipt_key,
+        "action": body.action,
+        "plan_ids": plan_ids,
+        "target_task_id": target_task_id,
+    }
 
 
 @router.patch("/api/plans/{plan_id}", response_model=PlanResource)

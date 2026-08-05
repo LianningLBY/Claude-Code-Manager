@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, isApiRequestError, type PlanInputRequest, type PlanRun } from '../../api/client';
 import { useFileUpload } from '../../hooks/useFileUpload';
@@ -20,10 +20,19 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const uploads = useFileUpload();
+  const clearUploads = uploads.clear;
   const answerIdempotencyKey = useMemo(
     () => `${request.id}:${crypto.randomUUID()}`,
     [request.id],
   );
+
+  useEffect(() => {
+    setAnswers({});
+    setAdditional('');
+    setSubmitting(false);
+    setError(null);
+    clearUploads();
+  }, [request.id, clearUploads]);
 
   const missingRequired = useMemo(
     () => request.questions.some((question) => {

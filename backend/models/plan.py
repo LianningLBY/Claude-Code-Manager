@@ -46,7 +46,9 @@ class Plan(Base):
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     pipeline_config: Mapped[dict] = mapped_column(JSON, nullable=False)
     current_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    active_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    active_run_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
     forked_from_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -65,9 +67,7 @@ class PlanVersion(Base):
         UniqueConstraint(
             "plan_id", "version_number", name="uq_plan_versions_plan_number"
         ),
-        UniqueConstraint(
-            "produced_by_step_id", name="uq_plan_versions_produced_step"
-        ),
+        UniqueConstraint("produced_by_step_id", name="uq_plan_versions_produced_step"),
         UniqueConstraint(
             "worker_id", "worker_version_id", name="uq_plan_versions_worker_id"
         ),
@@ -134,7 +134,9 @@ class PlanInputRequest(Base):
     attachments: Mapped[list | None] = mapped_column(JSON, nullable=True)
     answered_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
-    answer_idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    answer_idempotency_key: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     answered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -186,7 +188,7 @@ class PlanLegacyTaskLink(Base):
 
 
 class PlanApplicationReceipt(Base):
-    """Durable Manager/Worker handoff used to reconcile a lost HTTP ACK."""
+    """Durable Plan-application receipt and local chat delivery outbox."""
 
     __tablename__ = "plan_application_receipts"
 
@@ -198,9 +200,49 @@ class PlanApplicationReceipt(Base):
     plan_version_ids: Mapped[list] = mapped_column(JSON, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="prepared")
     response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # ``status`` is the HTTP/Manager receipt state. Delivery is independent so
+    # a committed response can still be recovered after a process restart.
+    delivery_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", index=True
+    )
+    outbox_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    payload_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    launch_evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    delivery_resolution: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+
+class PlanApplicationAttempt(Base):
+    """Immutable Plan/application link retained after an application release."""
+
+    __tablename__ = "plan_application_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_receipt_key",
+            "plan_version_id",
+            name="uq_plan_application_attempt_receipt_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    plan_version_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    application_receipt_key: Mapped[str] = mapped_column(
+        String(200), nullable=False, index=True
+    )
+    application_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    target_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    user_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    execution_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    applied_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    application_created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    released_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )

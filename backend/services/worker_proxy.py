@@ -113,10 +113,10 @@ class WorkerProxy:
         payload = response.json()
         if (
             not isinstance(payload, dict)
-            or payload.get("versioned_plan_worker_protocol") != 2
+            or payload.get("versioned_plan_worker_protocol") != 3
         ):
             raise RuntimeError(
-                f"Worker {worker.name} does not support versioned Plan protocol 2"
+                f"Worker {worker.name} does not support versioned Plan protocol 3"
             )
 
     async def get_plan_repo_revision(
@@ -173,6 +173,36 @@ class WorkerProxy:
         payload = response.json()
         if not isinstance(payload, dict) or payload.get("receipt_key") != receipt_key:
             raise RuntimeError("Worker returned an invalid Plan application receipt")
+        return payload
+
+    async def resolve_plan_application_receipt(
+        self,
+        worker: Worker,
+        receipt_key: str,
+        *,
+        action: str,
+        note: str,
+    ) -> dict:
+        await self._require_versioned_plan_protocol(worker)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self._api(
+                    worker,
+                    f"/api/plans/worker-application-receipts/{receipt_key}/resolve",
+                ),
+                headers=self._headers(worker),
+                json={"action": action, "note": note},
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("receipt_key") != receipt_key
+            or payload.get("action") != action
+        ):
+            raise RuntimeError(
+                "Worker returned an invalid Plan delivery resolution"
+            )
         return payload
 
     @staticmethod
@@ -302,10 +332,13 @@ class WorkerProxy:
             base_seed = None
 
         payload = {
-            "protocol": 2,
+            "protocol": 3,
             "plan_id": plan.id,
             "run_id": run.id,
-            "run_generation": run.generation,
+            # This fences the Manager lifecycle only. The imported Worker Run
+            # has an independent local generation used for its own retries and
+            # input answers.
+            "manager_claim_generation": run.generation,
             "title": plan.title,
             "initial_request": plan.initial_request,
             "target_task_id": plan.target_task_id,
@@ -435,7 +468,7 @@ class WorkerProxy:
             and version.get("produced_by_run_id") == run.id
         ]
         return {
-            "protocol": 2,
+            "protocol": 3,
             "base_worker_version_id": base_worker_version_id,
             "run": remote_run,
             "versions": versions,
@@ -461,7 +494,7 @@ class WorkerProxy:
                 self._api(worker, "/api/plans/worker-materialize-version"),
                 headers=self._headers(worker),
                 json={
-                    "protocol": 2,
+                    "protocol": 3,
                     "plan_id": plan.id,
                     "title": plan.title,
                     "initial_request": plan.initial_request,

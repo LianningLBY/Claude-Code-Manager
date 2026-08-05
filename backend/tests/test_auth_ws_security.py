@@ -275,6 +275,149 @@ async def test_shared_project_plan_uses_project_location_boundary(
 
 
 @pytest.mark.asyncio
+async def test_plan_catalog_sql_acl_matches_detail_access(secured_client, tmp_path):
+    client, session_factory = secured_client
+    admin_id, _ = await _create_user(
+        session_factory,
+        email="plan-list-admin@example.com",
+        role="admin",
+    )
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="plan-list-member@example.com",
+        role="member",
+    )
+    other_id, _ = await _create_user(
+        session_factory,
+        email="plan-list-other@example.com",
+        role="member",
+    )
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        worker = Worker(
+            name="plan-list-worker",
+            owner_user_id=member_id,
+            status="ready",
+        )
+        project = Project(
+            name="plan-list-project",
+            local_path=str(tmp_path),
+            status="ready",
+        )
+        owner_task = Task(
+            title="member task",
+            description="member task",
+            created_by=member_id,
+        )
+        shared_task = Task(
+            title="shared task",
+            description="shared task",
+            created_by=other_id,
+        )
+        hidden_task = Task(
+            title="hidden task",
+            description="hidden task",
+            created_by=other_id,
+        )
+        db.add_all([worker, project, owner_task, shared_task, hidden_task])
+        await db.flush()
+        db.add_all([
+            TeamProjectShare(
+                project_id=project.id,
+                target_type="user",
+                target_id=member_id,
+                shared_by=admin_id,
+            ),
+            TeamTaskShare(
+                task_id=shared_task.id,
+                target_type="user",
+                target_id=member_id,
+                permission="chat",
+                shared_by=admin_id,
+            ),
+        ])
+        visible = [
+            Plan(
+                title="owned standalone",
+                initial_request="visible",
+                created_by=member_id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="worker standalone",
+                initial_request="visible",
+                worker_id=worker.id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="project standalone",
+                initial_request="visible",
+                project_id=project.id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="owned related",
+                initial_request="visible",
+                target_task_id=owner_task.id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="chat-shared related",
+                initial_request="visible",
+                target_task_id=shared_task.id,
+                pipeline_config=pipeline,
+            ),
+        ]
+        hidden = [
+            Plan(
+                title="hidden standalone",
+                initial_request="hidden",
+                created_by=other_id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="hidden related",
+                initial_request="hidden",
+                target_task_id=hidden_task.id,
+                pipeline_config=pipeline,
+            ),
+        ]
+        db.add_all([*visible, *hidden])
+        await db.commit()
+        visible_ids = {plan.id for plan in visible}
+
+    headers = {"Authorization": f"Bearer {member_token}"}
+    listed = await client.get("/api/plans?limit=200", headers=headers)
+    counted = await client.get("/api/plans/count", headers=headers)
+
+    assert listed.status_code == 200, listed.text
+    assert {item["id"] for item in listed.json()} == visible_ids
+    assert counted.status_code == 200, counted.text
+    assert counted.json() == {"total": len(visible_ids)}
+
+
+@pytest.mark.asyncio
+async def test_plan_delivery_resolution_requires_admin(secured_client):
+    client, session_factory = secured_client
+    _member_id, member_token = await _create_user(
+        session_factory,
+        email="plan-delivery-member@example.com",
+        role="member",
+    )
+
+    response = await client.post(
+        "/api/plans/1/application-deliveries/example-receipt/resolve",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={
+            "action": "release_for_retry",
+            "note": "Member must not resolve ambiguous execution",
+        },
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_internal_ask_user_wait_rejects_member_jwt(secured_client):
     client, session_factory = secured_client
     _, token = await _create_user(

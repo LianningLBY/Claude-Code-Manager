@@ -3908,7 +3908,9 @@ async def test_stop_session_clears_pending_queue(client):
     assert body["ok"] is True
     assert body["stopped"] is False
     assert body["cleared_messages"] == 2
-    mock_clear.assert_awaited_once_with(task_id)
+    mock_clear.assert_awaited_once()
+    assert mock_clear.await_args.args == (task_id,)
+    assert mock_clear.await_args.kwargs["durable_db"] is not None
     mock_stop.assert_not_awaited()
 
 

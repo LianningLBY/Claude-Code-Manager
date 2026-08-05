@@ -15,9 +15,9 @@ const run = {
   generation: 9,
 } as PlanRun;
 
-function requestWithQuestions(count: number): PlanInputRequest {
+function requestWithQuestions(count: number, id = 81): PlanInputRequest {
   return {
-    id: 81,
+    id,
     plan_id: 61,
     run_id: run.id,
     source_step_id: 91,
@@ -108,5 +108,26 @@ describe('PlanInputForm', () => {
 
     expect(option).toHaveClass('text-indigo-300');
     expect(option).not.toHaveClass('text-indigo-100');
+  });
+
+  it('clears answers when the InputRequest identity changes', async () => {
+    const { rerender } = render(
+      <PlanInputForm
+        run={run}
+        request={requestWithQuestions(1, 81)}
+        onAnswered={vi.fn()}
+      />,
+    );
+    await userEvent.type(screen.getAllByRole('textbox')[0], 'answer for A');
+
+    rerender(
+      <PlanInputForm
+        run={run}
+        request={requestWithQuestions(1, 82)}
+        onAnswered={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByRole('textbox')[0]).toHaveValue(''));
   });
 });

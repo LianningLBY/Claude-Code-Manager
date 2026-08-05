@@ -173,10 +173,10 @@ class WorkerPlanRunImportRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    protocol: Literal[2]
+    protocol: Literal[3]
     plan_id: int = Field(gt=0)
     run_id: int = Field(gt=0)
-    run_generation: int = Field(ge=0)
+    manager_claim_generation: int = Field(ge=0)
     title: str = Field(min_length=1, max_length=200)
     initial_request: str = Field(min_length=1, max_length=200_000)
     target_task_id: int | None = None
@@ -205,7 +205,7 @@ class WorkerPlanVersionImportRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    protocol: Literal[2]
+    protocol: Literal[3]
     plan_id: int = Field(gt=0)
     title: str = Field(min_length=1, max_length=200)
     initial_request: str = Field(min_length=1, max_length=200_000)
@@ -366,6 +366,9 @@ class PlanResource(BaseModel):
     pipeline_config: PlanPipelineConfig
     application: "PlanApplicationResource | None" = None
     applications: list["PlanApplicationResource"] = Field(default_factory=list)
+    application_attempts: list["PlanApplicationAttemptResource"] = Field(
+        default_factory=list
+    )
     current_version: PlanVersionResource | None = None
     active_run: PlanRunResource | None = None
     open_input_request: PlanInputRequestResponse | None = None
@@ -389,7 +392,33 @@ class PlanApplicationResource(BaseModel):
     user_log_id: int | None
     execution_task_id: int | None
     execution_task_available: bool | None = None
+    application_receipt_key: str | None = None
+    delivery_status: str | None = None
+    delivery_error: str | None = None
+    launch_evidence: dict | None = None
+    delivery_resolution: dict | None = None
     created_at: datetime
+
+
+class PlanApplicationAttemptResource(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    plan_id: int
+    plan_version_id: int
+    application_receipt_key: str
+    application_type: str
+    target_task_id: int | None
+    target_session_id: str | None
+    user_log_id: int | None
+    execution_task_id: int | None
+    applied_by: int | None
+    application_created_at: datetime
+    released_at: datetime
+    delivery_status: str = "missing"
+    delivery_error: str | None = None
+    launch_evidence: dict | None = None
+    delivery_resolution: dict | None = None
 
 
 PlanResource.model_rebuild()

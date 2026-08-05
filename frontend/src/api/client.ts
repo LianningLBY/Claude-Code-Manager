@@ -552,6 +552,7 @@ export interface PlanResource {
   pipeline_config: PlanPipelineConfig;
   application: PlanApplication | null;
   applications: PlanApplication[];
+  application_attempts: PlanApplicationAttempt[];
   current_version: PlanVersion | null;
   active_run: PlanRun | null;
   open_input_request: PlanInputRequest | null;
@@ -567,7 +568,31 @@ export interface PlanApplication {
   user_log_id: number | null;
   execution_task_id: number | null;
   execution_task_available: boolean | null;
+  application_receipt_key?: string | null;
+  delivery_status?: string | null;
+  delivery_error?: string | null;
+  launch_evidence?: Record<string, unknown> | null;
+  delivery_resolution?: Record<string, unknown> | null;
   created_at: string;
+}
+
+export interface PlanApplicationAttempt {
+  id: number;
+  plan_id: number;
+  plan_version_id: number;
+  application_receipt_key: string;
+  application_type: 'chat_message' | 'execution_task';
+  target_task_id: number | null;
+  target_session_id: string | null;
+  user_log_id: number | null;
+  execution_task_id: number | null;
+  applied_by: number | null;
+  application_created_at: string;
+  released_at: string;
+  delivery_status: string;
+  delivery_error: string | null;
+  launch_evidence: Record<string, unknown> | null;
+  delivery_resolution: Record<string, unknown> | null;
 }
 
 export interface AskUserOption {
@@ -1501,6 +1526,20 @@ export const api = {
     return request<{ total: number }>(`/api/plans/count${query.size ? `?${query}` : ''}`);
   },
   getPlan: (planId: number) => request<PlanResource>(`/api/plans/${planId}`),
+  resolvePlanApplicationDelivery: (
+    planId: number,
+    receiptKey: string,
+    action: 'confirm_launched' | 'release_for_retry',
+    note: string,
+  ) => request<{
+    receipt_key: string;
+    action: string;
+    plan_ids: number[];
+    target_task_id: number | null;
+  }>(`/api/plans/${planId}/application-deliveries/${encodeURIComponent(receiptKey)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ action, note }),
+  }),
   updatePlan: (planId: number, data: {
     title?: string;
     archived?: boolean;
@@ -1639,6 +1678,7 @@ export const api = {
       session_id: string;
       applied_plan_task_ids?: number[];
       applied_plan_version_ids?: number[];
+      plan_application_receipt_key?: string;
     }>(`/api/tasks/${taskId}/chat`, {
       method: 'POST',
       body: JSON.stringify({

@@ -13,6 +13,7 @@ vi.mock('../../api/client', () => ({
     createPlanRun: vi.fn(),
     answerPlanInput: vi.fn(),
     updatePlan: vi.fn(),
+    resolvePlanApplicationDelivery: vi.fn(),
     getPlanVersionStaleness: vi.fn().mockResolvedValue({
       stale: false,
       hard_conflict: false,
@@ -116,6 +117,7 @@ function plan(current: PlanVersion, prior: PlanVersion): PlanResource {
       execution_task_available: true,
       created_at: '2026-08-02T08:30:00Z',
     }],
+    application_attempts: [],
     current_version: current,
     active_run: null,
     open_input_request: null,
@@ -123,7 +125,35 @@ function plan(current: PlanVersion, prior: PlanVersion): PlanResource {
 }
 
 describe('PlanDetail', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.setItem('cc_user', JSON.stringify({ id: 1, role: 'admin' }));
+  });
+
+  it('clears revision state when the Plan identity changes', async () => {
+    const priorA = version({ id: 11, plan_id: 4, version_number: 1 });
+    const currentA = version({ id: 12, plan_id: 4, version_number: 2 });
+    const priorB = version({ id: 21, plan_id: 5, version_number: 1 });
+    const currentB = version({ id: 22, plan_id: 5, version_number: 2 });
+    const planA = plan(currentA, priorA);
+    const planB = { ...plan(currentB, priorB), id: 5, title: 'Second Plan' };
+    vi.mocked(api.listPlanVersions).mockImplementation(async (planId) => (
+      planId === 4 ? [currentA, priorA] : [currentB, priorB]
+    ));
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([]);
+
+    const { rerender } = render(
+      <PlanDetail plan={planA} onRefresh={vi.fn()} />,
+    );
+    const revision = await screen.findByPlaceholderText('Revise from v2…');
+    await userEvent.type(revision, 'draft for Plan A');
+
+    rerender(<PlanDetail plan={planB} onRefresh={vi.fn()} />);
+
+    await waitFor(() => expect(
+      screen.getByPlaceholderText('Revise from v2…'),
+    ).toHaveValue(''));
+  });
 
   it('keeps an applied older Version, current review actions, routes, and execution link visible', async () => {
     const prior = version({
@@ -191,6 +221,91 @@ describe('PlanDetail', () => {
     expect(screen.getByRole('option', { name: 'v2 · Applied · Current' })).toBeInTheDocument();
     expect(screen.getByText('v2 applied · execution Task #91 unavailable')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Open v2 execution Task/ })).not.toBeInTheDocument();
+  });
+
+  it('shows uncertain delivery evidence and lets an administrator resolve it', async () => {
+    const prior = version({
+      id: 11,
+      version_number: 1,
+      human_decision: 'approved',
+      applied: true,
+      display_state: 'applied',
+    });
+    const current = version({});
+    const resource = plan(current, prior);
+    resource.application = {
+      ...resource.applications[0],
+      application_type: 'chat_message',
+      execution_task_id: null,
+      execution_task_available: null,
+      target_task_id: 8,
+      user_log_id: 44,
+      application_receipt_key: 'receipt-uncertain',
+      delivery_status: 'uncertain',
+      delivery_error: 'Automatic replay was blocked',
+      launch_evidence: { task_id: 8, instance_id: 3, retry_count: 2 },
+    };
+    resource.applications = [resource.application];
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.resolvePlanApplicationDelivery).mockResolvedValue({
+      receipt_key: 'receipt-uncertain',
+      action: 'release_for_retry',
+      plan_ids: [4],
+      target_task_id: 8,
+    });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.spyOn(window, 'prompt').mockReturnValue('No matching native turn exists');
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    expect(await screen.findByText('Plan delivery needs reconciliation')).toBeInTheDocument();
+    expect(screen.getAllByText(/automatic replay was blocked/i)).toHaveLength(2);
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm no turn · release Version' }));
+
+    await waitFor(() => expect(api.resolvePlanApplicationDelivery).toHaveBeenCalledWith(
+      4,
+      'receipt-uncertain',
+      'release_for_retry',
+      'No matching native turn exists',
+    ));
+  });
+
+  it('keeps a released delivery resolution discoverable in audit history', async () => {
+    const prior = version({ id: 11, version_number: 1, human_decision: 'approved' });
+    const current = version({});
+    const resource = plan(current, prior);
+    resource.application = null;
+    resource.applications = [];
+    resource.application_attempts = [{
+      id: 71,
+      plan_id: 4,
+      plan_version_id: prior.id,
+      application_receipt_key: 'receipt-released',
+      application_type: 'chat_message',
+      target_task_id: 8,
+      target_session_id: 'session-8',
+      user_log_id: 44,
+      execution_task_id: null,
+      applied_by: 1,
+      application_created_at: '2026-08-02T08:30:00Z',
+      released_at: '2026-08-02T08:35:00Z',
+      delivery_status: 'cancelled',
+      delivery_error: 'Administrator confirmed that the delivery did not launch',
+      launch_evidence: { task_id: 8, retry_count: 2 },
+      delivery_resolution: {
+        action: 'release_for_retry',
+        note: 'No exact native turn exists',
+        resolved_by: 1,
+      },
+    }];
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    await userEvent.click(await screen.findByText('Debug information'));
+    expect(screen.getByText('Delivery history (1)')).toBeInTheDocument();
+    expect(screen.getByText(/receipt-released.*release_for_retry/)).toBeInTheDocument();
+    expect(screen.getByText('Resolution note: No exact native turn exists')).toBeInTheDocument();
   });
 
   it('shows a confirmable warning for a migrated Version without blocking decisions', async () => {

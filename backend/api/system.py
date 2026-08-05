@@ -79,7 +79,7 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "default_codex_service_tier": DEFAULT_CODEX_SERVICE_TIER,
         "codex_service_tier_options": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
-        "versioned_plan_worker_protocol": 2,
+        "versioned_plan_worker_protocol": 3,
         "plan_pipeline_defaults": (
             plan_pipeline.model_dump(mode="json")
         ),

@@ -85,6 +85,7 @@ export function PlanNeedsInputPanel({ onVisibilityChange }: Props = {}) {
               <button type="button" onClick={close} className="rounded-lg p-1.5 text-gray-500 hover:bg-gray-800 hover:text-gray-200" aria-label="Close"><X size={16} /></button>
             </div>
             <PlanInputForm
+              key={selected.open_input_request.id}
               run={selected.active_run}
               request={selected.open_input_request}
               compact

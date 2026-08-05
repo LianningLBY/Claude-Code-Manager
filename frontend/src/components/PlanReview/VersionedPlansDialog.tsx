@@ -117,7 +117,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
           })}
         </div>
       </section>
-      <section className={`${selected ? 'flex' : 'hidden'} min-w-0 flex-1 flex-col sm:flex`}>{selected ? <><button type="button" onClick={() => setSelectedId(null)} className="absolute left-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200 sm:hidden" aria-label="Back to Plans"><ChevronLeft size={16} /></button><PlanDetail plan={selected} onRefresh={refresh} onClose={onClose} selectedVersionIds={selectedVersionIds} onToggleVersion={onToggleVersion} onAttachVersion={onAttachVersion} /></> : <div className="m-auto text-sm text-gray-500">Select or create a Plan</div>}</section>
+      <section className={`${selected ? 'flex' : 'hidden'} min-w-0 flex-1 flex-col sm:flex`}>{selected ? <><button type="button" onClick={() => setSelectedId(null)} className="absolute left-3 top-3 z-20 rounded-lg bg-gray-900/90 p-1.5 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200 sm:hidden" aria-label="Back to Plans"><ChevronLeft size={16} /></button><PlanDetail key={selected.id} plan={selected} onRefresh={refresh} onClose={onClose} selectedVersionIds={selectedVersionIds} onToggleVersion={onToggleVersion} onAttachVersion={onAttachVersion} /></> : <div className="m-auto text-sm text-gray-500">Select or create a Plan</div>}</section>
     </div>
   </div>;
 }

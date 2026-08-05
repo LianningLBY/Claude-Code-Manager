@@ -1,17 +1,25 @@
 from datetime import datetime
+import asyncio
 import hashlib
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.global_settings import GlobalSettings
-from backend.models.plan import Plan, PlanApplication, PlanInputRequest, PlanVersion
+from backend.models.plan import (
+    Plan,
+    PlanApplication,
+    PlanApplicationAttempt,
+    PlanApplicationReceipt,
+    PlanInputRequest,
+    PlanVersion,
+)
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
 from backend.schemas.plan import default_plan_pipeline_config
@@ -37,13 +45,15 @@ async def _target(client, session_factory) -> Task:
         task = await db.get(Task, task_id)
         task.session_id = "session-plan-v2"
         task.status = "completed"
-        db.add(LogEntry(
-            instance_id=1,
-            task_id=task.id,
-            event_type="user_message",
-            role="user",
-            content="Existing context",
-        ))
+        db.add(
+            LogEntry(
+                instance_id=1,
+                task_id=task.id,
+                event_type="user_message",
+                role="user",
+                content="Existing context",
+            )
+        )
         await db.commit()
         await db.refresh(task)
         db.expunge(task)
@@ -84,9 +94,7 @@ async def _finish_current_run_with_version(
 
 
 @pytest.mark.asyncio
-async def test_public_plan_routes_are_global_only_and_frozen(
-    client, session_factory
-):
+async def test_public_plan_routes_are_global_only_and_frozen(client, session_factory):
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     pipeline["max_interactions"] = 5
     pipeline["planner"]["primary"] = {
@@ -185,9 +193,7 @@ async def test_plan_catalog_search_and_archived_only_match_list_and_count(client
     )
     assert archived_result.status_code == 200, archived_result.text
 
-    default_rows = await client.get(
-        "/api/plans", params={"q": "needle migration"}
-    )
+    default_rows = await client.get("/api/plans", params={"q": "needle migration"})
     assert default_rows.status_code == 200
     assert default_rows.json() == []
 
@@ -256,16 +262,10 @@ async def test_retry_requires_exact_terminal_failed_source(client, session_facto
 
 
 @pytest.mark.asyncio
-async def test_plan_input_rejects_high_confidence_credentials(
-    client, session_factory
-):
+async def test_plan_input_rejects_high_confidence_credentials(client, session_factory):
     rejected_create = await client.post(
         "/api/plans",
-        json={
-            "input": (
-                "Use ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD directly"
-            )
-        },
+        json={"input": ("Use ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD directly")},
     )
     assert rejected_create.status_code == 422
     assert "Settings" in rejected_create.text
@@ -298,14 +298,16 @@ async def test_plan_input_rejects_high_confidence_credentials(
             run_id=run.id,
             source_step_id=step.id,
             requested_by="planner",
-            questions=[{
-                "id": "credential_reference",
-                "header": "Credential",
-                "question": "Name the configured credential reference",
-                "response_type": "text",
-                "options": [],
-                "required": True,
-            }],
+            questions=[
+                {
+                    "id": "credential_reference",
+                    "header": "Credential",
+                    "question": "Name the configured credential reference",
+                    "response_type": "text",
+                    "options": [],
+                    "required": True,
+                }
+            ],
             status="open",
             idempotency_key=f"secret-guard:{run.id}",
             opened_at=datetime.utcnow(),
@@ -322,10 +324,12 @@ async def test_plan_input_rejects_high_confidence_credentials(
         json={
             "expected_run_generation": generation,
             "idempotency_key": "credential-answer",
-            "answers": [{
-                "question_id": "credential_reference",
-                "value": "ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD",
-            }],
+            "answers": [
+                {
+                    "question_id": "credential_reference",
+                    "value": "ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+                }
+            ],
         },
     )
     assert rejected.status_code == 422
@@ -350,18 +354,19 @@ async def test_plan_input_rejects_high_confidence_credentials(
         f"/api/plans/{plan_id}/runs",
         json={
             "run_type": "user_revision",
-            "request": (
-                "Use ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD directly"
-            ),
+            "request": ("Use ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD directly"),
         },
     )
     assert rejected_revision.status_code == 422
     async with session_factory() as db:
-        assert await db.scalar(
-            select(func.count(PlanAgentRun.id)).where(
-                PlanAgentRun.plan_id == plan_id
+        assert (
+            await db.scalar(
+                select(func.count(PlanAgentRun.id)).where(
+                    PlanAgentRun.plan_id == plan_id
+                )
             )
-        ) == 1
+            == 1
+        )
 
 
 @pytest.mark.asyncio
@@ -379,13 +384,15 @@ async def test_stale_confirmation_and_missing_target_hard_conflict(
         plan_id=plan_id,
     )
     async with session_factory() as db:
-        db.add(LogEntry(
-            instance_id=1,
-            task_id=target.id,
-            event_type="user_message",
-            role="user",
-            content="Context changed after planning",
-        ))
+        db.add(
+            LogEntry(
+                instance_id=1,
+                task_id=target.id,
+                event_type="user_message",
+                role="user",
+                content="Context changed after planning",
+            )
+        )
         await db.commit()
 
     stale = await client.post(
@@ -453,25 +460,23 @@ async def test_missing_legacy_repository_snapshot_is_confirmable_not_blocking(
 
     with patch(
         "backend.services.plan_staleness.capture_repo_revision",
-        new=AsyncMock(return_value={
-            "available": True,
-            "head": "current-head",
-            "dirty_sha256": "clean",
-        }),
+        new=AsyncMock(
+            return_value={
+                "available": True,
+                "head": "current-head",
+                "dirty_sha256": "clean",
+            }
+        ),
     ):
         _reject_plan_id, reject_version_id = await create_legacy_version(
             "Reject migrated Version",
         )
-        stale = await client.get(
-            f"/api/plan-versions/{reject_version_id}/staleness"
-        )
+        stale = await client.get(f"/api/plan-versions/{reject_version_id}/staleness")
         assert stale.status_code == 200, stale.text
         assert stale.json()["stale"] is True
         assert stale.json()["hard_conflict"] is False
         assert stale.json()["can_confirm"] is True
-        assert stale.json()["reasons"] == [
-            "captured_repository_state_missing"
-        ]
+        assert stale.json()["reasons"] == ["captured_repository_state_missing"]
 
         rejected = await client.post(
             f"/api/plan-versions/{reject_version_id}/reject",
@@ -574,8 +579,7 @@ async def test_approve_and_create_execution_is_atomic_and_history_stays_linked(
     versions = await client.get(f"/api/plans/{plan_id}/versions")
     assert versions.status_code == 200, versions.text
     version_states = {
-        item["version_number"]: item["display_state"]
-        for item in versions.json()
+        item["version_number"]: item["display_state"] for item in versions.json()
     }
     assert version_states == {1: "applied", 2: "awaiting_review"}
 
@@ -688,21 +692,24 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
         assert first.task.effort_level == settings.default_effort
         assert first.task.codex_service_tier == "default"
         assert first.task.timeout_hours == 3.5
-        assert await db.scalar(
-            select(func.count(PlanApplication.id)).where(
-                PlanApplication.plan_version_id == version_id
+        assert (
+            await db.scalar(
+                select(func.count(PlanApplication.id)).where(
+                    PlanApplication.plan_version_id == version_id
+                )
             )
-        ) == 1
+            == 1
+        )
 
 
 @pytest.mark.asyncio
 async def test_worker_import_creates_idempotent_inert_mirror(client, session_factory):
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     body = {
-        "protocol": 2,
+        "protocol": 3,
         "plan_id": 5101,
         "run_id": 5201,
-        "run_generation": 4,
+        "manager_claim_generation": 4,
         "title": "Relayed Plan",
         "initial_request": "Design on the Worker",
         "priority": 2,
@@ -717,6 +724,14 @@ async def test_worker_import_creates_idempotent_inert_mirror(client, session_fac
 
     replay = await client.post("/api/plans/worker-import", json=body)
     assert replay.status_code == 200, replay.text
+    # A later Manager claim may have a higher generation after any number of
+    # restarts; it must map to the same Worker-local Run.
+    body["manager_claim_generation"] = 99
+    replay_after_restarts = await client.post("/api/plans/worker-import", json=body)
+    assert replay_after_restarts.status_code == 200, replay_after_restarts.text
+    changed = {**body, "request_text": "Different imported request"}
+    rejected = await client.post("/api/plans/worker-import", json=changed)
+    assert rejected.status_code == 409
     async with session_factory() as db:
         plan = await db.get(Plan, 5101)
         run = await db.get(PlanAgentRun, 5201)
@@ -724,9 +739,113 @@ async def test_worker_import_creates_idempotent_inert_mirror(client, session_fac
         assert plan.worker_id is None
         assert plan.active_run_id == run.id
         assert run.relay_origin == "manager_v1"
-        assert run.generation == 4
+        assert run.generation == 0
         assert await db.scalar(select(func.count(Plan.id))) == 1
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_related_plan_capacity_is_atomic_for_concurrent_creates(
+    client, session_factory
+):
+    target = await _target(client, session_factory)
+    responses = await asyncio.gather(
+        *(
+            client.post(
+                "/api/plans",
+                json={"input": f"Concurrent Plan {index}", "target_task_id": target.id},
+            )
+            for index in range(4)
+        )
+    )
+    assert sorted(response.status_code for response in responses) == [
+        201,
+        201,
+        201,
+        429,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_related_plan_capacity_applies_to_forks(client, session_factory):
+    target = await _target(client, session_factory)
+    source = await client.post(
+        "/api/plans",
+        json={"input": "Fork source", "target_task_id": target.id},
+    )
+    assert source.status_code == 201, source.text
+    source_id = source.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory, plan_id=source_id
+    )
+    responses = []
+    for index in range(4):
+        responses.append(
+            await client.post(
+                f"/api/plans/{source_id}/fork",
+                json={
+                    "base_version_id": version_id,
+                    "title": f"Fork {index}",
+                },
+            )
+        )
+    assert [response.status_code for response in responses] == [201, 201, 201, 429]
+
+
+@pytest.mark.asyncio
+async def test_plan_catalog_paginates_before_bounded_batch_projection(
+    client, session_factory
+):
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        for index in range(25):
+            plan = Plan(
+                title=f"Bulk {index:02d}",
+                initial_request="Measure catalog queries",
+                pipeline_config=pipeline,
+                priority=0,
+            )
+            db.add(plan)
+            await db.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                run_type="initial",
+                request_text=plan.initial_request,
+                pipeline_config=pipeline,
+                status="queued",
+                current_stage="planner",
+            )
+            db.add(run)
+            await db.flush()
+            plan.active_run_id = run.id
+        await db.commit()
+
+    engine = session_factory.kw["bind"].sync_engine
+    statements = 0
+
+    def count_statement(*_args):
+        nonlocal statements
+        statements += 1
+
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        response = await client.get("/api/plans?limit=5&offset=10")
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 5
+    # The projection performs a fixed set of bulk queries, not one set per Plan.
+    assert statements <= 10
+
+    statements = 0
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        counted = await client.get("/api/plans/count")
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+    assert counted.status_code == 200, counted.text
+    assert counted.json()["total"] >= 25
+    assert statements <= 2
 
 
 @pytest.mark.asyncio
@@ -739,10 +858,10 @@ async def test_worker_import_requires_exact_attachment_digest(client):
     item = uploaded.json()[0]
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     body = {
-        "protocol": 2,
+        "protocol": 3,
         "plan_id": 5151,
         "run_id": 5251,
-        "run_generation": 0,
+        "manager_claim_generation": 0,
         "title": "Attachment Plan",
         "initial_request": "Use the attachment",
         "priority": 0,
@@ -752,16 +871,20 @@ async def test_worker_import_requires_exact_attachment_digest(client):
         "max_interactions": 3,
         "file_paths": [item["path"]],
         "image_paths": [],
-        "attachments": [{
-            "url": item["url"],
-            "name": item["filename"],
-            "is_image": False,
-        }],
-        "attachment_manifest": [{
-            "path": item["path"],
-            "size": len(b"exact bytes"),
-            "sha256": "0" * 64,
-        }],
+        "attachments": [
+            {
+                "url": item["url"],
+                "name": item["filename"],
+                "is_image": False,
+            }
+        ],
+        "attachment_manifest": [
+            {
+                "path": item["path"],
+                "size": len(b"exact bytes"),
+                "sha256": "0" * 64,
+            }
+        ],
     }
     rejected = await client.post("/api/plans/worker-import", json=body)
     assert rejected.status_code == 409
@@ -779,7 +902,7 @@ async def test_worker_import_requires_exact_attachment_digest(client):
 async def test_worker_materializes_exact_version_idempotently(client, session_factory):
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     body = {
-        "protocol": 2,
+        "protocol": 3,
         "plan_id": 5301,
         "title": "Migrated Plan",
         "initial_request": "Plan before migration",
@@ -817,9 +940,12 @@ async def test_worker_materializes_exact_version_idempotently(client, session_fa
         assert version.version_number == 3
         assert version.content == "# Immutable v3"
         assert version.human_decision == "approved"
-        assert await db.scalar(
-            select(func.count(PlanVersion.id)).where(PlanVersion.plan_id == plan.id)
-        ) == 1
+        assert (
+            await db.scalar(
+                select(func.count(PlanVersion.id)).where(PlanVersion.plan_id == plan.id)
+            )
+            == 1
+        )
 
 
 @pytest.mark.asyncio
@@ -873,7 +999,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
         base_version_id = base.id
 
     payload = {
-        "protocol": 2,
+        "protocol": 3,
         "base_worker_version_id": 800,
         "run": {
             "id": run_id,
@@ -888,7 +1014,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
             "draft_repo_revision": {"commit": "abc"},
             "request_text": "Plan this",
             "round": 1,
-            "generation": 3,
+            "generation": 1,
             "instance_id": None,
             "worker_id": None,
             "open_input_request_id": 901,
@@ -912,7 +1038,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
                     "input_request_id": None,
                     "step_type": "planner",
                     "round": 1,
-                    "generation": 3,
+                    "generation": 1,
                     "provider": "codex",
                     "model": "gpt-test",
                     "effort": "high",
@@ -934,7 +1060,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
                     "input_request_id": 901,
                     "step_type": "reviewer",
                     "round": 1,
-                    "generation": 3,
+                    "generation": 1,
                     "provider": "claude",
                     "model": "claude-test",
                     "effort": "medium",
@@ -995,7 +1121,8 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
         version = await db.get(PlanVersion, plan.current_version_id)
         input_request = await db.get(PlanInputRequest, run.open_input_request_id)
         assert run.status == "waiting_user"
-        assert run.generation == 3
+        # Manager and Worker generations are independent protocol-v3 fences.
+        assert run.generation == 2
         assert plan.current_version_id == base_version_id
         assert version.id == base_version_id
         assert run.result_version_id is None
@@ -1029,9 +1156,9 @@ async def test_canonical_create_and_revision_keep_stable_plan_identity(
     assert payload["display_state"] == "planner"
 
     async with session_factory() as db:
-        assert await db.scalar(
-            select(func.count(Task.id)).where(Task.mode == "plan")
-        ) == 0
+        assert (
+            await db.scalar(select(func.count(Task.id)).where(Task.mode == "plan")) == 0
+        )
         plan = await db.get(Plan, plan_id)
         first_run = await db.get(PlanAgentRun, first_run_id)
         version = PlanVersion(
@@ -1074,15 +1201,13 @@ async def test_canonical_create_and_revision_keep_stable_plan_identity(
     async with session_factory() as db:
         assert await db.scalar(select(func.count(Plan.id))) == 1
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 2
-        assert await db.scalar(
-            select(func.count(Task.id)).where(Task.mode == "plan")
-        ) == 0
+        assert (
+            await db.scalar(select(func.count(Task.id)).where(Task.mode == "plan")) == 0
+        )
 
 
 @pytest.mark.asyncio
-async def test_related_plan_creation_rejects_migrating_target(
-    client, session_factory
-):
+async def test_related_plan_creation_rejects_migrating_target(client, session_factory):
     target = await _target(client, session_factory)
     async with session_factory() as db:
         current = await db.get(Task, target.id)
@@ -1230,13 +1355,18 @@ async def test_exact_approved_version_is_applied_to_real_user_message(
     )
     assert approved.status_code == 200, approved.text
 
-    with patch("backend.main.dispatcher.enqueue_message", new=AsyncMock()):
+    enqueue = AsyncMock(side_effect=RuntimeError("shutdown after durable commit"))
+    with patch(
+        "backend.main.dispatcher.enqueue_plan_application_receipt",
+        new=enqueue,
+    ):
         sent = await client.post(
             f"/api/tasks/{target.id}/chat",
             json={"message": "Implement it", "plan_version_ids": [version_id]},
         )
     assert sent.status_code == 200, sent.text
     assert sent.json()["applied_plan_version_ids"] == [version_id]
+    response_receipt_key = sent.json()["plan_application_receipt_key"]
 
     async with session_factory() as db:
         application = (
@@ -1252,6 +1382,44 @@ async def test_exact_approved_version_is_applied_to_real_user_message(
         assert snapshot["version_id"] == version_id
         assert snapshot["version_number"] == 1
         assert snapshot["content"] == "# Exact immutable content"
+        receipt = (
+            await db.execute(
+                select(PlanApplicationReceipt).where(
+                    PlanApplicationReceipt.receipt_key
+                    == application.application_receipt_key
+                )
+            )
+        ).scalar_one()
+        assert receipt.status == "committed"
+        assert receipt.delivery_status == "pending"
+        assert receipt.outbox_payload["source_log_id"] == log.id
+        assert receipt.outbox_payload["user_message_text"] == "Implement it"
+        assert "# Exact immutable content" in receipt.outbox_payload["current_message"]
+        receipt_key = receipt.receipt_key
+        assert receipt_key == response_receipt_key
+
+    from backend.services.dispatcher import GlobalDispatcher
+
+    recovered_dispatcher = GlobalDispatcher(
+        session_factory,
+        MagicMock(),
+        AsyncMock(),
+    )
+    recovered_dispatcher._ensure_queue_worker = MagicMock()
+    assert await recovered_dispatcher.enqueue_plan_application_receipt(receipt_key)
+    recovered = await recovered_dispatcher._get_task_queue(target.id).get()
+    recovered_dispatcher._get_task_queue(target.id).task_done()
+    assert recovered.delivery_key == receipt_key
+    assert "# Exact immutable content" in recovered.current_message
+    async with session_factory() as db:
+        receipt = (
+            await db.execute(
+                select(PlanApplicationReceipt).where(
+                    PlanApplicationReceipt.receipt_key == receipt_key
+                )
+            )
+        ).scalar_one()
+        assert receipt.delivery_status == "queued"
 
     duplicate = await client.post(
         f"/api/tasks/{target.id}/chat",
@@ -1261,18 +1429,259 @@ async def test_exact_approved_version_is_applied_to_real_user_message(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_endpoint", ["stop-session", "cancel"])
+async def test_terminal_operation_rejects_plan_admission_after_queue_abort(
+    client,
+    session_factory,
+    terminal_endpoint,
+):
+    """The cancellation lease must outlive abort and the launch barrier."""
+
+    import backend.main
+
+    target = await _target(client, session_factory)
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Plan terminal race", "target_task_id": target.id},
+    )
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+        content="# Must not enter the stopped queue",
+    )
+    approved = await client.post(
+        f"/api/plan-versions/{version_id}/approve",
+        json={
+            "expected_current_version_id": version_id,
+            "confirm_stale": False,
+        },
+    )
+    assert approved.status_code == 200, approved.text
+    async with session_factory() as db:
+        task = await db.get(Task, target.id)
+        task.status = "executing"
+        # Force the terminal path through the async launch barrier without a
+        # reverse process owner, reproducing the post-abort/pre-CAS window.
+        task.instance_id = 991
+        await db.commit()
+
+    abort_finished = asyncio.Event()
+    barrier_entered = asyncio.Event()
+    finish_terminal = asyncio.Event()
+
+    async def abort_queue(*_args, **_kwargs):
+        abort_finished.set()
+        return 0
+
+    async def wait_for_launch_barrier(*_args, **_kwargs):
+        assert abort_finished.is_set()
+        barrier_entered.set()
+        await finish_terminal.wait()
+        return True
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new=AsyncMock(side_effect=abort_queue),
+        ) as abort,
+        patch.object(
+            backend.main.instance_manager,
+            "wait_for_task_launch_barrier",
+            new=AsyncMock(side_effect=wait_for_launch_barrier),
+        ),
+    ):
+        terminal_request = asyncio.create_task(
+            client.post(f"/api/tasks/{target.id}/{terminal_endpoint}")
+        )
+        await asyncio.wait_for(barrier_entered.wait(), timeout=2)
+        rejected = await client.post(
+            f"/api/tasks/{target.id}/chat",
+            json={
+                "message": "This races with terminal publication",
+                "plan_version_ids": [version_id],
+            },
+        )
+        finish_terminal.set()
+        terminal_response = await asyncio.wait_for(terminal_request, timeout=2)
+
+    assert rejected.status_code == 409, rejected.text
+    assert "Plan Version was not applied" in rejected.json()["detail"]
+    assert terminal_response.status_code == 200, terminal_response.text
+    assert abort.await_args.kwargs["cancel_durable"] is False
+    async with session_factory() as db:
+        assert (
+            await db.scalar(
+                select(PlanApplication.id).where(
+                    PlanApplication.plan_version_id == version_id
+                )
+            )
+            is None
+        )
+        assert (
+            await db.scalar(
+                select(PlanApplicationReceipt.id).where(
+                    PlanApplicationReceipt.plan_version_ids == [version_id]
+                )
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_uncertain_plan_delivery_is_visible_and_admin_can_release_it(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend import main as main_module
+    from backend.services.dispatcher import GlobalDispatcher
+
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        task = Task(
+            title="delivery target",
+            description="delivery target",
+            status="completed",
+            session_id="delivery-session",
+        )
+        plan = Plan(
+            title="uncertain delivery",
+            initial_request="Plan this",
+            pipeline_config=pipeline,
+        )
+        db.add_all([task, plan])
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            version_number=1,
+            content="# Exact plan",
+            human_decision="approved",
+        )
+        log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement it",
+            raw_json=json.dumps({"applied_plans": [{"plan_id": plan.id}]}),
+        )
+        db.add_all([version, log])
+        await db.flush()
+        plan.current_version_id = version.id
+        receipt = PlanApplicationReceipt(
+            receipt_key="uncertain-visible-receipt",
+            target_task_id=task.id,
+            manager_user_log_id=log.id,
+            plan_version_ids=[version.id],
+            status="committed",
+            delivery_status="uncertain",
+            delivery_error="Automatic replay blocked",
+            launch_evidence={
+                "task_id": task.id,
+                "instance_id": 7,
+                "retry_count": 3,
+            },
+        )
+        db.add(receipt)
+        await db.flush()
+        db.add(
+            PlanApplication(
+                plan_id=plan.id,
+                plan_version_id=version.id,
+                application_type="chat_message",
+                target_task_id=task.id,
+                user_log_id=log.id,
+                application_receipt_key=receipt.receipt_key,
+            )
+        )
+        await db.commit()
+        plan_id = plan.id
+        version_id = version.id
+
+    resource = await client.get(f"/api/plans/{plan_id}")
+    assert resource.status_code == 200, resource.text
+    application = resource.json()["applications"][0]
+    assert application["application_receipt_key"] == "uncertain-visible-receipt"
+    assert application["delivery_status"] == "uncertain"
+    assert application["launch_evidence"]["retry_count"] == 3
+
+    dispatcher = GlobalDispatcher(session_factory, MagicMock(), AsyncMock())
+    monkeypatch.setattr(main_module, "dispatcher", dispatcher)
+    monkeypatch.setattr(main_module, "broadcaster", AsyncMock())
+    resolved = await client.post(
+        f"/api/plans/{plan_id}/application-deliveries/"
+        "uncertain-visible-receipt/resolve",
+        json={
+            "action": "release_for_retry",
+            "note": "No exact native turn or process generation exists",
+        },
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["plan_ids"] == [plan_id]
+    replayed = await client.post(
+        f"/api/plans/{plan_id}/application-deliveries/"
+        "uncertain-visible-receipt/resolve",
+        json={
+            "action": "release_for_retry",
+            "note": "Idempotent replay of the same audited decision",
+        },
+    )
+    assert replayed.status_code == 200, replayed.text
+
+    refreshed = await client.get(f"/api/plans/{plan_id}")
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["applications"] == []
+    attempts = refreshed.json()["application_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["application_receipt_key"] == "uncertain-visible-receipt"
+    assert attempts[0]["delivery_status"] == "cancelled"
+    assert attempts[0]["delivery_resolution"]["action"] == "release_for_retry"
+    assert "native turn" in attempts[0]["delivery_resolution"]["note"]
+    assert attempts[0]["launch_evidence"]["retry_count"] == 3
+
+    async with session_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == "uncertain-visible-receipt"
+            )
+        )
+        assert receipt.delivery_status == "cancelled"
+        assert receipt.delivery_resolution["action"] == "release_for_retry"
+        assert "native turn" in receipt.delivery_resolution["note"]
+        assert (
+            await db.scalar(
+                select(PlanApplication.id).where(
+                    PlanApplication.plan_version_id == version_id
+                )
+            )
+            is None
+        )
+        attempt = await db.scalar(
+            select(PlanApplicationAttempt).where(
+                PlanApplicationAttempt.plan_version_id == version_id
+            )
+        )
+        assert attempt is not None
+        assert attempt.application_receipt_key == "uncertain-visible-receipt"
+
+
+@pytest.mark.asyncio
 async def test_instance_capacity_owner_is_task_xor_plan_run(db_session):
     instance = Instance(name="slot", status="running", current_plan_run_id=4)
     db_session.add(instance)
     await db_session.commit()
     assert instance.current_task_id is None
     assert instance.current_plan_run_id == 4
-    db_session.add(Instance(
-        name="invalid-slot",
-        status="running",
-        current_task_id=3,
-        current_plan_run_id=4,
-    ))
+    db_session.add(
+        Instance(
+            name="invalid-slot",
+            status="running",
+            current_task_id=3,
+            current_plan_run_id=4,
+        )
+    )
     with pytest.raises(IntegrityError):
         await db_session.commit()
     await db_session.rollback()
@@ -1280,12 +1689,14 @@ async def test_instance_capacity_owner_is_task_xor_plan_run(db_session):
 
 @pytest.mark.asyncio
 async def test_plan_application_target_shape_is_database_enforced(db_session):
-    db_session.add(PlanApplication(
-        plan_id=1,
-        plan_version_id=1,
-        application_type="chat_message",
-        execution_task_id=99,
-    ))
+    db_session.add(
+        PlanApplication(
+            plan_id=1,
+            plan_version_id=1,
+            application_type="chat_message",
+            execution_task_id=99,
+        )
+    )
     with pytest.raises(IntegrityError):
         await db_session.commit()
     await db_session.rollback()
@@ -1330,14 +1741,16 @@ async def test_plan_resources_never_expose_internal_attachment_paths(
             source_step_id=step.id,
             requested_by="planner",
             reason="Need confirmation",
-            questions=[{
-                "id": "confirm",
-                "header": "Confirm",
-                "question": "Confirm the requirement",
-                "response_type": "text",
-                "options": [],
-                "required": True,
-            }],
+            questions=[
+                {
+                    "id": "confirm",
+                    "header": "Confirm",
+                    "question": "Confirm the requirement",
+                    "response_type": "text",
+                    "options": [],
+                    "required": True,
+                }
+            ],
             status="open",
             attachments=[internal],
             idempotency_key=f"test-path:{run_id}",
@@ -1350,11 +1763,13 @@ async def test_plan_resources_never_expose_internal_attachment_paths(
     resource = await client.get(f"/api/plans/{plan_id}")
     assert resource.status_code == 200, resource.text
     payload = resource.json()
-    assert payload["initial_attachments"] == [{
-        "url": "/api/uploads/example.txt",
-        "name": "example.txt",
-        "is_image": False,
-    }]
+    assert payload["initial_attachments"] == [
+        {
+            "url": "/api/uploads/example.txt",
+            "name": "example.txt",
+            "is_image": False,
+        }
+    ]
     assert "path" not in payload["open_input_request"]["attachments"][0]
     run_resource = await client.get(f"/api/plan-runs/{run_id}")
     assert "path" not in run_resource.json()["input_requests"][0]["attachments"][0]
@@ -1408,14 +1823,17 @@ async def test_interaction_round_limit_fails_without_limiting_question_count(
         source_step=PlanAgentStep(id=step_id),
         requested_by="planner",
         reason="One more interaction is necessary",
-        questions=[{
-            "id": f"q{index}",
-            "header": f"Q{index}",
-            "question": f"Decision {index}",
-            "response_type": "text",
-            "options": [],
-            "required": True,
-        } for index in range(20)],
+        questions=[
+            {
+                "id": f"q{index}",
+                "header": f"Q{index}",
+                "question": f"Decision {index}",
+                "response_type": "text",
+                "options": [],
+                "required": True,
+            }
+            for index in range(20)
+        ],
         max_interactions=3,
     )
     assert outcome == "failed"
@@ -1428,9 +1846,14 @@ async def test_interaction_round_limit_fails_without_limiting_question_count(
         assert plan.active_run_id is None
         assert owner.status == "idle"
         assert owner.current_plan_run_id is None
-        assert await db.scalar(select(func.count(PlanInputRequest.id)).where(
-            PlanInputRequest.run_id == run_id
-        )) == 0
+        assert (
+            await db.scalar(
+                select(func.count(PlanInputRequest.id)).where(
+                    PlanInputRequest.run_id == run_id
+                )
+            )
+            == 0
+        )
 
 
 @pytest.mark.asyncio
@@ -1473,14 +1896,16 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
         {
             "action": "request_input",
             "reason": "Reviewer found one unresolved deployment constraint",
-            "questions": [{
-                "id": "maintenance_window",
-                "header": "Rollout",
-                "question": "Which maintenance window should the Plan use?",
-                "response_type": "text",
-                "options": [],
-                "required": True,
-            }],
+            "questions": [
+                {
+                    "id": "maintenance_window",
+                    "header": "Rollout",
+                    "question": "Which maintenance window should the Plan use?",
+                    "response_type": "text",
+                    "options": [],
+                    "required": True,
+                }
+            ],
         },
         {
             "action": "propose",
@@ -1494,19 +1919,21 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
         prompts.append(kwargs["prompt"])
         output = outputs.pop(0)
         async with session_factory() as db:
-            db.add(PlanAgentStep(
-                run_id=kwargs["run_id"],
-                plan_id=kwargs["plan_id"],
-                step_type=kwargs["step_type"],
-                round=kwargs["round_number"],
-                generation=kwargs["generation"],
-                provider="claude",
-                model="test-model",
-                route_slot="primary",
-                status="completed",
-                output=json.dumps(output),
-                finished_at=datetime.utcnow(),
-            ))
+            db.add(
+                PlanAgentStep(
+                    run_id=kwargs["run_id"],
+                    plan_id=kwargs["plan_id"],
+                    step_type=kwargs["step_type"],
+                    round=kwargs["round_number"],
+                    generation=kwargs["generation"],
+                    provider="claude",
+                    model="test-model",
+                    route_slot="primary",
+                    status="completed",
+                    output=json.dumps(output),
+                    finished_at=datetime.utcnow(),
+                )
+            )
             await db.commit()
         return output, json.dumps(output), object(), "primary", "test-account"
 
@@ -1564,9 +1991,12 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
         assert plan.current_version_id is None
         assert run.result_version_id is None
         assert run.draft_content == "# Version 1\nInitial decisions included."
-        assert await db.scalar(
-            select(func.count(PlanVersion.id)).where(PlanVersion.plan_id == plan_id)
-        ) == 0
+        assert (
+            await db.scalar(
+                select(func.count(PlanVersion.id)).where(PlanVersion.plan_id == plan_id)
+            )
+            == 0
+        )
     await claim_current_run()
     assert await runner.advance_versioned(run_id, cwd="/tmp") == "waiting_user"
     async with session_factory() as db:
@@ -1580,10 +2010,12 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
         json={
             "expected_run_generation": second_generation,
             "idempotency_key": "reviewer-answer",
-            "answers": [{
-                "question_id": "maintenance_window",
-                "value": "Sunday 02:00 UTC",
-            }],
+            "answers": [
+                {
+                    "question_id": "maintenance_window",
+                    "value": "Sunday 02:00 UTC",
+                }
+            ],
         },
     )
     assert answered.status_code == 200, answered.text
@@ -1597,21 +2029,32 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
     async with session_factory() as db:
         plan = await db.get(Plan, plan_id)
         run = await db.get(PlanAgentRun, run_id)
-        versions = list((await db.execute(
-            select(PlanVersion)
-            .where(PlanVersion.plan_id == plan_id)
-            .order_by(PlanVersion.version_number)
-        )).scalars())
-        requests = list((await db.execute(
-            select(PlanInputRequest)
-            .where(PlanInputRequest.run_id == run_id)
-            .order_by(PlanInputRequest.id)
-        )).scalars())
+        versions = list(
+            (
+                await db.execute(
+                    select(PlanVersion)
+                    .where(PlanVersion.plan_id == plan_id)
+                    .order_by(PlanVersion.version_number)
+                )
+            ).scalars()
+        )
+        requests = list(
+            (
+                await db.execute(
+                    select(PlanInputRequest)
+                    .where(PlanInputRequest.run_id == run_id)
+                    .order_by(PlanInputRequest.id)
+                )
+            ).scalars()
+        )
         assert plan.active_run_id is None
         assert plan.current_version_id == versions[0].id
         assert run.status == "completed"
         assert run.result_version_id == versions[0].id
-        assert run.draft_content == "# Version 2\nIncludes every decision and the Sunday window."
+        assert (
+            run.draft_content
+            == "# Version 2\nIncludes every decision and the Sunday window."
+        )
         assert run.interaction_count == 2
         assert [item.status for item in requests] == ["answered", "answered"]
         assert [item.version_number for item in versions] == [1]

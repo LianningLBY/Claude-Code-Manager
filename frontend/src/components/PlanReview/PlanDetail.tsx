@@ -94,7 +94,9 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const [error, setError] = useState<string | null>(null);
   const [staleness, setStaleness] = useState<PlanStaleness | null>(null);
   const uploads = useFileUpload();
+  const clearUploads = uploads.clear;
   const fileInput = useRef<HTMLInputElement>(null);
+  const previousPlanId = useRef(plan.id);
   const previousCurrentVersionId = useRef(plan.current_version_id);
   const loadRequest = useRef(0);
 
@@ -110,6 +112,20 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     setVersionId((current) => versionRows.some((item) => item.id === current) ? current : plan.current_version_id);
   }, [plan.current_version_id, plan.id]);
 
+  useEffect(() => {
+    if (previousPlanId.current === plan.id) return;
+    previousPlanId.current = plan.id;
+    setVersions([]);
+    setRuns([]);
+    setVersionId(plan.current_version_id);
+    setRevision('');
+    setCompare(false);
+    setBusy(false);
+    setBusyLabel(null);
+    setError(null);
+    setStaleness(null);
+    clearUploads();
+  }, [plan.id, plan.current_version_id, clearUploads]);
   useEffect(() => { void load().catch((reason) => setError(reason instanceof Error ? reason.message : String(reason))); }, [load]);
   useEffect(() => {
     setVersionId((current) => current === previousCurrentVersionId.current ? plan.current_version_id : current);
@@ -119,6 +135,15 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const previous = useMemo(() => shown ? versions.find((item) => item.version_number === shown.version_number - 1) || null : null, [shown, versions]);
   const appliedVersion = versions.find((item) => item.applied) || null;
   const executionApplications = (plan.applications || []).filter((item) => item.execution_task_id != null);
+  const uncertainApplications = (plan.applications || []).filter((item) => (
+    item.delivery_status === 'uncertain' && item.application_receipt_key
+  ));
+  const applicationAttempts = plan.application_attempts || [];
+  const currentUser = (() => {
+    try { return JSON.parse(localStorage.getItem('cc_user') || '{}') as { id?: number; role?: string }; }
+    catch { return {} as { id?: number; role?: string }; }
+  })();
+  const isAdmin = currentUser.role === 'admin' || currentUser.role === 'super_admin' || !currentUser.id;
   const latestFailedRun = runs.find((run) => run.status === 'failed') || null;
   const activeRunSnapshot = runs.find((run) => run.id === plan.active_run_id) || plan.active_run;
   const activeRun = activeRunSnapshot && ACTIVE_RUN_STATUSES.has(activeRunSnapshot.status)
@@ -194,6 +219,22 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     });
   };
 
+  const resolveDelivery = async (
+    receiptKey: string,
+    action: 'confirm_launched' | 'release_for_retry',
+  ) => {
+    const confirmation = action === 'confirm_launched'
+      ? 'Confirm only after verifying that this exact Task generation/turn exists or executed. Mark this delivery as launched?'
+      : 'Confirm only after verifying that this exact Task generation/turn never launched. Release the Version so it can be applied again?';
+    if (!window.confirm(confirmation)) return;
+    const note = window.prompt('Record the evidence used for this decision:')?.trim();
+    if (!note) return;
+    await mutate(
+      action === 'confirm_launched' ? 'Confirming Plan delivery' : 'Releasing Plan delivery',
+      () => api.resolvePlanApplicationDelivery(plan.id, receiptKey, action, note),
+    );
+  };
+
   const answered = async (answeredRequest?: PlanInputRequest) => {
     if (answeredRequest) {
       setRuns((currentRuns) => currentRuns.map((run) => run.id !== answeredRequest.run_id ? run : {
@@ -235,6 +276,21 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
       {busyLabel && <div role="status" aria-live="polite" className="mb-4 flex items-center gap-2 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-300"><Loader2 size={13} className="animate-spin" /> {busyLabel}…</div>}
       {plan.latest_run_status === 'failed' && plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> You can retry it; technical details are available in Debug information.</div>}
+      {uncertainApplications.map((application) => <div key={application.application_receipt_key} role="alert" className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3.5 py-3 text-sm text-red-100">
+        <div className="flex items-start gap-2.5">
+          <AlertCircle size={18} className="mt-0.5 shrink-0 text-red-300" />
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold text-red-300">Plan delivery needs reconciliation</div>
+            <p className="mt-1 leading-5">CCM restarted after claiming this delivery, so automatic replay was blocked. The Version remains applied until an administrator verifies whether the exact turn launched.</p>
+            {application.delivery_error && <p className="mt-1 text-xs text-red-200/80">{application.delivery_error}</p>}
+            <details className="mt-2 text-xs text-red-100/75"><summary className="cursor-pointer">Launch evidence and receipt</summary><pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all">{application.application_receipt_key}{'\n'}{JSON.stringify(application.launch_evidence || {}, null, 2)}</pre></details>
+            {isAdmin ? <div className="mt-3 flex flex-wrap gap-2">
+              <button type="button" disabled={busy} onClick={() => void resolveDelivery(application.application_receipt_key!, 'confirm_launched')} className="rounded-lg border border-emerald-500/50 px-3 py-1.5 text-xs text-emerald-200 transition-colors hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-40">Confirm exact turn launched</button>
+              <button type="button" disabled={busy} onClick={() => void resolveDelivery(application.application_receipt_key!, 'release_for_retry')} className="rounded-lg border border-red-400/50 px-3 py-1.5 text-xs text-red-100 transition-colors hover:bg-red-500/15 disabled:pointer-events-none disabled:opacity-40">Confirm no turn · release Version</button>
+            </div> : <p className="mt-2 text-xs text-red-200/80">Ask an administrator to reconcile this delivery.</p>}
+          </div>
+        </div>
+      </div>)}
       {showStaleness && staleness?.stale && !staleness.hard_conflict && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-3 text-gray-200">
         <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-400" />
         <div className="min-w-0">
@@ -245,7 +301,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       {showStaleness && staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       <CollapsiblePlanningRequest content={plan.initial_request} />
 
-      {activeRun?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm run={activeRun} request={plan.open_input_request} onAnswered={answered} /></div>}
+      {activeRun?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm key={plan.open_input_request.id} run={activeRun} request={plan.open_input_request} onAnswered={answered} /></div>}
       {activeRun && <PlanRunInputAudit run={activeRun} title={`v${candidateVersionNumber} ${activeRun.run_type === 'user_revision' ? 'revision & input history' : 'input history'}`} defaultOpen />}
 
       {activeRun?.draft_content && <section className="mt-4 min-w-0 rounded-xl border border-indigo-500/35 bg-indigo-500/5 p-4">
@@ -289,7 +345,21 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           </section>}
           {plan.applications.length > 0 && <section>
             <div className="mb-1 font-semibold text-gray-300">Applications ({plan.applications.length})</div>
-            <div className="space-y-1">{plan.applications.map((application) => { const applied = versions.find((item) => item.id === application.plan_version_id); return <div key={application.id}>v{applied?.version_number || '?'} · {application.application_type === 'execution_task' ? `execution Task #${application.execution_task_id}` : `chat message #${application.user_log_id}`}</div>; })}</div>
+            <div className="space-y-1">{plan.applications.map((application) => { const applied = versions.find((item) => item.id === application.plan_version_id); return <div key={application.id}>v{applied?.version_number || '?'} · {application.application_type === 'execution_task' ? `execution Task #${application.execution_task_id}` : `chat message #${application.user_log_id}`}{application.delivery_status ? ` · delivery ${application.delivery_status}` : ''}</div>; })}</div>
+          </section>}
+          {applicationAttempts.length > 0 && <section>
+            <div className="mb-1 font-semibold text-gray-300">Delivery history ({applicationAttempts.length})</div>
+            <div className="space-y-2">{applicationAttempts.map((attempt) => {
+              const applied = versions.find((item) => item.id === attempt.plan_version_id);
+              const action = typeof attempt.delivery_resolution?.action === 'string' ? attempt.delivery_resolution.action : null;
+              const note = typeof attempt.delivery_resolution?.note === 'string' ? attempt.delivery_resolution.note : null;
+              return <div key={attempt.id} className="border-t border-gray-800 pt-2 first:border-0 first:pt-0">
+                <div>v{applied?.version_number || '?'} · receipt {attempt.application_receipt_key} · delivery {attempt.delivery_status}{action ? ` · ${action}` : ''}</div>
+                {note && <div className="mt-1 text-gray-300">Resolution note: {note}</div>}
+                {attempt.delivery_error && <div className="mt-1 text-red-300/80">{attempt.delivery_error}</div>}
+                <details className="mt-1"><summary className="cursor-pointer">Evidence</summary><pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(attempt.launch_evidence || {}, null, 2)}</pre></details>
+              </div>;
+            })}</div>
           </section>}
         </div>
       </details>

@@ -199,8 +199,8 @@ websocket identity 校验及固定端口上的孤儿 Chrome 不会被复用；
 |---------|---------|
 | `test_claude_pool.py` | API-first 模型兼容选择、quota/auth fail-closed、Claude session + sidecar 安全迁移，以及候选选择不会提前更新 `last_selected` |
 | `test_codex_pool.py` | API-first 与原生 fallback、独立 round-robin cursor、额度终态分类和最终路由 marker |
-| `test_resume_config_dir.py` | preferred 手动切换、已有会话粘性、Task durable binding、多副本消歧，以及 rollout copy 期间取消/代次变化不会产生无主副本 |
-| `test_service_instance_manager.py` | Claude/Codex reactive/proactive 换号、精确 queued message 保留、Codex copy→rebind→binding 的 cancellation-settled 事务，以及 silent exit/`turn.failed` 按真实 provider 归因且不重复报错 |
+| `test_resume_config_dir.py` | preferred 手动切换、已有会话粘性、Task durable binding、多副本消歧、runtime-busy 短退避、disabled source 等待可迁移目标，以及 rollout copy 期间取消/代次变化不会产生无主副本 |
+| `test_service_instance_manager.py` | Claude/Codex reactive/proactive 换号、精确 queued message 保留、Codex copy→rebind→binding 的 cancellation-settled 事务、direct/ephemeral per-home admission，以及 silent exit/`turn.failed` 按真实 provider 归因且不重复报错 |
 | `PoolDrawer.test.tsx` | Claude/Codex 的「优先账号」「最近使用」独立展示，以及恢复自动后的 API-first/旧会话绑定提示 |
 
 #### `test_api_projects.py` — 项目 API

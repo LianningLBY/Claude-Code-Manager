@@ -119,6 +119,20 @@ def task_distill_runtime_users(
     return blockers
 
 
+def codex_task_distill_runtime_homes() -> set[str]:
+    """Return canonical homes owned by active or unreaped Codex distills."""
+
+    homes: set[str] = set()
+    for token, retained in list(_TASK_DISTILL_PROCESSES.items()):
+        if (
+            retained.provider == "codex"
+            and retained.provider_home is not None
+            and _TASK_DISTILL_PROCESSES.get(token) is retained
+        ):
+            homes.add(retained.provider_home)
+    return homes
+
+
 def build_task_distill_prompt(
     *,
     title: str,

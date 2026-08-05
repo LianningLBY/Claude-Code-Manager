@@ -124,31 +124,39 @@ Run: `cd frontend && npx vitest run src/components/Tasks/AttentionTag.test.tsx`
 
 Expected: PASS.
 
-### Task 5: Integrate the editor into TaskList and ChatView
+### Task 5: Integrate the editor into TaskList, the split sidebar, and ChatView
 
 **Files:**
 - Modify: `frontend/src/components/Tasks/TaskList.tsx`
 - Modify: `frontend/src/components/Tasks/TaskList.test.tsx`
+- Modify: `frontend/src/pages/TasksPage.tsx`
+- Modify: `frontend/src/pages/TasksPage.test.tsx`
 - Modify: `frontend/src/components/Chat/ChatView.tsx`
 - Modify: `frontend/src/components/Chat/ChatView.test.tsx`
 
 **Step 1: Add failing surface tests**
 
 Assert TaskList displays an existing tag, opens an empty editor from the
-overflow menu, and refreshes after save. Assert ChatView displays and edits the
-same value and exposes a compact add action when empty.
+overflow menu, and refreshes after save. Assert the split-view sidebar displays
+the tag without replacing the task title or project badge. Assert ChatView
+displays and edits the same value and exposes a compact add action when empty.
 
 **Step 2: Integrate TaskList**
 
 Track `editingAttentionTagId`, render the pill among the Task badges, and add
 “Add attention tag” to the overflow menu only when the value is absent.
 
-**Step 3: Integrate ChatView**
+**Step 3: Integrate the split-view sidebar**
+
+Render a read-only, truncated amber attention pill beneath the session title in
+the split-view sidebar. Do not add height when no tag exists.
+
+**Step 4: Integrate ChatView**
 
 Render the compact component in header row two and call `onTaskUpdated` after
 success. Keep the composer and visual-viewport behavior unchanged.
 
-**Step 4: Run focused frontend tests**
+**Step 5: Run focused frontend tests**
 
 Run:
 
@@ -156,6 +164,7 @@ Run:
 cd frontend
 npx vitest run src/components/Tasks/AttentionTag.test.tsx \
   src/components/Tasks/TaskList.test.tsx \
+  src/pages/TasksPage.test.tsx \
   src/components/Chat/ChatView.test.tsx
 ```
 

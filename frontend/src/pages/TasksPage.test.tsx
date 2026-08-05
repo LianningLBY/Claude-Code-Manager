@@ -109,6 +109,11 @@ describe('TasksPage realtime reconciliation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     capturedGlobalWs = undefined;
+    localStorage.clear();
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1024,
+    });
     vi.mocked(api.listTasks).mockResolvedValue([task] as never);
     vi.mocked(api.countTasks).mockResolvedValue({ total: 1 });
     vi.mocked(api.listProjects).mockResolvedValue([]);
@@ -167,5 +172,24 @@ describe('TasksPage realtime reconciliation', () => {
       await Promise.resolve();
     });
     expect(api.countTasks).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows the attention tag in the split-mode task sidebar', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1440,
+    });
+    vi.mocked(api.listTasks).mockResolvedValue([
+      { ...task, attention_tag: '等待任务结束' },
+    ] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={task.id}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('等待任务结束')).toBeInTheDocument();
   });
 });

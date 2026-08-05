@@ -9,7 +9,7 @@ import { ChatView } from '../components/Chat/ChatView';
 import { LoopChatView } from '../components/Chat/LoopChatView';
 import { ProjectSelect } from '../components/ProjectSelect';
 import { resolveTagColor } from '../components/TagColors';
-import { ChevronLeft, ChevronRight, ChevronDown, Filter, PanelLeftClose, PanelLeftOpen, Search, X, Star, Archive, ArchiveRestore, Share2 } from '../components/icons';
+import { ChevronLeft, ChevronRight, ChevronDown, Filter, PanelLeftClose, PanelLeftOpen, Search, X, Star, Archive, ArchiveRestore, Share2, Pin } from '../components/icons';
 import { PluginsBadge, SubAgentsBadge } from '../components/Tasks/TaskBadges';
 import { TAG_COLOR_OPTIONS } from '../components/TagColors';
 import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
@@ -630,6 +630,17 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     </span>
                     {t.has_unread && <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 shrink-0" />}
                   </div>
+                  {t.attention_tag && (
+                    <div className="mt-1 ml-4 min-w-0">
+                      <span
+                        title={t.attention_tag}
+                        className="inline-flex max-w-full items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+                      >
+                        <Pin size={10} className="shrink-0" />
+                        <span className="truncate">{t.attention_tag}</span>
+                      </span>
+                    </div>
+                  )}
                   <div className="flex items-center gap-1.5 mt-1 ml-4 flex-wrap">
                     <span className="text-[10px] text-gray-500">#{t.id}</span>
                     {proj && (

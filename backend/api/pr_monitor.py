@@ -51,7 +51,7 @@ from backend.schemas.pr_monitor import (
     MonitoredRepoCreate,
     MonitoredRepoUpdate,
     MonitoredRepoResponse,
-    MonitoredRepoDetailResponse,
+    MonitoredRepoSecretResponse,
     PRReviewResponse,
     PRReviewDetailResponse,
     PRReviewerRunResponse,
@@ -500,7 +500,7 @@ async def _withdraw_pending_merge_actions(db: AsyncSession, *, repo_id: int) -> 
             run.state_version += 1
 
 
-@router.post("/repos", response_model=MonitoredRepoDetailResponse)
+@router.post("/repos", response_model=MonitoredRepoSecretResponse)
 async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSession = Depends(get_db)):
     if body.review_mode == "single" and body.wait_for_ci:
         raise HTTPException(400, "wait_for_ci requires review_mode=panel")
@@ -563,7 +563,7 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
     return repo
 
 
-@router.get("/repos/{repo_id}", response_model=MonitoredRepoDetailResponse)
+@router.get("/repos/{repo_id}", response_model=MonitoredRepoResponse)
 async def get_repo(
     repo_id: int,
     request: Request,
@@ -576,7 +576,7 @@ async def get_repo(
     return repo
 
 
-@router.put("/repos/{repo_id}", response_model=MonitoredRepoDetailResponse)
+@router.put("/repos/{repo_id}", response_model=MonitoredRepoResponse)
 async def update_repo(
     repo_id: int,
     body: MonitoredRepoUpdate,
@@ -870,7 +870,10 @@ async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends
         return repo
 
 
-@router.post("/repos/{repo_id}/regenerate-secret", response_model=MonitoredRepoDetailResponse)
+@router.post(
+    "/repos/{repo_id}/regenerate-secret",
+    response_model=MonitoredRepoSecretResponse,
+)
 async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:

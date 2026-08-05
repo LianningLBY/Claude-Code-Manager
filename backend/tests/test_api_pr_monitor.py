@@ -462,6 +462,7 @@ def test_monitor_response_normalizes_legacy_null_required_checks():
         "updated_at": now,
     })
     assert parsed.required_checks == []
+    assert parsed.webhook_secret == "secr***"
 
 
 async def _create_worker(session_factory, worker_id: int) -> None:
@@ -886,6 +887,25 @@ async def test_list_repos_masks_secret(client):
 
 
 @pytest.mark.asyncio
+async def test_repo_detail_and_update_only_return_secret_hint(client):
+    created = await _create_repo(client, "owner/repo")
+    expected_hint = created["webhook_secret"][:4] + "***"
+
+    detail = await client.get(f"/api/pr-monitor/repos/{created['id']}")
+    updated = await client.put(
+        f"/api/pr-monitor/repos/{created['id']}",
+        json={"allowed_authors": ["alice"]},
+    )
+
+    assert detail.status_code == 200, detail.text
+    assert updated.status_code == 200, updated.text
+    assert detail.json()["webhook_secret"] == expected_hint
+    assert updated.json()["webhook_secret"] == expected_hint
+    assert created["webhook_secret"] not in detail.text
+    assert created["webhook_secret"] not in updated.text
+
+
+@pytest.mark.asyncio
 async def test_update_repo_settings(client):
     created = await _create_repo(client, "owner/repo")
     resp = await client.put(f"/api/pr-monitor/repos/{created['id']}", json={
@@ -919,13 +939,24 @@ async def test_toggle_repo(client):
 
 
 @pytest.mark.asyncio
-async def test_regenerate_secret(client):
+async def test_regenerate_secret_is_one_time_and_webhook_uses_rotated_value(client):
     created = await _create_repo(client, "owner/repo")
     resp = await client.post(f"/api/pr-monitor/repos/{created['id']}/regenerate-secret")
     assert resp.status_code == 200
     new_secret = resp.json()["webhook_secret"]
     assert len(new_secret) == 64
     assert new_secret != created["webhook_secret"]
+
+    detail = await client.get(f"/api/pr-monitor/repos/{created['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["webhook_secret"] == new_secret[:4] + "***"
+    assert new_secret not in detail.text
+
+    payload = _pr_payload()
+    rejected = await _post_webhook(client, created["webhook_secret"], payload)
+    accepted = await _post_webhook(client, new_secret, payload)
+    assert rejected.status_code == 403
+    assert accepted.status_code == 200, accepted.text
 
 
 @pytest.mark.asyncio

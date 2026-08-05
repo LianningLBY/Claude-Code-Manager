@@ -9,6 +9,7 @@ vi.mock('../api/client', () => ({
     config: vi.fn(),
     listWorkers: vi.fn(),
     getMonitoredRepos: vi.fn(),
+    getMonitoredRepo: vi.fn(),
     createMonitoredRepo: vi.fn(),
     updateMonitoredRepo: vi.fn(),
     deleteMonitoredRepo: vi.fn(),
@@ -35,7 +36,7 @@ const baseRepo: MonitoredRepo = {
   project_id: 10,
   enabled: true,
   auto_merge: false,
-  webhook_secret: 'secret',
+  webhook_secret: 'secr***',
   provider: 'codex',
   review_model: null,
   review_effort: null,
@@ -118,7 +119,7 @@ function selectFollowingLabel(label: string): HTMLSelectElement {
 
 async function openRepo(user: ReturnType<typeof userEvent.setup>, repo = baseRepo) {
   vi.mocked(api.getMonitoredRepos).mockResolvedValue([repo]);
-  vi.mocked(api.updateMonitoredRepo).mockResolvedValue(repo);
+  vi.mocked(api.getMonitoredRepo).mockResolvedValue(repo);
   render(<PRMonitorPage />);
   await user.click(await screen.findByText(repo.repo_full_name));
   await screen.findByRole('button', { name: 'Save Changes' });
@@ -157,11 +158,18 @@ describe('PRMonitorPage safety controls', () => {
     });
     vi.mocked(api.listWorkers).mockResolvedValue([]);
     vi.mocked(api.getMonitoredRepos).mockResolvedValue([]);
-    vi.mocked(api.createMonitoredRepo).mockResolvedValue(baseRepo);
+    vi.mocked(api.getMonitoredRepo).mockResolvedValue(baseRepo);
+    vi.mocked(api.createMonitoredRepo).mockResolvedValue({
+      ...baseRepo,
+      webhook_secret: 'newly-created-raw-secret',
+    });
     vi.mocked(api.updateMonitoredRepo).mockResolvedValue(baseRepo);
     vi.mocked(api.deleteMonitoredRepo).mockResolvedValue({ ok: true });
     vi.mocked(api.toggleMonitoredRepo).mockResolvedValue(baseRepo);
-    vi.mocked(api.regenerateSecret).mockResolvedValue(baseRepo);
+    vi.mocked(api.regenerateSecret).mockResolvedValue({
+      ...baseRepo,
+      webhook_secret: 'newly-rotated-raw-secret',
+    });
     vi.mocked(api.getRepoReviews).mockResolvedValue([]);
     vi.mocked(api.getReviewDetail).mockResolvedValue(reviewFixture());
     vi.mocked(api.getPRMonitorRun).mockResolvedValue(runFixture());
@@ -226,6 +234,21 @@ describe('PRMonitorPage safety controls', () => {
         required_checks: [],
       }));
     });
+    expect(await screen.findByText('newly-created-raw-secret')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('will not be shown again');
+  });
+
+  it('keeps stored secrets masked and reveals only the rotated value', async () => {
+    const user = userEvent.setup();
+    await openRepo(user);
+
+    expect(await screen.findByText('secr***')).toBeInTheDocument();
+    expect(screen.getByTitle('Rotate to reveal a new secret')).toBeDisabled();
+
+    await user.click(screen.getByTitle('Regenerate secret'));
+
+    expect(await screen.findByText('newly-rotated-raw-secret')).toBeInTheDocument();
+    expect(screen.getByTitle('Copy newly generated secret')).toBeEnabled();
   });
 
   it('normalizes an invalid panel auto-merge setting before saving', async () => {

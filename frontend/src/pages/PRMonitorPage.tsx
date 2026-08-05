@@ -158,6 +158,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   const [workers, setWorkers] = useState<{ id: number; name: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [createdSecret, setCreatedSecret] = useState<string | null>(null);
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
 
@@ -179,7 +180,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
       if (reviewMode === 'panel' && waitForCi && checks.length === 0) {
         throw new Error('启用 CI Gate 时至少配置一个 required check');
       }
-      await api.createMonitoredRepo({
+      const created = await api.createMonitoredRepo({
         repo_full_name: repoName.trim(),
         auto_merge: reviewMode === 'single' && autoMerge,
         auto_repair: reviewMode === 'panel' && autoRepair,
@@ -195,14 +196,44 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
         allowed_authors: authors,
         worker_id: workerId ? Number(workerId) : undefined,
       });
+      setCreatedSecret(created.webhook_secret);
       onSaved();
-      onClose();
     } catch (e) {
       setError(String(e));
     } finally {
       setSubmitting(false);
     }
   };
+
+  if (createdSecret) {
+    return (
+      <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+        <div className="bg-gray-800 rounded-xl shadow-2xl w-full max-w-md">
+          <div className="px-5 py-4 border-b border-gray-700">
+            <h3 className="text-foreground font-semibold">Repository added</h3>
+          </div>
+          <div className="p-5 space-y-4">
+            <p className="text-sm text-amber-300" role="alert">
+              Copy this webhook secret now. It will not be shown again.
+            </p>
+            <code className="block bg-gray-700 text-foreground text-xs rounded px-3 py-2 break-all">
+              {createdSecret}
+            </code>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => copyToClipboard(createdSecret)}
+                className="px-4 py-2 text-sm bg-gray-700 text-gray-200 rounded hover:bg-gray-600">
+                Copy secret
+              </button>
+              <button type="button" onClick={onClose}
+                className="px-4 py-2 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500">
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
@@ -365,6 +396,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [authorsInput, setAuthorsInput] = useState((repo.allowed_authors || []).join(', '));
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
   const [webhookUrl, setWebhookUrl] = useState(DEFAULT_WEBHOOK_URL);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [runActionError, setRunActionError] = useState<string | null>(null);
@@ -378,7 +410,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
 
   const loadDetail = useCallback(async () => {
     try {
-      const d = await api.updateMonitoredRepo(repo.id, {});
+      const d = await api.getMonitoredRepo(repo.id);
       setDetail(d);
     } catch (error) { setSaveError(String(error)); }
   }, [repo.id]);
@@ -428,7 +460,11 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
     if (!confirm('Regenerate webhook secret? You will need to update the GitHub webhook config.')) return;
     try {
       const updated = await api.regenerateSecret(repo.id);
-      setDetail(updated);
+      setRevealedSecret(updated.webhook_secret);
+      setDetail({
+        ...updated,
+        webhook_secret: `${updated.webhook_secret.slice(0, 4)}***`,
+      });
       setSaveError(null);
     } catch (error) { setSaveError(String(error)); }
   };
@@ -493,6 +529,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   );
   const developerTaskNumber = Number(developerTaskId);
   const validDeveloperTaskId = Number.isInteger(developerTaskNumber) && developerTaskNumber > 0;
+  const secretForDisplay = revealedSecret ?? detail.webhook_secret;
 
   const handleCopy = (text: string, label: string) => {
     copyToClipboard(text);
@@ -628,9 +665,11 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
           <div>
             <label className="block text-xs text-gray-400 mb-1">Secret</label>
             <div className="flex items-center gap-2">
-              <code className="flex-1 bg-gray-700 text-foreground text-xs rounded px-3 py-2 overflow-x-auto">{detail.webhook_secret}</code>
-              <button onClick={() => handleCopy(detail.webhook_secret, 'secret')}
-                className="p-2 text-gray-400 hover:text-foreground">
+              <code className="flex-1 bg-gray-700 text-foreground text-xs rounded px-3 py-2 overflow-x-auto">{secretForDisplay}</code>
+              <button onClick={() => handleCopy(secretForDisplay, 'secret')}
+                disabled={!revealedSecret}
+                title={revealedSecret ? 'Copy newly generated secret' : 'Rotate to reveal a new secret'}
+                className="p-2 text-gray-400 hover:text-foreground disabled:opacity-40">
                 {copied === 'secret' ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
               </button>
               <button onClick={handleRegenerate} className="p-2 text-gray-400 hover:text-foreground" title="Regenerate secret">
@@ -639,7 +678,8 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
             </div>
           </div>
           <p className="text-xs text-gray-500">
-            Content type: application/json. Events: Pull requests only.
+            The stored secret is hidden. Rotate it to receive a new value once.
+            {' '}Content type: application/json. Events: Pull requests only.
           </p>
         </div>
       </div>

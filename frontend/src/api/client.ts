@@ -842,6 +842,9 @@ export interface MonitoredRepo {
   updated_at: string;
 }
 
+/** Returned only by create/rotate; webhook_secret is the one-time raw value. */
+export type MonitoredRepoSecretResponse = MonitoredRepo & { webhook_secret: string };
+
 export interface RequiredCheckPolicy {
   kind: 'check_run' | 'status';
   name: string;
@@ -2084,8 +2087,10 @@ export const api = {
   // PR Monitor
   getMonitoredRepos: () =>
     request<MonitoredRepo[]>('/api/pr-monitor/repos'),
+  getMonitoredRepo: (id: number) =>
+    request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`),
   createMonitoredRepo: (data: { repo_full_name: string; project_id?: number; worker_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string; review_effort?: string; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[] }) =>
-    request<MonitoredRepo>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
+    request<MonitoredRepoSecretResponse>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
   updateMonitoredRepo: (id: number, data: { project_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string | null; review_effort?: string | null; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[]; enabled?: boolean }) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteMonitoredRepo: (id: number) =>
@@ -2093,7 +2098,7 @@ export const api = {
   toggleMonitoredRepo: (id: number) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}/toggle`, { method: 'POST' }),
   regenerateSecret: (id: number) =>
-    request<MonitoredRepo>(`/api/pr-monitor/repos/${id}/regenerate-secret`, { method: 'POST' }),
+    request<MonitoredRepoSecretResponse>(`/api/pr-monitor/repos/${id}/regenerate-secret`, { method: 'POST' }),
   getRepoReviews: (repoId: number, page = 1, size = 20) =>
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>

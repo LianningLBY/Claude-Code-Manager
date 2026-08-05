@@ -671,6 +671,10 @@ async def test_pr_monitor_detail_reviews_and_mutations_require_exact_worker_owne
             headers=alice_headers,
         ),
         await client.post(
+            f"/api/pr-monitor/repos/{ids['repo']}/regenerate-secret",
+            headers=alice_headers,
+        ),
+        await client.post(
             "/api/pr-monitor/repos",
             headers=alice_headers,
             json={
@@ -691,7 +695,8 @@ async def test_pr_monitor_detail_reviews_and_mutations_require_exact_worker_owne
         headers=bob_headers,
     )
     assert detail.status_code == 200
-    assert detail.json()["webhook_secret"] == "full-private-secret"
+    assert detail.json()["webhook_secret"] == "full***"
+    assert "full-private-secret" not in detail.text
     assert reviews.status_code == 200
     assert [row["id"] for row in reviews.json()] == [ids["review"]]
 

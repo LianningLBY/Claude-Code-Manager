@@ -14,6 +14,9 @@ from backend.config import settings
 from backend.schemas.plan import PlanPipelineConfig
 
 
+TaskMode = Literal["auto", "plan", "loop", "goal"]
+
+
 class UserSkillSnapshotPayload(BaseModel):
     """Internal Manager→Worker copy of one selected User Skill."""
 
@@ -58,7 +61,7 @@ class TaskCreate(BaseModel):
     target_branch: str = "main"
     priority: int = 0
     max_retries: int = 2
-    mode: str = "auto"  # "auto", "plan", "loop", or "goal"
+    mode: TaskMode = "auto"
     todo_file_path: str | None = None  # required when mode="loop"
     max_iterations: int = 50  # loop only: max iterations before auto-abort
     must_complete: bool = False  # loop only: reject done until all items finished
@@ -240,7 +243,7 @@ class TaskUpdate(BaseModel):
     max_retries: int | None = None
     max_iterations: int | None = None
     must_complete: bool | None = None
-    mode: str | None = None
+    mode: TaskMode | None = None
     goal_condition: str | None = None
     goal_max_turns: int | None = None
     goal_evaluator_model: str | None = None
@@ -260,6 +263,16 @@ class TaskUpdate(BaseModel):
         # exclude_unset. An explicit JSON null does run this validator and must
         # not become a database NULL or inherit a deployment default.
         return _normalize_task_provider(value)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def reject_explicit_null_mode(cls, value: object) -> object:
+        # ``None`` is only the model default used to mean "not supplied".
+        # An explicit JSON null must not clear the non-null database field or
+        # let the dispatcher fall through to its ordinary Auto path.
+        if value is None:
+            raise ValueError("mode must be auto, plan, loop, or goal")
+        return value
 
     @field_validator("attention_tag", mode="before")
     @classmethod

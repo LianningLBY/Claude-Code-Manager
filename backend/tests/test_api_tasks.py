@@ -29,6 +29,55 @@ async def test_create_task(client):
 
 
 @pytest.mark.asyncio
+async def test_create_task_rejects_unknown_mode_before_write(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    response = await client.post("/api/tasks", json={
+        "title": "Unknown mode",
+        "description": "must not silently become Auto",
+        "mode": "delivery",
+    })
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "mode"]
+    assert error["type"] == "literal_error"
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_mode", ["delivery", "AUTO", " auto ", None])
+async def test_update_task_rejects_invalid_mode_without_mutation(
+    client,
+    session_factory,
+    invalid_mode,
+):
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": "Keep Auto mode",
+        "description": "d",
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"mode": invalid_mode},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "mode"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.mode == "auto"
+
+
+@pytest.mark.asyncio
 async def test_create_task_wakes_dispatcher_after_commit(client):
     """New work should not wait for the dispatcher's 2-second safety poll."""
     from backend.main import dispatcher

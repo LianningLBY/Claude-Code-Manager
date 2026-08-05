@@ -33,6 +33,15 @@ def _normalize_task_provider(value: object) -> str:
     return provider
 
 
+def _normalize_attention_tag(value: object) -> object:
+    """Trim a user attention tag and canonicalize blank input to NULL."""
+
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    return normalized or None
+
+
 class TaskCreate(BaseModel):
     # Manager→Worker 转发时指定 ID（task ID 全局由 Manager 分配，见设计文档 §2）
     id: int | None = None
@@ -72,6 +81,7 @@ class TaskCreate(BaseModel):
     selected_user_skills: list[int] | None = None
     user_skill_snapshots: list[UserSkillSnapshotPayload] | None = None
     tags: list[str] | None = None
+    attention_tag: str | None = Field(default=None, max_length=80)
     image_paths: list[str] | None = None  # kept for backwards compat
     file_paths: list[str] | None = None
     attachments: list[dict] | None = None  # [{url, name, is_image}, ...]
@@ -83,6 +93,11 @@ class TaskCreate(BaseModel):
     @classmethod
     def normalize_provider(cls, value: object) -> str:
         return _normalize_task_provider(value)
+
+    @field_validator("attention_tag", mode="before")
+    @classmethod
+    def normalize_attention_tag(cls, value: object) -> object:
+        return _normalize_attention_tag(value)
 
     @model_validator(mode='after')
     def validate_mode_fields(self):
@@ -221,6 +236,7 @@ class TaskUpdate(BaseModel):
     provider: str | None = None
     starred: bool | None = None
     tags: list[str] | None = None
+    attention_tag: str | None = Field(default=None, max_length=80)
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -229,6 +245,11 @@ class TaskUpdate(BaseModel):
         # exclude_unset. An explicit JSON null does run this validator and must
         # not become a database NULL or inherit a deployment default.
         return _normalize_task_provider(value)
+
+    @field_validator("attention_tag", mode="before")
+    @classmethod
+    def normalize_attention_tag(cls, value: object) -> object:
+        return _normalize_attention_tag(value)
 
 
 class TaskResponse(BaseModel):
@@ -277,6 +298,7 @@ class TaskResponse(BaseModel):
     has_unread: bool
     error_message: str | None
     tags: list[str] | None
+    attention_tag: str | None = None
     metadata_: dict | None = None
     shared_from_id: int | None = None
     active_sub_agents: int = 0

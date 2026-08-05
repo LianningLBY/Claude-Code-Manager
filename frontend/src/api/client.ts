@@ -256,6 +256,7 @@ export interface Task {
   active_sub_agents: number;
   background_active?: boolean;
   tags: string[] | null;
+  attention_tag?: string | null;
   metadata_: {
     image_paths?: string[];
     attachments?: FileAttachment[];
@@ -1344,9 +1345,9 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
-  updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null }) =>
+  updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteTask: (id: number) =>
     request<{ ok: boolean }>(`/api/tasks/${id}`, { method: 'DELETE' }),

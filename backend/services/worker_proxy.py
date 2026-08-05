@@ -373,6 +373,7 @@ class WorkerProxy:
             "selected_user_skills": task.selected_user_skills,
             "user_skill_snapshots": user_skill_snapshots,
             "tags": list(task.tags) if task.tags else None,
+            "attention_tag": task.attention_tag,
         }
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(

@@ -736,6 +736,8 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         if source is None:
             raise HTTPException(404, "Clone source task not found")
         await require_task_control(request, source, db)
+        if "attention_tag" not in body.model_fields_set:
+            data["attention_tag"] = source.attention_tag
         cloned = await _clone_session(clone_from_task_id, db)
         if cloned:
             data["session_id"] = cloned["session_id"]

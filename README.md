@@ -34,6 +34,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 
 ### 交互与对话
 - **多轮对话** — 任务完成后可通过 Chat 界面继续追问，自动 `--resume` 同一 session
+- **Session 关注标签** — 每个 Task 可维护一个自定义短标签，在任务列表和 Chat 顶栏醒目展示并随时编辑，便于记录“何时再看/下一步做什么”；该字段与系统内部 `tags` 独立，复制、Fork 和 Worker 迁移时会保留
 - **Task 产物下载** — Claude/Codex 会把明确交付给用户的文件保存到当前 Project 的 `.claude-manager/artifacts/task-<id>/`，聊天中的显式产物链接可直接下载；普通源码和文档引用不会误显示为下载文件
 - **数学公式渲染** — 聊天和 Discussion 中的 Markdown 支持 KaTeX；兼容 Codex 常用的 `\\(...\\)` / 整段 `\\[...\\]` 以及 `$$...$$`，单美元符号内容按普通文本显示，链接、HTML、代码和货币内容保持不变
 - **交互式提问（ask_user）** — 模型调用内置 `AskUserQuestion` 时，聊天里弹出可选卡片（单选/多选/自定义文本），用户选完即把答案喂回模型继续。超时默认 1800s，支持跨页面全局通知（右下角弹窗 + 未读标记），可用 `ASK_USER_ENABLED=false` 关闭
@@ -367,6 +368,7 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 2. **Dispatcher** 自动分配任务到空闲 worker → Claude Code 自主完成所有工作（含 worktree 创建和清理） → 取下一个
 3. 点击任务的 **Chat** 按钮，可以对已完成的任务继续追问
 4. 启用 Monitor 的任务中，Agent 可自主创建持久监控子 Agent，Task 列表显示活跃子 Agent 数量
+5. 可在任务卡片菜单添加一个关注标签，或直接点击任务卡片/Chat 顶栏中的标签修改；清空并保存即可移除
 
 ### Plan Mode
 

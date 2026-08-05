@@ -128,6 +128,8 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_delete_task` | DELETE 删除任务 |
 | `test_cancel_task` | 取消任务 |
 | `test_retry_task` | 重试任务 |
+| `test_attention_tag_create_update_and_clear_preserves_system_tags` | 关注标签会裁剪首尾空白、可清空，且不改写系统内部 `tags` |
+| `test_cloned_task_inherits_attention_tag_unless_overridden` | Clone 默认继承关注标签，显式覆盖或清空时按请求处理 |
 | `test_create_task_defaults_to_standard_service_tier` / `test_create_fast_codex_task_persists_priority` | Task 默认持久化 Standard，Codex Fast 持久化 `priority` |
 | `test_create_fast_task_rejects_incompatible_configuration` / `test_update_validates_merged_provider_model_and_service_tier` | Claude、mini/Spark 与合并更新不能绕过 Fast 能力校验 |
 | `test_migration_import_*_fast_service_tier` | Worker migration-import 保留兼容 Fast，拒绝不支持模型 |
@@ -440,6 +442,10 @@ Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；S
 |------|---------|
 | `ChatView > Codex main MCP capability` | Manager 默认开启、紧急关闭、runtime broadcast，以及 Worker 代理 runtime capability 均显示准确 |
 | `PrefsMenu > shows the read-only Codex main MCP runtime capability for admins` | 管理员设置菜单展示只读的实际主任务 MCP capability |
+| `AttentionTag.test.tsx` | 单标签展示、添加、修改、清空、失败后保留草稿 |
+| `TaskList / ChatView > Attention tag` | 任务卡片与 Chat 顶栏可显示和保存关注标签，并刷新 Task 数据 |
+
+关注标签人工冒烟：在无标签任务的卡片菜单选择 `Add attention tag`，输入中文并保存；确认卡片与 Chat 顶栏同步显示。点击标签修改，再清空保存，确认标签消失；Task 原有项目标签、PR/系统标记保持不变。
 
 人工 app-server/exec smoke（仅测试环境）：
 

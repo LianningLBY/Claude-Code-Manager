@@ -36,7 +36,8 @@ PLAN_CLEANUP_REVISION = "f7a1c3d9e5b2"
 PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
 PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
-CURRENT_HEAD_REVISION = "b7c9e2f4a610"
+PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
+CURRENT_HEAD_REVISION = "2f6c8a1d4e90"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -221,6 +222,7 @@ class TestLegacyMigration:
         assert "loop_progress" in task_cols
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
+        assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
@@ -430,6 +432,7 @@ class TestFreshMigration:
         assert "loop_progress" in task_cols
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
+        assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
@@ -1026,7 +1029,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_finding_actions(self, tmp_path):
+    def test_migration_graph_has_one_head_after_attention_tag(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -1034,6 +1037,10 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == PR_FINDING_ACTIONS_REVISION
+        )
+        assert (
+            script.get_revision(PR_FINDING_ACTIONS_REVISION).down_revision
             == PR_REVIEW_PANEL_REVISION
         )
         assert (

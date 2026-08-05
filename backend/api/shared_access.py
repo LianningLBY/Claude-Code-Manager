@@ -257,6 +257,7 @@ async def shared_config(
         "target_repo": task.target_repo,
         "target_branch": task.target_branch,
         "error_message": task.error_message,
+        "attention_tag": task.attention_tag,
         "loop_progress": task.loop_progress,
         "plan_content": task.plan_content,
         "plan_approved": task.plan_approved,

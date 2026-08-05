@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import time
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -231,6 +232,30 @@ class CodexThreadNotIdleError(CodexAppServerBusyError):
         self.operation = operation
 
 
+class CodexThreadTerminalStateError(CodexAppServerError):
+    """A native thread is terminal but cannot yet admit another turn safely."""
+
+    def __init__(
+        self,
+        thread_id: str,
+        state: str,
+        *,
+        operation: str,
+        recovery_attempted: bool = False,
+        detail: str | None = None,
+    ) -> None:
+        recovery = " after one runtime recycle" if recovery_attempted else ""
+        suffix = f": {detail}" if detail else ""
+        super().__init__(
+            f"Codex thread {thread_id} remained in terminal state {state} "
+            f"before {operation}{recovery}{suffix}"
+        )
+        self.thread_id = thread_id
+        self.state = state
+        self.operation = operation
+        self.recovery_attempted = recovery_attempted
+
+
 class CodexRequiredMcpError(CodexAppServerError):
     """A thread could not be created with its required MCP configuration."""
 
@@ -241,6 +266,25 @@ class CodexRequiredMcpPreTurnError(CodexRequiredMcpError):
 
 class CodexThreadHomeMismatchError(CodexAppServerError):
     """A thread was routed to a different account without an explicit rebind."""
+
+
+class CodexThreadIdentityMismatchError(CodexThreadHomeMismatchError):
+    """A resume response identified a different native thread than requested."""
+
+    def __init__(
+        self,
+        expected_thread_id: str,
+        actual_thread_id: str,
+        *,
+        operation: str,
+    ) -> None:
+        super().__init__(
+            f"Codex {operation} for thread {expected_thread_id} returned "
+            f"a different thread id: {actual_thread_id}"
+        )
+        self.expected_thread_id = expected_thread_id
+        self.actual_thread_id = actual_thread_id
+        self.operation = operation
 
 
 class CodexServiceTierUnavailableError(CodexAppServerError):
@@ -302,6 +346,12 @@ def _require_idle_thread_status(
 
     status = thread.get("status") if isinstance(thread, dict) else None
     status_type = status.get("type") if isinstance(status, dict) else None
+    if status_type in {"systemError", "notLoaded"}:
+        raise CodexThreadTerminalStateError(
+            thread_id,
+            str(status_type),
+            operation=operation,
+        )
     if status_type != "idle":
         raise CodexThreadNotIdleError(
             thread_id,
@@ -572,9 +622,12 @@ class _TurnContext:
     turn_id: str | None = None
     admitted_turn_id: str | None = None
     observed_turn_id: str | None = None
+    client_user_message_id: str | None = None
+    provisional_started_turn_ids: set[str] = field(default_factory=set)
     usage: dict[str, int] | None = None
     first_input_seen: bool = False
     first_output_seen: bool = False
+    turn_started_emitted: bool = False
     pending_terminal_notification: tuple[str, dict[str, Any]] | None = None
     admission_observed_future: asyncio.Future | None = None
     admission_confirmed: bool = False
@@ -829,6 +882,30 @@ class CodexAppServer:
         self._contexts_by_turn[turn_id] = context
         return True
 
+    def _promote_correlated_turn_context(
+        self,
+        context: _TurnContext,
+        turn_id: str,
+    ) -> bool:
+        """Promote one client-id-proven native turn while retaining aliases."""
+
+        # The RPC submission id can continue to appear on item notifications
+        # after Codex adopts the input into another native turn.  Keep it as an
+        # alias; detach_turn_context removes every alias for this generation.
+        if context.admitted_turn_id:
+            if not self._alias_turn_context(context, context.admitted_turn_id):
+                return False
+        if not self._alias_turn_context(context, turn_id):
+            return False
+        if context.observed_turn_id in {
+            None,
+            context.admitted_turn_id,
+            turn_id,
+        }:
+            context.turn_id = turn_id
+            context.observed_turn_id = turn_id
+        return True
+
     def _interrupt_context_is_current(self, context: _TurnContext) -> bool:
         """Return whether an exact turn context still owns live work."""
 
@@ -853,6 +930,42 @@ class CodexAppServer:
                 return str(turn["id"])
         turn_id = params.get("turnId")
         return str(turn_id) if turn_id else None
+
+    @staticmethod
+    def _notification_user_message_client_ids(
+        method: str,
+        params: dict[str, Any],
+    ) -> set[str]:
+        """Return schema-backed client ids proving which input owns a turn."""
+
+        items: list[Any] = []
+        if method in {"item/started", "item/completed"}:
+            items.append(params.get("item"))
+        elif method == "turn/completed":
+            turn = params.get("turn")
+            if isinstance(turn, dict) and isinstance(turn.get("items"), list):
+                items.extend(turn["items"])
+        result: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "userMessage":
+                continue
+            client_id = item.get("clientId")
+            if client_id:
+                result.add(str(client_id))
+        return result
+
+    def _notification_matches_context_input(
+        self,
+        context: _TurnContext,
+        method: str,
+        params: dict[str, Any],
+    ) -> bool:
+        client_id = context.client_user_message_id
+        return bool(
+            client_id
+            and client_id
+            in self._notification_user_message_client_ids(method, params)
+        )
 
     def _tool_free_context_for_params(
         self,
@@ -1836,6 +1949,16 @@ class CodexAppServer:
             (time.perf_counter() - context.launch_started) * 1000,
             status,
         )
+        runtime = self._thread_runtime.get(context.thread_id)
+        if runtime is not None:
+            aliases = {
+                turn_id
+                for turn_id, candidate in self._contexts_by_turn.items()
+                if candidate is context
+            }
+            runtime.active_turn_ids.difference_update(aliases)
+            if not runtime.active_turn_ids:
+                runtime.status_type = "idle"
         context.process.finish(
             exit_code,
             stderr,
@@ -2595,6 +2718,55 @@ class CodexAppServer:
                     + message
                 )
             raise CodexAppServerError(message)
+        thread_id = str(thread_id)
+        if (
+            resume_session_id
+            and thread_id != str(resume_session_id)
+        ):
+            raise CodexThreadIdentityMismatchError(
+                str(resume_session_id),
+                thread_id,
+                operation=thread_method,
+            )
+        terminal_recovery_attempted = False
+        status = thread.get("status") if isinstance(thread, dict) else None
+        status_type = self._thread_status_type(status)
+        if resume_session_id and status_type == "systemError":
+            # systemError is an authoritative no-running-turn state, but Codex
+            # will not admit a follow-up until the loaded runtime is refreshed.
+            # Recycle this exact thread once; never replay through exec and never
+            # weaken the explicit-idle requirement on the second resume.
+            terminal_recovery_attempted = True
+            logger.warning(
+                "Recycling terminal Codex thread before resume thread=%s state=%s",
+                thread_id,
+                status_type,
+            )
+            try:
+                await self.recycle_thread_runtime(thread_id)
+                response = await self._request(thread_method, thread_params)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise CodexThreadTerminalStateError(
+                    thread_id,
+                    status_type,
+                    operation=f"{thread_method} turn admission",
+                    recovery_attempted=True,
+                    detail=f"runtime recycle failed: {exc}",
+                ) from exc
+            thread = response.get("thread") if isinstance(response, dict) else None
+            recovered_thread_id = (
+                thread.get("id") if isinstance(thread, dict) else None
+            )
+            if str(recovered_thread_id or "") != thread_id:
+                raise CodexThreadTerminalStateError(
+                    thread_id,
+                    status_type,
+                    operation=f"{thread_method} turn admission",
+                    recovery_attempted=True,
+                    detail="recovery resumed a different or missing thread",
+                )
         if tools_disabled:
             try:
                 _audit_tool_free_thread_response(response)
@@ -2614,7 +2786,6 @@ class CodexAppServer:
                     "Codex tool-free profile was not proven by the "
                     f"{thread_method} response"
                 ) from exc
-        thread_id = str(thread_id)
         self._known_threads.add(thread_id)
         if on_thread_started is not None:
             # A caller that owns durable lifecycle state can bind the exact
@@ -2650,11 +2821,24 @@ class CodexAppServer:
                     and active_goal.get("status") == "active"
                 )
             if not adopt_active_goal:
-                _require_idle_thread_status(
-                    thread,
-                    thread_id=str(thread_id),
-                    operation=f"{thread_method} turn admission",
-                )
+                try:
+                    _require_idle_thread_status(
+                        thread,
+                        thread_id=str(thread_id),
+                        operation=f"{thread_method} turn admission",
+                    )
+                except CodexThreadTerminalStateError as exc:
+                    if (
+                        terminal_recovery_attempted
+                        and not exc.recovery_attempted
+                    ):
+                        raise CodexThreadTerminalStateError(
+                            exc.thread_id,
+                            exc.state,
+                            operation=exc.operation,
+                            recovery_attempted=True,
+                        ) from exc
+                    raise
         if (
             resume_session_id
             and service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2718,11 +2902,13 @@ class CodexAppServer:
             _interrupt,
             thread_id=thread_id,
         )
+        client_user_message_id = uuid.uuid4().hex
         context = _TurnContext(
             thread_id=thread_id,
             process=turn_process,
             launch_started=launch_started,
             task_id=task_id,
+            client_user_message_id=client_user_message_id,
             tools_disabled=tools_disabled,
             descendant_state_changed=asyncio.Event(),
             descendant_interrupt_lock=asyncio.Lock(),
@@ -2794,6 +2980,7 @@ class CodexAppServer:
         turn_params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [{"type": "text", "text": model_prompt}],
+            "clientUserMessageId": client_user_message_id,
             "cwd": os.path.abspath(cwd),
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
@@ -4196,15 +4383,6 @@ class CodexAppServer:
                 waiter.set_result(params)
             return
         turn_id = self._notification_turn_id(method, params)
-        if (
-            thread_id_str is not None
-            and method in {"turn/started", "turn/completed"}
-        ):
-            self._record_thread_turn_lifecycle(
-                method,
-                thread_id_str,
-                turn_id,
-            )
         context = self._contexts_by_turn.get(turn_id) if turn_id else None
         if (
             context is not None
@@ -4220,18 +4398,79 @@ class CodexAppServer:
                 method,
             )
             return
+        notification_client_ids = self._notification_user_message_client_ids(
+            method,
+            params,
+        )
+        if (
+            context is not None
+            and context.client_user_message_id
+            and notification_client_ids
+            and context.client_user_message_id not in notification_client_ids
+        ):
+            # An exact turn-id mapping is not allowed to override explicit
+            # schema-backed evidence that this user input belongs to another
+            # request. Ignore the whole notification, including lifecycle
+            # bookkeeping, so a contradictory terminal cannot close this
+            # adapter or falsely mark its runtime idle.
+            logger.error(
+                "Ignoring Codex notification with mismatched client input "
+                "thread=%s turn=%s expected_client=%s actual_clients=%s "
+                "method=%s",
+                thread_id,
+                turn_id,
+                context.client_user_message_id,
+                sorted(notification_client_ids),
+                method,
+            )
+            return
+        if (
+            thread_id_str is not None
+            and method in {"turn/started", "turn/completed"}
+        ):
+            self._record_thread_turn_lifecycle(
+                method,
+                thread_id_str,
+                turn_id,
+            )
         if context is None and thread_id_str:
             candidate = self._contexts_by_thread.get(thread_id_str)
             if candidate is not None and turn_id:
                 # turn/start can return a fresh submission id while its input
-                # is actually steered into an existing goal turn. The first
-                # real notification is authoritative. Once a real turn has
-                # been observed, an unknown id belongs to another lifecycle
-                # and must not be cross-routed by thread fallback.
-                if (
-                    candidate.observed_turn_id is not None
-                    and candidate.observed_turn_id != turn_id
-                ):
+                # is actually steered into another native turn. turn/started is
+                # only provisional: the response-first race can publish the
+                # submission id before the native id. A schema-backed clientId
+                # is the authoritative cross-id correlation proof.
+                native_goal_continuation = bool(
+                    method == "turn/started"
+                    and candidate.following_native_goal
+                    and candidate.turn_id is None
+                )
+                matches_input = self._notification_matches_context_input(
+                    candidate,
+                    method,
+                    params,
+                )
+                if native_goal_continuation:
+                    # The first user submission needs client-id proof because
+                    # app-server may steer it into an older native turn.  Once
+                    # CCM already owns an active native Goal, however, its next
+                    # autonomous turn has no new userMessage/clientId.  The
+                    # exact retained thread owner plus turn/started is the
+                    # authoritative continuation boundary.
+                    if not self._bind_turn_context(
+                        candidate,
+                        turn_id,
+                        observed=True,
+                    ):
+                        return
+                elif matches_input:
+                    if not self._promote_correlated_turn_context(
+                        candidate,
+                        turn_id,
+                    ):
+                        return
+                elif candidate.observed_turn_id is not None:
                     logger.debug(
                         "Ignoring Codex notification for unrelated turn "
                         "thread=%s expected=%s actual=%s method=%s",
@@ -4241,11 +4480,17 @@ class CodexAppServer:
                         method,
                     )
                     return
-                if not self._bind_turn_context(
-                    candidate,
-                    turn_id,
-                    observed=True,
-                ):
+                elif method == "turn/started":
+                    candidate.provisional_started_turn_ids.add(turn_id)
+                else:
+                    logger.debug(
+                        "Ignoring uncorrelated Codex notification for unknown "
+                        "turn thread=%s candidates=%s actual=%s method=%s",
+                        thread_id,
+                        sorted(candidate.provisional_started_turn_ids),
+                        turn_id,
+                        method,
+                    )
                     return
             context = candidate
         if context is None:
@@ -4268,9 +4513,20 @@ class CodexAppServer:
                     params.get("item"),
                 )
             return
-        if turn_id and context.observed_turn_id is None:
-            if not self._bind_turn_context(context, turn_id, observed=True):
-                return
+        if turn_id and method == "turn/started":
+            context.provisional_started_turn_ids.add(turn_id)
+        elif turn_id and context.observed_turn_id is None:
+            matches_input = self._notification_matches_context_input(
+                context,
+                method,
+                params,
+            )
+            if matches_input and context.turn_id != turn_id:
+                if not self._promote_correlated_turn_context(context, turn_id):
+                    return
+            elif matches_input:
+                if not self._bind_turn_context(context, turn_id, observed=True):
+                    return
         if turn_id and context.observed_turn_id is not None:
             observed_future = context.admission_observed_future
             if observed_future is not None and not observed_future.done():
@@ -4341,7 +4597,9 @@ class CodexAppServer:
             return
 
         if method == "turn/started":
-            context.process.feed({"type": "turn.started"})
+            if not context.turn_started_emitted:
+                context.turn_started_emitted = True
+                context.process.feed({"type": "turn.started"})
             return
 
         if method == "item/started":
@@ -4865,11 +5123,14 @@ class CodexAppServerRegistry:
                 admitted = True
             return process, thread_id
         except BaseException as exc:
-            if isinstance(exc, CodexThreadNotIdleError):
-                # thread/resume has already rejoined this live native thread.
-                # Preserve its exact home route even though no new CCM process
-                # was admitted; dropping the reservation would let a later
-                # caller attempt the same active rollout from another account.
+            if isinstance(
+                exc,
+                (CodexThreadNotIdleError, CodexThreadTerminalStateError),
+            ):
+                # thread start/resume already resolved this exact native
+                # thread in the selected home. Preserve the route even though
+                # no new CCM process was admitted; dropping it would let a
+                # later caller attempt the same rollout from another account.
                 async with self._lock:
                     owner = self._thread_owners.get(exc.thread_id)
                     if owner is None:

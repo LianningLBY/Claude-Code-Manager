@@ -10647,6 +10647,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         from backend.services.codex_app_server import (
             CodexServiceTierUnavailableError,
+            CodexThreadIdentityMismatchError,
+            CodexThreadTerminalStateError,
         )
 
         provider = (
@@ -10664,6 +10666,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 "Codex Fast 未被当前模型或账号确认，本条消息未执行。"
                 "请切换到支持 Fast 的模型/账号，或将速度改为 Standard 后"
                 f"重新发送。详情：{exc}"
+            )
+        elif isinstance(exc, CodexThreadTerminalStateError):
+            notice = (
+                "Codex 会话进入无法安全恢复的终态，本条消息未执行。"
+                "系统未能取得原线程的 idle 证明；为避免重复执行已停止"
+                f"自动重试。详情：{exc}"
+            )
+        elif isinstance(exc, CodexThreadIdentityMismatchError):
+            notice = (
+                "Codex 返回的会话身份与请求不一致，本条消息未执行。"
+                "为避免串到其他会话或重复执行，系统已停止自动重试。"
+                f"详情：{exc}"
             )
         else:
             notice = (
@@ -10741,6 +10755,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         CodexAppServerBusyError,
                         CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
+                        CodexThreadIdentityMismatchError,
+                        CodexThreadTerminalStateError,
                     )
                     from backend.services.instance_manager import (
                         InstanceAlreadyRunningError,
@@ -10755,6 +10771,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             CodexAppServerBusyError,
                             CodexServiceTierUnavailableError,
                             CodexThreadHomeMismatchError,
+                            CodexThreadTerminalStateError,
                             InstanceAlreadyRunningError,
                         ),
                     ):
@@ -10763,6 +10780,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 exc,
                                 (
                                     CodexServiceTierUnavailableError,
+                                    CodexThreadIdentityMismatchError,
+                                    CodexThreadTerminalStateError,
                                     QueuedMessageRoutingMismatchError,
                                 ),
                             )
@@ -11822,6 +11841,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     CodexAppServerBusyError,
                     CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
+                    CodexThreadTerminalStateError,
                 )
                 from backend.services.cloudrouter_accounts import (
                     CloudRouterAccountError,
@@ -11840,6 +11860,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         CodexAppServerBusyError,
                         CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
+                        CodexThreadTerminalStateError,
                         InstanceAlreadyRunningError,
                     ),
                 )

@@ -978,6 +978,7 @@ class InstanceManager:
                 CodexRequiredMcpPreTurnError,
                 CodexServiceTierUnavailableError,
                 CodexThreadHomeMismatchError,
+                CodexThreadTerminalStateError,
                 normalize_codex_service_tier,
                 normalize_codex_home,
             )
@@ -1221,6 +1222,7 @@ class InstanceManager:
                     CodexRequiredMcpError,
                     CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
+                    CodexThreadTerminalStateError,
                     CodexLaunchCommitError,
                     InstanceNotFoundError,
                     LaunchSupersededError,

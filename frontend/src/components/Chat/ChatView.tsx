@@ -35,7 +35,7 @@ interface ChatViewProps {
   task: Task;
   projects: Project[];
   onBack: () => void;
-  onTaskUpdated?: () => void;
+  onTaskUpdated?: (task?: Task) => void;
   onTaskForked?: (task: Task) => void;
   inline?: boolean;
 }
@@ -1825,7 +1825,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               setEditingAttentionTag(true);
             }}
             onCancel={() => setEditingAttentionTag(false)}
-            onSaved={() => onTaskUpdated?.()}
+            onSaved={(updated) => onTaskUpdated?.(updated)}
             showAddButton
             className={editingAttentionTag ? 'flex-1' : 'max-w-[45vw] sm:max-w-xs'}
           />

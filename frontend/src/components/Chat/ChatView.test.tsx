@@ -1621,7 +1621,9 @@ describe('ChatView', () => {
           attention_tag: '需要人工确认',
         });
       });
-      expect(onTaskUpdated).toHaveBeenCalled();
+      expect(onTaskUpdated).toHaveBeenCalledWith(
+        expect.objectContaining({ attention_tag: '需要人工确认' }),
+      );
     });
   });
 

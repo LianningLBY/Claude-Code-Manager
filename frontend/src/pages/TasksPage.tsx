@@ -54,6 +54,20 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     onChatTaskChange(t?.id ?? null);
   }, [onChatTaskChange]);
 
+  const applyReturnedTaskUpdate = useCallback((updated: Task) => {
+    // This callback currently handles the attention-tag editor. Patch only the
+    // returned field so a PUT response cannot overwrite a newer WS status.
+    const patchTask = (task: Task): Task => task.id === updated.id
+      ? { ...task, attention_tag: updated.attention_tag }
+      : task;
+    const patchList = (list: Task[]): Task[] => list.map(patchTask);
+
+    setTasks(patchList);
+    setAllTasks(patchList);
+    setSearchResults((current) => current ? patchList(current) : current);
+    setChatTask((current) => current ? patchTask(current) : current);
+  }, [setSearchResults]);
+
   useEffect(() => {
     const teamHandler = (e: Event) => {
       const task = (e as CustomEvent).detail?.task;
@@ -490,6 +504,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         tasks={searchResults ?? filteredTasks}
         projects={projects}
         onRefresh={refresh}
+        onTaskUpdated={applyReturnedTaskUpdate}
         onOpenChat={handleOpenChat}
         activeTaskId={chatTask?.id ?? null}
         autoSortOnAccess={autoSortOnAccess}
@@ -530,7 +545,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           task={chatTask}
           projects={projects}
           onBack={() => setChatTaskWrapped(null)}
-          onTaskUpdated={refresh}
+          onTaskUpdated={(updated) => {
+            if (updated) applyReturnedTaskUpdate(updated);
+            else void refresh();
+          }}
           onTaskForked={(forked) => {
             setChatTaskWrapped(forked);
             refresh();

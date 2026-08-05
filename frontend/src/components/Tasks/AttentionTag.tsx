@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type SyntheticEvent } from 'react';
 
 import { api } from '../../api/client';
 import type { Task } from '../../api/client';
@@ -29,6 +29,10 @@ export function AttentionTag({
   const [draft, setDraft] = useState(value || '');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+
+  const stopReorderGesture = (event: SyntheticEvent) => {
+    event.stopPropagation();
+  };
 
   useEffect(() => {
     const nextValue = value || null;
@@ -107,7 +111,13 @@ export function AttentionTag({
   }
 
   return (
-    <div className={`min-w-0 ${className}`}>
+    <div
+      className={`min-w-0 ${className}`}
+      onPointerDown={stopReorderGesture}
+      onMouseDown={stopReorderGesture}
+      onTouchStart={stopReorderGesture}
+      onDragStart={stopReorderGesture}
+    >
       <div className="flex min-w-0 items-center gap-1 rounded-lg border border-amber-400/30 bg-amber-500/10 p-1">
         <Pin size={13} className="ml-1 shrink-0 text-amber-400" />
         <input

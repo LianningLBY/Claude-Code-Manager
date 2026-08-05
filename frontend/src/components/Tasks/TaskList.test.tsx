@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, createEvent } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, createEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { TaskList } from './TaskList';
 import type { Task, Project } from '../../api/client';
 
@@ -229,18 +230,30 @@ describe('TaskList', () => {
       expect(screen.getByTitle('Edit attention tag')).toBeInTheDocument();
     });
 
-    it('opens the inline editor from the overflow menu and refreshes after save', async () => {
-      vi.mocked(api.updateTask).mockResolvedValueOnce(
-        makeTask({ attention_tag: '今晚继续' }),
-      );
-      render(
-        <TaskList
-          tasks={[makeTask({ attention_tag: null })]}
-          projects={projects}
-          onRefresh={onRefresh}
-          onOpenChat={onOpenChat}
-        />,
-      );
+    it('keeps the API-returned tag visible while the original snapshot stays stale', async () => {
+      const updated = makeTask({ attention_tag: '今晚继续' });
+      vi.mocked(api.updateTask).mockResolvedValueOnce(updated);
+
+      function ControlledTaskList() {
+        const [visibleTasks, setVisibleTasks] = useState([
+          makeTask({ attention_tag: null }),
+        ]);
+        return (
+          <TaskList
+            tasks={visibleTasks}
+            projects={projects}
+            onRefresh={onRefresh}
+            onTaskUpdated={(returned) => {
+              setVisibleTasks((current) => current.map((item) =>
+                item.id === returned.id ? returned : item
+              ));
+            }}
+            onOpenChat={onOpenChat}
+          />
+        );
+      }
+
+      render(<ControlledTaskList />);
 
       await userEvent.click(screen.getByTitle('More actions'));
       await userEvent.click(screen.getByText('Add attention tag'));
@@ -252,7 +265,32 @@ describe('TaskList', () => {
           attention_tag: '今晚继续',
         });
       });
-      expect(onRefresh).toHaveBeenCalled();
+      expect(await screen.findByText('今晚继续')).toBeInTheDocument();
+      expect(onRefresh).not.toHaveBeenCalled();
+    });
+
+    it('does not start card reordering when long-pressing the tag editor', () => {
+      render(
+        <TaskList
+          tasks={[makeTask({ attention_tag: '需要修改' })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      fireEvent.click(screen.getByTitle('Edit attention tag'));
+      const input = screen.getByLabelText('Attention tag');
+      const card = input.closest('[data-reorder-idx]');
+
+      vi.useFakeTimers();
+      try {
+        fireEvent.touchStart(input);
+        act(() => vi.advanceTimersByTime(500));
+        expect(card).not.toHaveClass('opacity-40');
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

@@ -14,6 +14,7 @@ interface TaskListProps {
   tasks: Task[];
   projects: Project[];
   onRefresh: () => void;
+  onTaskUpdated?: (task: Task) => void;
   onOpenChat: (task: Task) => void;
   activeTaskId?: number | null;
   autoSortOnAccess?: boolean;
@@ -32,7 +33,7 @@ const statusColors: Record<string, string> = {
   cancelled: 'bg-gray-500',
 };
 
-export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
+export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
   const projectMap = useMemo(() => {
     const map: Record<number, { name: string; color: string | null }> = {};
     for (const p of projects) map[p.id] = { name: p.name, color: p.badge_color };
@@ -125,6 +126,12 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
     } catch { /* ignore */ }
   };
 
+  const handleAttentionTagSaved = (updated: Task) => {
+    setEditingAttentionTagId(null);
+    if (onTaskUpdated) onTaskUpdated(updated);
+    else onRefresh();
+  };
+
   // 拖拽排序（长按/拖动；标星置顶保留，仅同组内移动）
   const handleReordered = useCallback((optimistic?: Task[]) => {
     if (optimistic) {
@@ -178,10 +185,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
                   editing={false}
                   onEdit={() => setEditingAttentionTagId(t.id)}
                   onCancel={() => setEditingAttentionTagId(null)}
-                  onSaved={() => {
-                    setEditingAttentionTagId(null);
-                    onRefresh();
-                  }}
+                  onSaved={handleAttentionTagSaved}
                   className="max-w-[min(16rem,55vw)]"
                 />
               )}
@@ -324,10 +328,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
                 editing
                 onEdit={() => setEditingAttentionTagId(t.id)}
                 onCancel={() => setEditingAttentionTagId(null)}
-                onSaved={() => {
-                  setEditingAttentionTagId(null);
-                  onRefresh();
-                }}
+                onSaved={handleAttentionTagSaved}
                 className="mb-1 w-full"
               />
             )}

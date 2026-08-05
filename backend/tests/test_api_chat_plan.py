@@ -57,6 +57,7 @@ async def test_codex_fork_starts_before_selected_user_message(
         task.last_cwd = "/tmp/project"
         task.enabled_skills = {"code-review": True}
         task.selected_user_skills = [41]
+        task.attention_tag = "等 Fork 完成后继续"
         task.metadata_ = {
             "codex_account_id": "codex-a",
             "attachments": [{
@@ -159,6 +160,7 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert payload["enabled_skills"] == {"code-review": True}
     assert payload["selected_user_skills"] == [41]
     assert payload["codex_service_tier"] == "priority"
+    assert payload["attention_tag"] == "等 Fork 完成后继续"
     assert payload["metadata_"]["codex_account_id"] == "codex-a"
     assert payload["metadata_"]["forked_from_task_id"] == task_id
     assert payload["metadata_"]["forked_from_log_id"] == anchor_id

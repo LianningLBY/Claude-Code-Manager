@@ -129,6 +129,7 @@ class SharedRelay:
                     shadow.session_id = config.get("session_id") or shadow.session_id
                     shadow.target_repo = config.get("target_repo")
                     shadow.error_message = config.get("error_message")
+                    shadow.attention_tag = config.get("attention_tag")
                     await db.commit()
         except Exception:
             logger.debug("failed to fetch config for shadow task shared=%d", shared.id)

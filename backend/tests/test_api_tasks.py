@@ -1046,6 +1046,82 @@ async def test_update_task(client):
 
 
 @pytest.mark.asyncio
+async def test_attention_tag_create_update_and_clear_preserves_system_tags(client):
+    created = await client.post("/api/tasks", json={
+        "title": "Tagged session",
+        "description": "d",
+        "target_repo": "/tmp",
+        "attention_tag": "  等它结束后再看  ",
+        "tags": ["existing-system-marker"],
+    })
+
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+    assert created.json()["attention_tag"] == "等它结束后再看"
+    assert created.json()["tags"] == ["existing-system-marker"]
+
+    updated = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"attention_tag": "  今晚继续  "},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["attention_tag"] == "今晚继续"
+    assert updated.json()["tags"] == ["existing-system-marker"]
+
+    cleared = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"attention_tag": "   "},
+    )
+
+    assert cleared.status_code == 200
+    assert cleared.json()["attention_tag"] is None
+    assert cleared.json()["tags"] == ["existing-system-marker"]
+
+
+@pytest.mark.asyncio
+async def test_attention_tag_rejects_values_longer_than_80_characters(client):
+    created = await client.post("/api/tasks", json={
+        "title": "Tagged session",
+        "description": "d",
+        "target_repo": "/tmp",
+        "attention_tag": "x" * 81,
+    })
+
+    assert created.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_cloned_task_inherits_attention_tag_unless_overridden(client):
+    source = await client.post("/api/tasks", json={
+        "title": "Source",
+        "description": "d",
+        "target_repo": "/tmp",
+        "attention_tag": "等源任务结束",
+    })
+    source_id = source.json()["id"]
+
+    inherited = await client.post("/api/tasks", json={
+        "title": "Inherited",
+        "description": "d",
+        "target_repo": "/tmp",
+        "clone_from_task_id": source_id,
+    })
+    overridden = await client.post("/api/tasks", json={
+        "title": "Overridden",
+        "description": "d",
+        "target_repo": "/tmp",
+        "clone_from_task_id": source_id,
+        "attention_tag": "单独关注",
+    })
+
+    assert inherited.status_code == 201
+    assert inherited.json()["attention_tag"] == "等源任务结束"
+    assert overridden.status_code == 201
+    assert overridden.json()["attention_tag"] == "单独关注"
+
+
+@pytest.mark.asyncio
 async def test_update_task_not_found(client):
     resp = await client.put("/api/tasks/9999", json={"title": "X"})
     assert resp.status_code == 404

@@ -402,6 +402,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         enable_workflows=False,
         selected_user_skills=[5],
         tags=["pr-review"],
+        attention_tag="等审核发布后再看",
         metadata_={"pr_review_id": 123},
     )
     proxy.get_worker = AsyncMock(return_value=worker)
@@ -417,6 +418,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
 
     parsed_on_worker = TaskCreate.model_validate(captured_payload)
     assert captured_payload["tags"] == ["pr-review"]
+    assert captured_payload["attention_tag"] == "等审核发布后再看"
     assert captured_payload["selected_user_skills"] == [5]
     assert captured_payload["user_skill_snapshots"] == [{
         "id": 5,
@@ -427,6 +429,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
     assert captured_payload["codex_service_tier"] == "priority"
     assert captured_payload["project_id"] is None
     assert parsed_on_worker.tags == ["pr-review"]
+    assert parsed_on_worker.attention_tag == "等审核发布后再看"
     assert parsed_on_worker.project_id is None
     assert parsed_on_worker.codex_service_tier == "priority"
     proxy.ensure_worker_project.assert_not_awaited()

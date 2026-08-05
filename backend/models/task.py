@@ -89,6 +89,12 @@ class Task(Base):
     enabled_skills: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     selected_user_skills: Mapped[list | None] = mapped_column(JSON, nullable=True)
     tags: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # User-authored reminder shown in the Task list and Chat header. Keep this
+    # separate from ``tags`` because that JSON contains machine-owned markers
+    # such as ``pr-review``.
+    attention_tag: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     context_window_usage: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     starred: Mapped[bool] = mapped_column(default=False, server_default="0", index=True)

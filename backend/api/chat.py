@@ -883,6 +883,7 @@ async def fork_codex_task(
             enabled_skills=deepcopy(source.enabled_skills),
             selected_user_skills=deepcopy(source.selected_user_skills),
             tags=deepcopy(source.tags),
+            attention_tag=source.attention_tag,
             metadata_=metadata,
             started_at=now,
             completed_at=now,

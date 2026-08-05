@@ -765,6 +765,7 @@ async def test_worker_task_import_is_one_inert_request(
         retry_count=2,
         provider="codex",
         codex_service_tier="priority",
+        attention_tag="迁移结束后关注",
     )
     requests = []
 
@@ -815,6 +816,7 @@ async def test_worker_task_import_is_one_inert_request(
     assert payload["selected_user_skills"] is None
     assert payload["user_skill_snapshots"] == []
     assert payload["codex_service_tier"] == "priority"
+    assert payload["attention_tag"] == "迁移结束后关注"
 
 
 async def test_put_worker_id_triggers_migration(client, session_factory, monkeypatch):

@@ -220,6 +220,7 @@ class TestLegacyMigration:
         assert "loop_progress" in task_cols
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
+        assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
@@ -429,6 +430,7 @@ class TestFreshMigration:
         assert "loop_progress" in task_cols
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
+        assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols

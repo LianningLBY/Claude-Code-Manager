@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +12,7 @@ from backend.models.pr_monitor import (
     MonitoredRepo,
     PRFinding,
     PRFindingAction,
+    PRFindingRebuttal,
     PRMonitorRun,
     PRReview,
 )
@@ -22,7 +23,43 @@ class FindingActionConflict(RuntimeError):
 
 
 _ACTIONABLE_REVIEW_STATUSES = {"approved", "merged", "commented"}
-_ACTIVE_FIX_STATUSES = {"pending", "running", "awaiting_confirmation"}
+_ACTIVE_FIX_STATUSES = {
+    "pending", "running", "awaiting_confirmation", "cancelling",
+}
+_ACTIVE_REBUTTAL_STATUSES = {"pending", "adjudicating", "accepted"}
+
+
+async def lock_pr_repo_action_boundary(
+    db: AsyncSession,
+    repo_id: int,
+) -> MonitoredRepo:
+    """Acquire a portable write fence for all Finding-side effects.
+
+    PostgreSQL/MySQL row locks and SQLite's writer serialization now share the
+    same repo -> review -> finding order.  The explicit no-op UPDATE matters:
+    SQLite ignores SELECT ... FOR UPDATE.
+    """
+
+    guarded = await db.execute(
+        update(MonitoredRepo)
+        .where(MonitoredRepo.id == repo_id)
+        .values(updated_at=MonitoredRepo.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+    if guarded.rowcount != 1:
+        await db.rollback()
+        raise FindingActionConflict("Review repository is no longer available")
+    repo = (
+        await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if repo is None:
+        raise FindingActionConflict("Review repository is no longer available")
+    return repo
 
 
 async def is_current_review_snapshot(
@@ -102,6 +139,25 @@ async def create_immediate_finding_action(
             raise FindingActionConflict("Idempotency key is already in use")
         return existing
 
+    review_probe = await db.get(PRReview, review_id)
+    if review_probe is None:
+        raise FindingActionConflict("Finding is no longer available")
+    repo_id = review_probe.repo_id
+    # Make the portable writer fence the first statement in a fresh
+    # transaction.  In SQLite WAL mode a transaction that first established a
+    # read snapshot cannot always be upgraded after another process commits;
+    # starting the no-op UPDATE on a clean transaction avoids
+    # SQLITE_BUSY_SNAPSHOT and gives every backend the same ordering boundary.
+    await db.rollback()
+    repo = await lock_pr_repo_action_boundary(db, repo_id)
+    review = (
+        await db.execute(
+            select(PRReview)
+            .where(PRReview.id == review_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     finding = (
         await db.execute(
             select(PRFinding)
@@ -110,26 +166,11 @@ async def create_immediate_finding_action(
                 PRFinding.pr_review_id == review_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    review = (
-        await db.execute(
-            select(PRReview)
-            .where(PRReview.id == review_id)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if finding is None or review is None:
+    if finding is None or review is None or not repo.enabled:
         raise FindingActionConflict("Finding is no longer available")
-    locked_repo = (
-        await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == review.repo_id)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if locked_repo is None:
-        raise FindingActionConflict("Review repository is no longer available")
     if not await is_current_review_snapshot(db, review):
         raise FindingActionConflict(
             "This finding belongs to a superseded PR snapshot"
@@ -149,6 +190,20 @@ async def create_immediate_finding_action(
     if active_fix is not None:
         raise FindingActionConflict(
             "Finding already has an active AI repair; complete or cancel it first"
+        )
+    active_rebuttal = (
+        await db.execute(
+            select(PRFindingRebuttal.id)
+            .where(
+                PRFindingRebuttal.finding_id == finding.id,
+                PRFindingRebuttal.status.in_(_ACTIVE_REBUTTAL_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if active_rebuttal is not None:
+        raise FindingActionConflict(
+            "Finding already has an active adjudication"
         )
 
     now = datetime.utcnow()

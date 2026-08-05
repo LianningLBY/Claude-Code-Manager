@@ -1273,6 +1273,124 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("marker_kind", "initial_status"),
+    (
+        pytest.param("tag", "pending", id="worker-tag-pending"),
+        pytest.param("tag", "executing", id="worker-tag-executing"),
+        pytest.param("metadata", "pending", id="manager-metadata-pending"),
+        pytest.param(
+            "metadata",
+            "executing",
+            id="manager-metadata-executing",
+        ),
+    ),
+)
+async def test_internal_termination_accepts_pr_fix_task_generations(
+    client,
+    session_factory,
+    marker_kind,
+    initial_status,
+):
+    """Worker fix tags and Manager fix metadata authorize exact cleanup."""
+
+    import backend.main
+
+    marker = (
+        {"tags": ["pr-review-fix"]}
+        if marker_kind == "tag"
+        else {"metadata_": {"pr_finding_action_id": 701}}
+    )
+    async with session_factory() as db:
+        task = Task(
+            title=f"{marker_kind} {initial_status} PR fix",
+            description="test",
+            status=initial_status,
+            **marker,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    snapshot_response = await client.get(
+        f"/api/tasks/{task_id}/terminate-generation"
+    )
+    assert snapshot_response.status_code == 200, snapshot_response.text
+    snapshot = snapshot_response.json()
+    assert snapshot["status"] == initial_status
+
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+        return_value=0,
+    ) as abort:
+        response = await client.post(
+            f"/api/tasks/{task_id}/terminate-generation",
+            json={
+                "expected_status": snapshot["status"],
+                "expected_retry_count": snapshot["retry_count"],
+                "expected_instance_id": snapshot["instance_id"],
+                "expected_started_at": snapshot["started_at"],
+                "expected_completed_at": snapshot["completed_at"],
+                "expected_pty_background_generation": snapshot[
+                    "pty_background_generation"
+                ],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert response.json()["metadata_"]["pr_review_superseded"] is True
+    abort.assert_awaited_once_with(task_id)
+
+
+@pytest.mark.asyncio
+async def test_internal_termination_rejects_plain_tasks_before_cleanup(
+    client,
+    session_factory,
+):
+    """The hidden protocol remains unavailable to ordinary Worker Tasks."""
+
+    import backend.main
+
+    async with session_factory() as db:
+        task = Task(
+            title="ordinary worker task",
+            description="test",
+            status="pending",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    get_response = await client.get(
+        f"/api/tasks/{task_id}/terminate-generation"
+    )
+    assert get_response.status_code == 400, get_response.text
+
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+    ) as abort:
+        post_response = await client.post(
+            f"/api/tasks/{task_id}/terminate-generation",
+            json={
+                "expected_status": "pending",
+                "expected_retry_count": 0,
+                "expected_instance_id": None,
+                "expected_started_at": None,
+                "expected_completed_at": None,
+                "expected_pty_background_generation": None,
+            },
+        )
+
+    assert post_response.status_code == 400, post_response.text
+    abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hidden_termination_protocol_requires_service_identity(
     session_factory,
 ):

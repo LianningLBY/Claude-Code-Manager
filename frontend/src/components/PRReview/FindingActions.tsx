@@ -17,18 +17,38 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
   const [error, setError] = useState<string | null>(null);
   const [reviewedDiff, setReviewedDiff] = useState<{
     actionId: number;
-    patchSha256: string | null;
+    actionStatus: PRFindingAction['status'];
+    expectedHeadSha: string;
+    patchSha256: string;
+    receipt: string;
+    confirmationToken: string;
   } | null>(null);
 
   useEffect(() => setAction(finding.latest_action), [finding.latest_action]);
 
   useEffect(() => {
-    if (!action || !['pending', 'running'].includes(action.status)) return;
+    setReviewedDiff(previous => {
+      if (!previous) return null;
+      if (
+        !action
+        || previous.actionId !== action.id
+        || previous.actionStatus !== action.status
+        || previous.expectedHeadSha !== action.expected_head_sha
+        || previous.patchSha256 !== action.patch_sha256
+      ) {
+        return null;
+      }
+      return previous;
+    });
+  }, [action]);
+
+  useEffect(() => {
+    if (!action || !['pending', 'running', 'cancelling'].includes(action.status)) return;
     const timer = window.setInterval(async () => {
       try {
         const next = await api.getReviewFindingAction(action.id);
         setAction(next);
-        if (!['pending', 'running'].includes(next.status)) await onChanged();
+        if (!['pending', 'running', 'cancelling'].includes(next.status)) await onChanged();
       } catch (reason) {
         setError(String(reason));
       }
@@ -51,8 +71,13 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
   };
 
   const downloadDiff = async () => {
-    if (!action) return;
-    const identity = { actionId: action.id, patchSha256: action.patch_sha256 };
+    if (!action?.patch_sha256) return;
+    const identity = {
+      actionId: action.id,
+      actionStatus: action.status,
+      expectedHeadSha: action.expected_head_sha,
+      patchSha256: action.patch_sha256,
+    };
     setBusy(true);
     setError(null);
     try {
@@ -63,7 +88,11 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
       anchor.download = file.filename;
       anchor.click();
       URL.revokeObjectURL(url);
-      setReviewedDiff(identity);
+      setReviewedDiff({
+        ...identity,
+        receipt: file.receipt,
+        confirmationToken: file.confirmationToken,
+      });
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -74,11 +103,13 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
   const diffIsCurrent = Boolean(
     action
     && reviewedDiff?.actionId === action.id
+    && reviewedDiff.actionStatus === action.status
+    && reviewedDiff.expectedHeadSha === action.expected_head_sha
     && reviewedDiff.patchSha256 === action.patch_sha256,
   );
   const activeFix = Boolean(
     action?.action_type === 'ai_fix'
-    && ['pending', 'running', 'awaiting_confirmation'].includes(action.status),
+    && ['pending', 'running', 'awaiting_confirmation', 'cancelling'].includes(action.status),
   );
   const result = action?.result;
   const targetRepo = typeof result?.head_repo_full_name === 'string' ? result.head_repo_full_name : null;
@@ -92,15 +123,16 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
   const canConfirm = Boolean(
     currentSnapshot
     && action?.status === 'awaiting_confirmation'
-    && action.confirmation_token
     && action.patch_sha256
     && targetIdentityComplete,
   );
-  const canReconcile = Boolean(
-    action?.status === 'running'
-    && action.confirmation_token
-    && action.patch_sha256
-    && targetIdentityComplete,
+  const canCancel = Boolean(
+    action?.action_type === 'ai_fix'
+    && (
+      action.status === 'pending'
+      || (action.status === 'running' && action.confirmed_at === null)
+      || action.status === 'awaiting_confirmation'
+    ),
   );
 
   return (
@@ -109,7 +141,7 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
       {error && <p role="alert" className="mb-2 text-red-400">{error}</p>}
       {!currentSnapshot && <p className="mb-2 text-gray-500">Historical snapshot — new actions are locked.</p>}
       {activeFix && <p className="mb-2 text-gray-500">Finish the active AI fix before recording another action.</p>}
-      {(canConfirm || canReconcile) && action && (
+      {canConfirm && action && (
         <div className="mb-2 rounded border border-amber-700/50 bg-amber-950/20 p-2 text-xs text-gray-300">
           <div>Target: {targetRepo}#{prNumber} · {targetRef}</div>
           <div>Head: {action.expected_head_sha}</div>
@@ -136,22 +168,35 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
             }}>Generate AI fix</button>
           </>
         )}
-        {(canConfirm || canReconcile) && (
+        {canCancel && action && (
+          <button disabled={busy} className="rounded bg-red-700 px-2 py-1 text-white disabled:opacity-50" onClick={() => {
+            if (window.confirm('Cancel this active AI fix? Any unconfirmed generated patch will be discarded.')) {
+              setReviewedDiff(null);
+              void run(() => api.cancelPRFindingAction(action.id));
+            }
+          }}>Cancel AI fix</button>
+        )}
+        {canConfirm && (
           <>
             <button disabled={busy} className="rounded bg-gray-700 px-2 py-1 disabled:opacity-50" onClick={() => void downloadDiff()}>Download diff</button>
             <button disabled={busy || !diffIsCurrent} className="rounded bg-amber-600 px-2 py-1 text-white disabled:opacity-50" onClick={() => {
-              if (!action?.confirmation_token || !action.patch_sha256) return;
+              if (!action || !reviewedDiff || !diffIsCurrent) return;
               const confirmation = [
-                'Create a commit and non-force push this reviewed diff?',
+                'Create a commit and exact-head conditional push this reviewed diff?',
                 `PR: ${targetRepo}#${prNumber}`,
                 `Source ref: ${targetRef}`,
-                `Expected head: ${action.expected_head_sha}`,
+                `Expected head: ${reviewedDiff.expectedHeadSha}`,
                 `Files: ${allowedFiles.join(', ')}`,
-                `Patch SHA-256: ${action.patch_sha256}`,
+                `Patch SHA-256: ${reviewedDiff.patchSha256}`,
               ].join('\n');
               if (!window.confirm(confirmation)) return;
-              void run(() => api.confirmReviewFindingFix(action.id, action.confirmation_token!, action.patch_sha256!));
-            }}>{canReconcile ? 'Reconcile push' : 'Confirm and push'}</button>
+              void run(() => api.confirmReviewFindingFix(
+                action.id,
+                reviewedDiff.confirmationToken,
+                reviewedDiff.patchSha256,
+                reviewedDiff.receipt,
+              ));
+            }}>Confirm and push</button>
           </>
         )}
       </div>

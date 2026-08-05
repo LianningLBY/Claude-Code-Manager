@@ -4740,6 +4740,7 @@ class GlobalDispatcher:
         generation: _TaskLifecycleGeneration,
         reason: str,
     ) -> str | None:
+        failed_pr_task: Task | None = None
         async with self.db_factory() as db:
             task = await self._read_owned_lifecycle_task(
                 db,
@@ -4800,12 +4801,32 @@ class GlobalDispatcher:
             if resulting_generation is None:
                 await db.rollback()
                 return None
+            if status == "failed" and is_pr_sandbox_task(task):
+                refreshed = await db.get(
+                    Task,
+                    generation.task_id,
+                    populate_existing=True,
+                )
+                if (
+                    refreshed is not None
+                    and self._task_status_generation(refreshed)
+                    == resulting_generation
+                ):
+                    db.expunge(refreshed)
+                    failed_pr_task = refreshed
             await db.commit()
 
-        await self._broadcast_task_status_generation(
+        published = await self._broadcast_task_status_generation(
             resulting_generation,
             instance_id=generation.instance_id,
         )
+        if published and failed_pr_task is not None:
+            # Normal non-zero exits do not enter the lifecycle exception
+            # handler. Consume their exact exhausted generation here so PR
+            # fix actions cannot remain durably ``running`` forever. The
+            # completion/failure handler performs its own DB CAS as a final
+            # fence against a retry that wins after publication.
+            await self._handle_pr_review_failure(failed_pr_task, reason)
         return status
 
     async def _complete_owned_task_result(

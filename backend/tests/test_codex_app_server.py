@@ -4581,6 +4581,87 @@ async def test_unsuccessful_parent_terminal_is_bounded_with_active_child(
 
 
 @pytest.mark.asyncio
+async def test_interrupt_active_goal_descendant_without_visible_turn():
+    """A Goal-backed child can be active while thread/read exposes no turn."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-root",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-root"}}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": "thread-child",
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": [],
+                },
+            }
+        if method == "thread/goal/set":
+            assert params == {
+                "threadId": "thread-child",
+                "status": "paused",
+            }
+            asyncio.get_running_loop().call_soon(
+                server._handle_notification,
+                "thread/status/changed",
+                {
+                    "threadId": "thread-child",
+                    "status": {"type": "idle"},
+                },
+            )
+            return {}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, _ = await server.start_turn(
+        prompt="coordinate a goal-backed child",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=140,
+    )
+    await process.stdout.readline()
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {
+            "id": "turn-root",
+            "status": "interrupted",
+            "error": None,
+        },
+    })
+
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 130
+    assert server._contexts_by_descendant == {}
+    assert any(
+        call.args[0] == "thread/goal/set"
+        for call in server._request.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_descendant_terminal_deadline_holds_adapter_until_proven(
     monkeypatch,
 ):
@@ -4613,6 +4694,8 @@ async def test_descendant_terminal_deadline_holds_adapter_until_proven(
                     "status": {"type": "active", "activeFlags": []},
                 },
             }
+        if method == "thread/goal/set":
+            raise CodexAppServerError("no active goal for thread")
         raise AssertionError(f"unexpected request: {method}")
 
     server._request = AsyncMock(side_effect=request)

@@ -1522,6 +1522,22 @@ class CodexAppServer:
                 else set()
             )
         if len(active_turn_ids) != 1:
+            # Native Goals (including collaboration agents waiting on their
+            # own descendants) can keep a thread ``active`` without exposing
+            # a running turn in ``thread/read``.  A turn interrupt is
+            # impossible in that state, but the Goal protocol still provides
+            # an exact, thread-scoped stop.  Pause it before giving up; this
+            # avoids forcing callers to kill the account-wide shared
+            # app-server just to release one task.
+            try:
+                goal_paused = await self._pause_active_goal(thread_id)
+            except (asyncio.TimeoutError, CodexAppServerError):
+                goal_paused = False
+            if goal_paused:
+                return await self._wait_descendant_terminal(
+                    context,
+                    thread_id,
+                )
             return False
 
         turn_id = next(iter(active_turn_ids))
@@ -1970,7 +1986,7 @@ class CodexAppServer:
         )
         self._detach_turn_context(context)
 
-    async def _pause_active_goal(self, thread_id: str) -> None:
+    async def _pause_active_goal(self, thread_id: str) -> bool:
         """Pause an adopted native goal with one bounded protocol round trip."""
 
         try:
@@ -1993,8 +2009,9 @@ class CodexAppServer:
                     "continuing direct turn interrupt",
                     thread_id,
                 )
-                return
+                return False
             raise
+        return True
 
     async def _steer_detached_native_goal(
         self,

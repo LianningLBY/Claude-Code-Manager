@@ -3609,6 +3609,25 @@ class GlobalDispatcher:
             return None
         await self._require_task_lifecycle_active(expected_generation)
 
+        # ``select`` only knows account health and quota. Exclude homes held by
+        # maintenance or a non-app-server exec before selecting a fresh route.
+        # App-server turns can share a transport; the per-home launch guard is
+        # authoritative if this scheduling snapshot races a new owner.
+        busy_homes = {
+            pool.canonical_home(home)
+            for home in self.instance_manager.busy_codex_homes()
+        }
+        busy_compatible_homes = {
+            home
+            for home in busy_homes
+            if pool.is_home_available(home)
+            and pool.supports_model_for_home(
+                home,
+                model,
+                service_tier=codex_service_tier,
+            )
+        }
+
         bound_id = await self._codex_task_binding(task_id)
         bound_home = pool.home_for_account(bound_id) if bound_id else None
         matches: list[str] = []
@@ -3625,6 +3644,7 @@ class GlobalDispatcher:
             if (
                 preferred_owner_home
                 and pool.is_home_available(preferred_owner_home)
+                and preferred_owner_home not in busy_homes
                 and pool.supports_model_for_home(
                     preferred_owner_home,
                     model,
@@ -3687,6 +3707,7 @@ class GlobalDispatcher:
         resident_available = bool(
             resident
             and pool.is_home_available(resident)
+            and resident not in busy_homes
             and pool.supports_model_for_home(
                 resident,
                 model,
@@ -3706,6 +3727,10 @@ class GlobalDispatcher:
             return resident
 
         excluded: set[str] = set()
+        for home in busy_homes:
+            busy_account_id = pool.account_id_for_home(home)
+            if busy_account_id:
+                excluded.add(busy_account_id)
         resident_id = pool.account_id_for_home(resident) if resident else None
         if resident_id:
             excluded.add(resident_id)
@@ -3735,6 +3760,12 @@ class GlobalDispatcher:
                     f"service tier {codex_service_tier!r} require quota or "
                     "credential intervention before retrying",
                     permanent=True,
+                )
+            if busy_compatible_homes:
+                raise CodexAccountRoutingError(
+                    "Codex pool has no idle compatible account; one or more "
+                    "otherwise available accounts are temporarily busy",
+                    retry_after=CODEX_ROUTING_RETRY_DELAY,
                 )
             if resident and pool.is_known_account(resident) and pool.is_home_enabled(resident):
                 retry_after = self._codex_pool_retry_after()
@@ -3780,7 +3811,7 @@ class GlobalDispatcher:
                     "because its rollout could not be migrated safely",
                     task_id, session_id, resident, target,
                 )
-                if pool.is_home_available(resident):
+                if resident_available:
                     await self._persist_codex_binding_for_route(
                         task_id=task_id,
                         account_id=pool.account_id_for_home(resident),
@@ -3789,7 +3820,12 @@ class GlobalDispatcher:
                     return resident
                 raise CodexAccountRoutingError(
                     f"Codex session {session_id} could not be migrated from "
-                    f"unavailable account home {resident}"
+                    f"unavailable account home {resident}",
+                    retry_after=(
+                        CODEX_ROUTING_RETRY_DELAY
+                        if resident in busy_homes
+                        else self._codex_pool_retry_after()
+                    ),
                 )
 
         if not binding_persisted:

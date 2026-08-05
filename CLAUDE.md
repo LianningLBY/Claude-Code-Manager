@@ -207,6 +207,8 @@ claude-manager/
 - **Task.project_id**: 可选关联 Project，dispatcher 自动解析为 target_repo
 - **Project Todo（清单）**: 每个 Project 挂一个 prompt 模板清单（`project_todos` 表）。前端 `ProjectTodoList`（Project 卡片内可折叠）「▶ Run」以 `{title, description=prompt, project_id}` 建 task（默认配置，target_repo 由 dispatcher 从 project 补全）→ 跳 chat，并把 todo 标 `done` + 记 `created_task_id`（溯源）。状态 open/done/archived（软归档，DELETE 才是永久删除）。清单语义：建 task 即划掉；非模板库，故只存 prompt 不存 task 配置
 
+- **Codex home runtime 准入**: Dispatcher 的 busy-home 快照只用于选路，direct task exec、app-server、GoalEvaluator 和 Distill 最终都必须在同一 canonical home lock 内互斥准入；direct spawn 取消后只有证明 exact process generation 已回收才可释放 home，GoalEvaluator/Distill cleanup 失败则以各自结构化 retained-process registry 继续 fail closed。若 runtime busy 排空兼容候选，统一短退避重试，不能继承其他账号的长 cooldown，也不能把保留在 disabled/retired source 的 session 判成永久失败。
+
 ## 任务生命周期（9 步）
 
 你收到任务后，按以下流程自主完成：

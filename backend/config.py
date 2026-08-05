@@ -45,6 +45,36 @@ class Settings(BaseSettings):
     context_compact_threshold: float = 0.80
     default_goal_evaluator_model: str = "claude-haiku-4-5"
     goal_evaluation_timeout: int = 120
+    # --- Independent Plan Agent pipeline ---
+    # Both stages have an explicit primary/fallback route. A Plan Task stores
+    # the resolved snapshot so queued work cannot drift with later defaults.
+    plan_planner_provider: str = "claude"
+    plan_planner_model: str = "claude-fable-5"
+    plan_planner_effort: str = "high"
+    plan_planner_fallback_provider: str = "codex"
+    plan_planner_fallback_model: str = "gpt-5.6-terra"
+    plan_planner_fallback_effort: str = "xhigh"
+    plan_reviewer_enabled: bool = True
+    plan_reviewer_provider: str = "codex"
+    plan_reviewer_model: str = "gpt-5.6-sol"
+    plan_reviewer_effort: str = "xhigh"
+    plan_reviewer_fallback_provider: str = "claude"
+    plan_reviewer_fallback_model: str = "claude-sonnet-5"
+    plan_reviewer_fallback_effort: str = "high"
+    plan_max_revision_cycles: int = 2
+    # Pause/resume rounds per PlanRun. This never limits questions per request.
+    plan_max_interactions: int = 3
+    plan_planner_timeout: int = 1800
+    plan_reviewer_timeout: int = 900
+    # Once a Codex Reviewer has started streaming agent/reasoning deltas, a
+    # longer silent interval indicates a stuck Responses stream. Initial
+    # xhigh reasoning is deliberately governed by plan_reviewer_timeout.
+    plan_reviewer_delta_idle_timeout: int = 90
+    # Abort only pathological JSON whitespace outside string values. Long Plan
+    # content and reasoning remain governed by the normal route timeout.
+    plan_structured_output_whitespace_limit: int = 4_096
+    plan_transcript_max_chars: int = 60_000
+    plan_step_output_max_chars: int = 200_000
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---

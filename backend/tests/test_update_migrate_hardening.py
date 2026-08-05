@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import socket
 import sqlite3
@@ -262,6 +263,22 @@ def test_protocol_v2_and_shell_syntax() -> None:
     content = SCRIPT.read_text()
     assert "CCM_UPDATE_PROTOCOL_VERSION=2" in content.splitlines()[:8]
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
+
+
+def test_systemd_user_manager_deserialize_is_narrowly_allowed() -> None:
+    content = SCRIPT.read_text()
+    start = content.index("def fixed_systemd_user_manager")
+    end = content.index("\n\nunsafe_uninspectable", start)
+    namespace = {"Path": Path, "re": re}
+    exec(content[start:end], namespace)
+    classifier = namespace["fixed_systemd_user_manager"]
+
+    assert classifier("/usr/lib/systemd/systemd --user")
+    assert classifier("/usr/lib/systemd/systemd --user --deserialize=19")
+    assert not classifier("/usr/lib/systemd/systemd --user --deserialize=x")
+    assert not classifier("/usr/lib/systemd/systemd --user --deserialize=1 extra")
+    assert not classifier("/tmp/systemd --system")
+    assert not classifier("python systemd --user")
 
 
 def test_root_bootstrap_uses_isolated_system_python_before_setuid() -> None:

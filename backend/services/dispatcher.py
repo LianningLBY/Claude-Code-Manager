@@ -14,7 +14,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import httpx
+from fastapi import HTTPException
 from sqlalchemy import select, update, func, or_
 
 from sqlalchemy import select as sa_select
@@ -23,6 +26,8 @@ from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.plan import Plan
+from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
@@ -47,7 +52,6 @@ from backend.services.instance_manager import (
 )
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.pr_review_runtime import (
-    is_pr_review_task,
     is_pr_sandbox_task,
     isolated_pr_review_cwd,
 )
@@ -75,6 +79,10 @@ from backend.services.worker_routing_config import (
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from backend.services.claude_pool import ClaudePool
+    from backend.services.codex_pool import CodexPool
 
 
 class QueuedMessagePrelaunchError(RuntimeError):
@@ -292,9 +300,7 @@ class _TaskLifecycleGeneration:
     completed_at: datetime | None
 
 
-_TaskRoutingGeneration = (
-    _TaskLifecycleGeneration | _TaskStatusGeneration
-)
+_TaskRoutingGeneration = _TaskLifecycleGeneration | _TaskStatusGeneration
 
 
 @dataclass(slots=True)
@@ -379,6 +385,14 @@ class QueuedMessage:
     # The API persists a visible user row before queue admission.  Keep its
     # exact id so compaction can exclude the current request from history.
     source_log_id: int | None = field(compare=False, default=None)
+    # Durable Plan-application outbox identity. Repeated HTTP recovery and
+    # startup recovery may request admission, but only one in-memory item is
+    # accepted for this key.
+    delivery_key: str | None = field(compare=False, default=None)
+    # A queue clear can own recovery of an item during the tiny q.get() ->
+    # in-flight registration window. The consumer then must not recover the
+    # same durable receipt a second time.
+    queue_clear_handled: bool = field(compare=False, default=False, repr=False)
     # Immutable model-facing request. ``prompt`` may later be wrapped with a
     # compacted history; retries must not treat that wrapper as a new request.
     current_message: str | None = field(compare=False, default=None)
@@ -445,7 +459,9 @@ def _default_worker_provider() -> str:
 
 
 def _default_worker_model(provider: str) -> str:
-    return settings.default_codex_model if provider == "codex" else settings.default_model
+    return (
+        settings.default_codex_model if provider == "codex" else settings.default_model
+    )
 
 
 def _initial_task_command(task: Task):
@@ -493,7 +509,9 @@ def _build_git_env(merged_config: dict) -> dict:
 
     # Inject SSH credentials if available
     if merged_config.get("git_ssh_key_path"):
-        env["GIT_SSH_COMMAND"] = f"ssh -i {merged_config['git_ssh_key_path']} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+        env["GIT_SSH_COMMAND"] = (
+            f"ssh -i {merged_config['git_ssh_key_path']} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+        )
 
     # Inject HTTPS credentials if available
     if merged_config.get("git_https_token"):
@@ -512,7 +530,9 @@ def _build_git_env(merged_config: dict) -> dict:
 
     # Fallback to instance-level SSH key (set via GIT_SSH_KEY_PATH env var)
     if "GIT_SSH_COMMAND" not in env and settings.git_ssh_key_path:
-        env["GIT_SSH_COMMAND"] = f"ssh -i {settings.git_ssh_key_path} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+        env["GIT_SSH_COMMAND"] = (
+            f"ssh -i {settings.git_ssh_key_path} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+        )
     return env
 
 
@@ -553,9 +573,7 @@ async def _build_secrets_block(db_factory, secret_ids: list[int]) -> str:
     if not secret_ids:
         return ""
     async with db_factory() as db:
-        result = await db.execute(
-            sa_select(Secret).where(Secret.id.in_(secret_ids))
-        )
+        result = await db.execute(sa_select(Secret).where(Secret.id.in_(secret_ids)))
         secrets = list(result.scalars().all())
     if not secrets:
         return ""
@@ -622,9 +640,7 @@ class GlobalDispatcher:
         # Otherwise two per-task queue consumers can both SELECT the same idle
         # row before either reaches `_launching_instances.add()`.
         self._instance_claim_lock = asyncio.Lock()
-        self._instance_claim_owners: dict[
-            int, tuple[object, asyncio.Task | None]
-        ] = {}
+        self._instance_claim_owners: dict[int, tuple[object, asyncio.Task | None]] = {}
         # Startup reconciliation and queued-chat Phase 1 share this gate.
         # A queued turn may do slow account/session preparation after reserving
         # an idle slot; start() must either observe that spawned generation or
@@ -632,10 +648,16 @@ class GlobalDispatcher:
         self._chat_launch_admission_lock = asyncio.Lock()
         self._running = False
         self._shutting_down = False
-        self._monitor_tasks: dict[int, asyncio.Task] = {}           # monitor_session_id -> asyncio task
-        self._monitor_processes: dict[int, asyncio.subprocess.Process] = {}  # monitor_session_id -> subprocess
+        self._monitor_tasks: dict[
+            int, asyncio.Task
+        ] = {}  # monitor_session_id -> asyncio task
+        self._monitor_processes: dict[
+            int, asyncio.subprocess.Process
+        ] = {}  # monitor_session_id -> subprocess
         self._monitor_config_dirs: dict[int, str] = {}
-        self._monitor_log_fhs: dict[int, object] = {}  # monitor_session_id -> log file handle
+        self._monitor_log_fhs: dict[
+            int, object
+        ] = {}  # monitor_session_id -> log file handle
         self._monitor_turn_handles: dict[int, _MonitorTurnHandle] = {}
         self._monitor_cleanup_locks: dict[int, asyncio.Lock] = {}
         # Scheduled lifecycles sleep without blocking maintenance. Only a
@@ -643,7 +665,9 @@ class GlobalDispatcher:
         self._monitor_active_turns: set[int] = set()
 
         # Sub-agent (one-shot tasks) lifecycle — parallel to monitor
-        self._sub_agent_tasks: dict[int, asyncio.Task] = {}      # session_id -> asyncio task
+        self._sub_agent_tasks: dict[
+            int, asyncio.Task
+        ] = {}  # session_id -> asyncio task
         self._sub_agent_processes: dict[int, asyncio.subprocess.Process] = {}
         self._sub_agent_config_dirs: dict[int, str] = {}
         self._sub_agent_log_fhs: dict[int, object] = {}
@@ -658,6 +682,15 @@ class GlobalDispatcher:
         self._task_queues: dict[int, asyncio.PriorityQueue] = {}
         self._task_queue_workers: dict[int, asyncio.Task] = {}
         self._task_queue_activity: dict[int, float] = {}
+        self._queued_delivery_keys: set[str] = set()
+        self._cancel_durable_queue_tasks: set[int] = set()
+        self._task_queue_cancellation_lease_counts: dict[int, int] = {}
+        # A receipt stages against both this process epoch and the task queue
+        # generation. A same-process stop that completes before the receipt is
+        # committed still invalidates that staged admission; a later process
+        # may safely recover the durable pending row under its new epoch.
+        self._queue_admission_epoch = secrets.token_hex(16)
+        self._task_queue_dequeued: dict[int, QueuedMessage] = {}
         # A queued or currently-consumed resume is task work even before its DB
         # status becomes executing. Keeping it as a maintenance blocker avoids
         # restarting after accepting a chat/monitor message but before launch.
@@ -674,6 +707,9 @@ class GlobalDispatcher:
         # maintenance window. TaskQueue excludes them without consuming retry
         # budget, while unrelated pending tasks can still use idle instances.
         self._account_routing_not_before: dict[int, float] = {}
+        # Alternate local admission when both queues have work so neither
+        # ordinary Tasks nor first-class PlanRuns can starve the other.
+        self._prefer_plan_runs = True
 
         # Pool: initialized lazily on start() if pool_enabled
         self.pool: "ClaudePool | None" = None
@@ -690,6 +726,98 @@ class GlobalDispatcher:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    async def stop_plan_agent_lifecycle(
+        self,
+        task_id: int,
+        instance_id: int | None,
+    ) -> bool:
+        """Cancel and reap the exact dispatcher lifecycle for a Plan Task.
+
+        Plan Agents are read-only auxiliary subprocesses rather than ordinary
+        InstanceManager turns. The Task's persisted instance_id plus the live
+        dispatcher slot is their owner generation.
+        """
+
+        if instance_id is None:
+            return False
+        lifecycle = self._running_tasks.get(instance_id)
+        if lifecycle is None or lifecycle.done():
+            return False
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id)
+            if (
+                task is None
+                or task.mode != "plan"
+                or task.instance_id != instance_id
+                or task.status not in {"in_progress", "executing"}
+                or self._running_tasks.get(instance_id) is not lifecycle
+            ):
+                return False
+        lifecycle.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(lifecycle, return_exceptions=True)),
+                timeout=AUX_LIFECYCLE_CANCEL_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Plan Task {task_id} lifecycle ignored cancellation"
+            ) from exc
+        from backend.services.plan_agent_runner import (
+            has_unreaped_plan_agent_for_task,
+        )
+
+        if has_unreaped_plan_agent_for_task(task_id):
+            raise RuntimeError(
+                f"Plan Task {task_id} process cleanup could not be confirmed"
+            )
+        return True
+
+    async def stop_plan_run_lifecycle(
+        self,
+        run_id: int,
+        instance_id: int | None,
+    ) -> bool:
+        """Cancel and reap one exact first-class PlanRun lifecycle."""
+
+        lifecycle = (
+            self._running_tasks.get(instance_id) if instance_id is not None else None
+        )
+        if lifecycle is None and instance_id is None:
+            lifecycle = next(
+                (
+                    task
+                    for task in self._running_tasks.values()
+                    if not task.done()
+                    and getattr(task, "_ccm_worker_plan_run_id", None) == run_id
+                ),
+                None,
+            )
+        if (
+            lifecycle is None
+            or lifecycle.done()
+            or (
+                getattr(lifecycle, "_ccm_plan_run_id", None) != run_id
+                and getattr(lifecycle, "_ccm_worker_plan_run_id", None) != run_id
+            )
+        ):
+            return False
+        lifecycle.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(lifecycle, return_exceptions=True)),
+                timeout=AUX_LIFECYCLE_CANCEL_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Plan Run {run_id} ignored cancellation") from exc
+        from backend.services.plan_agent_runner import active_plan_run_ids
+
+        if run_id in active_plan_run_ids():
+            raise RuntimeError(
+                f"Plan Run {run_id} runtime cleanup could not be confirmed"
+            )
+        return True
 
     async def start(self):
         if self._shutting_down:
@@ -715,6 +843,7 @@ class GlobalDispatcher:
             )
             if settings.pool_enabled or has_cloudrouter_claude:
                 from backend.services.claude_pool import ClaudePool
+
                 self.pool = ClaudePool(
                     config_path=settings.pool_config_path,
                     cooldown_seconds=settings.pool_cooldown_seconds,
@@ -731,12 +860,18 @@ class GlobalDispatcher:
             # its pre-spawn phase so no child can appear after reconciliation's
             # manager-owned snapshot without being represented in that snapshot.
             async with self._chat_launch_admission_lock:
+                await self._recover_versioned_plan_runs()
                 await self._cleanup_stale_state()
             await self._recover_codex_monitor_cleanups()
             await self._recover_monitor_sessions()
 
             # Ensure we have worker instances up to max_concurrent_instances
             await self._ensure_instances()
+
+            # Plan applications are committed before volatile queue admission.
+            # Rehydrate every not-yet-launched delivery after stale runtime
+            # reconciliation and capacity setup.
+            await self._recover_plan_application_outbox()
 
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
             self._curator_task = asyncio.create_task(self._curator_loop())
@@ -748,6 +883,110 @@ class GlobalDispatcher:
             logger.exception("GlobalDispatcher failed to start")
             raise
         logger.info("GlobalDispatcher started")
+
+    async def _recover_versioned_plan_runs(self) -> None:
+        """Reconcile durable PlanRun states before generic Instance cleanup."""
+
+        from backend.services.plan_agent_runner import active_plan_run_ids
+
+        live_run_ids = active_plan_run_ids()
+        async with self.db_factory() as db:
+            runs = list(
+                (
+                    await db.execute(
+                        select(PlanAgentRun).where(
+                            PlanAgentRun.plan_id.isnot(None),
+                            PlanAgentRun.status.in_(
+                                ["queued", "running", "waiting_user"]
+                            ),
+                        )
+                    )
+                ).scalars()
+            )
+            for run in runs:
+                plan = await db.get(Plan, run.plan_id)
+                if plan is None or plan.active_run_id != run.id:
+                    if run.status != "waiting_user" or plan is None:
+                        run.status = "failed"
+                        run.current_stage = "failed"
+                        run.error = "Plan Run lost its aggregate owner during recovery"
+                        run.finished_at = datetime.utcnow()
+                    run.instance_id = None
+                    continue
+                if run.status == "running" and run.id not in live_run_ids:
+                    if run.last_execution_started_at is not None:
+                        run.execution_seconds = float(run.execution_seconds or 0) + max(
+                            0.0,
+                            (
+                                datetime.utcnow() - run.last_execution_started_at
+                            ).total_seconds(),
+                        )
+                        run.last_execution_started_at = None
+                    if run.instance_id is not None:
+                        owner = await db.get(Instance, run.instance_id)
+                        if (
+                            owner is not None
+                            and owner.current_plan_run_id == run.id
+                            and owner.current_task_id is None
+                            and owner.pid is None
+                        ):
+                            owner.status = "idle"
+                            owner.current_plan_run_id = None
+                    running_steps = list(
+                        (
+                            await db.execute(
+                                select(PlanAgentStep).where(
+                                    PlanAgentStep.run_id == run.id,
+                                    PlanAgentStep.status == "running",
+                                )
+                            )
+                        ).scalars()
+                    )
+                    for step in running_steps:
+                        step.status = "cancelled"
+                        step.error = "Interrupted by CCM restart"
+                        step.finished_at = datetime.utcnow()
+                    run.status = "queued"
+                    run.instance_id = None
+                    run.generation += 1
+                    run.updated_at = datetime.utcnow()
+                elif (
+                    run.status in {"queued", "waiting_user"}
+                    and run.instance_id is not None
+                ):
+                    owner = await db.get(Instance, run.instance_id)
+                    if (
+                        owner is not None
+                        and owner.current_plan_run_id == run.id
+                        and owner.current_task_id is None
+                        and owner.pid is None
+                    ):
+                        owner.status = "idle"
+                        owner.current_plan_run_id = None
+                    run.instance_id = None
+                    run.last_execution_started_at = None
+
+            owners = list(
+                (
+                    await db.execute(
+                        select(Instance).where(Instance.current_plan_run_id.isnot(None))
+                    )
+                ).scalars()
+            )
+            for owner in owners:
+                owned = await db.get(PlanAgentRun, owner.current_plan_run_id)
+                if (
+                    (
+                        owned is None
+                        or owned.instance_id != owner.id
+                        or owned.status != "running"
+                    )
+                    and owner.current_task_id is None
+                    and owner.pid is None
+                ):
+                    owner.status = "idle"
+                    owner.current_plan_run_id = None
+            await db.commit()
 
     def wake(self) -> None:
         """Wake the task dispatcher after a pending task is committed."""
@@ -775,15 +1014,16 @@ class GlobalDispatcher:
             } | self._launching_instances
             cap = settings.max_concurrent_instances
             if cap > 0:
-                occupied_iids = set(
-                    (
-                        await db.execute(
-                            select(Instance.id).where(
-                                active_capacity_predicate()
+                occupied_iids = (
+                    set(
+                        (
+                            await db.execute(
+                                select(Instance.id).where(active_capacity_predicate())
                             )
-                        )
-                    ).scalars()
-                ) | busy_iids
+                        ).scalars()
+                    )
+                    | busy_iids
+                )
                 # Lowering the cap never interrupts active work; it only
                 # closes admission until occupancy falls below the new cap.
                 if len(occupied_iids) >= cap:
@@ -828,8 +1068,10 @@ class GlobalDispatcher:
         async with self._instance_claim_lock:
             owned = [
                 instance_id
-                for instance_id, (_token, claim_owner)
-                in self._instance_claim_owners.items()
+                for instance_id, (
+                    _token,
+                    claim_owner,
+                ) in self._instance_claim_owners.items()
                 if claim_owner is owner
             ]
             for instance_id in owned:
@@ -854,6 +1096,14 @@ class GlobalDispatcher:
         self._maintenance_shutdown_committed = False
         self._dispatch_resumed.set()
         self._dispatch_wakeup.set()
+        try:
+            asyncio.get_running_loop().create_task(
+                self._recover_plan_application_outbox(after_restart=False)
+            )
+        except RuntimeError:
+            # Synchronous construction/tests may reopen the flag without an
+            # event loop. Startup recovery remains authoritative there.
+            pass
 
     @asynccontextmanager
     async def task_start_guard(self):
@@ -967,11 +1217,7 @@ class GlobalDispatcher:
             if not isinstance(instance_id, int):
                 continue
             records = getattr(self.instance_manager, "_consumer_records", {})
-            record = (
-                records.get(instance_id)
-                if isinstance(records, dict)
-                else None
-            )
+            record = records.get(instance_id) if isinstance(records, dict) else None
             process = (
                 self.instance_manager.processes.get(instance_id)
                 or getattr(self.instance_manager, "_process_groups", {}).get(
@@ -984,10 +1230,9 @@ class GlobalDispatcher:
                 ).get(instance_id)
                 or getattr(record, "process", None)
             )
-            consumer = (
-                getattr(record, "task", None)
-                or getattr(self.instance_manager, "_tasks", {}).get(instance_id)
-            )
+            consumer = getattr(record, "task", None) or getattr(
+                self.instance_manager, "_tasks", {}
+            ).get(instance_id)
             running_result = self.instance_manager.is_running(instance_id)
             manager_reports_running = (
                 running_result if isinstance(running_result, bool) else False
@@ -1028,14 +1273,12 @@ class GlobalDispatcher:
             unmanaged_live_owners: dict[int, tuple[int, int]] = {}
             reverse_owner_ids: dict[int, set[int]] = {}
             reconciliation_race_instance_ids: set[int] = set()
-            stale_instances: list[
-                tuple[Instance, bool]
-            ] = []
+            stale_instances: list[tuple[Instance, bool]] = []
             for inst in persisted_instances:
                 if inst.current_task_id is not None:
-                    reverse_owner_ids.setdefault(
-                        inst.current_task_id, set()
-                    ).add(inst.id)
+                    reverse_owner_ids.setdefault(inst.current_task_id, set()).add(
+                        inst.id
+                    )
                 if inst.id in manager_owned_instance_ids:
                     if inst.current_task_id is not None:
                         live_task_ids.add(inst.current_task_id)
@@ -1108,9 +1351,7 @@ class GlobalDispatcher:
             # exact no-op UPDATE is also a CAS on SQLite/MySQL configurations
             # where SELECT FOR UPDATE alone is insufficient.
             task_ids_to_lock = {task.id for task in active_tasks}
-            task_ids_to_lock.update(
-                task.id for task in stale_background_tasks
-            )
+            task_ids_to_lock.update(task.id for task in stale_background_tasks)
             task_ids_to_lock.update(
                 inst.current_task_id
                 for inst, _ in stale_instances
@@ -1131,15 +1372,11 @@ class GlobalDispatcher:
                     .all()
                 )
                 for locked_task in locked_tasks:
-                    locked_generation = self._task_status_generation(
-                        locked_task
-                    )
+                    locked_generation = self._task_status_generation(locked_task)
                     task_guard = await db.execute(
                         update(Task)
                         .where(
-                            *self._task_status_generation_predicates(
-                                locked_generation
-                            )
+                            *self._task_status_generation_predicates(locked_generation)
                         )
                         .values(status=locked_generation.status)
                     )
@@ -1202,8 +1439,8 @@ class GlobalDispatcher:
                             is_error=True,
                         )
                     )
-                    resulting_generation = (
-                        await self._read_task_status_generation(db, task.id)
+                    resulting_generation = await self._read_task_status_generation(
+                        db, task.id
                     )
                     if resulting_generation is not None:
                         reset_tasks.append(resulting_generation)
@@ -1291,13 +1528,9 @@ class GlobalDispatcher:
                 elif (
                     len(task_reverse_owners) > 1
                     or (
-                        task_reverse_owners
-                        and t.instance_id not in task_reverse_owners
+                        task_reverse_owners and t.instance_id not in task_reverse_owners
                     )
-                    or (
-                        not task_reverse_owners
-                        and t.instance_id is not None
-                    )
+                    or (not task_reverse_owners and t.instance_id is not None)
                 ):
                     # Only a unique, bidirectionally consistent dead claim is
                     # safe to retry automatically. Multiple reverse owners (or
@@ -1352,7 +1585,8 @@ class GlobalDispatcher:
                     }
                     logger.warning(
                         "Releasing unowned task %s from %s back to pending",
-                        t.id, t.status,
+                        t.id,
+                        t.status,
                     )
                 release_predicates = [
                     Task.id == t.id,
@@ -1382,17 +1616,13 @@ class GlobalDispatcher:
                     Task.shared_from_id.is_(None),
                 ]
                 if new_status == "pending":
-                    release_predicates.append(
-                        task_retry_not_superseded_predicate()
-                    )
+                    release_predicates.append(task_retry_not_superseded_predicate())
                 released = await db.execute(
-                    update(Task)
-                    .where(*release_predicates)
-                    .values(**values)
+                    update(Task).where(*release_predicates).values(**values)
                 )
                 if released.rowcount:
-                    resulting_generation = (
-                        await self._read_task_status_generation(db, t.id)
+                    resulting_generation = await self._read_task_status_generation(
+                        db, t.id
                     )
                     if resulting_generation is not None:
                         reset_tasks.append(resulting_generation)
@@ -1401,15 +1631,11 @@ class GlobalDispatcher:
             # before proving its orphan process dead.  Quarantine that dirty
             # state regardless of the task's current queue status so startup
             # cannot dispatch a second writer.
-            for task_id, (instance_id, unmanaged_pid) in (
-                unmanaged_live_owners.items()
-            ):
-                pending_owner = await db.get(
-                    Task, task_id, populate_existing=True
-                )
-                if (
-                    pending_owner is None
-                    or pending_owner.instance_id not in (None, instance_id)
+            for task_id, (instance_id, unmanaged_pid) in unmanaged_live_owners.items():
+                pending_owner = await db.get(Task, task_id, populate_existing=True)
+                if pending_owner is None or pending_owner.instance_id not in (
+                    None,
+                    instance_id,
                 ):
                     # A concurrent retry may already have claimed a different
                     # slot.  Never use that refreshed owner as permission to
@@ -1456,22 +1682,21 @@ class GlobalDispatcher:
                     )
                 )
                 if quarantined.rowcount:
-                    resulting_generation = (
-                        await self._read_task_status_generation(db, task_id)
+                    resulting_generation = await self._read_task_status_generation(
+                        db, task_id
                     )
                     if resulting_generation is not None:
                         reset_tasks.append(resulting_generation)
 
             if reconcile_auxiliary:
                 from backend.models.monitor_session import MonitorSession
+
                 (
                     active_monitor_ids,
                     active_sub_agent_ids,
                 ) = self._active_auxiliary_session_ids()
                 result = await db.execute(
-                    select(MonitorSession).where(
-                        MonitorSession.status == "running"
-                    )
+                    select(MonitorSession).where(MonitorSession.status == "running")
                 )
                 for ms in result.scalars().all():
                     # Remote mirror rows are owned by their source CCM.
@@ -1488,9 +1713,7 @@ class GlobalDispatcher:
                             # A scheduled Monitor owns no model process while
                             # it waits. It is durable and will be rehydrated
                             # immediately after startup reconciliation.
-                            manager_owned = (
-                                await db.get(Task, ms.task_id)
-                            ) is not None
+                            manager_owned = (await db.get(Task, ms.task_id)) is not None
                         else:
                             # An unclean restart with an active generation
                             # cannot prove that the old child is gone. Fail
@@ -1511,14 +1734,11 @@ class GlobalDispatcher:
                         # lifecycle registry; fail closed while exact evidence
                         # remains.
                         manager_owned = (
-                            ms.id in active_monitor_ids
-                            or ms.id in active_sub_agent_ids
+                            ms.id in active_monitor_ids or ms.id in active_sub_agent_ids
                         )
                     if manager_owned:
                         continue
-                    logger.warning(
-                        "Cleaning up stale auxiliary session %s", ms.id
-                    )
+                    logger.warning("Cleaning up stale auxiliary session %s", ms.id)
                     ms.status = "failed"
                     ms.completed_at = datetime.utcnow()
                     if ms.agent_type == "monitor":
@@ -1533,9 +1753,7 @@ class GlobalDispatcher:
         # 防御性广播：lifespan 启动路径此刻还没有 WS 订阅者（重连前端靠重连后
         # 轮询自愈），但 dispatcher 也可能经 API 端点手动 start——那时有观众
         for resulting_generation in reset_tasks:
-            await self._broadcast_task_status_generation(
-                resulting_generation
-            )
+            await self._broadcast_task_status_generation(resulting_generation)
 
     async def stop(
         self,
@@ -1554,15 +1772,11 @@ class GlobalDispatcher:
         failures: list[str] = []
         if self._dispatch_task and not self._dispatch_task.done():
             self._dispatch_task.cancel()
-            _, pending = await asyncio.wait(
-                {self._dispatch_task}, timeout=timeout
-            )
+            _, pending = await asyncio.wait({self._dispatch_task}, timeout=timeout)
             if pending:
                 failures.append("dispatch loop ignored cancellation")
             else:
-                await asyncio.gather(
-                    self._dispatch_task, return_exceptions=True
-                )
+                await asyncio.gather(self._dispatch_task, return_exceptions=True)
         curator = getattr(self, "_curator_task", None)
         if curator and not curator.done():
             curator.cancel()
@@ -1576,8 +1790,7 @@ class GlobalDispatcher:
             # observe them.  A runtime pause must not report success while an
             # admission producer is still live.
             raise RuntimeError(
-                "GlobalDispatcher background stop incomplete: "
-                + "; ".join(failures)
+                "GlobalDispatcher background stop incomplete: " + "; ".join(failures)
             )
         logger.info("GlobalDispatcher paused (in-flight work preserved)")
 
@@ -1594,9 +1807,7 @@ class GlobalDispatcher:
         try:
             await self.stop()
         except Exception as exc:
-            shutdown_failures.append(
-                f"dispatcher producer stop failed: {exc!r}"
-            )
+            shutdown_failures.append(f"dispatcher producer stop failed: {exc!r}")
             logger.exception(
                 "Dispatcher producer stop failed; continuing exact reapers"
             )
@@ -1606,7 +1817,7 @@ class GlobalDispatcher:
         # before taking the final InstanceManager generation snapshot.
         for task_id in list(self._task_queue_workers):
             try:
-                await self.abort_task_queue(task_id)
+                await self.abort_task_queue(task_id, cancel_durable=False)
             except Exception as exc:
                 shutdown_failures.append(
                     f"task {task_id} queue cleanup failed: {exc!r}"
@@ -1621,20 +1832,24 @@ class GlobalDispatcher:
         # but they still own real process groups.  Stop and await them before
         # the manager snapshot so shutdown cannot leave invisible children.
         aux_stops = [
-            *(self.stop_monitor_session_process(session_id)
-              for session_id in (
-                  set(self._monitor_tasks)
-                  | set(self._monitor_processes)
-                  | set(getattr(self, "_monitor_turn_handles", {}))
-              )),
-            *(self.stop_sub_agent_session_process(session_id)
-              for session_id in (
-                  set(self._sub_agent_tasks)
-                  | set(self._sub_agent_processes)
-                  | set(self._sub_agent_codex_processes)
-                  | set(self._sub_agent_codex_homes)
-                  | set(self._sub_agent_codex_threads)
-              )),
+            *(
+                self.stop_monitor_session_process(session_id)
+                for session_id in (
+                    set(self._monitor_tasks)
+                    | set(self._monitor_processes)
+                    | set(getattr(self, "_monitor_turn_handles", {}))
+                )
+            ),
+            *(
+                self.stop_sub_agent_session_process(session_id)
+                for session_id in (
+                    set(self._sub_agent_tasks)
+                    | set(self._sub_agent_processes)
+                    | set(self._sub_agent_codex_processes)
+                    | set(self._sub_agent_codex_homes)
+                    | set(self._sub_agent_codex_threads)
+                )
+            ),
         ]
         if aux_stops:
             results = await asyncio.gather(*aux_stops, return_exceptions=True)
@@ -1673,8 +1888,7 @@ class GlobalDispatcher:
                     if task in pending_lifecycle_tasks
                 ]
                 shutdown_failures.append(
-                    "lifecycle tasks ignored cancellation: "
-                    + ", ".join(pending_keys)
+                    "lifecycle tasks ignored cancellation: " + ", ".join(pending_keys)
                 )
                 logger.error(
                     "Lifecycle task(s) ignored shutdown cancellation: %s",
@@ -1683,10 +1897,7 @@ class GlobalDispatcher:
         unsettled_lifecycle_instance_ids = {
             instance_id
             for instance_id, lifecycle in self._running_tasks.items()
-            if (
-                isinstance(instance_id, int)
-                and lifecycle in pending_lifecycle_tasks
-            )
+            if (isinstance(instance_id, int) and lifecycle in pending_lifecycle_tasks)
         }
         try:
             from backend.services.goal_evaluator import (
@@ -1695,12 +1906,8 @@ class GlobalDispatcher:
 
             await reap_unreaped_goal_evaluators()
         except Exception as exc:
-            shutdown_failures.append(
-                f"goal evaluator cleanup failed: {exc!r}"
-            )
-            logger.exception(
-                "Failed to reap retained goal evaluator during shutdown"
-            )
+            shutdown_failures.append(f"goal evaluator cleanup failed: {exc!r}")
+            logger.exception("Failed to reap retained goal evaluator during shutdown")
         try:
             from backend.services.skill_distill import (
                 reap_unreaped_task_distills,
@@ -1708,12 +1915,17 @@ class GlobalDispatcher:
 
             await reap_unreaped_task_distills()
         except Exception as exc:
-            shutdown_failures.append(
-                f"skill distill cleanup failed: {exc!r}"
+            shutdown_failures.append(f"skill distill cleanup failed: {exc!r}")
+            logger.exception("Failed to reap retained skill distill during shutdown")
+        try:
+            from backend.services.plan_agent_runner import (
+                reap_unreaped_plan_agents,
             )
-            logger.exception(
-                "Failed to reap retained skill distill during shutdown"
-            )
+
+            await reap_unreaped_plan_agents()
+        except Exception as exc:
+            shutdown_failures.append(f"Plan Agent cleanup failed: {exc!r}")
+            logger.exception("Failed to reap retained Plan Agent during shutdown")
 
         managed_instance_ids = {
             instance_id
@@ -1741,9 +1953,7 @@ class GlobalDispatcher:
             record = records.get(instance_id) if isinstance(records, dict) else None
             candidates = (
                 self.instance_manager.processes.get(instance_id),
-                getattr(self.instance_manager, "_process_groups", {}).get(
-                    instance_id
-                ),
+                getattr(self.instance_manager, "_process_groups", {}).get(instance_id),
                 getattr(
                     self.instance_manager,
                     "_container_exec_processes",
@@ -1763,8 +1973,7 @@ class GlobalDispatcher:
             record = records.get(instance_id) if isinstance(records, dict) else None
             task_status = (
                 "completed"
-                if record is not None
-                and getattr(record, "chat_initiated", False)
+                if record is not None and getattr(record, "chat_initiated", False)
                 else "pending"
             )
             stop_failed = False
@@ -1784,9 +1993,7 @@ class GlobalDispatcher:
                     expected_pid=expected_pid,
                     expected_started_at=expected_started_at,
                     task_status=task_status,
-                    terminal_consumer_timeout=(
-                        SHUTDOWN_TERMINAL_CONSUMER_TIMEOUT
-                    ),
+                    terminal_consumer_timeout=(SHUTDOWN_TERMINAL_CONSUMER_TIMEOUT),
                     consumer_cancel_timeout=SHUTDOWN_CONSUMER_CANCEL_TIMEOUT,
                 )
                 if not stopped and self.instance_manager.is_running(instance_id):
@@ -1905,9 +2112,7 @@ class GlobalDispatcher:
         # for stop() to release.  Return only those proven process-free claims;
         # a failed reap keeps its active Task owner fail-closed.
         for instance_id in (
-            fresh_instance_ids
-            - failed_reaps
-            - unsettled_lifecycle_instance_ids
+            fresh_instance_ids - failed_reaps - unsettled_lifecycle_instance_ids
         ):
             if self.instance_manager.is_running(instance_id):
                 continue
@@ -1969,8 +2174,7 @@ class GlobalDispatcher:
         # object's id for a same-key replacement during this shutdown pass.
         attempted_states: dict[int, object] = {}
         shutdown_error = (
-            "Claude PTY background activity was interrupted by dispatcher "
-            "shutdown"
+            "Claude PTY background activity was interrupted by dispatcher shutdown"
         )
 
         # A terminal callback may replace/remove a state while an earlier exact
@@ -1992,8 +2196,7 @@ class GlobalDispatcher:
                 generation = getattr(state, "generation", None)
                 expected_key = (
                     (task_id, session_id)
-                    if isinstance(task_id, int)
-                    and isinstance(session_id, str)
+                    if isinstance(task_id, int) and isinstance(session_id, str)
                     else None
                 )
                 if (
@@ -2054,8 +2257,7 @@ class GlobalDispatcher:
                 stopped = False
                 try:
                     stopped = bool(
-                        await self.instance_manager
-                        .stop_detached_pty_background_generation(
+                        await self.instance_manager.stop_detached_pty_background_generation(
                             task_id,
                             session_id,
                             generation,
@@ -2171,9 +2373,12 @@ class GlobalDispatcher:
     def active_auxiliary_blockers(self) -> list[dict[str, object]]:
         """Return live CCM-owned auxiliary generations that a restart kills."""
 
-        _scheduled_monitor_ids, sub_agent_ids = (
-            self._active_auxiliary_session_ids()
+        from backend.services.plan_agent_runner import (
+            active_plan_run_ids,
+            active_plan_agent_task_ids,
         )
+
+        _scheduled_monitor_ids, sub_agent_ids = self._active_auxiliary_session_ids()
         monitor_ids = {
             session_id
             for session_id in (
@@ -2182,6 +2387,12 @@ class GlobalDispatcher:
                 | set(getattr(self, "_monitor_active_turns", set()))
             )
             if type(session_id) is int
+        }
+        worker_plan_ids = {
+            int(run_id)
+            for task in getattr(self, "_running_tasks", {}).values()
+            if not task.done()
+            and (run_id := getattr(task, "_ccm_worker_plan_run_id", None)) is not None
         }
         return [
             *(
@@ -2201,6 +2412,33 @@ class GlobalDispatcher:
                     "kind": "sub_agent",
                 }
                 for session_id in sorted(sub_agent_ids)
+            ),
+            *(
+                {
+                    "id": task_id,
+                    "title": f"Plan Agent Task #{task_id}",
+                    "status": "running_auxiliary",
+                    "kind": "plan_agent",
+                }
+                for task_id in sorted(active_plan_agent_task_ids())
+            ),
+            *(
+                {
+                    "id": run_id,
+                    "title": f"Plan Run #{run_id}",
+                    "status": "running_auxiliary",
+                    "kind": "plan_run",
+                }
+                for run_id in sorted(active_plan_run_ids())
+            ),
+            *(
+                {
+                    "id": run_id,
+                    "title": f"Worker Plan Run #{run_id}",
+                    "status": "running_auxiliary",
+                    "kind": "worker_plan_run",
+                }
+                for run_id in sorted(worker_plan_ids)
             ),
         ]
 
@@ -2226,9 +2464,7 @@ class GlobalDispatcher:
                 result = await db.execute(select(Instance))
                 existing = list(result.scalars().all())
                 live_count = sum(
-                    1
-                    for instance in existing
-                    if instance_occupies_slot(instance)
+                    1 for instance in existing if instance_occupies_slot(instance)
                 )
                 needed = settings.max_concurrent_instances - live_count
                 if needed <= 0:
@@ -2261,12 +2497,10 @@ class GlobalDispatcher:
                 result = await db.execute(select(Instance))
                 existing = list(result.scalars().all())
                 live_count = sum(
-                    1 for instance in existing
-                    if instance_occupies_slot(instance)
+                    1 for instance in existing if instance_occupies_slot(instance)
                 )
                 idle_count = sum(
-                    1 for instance in existing
-                    if instance_is_reusable_idle(instance)
+                    1 for instance in existing if instance_is_reusable_idle(instance)
                 )
                 needed = settings.min_idle_instances - idle_count
                 if needed <= 0:
@@ -2414,10 +2648,14 @@ class GlobalDispatcher:
                 # Check if system is idle (no executing tasks)
                 async with self.db_factory() as db:
                     from backend.models.task import Task
-                    executing = (await db.execute(
-                        select(func.count()).select_from(Task)
-                        .where(Task.status.in_(["executing", "in_progress"]))
-                    )).scalar() or 0
+
+                    executing = (
+                        await db.execute(
+                            select(func.count())
+                            .select_from(Task)
+                            .where(Task.status.in_(["executing", "in_progress"]))
+                        )
+                    ).scalar() or 0
                 if executing > 0:
                     continue
 
@@ -2425,9 +2663,13 @@ class GlobalDispatcher:
                 logger.info("curator: starting periodic run")
                 async with self.db_factory() as db:
                     from backend.services.skill_curator import run_curator
+
                     summary = await run_curator(db)
-                    logger.info("curator: checked %d skills, %d stale",
-                                summary["checked"], len(summary["stale"]))
+                    logger.info(
+                        "curator: checked %d skills, %d stale",
+                        summary["checked"],
+                        len(summary["stale"]),
+                    )
 
                 # Run distill (every 30 days — check if 30 days since last distill)
                 if hours_since >= 720:  # 30 days
@@ -2435,6 +2677,7 @@ class GlobalDispatcher:
                         logger.info("distill: starting periodic analysis")
                         async with self.db_factory() as db:
                             from backend.services.skill_distill import analyze_patterns
+
                             result = await analyze_patterns(db)
                             logger.info("distill: %s", result.get("summary", ""))
                     except Exception:
@@ -2446,6 +2689,202 @@ class GlobalDispatcher:
                 break
             except Exception:
                 logger.exception("curator: error in curator loop")
+
+    async def _claim_plan_run(
+        self,
+        db,
+        *,
+        instance: Instance,
+    ) -> tuple[int, int] | None:
+        """Claim one local first-class PlanRun and its exact Instance owner."""
+
+        row = (
+            await db.execute(
+                select(PlanAgentRun, Plan)
+                .join(Plan, Plan.id == PlanAgentRun.plan_id)
+                .where(
+                    PlanAgentRun.status == "queued",
+                    PlanAgentRun.worker_id.is_(None),
+                    Plan.active_run_id == PlanAgentRun.id,
+                    Plan.archived_at.is_(None),
+                )
+                .order_by(
+                    Plan.priority.asc(),
+                    PlanAgentRun.created_at.asc(),
+                    PlanAgentRun.id.asc(),
+                )
+                .limit(1)
+                .with_for_update()
+            )
+        ).first()
+        if row is None:
+            return None
+        run, plan = row
+        now = datetime.utcnow()
+        timeout = self._resolve_timeout(plan)
+        if timeout is not None and float(run.execution_seconds or 0) >= timeout:
+            run.status = "failed"
+            run.current_stage = "failed"
+            run.error = f"Plan Run timed out after {timeout:.0f}s of execution"
+            run.finished_at = now
+            run.updated_at = now
+            plan.active_run_id = None
+            plan.lock_version += 1
+            plan.updated_at = now
+            await db.commit()
+            return None
+        claimed_generation = run.generation + 1
+        claimed_run = await db.execute(
+            update(PlanAgentRun)
+            .where(
+                PlanAgentRun.id == run.id,
+                PlanAgentRun.plan_id == plan.id,
+                PlanAgentRun.status == "queued",
+                PlanAgentRun.generation == run.generation,
+                PlanAgentRun.instance_id.is_(None),
+            )
+            .values(
+                status="running",
+                instance_id=instance.id,
+                generation=claimed_generation,
+                last_execution_started_at=now,
+                updated_at=now,
+            )
+        )
+        claimed_instance = await db.execute(
+            update(Instance)
+            .where(
+                Instance.id == instance.id,
+                reusable_idle_predicate(),
+            )
+            .values(
+                status="running",
+                current_plan_run_id=run.id,
+                current_task_id=None,
+                pid=None,
+                started_at=now,
+            )
+        )
+        if claimed_run.rowcount != 1 or claimed_instance.rowcount != 1:
+            await db.rollback()
+            return None
+        await db.commit()
+        return run.id, claimed_generation
+
+    async def _cleanup_plan_run_owner(
+        self,
+        *,
+        instance_id: int,
+        run_id: int,
+        generation: int,
+    ) -> None:
+        """Release only the exact PlanRun generation left after its coroutine."""
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+            owner = await db.get(Instance, instance_id, with_for_update=True)
+            if (
+                owner is None
+                or owner.current_plan_run_id != run_id
+                or owner.current_task_id is not None
+                or owner.pid is not None
+            ):
+                await db.rollback()
+                return
+            if run is not None and run.generation == generation:
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (
+                            datetime.utcnow() - run.last_execution_started_at
+                        ).total_seconds(),
+                    )
+                    run.last_execution_started_at = None
+                run.instance_id = None
+                if run.status == "running":
+                    # A path that neither advanced nor recorded failure is not
+                    # safe to replay silently; preserve an explicit terminal.
+                    run.status = "failed"
+                    run.current_stage = "failed"
+                    run.error = "Plan Run lifecycle ended without a durable outcome"
+                    run.finished_at = datetime.utcnow()
+                    if run.plan_id is not None:
+                        plan = await db.get(Plan, run.plan_id, with_for_update=True)
+                        if plan is not None and plan.active_run_id == run.id:
+                            plan.active_run_id = None
+                            plan.lock_version += 1
+                            plan.updated_at = datetime.utcnow()
+            owner.status = "idle"
+            owner.current_plan_run_id = None
+            await db.commit()
+
+    async def _run_plan_run_lifecycle(
+        self,
+        instance_id: int,
+        run_id: int,
+        generation: int,
+    ) -> None:
+        from backend.services.plan_agent_runner import (
+            PlanAgentCleanupError,
+            PlanAgentRunner,
+        )
+
+        lifecycle = asyncio.current_task()
+        runner = PlanAgentRunner(
+            db_factory=self.db_factory,
+            instance_manager=self.instance_manager,
+            claude_pool=self.pool,
+            codex_pool=self.codex_pool,
+            cloudrouter_store=self.cloudrouter_store,
+            broadcaster=self.broadcaster,
+        )
+        try:
+            async with self.db_factory() as db:
+                run = await db.get(PlanAgentRun, run_id)
+                plan = (
+                    await db.get(Plan, run.plan_id)
+                    if run is not None and run.plan_id
+                    else None
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.instance_id != instance_id
+                    or plan.active_run_id != run.id
+                ):
+                    return
+                cwd = plan.target_repo or os.getcwd()
+            result = await runner.advance_versioned(run_id, cwd=cwd)
+            if result == "queued":
+                self.wake()
+        except asyncio.CancelledError:
+            # Maintenance shutdown may cancel the coroutine after its exact
+            # disposable turn is cleaned. Preserve the durable Run for replay;
+            # a user cancellation has already changed its generation/status.
+            try:
+                await runner.defer_versioned_run(run_id, generation)
+            finally:
+                raise
+        except PlanAgentCleanupError as exc:
+            logger.exception("Plan Run %s cleanup could not be confirmed", run_id)
+            await runner.fail_versioned_run(run_id, generation, str(exc))
+        except Exception as exc:
+            logger.exception("Plan Run %s failed", run_id)
+            await runner.fail_versioned_run(run_id, generation, str(exc))
+        finally:
+            try:
+                await _settle_despite_cancellation(
+                    self._cleanup_plan_run_owner(
+                        instance_id=instance_id,
+                        run_id=run_id,
+                        generation=generation,
+                    )
+                )
+            finally:
+                if self._running_tasks.get(instance_id) is lifecycle:
+                    self._running_tasks.pop(instance_id, None)
 
     async def _dispatch_loop(self):
         """Dispatch pending tasks, event-driven with a low-frequency poll fallback."""
@@ -2465,6 +2904,7 @@ class GlobalDispatcher:
                 try:
                     async with self.task_start_guard():
                         await self._dispatch_worker_tasks()
+                        await self._dispatch_worker_plan_runs()
                 except TaskStartPausedError:
                     pass
 
@@ -2475,34 +2915,67 @@ class GlobalDispatcher:
                     instance = None
                     claim_token = None
                     task = None
+                    plan_run_claim: tuple[int, int] | None = None
                     lifecycle_registered = False
                     try:
                         # The durable pending -> in_progress transition is the
                         # maintenance admission commit point.
                         async with self.task_start_guard():
                             async with self.db_factory() as db:
-                                instance, claim_token = (
-                                    await self._reserve_idle_instance(db)
-                                )
+                                (
+                                    instance,
+                                    claim_token,
+                                ) = await self._reserve_idle_instance(db)
                                 if instance is None or claim_token is None:
                                     break
                                 queue = TaskQueue(db)
                                 now = time.monotonic()
                                 self._account_routing_not_before = {
                                     task_id: deadline
-                                    for task_id, deadline
-                                    in self._account_routing_not_before.items()
+                                    for task_id, deadline in self._account_routing_not_before.items()
                                     if deadline > now
                                 }
-                                task = await queue.dequeue(
-                                    exclude_ids=set(
-                                        self._account_routing_not_before
-                                    ),
-                                    instance_id=instance.id,
-                                )
+                                if self._prefer_plan_runs:
+                                    plan_run_claim = await self._claim_plan_run(
+                                        db,
+                                        instance=instance,
+                                    )
+                                if plan_run_claim is None:
+                                    task = await queue.dequeue(
+                                        exclude_ids=set(
+                                            self._account_routing_not_before
+                                        ),
+                                        instance_id=instance.id,
+                                    )
+                                if task is None and plan_run_claim is None:
+                                    plan_run_claim = await self._claim_plan_run(
+                                        db,
+                                        instance=instance,
+                                    )
 
-                        if task is None:
+                        if task is None and plan_run_claim is None:
                             break
+
+                        if plan_run_claim is not None:
+                            run_id, run_generation = plan_run_claim
+                            logger.info(
+                                "Dispatching Plan Run %s generation %s to instance %s",
+                                run_id,
+                                run_generation,
+                                instance.id,
+                            )
+                            lifecycle = asyncio.create_task(
+                                self._run_plan_run_lifecycle(
+                                    instance.id,
+                                    run_id,
+                                    run_generation,
+                                )
+                            )
+                            setattr(lifecycle, "_ccm_plan_run_id", run_id)
+                            self._running_tasks[instance.id] = lifecycle
+                            self._prefer_plan_runs = False
+                            lifecycle_registered = True
+                            continue
 
                         # Resolve project -> target_repo + git config
                         merged: dict = {}
@@ -2531,12 +3004,21 @@ class GlobalDispatcher:
 
                         logger.info(
                             "Dispatching task %s (%s) to instance %s (%s)",
-                            task.id, task.title, instance.id, instance.name,
+                            task.id,
+                            task.title,
+                            instance.id,
+                            instance.name,
                         )
                         lifecycle = asyncio.create_task(
                             self._run_task_lifecycle(instance.id, task, git_env)
                         )
+                        # Task.instance_id remains as historical execution
+                        # metadata after a turn, while Instances are reusable.
+                        # Bind this lifecycle to its exact Task so a later Plan
+                        # on the same slot cannot block the old Task's chat.
+                        setattr(lifecycle, "_ccm_task_id", task.id)
                         self._running_tasks[instance.id] = lifecycle
+                        self._prefer_plan_runs = True
                         lifecycle_registered = True
                     except TaskStartPausedError:
                         break
@@ -2548,6 +3030,12 @@ class GlobalDispatcher:
                                     "dispatcher stopped before launch",
                                     instance_id=instance.id,
                                 )
+                        if plan_run_claim is not None and instance is not None:
+                            await self._cleanup_plan_run_owner(
+                                instance_id=instance.id,
+                                run_id=plan_run_claim[0],
+                                generation=plan_run_claim[1],
+                            )
                         raise
                     except Exception as exc:
                         logger.exception("Failed to prepare a claimed task for launch")
@@ -2562,9 +3050,16 @@ class GlobalDispatcher:
                                 from backend.services.task_events import (
                                     broadcast_status_change,
                                 )
+
                                 await broadcast_status_change(
                                     task.id, "pending", instance.id
                                 )
+                        if plan_run_claim is not None and instance is not None:
+                            await self._cleanup_plan_run_owner(
+                                instance_id=instance.id,
+                                run_id=plan_run_claim[0],
+                                generation=plan_run_claim[1],
+                            )
                     finally:
                         # Once registered, _running_tasks is the admission
                         # guard.  Otherwise this releases a failed/no-task
@@ -2585,14 +3080,10 @@ class GlobalDispatcher:
                     pass
 
             except asyncio.CancelledError:
-                await self._release_owned_instance_reservations(
-                    asyncio.current_task()
-                )
+                await self._release_owned_instance_reservations(asyncio.current_task())
                 break
             except Exception as e:
-                await self._release_owned_instance_reservations(
-                    asyncio.current_task()
-                )
+                await self._release_owned_instance_reservations(asyncio.current_task())
                 logger.error(f"Dispatch loop error: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
@@ -2602,6 +3093,7 @@ class GlobalDispatcher:
         取出后立即标 in_progress，防止 2 秒后重复转发；转发失败回 failed。
         """
         from backend.main import worker_proxy
+
         if worker_proxy is None:
             return
         from backend.models.worker import Worker as WorkerModel
@@ -2633,12 +3125,14 @@ class GlobalDispatcher:
                 continue  # worker 没就绪，留在 pending 等下轮
             # Check worker concurrency limit
             async with self.db_factory() as db:
-                running_on_worker = (await db.execute(
-                    select(func.count(Task.id)).where(
-                        Task.worker_id == worker.id,
-                        Task.status.in_(["in_progress", "executing"]),
+                running_on_worker = (
+                    await db.execute(
+                        select(func.count(Task.id)).where(
+                            Task.worker_id == worker.id,
+                            Task.status.in_(["in_progress", "executing"]),
+                        )
                     )
-                )).scalar() or 0
+                ).scalar() or 0
             if running_on_worker >= worker.max_tasks:
                 continue  # worker 已满，留在 pending 等下轮
             # 与本地路径一致：把 project.local_path 写进 target_repo——
@@ -2740,6 +3234,7 @@ class GlobalDispatcher:
         claimed_generation: _TaskStatusGeneration,
     ):
         from backend.main import worker_proxy
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -2747,13 +3242,23 @@ class GlobalDispatcher:
                 return
             except Exception as e:
                 if attempt < max_retries - 1:
-                    delay = 2 ** attempt
-                    logger.warning("forward task %s to worker failed (attempt %d/%d), retry in %ds: %s",
-                                   task.id, attempt + 1, max_retries, delay, e)
+                    delay = 2**attempt
+                    logger.warning(
+                        "forward task %s to worker failed (attempt %d/%d), retry in %ds: %s",
+                        task.id,
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        e,
+                    )
                     await asyncio.sleep(delay)
                 else:
-                    logger.error("forward task %s to worker failed after %d attempts: %s",
-                                 task.id, max_retries, e)
+                    logger.error(
+                        "forward task %s to worker failed after %d attempts: %s",
+                        task.id,
+                        max_retries,
+                        e,
+                    )
                     resulting_generation = None
                     async with self.db_factory() as db:
                         failed = await db.execute(
@@ -2768,16 +3273,13 @@ class GlobalDispatcher:
                                 status="failed",
                                 completed_at=datetime.utcnow(),
                                 error_message=(
-                                    "转发到 Worker 失败 "
-                                    f"({max_retries} 次重试): {e}"
+                                    f"转发到 Worker 失败 ({max_retries} 次重试): {e}"
                                 ),
                             )
                         )
                         if failed.rowcount:
                             resulting_generation = (
-                                await self._read_task_status_generation(
-                                    db, task.id
-                                )
+                                await self._read_task_status_generation(db, task.id)
                             )
                         await db.commit()
                     if resulting_generation is not None:
@@ -2785,6 +3287,261 @@ class GlobalDispatcher:
                             resulting_generation,
                             extra={"old_status": "in_progress"},
                         )
+
+    async def _dispatch_worker_plan_runs(self) -> None:
+        """Claim Manager-owned PlanRuns whose execution belongs to a Worker."""
+
+        from backend.main import worker_proxy
+        from backend.models.worker import Worker
+        from backend.services.plan_service import plan_operation_lock
+
+        if worker_proxy is None:
+            return
+        async with self.db_factory() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(PlanAgentRun.id, PlanAgentRun.plan_id)
+                        .join(Plan, Plan.id == PlanAgentRun.plan_id)
+                        .join(Worker, Worker.id == PlanAgentRun.worker_id)
+                        .where(
+                            PlanAgentRun.status == "queued",
+                            PlanAgentRun.worker_id.isnot(None),
+                            Plan.active_run_id == PlanAgentRun.id,
+                            Plan.archived_at.is_(None),
+                            Plan.worker_id == PlanAgentRun.worker_id,
+                            Worker.status == "ready",
+                        )
+                        .order_by(
+                            Plan.priority.asc(),
+                            PlanAgentRun.created_at.asc(),
+                            PlanAgentRun.id.asc(),
+                        )
+                    )
+                ).all()
+            )
+        for run_id, plan_id in rows:
+            key = f"worker-plan-{run_id}"
+            existing = self._running_tasks.get(key)
+            if existing is not None and not existing.done():
+                continue
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    current = await db.get(PlanAgentRun, run_id)
+                    plan = await db.get(Plan, plan_id)
+                    if (
+                        current is None
+                        or plan is None
+                        or current.status != "queued"
+                        or current.worker_id is None
+                        or plan.worker_id != current.worker_id
+                        or plan.active_run_id != current.id
+                    ):
+                        continue
+                    worker = await db.get(Worker, current.worker_id)
+                    if worker is None or worker.status != "ready":
+                        continue
+                    running_tasks = int(
+                        await db.scalar(
+                            select(func.count(Task.id)).where(
+                                Task.worker_id == worker.id,
+                                Task.status.in_(["in_progress", "executing"]),
+                            )
+                        )
+                        or 0
+                    )
+                    running_plans = int(
+                        await db.scalar(
+                            select(func.count(PlanAgentRun.id)).where(
+                                PlanAgentRun.worker_id == worker.id,
+                                PlanAgentRun.status == "running",
+                            )
+                        )
+                        or 0
+                    )
+                    if running_tasks + running_plans >= worker.max_tasks:
+                        continue
+                    generation = current.generation
+                    worker_id = current.worker_id
+                    claimed = await db.execute(
+                        update(PlanAgentRun)
+                        .where(
+                            PlanAgentRun.id == run_id,
+                            PlanAgentRun.plan_id == plan_id,
+                            PlanAgentRun.worker_id == worker_id,
+                            PlanAgentRun.status == "queued",
+                            PlanAgentRun.generation == generation,
+                        )
+                        .values(status="running", updated_at=datetime.utcnow())
+                    )
+                    if claimed.rowcount != 1:
+                        await db.rollback()
+                        continue
+                    await db.commit()
+            lifecycle = asyncio.create_task(
+                self._run_worker_plan_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                )
+            )
+            setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
+            self._running_tasks[key] = lifecycle
+            lifecycle.add_done_callback(
+                lambda finished, k=key: self._remove_running_task_if_same(k, finished)
+            )
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status="running",
+                stage=current.current_stage,
+                round_number=current.round,
+            )
+
+    @staticmethod
+    def _worker_plan_failure_is_permanent(exc: Exception) -> bool:
+        if isinstance(exc, HTTPException):
+            return exc.status_code < 500 and exc.status_code != 429
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            return status < 500 and status != 429
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "does not support versioned plan protocol",
+                "protocol mismatch",
+                "collides with local data",
+                "invalid plan run",
+                "invalid plan version",
+            )
+        )
+
+    async def _run_worker_plan_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+    ) -> None:
+        from backend.main import worker_proxy
+        from backend.services.plan_service import (
+            apply_worker_plan_outcome,
+            plan_operation_lock,
+        )
+
+        try:
+            async with self.db_factory() as db:
+                plan = await db.get(Plan, plan_id)
+                run = await db.get(PlanAgentRun, run_id)
+                if plan is None or run is None:
+                    return
+            payload = await worker_proxy.run_versioned_plan_until_pause(plan, run)
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    current_plan = await db.get(Plan, plan_id, with_for_update=True)
+                    current_run = await db.get(
+                        PlanAgentRun, run_id, with_for_update=True
+                    )
+                    if current_plan is None or current_run is None:
+                        return
+                    imported = await apply_worker_plan_outcome(
+                        db,
+                        plan=current_plan,
+                        run=current_run,
+                        worker_id=worker_id,
+                        expected_generation=generation,
+                        payload=payload,
+                    )
+                    status = imported.status
+                    stage = imported.current_stage
+                    round_number = imported.round
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status=status,
+                stage=stage,
+                round_number=round_number,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            permanent = self._worker_plan_failure_is_permanent(exc)
+            logger.exception(
+                "Worker Plan Run %s %s",
+                run_id,
+                "failed" if permanent else "was deferred",
+            )
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+                    plan = await db.get(Plan, plan_id, with_for_update=True)
+                    if (
+                        run is None
+                        or plan is None
+                        or run.status != "running"
+                        or run.generation != generation
+                        or run.worker_id != worker_id
+                        or plan.active_run_id != run.id
+                    ):
+                        return
+                    now = datetime.utcnow()
+                    if permanent:
+                        run.status = "failed"
+                        run.current_stage = "failed"
+                        run.error = str(exc)[:4000]
+                        run.finished_at = now
+                        plan.active_run_id = None
+                    else:
+                        run.status = "queued"
+                    run.updated_at = now
+                    plan.lock_version += 1
+                    plan.updated_at = now
+                    await db.commit()
+                    status = run.status
+                    stage = run.current_stage
+                    round_number = run.round
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status=status,
+                stage=stage,
+                round_number=round_number,
+            )
+
+    async def _broadcast_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        status: str,
+        stage: str,
+        round_number: int,
+    ) -> None:
+        try:
+            async with self.db_factory() as db:
+                plan = await db.get(Plan, plan_id)
+                target_task_id = plan.target_task_id if plan is not None else None
+            from backend.services.plan_events import broadcast_plan_event
+
+            await broadcast_plan_event(
+                event=(
+                    "plan_input_requested"
+                    if status == "waiting_user"
+                    else "plan_run_status_changed"
+                ),
+                plan_id=plan_id,
+                target_task_id=target_task_id,
+                broadcaster=self.broadcaster,
+                run_id=run_id,
+                status=status,
+                stage=stage,
+                round=round_number,
+            )
+        except Exception:
+            logger.exception("Failed to broadcast Worker Plan Run %s", run_id)
 
     async def _pool_select(
         self,
@@ -2822,9 +3579,7 @@ class GlobalDispatcher:
         if self.cloudrouter_store is None or not config_dir:
             return
         try:
-            account = self.cloudrouter_store.account_for_claude_config_dir(
-                config_dir
-            )
+            account = self.cloudrouter_store.account_for_claude_config_dir(config_dir)
         except Exception:
             logger.exception(
                 "Could not resolve auxiliary Claude account home %s",
@@ -2906,9 +3661,7 @@ class GlobalDispatcher:
                 )
             if (
                 preferred_owner_config_dir is not None
-                and self.pool.is_config_dir_available(
-                    preferred_owner_config_dir
-                )
+                and self.pool.is_config_dir_available(preferred_owner_config_dir)
                 and self.pool.supports_model_for_config_dir(
                     preferred_owner_config_dir, model
                 )
@@ -2930,9 +3683,7 @@ class GlobalDispatcher:
         if session_id:
             matches = self.pool.locate_session_config_dirs(session_id)
             resident: str | None = None
-            if bound_config_dir and (
-                not matches or bound_config_dir in matches
-            ):
+            if bound_config_dir and (not matches or bound_config_dir in matches):
                 # A just-started/hot PTY session may not have flushed its JSONL
                 # yet. The durable Task owner is still safer than drifting to a
                 # newly selected account where --resume cannot possibly find
@@ -2991,8 +3742,7 @@ class GlobalDispatcher:
                 and self.pool.supports_model_for_config_dir(resident, model)
             )
             if resident_available and (
-                preferred_config_dir is None
-                or preferred_config_dir == resident
+                preferred_config_dir is None or preferred_config_dir == resident
             ):
                 await self._persist_claude_binding_for_route(
                     task_id=task_id,
@@ -3013,20 +3763,17 @@ class GlobalDispatcher:
             )
             if config_dir:
                 if resident and resident != config_dir:
-                    await self._require_task_lifecycle_active(
-                        expected_generation
-                    )
+                    await self._require_task_lifecycle_active(expected_generation)
                     from backend.services.claude_pool import (
                         migrate_session_async,
                     )
+
                     migrated = await migrate_session_async(
                         old_config_dir=resident,
                         new_config_dir=config_dir,
                         session_id=session_id,
                     )
-                    await self._require_task_lifecycle_active(
-                        expected_generation
-                    )
+                    await self._require_task_lifecycle_active(expected_generation)
                     if not migrated:
                         if resident_available:
                             logger.error(
@@ -3060,8 +3807,8 @@ class GlobalDispatcher:
             # --resume finds the conversation instead of hard-failing on a wrong
             # (inherited) account dir.
             if resident:
-                compatible_account_exists = (
-                    self.pool.has_compatible_enabled_account(model)
+                compatible_account_exists = self.pool.has_compatible_enabled_account(
+                    model
                 )
                 retryable_account_exists = (
                     compatible_account_exists
@@ -3069,27 +3816,21 @@ class GlobalDispatcher:
                 )
                 routing_error_kwargs = {
                     "retry_after": (
-                        CODEX_ROUTING_RETRY_DELAY
-                        if retryable_account_exists
-                        else None
+                        CODEX_ROUTING_RETRY_DELAY if retryable_account_exists else None
                     ),
                     "permanent": not retryable_account_exists,
                 }
-                if (
-                    self.pool.is_known_account(resident)
-                    and not self.pool.supports_model_for_config_dir(
-                        resident, model
-                    )
-                ):
+                if self.pool.is_known_account(
+                    resident
+                ) and not self.pool.supports_model_for_config_dir(resident, model):
                     raise ClaudeAccountRoutingError(
                         f"Claude session is resident on a CloudRouter account "
                         f"that does not support model {model!r}, and no "
                         "compatible replacement is currently available",
                         **routing_error_kwargs,
                     )
-                if (
-                    self.pool.is_known_account(resident)
-                    and self.pool.is_disabled(resident)
+                if self.pool.is_known_account(resident) and self.pool.is_disabled(
+                    resident
                 ):
                     raise ClaudeAccountRoutingError(
                         "Claude session is resident on a disabled account and "
@@ -3107,7 +3848,8 @@ class GlobalDispatcher:
                     "Pool exhausted; resuming session %s on its resident account "
                     "dir %s (account may be rate-limited, but --resume can still "
                     "find the conversation)",
-                    session_id, resident,
+                    session_id,
+                    resident,
                 )
                 await self._persist_claude_binding_for_route(
                     task_id=task_id,
@@ -3119,9 +3861,7 @@ class GlobalDispatcher:
         # Fresh launch (no session to anchor): just pick a healthy account.
         config_dir = self.pool.select(validate=False, model=model)
         if config_dir is None and self.pool._accounts:
-            compatible_account_exists = (
-                self.pool.has_compatible_enabled_account(model)
-            )
+            compatible_account_exists = self.pool.has_compatible_enabled_account(model)
             retryable_account_exists = (
                 compatible_account_exists
                 and self.pool.has_retryable_compatible_account(model)
@@ -3139,9 +3879,7 @@ class GlobalDispatcher:
                 f"Claude pool has {detail} {model!r}; refusing to fall back "
                 "to the service default account",
                 retry_after=(
-                    CODEX_ROUTING_RETRY_DELAY
-                    if retryable_account_exists
-                    else None
+                    CODEX_ROUTING_RETRY_DELAY if retryable_account_exists else None
                 ),
                 permanent=not retryable_account_exists,
             )
@@ -3185,24 +3923,16 @@ class GlobalDispatcher:
             statement = select(Task).where(Task.id == task_id)
             if expected_generation is not None:
                 if getattr(expected_generation, "status", None) is None:
-                    expected_predicates = (
-                        self._task_lifecycle_generation_predicates(
-                            expected_generation
-                        )
+                    expected_predicates = self._task_lifecycle_generation_predicates(
+                        expected_generation
                     )
                 else:
                     expected_predicates = [
-                        *self._task_status_generation_predicates(
-                            expected_generation
-                        ),
+                        *self._task_status_generation_predicates(expected_generation),
                         task_retry_not_superseded_predicate(),
                     ]
-                statement = statement.where(
-                    *expected_predicates
-                )
-            task = (
-                await db.execute(statement.with_for_update())
-            ).scalar_one_or_none()
+                statement = statement.where(*expected_predicates)
+            task = (await db.execute(statement.with_for_update())).scalar_one_or_none()
             if not task:
                 return False
             metadata = dict(task.metadata_ or {})
@@ -3345,21 +4075,17 @@ class GlobalDispatcher:
             return True, cancellation
         except BaseException:
             logger.exception(
-                "Codex routing rollback failed for task %s thread %s "
-                "(%s -> %s)",
+                "Codex routing rollback failed for task %s thread %s (%s -> %s)",
                 task_id,
                 session_id,
                 target_home,
                 source_home,
             )
             try:
-                clear_owner, clear_cancellation = (
-                    await _settle_despite_cancellation(
-                        self.instance_manager
-                        .clear_codex_thread_owner_for_recovery(
-                            session_id,
-                            expected_codex_home=target_home,
-                        )
+                clear_owner, clear_cancellation = await _settle_despite_cancellation(
+                    self.instance_manager.clear_codex_thread_owner_for_recovery(
+                        session_id,
+                        expected_codex_home=target_home,
                     )
                 )
                 if cancellation is None:
@@ -3367,8 +4093,7 @@ class GlobalDispatcher:
                 clear_owner.result()
             except BaseException:
                 logger.exception(
-                    "Codex routing could not clear stale owner for task %s "
-                    "thread %s",
+                    "Codex routing could not clear stale owner for task %s thread %s",
                     task_id,
                     session_id,
                 )
@@ -3402,24 +4127,18 @@ class GlobalDispatcher:
             bound = False
             binding_error = exc
 
-        lost_binding = (
-            task_id is not None
-            and account_id is not None
-            and not bound
-        )
+        lost_binding = task_id is not None and account_id is not None and not bound
         if (
             (binding_error is not None or lost_binding)
             and session_id
             and source_home
             and target_home
         ):
-            _, rollback_cancellation = (
-                await self._rollback_codex_rebind_for_recovery(
-                    task_id=task_id,
-                    session_id=session_id,
-                    source_home=source_home,
-                    target_home=target_home,
-                )
+            _, rollback_cancellation = await self._rollback_codex_rebind_for_recovery(
+                task_id=task_id,
+                session_id=session_id,
+                source_home=source_home,
+                target_home=target_home,
             )
             if cancellation is None:
                 cancellation = rollback_cancellation
@@ -3486,9 +4205,7 @@ class GlobalDispatcher:
                 target_home=target_home,
             )
 
-        operation, cancellation = await _settle_despite_cancellation(
-            transition()
-        )
+        operation, cancellation = await _settle_despite_cancellation(transition())
         try:
             result = operation.result()
         except BaseException as exc:
@@ -3564,9 +4281,7 @@ class GlobalDispatcher:
                 expected_generation=expected_generation,
             )
 
-        operation, cancellation = await _settle_despite_cancellation(
-            transition()
-        )
+        operation, cancellation = await _settle_despite_cancellation(transition())
         try:
             result = operation.result()
         except BaseException as exc:
@@ -3667,7 +4382,10 @@ class GlobalDispatcher:
                 logger.warning(
                     "Repairing stale Codex account binding for task %s session %s: "
                     "%s -> %s",
-                    task_id, session_id, canonical_bound, resident,
+                    task_id,
+                    session_id,
+                    canonical_bound,
+                    resident,
                 )
             elif preferred_owner_home in matches:
                 resident = preferred_owner_home
@@ -3767,7 +4485,11 @@ class GlobalDispatcher:
                     "otherwise available accounts are temporarily busy",
                     retry_after=CODEX_ROUTING_RETRY_DELAY,
                 )
-            if resident and pool.is_known_account(resident) and pool.is_home_enabled(resident):
+            if (
+                resident
+                and pool.is_known_account(resident)
+                and pool.is_home_enabled(resident)
+            ):
                 retry_after = self._codex_pool_retry_after()
                 raise CodexAccountRoutingError(
                     f"Codex pool is cooling down; task {task_id} session "
@@ -3809,7 +4531,10 @@ class GlobalDispatcher:
                 logger.exception(
                     "Refusing to switch Codex task %s session %s from %s to %s "
                     "because its rollout could not be migrated safely",
-                    task_id, session_id, resident, target,
+                    task_id,
+                    session_id,
+                    resident,
+                    target,
                 )
                 if resident_available:
                     await self._persist_codex_binding_for_route(
@@ -3844,8 +4569,11 @@ class GlobalDispatcher:
         once and pass the combined text into both detectors.
         """
         from backend.services.claude_pool import collect_process_output_for_detection
+
         stderr = self.instance_manager.get_last_stderr(instance_id)
-        log_contents = await self.instance_manager.get_recent_log_contents(task_id, limit=10)
+        log_contents = await self.instance_manager.get_recent_log_contents(
+            task_id, limit=10
+        )
         return collect_process_output_for_detection(stderr, log_contents)
 
     async def _check_rate_limit_and_rotate(
@@ -3892,7 +4620,11 @@ class GlobalDispatcher:
         if not self.pool:
             return None
 
-        from backend.services.claude_pool import is_pool_rotatable, is_auth_failure, is_rate_limited
+        from backend.services.claude_pool import (
+            is_pool_rotatable,
+            is_auth_failure,
+            is_rate_limited,
+        )
         from backend.services.claude_pool import (
             collect_process_output_for_detection,
             migrate_session_async,
@@ -3900,7 +4632,9 @@ class GlobalDispatcher:
 
         if combined is None:
             stderr = self.instance_manager.get_last_stderr(instance_id)
-            log_contents = await self.instance_manager.get_recent_log_contents(task_id, limit=10)
+            log_contents = await self.instance_manager.get_recent_log_contents(
+                task_id, limit=10
+            )
             combined = collect_process_output_for_detection(stderr, log_contents)
         await self._require_task_lifecycle_active(expected_generation)
 
@@ -3918,12 +4652,16 @@ class GlobalDispatcher:
             # Launched on the default account (no explicit config_dir) —
             # rotation must still work; the default dir is a pool member.
             import os as _os
+
             old_config_dir = _os.path.expanduser("~/.claude")
 
         # Mark the old account
         if is_auth_failure(combined) or cloudrouter_auth_failed:
             self.pool.mark_auth_failure(old_config_dir)
-            logger.warning("Pool account %s auth failure, marked indefinite cooldown", old_config_dir)
+            logger.warning(
+                "Pool account %s auth failure, marked indefinite cooldown",
+                old_config_dir,
+            )
         elif is_rate_limited(combined):
             self.pool.mark_rate_limited(old_config_dir)
             logger.info("Pool account %s rate-limited, marked cooldown", old_config_dir)
@@ -3938,7 +4676,9 @@ class GlobalDispatcher:
         )
         await self._require_task_lifecycle_active(expected_generation)
         if not new_config_dir:
-            logger.warning("Pool exhausted — no alternative account for task %d", task_id)
+            logger.warning(
+                "Pool exhausted — no alternative account for task %d", task_id
+            )
             return None
 
         # Get session_id for --resume
@@ -3992,23 +4732,29 @@ class GlobalDispatcher:
 
         # Broadcast pool rotation event
         await self._require_task_lifecycle_active(expected_generation)
-        await self.broadcaster.broadcast(f"task:{task_id}", {
-            "event_type": "pool_rotation",
-            "old_account": old_account_id,
-            "new_account": self.pool.account_id_from_config_dir(new_config_dir),
-            "reason": (
-                "rate_limit"
-                if is_rate_limited(combined) and not cloudrouter_auth_failed
-                else "auth_failure"
-            ),
-        })
-        await self.broadcaster.broadcast("system", {
-            "event": "pool_rotation",
-            "task_id": task_id,
-            "instance_id": instance_id,
-            "old_account": old_account_id,
-            "new_account": self.pool.account_id_from_config_dir(new_config_dir),
-        })
+        await self.broadcaster.broadcast(
+            f"task:{task_id}",
+            {
+                "event_type": "pool_rotation",
+                "old_account": old_account_id,
+                "new_account": self.pool.account_id_from_config_dir(new_config_dir),
+                "reason": (
+                    "rate_limit"
+                    if is_rate_limited(combined) and not cloudrouter_auth_failed
+                    else "auth_failure"
+                ),
+            },
+        )
+        await self.broadcaster.broadcast(
+            "system",
+            {
+                "event": "pool_rotation",
+                "task_id": task_id,
+                "instance_id": instance_id,
+                "old_account": old_account_id,
+                "new_account": self.pool.account_id_from_config_dir(new_config_dir),
+            },
+        )
 
         return {
             "config_dir": new_config_dir,
@@ -4057,9 +4803,7 @@ class GlobalDispatcher:
                 else await db.get(Task, task_id)
             )
             session_id = task.session_id if task else None
-            bound_id = (
-                (task.metadata_ or {}).get("codex_account_id") if task else None
-            )
+            bound_id = (task.metadata_ or {}).get("codex_account_id") if task else None
             task_model = task.model if task else None
             task_service_tier = (
                 task.codex_service_tier
@@ -4127,8 +4871,7 @@ class GlobalDispatcher:
                 # unambiguous pool copy, but never guess among migrated copies.
                 if len(matches) != 1:
                     logger.error(
-                        "Cannot identify a unique Codex rollout for task %s "
-                        "session %s",
+                        "Cannot identify a unique Codex rollout for task %s session %s",
                         task_id,
                         session_id,
                     )
@@ -4152,7 +4895,8 @@ class GlobalDispatcher:
             except CodexSessionMigrationError:
                 logger.exception(
                     "Codex rollout migration failed for task %s session %s",
-                    task_id, session_id,
+                    task_id,
+                    session_id,
                 )
                 raise CodexAccountRoutingError(
                     f"Codex rollout migration failed for task {task_id} "
@@ -4162,7 +4906,8 @@ class GlobalDispatcher:
             except (CodexAppServerBusyError, CodexThreadHomeMismatchError):
                 logger.exception(
                     "Codex app-server refused account rebind for task %s session %s",
-                    task_id, session_id,
+                    task_id,
+                    session_id,
                 )
                 raise CodexAccountRoutingError(
                     f"Codex app-server could not rebind task {task_id} session "
@@ -4180,21 +4925,27 @@ class GlobalDispatcher:
             )
         await self._require_task_lifecycle_active(expected_generation)
         reason = "auth_failure" if auth_failed else "rate_limit"
-        await self.broadcaster.broadcast(f"task:{task_id}", {
-            "event_type": "pool_rotation",
-            "provider": "codex",
-            "old_account": old_account_id,
-            "new_account": new_account_id,
-            "reason": reason,
-        })
-        await self.broadcaster.broadcast("system", {
-            "event": "pool_rotation",
-            "provider": "codex",
-            "task_id": task_id,
-            "instance_id": instance_id,
-            "old_account": old_account_id,
-            "new_account": new_account_id,
-        })
+        await self.broadcaster.broadcast(
+            f"task:{task_id}",
+            {
+                "event_type": "pool_rotation",
+                "provider": "codex",
+                "old_account": old_account_id,
+                "new_account": new_account_id,
+                "reason": reason,
+            },
+        )
+        await self.broadcaster.broadcast(
+            "system",
+            {
+                "event": "pool_rotation",
+                "provider": "codex",
+                "task_id": task_id,
+                "instance_id": instance_id,
+                "old_account": old_account_id,
+                "new_account": new_account_id,
+            },
+        )
         return {
             "config_dir": new_home,
             "session_id": session_id,
@@ -4225,7 +4976,9 @@ class GlobalDispatcher:
             parts.append(secrets_block)
         if image_paths:
             image_list = "\n".join(f"- {p}" for p in image_paths)
-            parts.append(f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}")
+            parts.append(
+                f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}"
+            )
         command, command_args = _initial_task_command(task)
         task_description = task.description
         if command:
@@ -4305,9 +5058,7 @@ class GlobalDispatcher:
 
         process = self.instance_manager.processes.get(instance_id)
         if process:
-            await self._wait_process(
-                process, task, label, instance_id=instance_id
-            )
+            await self._wait_process(process, task, label, instance_id=instance_id)
         await self._wait_output_consumer(instance_id, task, label, process)
         return self._effective_process_exit_code(instance_id, process)
 
@@ -4367,9 +5118,7 @@ class GlobalDispatcher:
 
             process = self.instance_manager.processes.get(instance_id)
             if process:
-                await self._wait_process(
-                    process, task, label, instance_id=instance_id
-                )
+                await self._wait_process(process, task, label, instance_id=instance_id)
             await self._wait_output_consumer(instance_id, task, label, process)
             exit_code = self._effective_process_exit_code(instance_id, process)
             if not await self._task_claim_is_active(generation):
@@ -4401,7 +5150,9 @@ class GlobalDispatcher:
             current_session = rotation.get("session_id") or current_session
             logger.info(
                 "%s for task %s rotating account and retrying native session %s",
-                label, task.id, current_session,
+                label,
+                task.id,
+                current_session,
             )
 
         return -1, current_home
@@ -4451,9 +5202,7 @@ class GlobalDispatcher:
                 active = (
                     await db.execute(
                         select(Task.id).where(
-                            *self._task_status_generation_predicates(
-                                generation
-                            ),
+                            *self._task_status_generation_predicates(generation),
                             task_retry_not_superseded_predicate(),
                         )
                     )
@@ -4698,9 +5447,7 @@ class GlobalDispatcher:
         async def publish_with_session(session) -> bool:
             guarded = await session.execute(
                 update(Task)
-                .where(
-                    *self._task_status_generation_predicates(generation)
-                )
+                .where(*self._task_status_generation_predicates(generation))
                 .values(status=generation.status)
             )
             if not guarded.rowcount:
@@ -4763,9 +5510,7 @@ class GlobalDispatcher:
         async with self.db_factory() as db:
             claimed = await db.execute(
                 update(Task)
-                .where(
-                    *self._task_lifecycle_generation_predicates(generation)
-                )
+                .where(*self._task_lifecycle_generation_predicates(generation))
                 .values(status="executing")
             )
             await db.commit()
@@ -4796,9 +5541,7 @@ class GlobalDispatcher:
                 changed = await db.execute(
                     update(Task)
                     .where(
-                        *self._task_status_generation_predicates(
-                            observed_generation
-                        ),
+                        *self._task_status_generation_predicates(observed_generation),
                         task_retry_not_superseded_predicate(),
                     )
                     .values(
@@ -4815,9 +5558,7 @@ class GlobalDispatcher:
                 changed = await db.execute(
                     update(Task)
                     .where(
-                        *self._task_status_generation_predicates(
-                            observed_generation
-                        ),
+                        *self._task_status_generation_predicates(observed_generation),
                         task_retry_not_superseded_predicate(),
                     )
                     .values(
@@ -4881,16 +5622,12 @@ class GlobalDispatcher:
             )
             if task is None:
                 return False, False
-            background_active = (
-                task.pty_background_generation is not None
-            )
+            background_active = task.pty_background_generation is not None
             observed_generation = self._task_status_generation(task)
             changed = await db.execute(
                 update(Task)
                 .where(
-                    *self._task_status_generation_predicates(
-                        observed_generation
-                    ),
+                    *self._task_status_generation_predicates(observed_generation),
                     task_retry_not_superseded_predicate(),
                 )
                 .values(
@@ -4908,9 +5645,7 @@ class GlobalDispatcher:
                 await db.execute(
                     update(Instance)
                     .where(Instance.id == generation.instance_id)
-                    .values(
-                        total_tasks_completed=Instance.total_tasks_completed + 1
-                    )
+                    .values(total_tasks_completed=Instance.total_tasks_completed + 1)
                 )
             resulting_generation = await self._read_task_status_generation(
                 db, generation.task_id
@@ -4960,9 +5695,7 @@ class GlobalDispatcher:
             changed = await db.execute(
                 update(Task)
                 .where(
-                    *self._task_status_generation_predicates(
-                        observed_generation
-                    ),
+                    *self._task_status_generation_predicates(observed_generation),
                     task_retry_not_superseded_predicate(),
                 )
                 .values(
@@ -5010,9 +5743,7 @@ class GlobalDispatcher:
                     task_id,
                     reason[:500],
                     instance_id=instance_id,
-                    generation_fence=self._task_lifecycle_queue_fence(
-                        generation
-                    ),
+                    generation_fence=self._task_lifecycle_queue_fence(generation),
                 )
         except BaseException:
             self._account_routing_not_before.pop(task_id, None)
@@ -5022,21 +5753,27 @@ class GlobalDispatcher:
             # terminal task merely because account routing also failed.
             self._account_routing_not_before.pop(task_id, None)
             logger.info(
-                "Skipped account routing deferral for inactive task %s", task_id,
+                "Skipped account routing deferral for inactive task %s",
+                task_id,
             )
             return
 
-        await self.broadcaster.broadcast("tasks", {
-            "event": "status_change",
-            "task_id": task_id,
-            "new_status": "pending",
-            "instance_id": instance_id,
-            "reason": "codex_account_wait",
-            "retry_after": round(delay, 1),
-        })
+        await self.broadcaster.broadcast(
+            "tasks",
+            {
+                "event": "status_change",
+                "task_id": task_id,
+                "new_status": "pending",
+                "instance_id": instance_id,
+                "reason": "codex_account_wait",
+                "retry_after": round(delay, 1),
+            },
+        )
         logger.warning(
             "Deferred task %s for %.1fs while account routing recovers: %s",
-            task_id, delay, reason,
+            task_id,
+            delay,
+            reason,
         )
 
         asyncio.get_running_loop().call_later(delay, self.wake)
@@ -5071,15 +5808,21 @@ class GlobalDispatcher:
         )
         logger.info(
             "Task %d transient 429/overload — waiting %.0fs before retry #%d/%d",
-            task.id, delay, attempt, settings.transient_retry_max,
+            task.id,
+            delay,
+            attempt,
+            settings.transient_retry_max,
         )
-        await self.broadcaster.broadcast(f"task:{task.id}", {
-            "event_type": "transient_retry",
-            "task_id": task.id,
-            "attempt": attempt,
-            "max_attempts": settings.transient_retry_max,
-            "delay": round(delay, 1),
-        })
+        await self.broadcaster.broadcast(
+            f"task:{task.id}",
+            {
+                "event_type": "transient_retry",
+                "task_id": task.id,
+                "attempt": attempt,
+                "max_attempts": settings.transient_retry_max,
+                "delay": round(delay, 1),
+            },
+        )
         await asyncio.sleep(delay)
 
         if not await self._task_claim_is_active(generation):
@@ -5097,8 +5840,15 @@ class GlobalDispatcher:
             session_id = current.session_id or task.session_id
 
         exit_code = await self._relaunch_and_wait(
-            instance_id, task, generation, cwd, git_env, config_dir, session_id,
-            thinking_budget=thinking_budget, effort_level=effort_level,
+            instance_id,
+            task,
+            generation,
+            cwd,
+            git_env,
+            config_dir,
+            session_id,
+            thinking_budget=thinking_budget,
+            effort_level=effort_level,
             label=f"Transient retry #{attempt}",
         )
         if not await self._task_claim_is_active(generation):
@@ -5118,7 +5868,9 @@ class GlobalDispatcher:
             )
             if not changed:
                 return
-            logger.info("Task %d recovered after %d transient retry(ies)", task.id, attempt)
+            logger.info(
+                "Task %d recovered after %d transient retry(ies)", task.id, attempt
+            )
             return
 
         # Still failing — keep backing off while it's transient and budget
@@ -5134,11 +5886,16 @@ class GlobalDispatcher:
                     instance_id,
                     (task.provider or "claude").lower(),
                     combined,
-                ) is True
+                )
+                is True
             )
         ):
             await self._run_transient_retry(
-                instance_id, task, generation, cwd, git_env,
+                instance_id,
+                task,
+                generation,
+                cwd,
+                git_env,
                 thinking_budget=thinking_budget,
                 effort_level=effort_level,
                 attempt=attempt + 1,
@@ -5157,9 +5914,16 @@ class GlobalDispatcher:
         )
         if rotation:
             await self._run_pool_retry(
-                instance_id, task, generation, cwd, git_env,
-                rotation["config_dir"], rotation["session_id"], rotation["excluded"],
-                thinking_budget=thinking_budget, effort_level=effort_level,
+                instance_id,
+                task,
+                generation,
+                cwd,
+                git_env,
+                rotation["config_dir"],
+                rotation["session_id"],
+                rotation["excluded"],
+                thinking_budget=thinking_budget,
+                effort_level=effort_level,
             )
             return
 
@@ -5169,7 +5933,9 @@ class GlobalDispatcher:
             reason = f"Exit code: {exit_code} after {attempt} transient retry(ies)"
         await self._retry_or_fail_mode_task(generation, reason)
 
-    async def _run_task_lifecycle(self, instance_id: int, task: Task, git_env: dict | None = None):
+    async def _run_task_lifecycle(
+        self, instance_id: int, task: Task, git_env: dict | None = None
+    ):
         """Execute the task lifecycle: assign → Claude Code → judge result.
 
         Claude Code handles worktree creation, git operations, and cleanup
@@ -5218,6 +5984,7 @@ class GlobalDispatcher:
             # 不 commit（由 agent 的正常 git 流程带入），幂等且绝不阻断任务。
             if not review_task:
                 from backend.services.agent_docs import ensure_agents_md
+
                 ensure_agents_md(task.target_repo or cwd)
             thinking_budget = task.thinking_budget
             effort_level = task.effort_level or settings.default_effort
@@ -5282,9 +6049,7 @@ class GlobalDispatcher:
                                 current.model,
                                 current.codex_service_tier,
                             )
-                            original_task_skills = dict(
-                                current.enabled_skills or {}
-                            )
+                            original_task_skills = dict(current.enabled_skills or {})
                             # The command/prompt belongs to the dequeued lifecycle
                             # generation; only its persistent skill baseline is
                             # refreshed here.  Mixing a concurrently edited
@@ -5306,8 +6071,7 @@ class GlobalDispatcher:
                             initial_skill_overrides = {
                                 key: value
                                 for key, value in launch_skills.items()
-                                if original_task_skills.get(key, missing_skill)
-                                != value
+                                if original_task_skills.get(key, missing_skill) != value
                             }
                             initial_skill_token = (
                                 secrets.token_urlsafe(24)
@@ -5321,15 +6085,13 @@ class GlobalDispatcher:
                                 # calls create_sub_agent. Publish the temporary
                                 # command skill in the ownership transaction.
                                 current.enabled_skills = launch_skills
-                                temporary_metadata = dict(
-                                    current.metadata_ or {}
+                                temporary_metadata = dict(current.metadata_ or {})
+                                temporary_metadata[TEMP_SKILLS_GENERATION_KEY] = (
+                                    initial_skill_token
                                 )
-                                temporary_metadata[
-                                    TEMP_SKILLS_GENERATION_KEY
-                                ] = initial_skill_token
                                 current.metadata_ = temporary_metadata
-                    executing_generation = (
-                        await self._read_task_status_generation(db, task.id)
+                    executing_generation = await self._read_task_status_generation(
+                        db, task.id
                     )
                 await db.commit()
             if routing_sync_pending:
@@ -5346,12 +6108,11 @@ class GlobalDispatcher:
             if not claimed.rowcount or executing_generation is None:
                 logger.info(
                     "Task %s launch claim on instance %s was superseded",
-                    task.id, instance_id,
+                    task.id,
+                    instance_id,
                 )
                 return
-            lifecycle_generation = self._task_lifecycle_generation(
-                executing_generation
-            )
+            lifecycle_generation = self._task_lifecycle_generation(executing_generation)
             # Launch and cleanup must use the same post-barrier snapshots,
             # including ordinary user saves that won the race before claim.
             task.enabled_skills = launch_skills
@@ -5457,17 +6218,14 @@ class GlobalDispatcher:
             # buffered output before judging the result. Without this the
             # task can be marked completed while the last chunk of Claude's
             # reply is still being parsed/broadcast.
-            await self._wait_output_consumer(
-                instance_id, task, "Task run", process
-            )
+            await self._wait_output_consumer(instance_id, task, "Task run", process)
 
             exit_code = self._effective_process_exit_code(instance_id, process)
 
             # === Step 5: Judge result ===
             if not await self._task_claim_is_active(lifecycle_generation):
                 logger.info(
-                    "Task %s lifecycle was superseded before result "
-                    "classification",
+                    "Task %s lifecycle was superseded before result classification",
                     task.id,
                 )
                 return
@@ -5476,7 +6234,9 @@ class GlobalDispatcher:
             # Keep session alive so user can resume via chat.
             interrupted = exit_code in (-2, 130)
             if interrupted:
-                logger.info(f"Task {task.id} was interrupted by user (exit_code={exit_code})")
+                logger.info(
+                    f"Task {task.id} was interrupted by user (exit_code={exit_code})"
+                )
                 await self._complete_owned_task(lifecycle_generation)
                 return
 
@@ -5484,9 +6244,16 @@ class GlobalDispatcher:
             # persistent session alive, so it reports exit_code 0. The per-turn
             # flag (set in _process_event) is the reliable cross-mode signal →
             # wait + retry the same account before judging success/failure.
-            if settings.transient_retry_enabled and self.instance_manager.transient_error_seen(instance_id):
+            if (
+                settings.transient_retry_enabled
+                and self.instance_manager.transient_error_seen(instance_id)
+            ):
                 await self._run_transient_retry(
-                    instance_id, task, lifecycle_generation, cwd, git_env,
+                    instance_id,
+                    task,
+                    lifecycle_generation,
+                    cwd,
+                    git_env,
                     thinking_budget=thinking_budget,
                     effort_level=effort_level,
                 )
@@ -5495,9 +6262,8 @@ class GlobalDispatcher:
             # PTY proactive pool switch: turn finished OK but an actionable
             # rate_limit_event was observed → migrate session to a healthy
             # account before judging success (next retry/turn uses fresh quota).
-            if (
-                pty_managed_turn
-                and self.instance_manager.pty_rate_limit_seen(instance_id)
+            if pty_managed_turn and self.instance_manager.pty_rate_limit_seen(
+                instance_id
             ):
                 await self.instance_manager._try_proactive_pool_switch(
                     instance_id,
@@ -5511,6 +6277,7 @@ class GlobalDispatcher:
 
             if exit_code != 0:
                 from backend.services.claude_pool import is_transient_for
+
                 combined = await self._collect_failure_output(instance_id, task.id)
 
                 # Transient overload that only surfaced on stderr (subprocess
@@ -5521,10 +6288,15 @@ class GlobalDispatcher:
                         instance_id,
                         (task.provider or "claude").lower(),
                         combined,
-                    ) is True
+                    )
+                    is True
                 ):
                     await self._run_transient_retry(
-                        instance_id, task, lifecycle_generation, cwd, git_env,
+                        instance_id,
+                        task,
+                        lifecycle_generation,
+                        cwd,
+                        git_env,
                         thinking_budget=thinking_budget,
                         effort_level=effort_level,
                     )
@@ -5540,8 +6312,13 @@ class GlobalDispatcher:
                 )
                 if rotation:
                     await self._run_pool_retry(
-                        instance_id, task, lifecycle_generation, cwd, git_env,
-                        rotation["config_dir"], rotation["session_id"],
+                        instance_id,
+                        task,
+                        lifecycle_generation,
+                        cwd,
+                        git_env,
+                        rotation["config_dir"],
+                        rotation["session_id"],
                         rotation["excluded"],
                         thinking_budget=thinking_budget,
                         effort_level=effort_level,
@@ -5564,7 +6341,9 @@ class GlobalDispatcher:
                                     "compacting session",
                                     task.id,
                                 )
-                                summary = await self._compact_session(task.id, t.session_id, db)
+                                summary = await self._compact_session(
+                                    task.id, t.session_id, db
+                                )
                                 if summary:
                                     compacted = await db.execute(
                                         update(Task)
@@ -5586,12 +6365,15 @@ class GlobalDispatcher:
                                     )
                                     await db.commit()
                                     if compacted.rowcount:
-                                        await self.broadcaster.broadcast("tasks", {
-                                            "event": "status_change",
-                                            "task_id": task.id,
-                                            "new_status": "pending",
-                                            "instance_id": instance_id,
-                                        })
+                                        await self.broadcaster.broadcast(
+                                            "tasks",
+                                            {
+                                                "event": "status_change",
+                                                "task_id": task.id,
+                                                "new_status": "pending",
+                                                "instance_id": instance_id,
+                                            },
+                                        )
                                     return
                     except Exception:
                         logger.exception(
@@ -5606,23 +6388,25 @@ class GlobalDispatcher:
                 return
 
             # === Claude Code completed successfully ===
-            completed, background_active = (
-                await self._complete_owned_task_result(
+            completed, background_active = await self._complete_owned_task_result(
                 lifecycle_generation,
                 count_completion=True,
-                )
             )
             if not completed:
                 return
 
-            logger.info(f"Task {task.id} ({task.title}) completed successfully on instance {instance_id}")
+            logger.info(
+                f"Task {task.id} ({task.title}) completed successfully on instance {instance_id}"
+            )
 
             if not background_active:
                 await self._handle_pr_review_completion(task)
 
         except asyncio.CancelledError:
             lifecycle_cancelled = True
-            logger.info(f"Lifecycle cancelled for task {task.id} on instance {instance_id}")
+            logger.info(
+                f"Lifecycle cancelled for task {task.id} on instance {instance_id}"
+            )
             if not self._shutting_down:
                 async with self.db_factory() as db:
                     deferred = await TaskQueue(db).defer(
@@ -5630,15 +6414,14 @@ class GlobalDispatcher:
                         "dispatcher stopped",
                         instance_id=instance_id,
                         generation_fence=(
-                            self._task_lifecycle_queue_fence(
-                                lifecycle_generation
-                            )
+                            self._task_lifecycle_queue_fence(lifecycle_generation)
                             if lifecycle_generation is not None
                             else None
                         ),
                     )
                 if deferred:
                     from backend.services.task_events import broadcast_status_change
+
                     await broadcast_status_change(task.id, "pending", instance_id)
             raise
         except TaskLifecycleSupersededError:
@@ -5671,7 +6454,8 @@ class GlobalDispatcher:
             if e.permanent:
                 logger.error(
                     "Permanent Codex account routing error for task %s: %s",
-                    task.id, e,
+                    task.id,
+                    e,
                 )
                 if lifecycle_generation is not None:
                     await self._fail_owned_task(
@@ -5705,15 +6489,14 @@ class GlobalDispatcher:
                         f"instance admission race: {e}"[:500],
                         instance_id=instance_id,
                         generation_fence=(
-                            self._task_lifecycle_queue_fence(
-                                lifecycle_generation
-                            )
+                            self._task_lifecycle_queue_fence(lifecycle_generation)
                             if lifecycle_generation is not None
                             else None
                         ),
                     )
                 if deferred:
                     from backend.services.task_events import broadcast_status_change
+
                     await broadcast_status_change(task.id, "pending", instance_id)
                 return
             logger.error(f"Lifecycle error for task {task.id}: {e}", exc_info=True)
@@ -5726,6 +6509,7 @@ class GlobalDispatcher:
                     await self._handle_pr_review_failure(task, str(e))
         finally:
             from backend.services.mcp_config import cleanup_mcp_config
+
             cleanup_mcp_config(task.id)
             _cleanup_skill_prompt_files(task.id)
             if has_temporary_initial_skills:
@@ -5744,37 +6528,33 @@ class GlobalDispatcher:
                                 task.id,
                                 populate_existing=True,
                             )
-                            metadata = dict(
-                                current.metadata_ or {}
-                            ) if current is not None else {}
+                            metadata = (
+                                dict(current.metadata_ or {})
+                                if current is not None
+                                else {}
+                            )
                             if (
                                 current is None
-                                or metadata.get(
-                                    TEMP_SKILLS_GENERATION_KEY
-                                )
+                                or metadata.get(TEMP_SKILLS_GENERATION_KEY)
                                 != initial_skill_token
                             ):
                                 await db.rollback()
                             else:
-                                skills = dict(
-                                    current.enabled_skills or {}
-                                )
+                                skills = dict(current.enabled_skills or {})
                                 missing = object()
-                                for key, temporary_value in (
-                                    initial_skill_overrides.items()
-                                ):
-                                    if (
-                                        skills.get(key, missing)
-                                        != temporary_value
-                                    ):
+                                for (
+                                    key,
+                                    temporary_value,
+                                ) in initial_skill_overrides.items():
+                                    if skills.get(key, missing) != temporary_value:
                                         continue
                                     if key in original_task_skills:
                                         skills[key] = original_task_skills[key]
                                     else:
                                         skills.pop(key, None)
                                 current.enabled_skills = skills
-                                current.metadata_ = (
-                                    clear_temporary_skills_marker(metadata)
+                                current.metadata_ = clear_temporary_skills_marker(
+                                    metadata
                                 )
                                 await db.commit()
                 except Exception:
@@ -5793,12 +6573,10 @@ class GlobalDispatcher:
                     and lifecycle_generation is not None
                     and not (lifecycle_cancelled and self._shutting_down)
                 ):
-                    reset, reset_cancellation = (
-                        await _settle_despite_cancellation(
-                            self._reset_instance_if_stale(
-                                instance_id,
-                                lifecycle_generation,
-                            )
+                    reset, reset_cancellation = await _settle_despite_cancellation(
+                        self._reset_instance_if_stale(
+                            instance_id,
+                            lifecycle_generation,
                         )
                     )
                     reset.result()
@@ -6083,9 +6861,7 @@ class GlobalDispatcher:
         try:
             if generation.instance_id != instance_id:
                 return
-            lifecycle_lock = self.instance_manager._instance_lifecycle_lock(
-                instance_id
-            )
+            lifecycle_lock = self.instance_manager._instance_lifecycle_lock(instance_id)
             async with lifecycle_lock:
                 # ``is_running`` covers more exact-generation evidence than the
                 # parent process map alone: a terminal parent may still have a
@@ -6095,10 +6871,7 @@ class GlobalDispatcher:
                 if isinstance(running_result, bool) and running_result:
                     return
                 current_process = self.instance_manager.processes.get(instance_id)
-                if (
-                    current_process is not None
-                    and current_process.returncode is None
-                ):
+                if current_process is not None and current_process.returncode is None:
                     return
 
                 async with self.db_factory() as db:
@@ -6119,26 +6892,23 @@ class GlobalDispatcher:
                             .with_for_update()
                         )
                     ).scalar_one_or_none()
-                    if (
-                        owner is not None
-                        and owner.current_task_id
-                        not in (None, generation.task_id)
+                    if owner is not None and owner.current_task_id not in (
+                        None,
+                        generation.task_id,
                     ):
                         return
 
                     resulting_generation = None
                     task_reset = None
-                    if (
-                        task_owner is not None
-                        and task_owner.status in ("executing", "in_progress")
+                    if task_owner is not None and task_owner.status in (
+                        "executing",
+                        "in_progress",
                     ):
                         observed_task = self._task_status_generation(task_owner)
                         task_reset = await db.execute(
                             update(Task)
                             .where(
-                                *self._task_status_generation_predicates(
-                                    observed_task
-                                ),
+                                *self._task_status_generation_predicates(observed_task),
                                 task_retry_not_superseded_predicate(),
                             )
                             .values(
@@ -6160,8 +6930,7 @@ class GlobalDispatcher:
                         (
                             Instance.current_task_id.is_(None)
                             if owner.current_task_id is None
-                            else Instance.current_task_id
-                            == owner.current_task_id
+                            else Instance.current_task_id == owner.current_task_id
                         ),
                         (
                             Instance.pid.is_(None)
@@ -6185,11 +6954,9 @@ class GlobalDispatcher:
                         await db.rollback()
                         return
                     if task_reset is not None:
-                        resulting_generation = (
-                            await self._read_task_status_generation(
-                                db,
-                                generation.task_id,
-                            )
+                        resulting_generation = await self._read_task_status_generation(
+                            db,
+                            generation.task_id,
                         )
                         if resulting_generation is None:
                             await db.rollback()
@@ -6198,7 +6965,8 @@ class GlobalDispatcher:
                 if instance_reset.rowcount:
                     logger.warning(
                         "Safety reset inactive owner: instance %s / task %s",
-                        instance_id, generation.task_id,
+                        instance_id,
+                        generation.task_id,
                     )
                 if resulting_generation is not None:
                     await self._broadcast_task_status_generation(
@@ -6210,6 +6978,74 @@ class GlobalDispatcher:
                 "Failed to safety-reset instance %s / task %s",
                 instance_id,
                 generation.task_id,
+            )
+        finally:
+            await self._reconcile_superseded_reverse_task_owners(generation.task_id)
+
+    async def _reconcile_superseded_reverse_task_owners(
+        self,
+        task_id: int,
+    ) -> None:
+        """Release dead retry owners after Task authority moved elsewhere.
+
+        A failed lifecycle can durably advance a Task to its next retry before
+        its own ``finally`` runs. The ordinary exact-generation reset must then
+        refuse to adopt the newer Task row, but its dead reverse Instance owner
+        still needs a later exact cleanup. Snapshot only non-authoritative
+        reverse owners here; ``InstanceManager`` revalidates the Task, PID,
+        start identity, runtime maps, and launch reservations under its
+        per-instance lock before changing anything.
+        """
+
+        try:
+            async with self.db_factory() as db:
+                task = await db.get(Task, task_id)
+                if (
+                    task is None
+                    or task.worker_id is not None
+                    or task.shared_from_id is not None
+                    or (
+                        task.status in {"in_progress", "executing"}
+                        and task.instance_id is None
+                    )
+                ):
+                    return
+                authoritative_instance_id = task.instance_id
+                candidate_predicates = [
+                    Instance.current_task_id == task_id,
+                ]
+                if authoritative_instance_id is not None:
+                    candidate_predicates.append(
+                        Instance.id != authoritative_instance_id
+                    )
+                candidates = list(
+                    (
+                        await db.execute(
+                            select(
+                                Instance.id,
+                                Instance.pid,
+                                Instance.started_at,
+                            )
+                            .where(*candidate_predicates)
+                            .order_by(Instance.id)
+                        )
+                    ).all()
+                )
+                await db.rollback()
+
+            for candidate in candidates:
+                await self.instance_manager.reconcile_dead_reverse_task_owner(
+                    candidate.id,
+                    expected_task_id=task_id,
+                    expected_pid=candidate.pid,
+                    expected_started_at=candidate.started_at,
+                )
+        except Exception:
+            # The stale row remains a deployment/capacity blocker, so a failed
+            # reconciliation is fail-closed and can be retried safely.
+            logger.exception(
+                "Failed to reconcile superseded reverse owners for task %s",
+                task_id,
             )
 
     async def _run_pool_retry(
@@ -6235,7 +7071,10 @@ class GlobalDispatcher:
         """
         logger.info(
             "Pool retry #%d for task %d: switching to %s (session=%s)",
-            _rotation_count, task.id, config_dir, session_id,
+            _rotation_count,
+            task.id,
+            config_dir,
+            session_id,
         )
 
         if not await self._task_claim_is_active(generation):
@@ -6246,8 +7085,15 @@ class GlobalDispatcher:
             return
 
         exit_code = await self._relaunch_and_wait(
-            instance_id, task, generation, cwd, git_env, config_dir, session_id,
-            thinking_budget=thinking_budget, effort_level=effort_level,
+            instance_id,
+            task,
+            generation,
+            cwd,
+            git_env,
+            config_dir,
+            session_id,
+            thinking_budget=thinking_budget,
+            effort_level=effort_level,
             label="Pool retry run",
         )
         if not await self._task_claim_is_active(generation):
@@ -6260,7 +7106,11 @@ class GlobalDispatcher:
                 count_completion=exit_code == 0,
             )
             if changed and exit_code == 0:
-                logger.info("Task %d completed after %d pool rotation(s)", task.id, _rotation_count)
+                logger.info(
+                    "Task %d completed after %d pool rotation(s)",
+                    task.id,
+                    _rotation_count,
+                )
             return
 
         # Failed again — try another rotation if budget remains
@@ -6274,8 +7124,13 @@ class GlobalDispatcher:
             if rotation:
                 merged_excluded = excluded | rotation["excluded"]
                 await self._run_pool_retry(
-                    instance_id, task, generation, cwd, git_env,
-                    rotation["config_dir"], rotation["session_id"],
+                    instance_id,
+                    task,
+                    generation,
+                    cwd,
+                    git_env,
+                    rotation["config_dir"],
+                    rotation["session_id"],
                     merged_excluded,
                     thinking_budget=thinking_budget,
                     effort_level=effort_level,
@@ -6325,14 +7180,19 @@ class GlobalDispatcher:
                     )
                     sid = t.session_id if t else None
                 if sid:
-                    release = getattr(self.instance_manager, "release_pty_session", None)
+                    release = getattr(
+                        self.instance_manager, "release_pty_session", None
+                    )
                     if release is not None:
                         result = release(sid)
                         import inspect as _inspect
+
                         if _inspect.isawaitable(result):
                             await result
             except Exception:
-                logger.exception("Failed to release loop PTY session for task %d", task.id)
+                logger.exception(
+                    "Failed to release loop PTY session for task %d", task.id
+                )
 
     async def _run_loop_iterations(
         self,
@@ -6350,7 +7210,6 @@ class GlobalDispatcher:
         telling us whether to continue, stop (done), or give up (abort).
         The backend never parses the todo file — Claude owns that logic entirely.
         """
-        import json
         from pathlib import Path
 
         signal_path = Path(cwd) / ".claude-manager" / f"loop_signal_{task.id}.json"
@@ -6385,14 +7244,21 @@ class GlobalDispatcher:
                 else:
                     fail_msg = f"超出最大迭代次数限制 ({max_iterations})"
                 await self._fail_owned_task(generation, fail_msg)
-                logger.warning(f"Loop task {task.id} exceeded max iterations ({max_iterations}), aborting")
+                logger.warning(
+                    f"Loop task {task.id} exceeded max iterations ({max_iterations}), aborting"
+                )
                 return
 
             # Clear signal file so we can detect if Claude fails to write one
             signal_path.unlink(missing_ok=True)
 
             prompt = self._build_loop_prompt(
-                task, iteration, str(signal_path), history, anchored_total, plan,
+                task,
+                iteration,
+                str(signal_path),
+                history,
+                anchored_total,
+                plan,
             )
 
             # PTY mode: iterations after the first reuse the same hot session
@@ -6422,7 +7288,10 @@ class GlobalDispatcher:
                 codex_service_tier=task.codex_service_tier,
             )
 
-            iteration_exit_code, config_dir = await self._launch_mode_turn_with_rotation(
+            (
+                iteration_exit_code,
+                config_dir,
+            ) = await self._launch_mode_turn_with_rotation(
                 instance_id,
                 task,
                 generation,
@@ -6478,11 +7347,7 @@ class GlobalDispatcher:
                 async with self.db_factory() as db:
                     progress_updated = await db.execute(
                         update(Task)
-                        .where(
-                            *self._task_lifecycle_generation_predicates(
-                                generation
-                            )
-                        )
+                        .where(*self._task_lifecycle_generation_predicates(generation))
                         .values(loop_progress=signal["progress"])
                     )
                     await db.commit()
@@ -6507,20 +7372,25 @@ class GlobalDispatcher:
                 plan = signal["plan"]
 
             # Collect iteration history for subsequent prompts
-            history.append({
-                "iteration": iteration + 1,
-                "progress": progress_str,
-                "summary": signal.get("summary", ""),
-            })
+            history.append(
+                {
+                    "iteration": iteration + 1,
+                    "progress": progress_str,
+                    "summary": signal.get("summary", ""),
+                }
+            )
 
             # Broadcast iteration result so frontend can update the panel header
-            await self.broadcaster.broadcast(f"task:{task.id}", {
-                "event": "loop_iteration_end",
-                "iteration": iteration,
-                "action": signal.get("action", "abort"),
-                "reason": signal.get("reason", ""),
-                "progress": signal.get("progress"),
-            })
+            await self.broadcaster.broadcast(
+                f"task:{task.id}",
+                {
+                    "event": "loop_iteration_end",
+                    "iteration": iteration,
+                    "action": signal.get("action", "abort"),
+                    "reason": signal.get("reason", ""),
+                    "progress": signal.get("progress"),
+                },
+            )
 
             action = signal.get("action")
 
@@ -6547,19 +7417,26 @@ class GlobalDispatcher:
                     generation,
                     count_completion=True,
                 )
-                logger.info(f"Loop task {task.id} completed after {iteration + 1} iteration(s)")
+                logger.info(
+                    f"Loop task {task.id} completed after {iteration + 1} iteration(s)"
+                )
                 break
 
             else:
                 # "abort" or missing/malformed signal — P1: retry if attempts remain
-                reason = signal.get("reason") or "Claude did not write a valid loop signal"
+                reason = (
+                    signal.get("reason") or "Claude did not write a valid loop signal"
+                )
                 status = await self._retry_or_fail_mode_task(
                     generation,
                     reason,
                 )
                 logger.warning(
                     "Loop task %s aborted at iteration %s -> %s: %s",
-                    task.id, iteration, status or "superseded", reason,
+                    task.id,
+                    iteration,
+                    status or "superseded",
+                    reason,
                 )
                 break
 
@@ -6587,8 +7464,7 @@ class GlobalDispatcher:
         if provider != "codex":
             return (
                 provider,
-                task.goal_evaluator_model
-                or settings.default_goal_evaluator_model,
+                task.goal_evaluator_model or settings.default_goal_evaluator_model,
                 "default",
             )
 
@@ -6613,8 +7489,7 @@ class GlobalDispatcher:
                 )
         else:
             evaluator_model = (
-                task.goal_evaluator_model
-                or settings.default_codex_goal_evaluator_model
+                task.goal_evaluator_model or settings.default_codex_goal_evaluator_model
             )
             if evaluator_model == "default":
                 evaluator_model = settings.default_codex_model
@@ -6716,9 +7591,7 @@ class GlobalDispatcher:
                 if evaluation_home is None:
                     detail = (
                         "no enabled account supports"
-                        if not pool.has_compatible_enabled_account(
-                            evaluator_model
-                        )
+                        if not pool.has_compatible_enabled_account(evaluator_model)
                         else "no compatible pool account is currently available for"
                     )
                     raise GoalEvaluationError(
@@ -6742,6 +7615,7 @@ class GlobalDispatcher:
                     provider=provider,
                 )
             try:
+
                 async def evaluate_with_home(
                     admitted_home,
                     *,
@@ -6769,19 +7643,11 @@ class GlobalDispatcher:
                     evaluator_model,
                     service_tier=evaluator_service_tier,
                 ):
-                    if (
-                        provider == "codex"
-                        and evaluator_service_tier == "priority"
-                    ):
-                        async with (
-                            self.instance_manager.codex_home_app_server_guard(
-                                evaluation_home,
-                            )
+                    if provider == "codex" and evaluator_service_tier == "priority":
+                        async with self.instance_manager.codex_home_app_server_guard(
+                            evaluation_home,
                         ) as admitted_home:
-                            registry = (
-                                self.instance_manager
-                                ._ensure_codex_app_server_registry()
-                            )
+                            registry = self.instance_manager._ensure_codex_app_server_registry()
                             result = await evaluate_with_home(
                                 admitted_home,
                                 codex_app_server_registry=registry,
@@ -6800,10 +7666,7 @@ class GlobalDispatcher:
                 # failed provider turns still count as real recent usage.
                 if exc.returncode is not None:
                     record_evaluator_route()
-                if (
-                    provider != "codex"
-                    or rotation_attempt > 0
-                ):
+                if provider != "codex" or rotation_attempt > 0:
                     raise
                 if not await self._task_claim_is_active(generation):
                     raise
@@ -6816,7 +7679,8 @@ class GlobalDispatcher:
 
                 classifier_exit_code = (
                     exc.returncode
-                    if isinstance(exc.returncode, int) and exc.returncode not in (0, -2, 130)
+                    if isinstance(exc.returncode, int)
+                    and exc.returncode not in (0, -2, 130)
                     else 1
                 )
                 rotation = await self._check_rate_limit_and_rotate(
@@ -6997,11 +7861,7 @@ class GlobalDispatcher:
             async with self.db_factory() as db:
                 progress_updated = await db.execute(
                     update(Task)
-                    .where(
-                        *self._task_lifecycle_generation_predicates(
-                            generation
-                        )
-                    )
+                    .where(*self._task_lifecycle_generation_predicates(generation))
                     .values(
                         goal_turns_used=turn,
                         goal_last_reason=eval_result.reason,
@@ -7017,19 +7877,25 @@ class GlobalDispatcher:
                 return
 
             # Broadcast evaluation result
-            await self.broadcaster.broadcast(f"task:{task.id}", {
-                "event_type": "goal_evaluation",
-                "turn": turn,
-                "max_turns": max_turns,
-                "achieved": eval_result.achieved,
-                "reason": eval_result.reason,
-            })
-            await self.broadcaster.broadcast("tasks", {
-                "event": "goal_evaluation",
-                "task_id": task.id,
-                "turn": turn,
-                "achieved": eval_result.achieved,
-            })
+            await self.broadcaster.broadcast(
+                f"task:{task.id}",
+                {
+                    "event_type": "goal_evaluation",
+                    "turn": turn,
+                    "max_turns": max_turns,
+                    "achieved": eval_result.achieved,
+                    "reason": eval_result.reason,
+                },
+            )
+            await self.broadcaster.broadcast(
+                "tasks",
+                {
+                    "event": "goal_evaluation",
+                    "task_id": task.id,
+                    "turn": turn,
+                    "achieved": eval_result.achieved,
+                },
+            )
 
             if eval_result.achieved:
                 await self._complete_owned_task(
@@ -7052,7 +7918,9 @@ class GlobalDispatcher:
         image_paths = metadata.get("image_paths") or []
         if image_paths:
             image_list = "\n".join(f"- {p}" for p in image_paths)
-            parts.append(f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}")
+            parts.append(
+                f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}"
+            )
 
         parts.append(f"任务:\n{task.description}")
         parts.append(
@@ -7110,7 +7978,9 @@ class GlobalDispatcher:
         parts = []
         for content, iteration in rows:
             if content:
-                turn_label = f"[Turn {(iteration or 0) + 1}] " if iteration is not None else ""
+                turn_label = (
+                    f"[Turn {(iteration or 0) + 1}] " if iteration is not None else ""
+                )
                 parts.append(f"{turn_label}{content}")
 
         summary = "\n\n".join(parts)
@@ -7118,9 +7988,15 @@ class GlobalDispatcher:
             summary = summary[-15000:]
         return summary
 
-    def _build_loop_prompt(self, task: Task, iteration: int, signal_path: str,
-                           history: list[dict] | None = None, anchored_total: int | None = None,
-                           plan: str | None = None) -> str:
+    def _build_loop_prompt(
+        self,
+        task: Task,
+        iteration: int,
+        signal_path: str,
+        history: list[dict] | None = None,
+        anchored_total: int | None = None,
+        plan: str | None = None,
+    ) -> str:
         """Build the per-iteration prompt for a loop task.
 
         Only describes todo-related responsibilities. Git/commit/worktree lifecycle
@@ -7160,7 +8036,11 @@ class GlobalDispatcher:
             progress_hint = "已完成数/总数"
 
         # Signal template: plan field for must_complete, without for normal
-        plan_field = ', "plan": "后续每轮计划（简洁，如需调整则更新，无变化则留空）"' if task.must_complete else ""
+        plan_field = (
+            ', "plan": "后续每轮计划（简洁，如需调整则更新，无变化则留空）"'
+            if task.must_complete
+            else ""
+        )
 
         if task.must_complete and iteration == 0:
             # First iteration of must_complete: require planning
@@ -7197,7 +8077,9 @@ class GlobalDispatcher:
                 if last_progress:
                     try:
                         done_count = int(last_progress.split("/")[0])
-                        remaining_items = f"，还剩 {anchored_total - done_count} 项未完成"
+                        remaining_items = (
+                            f"，还剩 {anchored_total - done_count} 项未完成"
+                        )
                     except (IndexError, ValueError):
                         pass
 
@@ -7262,6 +8144,7 @@ class GlobalDispatcher:
         """
         import json
         from pathlib import Path
+
         try:
             return json.loads(Path(signal_path).read_text(encoding="utf-8"))
         except Exception as e:
@@ -7290,8 +8173,13 @@ class GlobalDispatcher:
             resume_sid = t.session_id if t else None
 
         if not resume_sid:
-            logger.warning(f"Loop task {task.id} iter {iteration}: signal missing and no session_id to resume")
-            return {"action": "abort", "reason": "Signal file missing and no session to resume"}
+            logger.warning(
+                f"Loop task {task.id} iter {iteration}: signal missing and no session_id to resume"
+            )
+            return {
+                "action": "abort",
+                "reason": "Signal file missing and no session to resume",
+            }
 
         fix_prompt = (
             f"你刚才完成了工作但忘记写信号文件。请检查 {task.todo_file_path} 的当前状态，"
@@ -7313,7 +8201,9 @@ class GlobalDispatcher:
             codex_service_tier=task.codex_service_tier,
         )
 
-        logger.info(f"Loop task {task.id} iter {iteration}: resuming session {resume_sid} to fix missing signal")
+        logger.info(
+            f"Loop task {task.id} iter {iteration}: resuming session {resume_sid} to fix missing signal"
+        )
         exit_code, _ = await self._launch_mode_turn_with_rotation(
             instance_id,
             task,
@@ -7344,59 +8234,79 @@ class GlobalDispatcher:
         git_env: dict | None = None,
         effort_level: str | None = None,
     ):
-        """Run plan phase for plan-mode tasks."""
+        """Run the independent, read-only Planner/Reviewer pipeline."""
         if not await self._ensure_owned_executing(generation):
             return
-        plan_prompt = (
-            f"Please analyze the following task and create a detailed plan. "
-            f"Do NOT execute any changes, only describe what you would do:\n\n{task.description}"
+
+        from backend.services.plan_agent_runner import (
+            PlanAgentCleanupError,
+            PlanAgentRunner,
+            PlanRouteUnavailable,
         )
-        config_dir = await self._resolve_resume_config_dir(
-            task.session_id,
-            task.provider,
-            task_id=task.id,
-            expected_generation=generation,
-            **({"model": task.model} if task.model else {}),
-            codex_service_tier=task.codex_service_tier,
+        from backend.services.plan_tasks import capture_repo_revision
+
+        if task.plan_repo_revision is None:
+            initial_revision = await capture_repo_revision(cwd)
+            async with self.db_factory() as db:
+                current = await self._read_owned_lifecycle_task(db, generation)
+                if current is None:
+                    return
+                current.plan_repo_revision = initial_revision
+                await db.commit()
+                task.plan_repo_revision = initial_revision
+
+        runner = PlanAgentRunner(
+            db_factory=self.db_factory,
+            instance_manager=self.instance_manager,
+            claude_pool=self.pool,
+            codex_pool=self.codex_pool,
+            cloudrouter_store=self.cloudrouter_store,
+            broadcaster=self.broadcaster,
         )
-        exit_code, config_dir = await self._launch_mode_turn_with_rotation(
-            instance_id,
-            task,
-            generation,
-            cwd,
-            git_env,
-            prompt=plan_prompt,
-            config_dir=config_dir,
-            resume_session_id=task.session_id,
-            loop_iteration=None,
-            effort_level=effort_level,
-            label="Plan phase",
-        )
-        if exit_code not in (0, -2, 130):
+        try:
+            result = await runner.run(task, cwd=cwd)
+        except asyncio.CancelledError:
+            raise
+        except PlanAgentCleanupError:
+            # A surviving process tree is not safe to retry automatically.
+            logger.exception(
+                "Plan Agent cleanup failed for task %s",
+                task.id,
+            )
+            await self._fail_owned_task(
+                generation,
+                "Plan Agent cleanup could not be confirmed",
+            )
+            return
+        except PlanRouteUnavailable as exc:
+            # Primary and fallback routes already exhausted every compatible
+            # account. The product contract is terminal failure, not another
+            # generic Task retry that repeats the same unavailable routes.
+            logger.warning(
+                "Plan Agent routes unavailable for task %s: %s",
+                task.id,
+                exc,
+            )
+            await self._fail_owned_task(generation, str(exc))
+            return
+        except Exception as exc:
+            logger.exception("Plan Agent pipeline failed for task %s", task.id)
             await self._retry_or_fail_mode_task(
                 generation,
-                f"Plan phase failed (exit code {exit_code})",
+                f"Plan Agent pipeline failed: {exc}",
             )
             return
-        if exit_code in (-2, 130):
-            return
 
-        # Collect plan content from logs
         async with self.db_factory() as db:
-            from sqlalchemy import select as sa_select
-            from backend.models.log_entry import LogEntry
-            result = await db.execute(
-                sa_select(LogEntry.content)
-                .where(
-                    LogEntry.task_id == task.id,
-                    LogEntry.event_type == "message",
-                    LogEntry.role == "assistant",
-                )
-                .order_by(LogEntry.id)
+            plan_metadata = dict(task.metadata_ or {})
+            plan_metadata.update(
+                {
+                    "plan_agent_run_id": result.run_id,
+                    "plan_review_verdict": result.verdict,
+                    "plan_review_feedback": result.feedback,
+                    "plan_review_exhausted": result.review_exhausted,
+                }
             )
-            plan_texts = [r[0] for r in result.all() if r[0]]
-            plan_content = "\n".join(plan_texts)
-
             plan_ready = await db.execute(
                 update(Task)
                 .where(
@@ -7405,16 +8315,24 @@ class GlobalDispatcher:
                         statuses=("executing",),
                     )
                 )
-                .values(plan_content=plan_content, status="plan_review")
+                .values(
+                    plan_content=result.plan_content,
+                    status="plan_review",
+                    error_message=None,
+                    metadata_=plan_metadata,
+                )
             )
             await db.commit()
 
         if plan_ready.rowcount:
-            await self.broadcaster.broadcast("tasks", {
-                "event": "plan_ready",
-                "task_id": task.id,
-                "instance_id": instance_id,
-            })
+            await self.broadcaster.broadcast(
+                "tasks",
+                {
+                    "event": "plan_ready",
+                    "task_id": task.id,
+                    "instance_id": instance_id,
+                },
+            )
 
     # -----------------------------------------------------------------------
     # Monitor Session lifecycle
@@ -7448,9 +8366,8 @@ class GlobalDispatcher:
     def _aux_process_reaped(cls, process: asyncio.subprocess.Process) -> bool:
         """Return true only when both the parent and its exact group are gone."""
 
-        return (
-            process.returncode is not None
-            and not cls._aux_process_group_alive(process)
+        return process.returncode is not None and not cls._aux_process_group_alive(
+            process
         )
 
     @staticmethod
@@ -7563,9 +8480,7 @@ class GlobalDispatcher:
             and not lifecycle.done()
         ):
             lifecycle.cancel()
-            _, pending = await asyncio.wait(
-                {lifecycle}, timeout=lifecycle_timeout
-            )
+            _, pending = await asyncio.wait({lifecycle}, timeout=lifecycle_timeout)
             lifecycle_timed_out = bool(pending)
             if not lifecycle_timed_out:
                 await asyncio.gather(lifecycle, return_exceptions=True)
@@ -7617,15 +8532,13 @@ class GlobalDispatcher:
 
         log_fh = open(log_path, "wb")
         try:
-            process, delayed_cancellation = (
-                await self._settle_aux_process_spawn(
-                    *cmd,
-                    stdout=log_fh,
-                    stderr=log_fh,
-                    cwd=cwd,
-                    env=env,
-                    start_new_session=True,
-                )
+            process, delayed_cancellation = await self._settle_aux_process_spawn(
+                *cmd,
+                stdout=log_fh,
+                stderr=log_fh,
+                cwd=cwd,
+                env=env,
+                start_new_session=True,
             )
         except BaseException:
             log_fh.close()
@@ -7664,8 +8577,7 @@ class GlobalDispatcher:
                     log_map.pop(session_id, None)
                 log_fh.close()
                 logger.critical(
-                    "Retaining unreaped auxiliary process evidence: "
-                    "session=%s pid=%s",
+                    "Retaining unreaped auxiliary process evidence: session=%s pid=%s",
                     session_id,
                     process.pid,
                 )
@@ -7754,20 +8666,14 @@ class GlobalDispatcher:
             cleanup_pending,
         ) in rows:
             home_matches = bool(
-                persisted_home
-                and normalize_codex_home(persisted_home) == target
+                persisted_home and normalize_codex_home(persisted_home) == target
             )
             account_matches = bool(
-                account_id is not None
-                and persisted_account_id == account_id
+                account_id is not None and persisted_account_id == account_id
             )
             if not home_matches and not account_matches:
                 continue
-            if (
-                status == "running"
-                or thread_id is not None
-                or cleanup_pending
-            ):
+            if status == "running" or thread_id is not None or cleanup_pending:
                 blockers.add(f"monitor {session_id}")
         return sorted(blockers)
 
@@ -7793,8 +8699,7 @@ class GlobalDispatcher:
             delayed_cancellation = exc
         except Exception:
             logger.exception(
-                "Failed to prove auxiliary process group reaped: "
-                "session=%s pid=%s",
+                "Failed to prove auxiliary process group reaped: session=%s pid=%s",
                 session_id,
                 candidate.pid,
             )
@@ -7808,8 +8713,7 @@ class GlobalDispatcher:
             # apparently free session slot by dropping its only evidence.
             process_map.setdefault(session_id, candidate)
             logger.critical(
-                "Retaining unreaped auxiliary process evidence: "
-                "session=%s pid=%s",
+                "Retaining unreaped auxiliary process evidence: session=%s pid=%s",
                 session_id,
                 candidate.pid,
             )
@@ -7846,9 +8750,7 @@ class GlobalDispatcher:
                 )
                 if (
                     not reaped
-                    and getattr(self, "_monitor_turn_handles", {}).get(
-                        session_id
-                    )
+                    and getattr(self, "_monitor_turn_handles", {}).get(session_id)
                     is handle
                 ):
                     raise RuntimeError(
@@ -7863,22 +8765,17 @@ class GlobalDispatcher:
                         session_id,
                     )
 
-        if (
-            session_id not in self._monitor_processes
-            and session_id
-            not in getattr(self, "_monitor_turn_handles", {})
+        if session_id not in self._monitor_processes and session_id not in getattr(
+            self, "_monitor_turn_handles", {}
         ):
             getattr(self, "_monitor_active_turns", set()).discard(session_id)
 
         if terminal:
             try:
-                cleaned = await self._cleanup_codex_monitor_thread(
-                    session_id
-                )
+                cleaned = await self._cleanup_codex_monitor_thread(session_id)
                 if not cleaned:
                     raise RuntimeError(
-                        "Codex Monitor terminal thread cleanup remains "
-                        "pending"
+                        "Codex Monitor terminal thread cleanup remains pending"
                     )
             except BaseException as exc:
                 # Cleanup state and the exact identity remain durable for the
@@ -7888,8 +8785,7 @@ class GlobalDispatcher:
                     stop_error = exc
                 else:
                     logger.exception(
-                        "Additional Codex Monitor thread cleanup failure: "
-                        "session=%s",
+                        "Additional Codex Monitor thread cleanup failure: session=%s",
                         session_id,
                     )
 
@@ -7912,14 +8808,10 @@ class GlobalDispatcher:
                 process,
                 reason=reason,
             )
-        terminal = (
-            process is None
-            or getattr(process, "returncode", None) is not None
-        )
+        terminal = process is None or getattr(process, "returncode", None) is not None
         handles = getattr(self, "_monitor_turn_handles", {})
         uncommitted_thread = (
-            handle.codex_created_thread
-            and not handle.codex_identity_committed
+            handle.codex_created_thread and not handle.codex_identity_committed
         )
         if (
             terminal
@@ -7974,11 +8866,13 @@ class GlobalDispatcher:
         registry = self.instance_manager._ensure_codex_app_server_registry()
         transport_removed = False
         if candidate is not None and getattr(candidate, "returncode", None) is None:
-            transport_removed = bool(await registry.abort_unclaimed_turn(
-                home,
-                candidate,
-                reason=reason,
-            ))
+            transport_removed = bool(
+                await registry.abort_unclaimed_turn(
+                    home,
+                    candidate,
+                    reason=reason,
+                )
+            )
 
         if thread_id is not None and not transport_removed:
             await registry.delete_thread(home, thread_id)
@@ -8025,8 +8919,7 @@ class GlobalDispatcher:
                     MonitorSession.agent_type == "monitor",
                     MonitorSession.source == "ccm",
                     MonitorSession.status == "running",
-                    MonitorSession.active_turn_generation
-                    == handle.generation,
+                    MonitorSession.active_turn_generation == handle.generation,
                     MonitorSession.codex_thread_id.is_(None),
                     MonitorSession.codex_home.is_(None),
                 )
@@ -8142,20 +9035,16 @@ class GlobalDispatcher:
                 async with self.instance_manager.codex_home_app_server_guard(
                     codex_home
                 ) as admitted_home:
-                    registry = (
-                        self.instance_manager
-                        ._ensure_codex_app_server_registry()
-                    )
+                    registry = self.instance_manager._ensure_codex_app_server_registry()
                     await registry.delete_thread(admitted_home, thread_id)
             except Exception as exc:
                 if not self._codex_thread_already_absent(exc):
                     cleanup_error = exc
 
             if cleanup_error is not None:
-                message = (
-                    "Codex Monitor thread cleanup failed: "
-                    f"{cleanup_error}"
-                )[:2000]
+                message = (f"Codex Monitor thread cleanup failed: {cleanup_error}")[
+                    :2000
+                ]
                 async with self.db_factory() as db:
                     await db.execute(
                         update(MonitorSession)
@@ -8207,8 +9096,7 @@ class GlobalDispatcher:
                 await db.commit()
             if cleared.rowcount:
                 logger.info(
-                    "Codex Monitor thread deleted: session=%s thread=%s "
-                    "home=%s",
+                    "Codex Monitor thread deleted: session=%s thread=%s home=%s",
                     monitor_session_id,
                     thread_id,
                     codex_home,
@@ -8226,10 +9114,7 @@ class GlobalDispatcher:
 
         from backend.models.monitor_session import MonitorSession
 
-        message = (
-            "Codex Monitor MCP runtime recycle failed: "
-            f"{error}"
-        )[:2000]
+        message = (f"Codex Monitor MCP runtime recycle failed: {error}")[:2000]
         now = datetime.utcnow()
         task_id: int | None = None
         async with self.db_factory() as db:
@@ -8303,8 +9188,7 @@ class GlobalDispatcher:
                     or session.active_turn_generation is not None
                 ):
                     raise RuntimeError(
-                        "Codex Monitor runtime recycle lost its exact idle "
-                        "generation"
+                        "Codex Monitor runtime recycle lost its exact idle generation"
                     )
                 thread_id = session.codex_thread_id
                 codex_home = session.codex_home
@@ -8321,10 +9205,7 @@ class GlobalDispatcher:
             async with self.instance_manager.codex_home_app_server_guard(
                 codex_home
             ) as admitted_home:
-                registry = (
-                    self.instance_manager
-                    ._ensure_codex_app_server_registry()
-                )
+                registry = self.instance_manager._ensure_codex_app_server_registry()
                 await registry.recycle_thread_runtime(
                     admitted_home,
                     thread_id,
@@ -8428,16 +9309,13 @@ class GlobalDispatcher:
         existing = self._monitor_tasks.get(monitor_session.id)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(
-            self._monitor_session_lifecycle(monitor_session.id)
-        )
+        task = asyncio.create_task(self._monitor_session_lifecycle(monitor_session.id))
         self._monitor_tasks[monitor_session.id] = task
 
     @staticmethod
     def _monitor_failure_backoff(failures: int) -> float:
         return min(
-            MONITOR_FAILURE_BACKOFF_BASE
-            * (2 ** max(0, failures - 1)),
+            MONITOR_FAILURE_BACKOFF_BASE * (2 ** max(0, failures - 1)),
             MONITOR_FAILURE_BACKOFF_MAX,
         )
 
@@ -8546,9 +9424,7 @@ class GlobalDispatcher:
                 return
             task_id, previous_failures = state
             failures = previous_failures + 1
-            terminal = (
-                failures >= MONITOR_MAX_CONSECUTIVE_FAILURES
-            )
+            terminal = failures >= MONITOR_MAX_CONSECUTIVE_FAILURES
             now = datetime.utcnow()
             values = {
                 "active_turn_generation": None,
@@ -8559,9 +9435,7 @@ class GlobalDispatcher:
                     None
                     if terminal
                     else now
-                    + timedelta(
-                        seconds=self._monitor_failure_backoff(failures)
-                    )
+                    + timedelta(seconds=self._monitor_failure_backoff(failures))
                 ),
             }
             if terminal:
@@ -8686,16 +9560,10 @@ class GlobalDispatcher:
                     ms.next_check_at = None
                     ms.active_turn_generation = None
                     ms.turn_started_at = None
-                    ms.last_error = (
-                        "Monitor provider no longer matches its parent task"
-                    )
+                    ms.last_error = "Monitor provider no longer matches its parent task"
                     await db.commit()
                     return None
-                task_cwd = (
-                    task.last_cwd
-                    or task.target_repo
-                    or os.getcwd()
-                )
+                task_cwd = task.last_cwd or task.target_repo or os.getcwd()
                 codex_model: str | None = None
                 codex_effort: str | None = None
                 codex_service_tier: str | None = None
@@ -8721,11 +9589,7 @@ class GlobalDispatcher:
                         await db.commit()
                         return None
 
-                    codex_model = (
-                        ms.model
-                        or task.model
-                        or settings.default_codex_model
-                    )
+                    codex_model = ms.model or task.model or settings.default_codex_model
                     codex_effort = (
                         ms.codex_effort_level
                         if ms.codex_effort_level is not None
@@ -8779,11 +9643,7 @@ class GlobalDispatcher:
                     "description": ms.description,
                     "context": ms.monitor_context,
                     "interval": ms.interval,
-                    "model": (
-                        codex_model
-                        if monitor_provider == "codex"
-                        else ms.model
-                    ),
+                    "model": (codex_model if monitor_provider == "codex" else ms.model),
                     "cwd": task_cwd,
                     "codex_effort_level": codex_effort,
                     "codex_service_tier": codex_service_tier,
@@ -8793,18 +9653,16 @@ class GlobalDispatcher:
                     "codex_disable_project_config": bool(
                         ms.codex_disable_project_config
                     ),
-                    "parent_codex_account_id": (
-                        task.metadata_ or {}
-                    ).get("codex_account_id"),
+                    "parent_codex_account_id": (task.metadata_ or {}).get(
+                        "codex_account_id"
+                    ),
                     "task_routing": (
                         task.provider,
                         task.model,
                         task.codex_service_tier,
                     ),
                 }
-                commit, cancellation = await _settle_despite_cancellation(
-                    db.commit()
-                )
+                commit, cancellation = await _settle_despite_cancellation(db.commit())
                 commit.result()
             if cancellation is not None:
                 cleanup, _ = await _settle_despite_cancellation(
@@ -8850,21 +9708,15 @@ class GlobalDispatcher:
             home = pool.canonical_home(str(persisted_home))
             if persisted_account is not None:
                 account_home = pool.home_for_account(str(persisted_account))
-                if (
-                    account_home is None
-                    or pool.canonical_home(account_home) != home
-                ):
+                if account_home is None or pool.canonical_home(account_home) != home:
                     raise RuntimeError(
                         "Codex Monitor persisted account does not own its "
                         "persisted CODEX_HOME"
                     )
-            if (
-                not pool.is_home_available(home)
-                or not pool.supports_model_for_home(
-                    home,
-                    model,
-                    service_tier=tier,
-                )
+            if not pool.is_home_available(home) or not pool.supports_model_for_home(
+                home,
+                model,
+                service_tier=tier,
             ):
                 raise RuntimeError(
                     "Codex Monitor's persisted account is unavailable or no "
@@ -8879,19 +9731,16 @@ class GlobalDispatcher:
 
         parent_account = snapshot.get("parent_codex_account_id")
         candidate = (
-            pool.home_for_account(str(parent_account))
-            if parent_account
-            else None
+            pool.home_for_account(str(parent_account)) if parent_account else None
         )
         if candidate is not None:
             candidate = pool.canonical_home(candidate)
-            if (
-                not pool.is_home_available(candidate)
-                or not pool.supports_model_for_home(
-                    candidate,
-                    model,
-                    service_tier=tier,
-                )
+            if not pool.is_home_available(
+                candidate
+            ) or not pool.supports_model_for_home(
+                candidate,
+                model,
+                service_tier=tier,
             ):
                 candidate = None
         home = candidate or pool.select(
@@ -8973,9 +9822,7 @@ class GlobalDispatcher:
         persisted_thread = snapshot.get("codex_thread_id")
         persisted_home = snapshot.get("codex_home")
         codex_home, account_id = self._resolve_codex_monitor_home(snapshot)
-        expected_provider, expected_model, expected_tier = snapshot[
-            "task_routing"
-        ]
+        expected_provider, expected_model, expected_tier = snapshot["task_routing"]
         process = None
         handle: _MonitorTurnHandle | None = None
 
@@ -8983,9 +9830,7 @@ class GlobalDispatcher:
             admitted_home: str,
         ) -> _MonitorTurnHandle:
             nonlocal process, handle
-            registry = (
-                self.instance_manager._ensure_codex_app_server_registry()
-            )
+            registry = self.instance_manager._ensure_codex_app_server_registry()
 
             async def guard_current_generation(
                 db,
@@ -9061,24 +9906,17 @@ class GlobalDispatcher:
                 await guard_current_generation(
                     db,
                     thread_id=(
-                        None
-                        if persisted_thread is None
-                        else str(persisted_thread)
+                        None if persisted_thread is None else str(persisted_thread)
                     ),
-                    home=(
-                        None
-                        if persisted_home is None
-                        else str(persisted_home)
-                    ),
+                    home=(None if persisted_home is None else str(persisted_home)),
                 )
 
                 async def bind_started_thread(thread_id: str) -> None:
                     """Durably bind thread/start before turn/start admission."""
 
                     nonlocal handle
-                    if (
-                        persisted_thread is not None
-                        and thread_id != str(persisted_thread)
+                    if persisted_thread is not None and thread_id != str(
+                        persisted_thread
                     ):
                         raise RuntimeError(
                             "Codex thread/resume returned a different Monitor "
@@ -9093,9 +9931,7 @@ class GlobalDispatcher:
                         codex_thread_id=thread_id,
                         codex_account_id=account_id,
                         codex_created_thread=persisted_thread is None,
-                        codex_identity_committed=(
-                            persisted_thread is not None
-                        ),
+                        codex_identity_committed=(persisted_thread is not None),
                     )
                     # Publish even the pre-turn identity synchronously. If its
                     # DB commit fails, this is the only exact evidence needed
@@ -9122,8 +9958,7 @@ class GlobalDispatcher:
                             (
                                 MonitorSession.codex_home.is_(None)
                                 if persisted_home is None
-                                else MonitorSession.codex_home
-                                == str(persisted_home)
+                                else MonitorSession.codex_home == str(persisted_home)
                             ),
                         )
                         .values(
@@ -9167,9 +10002,7 @@ class GlobalDispatcher:
                         handle is None
                         or not handle.codex_identity_committed
                         or handle.codex_thread_id != thread_id
-                        or self._monitor_turn_handles.get(
-                            monitor_session_id
-                        )
+                        or self._monitor_turn_handles.get(monitor_session_id)
                         is not handle
                     ):
                         raise RuntimeError(
@@ -9187,9 +10020,7 @@ class GlobalDispatcher:
                     effort=(None if effort is None else str(effort)),
                     codex_service_tier=tier,
                     resume_session_id=(
-                        None
-                        if persisted_thread is None
-                        else str(persisted_thread)
+                        None if persisted_thread is None else str(persisted_thread)
                     ),
                     git_env=None,
                     task_id=task_id,
@@ -9216,9 +10047,7 @@ class GlobalDispatcher:
                         "turn through its ownership barrier"
                     )
 
-                commit, cancellation = await _settle_despite_cancellation(
-                    db.commit()
-                )
+                commit, cancellation = await _settle_despite_cancellation(db.commit())
                 commit.result()
             if cancellation is not None:
                 raise cancellation
@@ -9227,18 +10056,14 @@ class GlobalDispatcher:
 
         try:
             async with get_task_operation_lock(task_id):
-                async with (
-                    self.instance_manager._cloudrouter_runtime_admission(
-                        "codex",
-                        codex_home,
-                        model,
-                        service_tier=tier,
-                    )
+                async with self.instance_manager._cloudrouter_runtime_admission(
+                    "codex",
+                    codex_home,
+                    model,
+                    service_tier=tier,
                 ):
-                    async with (
-                        self.instance_manager.codex_home_app_server_guard(
-                            codex_home
-                        )
+                    async with self.instance_manager.codex_home_app_server_guard(
+                        codex_home
                     ) as admitted_home:
                         self._revalidate_codex_monitor_route(
                             admitted_home=admitted_home,
@@ -9277,8 +10102,7 @@ class GlobalDispatcher:
                                 "Uncommitted Codex Monitor turn is still live"
                             )
                         registry = (
-                            self.instance_manager
-                            ._ensure_codex_app_server_registry()
+                            self.instance_manager._ensure_codex_app_server_registry()
                         )
                         try:
                             await registry.delete_thread(
@@ -9286,16 +10110,9 @@ class GlobalDispatcher:
                                 str(handle.codex_thread_id),
                             )
                         except Exception as delete_exc:
-                            if not self._codex_thread_already_absent(
-                                delete_exc
-                            ):
+                            if not self._codex_thread_already_absent(delete_exc):
                                 raise
-                        if (
-                            self._monitor_turn_handles.get(
-                                monitor_session_id
-                            )
-                            is handle
-                        ):
+                        if self._monitor_turn_handles.get(monitor_session_id) is handle:
                             self._monitor_turn_handles.pop(
                                 monitor_session_id,
                                 None,
@@ -9303,21 +10120,16 @@ class GlobalDispatcher:
                 except BaseException as cleanup_exc:
                     # Retain exact in-memory evidence. Terminal DB cleanup can
                     # also recover it if the identity commit actually won.
-                    self._monitor_turn_handles[
-                        monitor_session_id
-                    ] = handle
+                    self._monitor_turn_handles[monitor_session_id] = handle
                     if (
                         handle.codex_created_thread
                         and not handle.codex_identity_committed
                     ):
                         try:
-                            persistence, _ = (
-                                await _settle_despite_cancellation(
-                                    self
-                                    ._persist_uncommitted_codex_monitor_cleanup(
-                                        handle,
-                                        cleanup_exc,
-                                    )
+                            persistence, _ = await _settle_despite_cancellation(
+                                self._persist_uncommitted_codex_monitor_cleanup(
+                                    handle,
+                                    cleanup_exc,
                                 )
                             )
                             if (
@@ -9331,9 +10143,7 @@ class GlobalDispatcher:
                                     )
                                     is not None
                                 )
-                                and self._monitor_turn_handles.get(
-                                    monitor_session_id
-                                )
+                                and self._monitor_turn_handles.get(monitor_session_id)
                                 is handle
                             ):
                                 self._monitor_turn_handles.pop(
@@ -9359,8 +10169,7 @@ class GlobalDispatcher:
         if codex_home and self.codex_pool:
             self.codex_pool.record_routed_account(codex_home)
         logger.info(
-            "Codex Monitor turn launched: session=%s generation=%s "
-            "thread=%s home=%s",
+            "Codex Monitor turn launched: session=%s generation=%s thread=%s home=%s",
             monitor_session_id,
             generation,
             handle.codex_thread_id,
@@ -9384,11 +10193,7 @@ class GlobalDispatcher:
         task_id = int(snapshot["task_id"])
         prompt = self._build_monitor_agent_prompt(
             description=str(snapshot["description"]),
-            context=(
-                None
-                if snapshot["context"] is None
-                else str(snapshot["context"])
-            ),
+            context=(None if snapshot["context"] is None else str(snapshot["context"])),
             interval=int(snapshot["interval"]),
         )
         if provider == "codex":
@@ -9410,11 +10215,7 @@ class GlobalDispatcher:
         process = await self._launch_monitor_agent(
             prompt=prompt,
             cwd=str(snapshot["cwd"]),
-            model=(
-                None
-                if snapshot["model"] is None
-                else str(snapshot["model"])
-            ),
+            model=(None if snapshot["model"] is None else str(snapshot["model"])),
             monitor_session_id=monitor_session_id,
             mcp_config_path=mcp_config_path,
             interval_seconds=int(snapshot["interval"]),
@@ -9483,14 +10284,10 @@ class GlobalDispatcher:
                 )
             except asyncio.TimeoutError:
                 turn_error = (
-                    "Monitor check turn timed out after "
-                    f"{MONITOR_TURN_TIMEOUT:.0f}s"
+                    f"Monitor check turn timed out after {MONITOR_TURN_TIMEOUT:.0f}s"
                 )
             if turn_error is None and process.returncode not in (0, None):
-                turn_error = (
-                    "Monitor check turn exited with "
-                    f"code {process.returncode}"
-                )
+                turn_error = f"Monitor check turn exited with code {process.returncode}"
         except asyncio.CancelledError as exc:
             cancellation = exc
         except Exception as exc:
@@ -9515,15 +10312,12 @@ class GlobalDispatcher:
                         reaped = await self._finalize_codex_monitor_turn(
                             handle,
                             reason=(
-                                turn_error
-                                or "CCM Monitor lifecycle was cancelled"
+                                turn_error or "CCM Monitor lifecycle was cancelled"
                             ),
                         )
                     except asyncio.CancelledError as exc:
                         delayed_cancellation = exc
-                        reaped = (
-                            getattr(process, "returncode", None) is not None
-                        )
+                        reaped = getattr(process, "returncode", None) is not None
                     except Exception:
                         logger.exception(
                             "Failed to stop Codex Monitor turn: session=%s "
@@ -9533,37 +10327,21 @@ class GlobalDispatcher:
                         )
                         reaped = False
                 else:
-                    reaped = (
-                        getattr(process, "returncode", None) is not None
-                    )
-                    if (
-                        reaped
-                        and handles.get(monitor_session_id) is handle
-                    ):
+                    reaped = getattr(process, "returncode", None) is not None
+                    if reaped and handles.get(monitor_session_id) is handle:
                         handles.pop(monitor_session_id, None)
             elif handle is not None:
-                delayed_cancellation = (
-                    await self._finalize_aux_lifecycle_process(
-                        session_id=monitor_session_id,
-                        process=handle.process,
-                        process_map=self._monitor_processes,
-                    )
+                delayed_cancellation = await self._finalize_aux_lifecycle_process(
+                    session_id=monitor_session_id,
+                    process=handle.process,
+                    process_map=self._monitor_processes,
                 )
-                reaped = (
-                    monitor_session_id not in self._monitor_processes
-                )
-                if (
-                    reaped
-                    and handles.get(monitor_session_id) is handle
-                ):
+                reaped = monitor_session_id not in self._monitor_processes
+                if reaped and handles.get(monitor_session_id) is handle:
                     handles.pop(monitor_session_id, None)
 
-            if reaped and (
-                handle is None or handle.provider == "claude"
-            ):
-                getattr(
-                    self, "_monitor_config_dirs", {}
-                ).pop(monitor_session_id, None)
+            if reaped and (handle is None or handle.provider == "claude"):
+                getattr(self, "_monitor_config_dirs", {}).pop(monitor_session_id, None)
             cleanup_monitor_agent_mcp_config(
                 monitor_session_id,
                 generation,
@@ -9582,10 +10360,7 @@ class GlobalDispatcher:
                 await self._mark_monitor_turn_uncertain(
                     monitor_session_id,
                     generation,
-                    (
-                        turn_error
-                        or "Monitor turn could not be proven terminal"
-                    ),
+                    (turn_error or "Monitor turn could not be proven terminal"),
                 )
             elif cancellation is not None or delayed_cancellation is not None:
                 await self._release_interrupted_monitor_turn(
@@ -9606,8 +10381,7 @@ class GlobalDispatcher:
                         select(MonitorSession.id).where(
                             MonitorSession.id == monitor_session_id,
                             MonitorSession.status == "running",
-                            MonitorSession.active_turn_generation
-                            == generation,
+                            MonitorSession.active_turn_generation == generation,
                         )
                     )
                 if still_active is not None:
@@ -9623,17 +10397,14 @@ class GlobalDispatcher:
             if reaped:
                 try:
                     if str(snapshot["provider"]) == "codex":
-                        if (
-                            cancellation is None
-                            and delayed_cancellation is None
-                        ):
-                            recycle, recycle_cancellation = (
-                                await _settle_despite_cancellation(
-                                    self
-                                    ._recycle_codex_monitor_thread_runtime(
-                                        monitor_session_id,
-                                        generation,
-                                    )
+                        if cancellation is None and delayed_cancellation is None:
+                            (
+                                recycle,
+                                recycle_cancellation,
+                            ) = await _settle_despite_cancellation(
+                                self._recycle_codex_monitor_thread_runtime(
+                                    monitor_session_id,
+                                    generation,
                                 )
                             )
                             if recycle_cancellation is not None:
@@ -9655,14 +10426,14 @@ class GlobalDispatcher:
                                         exc.__traceback__,
                                     ),
                                 )
-                                failure, failure_cancellation = (
-                                    await _settle_despite_cancellation(
-                                        self
-                                        ._fail_codex_monitor_runtime_recycle(
-                                            monitor_session_id,
-                                            generation,
-                                            exc,
-                                        )
+                                (
+                                    failure,
+                                    failure_cancellation,
+                                ) = await _settle_despite_cancellation(
+                                    self._fail_codex_monitor_runtime_recycle(
+                                        monitor_session_id,
+                                        generation,
+                                        exc,
                                     )
                                 )
                                 failure.result()
@@ -9670,23 +10441,18 @@ class GlobalDispatcher:
                                     delayed_cancellation is None
                                     and failure_cancellation is not None
                                 ):
-                                    delayed_cancellation = (
-                                        failure_cancellation
-                                    )
+                                    delayed_cancellation = failure_cancellation
 
                         async with self.db_factory() as db:
                             terminal_codex = await db.scalar(
                                 select(MonitorSession.id).where(
-                                    MonitorSession.id
-                                    == monitor_session_id,
+                                    MonitorSession.id == monitor_session_id,
                                     MonitorSession.status != "running",
                                     MonitorSession.provider == "codex",
                                 )
                             )
                         if terminal_codex is not None:
-                            await self._cleanup_codex_monitor_thread(
-                                monitor_session_id
-                            )
+                            await self._cleanup_codex_monitor_thread(monitor_session_id)
                 finally:
                     active_turns.discard(monitor_session_id)
             if delayed_cancellation is not None:
@@ -9705,9 +10471,7 @@ class GlobalDispatcher:
 
         try:
             while True:
-                snapshot = await self._claim_due_monitor_turn(
-                    monitor_session_id
-                )
+                snapshot = await self._claim_due_monitor_turn(monitor_session_id)
                 if snapshot is None:
                     return
                 await self._execute_scheduled_monitor_turn(
@@ -9722,10 +10486,7 @@ class GlobalDispatcher:
                 monitor_session_id,
             )
         finally:
-            if (
-                self._monitor_tasks.get(monitor_session_id)
-                is asyncio.current_task()
-            ):
+            if self._monitor_tasks.get(monitor_session_id) is asyncio.current_task():
                 self._monitor_tasks.pop(monitor_session_id, None)
             # Some terminal transitions happen while claiming a generation
             # rather than while executing one (for example, the parent Task's
@@ -9746,9 +10507,7 @@ class GlobalDispatcher:
                         )
                     )
                 if terminal_codex is not None:
-                    await self._cleanup_codex_monitor_thread(
-                        monitor_session_id
-                    )
+                    await self._cleanup_codex_monitor_thread(monitor_session_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -9778,20 +10537,27 @@ class GlobalDispatcher:
         """
         cmd = [
             settings.claude_binary,
-            "-p", prompt,
-            "--output-format", "stream-json",
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
-            "--disallowedTools", "Edit,Write,NotebookEdit,Workflow,Agent,Monitor",
-            "--mcp-config", str(mcp_config_path),
+            "--disallowedTools",
+            "Edit,Write,NotebookEdit,Workflow,Agent,Monitor",
+            "--mcp-config",
+            str(mcp_config_path),
         ]
         if model:
             cmd.extend(["--model", model])
         elif settings.default_model:
             cmd.extend(["--model", settings.default_model])
 
-        env = {k: v for k, v in os.environ.items()
-               if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
+        }
         config_dir: str | None = None
 
         # One scheduled turn performs a single check and never sleeps. Preserve
@@ -9806,9 +10572,7 @@ class GlobalDispatcher:
         # Monitor sub-agent needs a logged-in account. Pick one from the pool
         # (or fall back to default ~/.claude).
         if self.pool:
-            config_dir = await self._pool_select(
-                model=model or settings.default_model
-            )
+            config_dir = await self._pool_select(model=model or settings.default_model)
             if config_dir:
                 env["CLAUDE_CONFIG_DIR"] = config_dir
                 self._sanitize_cloudrouter_claude_env(env, config_dir)
@@ -9838,9 +10602,9 @@ class GlobalDispatcher:
                 # process_map. Keep its credential-home evidence until that
                 # generation is proven dead.
                 if monitor_session_id not in self._monitor_processes:
-                    getattr(
-                        self, "_monitor_config_dirs", {}
-                    ).pop(monitor_session_id, None)
+                    getattr(self, "_monitor_config_dirs", {}).pop(
+                        monitor_session_id, None
+                    )
                 raise
         if config_dir and self.pool:
             self.pool.record_routed_account(config_dir)
@@ -9898,9 +10662,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             raise RuntimeError(
                 "GlobalDispatcher is shutting down; sub-agent admission is closed"
             )
-        task = asyncio.create_task(
-            self._sub_agent_session_lifecycle(session.id)
-        )
+        task = asyncio.create_task(self._sub_agent_session_lifecycle(session.id))
         self._sub_agent_tasks[session.id] = task
 
     async def _sub_agent_session_lifecycle(self, session_id: int):
@@ -10045,7 +10807,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         await db.commit()
                         await self.broadcaster.broadcast(
                             f"task:{sa.task_id}",
-                            {"event": "sub_agent_session_status", "sub_agent_session_id": sa.id, "status": "failed"},
+                            {
+                                "event": "sub_agent_session_status",
+                                "sub_agent_session_id": sa.id,
+                                "status": "failed",
+                            },
                         )
             except Exception:
                 pass
@@ -10064,9 +10830,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     process_map=self._sub_agent_processes,
                 )
                 if session_id not in self._sub_agent_processes:
-                    getattr(
-                        self, "_sub_agent_config_dirs", {}
-                    ).pop(session_id, None)
+                    getattr(self, "_sub_agent_config_dirs", {}).pop(session_id, None)
             if mcp_config_path is not None:
                 cleanup_sub_agent_mcp_config(session_id)
             log_fh = self._sub_agent_log_fhs.pop(session_id, None)
@@ -10091,26 +10855,31 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         """Launch a Claude subprocess for a one-shot sub-agent task."""
         cmd = [
             settings.claude_binary,
-            "-p", prompt,
-            "--output-format", "stream-json",
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
-            "--disallowedTools", "Agent,Task,Monitor",
-            "--mcp-config", str(mcp_config_path),
+            "--disallowedTools",
+            "Agent,Task,Monitor",
+            "--mcp-config",
+            str(mcp_config_path),
         ]
         if model:
             cmd.extend(["--model", model])
         elif settings.default_model:
             cmd.extend(["--model", settings.default_model])
 
-        env = {k: v for k, v in os.environ.items()
-               if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
+        }
         config_dir: str | None = None
 
         if self.pool:
-            config_dir = await self._pool_select(
-                model=model or settings.default_model
-            )
+            config_dir = await self._pool_select(model=model or settings.default_model)
             if config_dir:
                 env["CLAUDE_CONFIG_DIR"] = config_dir
                 self._sanitize_cloudrouter_claude_env(env, config_dir)
@@ -10137,9 +10906,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 )
             except BaseException:
                 if session_id not in self._sub_agent_processes:
-                    getattr(
-                        self, "_sub_agent_config_dirs", {}
-                    ).pop(session_id, None)
+                    getattr(self, "_sub_agent_config_dirs", {}).pop(session_id, None)
                 raise
         if config_dir and self.pool:
             self.pool.record_routed_account(config_dir)
@@ -10164,7 +10931,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             str,
             str | None,
             str,
-        ] | None = None,
+        ]
+        | None = None,
     ):
         """Launch an independent Codex thread with required callback tools."""
 
@@ -10200,14 +10968,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             async with self.instance_manager.codex_home_app_server_guard(
                 codex_home
             ) as admitted_home:
-                registry = (
-                    self.instance_manager._ensure_codex_app_server_registry()
-                )
+                registry = self.instance_manager._ensure_codex_app_server_registry()
                 from backend.models.sub_agent import SubAgentSession
 
                 expected_provider, expected_model, expected_tier = (
-                    expected_task_routing
-                    or ("codex", model, codex_service_tier)
+                    expected_task_routing or ("codex", model, codex_service_tier)
                 )
                 process = None
                 thread_id = None
@@ -10290,16 +11055,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         await db.commit()
                 except BaseException:
                     if process is not None:
-                        cleanup, _cleanup_cancellation = (
-                            await _settle_despite_cancellation(
-                                self._finalize_codex_sub_agent_turn(
-                                    session_id,
-                                    process,
-                                    reason=(
-                                        "Codex sub-agent launch admission "
-                                        "did not commit"
-                                    ),
-                                )
+                        (
+                            cleanup,
+                            _cleanup_cancellation,
+                        ) = await _settle_despite_cancellation(
+                            self._finalize_codex_sub_agent_turn(
+                                session_id,
+                                process,
+                                reason=(
+                                    "Codex sub-agent launch admission did not commit"
+                                ),
                             )
                         )
                         try:
@@ -10391,7 +11156,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             if getattr(existing, "_ccm_queue_worker_handoff", False):
                 return
             last_activity = self._task_queue_activity.get(task_id, 0)
-            if last_activity and time.monotonic() - last_activity > QUEUE_STUCK_THRESHOLD:
+            if (
+                last_activity
+                and time.monotonic() - last_activity > QUEUE_STUCK_THRESHOLD
+            ):
                 logger.warning(
                     f"Task {task_id} queue consumer stuck for >{QUEUE_STUCK_THRESHOLD}s, "
                     "cancelling before replacement"
@@ -10451,9 +11219,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         if self._task_queue_workers.get(task_id) is not current:
             return
         self._task_queue_activity[task_id] = time.monotonic()
-        replacement = asyncio.create_task(
-            self._task_queue_consumer(task_id)
-        )
+        replacement = asyncio.create_task(self._task_queue_consumer(task_id))
         self._task_queue_workers[task_id] = replacement
 
     async def enqueue_message(
@@ -10468,6 +11234,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         expected_task_routing: tuple[str, str | None, str] | None = None,
         monitor_session_id: int | None = None,
         source_log_id: int | None = None,
+        delivery_key: str | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         allow_new_session: bool | None = None,
@@ -10483,16 +11250,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             raise RuntimeError(
                 "Dispatcher is shutting down; message admission is closed"
             )
-        internal_session_report = source.startswith(
-            ("monitor:", "sub-agent:")
-        )
+        internal_session_report = source.startswith(("monitor:", "sub-agent:"))
         msg = QueuedMessage(
             priority=priority,
-            timestamp=(
-                time.monotonic()
-                if queue_timestamp is None
-                else queue_timestamp
-            ),
+            timestamp=(time.time() if queue_timestamp is None else queue_timestamp),
             prompt=prompt,
             source=source,
             user_message_text=user_message_text,
@@ -10501,6 +11262,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             expected_task_routing=expected_task_routing,
             monitor_session_id=monitor_session_id,
             source_log_id=source_log_id,
+            delivery_key=delivery_key,
             current_message=prompt if current_message is None else current_message,
             allow_new_session=(
                 internal_session_report
@@ -10512,56 +11274,646 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             ),
         )
         async with self._dispatch_claim_lock:
-            if self._maintenance_shutdown_committed:
-                raise TaskStartPausedError("service shutdown has already been committed")
-            msg.queue_generation = self._task_queue_generations.get(task_id, 0)
+            admitted = self._admit_queued_message_locked(task_id, msg)
+            if not admitted:
+                return
             q = self._get_task_queue(task_id)
-            await q.put(msg)
-            self._pending_task_starts.add(task_id)
-            self._ensure_queue_worker(task_id)
         logger.info(
             f"Enqueued message for task {task_id}: source={source} priority={priority} "
             f"queue_depth={q.qsize()}"
         )
 
-    async def clear_task_queue(self, task_id: int) -> int:
+    def _assert_queue_admission_locked(self, task_id: int) -> None:
+        if self._shutting_down:
+            raise RuntimeError(
+                "Dispatcher is shutting down; message admission is closed"
+            )
+        if self._maintenance_shutdown_committed:
+            raise TaskStartPausedError("service shutdown has already been committed")
+        if task_id in self._cancel_durable_queue_tasks:
+            raise TaskStartPausedError("Task queue is being cancelled")
+
+    def _admit_queued_message_locked(
+        self,
+        task_id: int,
+        msg: QueuedMessage,
+    ) -> bool:
+        """Publish one in-memory queue item while holding admission."""
+
+        self._assert_queue_admission_locked(task_id)
+        if (
+            msg.delivery_key is not None
+            and msg.delivery_key in self._queued_delivery_keys
+        ):
+            return False
+        msg.queue_generation = self._task_queue_generations.get(task_id, 0)
+        q = self._get_task_queue(task_id)
+        q.put_nowait(msg)
+        if msg.delivery_key is not None:
+            self._queued_delivery_keys.add(msg.delivery_key)
+        self._pending_task_starts.add(task_id)
+        self._ensure_queue_worker(task_id)
+        return True
+
+    async def snapshot_plan_queue_admission(self, task_id: int) -> dict[str, object]:
+        """Linearization fence captured before a Plan receipt is committed."""
+
+        async with self._dispatch_claim_lock:
+            self._assert_queue_admission_locked(task_id)
+            return {
+                "epoch": self._queue_admission_epoch,
+                "generation": self._task_queue_generations.get(task_id, 0),
+            }
+
+    async def enqueue_plan_application_receipt(self, receipt_key: str) -> bool:
+        """Admit one durable Plan application outbox row idempotently."""
+
+        from backend.models.plan import PlanApplicationReceipt
+
+        async with self.db_factory() as db:
+            receipt = (
+                await db.execute(
+                    select(PlanApplicationReceipt).where(
+                        PlanApplicationReceipt.receipt_key == receipt_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if receipt is None or receipt.delivery_status in {
+                "launched",
+                "failed",
+                "cancelled",
+                "uncertain",
+            }:
+                return False
+            payload = receipt.outbox_payload
+            if not isinstance(payload, dict):
+                receipt.delivery_status = "failed"
+                receipt.delivery_error = "Plan application outbox payload is missing"
+                receipt.updated_at = datetime.utcnow()
+                await db.commit()
+                raise RuntimeError(receipt.delivery_error)
+            import hashlib
+
+            actual_digest = hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if receipt.payload_digest != actual_digest:
+                receipt.delivery_status = "failed"
+                receipt.delivery_error = (
+                    "Plan application outbox payload digest changed"
+                )
+                receipt.updated_at = datetime.utcnow()
+                await db.commit()
+                raise RuntimeError(receipt.delivery_error)
+            expected = payload.get("expected_task_routing")
+            expected_routing = None
+            if isinstance(expected, list) and len(expected) == 3:
+                expected_routing = (expected[0], expected[1], expected[2])
+            task_id = receipt.target_task_id
+            stored_queue_timestamp = payload.get("queue_timestamp")
+            queue_timestamp = (
+                float(stored_queue_timestamp)
+                if isinstance(stored_queue_timestamp, (int, float))
+                and not isinstance(stored_queue_timestamp, bool)
+                else time.time()
+            )
+        msg = QueuedMessage(
+            priority=int(payload.get("priority", PRIORITY_USER)),
+            timestamp=queue_timestamp,
+            prompt=str(payload["prompt"]),
+            source=str(payload.get("source", "user")),
+            user_message_text=payload.get("user_message_text"),
+            command_skills=payload.get("command_skills"),
+            model_override=payload.get("model_override"),
+            expected_task_routing=expected_routing,
+            monitor_session_id=payload.get("monitor_session_id"),
+            source_log_id=payload.get("source_log_id"),
+            delivery_key=receipt_key,
+            current_message=payload.get("current_message"),
+            allow_new_session=bool(payload.get("allow_new_session", False)),
+        )
+        rejected_release: tuple[list[int], int | None] | None = None
+        rejection_error: str | None = None
+        async with self._dispatch_claim_lock:
+            admission_fence = payload.get("queue_admission_fence")
+            same_process_stale_generation = bool(
+                isinstance(admission_fence, dict)
+                and admission_fence.get("epoch") == self._queue_admission_epoch
+                and isinstance(admission_fence.get("generation"), int)
+                and not isinstance(admission_fence.get("generation"), bool)
+                and admission_fence["generation"]
+                != self._task_queue_generations.get(task_id, 0)
+            )
+            if (
+                task_id in self._cancel_durable_queue_tasks
+                or same_process_stale_generation
+            ):
+                from backend.services.plan_service import (
+                    release_unstarted_plan_application,
+                )
+
+                rejection_error = (
+                    "Plan application delivery was cancelled before launch"
+                    if task_id in self._cancel_durable_queue_tasks
+                    else "Task queue was stopped before Plan admission completed"
+                )
+                async with self.db_factory() as db:
+                    rejected_release = await release_unstarted_plan_application(
+                        db,
+                        receipt_key=receipt_key,
+                        delivery_status="cancelled",
+                        error=rejection_error,
+                    )
+                    if rejected_release is None:
+                        await db.rollback()
+                    else:
+                        await db.commit()
+                self._queued_delivery_keys.discard(receipt_key)
+                q = None
+            else:
+                self._assert_queue_admission_locked(task_id)
+                if receipt_key in self._queued_delivery_keys:
+                    return True
+                async with self.db_factory() as db:
+                    admitted = await db.execute(
+                        update(PlanApplicationReceipt)
+                        .where(
+                            PlanApplicationReceipt.receipt_key == receipt_key,
+                            PlanApplicationReceipt.target_task_id == task_id,
+                            PlanApplicationReceipt.payload_digest == actual_digest,
+                            PlanApplicationReceipt.delivery_status.in_(
+                                ["pending", "queued"]
+                            ),
+                        )
+                        .values(
+                            delivery_status="queued",
+                            delivery_error=None,
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    if admitted.rowcount != 1:
+                        await db.rollback()
+                        return False
+                    await db.commit()
+                # A process shutdown flag is not protected by this lock. Check it
+                # again after the DB await; a committed ``queued`` row is durable
+                # and will be recovered if shutdown won in that interval.
+                self._assert_queue_admission_locked(task_id)
+                if not self._admit_queued_message_locked(task_id, msg):
+                    return True
+                q = self._get_task_queue(task_id)
+        if rejection_error is not None:
+            if rejected_release is not None:
+                plan_ids, target_task_id = rejected_release
+                await self._broadcast_plan_delivery_change(
+                    receipt_key=receipt_key,
+                    status="cancelled",
+                    error=rejection_error,
+                    plan_ids=plan_ids,
+                    target_task_id=target_task_id,
+                )
+            return False
+        assert q is not None
+        logger.info(
+            "Admitted durable Plan delivery %s for task %s: queue_depth=%s",
+            receipt_key,
+            task_id,
+            q.qsize(),
+        )
+        return True
+
+    async def _recover_plan_application_outbox(
+        self,
+        *,
+        after_restart: bool = True,
+    ) -> None:
+        from backend.models.plan import PlanApplicationReceipt
+
+        uncertain_keys: list[str] = []
+        async with self.db_factory() as db:
+            # ``launching`` was committed in the same transaction as the Task
+            # execution claim. After a process restart there is no safe way to
+            # distinguish "spawn not called" from "external turn accepted but
+            # launch acknowledgement not committed". Fail closed instead of
+            # replaying a potentially non-idempotent turn.
+            if after_restart:
+                uncertain_keys = list(
+                    (
+                        await db.execute(
+                            select(PlanApplicationReceipt.receipt_key).where(
+                                PlanApplicationReceipt.outbox_payload.isnot(None),
+                                PlanApplicationReceipt.delivery_status == "launching",
+                            )
+                        )
+                    ).scalars()
+                )
+                await db.execute(
+                    update(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.outbox_payload.isnot(None),
+                        PlanApplicationReceipt.delivery_status == "launching",
+                    )
+                    .values(
+                        delivery_status="uncertain",
+                        delivery_error=(
+                            "CCM restarted after the launch claim; automatic "
+                            "replay was blocked to prevent duplicate execution"
+                        ),
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+            await db.commit()
+            keys = list(
+                (
+                    await db.execute(
+                        select(PlanApplicationReceipt.receipt_key)
+                        .where(
+                            PlanApplicationReceipt.outbox_payload.isnot(None),
+                            PlanApplicationReceipt.delivery_status.in_(
+                                ["pending", "queued"]
+                            ),
+                        )
+                        .order_by(PlanApplicationReceipt.id)
+                    )
+                ).scalars()
+            )
+        for receipt_key in uncertain_keys:
+            plan_ids, target_task_id, evidence = await self._delivery_plan_context(
+                receipt_key
+            )
+            await self._broadcast_plan_delivery_change(
+                receipt_key=receipt_key,
+                status="uncertain",
+                error=(
+                    "CCM restarted after the launch claim; automatic replay "
+                    "was blocked to prevent duplicate execution"
+                ),
+                plan_ids=plan_ids,
+                target_task_id=target_task_id,
+                launch_evidence=evidence,
+            )
+        for key in keys:
+            try:
+                await self.enqueue_plan_application_receipt(key)
+            except Exception:
+                logger.exception("Could not recover Plan application delivery %s", key)
+
+    async def resolve_uncertain_plan_delivery(
+        self,
+        *,
+        receipt_key: str,
+        action: str,
+        note: str,
+        actor_id: int | None,
+    ) -> tuple[list[int], int | None]:
+        """Resolve an ambiguous receipt without racing queue admission."""
+
+        from backend.services.plan_service import (
+            resolve_uncertain_plan_application,
+        )
+
+        async with self._dispatch_claim_lock:
+            if receipt_key in self._queued_delivery_keys:
+                raise RuntimeError("Plan delivery still has an in-memory queue owner")
+            async with self.db_factory() as db:
+                result = await resolve_uncertain_plan_application(
+                    db,
+                    receipt_key=receipt_key,
+                    action=action,
+                    note=note,
+                    actor_id=actor_id,
+                )
+                await db.commit()
+            self._queued_delivery_keys.discard(receipt_key)
+            return result
+
+    async def _mark_plan_delivery(
+        self,
+        delivery_key: str | None,
+        status: str,
+        *,
+        error: str | None = None,
+    ) -> None:
+        if delivery_key is None:
+            return
+        from backend.models.plan import PlanApplicationReceipt
+
+        try:
+            async with self.db_factory() as db:
+                receipt = (
+                    await db.execute(
+                        select(PlanApplicationReceipt)
+                        .where(PlanApplicationReceipt.receipt_key == delivery_key)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if receipt is None or receipt.delivery_status in {
+                    "launched",
+                    "failed",
+                    "cancelled",
+                }:
+                    return
+                actual_status = status
+                actual_error = error
+                if status == "failed" and receipt.delivery_status in {
+                    "launching",
+                    "uncertain",
+                }:
+                    actual_status = "uncertain"
+                    actual_error = (
+                        error
+                        or "Delivery failed after its launch claim; replay is unsafe"
+                    )
+                receipt.delivery_status = actual_status
+                receipt.delivery_error = actual_error
+                receipt.updated_at = datetime.utcnow()
+                await db.commit()
+            if actual_status in {
+                "launched",
+                "failed",
+                "cancelled",
+                "uncertain",
+            }:
+                async with self._dispatch_claim_lock:
+                    self._queued_delivery_keys.discard(delivery_key)
+            if actual_status == "uncertain":
+                plan_ids, target_task_id, evidence = await self._delivery_plan_context(
+                    delivery_key
+                )
+                await self._broadcast_plan_delivery_change(
+                    receipt_key=delivery_key,
+                    status="uncertain",
+                    error=actual_error or "Plan delivery launch is uncertain",
+                    plan_ids=plan_ids,
+                    target_task_id=target_task_id,
+                    launch_evidence=evidence,
+                )
+        except Exception:
+            logger.exception(
+                "Could not persist Plan delivery %s as %s",
+                delivery_key,
+                status,
+            )
+
+    async def _release_plan_delivery_before_launch(
+        self,
+        delivery_key: str | None,
+        *,
+        status: str,
+        error: str,
+    ) -> bool:
+        if delivery_key is None:
+            return False
+        from backend.services.plan_service import (
+            release_unstarted_plan_application,
+        )
+
+        async with self.db_factory() as db:
+            released = await release_unstarted_plan_application(
+                db,
+                receipt_key=delivery_key,
+                delivery_status=status,
+                error=error,
+            )
+            if released is None:
+                await db.rollback()
+                await self._mark_plan_delivery(
+                    delivery_key,
+                    "failed",
+                    error=error,
+                )
+                return False
+            plan_ids, target_task_id = released
+            await db.commit()
+        async with self._dispatch_claim_lock:
+            self._queued_delivery_keys.discard(delivery_key)
+        await self._broadcast_plan_delivery_change(
+            receipt_key=delivery_key,
+            status=status,
+            error=error,
+            plan_ids=plan_ids,
+            target_task_id=target_task_id,
+        )
+        return True
+
+    async def _broadcast_plan_delivery_change(
+        self,
+        *,
+        receipt_key: str,
+        status: str,
+        error: str,
+        plan_ids: list[int],
+        target_task_id: int | None,
+        launch_evidence: dict | None = None,
+    ) -> None:
+        from backend.services.plan_events import broadcast_plan_event
+
+        event = (
+            "plan_application_delivery_uncertain"
+            if status == "uncertain"
+            else "plan_application_delivery_failed"
+        )
+        for plan_id in plan_ids:
+            await broadcast_plan_event(
+                event=event,
+                plan_id=plan_id,
+                target_task_id=target_task_id,
+                broadcaster=self.broadcaster,
+                receipt_key=receipt_key,
+                delivery_status=status,
+            )
+        await self.broadcaster.broadcast(
+            f"task:{target_task_id}",
+            {
+                "event_type": event,
+                "task_id": target_task_id,
+                "receipt_key": receipt_key,
+                "delivery_status": status,
+                "error": error[:2000],
+                "launch_evidence": launch_evidence,
+            },
+        )
+
+    async def _delivery_plan_context(
+        self,
+        receipt_key: str,
+    ) -> tuple[list[int], int | None, dict | None]:
+        from backend.models.plan import PlanApplication, PlanApplicationReceipt
+
+        async with self.db_factory() as db:
+            receipt = await db.scalar(
+                select(PlanApplicationReceipt).where(
+                    PlanApplicationReceipt.receipt_key == receipt_key
+                )
+            )
+            if receipt is None:
+                return [], None, None
+            plan_ids = list(
+                dict.fromkeys(
+                    (
+                        await db.execute(
+                            select(PlanApplication.plan_id).where(
+                                PlanApplication.application_receipt_key == receipt_key
+                            )
+                        )
+                    ).scalars()
+                )
+            )
+            return plan_ids, receipt.target_task_id, receipt.launch_evidence
+
+    async def _reset_plan_deliveries_after_queue_clear(
+        self,
+        delivery_keys: list[str],
+        *,
+        cancel: bool,
+    ) -> None:
+        for delivery_key in dict.fromkeys(delivery_keys):
+            async with self._dispatch_claim_lock:
+                self._queued_delivery_keys.discard(delivery_key)
+            if cancel:
+                await self._release_plan_delivery_before_launch(
+                    delivery_key,
+                    status="cancelled",
+                    error="Plan application delivery was cancelled before launch",
+                )
+                continue
+            async with self.db_factory() as db:
+                from backend.models.plan import PlanApplicationReceipt
+
+                await db.execute(
+                    update(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.receipt_key == delivery_key,
+                        PlanApplicationReceipt.delivery_status.in_(
+                            ["pending", "queued"]
+                        ),
+                    )
+                    .values(
+                        delivery_status="pending",
+                        delivery_error=None,
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+                await db.commit()
+            try:
+                await self.enqueue_plan_application_receipt(delivery_key)
+            except (TaskStartPausedError, RuntimeError):
+                # The durable row remains pending and startup recovery will
+                # admit it if this process actually exits. A cancelled update
+                # can call recovery explicitly after reopening admission.
+                logger.info(
+                    "Deferred cleared Plan delivery %s until admission resumes",
+                    delivery_key,
+                )
+
+    async def clear_task_queue(
+        self,
+        task_id: int,
+        *,
+        durable_db=None,
+    ) -> int:
         """Drop all pending queued messages for a task (used on interrupt).
 
         Returns the number of messages discarded. The message currently being
         processed (if any) is not affected — callers stop the process separately.
         """
+        delivery_keys: list[str] = []
+        released_deliveries: list[tuple[str, list[int], int | None]] = []
         async with self._dispatch_claim_lock:
             self._task_queue_generations[task_id] = (
                 self._task_queue_generations.get(task_id, 0) + 1
             )
             q = self._task_queues.get(task_id)
-            if q is None:
-                self._pending_task_starts.discard(task_id)
-                return 0
             # q.get() removes an item before the consumer can acquire the
             # admission lock to register it as in-flight. In that state the
             # queue is empty but pending still records the accepted message.
             # Advancing the generation above cancels that handoff; count it so
             # stop-session reports a successful clear instead of a false 400.
-            cancelled_handoff = (
-                q.empty()
-                and task_id in self._pending_task_starts
-                and not self._task_queue_inflight.get(task_id, 0)
+            handoff = self._task_queue_dequeued.get(task_id)
+            cancelled_handoff = bool(
+                handoff is not None and not self._task_queue_inflight.get(task_id, 0)
             )
+            if cancelled_handoff:
+                handoff.queue_clear_handled = True
+                if handoff.delivery_key is not None:
+                    delivery_keys.append(handoff.delivery_key)
             cleared = 0
-            while True:
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                q.task_done()
-                cleared += 1
-            if q.empty() and not self._task_queue_inflight.get(task_id, 0):
+            if q is not None:
+                while True:
+                    try:
+                        queued = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if queued.delivery_key is not None:
+                        delivery_keys.append(queued.delivery_key)
+                    q.task_done()
+                    cleared += 1
+            if (q is None or q.empty()) and not self._task_queue_inflight.get(
+                task_id, 0
+            ):
                 self._pending_task_starts.discard(task_id)
             if cancelled_handoff:
                 cleared += 1
+            if task_id in self._cancel_durable_queue_tasks:
+                from backend.services.plan_service import (
+                    release_unstarted_plan_applications_for_task,
+                )
+
+                if durable_db is None:
+                    async with self.db_factory() as db:
+                        released_deliveries = (
+                            await release_unstarted_plan_applications_for_task(
+                                db,
+                                target_task_id=task_id,
+                                delivery_status="cancelled",
+                                error=(
+                                    "Plan application delivery was cancelled "
+                                    "before launch"
+                                ),
+                            )
+                        )
+                        await db.commit()
+                else:
+                    released_deliveries = (
+                        await release_unstarted_plan_applications_for_task(
+                            durable_db,
+                            target_task_id=task_id,
+                            delivery_status="cancelled",
+                            error=(
+                                "Plan application delivery was cancelled before launch"
+                            ),
+                        )
+                    )
+                    await durable_db.commit()
+                released_keys = {item[0] for item in released_deliveries}
+                for receipt_key in released_keys:
+                    self._queued_delivery_keys.discard(receipt_key)
+                cleared += len(released_keys - set(delivery_keys))
+            else:
+                released_keys = set()
+        for receipt_key, plan_ids, target_task_id in released_deliveries:
+            await self._broadcast_plan_delivery_change(
+                receipt_key=receipt_key,
+                status="cancelled",
+                error="Plan application delivery was cancelled before launch",
+                plan_ids=plan_ids,
+                target_task_id=target_task_id,
+            )
+        delivery_keys = [key for key in delivery_keys if key not in released_keys]
+        if delivery_keys:
+            await self._reset_plan_deliveries_after_queue_clear(
+                delivery_keys,
+                cancel=task_id in self._cancel_durable_queue_tasks,
+            )
         if cleared:
-            logger.info(f"Cleared {cleared} pending queued message(s) for task {task_id} on interrupt")
+            logger.info(
+                f"Cleared {cleared} pending queued message(s) for task {task_id} on interrupt"
+            )
         return cleared
 
     async def _claim_dequeued_message(
@@ -10570,20 +11922,34 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         msg: QueuedMessage,
     ) -> bool:
         """Register a dequeued message unless a queue clear invalidated it."""
+        cancelled_delivery_key: str | None = None
+        cancel_delivery = False
         async with self._dispatch_claim_lock:
             if msg.queue_generation != self._task_queue_generations.get(task_id, 0):
-                return False
-            self._task_queue_inflight[task_id] = (
-                self._task_queue_inflight.get(task_id, 0) + 1
+                cancelled_delivery_key = (
+                    None if msg.queue_clear_handled else msg.delivery_key
+                )
+                cancel_delivery = task_id in self._cancel_durable_queue_tasks
+            else:
+                self._task_queue_inflight[task_id] = (
+                    self._task_queue_inflight.get(task_id, 0) + 1
+                )
+                self._pending_task_starts.add(task_id)
+                return True
+        if cancelled_delivery_key is not None:
+            await self._reset_plan_deliveries_after_queue_clear(
+                [cancelled_delivery_key],
+                cancel=cancel_delivery,
             )
-            self._pending_task_starts.add(task_id)
-            return True
+        return False
 
     async def abort_task_queue(
         self,
         task_id: int,
         *,
         timeout: float = TASK_QUEUE_ABORT_TIMEOUT,
+        cancel_durable: bool = True,
+        durable_db=None,
     ) -> int:
         """Discard pending messages and cancel the already-dequeued message.
 
@@ -10594,7 +11960,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         and temporary skill state have completed their ``finally`` cleanup.
         """
 
-        cleared = await self.clear_task_queue(task_id)
+        if cancel_durable:
+            async with self.task_queue_cancellation_lease(task_id):
+                return await self.abort_task_queue(
+                    task_id,
+                    timeout=timeout,
+                    cancel_durable=False,
+                    durable_db=durable_db,
+                )
+
+        cleared = await self.clear_task_queue(
+            task_id,
+            durable_db=durable_db,
+        )
         worker = self._task_queue_workers.get(task_id)
         cancelled_worker = False
         if (
@@ -10610,15 +11988,45 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 # let cancel/stop claim success while the already-dequeued
                 # message can still own a hidden launch reservation or child.
                 raise TaskQueueAbortTimeoutError(
-                    f"Task {task_id} queue worker did not stop within "
-                    f"{timeout:.1f}s"
+                    f"Task {task_id} queue worker did not stop within {timeout:.1f}s"
                 )
             await asyncio.gather(*done, return_exceptions=True)
         # A retryable error can requeue between the first drain and consumer
-        # cancellation.  Drain once more after the worker is definitively gone.
+        # cancellation. Drain once more after the worker is definitively gone.
         if cancelled_worker:
-            cleared += await self.clear_task_queue(task_id)
+            cleared += await self.clear_task_queue(
+                task_id,
+                durable_db=durable_db,
+            )
         return cleared
+
+    @asynccontextmanager
+    async def task_queue_cancellation_lease(self, task_id: int):
+        """Keep Task message admission closed through a terminal operation.
+
+        The lease is reference-counted because stop, cancel, and supersede may
+        overlap. One completed operation must not reopen admission while
+        another operation is still settling a launch or publishing its exact
+        terminal generation.
+        """
+
+        async with self._dispatch_claim_lock:
+            self._task_queue_cancellation_lease_counts[task_id] = (
+                self._task_queue_cancellation_lease_counts.get(task_id, 0) + 1
+            )
+            self._cancel_durable_queue_tasks.add(task_id)
+        try:
+            yield
+        finally:
+            async with self._dispatch_claim_lock:
+                remaining = (
+                    self._task_queue_cancellation_lease_counts.get(task_id, 0) - 1
+                )
+                if remaining > 0:
+                    self._task_queue_cancellation_lease_counts[task_id] = remaining
+                else:
+                    self._task_queue_cancellation_lease_counts.pop(task_id, None)
+                    self._cancel_durable_queue_tasks.discard(task_id)
 
     async def _queue_heartbeat(self, task_id: int):
         """Continuously mark a task's queue consumer as alive.
@@ -10651,11 +12059,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             CodexThreadTerminalStateError,
         )
 
-        provider = (
-            "Claude"
-            if isinstance(exc, ClaudeAccountRoutingError)
-            else "Codex"
-        )
+        provider = "Claude" if isinstance(exc, ClaudeAccountRoutingError) else "Codex"
         if isinstance(exc, QueuedMessageRoutingMismatchError):
             notice = (
                 "任务的 Provider、模型或 Fast/Standard 配置已在消息发送后"
@@ -10726,11 +12130,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     )
                     break
 
+                self._task_queue_dequeued[task_id] = msg
+
                 try:
                     claimed = await self._claim_dequeued_message(task_id, msg)
                 except BaseException:
                     q.task_done()
                     raise
+                self._task_queue_dequeued.pop(task_id, None)
                 if not claimed:
                     q.task_done()
                     logger.info(
@@ -10750,6 +12157,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             # exact message in hand and retry only after the
                             # updater cancels its restart and reopens the gate.
                             continue
+                except asyncio.CancelledError:
+                    if msg.delivery_key is not None:
+                        await self._reset_plan_deliveries_after_queue_clear(
+                            [msg.delivery_key],
+                            cancel=(task_id in self._cancel_durable_queue_tasks),
+                        )
+                    raise
                 except Exception as exc:
                     from backend.services.codex_app_server import (
                         CodexAppServerBusyError,
@@ -10785,8 +12199,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                     QueuedMessageRoutingMismatchError,
                                 ),
                             )
-                            or
-                            isinstance(
+                            or isinstance(
                                 exc,
                                 (
                                     ClaudeAccountRoutingError,
@@ -10802,12 +12215,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 exc,
                             )
                             try:
-                                await (
-                                    self
-                                    ._publish_permanent_account_routing_failure(
-                                        task_id,
-                                        exc,
-                                    )
+                                await self._publish_permanent_account_routing_failure(
+                                    task_id,
+                                    exc,
                                 )
                             except Exception:
                                 # If the durable/user-visible refusal itself
@@ -10819,8 +12229,12 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                     task_id,
                                 )
                                 await q.put(msg)
-                                await asyncio.sleep(
-                                    CODEX_ROUTING_RETRY_DELAY
+                                await asyncio.sleep(CODEX_ROUTING_RETRY_DELAY)
+                            else:
+                                await self._release_plan_delivery_before_launch(
+                                    msg.delivery_key,
+                                    status="failed",
+                                    error=str(exc)[:2000],
                                 )
                         else:
                             # Routing/rebind/instance-contention conflicts are
@@ -10829,7 +12243,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             logger.warning(
                                 "Deferring queued message for task %s until a "
                                 "launch slot is available: %s",
-                                task_id, exc,
+                                task_id,
+                                exc,
                             )
                             await q.put(msg)
                             retry_after = getattr(exc, "retry_after", None)
@@ -10837,10 +12252,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 max(
                                     0.0,
                                     min(
-                                        float(
-                                            retry_after
-                                            or CODEX_ROUTING_RETRY_DELAY
-                                        ),
+                                        float(retry_after or CODEX_ROUTING_RETRY_DELAY),
                                         300.0,
                                     ),
                                 )
@@ -10848,6 +12260,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     else:
                         logger.exception(
                             f"Error processing queued message for task {task_id}"
+                        )
+                        await self._release_plan_delivery_before_launch(
+                            msg.delivery_key,
+                            status="failed",
+                            error=str(exc)[:2000],
                         )
                 finally:
                     # `_process_queued_message` normally releases immediately
@@ -10872,6 +12289,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         finally:
             hb_task.cancel()
             await asyncio.gather(hb_task, return_exceptions=True)
+            orphaned_delivery_key = None
+            async with self._dispatch_claim_lock:
+                handoff = self._task_queue_dequeued.get(task_id)
+                if handoff is not None:
+                    self._task_queue_dequeued.pop(task_id, None)
+                    if not handoff.queue_clear_handled:
+                        orphaned_delivery_key = handoff.delivery_key
+            if orphaned_delivery_key is not None:
+                await self._reset_plan_deliveries_after_queue_clear(
+                    [orphaned_delivery_key],
+                    cancel=task_id in self._cancel_durable_queue_tasks,
+                )
             # Only deregister if THIS task is still the registered worker. The
             # watchdog (_ensure_queue_worker) may have already cancelled us and
             # registered a fresh consumer; popping unconditionally would erase
@@ -10938,28 +12367,34 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         lifecycle = self._running_tasks.get(instance_id)
         if lifecycle is not None and not lifecycle.done():
-            # Fresh lifecycle preparation precedes Instance.current_task_id/PID
-            # persistence, so Task.instance_id is its exact durable owner link.
-            return True
+            lifecycle_task_id = getattr(lifecycle, "_ccm_task_id", None)
+            if lifecycle_task_id == task_id:
+                # Fresh lifecycle preparation precedes
+                # Instance.current_task_id/PID persistence, so the explicit
+                # in-memory binding is authoritative in that launch window.
+                return True
+            if lifecycle_task_id is None:
+                # Compatibility for older embedders/tests: require the current
+                # reverse owner instead of trusting a stale Task.instance_id.
+                lifecycle_instance = await db.get(
+                    Instance, instance_id, populate_existing=True
+                )
+                if (
+                    lifecycle_instance is not None
+                    and lifecycle_instance.current_task_id == task_id
+                ):
+                    return True
 
         records = getattr(self.instance_manager, "_consumer_records", {})
-        record = (
-            records.get(instance_id) if isinstance(records, dict) else None
-        )
+        record = records.get(instance_id) if isinstance(records, dict) else None
         record_task_id = getattr(record, "task_id", None)
         launch_params = getattr(self.instance_manager, "_launch_params", {})
         params = (
-            launch_params.get(instance_id)
-            if isinstance(launch_params, dict)
-            else None
+            launch_params.get(instance_id) if isinstance(launch_params, dict) else None
         )
-        params_task_id = (
-            params.get("task_id") if isinstance(params, dict) else None
-        )
+        params_task_id = params.get("task_id") if isinstance(params, dict) else None
         manager_running = bool(self.instance_manager.is_running(instance_id))
-        if manager_running and (
-            record_task_id == task_id or params_task_id == task_id
-        ):
+        if manager_running and (record_task_id == task_id or params_task_id == task_id):
             # Instance.current_task_id can be cleared near the end of output
             # persistence while the exact Codex consumer still owns rollout
             # migration/account binding.  The generation record is the
@@ -10995,9 +12430,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # before the narrower launch try/finally is reached.
             if msg.instance_claim is not None:
                 instance_id, claim_token = msg.instance_claim
-                await self._release_instance_reservation(
-                    instance_id, claim_token
-                )
+                await self._release_instance_reservation(instance_id, claim_token)
                 msg.instance_claim = None
             if cleanup_state["has_temp_skills"]:
                 await self._restore_queued_message_skills(
@@ -11024,9 +12457,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 # SQLite serializes the write transaction, so a concurrent
                 # config save is ordered before or after this restoration.
                 guarded = await db.execute(
-                    update(Task)
-                    .where(Task.id == task_id)
-                    .values(status=Task.status)
+                    update(Task).where(Task.id == task_id).values(status=Task.status)
                 )
                 if not guarded.rowcount:
                     await db.rollback()
@@ -11038,8 +12469,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 metadata = dict(task.metadata_ or {})
                 if (
                     temporary_skill_token is None
-                    or metadata.get(TEMP_SKILLS_GENERATION_KEY)
-                    != temporary_skill_token
+                    or metadata.get(TEMP_SKILLS_GENERATION_KEY) != temporary_skill_token
                 ):
                     await db.rollback()
                     return
@@ -11149,8 +12579,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 and current_expected_route != msg.expected_task_routing
             ):
                 raise QueuedMessageRoutingMismatchError(
-                    "Task execution configuration changed after message "
-                    "admission"
+                    "Task execution configuration changed after message admission"
                 )
             if task.worker_id is not None or task.shared_from_id is not None:
                 # A message can be dequeued just before Task migration commits.
@@ -11214,9 +12643,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # it.  In particular, a late autonomous turn may have no Instance
             # owner but remains a live writer through its durable marker.
             for attempt in range(60):
-                if not await self._queued_task_has_live_generation(
-                    db, task_id
-                ):
+                if not await self._queued_task_has_live_generation(db, task_id):
                     break
                 await asyncio.sleep(2)
             else:
@@ -11237,10 +12664,12 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # is always sacrificed to flip the task to "failed"; only the SECOND
             # message reaches this branch and recovers (prod task #725).
             from backend.api.tasks import _clone_session, _find_session_jsonl
+
             provider = (task.provider or "claude").lower()
-            session_gone = bool(task.session_id) and _find_session_jsonl(
-                task.session_id, provider=provider
-            ) is None
+            session_gone = (
+                bool(task.session_id)
+                and _find_session_jsonl(task.session_id, provider=provider) is None
+            )
             if task.session_id and (task.status == "failed" or session_gone):
                 # Snapshot the complete resume generation before any clone /
                 # compaction awaits.  A concurrent cancel, retry, or owner/session
@@ -11252,19 +12681,24 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 recovery_started_at = task.started_at
                 recovery_completed_at = task.completed_at
                 if task.status == "failed":
-                    logger.info("Task %d session crashed, recovering session...", task_id)
+                    logger.info(
+                        "Task %d session crashed, recovering session...", task_id
+                    )
                 else:
                     logger.warning(
                         "Task %d session %s not on disk, recovering before resume "
                         "(would otherwise hard-fail with 'No conversation found')",
-                        task_id, task.session_id,
+                        task_id,
+                        task.session_id,
                     )
                 # A present Codex rollout remains resumable after a failed
                 # turn.  Unlike Claude's flat JSONL, it cannot be made into a
                 # new thread by merely copying/renaming the file because the
                 # thread id is embedded in its metadata.
                 keep_codex_session = provider == "codex" and not session_gone
-                cloned = None if keep_codex_session else await _clone_session(task_id, db)
+                cloned = (
+                    None if keep_codex_session else await _clone_session(task_id, db)
+                )
                 recovered_session_id = recovery_session_id
                 recovered_context_usage = task.context_window_usage
                 recovered_prompt = msg.prompt
@@ -11277,7 +12711,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     )
                 elif not keep_codex_session:
                     # JSONL file missing, fall back to compact summary
-                    logger.warning("Task %d JSONL not found, falling back to compact summary", task_id)
+                    logger.warning(
+                        "Task %d JSONL not found, falling back to compact summary",
+                        task_id,
+                    )
                     summary = await self._compact_session(
                         task_id,
                         recovery_session_id,
@@ -11295,7 +12732,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 else:
                     logger.info(
                         "Task %d reusing existing Codex session %s after failed turn",
-                        task_id, task.session_id,
+                        task_id,
+                        task.session_id,
                     )
                 # 关键：不能设成 "pending"——否则主调度循环 (dequeue) 会把它当作
                 # 新任务抢走一个空闲 instance 从头执行 task 描述，导致同一 task 出现
@@ -11337,9 +12775,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 # moving it to in_progress would make ack/reconcile reject it
                 # forever.
                 recovery_claim = await db.execute(
-                    update(Task)
-                    .where(*recovery_predicates)
-                    .values(status=Task.status)
+                    update(Task).where(*recovery_predicates).values(status=Task.status)
                 )
                 if not recovery_claim.rowcount:
                     await db.rollback()
@@ -11397,6 +12833,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 # 广播认领态（此分支是 failed/session 丢失的恢复路径）：不广播
                 # 的话前端要等 executing 广播才知道任务被认领（轮询窗口内分叉）
                 from backend.services.task_events import broadcast_status_change
+
                 await broadcast_status_change(task_id, "in_progress")
 
             # Fence startup reconciliation from this point through successful
@@ -11444,7 +12881,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # the integer Instance predicate (PostgreSQL is strict here).
             inst, claim_token = await self._reserve_idle_instance(db)
             if inst is None or claim_token is None:
-                logger.warning(f"No idle instance for task {task_id}, re-queueing message")
+                logger.warning(
+                    f"No idle instance for task {task_id}, re-queueing message"
+                )
                 q = self._get_task_queue(task_id)
                 await q.put(msg)
                 await asyncio.sleep(5)
@@ -11457,7 +12896,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 project = await db.get(Project, task.project_id)
                 global_cfg = await db.get(GlobalSettings, 1)
                 if project:
-                    merged = merge_git_config(settings_to_dict(project), settings_to_dict(global_cfg))
+                    merged = merge_git_config(
+                        settings_to_dict(project), settings_to_dict(global_cfg)
+                    )
             git_env = _build_git_env(merged)
 
             effort_level = task.effort_level or settings.default_effort
@@ -11517,6 +12958,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 # codex 无该字段时查 codex 窗口表（272K/128K，非 claude 的 200K）
                 if (task.provider or "claude").lower() == "codex":
                     from backend.services.codex_models import codex_context_window
+
                     window = usage.get("context_window") or codex_context_window(
                         effective_model
                     )
@@ -11538,7 +12980,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if utilization >= compact_threshold:
                     logger.info(
                         "Task %d context at %.0f%% (%d/%d), compacting session...",
-                        task_id, utilization * 100, used_tokens, window,
+                        task_id,
+                        utilization * 100,
+                        used_tokens,
+                        window,
                     )
                     # 收集最近对话摘要
                     summary = await self._compact_session(
@@ -11557,26 +13002,34 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             f"（{used_tokens:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
                             f"已自动压缩摘要并开启新会话延续上下文"
                         )
-                        db.add(LogEntry(
-                            instance_id=inst.id,
-                            task_id=task_id,
-                            event_type="system_event",
-                            role="system",
-                            content=notice,
-                            is_error=False,
-                        ))
+                        db.add(
+                            LogEntry(
+                                instance_id=inst.id,
+                                task_id=task_id,
+                                event_type="system_event",
+                                role="system",
+                                content=notice,
+                                is_error=False,
+                            )
+                        )
                         await db.commit()
-                        await self.broadcaster.broadcast(f"task:{task_id}", {
-                            "event_type": "system_event",
-                            "role": "system",
-                            "content": notice,
-                        })
+                        await self.broadcaster.broadcast(
+                            f"task:{task_id}",
+                            {
+                                "event_type": "system_event",
+                                "role": "system",
+                                "content": notice,
+                            },
+                        )
                         msg.prompt = build_compacted_resume_prompt(
                             summary,
                             msg.current_message,
                         )
                         msg.allow_new_session = True
-                        logger.info("Task %d compacted, new session will start with summary", task_id)
+                        logger.info(
+                            "Task %d compacted, new session will start with summary",
+                            task_id,
+                        )
 
             # Capture launch params before closing DB session
             launch_kwargs = dict(
@@ -11618,7 +13071,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             broadcast_data = None
             if source_log_pending:
                 import json as _json
-                src_label = "monitor" if msg.source.startswith("monitor:") else "sub-agent"
+
+                src_label = (
+                    "monitor" if msg.source.startswith("monitor:") else "sub-agent"
+                )
                 log_raw: dict = {"source": src_label}
                 if msg.monitor_session_id:
                     log_raw["monitor_session_id"] = msg.monitor_session_id
@@ -11650,9 +13106,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # commit point. A paused updater either observes this executing
             # generation or prevents the launch before the CAS is committed.
             async with self.task_start_guard():
-                if await self._queued_task_has_live_generation(
-                    db, task_id
-                ):
+                if await self._queued_task_has_live_generation(db, task_id):
                     await db.rollback()
                     raise QueuedMessagePrelaunchError(
                         "A foreground or detached PTY generation became active "
@@ -11770,9 +13224,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if msg.command_skills:
                     effective_skills.update(msg.command_skills)
                     temporary_skill_token = secrets.token_urlsafe(24)
-                    cleanup_state["temporary_skill_token"] = (
-                        temporary_skill_token
-                    )
+                    cleanup_state["temporary_skill_token"] = temporary_skill_token
                 launch_kwargs.update(
                     provider=task.provider,
                     model=current_effective_model,
@@ -11794,19 +13246,55 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         temporary_skill_token
                     )
                     task.metadata_ = temporary_metadata
-                queued_turn_generation = (
-                    await self._read_task_status_generation(db, task_id)
+                queued_turn_generation = await self._read_task_status_generation(
+                    db, task_id
                 )
                 if queued_turn_generation is None:
                     await db.rollback()
                     raise QueuedMessagePrelaunchError(
                         "Queued task disappeared after launch claim"
                     )
-                cleanup_state["has_temp_skills"] = bool(
-                    msg.command_skills
-                )
+                cleanup_state["has_temp_skills"] = bool(msg.command_skills)
                 if monitor_log is not None:
                     db.add(monitor_log)
+                if msg.delivery_key is not None:
+                    from backend.models.plan import PlanApplicationReceipt
+
+                    delivery_claim = await db.execute(
+                        update(PlanApplicationReceipt)
+                        .where(
+                            PlanApplicationReceipt.receipt_key == msg.delivery_key,
+                            PlanApplicationReceipt.target_task_id == task_id,
+                            PlanApplicationReceipt.delivery_status.in_(
+                                ["pending", "queued"]
+                            ),
+                        )
+                        .values(
+                            delivery_status="launching",
+                            delivery_error=None,
+                            launch_evidence={
+                                "task_id": task_id,
+                                "instance_id": inst.id,
+                                "retry_count": queued_turn_generation.retry_count,
+                                "started_at": (
+                                    queued_turn_generation.started_at.isoformat()
+                                    if queued_turn_generation.started_at is not None
+                                    else None
+                                ),
+                                "session_id": task.session_id,
+                                "source_log_id": msg.source_log_id,
+                                "provider": task_provider,
+                                "model": current_effective_model,
+                                "service_tier": task.codex_service_tier,
+                            },
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    if delivery_claim.rowcount != 1:
+                        await db.rollback()
+                        raise QueuedMessagePrelaunchError(
+                            "Plan application delivery fence changed"
+                        )
                 await db.commit()
                 if monitor_log is not None:
                     msg.source_log_id = monitor_log.id
@@ -11817,9 +13305,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             broadcast_data,
                         )
             if broadcast_data is not None:
-                await self.broadcaster.broadcast(
-                    f"task:{task_id}", broadcast_data
-                )
+                await self.broadcaster.broadcast(f"task:{task_id}", broadcast_data)
                 msg.source_logged = True
 
             # Claim the instance across the launch window: launch() only flips
@@ -11864,18 +13350,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         InstanceAlreadyRunningError,
                     ),
                 )
-                permanent_prelaunch = isinstance(
-                    exc, CloudRouterAccountError
-                )
+                permanent_prelaunch = isinstance(exc, CloudRouterAccountError)
                 safe_to_retry = (
                     known_prelaunch
                     or self.instance_manager.processes.get(inst_id) is None
                 )
                 permanent_notice_data = None
                 rollback_values = {
-                    "status": (
-                        status_before_launch if safe_to_retry else "failed"
-                    ),
+                    "status": (status_before_launch if safe_to_retry else "failed"),
                     "instance_id": instance_id_before_launch,
                     "completed_at": completed_at_before_launch,
                 }
@@ -11906,8 +13388,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 )
                 failed_generation = None
                 if not safe_to_retry and restored.rowcount:
-                    failed_generation = (
-                        await self._read_task_status_generation(db, task_id)
+                    failed_generation = await self._read_task_status_generation(
+                        db, task_id
                     )
                 if permanent_prelaunch and restored.rowcount:
                     unsafe_cloudrouter_config = isinstance(
@@ -11946,6 +13428,25 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             permanent_notice.timestamp or datetime.utcnow()
                         ).isoformat(),
                     }
+                if safe_to_retry and msg.delivery_key is not None:
+                    # The launch adapter proved that no external generation
+                    # exists. Reopen the receipt before leaving this DB
+                    # transaction so the consumer can retry it or release the
+                    # Version after a permanent refusal.
+                    from backend.models.plan import PlanApplicationReceipt
+
+                    await db.execute(
+                        update(PlanApplicationReceipt)
+                        .where(
+                            PlanApplicationReceipt.receipt_key == msg.delivery_key,
+                            PlanApplicationReceipt.delivery_status == "launching",
+                        )
+                        .values(
+                            delivery_status="queued",
+                            delivery_error=None,
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
                 await db.commit()
                 if permanent_notice_data is not None:
                     await self.broadcaster.broadcast(
@@ -11958,27 +13459,26 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         instance_id=inst_id,
                         db=db,
                     )
-                if (
-                    safe_to_retry
-                    and not known_prelaunch
-                    and not permanent_prelaunch
-                ):
+                if safe_to_retry and not known_prelaunch and not permanent_prelaunch:
                     raise QueuedMessagePrelaunchError(
                         f"Queued message launch failed before process creation: {exc}"
                     ) from exc
                 raise
             finally:
-                await self._release_instance_reservation(
-                    inst_id, claim_token
-                )
+                await self._release_instance_reservation(inst_id, claim_token)
                 msg.instance_claim = None
 
-            await self.broadcaster.broadcast("tasks", {
-                "event": "status_change",
-                "task_id": task_id,
-                "new_status": "executing",
-                "instance_id": inst_id,
-            })
+            await self._mark_plan_delivery(msg.delivery_key, "launched")
+
+            await self.broadcaster.broadcast(
+                "tasks",
+                {
+                    "event": "status_change",
+                    "task_id": task_id,
+                    "new_status": "executing",
+                    "instance_id": inst_id,
+                },
+            )
         # DB session closed — process runs independently
         if launch_admission["held"]:
             launch_admission["held"] = False
@@ -11990,9 +13490,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             consumer = self.instance_manager._tasks.get(inst_id)
             pty_managed_turn = bool(
                 task_provider == "claude"
-                and self.instance_manager.is_pty_managed_turn(
-                    inst_id, process
-                )
+                and self.instance_manager.is_pty_managed_turn(inst_id, process)
             )
             if not pty_managed_turn:
                 # A subprocess/app-server output consumer may react to a
@@ -12022,9 +13520,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             elif process:
                 # Claude PTY represents one turn through a persistent session;
                 # its retry/switch handling remains in the PTY branch below.
-                await self._wait_process(
-                    process, task, "Chat run", instance_id=inst_id
-                )
+                await self._wait_process(process, task, "Chat run", instance_id=inst_id)
             # Status management is handled by _consume_output (chat_initiated=True)
             #
             # FullMirrorCCMBackend.on_exit is the sole owner of PTY transient
@@ -12046,15 +13542,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 await self.instance_manager._try_proactive_pool_switch(
                     inst_id,
                     task_id,
-                    rate_limit_info=self.instance_manager.pty_rate_limit_info(
-                        inst_id
-                    ),
+                    rate_limit_info=self.instance_manager.pty_rate_limit_info(inst_id),
                 )
                 self.instance_manager.clear_pty_rate_limit(inst_id)
         finally:
             # FullMirrorCCMBackend.on_exit is the sole authoritative PTY
             # Task→Instance finalizer. A queue cancellation or wait failure
             # must never manufacture a successful ``completed`` generation.
+            await self._mark_plan_delivery(msg.delivery_key, "launched")
             if repair_wake_identity is not None:
                 from backend.services.pr_monitor_loop import finish_repair_wake
 
@@ -12204,14 +13699,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             "（比基础当前消息更新，冲突时以此为准）"
                         )
                     else:
-                        inject_label = (
-                            "当前消息排队期间对上一阶段的补充/纠正"
-                        )
+                        inject_label = "当前消息排队期间对上一阶段的补充/纠正"
                     post_current_blocks.append(
                         (
                             injected_user.id,
-                            f"[{inject_label}]\n"
-                            f"{injected_content}",
+                            f"[{inject_label}]\n{injected_content}",
                         )
                     )
                 trailing_assistant = await _last_assistant_between(
@@ -12231,10 +13723,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             f"{(trailing_assistant.content or '')[:1200]}",
                         )
                     )
-                history_blocks.extend(
-                    block
-                    for _, block in sorted(post_current_blocks)
-                )
+                history_blocks.extend(block for _, block in sorted(post_current_blocks))
 
             # Prefer complete recent stages over a wide but shallow history.
             # Walk backwards under a fixed budget, then restore chronological
@@ -12271,26 +13760,17 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 omission = "\n...[中间省略]...\n"
                 head_length = (limit - len(omission)) // 2
                 tail_length = limit - len(omission) - head_length
-                return (
-                    text[:head_length]
-                    + omission
-                    + text[-tail_length:]
-                )
+                return text[:head_length] + omission + text[-tail_length:]
 
             original_background = task.description if task else None
-            if (
-                original_background
-                and original_background.lstrip().startswith(
-                    "[Context compacted]"
-                )
+            if original_background and original_background.lstrip().startswith(
+                "[Context compacted]"
             ):
                 # Lifecycle retries replace Task.description with a compacted
                 # wrapper. On a later overflow, retain only the stable original
                 # background section instead of recursively nesting the whole
                 # previous summary and its recovery instructions.
-                marker_index = original_background.rfind(
-                    "## 原始任务背景（"
-                )
+                marker_index = original_background.rfind("## 原始任务背景（")
                 if marker_index >= 0:
                     marker_end = original_background.find(
                         "\n",

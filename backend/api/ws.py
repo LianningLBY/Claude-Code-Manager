@@ -15,9 +15,10 @@ router = APIRouter()
 
 _MAX_WS_CHANNELS = 100
 _WS_ACL_RECHECK_SECONDS = 5.0
-_GLOBAL_CHANNELS = {"tasks", "workers", "system", "system_update", "pr-monitor"}
+_GLOBAL_CHANNELS = {"tasks", "plans", "workers", "system", "system_update", "pr-monitor"}
 _INSTANCE_CHANNEL_RE = re.compile(r"instance:([1-9]\d*)\Z")
 _TASK_CHANNEL_RE = re.compile(r"task:([1-9]\d*)\Z")
+_PLAN_CHANNEL_RE = re.compile(r"plan:([1-9]\d*)\Z")
 _WORKER_CHANNEL_RE = re.compile(r"worker:([1-9]\d*)\Z")
 _DISCUSSION_CHANNEL_RE = re.compile(
     r"discussion:([1-9]\d*)(?::agent:[1-9]\d*)?\Z"
@@ -27,14 +28,12 @@ _ROLE_RANK = {"member": 0, "admin": 1, "super_admin": 2}
 
 def _ws_identity(ws: WebSocket) -> dict | None:
     """Return the authenticated WS identity, including its role."""
-    if not settings.auth_token:
-        return {"user_id": None, "role": "super_admin", "auth_type": "none"}
-    # Legacy admin token (header or query param)
     auth = ws.headers.get("authorization", "")
-    if auth.startswith("Bearer ") and auth[7:] == settings.auth_token:
-        return {"user_id": None, "role": "super_admin", "auth_type": "token"}
     token = ws.query_params.get("token", "")
-    if token == settings.auth_token:
+    # Legacy admin token (header or query param)
+    if settings.auth_token and auth.startswith("Bearer ") and auth[7:] == settings.auth_token:
+        return {"user_id": None, "role": "super_admin", "auth_type": "token"}
+    if settings.auth_token and token == settings.auth_token:
         return {"user_id": None, "role": "super_admin", "auth_type": "token"}
     # JWT token (query param — browser WS can't set headers)
     if token:
@@ -49,6 +48,8 @@ def _ws_identity(ws: WebSocket) -> dict | None:
         payload = decode_jwt(auth[7:])
         if payload is not None:
             return {**payload, "auth_type": "jwt"}
+    if not settings.auth_token:
+        return {"user_id": None, "role": "super_admin", "auth_type": "none"}
     return None
 
 
@@ -160,6 +161,41 @@ async def _ws_worker_channel_allowed(
         return await check(session)
 
 
+async def _ws_plan_channel_allowed(identity: dict, plan_id: int, db=None) -> bool:
+    """Mirror canonical HTTP Plan access without importing the API router."""
+
+    from backend.database import async_session
+    from backend.models.plan import Plan
+    from backend.api.deps import has_project_access, has_worker_access
+
+    async def check(session) -> bool:
+        plan = await session.get(Plan, plan_id)
+        if plan is None:
+            return False
+        if plan.target_task_id is not None:
+            return await _ws_task_channel_allowed(
+                identity, plan.target_task_id, session
+            )
+        user_id = identity.get("user_id")
+        if user_id is not None and plan.created_by == user_id:
+            return True
+        request = _acl_request(identity)
+        if plan.worker_id is not None and await has_worker_access(
+            request, plan.worker_id, session
+        ):
+            return True
+        if plan.project_id is not None and await has_project_access(
+            request, plan.project_id, session
+        ):
+            return True
+        return False
+
+    if db is not None:
+        return await check(db)
+    async with async_session() as session:
+        return await check(session)
+
+
 async def _ws_discussion_channel_allowed(
     identity: dict,
     discussion_id: int,
@@ -194,12 +230,14 @@ async def _ws_channel_allowed(channel: object, identity: dict, db=None) -> bool:
         return False
     instance_match = _INSTANCE_CHANNEL_RE.fullmatch(channel)
     task_match = _TASK_CHANNEL_RE.fullmatch(channel)
+    plan_match = _PLAN_CHANNEL_RE.fullmatch(channel)
     worker_match = _WORKER_CHANNEL_RE.fullmatch(channel)
     discussion_match = _DISCUSSION_CHANNEL_RE.fullmatch(channel)
     known_channel = bool(
         channel in _GLOBAL_CHANNELS
         or instance_match
         or task_match
+        or plan_match
         or worker_match
         or discussion_match
     )
@@ -213,6 +251,12 @@ async def _ws_channel_allowed(channel: object, identity: dict, db=None) -> bool:
         return await _ws_task_channel_allowed(
             identity,
             int(task_match.group(1)),
+            db,
+        )
+    if plan_match:
+        return await _ws_plan_channel_allowed(
+            identity,
+            int(plan_match.group(1)),
             db,
         )
     if worker_match:

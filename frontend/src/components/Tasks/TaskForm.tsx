@@ -1,6 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../../api/client';
-import type { CodexServiceTier, Project, TagItem, Task } from '../../api/client';
+import type {
+  CodexServiceTier,
+  Project,
+  TagItem,
+  Task,
+} from '../../api/client';
 import { Plus, Paperclip, X, Star, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
 import { ProjectSelect } from '../ProjectSelect';
 import { VoiceButton } from '../Voice/VoiceButton';
@@ -105,7 +110,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     fallbackProvider: string,
   ) => {
     setPriority(stored?.priority ?? 0);
-    setMode(stored?.mode || 'auto');
+    // Plan creation now lives on the first-class Plans page. Normalize the
+    // legacy saved value so an old browser preference cannot recreate the
+    // removed Task-form mode invisibly.
+    setMode(stored?.mode === 'plan' ? 'auto' : stored?.mode || 'auto');
     setProvider(stored?.provider || fallbackProvider);
     setModel(stored?.model || '');
     setEffort(stored?.effort || '');
@@ -271,7 +279,17 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   }, [showPluginsDropdown, showConfigPanel, showSkillsDropdown]);
 
   const saveAsDefault = () => {
-    const cfg = { priority, mode, provider, model, effort, codexServiceTier, thinkingBudget, timeoutHours, systemPromptMode };
+    const cfg = {
+      priority,
+      mode,
+      provider,
+      model,
+      effort,
+      codexServiceTier,
+      thinkingBudget,
+      timeoutHours,
+      systemPromptMode,
+    };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
     setDefaultSaved(true);
     setTimeout(() => setDefaultSaved(false), 2000);
@@ -427,7 +445,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         provider,
         model: model || activeDefaultModel,
         ...(effort ? { effort_level: effort } : {}),
-        ...(provider === 'codex' ? { codex_service_tier: codexServiceTier } : {}),
+        ...(provider === 'codex'
+          ? { codex_service_tier: codexServiceTier }
+          : {}),
         ...(thinkingBudget ? { thinking_budget: parseInt(thinkingBudget) || null } : {}),
         ...(systemPromptMode ? { system_prompt_mode: systemPromptMode } : {}),
         ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
@@ -694,7 +714,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   onChange={(e) => setMode(e.target.value)}
                 >
                   <option value="auto">Auto</option>
-                  <option value="plan">Plan</option>
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
                 </select>

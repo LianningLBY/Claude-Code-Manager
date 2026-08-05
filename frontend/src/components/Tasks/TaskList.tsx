@@ -3,12 +3,13 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { api } from '../../api/client';
 import type { Task, Project } from '../../api/client';
 import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin } from '../icons';
-import { FastModeBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
+import { FastModeBadge, PlanPipelineBadge, PlanRevisionBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
 import { AttentionTag } from './AttentionTag';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
 import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
 import { useTaskReorder } from '../../hooks/useTaskReorder';
+import { getTaskStatusLabel } from './taskStatus';
 
 interface TaskListProps {
   tasks: Task[];
@@ -28,6 +29,7 @@ const statusColors: Record<string, string> = {
   executing: 'bg-blue-400 animate-pulse',
   background: 'bg-teal-400 animate-pulse',
   plan_review: 'bg-purple-500',
+  superseded: 'bg-gray-500',
   completed: 'bg-green-500',
   failed: 'bg-red-500',
   cancelled: 'bg-gray-500',
@@ -202,16 +204,39 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               {t.priority > 0 && (
                 <span className="text-xs bg-indigo-600/30 text-indigo-300 px-1.5 rounded">P{t.priority}</span>
               )}
-              <span className="hidden sm:inline text-xs text-gray-500 capitalize">
-                {t.background_active ? 'background' : t.status.replace('_', ' ')}
+              <span className={`text-xs text-gray-500 ${
+                t.mode === 'plan' && ['in_progress', 'executing'].includes(t.status)
+                  ? ''
+                  : 'hidden sm:inline'
+              }`}>
+                {getTaskStatusLabel(t)}
               </span>
-              <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
-                {t.provider === 'codex' ? 'Codex' : 'Claude'}
-              </span>
-              <FastModeBadge task={t} />
-              <TaskConfigBadge task={t} onRefresh={onRefresh} />
-              <PluginsBadge task={t} onRefresh={onRefresh} />
-              <SubAgentsBadge task={t} />
+              {t.mode === 'plan' ? (
+                <>
+                  {t.canonical_plan_id != null && (
+                    <button
+                      type="button"
+                      onClick={() => { window.location.hash = `#/plans/${t.canonical_plan_id}`; }}
+                      className="rounded bg-teal-600/20 px-1.5 text-[10px] font-medium text-teal-300 hover:bg-teal-600/30"
+                      title={`This historical Task has migrated to Plan #${t.canonical_plan_id}`}
+                    >
+                      Plan #{t.canonical_plan_id}
+                    </button>
+                  )}
+                  <PlanPipelineBadge task={t} />
+                  <PlanRevisionBadge task={t} />
+                </>
+              ) : (
+                <>
+                  <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
+                    {t.provider === 'codex' ? 'Codex' : 'Claude'}
+                  </span>
+                  <FastModeBadge task={t} />
+                  <TaskConfigBadge task={t} onRefresh={onRefresh} />
+                  <PluginsBadge task={t} onRefresh={onRefresh} />
+                  <SubAgentsBadge task={t} />
+                </>
+              )}
             </div>
             {/* Action buttons — always top-right aligned */}
             <div className="flex gap-1 shrink-0 items-center">

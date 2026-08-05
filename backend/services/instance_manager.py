@@ -2549,6 +2549,7 @@ class InstanceManager:
         from backend.services.goal_evaluator import (
             goal_evaluator_runtime_users,
         )
+        from backend.services.plan_agent_runner import plan_agent_runtime_users
         from backend.services.skill_distill import task_distill_runtime_users
 
         blockers.extend(goal_evaluator_runtime_users(
@@ -2561,6 +2562,10 @@ class InstanceManager:
             account.claude_config_dir,
         ))
         blockers.extend(task_distill_runtime_users(account.codex_home))
+        blockers.extend(plan_agent_runtime_users(
+            account.claude_config_dir,
+        ))
+        blockers.extend(plan_agent_runtime_users(account.codex_home))
 
         # After restart, an unknown/live generation may exist only as durable
         # Task/Instance recovery evidence. Missing/mismatched ownership cannot
@@ -9363,6 +9368,138 @@ class InstanceManager:
         if cancellation is not None:
             raise cancellation
         return result
+
+    @staticmethod
+    def _pid_is_definitely_gone(pid: int | None) -> bool:
+        """Return True only when the OS proves an exact PID no longer exists."""
+
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
+            return False
+        return False
+
+    async def reconcile_dead_reverse_task_owner(
+        self,
+        instance_id: int,
+        *,
+        expected_task_id: int,
+        expected_pid: int | None,
+        expected_started_at: datetime | None,
+    ) -> bool:
+        """Release one exact dead reverse owner superseded by another slot.
+
+        A retry can leave ``Instance.current_task_id`` pointing at a Task whose
+        authoritative ``Task.instance_id`` has already moved on.  There is no
+        process left for ``stop()`` to signal in that state.  Reconcile only
+        when the old PID is provably absent, all same-process runtime evidence
+        is gone, the Task points elsewhere, and the durable Instance still
+        matches the caller's exact PID/start fences.
+        """
+
+        lifecycle_lock = self._instance_lifecycle_lock(instance_id)
+        async with lifecycle_lock:
+            if (
+                instance_id in self._stopping
+                or instance_id in self._launch_reservations
+                or self.processes.get(instance_id) is not None
+                or self._process_groups.get(instance_id) is not None
+                or self._container_exec_processes.get(instance_id) is not None
+                or self._tasks.get(instance_id) is not None
+                or self._consumer_records.get(instance_id) is not None
+                or any(
+                    recovery_instance_id == instance_id
+                    for recovery_instance_id, _process in (
+                        self._consumer_recovery_pending
+                    )
+                )
+                or self._pty_post_exit_generation_for_instance(
+                    instance_id,
+                    expected_task_id,
+                ) is not None
+            ):
+                return False
+            if not self._pid_is_definitely_gone(expected_pid):
+                return False
+
+            async with self.db_factory() as db:
+                # Preserve the global Task -> Instance lock order. The Task
+                # no-op locks its authoritative owner before the exact stale
+                # reverse owner is cleared.
+                task_lock = await db.execute(
+                    update(Task)
+                    .where(Task.id == expected_task_id)
+                    .values(status=Task.status)
+                )
+                if not task_lock.rowcount:
+                    await db.rollback()
+                    return False
+                current_instance_id = await db.scalar(
+                    select(Task.instance_id).where(
+                        Task.id == expected_task_id
+                    )
+                )
+                if current_instance_id == instance_id:
+                    await db.rollback()
+                    return False
+
+                instance_cleanup = await db.execute(
+                    update(Instance)
+                    .where(
+                        Instance.id == instance_id,
+                        Instance.current_task_id == expected_task_id,
+                        (
+                            Instance.pid.is_(None)
+                            if expected_pid is None
+                            else Instance.pid == expected_pid
+                        ),
+                        (
+                            Instance.started_at.is_(None)
+                            if expected_started_at is None
+                            else Instance.started_at
+                            == expected_started_at
+                        ),
+                    )
+                    .values(
+                        status="idle",
+                        pid=None,
+                        current_task_id=None,
+                    )
+                )
+                if not instance_cleanup.rowcount:
+                    await db.rollback()
+                    return False
+                await db.commit()
+
+            try:
+                await self.broadcaster.broadcast(
+                    "system",
+                    {
+                        "event": "instance_status",
+                        "instance_id": instance_id,
+                        "status": "idle",
+                        "exit_code": None,
+                    },
+                )
+            except Exception:
+                # The exact DB cleanup is already durable. A transient
+                # WebSocket failure must not turn it back into an unresolved
+                # process owner or prevent the live generation from stopping.
+                logger.exception(
+                    "Failed to publish reconciled instance %s",
+                    instance_id,
+                )
+            logger.warning(
+                "Reconciled dead reverse owner: instance %s / task %s / pid %s",
+                instance_id,
+                expected_task_id,
+                expected_pid,
+            )
+            return True
 
     async def _stop_serialized(
         self,

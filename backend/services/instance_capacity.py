@@ -26,6 +26,7 @@ def reusable_idle_predicate():
         Instance.status == "idle",
         Instance.pid.is_(None),
         Instance.current_task_id.is_(None),
+        Instance.current_plan_run_id.is_(None),
     )
 
 
@@ -36,6 +37,7 @@ def occupied_slot_predicate():
         Instance.status.in_(LIVE_INSTANCE_STATUSES),
         Instance.pid.isnot(None),
         Instance.current_task_id.isnot(None),
+        Instance.current_plan_run_id.isnot(None),
     )
 
 
@@ -46,6 +48,7 @@ def active_capacity_predicate():
         Instance.status == "running",
         Instance.pid.isnot(None),
         Instance.current_task_id.isnot(None),
+        Instance.current_plan_run_id.isnot(None),
     )
 
 
@@ -56,6 +59,7 @@ def instance_occupies_slot(instance: Instance) -> bool:
         instance.status in LIVE_INSTANCE_STATUSES
         or instance.pid is not None
         or instance.current_task_id is not None
+        or instance.current_plan_run_id is not None
     )
 
 
@@ -64,4 +68,5 @@ def instance_is_reusable_idle(instance: Instance) -> bool:
         instance.status == "idle"
         and instance.pid is None
         and instance.current_task_id is None
+        and instance.current_plan_run_id is None
     )

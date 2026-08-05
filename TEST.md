@@ -150,17 +150,48 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_chat_send_cwd_not_found` | 工作目录不存在返回 400 |
 | `test_plan_approve_not_plan_review` | 非 plan_review 状态 approve 返回 400 |
 | `test_plan_reject_not_plan_review` | 非 plan_review 状态 reject 返回 400 |
-| `test_plan_approve_success` | plan_review 状态 approve → status=pending, plan_approved=True |
+| `test_plan_approve_success` | plan_review 状态 approve → status=completed、plan_approved=True，且不启动执行 turn |
 | `test_plan_reject_success` | plan_review 状态 reject → status=cancelled, plan_approved=False |
 | `test_plan_approve_not_found` | 不存在的 task approve 返回 404 |
 | `test_plan_reject_not_found` | 不存在的 task reject 返回 404 |
 | `test_codex_fast_rejects_unsupported_chat_model_before_logging` | Fast Task 的一次性模型覆盖若不支持 `priority`，在消息落库和执行前拒绝 |
+
+#### `test_plan_resources.py` / `test_plan_tasks.py` / `test_plan_agent_runner.py` — 交互式版本化 Plan
+
+覆盖稳定 Plan 身份、不可变 Version、Planner/Reviewer 多轮 request-input、单次请求不限制
+问题数量、独立 `0–5` interaction 设置、同 Run 恢复、精确 Version approve/apply、凭据防持久化、
+附件 digest/路径脱敏、Instance owner XOR、legacy revision chain Alembic backfill，以及
+Manager/Worker mirror、application receipt、generation 和审计映射。`test_plan_tasks.py` 中以
+Task 为载体的用例只验证 contract 期 legacy API；新产品路径以 `test_plan_resources.py` 为准。
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_public_plan_routes_are_global_only_and_frozen` | canonical 创建只接受全局 Planner/Reviewer 配置，并把含 `0–5` interaction 设置的完整快照冻结到 Plan/Run |
+| `test_canonical_create_and_revision_keep_stable_plan_identity` | related/standalone 都创建一等 Plan；Revise 保持 Plan id 并产生新的 Run/Version |
+| `test_plan_input_rejects_high_confidence_credentials` | Plan 创建/Revise/回答拒绝高置信 API key/token；失败时不写入 Plan 状态且 InputRequest 保持 open |
+| `test_worker_import_requires_exact_attachment_digest` | Worker 导入必须匹配附件 path/size/SHA-256 manifest |
+| `test_worker_plan_application_recovers_lost_http_ack` | Worker 已提交但 HTTP ACK 丢失时按 durable receipt 收敛，不重复应用 |
+| `test_related_plan_approval_requires_stale_confirmation_and_no_turn` | 对话/repo 已变化时 approve 先 409，确认后只完成 Plan，不 wake/enqueue 或改变目标 Task |
+| `test_approved_plan_is_applied_only_with_selected_user_message` | 只有显式 `plan_task_ids` 才把已批准方案与真实 user message 同 turn 入队，并以 Manager-local log id 一次性审计 |
+| `test_standalone_plan_creates_one_idempotent_execution_task` | standalone approve 后创建新的 auto Task，重复调用返回同一执行 Task |
+| `test_execution_task_materializer_is_directly_callable_and_idempotent` | Auto/内部调用方可直接经 `plan_service` 物化 exact Version，重放返回同一 Task/Application，且 Plan 审计 metadata 不可覆盖 |
+| `test_claude_plan_command_is_read_only` / `test_codex_plan_uses_disposable_read_only_app_server_thread` | Claude 禁 Bash/MCP/子 agent；Codex 复用 App Server 但使用 disposable read-only thread、空 MCP/禁 autonomous features，终态删除 thread |
+| `test_pipeline_revises_then_persists_audited_approval` | Planner → Reviewer revise → Planner → approve 的 run/step、模型与 feedback 全量审计 |
+| `test_interactive_planner_accepts_all_known_questions_without_count_limit` | 模型侧 question schema 使用非关键字 `is_required`，校验边界精确映射回领域/API 的 `required`，且不限制有效问题数 |
+| `test_interactive_question_wire_contract_requires_is_required` / `test_interactive_question_wire_contract_rejects_invalid_is_required` / `test_interactive_question_wire_contract_rejects_required_alias` | `is_required` 必须存在且为严格 bool；模型线协议拒绝旧 `required` 别名和双字段歧义 |
+| `test_structured_json_whitespace_guard_ignores_string_content_and_escapes` | 连续空白保护只统计 JSON 字符串外的空白，不误伤 Plan/问题字符串内容与 escape |
+| `test_codex_plan_json_whitespace_runaway_is_interrupted_and_cleaned` | Codex 结构化输出连续空白超限时精确 interrupt，删除 disposable thread 并抛出可审计错误 |
+| `test_stage_uses_fallback_only_after_primary_route_is_unavailable` | primary 不可用后才尝试 fallback，并审计 route slot 与实际成功模型 |
+| `test_route_exhausts_quota_limited_accounts_before_model_fallback` | 额度/认证失败先标记并轮换同 route 的兼容账号，不提前切模型 |
+| `test_stage_fails_after_primary_and_fallback_are_unavailable` | 两条 route 均不可用时保留双失败审计并终止 Plan |
+| `test_pipeline_rejects_unknown_planner_provider` | 非 claude/codex 的损坏路由 fail closed，不误走另一 provider |
 
 #### `test_api_system.py` — 系统 API
 
 | 测试 | 验证内容 |
 |------|---------|
 | `test_health` | GET /api/system/health → {"status": "ok"} |
+| `test_config_returns_two_stage_plan_pipeline_defaults` | 下发 Planner/Reviewer 两层 primary/fallback 默认组合 |
 | `test_stats_empty` | 无数据时所有计数为 0 |
 | `test_stats_with_tasks` | 不同状态 task 计数正确 |
 | `test_stats_running_instances` | running 实例计数正确 |
@@ -634,8 +665,10 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_worker_relay_proxy.py::test_worker_proxy_uses_authoritative_user_skill_snapshots` | Worker 转发在 Manager snapshot 对应的本地 User Skill 缺失或同 ID 内容碰撞时都坚持使用 metadata 权威正文 |
 | `test_worker_relay_proxy.py` / `test_task_migrator.py` 的 Skill snapshot 用例 | Worker 初次转发、续聊同步和迁移 payload 保留选择与正文 snapshot |
 | `test_worker_relay_proxy.py::test_worker_skill_selection_sync_*` | Worker Skill 同步必须读回并确认完整普通/User Skill 元组与权威 snapshot；确认缺失或陈旧时 fail closed |
-| `test_worker_relay_proxy.py::test_worker_execution_admission_syncs_latest_manager_skills` | 已转发 Task 在 Manager 保存最新普通/User Skills 后，Retry 与 Plan Approve 都先同步并确认最终元组/snapshot，再允许 Worker 进入 pending |
-| `test_worker_relay_proxy.py::test_migrated_inert_task_can_start_its_next_worker_turn` | 本地 completed/plan-review Task 经真实迁移流程导入 Worker 后，即使 Manager/Worker `instance_id` 不同，Retry、chat 与 Plan Approve 仍使用同一 status/retry generation 完成 Skill 同步并启动下一轮 |
+| `test_worker_relay_proxy.py::test_worker_execution_admission_syncs_latest_manager_skills` | Retry 仍先同步最终 Skills；Plan Approve 是纯控制面操作，不同步执行 Skills、不进入 pending |
+| `test_worker_relay_proxy.py::test_migrated_inert_task_can_start_its_next_worker_turn` | Retry/chat 可启动下一轮；Plan Approve 保持同一 Worker generation，但只进入 completed，不启动 turn |
+| `test_worker_relay_proxy.py::test_worker_plan_mirror_preserves_manager_local_audit_ids` | Worker 的本地 user/log/task id 不能覆盖 Manager 的 `plan_approved_by`、`plan_applied_log_id`、`plan_execution_task_id` |
+| `test_task_migrator.py::test_target_migration_blocks_actionable_related_plans` / `test_related_plan_cannot_migrate_independently` | active、待审批、待应用 Plan 阻止目标迁移；关联 Plan 不可脱离目标单独迁移 |
 | `test_worker_relay_proxy.py::test_worker_forward_reloads_authoritative_skills_after_lock_wait` / `test_worker_forward_rejects_generation_change_after_lock_wait` | WorkerProxy 等锁后重新加载 Manager 权威 Skill 元组；generation 已变化时在远端创建前 fail closed |
 | `test_worker_relay_proxy.py::test_initial_worker_forward_uses_skill_update_that_wins_claim_lock` / `test_initial_worker_forward_rejects_skill_update_after_claim` | 确定性覆盖首次 dispatch 的两个锁顺序：先完成的 pending Skill 保存进入远端创建 payload；claim 先完成后活跃 Skill 修改返回 409，Manager/Worker 不分叉 |
 | `test_worker_relay_proxy.py::test_worker_skill_update_shares_execution_admission_lock` | Worker Skill 保存与执行准入共用 task operation lock；pending/终态仍允许保存，不允许保存提交穿过正在进行的 Retry/Approve 准入窗口 |
@@ -762,7 +795,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_main_deployment_start.py` | guard 在 `init_db` 前执行；maintenance-only 不访问数据库、不启动 Dispatcher/Worker；受控 handoff 跳过重复 mutation |
 | `test_deployment_maintenance_auth.py` | 维护模式只开放 health/status/repair/rollback/restart；legacy recovery token 与已签名 admin JWT 无 DB 可恢复，member JWT 和密码登录被拒绝 |
 | `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
-| `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障 |
+| `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障；仅对白名单内的 `systemd --user [--deserialize=N]` user-manager 进程放行不可读 FD |
 | `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
 | `test_alembic_migrations.py::TestPublishedMigrationHistory` | `b6e1f4a2c9d7`、`f7a1c3d9e5b2` 与 sibling `5f7a9c2e4d61` 三种已部署状态都可升级到唯一 merge head；Plan cleanup 和 mergepoint 可降级/再升级，且旧 revision 文件无需改写 |
 | `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
@@ -1016,15 +1049,20 @@ python -m pytest \
 | 4 | 人 | 选 "+ New project" → 确认展开项目名称和 Remote URL 输入框 |
 | 5 | 人 | 观察 TaskList 各状态颜色：pending 黄、executing 蓝闪、completed 绿、failed 红 |
 
-### 测试 8：兼容性
+### 测试 8：交互式版本化 Plan
 
 | 步骤 | 谁 | 做什么 |
 |------|-----|--------|
-| 1 | 人 | 创建一个 Plan Mode 任务 → 确认进入 plan_review（紫色） |
-| 2 | 人 | 点击 Approve → 确认任务重新入队执行 |
-| 3 | 人 | 任务完成后点 Chat 按钮 → 发送追问消息 |
-| 4 | AI | 查 DB 确认 task.session_id 存在，`--resume` 会被使用 |
-| 5 | 人 | 测试语音按钮 → 确认录音转文字填入输入框 |
+| 1 | 人 | 确认侧栏有独立 Plans；Tasks 的 New Task/Filter 均无 Plan 入口，Task list/search 不出现 Plan |
+| 2 | 人 | 从 Plans 创建 standalone Plan → 确认立即出现在目录并打开 `#/plans/{id}`，Task List/Task count 不增加 |
+| 3 | 人 | 从 Task Chat 创建 related Plan → 确认 Plans 页 Related 筛选可找到，目标 Task Plans modal 选中项有高亮 |
+| 4 | 人 | 分别测试 kind/status/Project/search；Archive 后默认目录消失，Archived only 可找到、打开并恢复，Version/Run/Q&A 未丢失 |
+| 5 | 人 | Planner/Reviewer 请求多项输入 → 刷新后问题仍在，提交后恢复同一 Run；一次请求包含很多问题时完整渲染、不截断 |
+| 6 | 人 | Approve exact Version → 确认没有新 Agent turn；related 需显式附到下一条消息才应用 |
+| 7 | 人 | standalone Version 点击 Create execution Task → 确认跳转且历史仍保留同一个执行 Task 链接，重复点击不创建第二个 Task |
+| 8 | 人 | v1 已应用后 Revise 生成 v2 → 确认同一 Plan id、Version selector 可切换，并同时显示 v1 applied 与 v2 awaiting review |
+| 9 | 人 | Fork → 确认产生新 Plan id；Refresh context/Retry/Cancel/Reject/Archive 各自不改变原 Task/session |
+| 10 | 人 | Run 失败后确认旧可用 Version 仍可查看；桌面 modal、移动端全屏详情、附件上传/失败重试/问答历史均正常 |
 
 ### AI 验证命令速查
 

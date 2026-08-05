@@ -20,6 +20,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -558,10 +559,30 @@ class CodexTurnProcess:
         self.stderr = asyncio.StreamReader(limit=1024 * 1024)
         self._interrupt = interrupt
         self._done = asyncio.get_running_loop().create_future()
+        # Lightweight per-turn stream telemetry. Auxiliary callers such as
+        # the Plan pipeline can persist this before deleting a disposable
+        # thread, and can distinguish slow initial reasoning from a response
+        # stream that stopped making progress after output began.
+        self.last_delta_at: datetime | None = None
+        self.last_delta_monotonic: float | None = None
+        self.streamed_output_chars = 0
+        self.last_event_type: str | None = None
 
     def feed(self, payload: dict[str, Any]) -> None:
         if self.returncode is not None:
             return
+        event_type = payload.get("type")
+        if isinstance(event_type, str) and event_type:
+            self.last_event_type = event_type
+        if event_type in {
+            "item.agent_message.delta",
+            "item.reasoning.delta",
+        }:
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                self.streamed_output_chars += len(delta)
+            self.last_delta_at = datetime.utcnow()
+            self.last_delta_monotonic = time.monotonic()
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         self.stdout.feed_data(line.encode("utf-8") + b"\n")
 
@@ -2336,10 +2357,12 @@ class CodexAppServer:
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
         disable_project_config: bool = False,
+        disable_user_mcp: bool = False,
         skill_context: str = "",
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
+        output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
@@ -2415,6 +2438,11 @@ class CodexAppServer:
                     f"Invalid required Codex MCP configuration: {exc}"
                 ) from exc
             raise
+        if disable_user_mcp:
+            # This is a whole-map thread override. Plan/other read-only
+            # auxiliary turns must not inherit user or project MCP servers
+            # from the shared account process.
+            thread_config["mcp_servers"] = {}
         if self._actual_tier_proxy_route is not None:
             # A thread-scoped ``features`` table can outrank the app-server's
             # process-level ``--disable enable_request_compression`` override
@@ -2991,6 +3019,8 @@ class CodexAppServer:
             # between thread admission and this turn.
             "serviceTier": rpc_service_tier,
         }
+        if output_schema is not None:
+            turn_params["outputSchema"] = output_schema
         if tools_disabled:
             # A turn-level cwd without an explicit empty environment causes
             # Codex to silently restore its default local environment. Repeat

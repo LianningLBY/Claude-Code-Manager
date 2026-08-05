@@ -125,3 +125,25 @@ async def test_context_compact_threshold_rejects_out_of_range(client):
             "/api/settings/runtime", json={"context_compact_threshold": bad}
         )
         assert resp.status_code == 422, f"{bad} should be rejected"
+
+
+@pytest.mark.asyncio
+async def test_plan_pipeline_settings_are_persisted_and_returned(client):
+    current = (await client.get("/api/settings/plan-pipeline")).json()
+    current["planner"]["primary"] = {
+        "provider": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "max",
+    }
+    current["max_revision_cycles"] = 1
+
+    saved = await client.put(
+        "/api/settings/plan-pipeline",
+        json=current,
+    )
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json() == current
+    assert (await client.get("/api/settings/plan-pipeline")).json() == current
+    system = await client.get("/api/system/config")
+    assert system.json()["plan_pipeline_defaults"] == current

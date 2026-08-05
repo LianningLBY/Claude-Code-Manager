@@ -325,10 +325,7 @@ async def test_local_termination_gate_blocks_pending_reclaim_during_cleanup(
                 task = await observer.get(Task, task_id)
                 assert task.status == "pending"
                 assert task.completed_at is None
-                assert (
-                    (task.metadata_ or {}).get("pr_review_superseded")
-                    is True
-                )
+                assert (task.metadata_ or {}).get("pr_review_superseded") is True
                 assert await TaskQueue(observer).dequeue() is None
                 await observer.rollback()
             allow_cleanup.set()
@@ -431,10 +428,7 @@ async def test_supersede_gate_rejects_late_auxiliary_api_admission(
                 async with session_factory() as observer:
                     task = await observer.get(Task, task_id)
                     assert task.status == "executing"
-                    assert (
-                        (task.metadata_ or {}).get("pr_review_superseded")
-                        is True
-                    )
+                    assert (task.metadata_ or {}).get("pr_review_superseded") is True
 
                 monitor_response = await client.post(
                     f"/api/tasks/{task_id}/monitor-sessions",
@@ -679,12 +673,8 @@ async def test_local_termination_reaps_db_terminal_auxiliary_with_runtime(
     finally:
         runtime_map.pop(session_id, None)
 
-    expected_stop = (
-        monitor_stop if agent_type == "monitor" else sub_agent_stop
-    )
-    unexpected_stop = (
-        sub_agent_stop if agent_type == "monitor" else monitor_stop
-    )
+    expected_stop = monitor_stop if agent_type == "monitor" else sub_agent_stop
+    unexpected_stop = sub_agent_stop if agent_type == "monitor" else monitor_stop
     expected_stop.assert_awaited_once_with(session_id)
     unexpected_stop.assert_not_awaited()
     assert result.terminal_status == "completed"
@@ -821,9 +811,7 @@ async def test_local_termination_skips_historical_terminal_auxiliary_rows(
         task_id = task.id
         session_ids = [session.id for session in sessions]
 
-    monitor_ids, sub_agent_ids = (
-        backend.main.dispatcher._active_auxiliary_session_ids()
-    )
+    monitor_ids, sub_agent_ids = backend.main.dispatcher._active_auxiliary_session_ids()
     assert not (set(session_ids) & (monitor_ids | sub_agent_ids))
     monitor_stop = AsyncMock(
         side_effect=AssertionError("historical monitor was stopped")
@@ -911,9 +899,7 @@ async def test_local_termination_fails_closed_on_retained_terminal_runtime(
                     return_value=None,
                 ) as stop,
             ):
-                with pytest.raises(
-                    termination.TaskAuxiliaryTerminationConflict
-                ):
+                with pytest.raises(termination.TaskAuxiliaryTerminationConflict):
                     await termination.terminate_local_task_generation(
                         task_id,
                         db,
@@ -1121,7 +1107,7 @@ async def test_local_termination_revalidates_authority_after_queue_abort(
         await db.commit()
         task_id = task.id
 
-    async def migrate_while_queue_settles(_task_id):
+    async def migrate_while_queue_settles(_task_id, **_kwargs):
         async with db_factory() as db:
             task = await db.get(Task, task_id)
             task.worker_id = 91
@@ -1342,7 +1328,11 @@ async def test_internal_termination_accepts_pr_fix_task_generations(
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "completed"
     assert response.json()["metadata_"]["pr_review_superseded"] is True
-    abort.assert_awaited_once_with(task_id)
+    abort.assert_awaited_once()
+    call = abort.await_args
+    assert call.args == (task_id,)
+    assert call.kwargs["cancel_durable"] is False
+    assert call.kwargs["durable_db"] is not None
 
 
 @pytest.mark.asyncio
@@ -1503,9 +1493,7 @@ async def test_termination_retries_cancelled_ccm_auxiliary_cleanup(db_factory):
         ),
     ):
         async with db_factory() as db:
-            with pytest.raises(
-                termination.TaskAuxiliaryTerminationConflict
-            ):
+            with pytest.raises(termination.TaskAuxiliaryTerminationConflict):
                 await termination.terminate_local_task_generation(
                     task_id,
                     db,
@@ -1619,10 +1607,7 @@ async def test_hidden_termination_rejects_stale_remote_generation_before_abort(
         task = await db.get(Task, task_id)
         assert task.status == "pending"
         assert task.retry_count == 1
-        assert (
-            (task.metadata_ or {}).get("pr_review_superseded")
-            is not True
-        )
+        assert (task.metadata_ or {}).get("pr_review_superseded") is not True
 
 
 @pytest.mark.asyncio
@@ -1662,15 +1647,10 @@ async def test_hidden_termination_rejects_background_generation_aba(
     public_snapshot = await client.get(f"/api/tasks/{task_id}")
     assert public_snapshot.status_code == 200, public_snapshot.text
     assert "pty_background_generation" not in public_snapshot.json()
-    snapshot_response = await client.get(
-        f"/api/tasks/{task_id}/terminate-generation"
-    )
+    snapshot_response = await client.get(f"/api/tasks/{task_id}/terminate-generation")
     assert snapshot_response.status_code == 200, snapshot_response.text
     snapshot = snapshot_response.json()
-    assert (
-        snapshot["pty_background_generation"]
-        == snapshotted_generation
-    )
+    assert snapshot["pty_background_generation"] == snapshotted_generation
 
     async with session_factory() as db:
         task = await db.get(Task, task_id)
@@ -1702,10 +1682,7 @@ async def test_hidden_termination_rejects_background_generation_aba(
         task = await db.get(Task, task_id)
         assert task.status == "executing"
         assert task.pty_background_generation == new_generation
-        assert (
-            (task.metadata_ or {}).get("pr_review_superseded")
-            is not True
-        )
+        assert (task.metadata_ or {}).get("pr_review_superseded") is not True
 
 
 @pytest.mark.asyncio

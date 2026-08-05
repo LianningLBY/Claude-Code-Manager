@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import MonitoredRepo, PRFinding, PRReview, PRReviewerRun
 from backend.models.task import Task
+from backend.services.task_creation import stage_task_record
 from backend.services.task_queue import (
     task_is_pr_review_superseded,
     task_retry_not_superseded_predicate,
@@ -2364,13 +2365,8 @@ async def create_pr_review_task(
     await db.flush()
 
     provider = (repo.provider or "claude").lower()
-    # 直接构造 ORM 会绕过 POST /api/tasks 的 per-provider 默认模型逻辑，
-    # codex 且未配 review_model 时补上默认，避免 CLI 侧模型漂移
-    model = repo.review_model
-    if not model and provider == "codex":
-        from backend.config import settings as app_settings
-        model = app_settings.default_codex_model
-    task = Task(
+    task = await stage_task_record(
+        db,
         title=f"PR Review: {repo.repo_full_name}#{pr_data['number']}",
         description=prompt,
         mode="auto",
@@ -2383,13 +2379,11 @@ async def create_pr_review_task(
             "pr_action_nonce": action_nonce,
         },
         provider=provider,
-        model=model,
+        model=repo.review_model,
         effort_level=repo.review_effort,
         project_id=await _get_or_create_pr_monitor_project(db),
         worker_id=repo.worker_id,
     )
-    db.add(task)
-    await db.flush()
 
     review.task_id = task.id
     review.status = "reviewing"
@@ -3436,7 +3430,7 @@ async def recover_superseding_pr_reviews(
             continue
         pr_data, prepared_context = validated
         try:
-            async with AsyncExitStack() as stack:
+            async with AsyncExitStack():
                 # Task operation locks are the outer lifecycle boundary.
                 # Do not take the per-review action lock first: completion
                 # takes Task-operation -> review-action, and the reverse order

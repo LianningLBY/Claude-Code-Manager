@@ -3,6 +3,7 @@ import type { ReactNode, ErrorInfo } from 'react';
 import { AppShell } from './components/Layout/AppShell';
 import { Dashboard } from './pages/Dashboard';
 import { TasksPage } from './pages/TasksPage';
+import { PlansPage } from './pages/PlansPage';
 import { LoginPage } from './pages/LoginPage';
 import { ServerConfigPage } from './pages/ServerConfigPage';
 import { ProjectsPage } from './pages/ProjectsPage';
@@ -13,6 +14,7 @@ import { PRMonitorPage } from './pages/PRMonitorPage';
 import WorkersPage from './pages/WorkersPage';
 import TeamPage from './pages/TeamPage';
 import { SkillsPage } from './pages/SkillsPage';
+import { SettingsPage } from './pages/SettingsPage';
 
 import { getToken } from './api/client';
 import { isCapacitor, getServerUrl, getApiBase } from './config/server';
@@ -44,23 +46,29 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: string |
   }
 }
 
-const VALID_PAGES = new Set(['tasks', 'dashboard', 'projects', 'secrets', 'files', 'discussions', 'pr-monitor', 'workers', 'skills', 'team', 'server']);
+const VALID_PAGES = new Set(['tasks', 'plans', 'dashboard', 'projects', 'secrets', 'files', 'discussions', 'pr-monitor', 'workers', 'skills', 'team', 'settings', 'server']);
 
-function parseHash(): { page: string; chatTaskId: number | null } {
+function parseHash(): { page: string; chatTaskId: number | null; planId: number | null } {
   const hash = window.location.hash.replace(/^#\/?/, '');
   const parts = hash.split('/');
   const page = VALID_PAGES.has(parts[0]) ? parts[0] : 'tasks';
   let chatTaskId: number | null = null;
+  let planId: number | null = null;
   if (page === 'tasks' && parts[1] === 'chat' && parts[2]) {
     const id = parseInt(parts[2], 10);
     if (id > 0) chatTaskId = id;
   }
-  return { page, chatTaskId };
+  if (page === 'plans' && parts[1]) {
+    const id = parseInt(parts[1], 10);
+    if (id > 0) planId = id;
+  }
+  return { page, chatTaskId, planId };
 }
 
-function updateHash(page: string, chatTaskId: number | null) {
+function updateHash(page: string, chatTaskId: number | null, planId: number | null) {
   let hash = `#/${page}`;
   if (page === 'tasks' && chatTaskId) hash += `/chat/${chatTaskId}`;
+  if (page === 'plans' && planId) hash += `/${planId}`;
   if (window.location.hash !== hash) {
     window.history.replaceState(null, '', hash);
   }
@@ -70,19 +78,21 @@ function App() {
   const initial = parseHash();
   const [page, setPage] = useState(initial.page);
   const [chatTaskId, setChatTaskId] = useState<number | null>(initial.chatTaskId);
+  const [planId, setPlanId] = useState<number | null>(initial.planId);
   const [authenticated, setAuthenticated] = useState(false);
   const [checking, setChecking] = useState(true);
   const [needsServerConfig, setNeedsServerConfig] = useState(false);
 
   useEffect(() => {
-    updateHash(page, chatTaskId);
-  }, [page, chatTaskId]);
+    updateHash(page, chatTaskId, planId);
+  }, [page, chatTaskId, planId]);
 
   useEffect(() => {
     const onHashChange = () => {
       const parsed = parseHash();
       setPage(parsed.page);
       setChatTaskId(parsed.chatTaskId);
+      setPlanId(parsed.planId);
     };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
@@ -91,6 +101,13 @@ function App() {
   const handleNavigate = (p: string) => {
     setPage(p);
     if (p !== 'tasks') setChatTaskId(null);
+    if (p !== 'plans') setPlanId(null);
+  };
+
+  const handleNavigateTask = (taskId: number) => {
+    setPlanId(null);
+    setChatTaskId(taskId);
+    setPage('tasks');
   };
 
   useEffect(() => {
@@ -165,6 +182,7 @@ function App() {
       <AppShell currentPage={page} onNavigate={handleNavigate} wide={page === 'tasks' && !!chatTaskId}>
         {page === 'dashboard' && <Dashboard />}
         {page === 'tasks' && <TasksPage chatTaskId={chatTaskId} onChatTaskChange={setChatTaskId} />}
+        {page === 'plans' && <PlansPage selectedPlanId={planId} onSelectedPlanChange={setPlanId} onNavigateTask={handleNavigateTask} />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'secrets' && <SecretsPage />}
         {page === 'files' && <FilesPage />}
@@ -173,6 +191,7 @@ function App() {
         {page === 'workers' && <WorkersPage />}
         {page === 'skills' && <SkillsPage />}
         {page === 'team' && <TeamPage />}
+        {page === 'settings' && <SettingsPage />}
         {page === 'server' && (
           <ServerConfigPage onConfigured={() => window.location.reload()} />
         )}

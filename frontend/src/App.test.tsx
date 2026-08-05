@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import App from './App';
 
 vi.mock('./api/client', () => ({
@@ -21,7 +22,18 @@ vi.mock('./components/Layout/AppShell', () => ({
   ),
 }));
 vi.mock('./pages/TasksPage', () => ({
-  TasksPage: () => <div>Tasks screen</div>,
+  TasksPage: ({ chatTaskId }: { chatTaskId: number | null }) => <>
+    <div>Tasks screen</div>
+    {chatTaskId != null && <div>Task chat {chatTaskId}</div>}
+  </>,
+}));
+vi.mock('./pages/PlansPage', () => ({
+  PlansPage: ({ selectedPlanId, onNavigateTask }: { selectedPlanId: number | null; onNavigateTask: (taskId: number) => void }) => (
+    <div>
+      Plans screen {selectedPlanId ?? 'none'}
+      <button type="button" onClick={() => onNavigateTask(200)}>Open related Task #200</button>
+    </div>
+  ),
 }));
 vi.mock('./pages/LoginPage', () => ({
   LoginPage: () => <div>Login screen</div>,
@@ -108,5 +120,37 @@ describe('App authentication probe', () => {
         role: 'super_admin',
       });
     });
+  });
+
+  it('restores a first-class Plan deep link', async () => {
+    window.location.hash = '#/plans/14';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ ok: true, role: 'super_admin' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText('Plans screen 14')).toBeInTheDocument();
+  });
+
+  it('navigates atomically from a related Plan to its Task chat', async () => {
+    window.location.hash = '#/plans/14';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ ok: true, role: 'super_admin' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Open related Task #200' }));
+
+    expect(await screen.findByText('Task chat 200')).toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe('#/tasks/chat/200'));
   });
 });

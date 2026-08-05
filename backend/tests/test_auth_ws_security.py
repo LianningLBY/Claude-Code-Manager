@@ -8,11 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from backend.api.auth import create_jwt, decode_jwt
 from backend.config import settings
 from backend.models.discussion import Discussion
+from backend.models.plan import Plan
+from backend.models.project import Project
 from backend.models.task import Task
-from backend.models.team_share import TeamTaskShare  # noqa: F401
+from backend.models.team_share import TeamProjectShare, TeamTaskShare  # noqa: F401
 from backend.models.user import User
 from backend.models.user_group import UserGroupMember  # noqa: F401
 from backend.models.worker import Worker
+from backend.schemas.plan import default_plan_pipeline_config
 
 
 @pytest_asyncio.fixture
@@ -204,6 +207,214 @@ async def test_member_cannot_control_process_wide_system_operations(
         403,
         403,
     ]
+
+
+@pytest.mark.asyncio
+async def test_shared_project_plan_uses_project_location_boundary(
+    secured_client,
+    tmp_path,
+):
+    client, session_factory = secured_client
+    admin_id, _ = await _create_user(
+        session_factory,
+        email="plan-project-admin@example.com",
+        role="admin",
+    )
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="plan-project-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name="shared-plan-project",
+            local_path=str(tmp_path),
+            status="ready",
+        )
+        owned_worker = Worker(
+            name="member-plan-worker",
+            owner_user_id=member_id,
+            status="ready",
+        )
+        db.add_all([project, owned_worker])
+        await db.flush()
+        db.add(TeamProjectShare(
+            project_id=project.id,
+            target_type="user",
+            target_id=member_id,
+            shared_by=admin_id,
+        ))
+        await db.commit()
+        project_id = project.id
+        worker_id = owned_worker.id
+
+    headers = {"Authorization": f"Bearer {member_token}"}
+    created = await client.post(
+        "/api/plans",
+        headers=headers,
+        json={
+            "input": "Plan inside the shared checkout",
+            "project_id": project_id,
+            "target_repo": "/etc",
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["target_repo"] == str(tmp_path)
+
+    mismatch = await client.post(
+        "/api/plans",
+        headers=headers,
+        json={
+            "input": "Do not move the Project to another Worker",
+            "project_id": project_id,
+            "worker_id": worker_id,
+        },
+    )
+    assert mismatch.status_code == 400
+    assert "must match" in mismatch.text
+
+
+@pytest.mark.asyncio
+async def test_plan_catalog_sql_acl_matches_detail_access(secured_client, tmp_path):
+    client, session_factory = secured_client
+    admin_id, _ = await _create_user(
+        session_factory,
+        email="plan-list-admin@example.com",
+        role="admin",
+    )
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="plan-list-member@example.com",
+        role="member",
+    )
+    other_id, _ = await _create_user(
+        session_factory,
+        email="plan-list-other@example.com",
+        role="member",
+    )
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        worker = Worker(
+            name="plan-list-worker",
+            owner_user_id=member_id,
+            status="ready",
+        )
+        project = Project(
+            name="plan-list-project",
+            local_path=str(tmp_path),
+            status="ready",
+        )
+        owner_task = Task(
+            title="member task",
+            description="member task",
+            created_by=member_id,
+        )
+        shared_task = Task(
+            title="shared task",
+            description="shared task",
+            created_by=other_id,
+        )
+        hidden_task = Task(
+            title="hidden task",
+            description="hidden task",
+            created_by=other_id,
+        )
+        db.add_all([worker, project, owner_task, shared_task, hidden_task])
+        await db.flush()
+        db.add_all([
+            TeamProjectShare(
+                project_id=project.id,
+                target_type="user",
+                target_id=member_id,
+                shared_by=admin_id,
+            ),
+            TeamTaskShare(
+                task_id=shared_task.id,
+                target_type="user",
+                target_id=member_id,
+                permission="chat",
+                shared_by=admin_id,
+            ),
+        ])
+        visible = [
+            Plan(
+                title="owned standalone",
+                initial_request="visible",
+                created_by=member_id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="worker standalone",
+                initial_request="visible",
+                worker_id=worker.id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="project standalone",
+                initial_request="visible",
+                project_id=project.id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="owned related",
+                initial_request="visible",
+                target_task_id=owner_task.id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="chat-shared related",
+                initial_request="visible",
+                target_task_id=shared_task.id,
+                pipeline_config=pipeline,
+            ),
+        ]
+        hidden = [
+            Plan(
+                title="hidden standalone",
+                initial_request="hidden",
+                created_by=other_id,
+                pipeline_config=pipeline,
+            ),
+            Plan(
+                title="hidden related",
+                initial_request="hidden",
+                target_task_id=hidden_task.id,
+                pipeline_config=pipeline,
+            ),
+        ]
+        db.add_all([*visible, *hidden])
+        await db.commit()
+        visible_ids = {plan.id for plan in visible}
+
+    headers = {"Authorization": f"Bearer {member_token}"}
+    listed = await client.get("/api/plans?limit=200", headers=headers)
+    counted = await client.get("/api/plans/count", headers=headers)
+
+    assert listed.status_code == 200, listed.text
+    assert {item["id"] for item in listed.json()} == visible_ids
+    assert counted.status_code == 200, counted.text
+    assert counted.json() == {"total": len(visible_ids)}
+
+
+@pytest.mark.asyncio
+async def test_plan_delivery_resolution_requires_admin(secured_client):
+    client, session_factory = secured_client
+    _member_id, member_token = await _create_user(
+        session_factory,
+        email="plan-delivery-member@example.com",
+        role="member",
+    )
+
+    response = await client.post(
+        "/api/plans/1/application-deliveries/example-receipt/resolve",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={
+            "action": "release_for_retry",
+            "note": "Member must not resolve ambiguous execution",
+        },
+    )
+
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -414,10 +625,27 @@ async def test_ws_channels_apply_resource_acl_and_default_deny(db_factory):
         worker = Worker(name="owned-worker", owner_user_id=owner.id)
         discussion = Discussion(title="owned", creator_user_id=owner.id)
         db.add_all([task, worker, discussion])
+        await db.flush()
+        plan = Plan(
+            title="owned Plan",
+            initial_request="plan it",
+            target_task_id=task.id,
+            created_by=owner.id,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+        )
+        standalone_plan = Plan(
+            title="owned standalone Plan",
+            initial_request="plan it",
+            created_by=owner.id,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+        )
+        db.add_all([plan, standalone_plan])
         await db.commit()
         await db.refresh(task)
         await db.refresh(worker)
         await db.refresh(discussion)
+        await db.refresh(plan)
+        await db.refresh(standalone_plan)
 
         owner_identity = {
             "user_id": owner.id,
@@ -445,6 +673,10 @@ async def test_ws_channels_apply_resource_acl_and_default_deny(db_factory):
             owner_identity,
             db,
         )
+        assert await _ws_channel_allowed(f"plan:{plan.id}", owner_identity, db)
+        assert await _ws_channel_allowed(
+            f"plan:{standalone_plan.id}", owner_identity, db
+        )
         assert not await _ws_channel_allowed(
             f"task:{task.id}",
             other_identity,
@@ -455,6 +687,10 @@ async def test_ws_channels_apply_resource_acl_and_default_deny(db_factory):
             other_identity,
             db,
         )
+        assert not await _ws_channel_allowed(
+            f"plan:{plan.id}", other_identity, db
+        )
+        assert not await _ws_channel_allowed("plans", owner_identity, db)
         assert not await _ws_channel_allowed(
             "instance:1",
             owner_identity,
@@ -474,3 +710,4 @@ async def test_ws_channels_apply_resource_acl_and_default_deny(db_factory):
         }
         assert await _ws_channel_allowed("instance:1", admin_identity, db)
         assert await _ws_channel_allowed("workers", admin_identity, db)
+        assert await _ws_channel_allowed("plans", admin_identity, db)

@@ -2,6 +2,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -19,6 +20,13 @@ from backend.models.log_entry import LogEntry
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.project import Project
+from backend.models.plan import (
+    Plan,
+    PlanApplication,
+    PlanApplicationReceipt,
+    PlanVersion,
+)
+from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
@@ -203,6 +211,47 @@ async def test_authoritative_worker_apply_preserves_supersede_marker(
             "pr_review_id": 37,
             "pr_review_superseded": True,
         }
+
+
+async def test_worker_plan_mirror_preserves_manager_local_audit_ids(
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        mode="plan",
+        plan_approved=True,
+        plan_approved_by=42,
+        plan_applied_log_id=314,
+        plan_execution_task_id=2718,
+    )
+    observed = worker_relay_module.worker_task_generation(task)
+    assert observed is not None
+
+    async with session_factory() as db:
+        resulting = await (
+            worker_relay_module.apply_authoritative_worker_task(
+                db,
+                observed,
+                _remote_task(
+                    task,
+                    # These ids belong to the Worker's database/user namespace
+                    # and must never overwrite Manager-local audit links.
+                    plan_approved_by=9001,
+                    plan_applied_log_id=9002,
+                    plan_execution_task_id=9003,
+                ),
+            )
+        )
+
+    assert resulting is not None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.plan_approved_by == 42
+    assert current.plan_applied_log_id == 314
+    assert current.plan_execution_task_id == 2718
 
 
 @pytest.mark.parametrize(
@@ -436,6 +485,88 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
     # metadata_ is intentionally not a public TaskCreate field; the hidden
     # termination endpoint accepts the forwarded tag only for Worker copies.
     assert not hasattr(parsed_on_worker, "metadata_")
+
+
+async def test_worker_forward_syncs_related_plan_uploads(monkeypatch):
+    captured_payload = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return captured_payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            captured_payload.update(json)
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    relay = AsyncMock()
+    proxy = WorkerProxy(None, relay)
+    worker = Worker(
+        id=78,
+        name="worker",
+        status="ready",
+        private_ip="10.0.0.78",
+        auth_token="token",
+    )
+    task = Task(
+        id=902,
+        title="Plan for #44",
+        description="Use the attached references",
+        worker_id=worker.id,
+        project_id=12,
+        mode="plan",
+        provider="claude",
+        plan_target_task_id=44,
+        metadata_={
+            "created_from_plan_target_task_id": 44,
+            "file_paths": [
+                "/srv/uploads/mockup.png",
+                "/srv/uploads/notes.txt",
+            ],
+            "attachments": [
+                {
+                    "url": "/api/uploads/mockup.png",
+                    "name": "mockup.png",
+                    "is_image": True,
+                },
+                {
+                    "url": "/api/uploads/notes.txt",
+                    "name": "notes.txt",
+                    "is_image": False,
+                },
+            ],
+        },
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=34)
+    proxy.push_files = AsyncMock()
+    proxy._user_skill_snapshots = AsyncMock(return_value=[])
+
+    await proxy._forward_task_to_worker_locked(task)
+
+    assert captured_payload["file_paths"] == [
+        "/srv/uploads/mockup.png",
+        "/srv/uploads/notes.txt",
+    ]
+    assert captured_payload["image_paths"] == ["/srv/uploads/mockup.png"]
+    assert captured_payload["attachments"] == task.metadata_["attachments"]
+    proxy.push_files.assert_awaited_once_with(
+        worker,
+        ["/srv/uploads/mockup.png", "/srv/uploads/notes.txt"],
+    )
 
 
 async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
@@ -2487,6 +2618,102 @@ async def test_dispatch_worker_tasks_skips_unready_worker(db_factory, session_fa
         assert (await db.get(Task, t.id)).status == "pending"  # 留队等 worker 就绪
 
 
+async def test_dispatch_worker_plan_run_imports_terminal_outcome(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Worker-dispatched Plan",
+            initial_request="Plan it",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan it",
+            pipeline_config=pipeline,
+            status="queued",
+            generation=0,
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        plan_id = plan.id
+        run_id = run.id
+        created_at = run.created_at.isoformat()
+        updated_at = run.updated_at.isoformat()
+
+    proxy = AsyncMock()
+    proxy.run_versioned_plan_until_pause.return_value = {
+        "protocol": 3,
+        "run": {
+            "id": run_id,
+            "plan_id": plan_id,
+            "run_type": "initial",
+            "status": "failed",
+            "current_stage": "failed",
+            "base_version_id": None,
+            "result_version_id": None,
+            "request_text": "Plan it",
+            "round": 1,
+            "generation": 0,
+            "instance_id": None,
+            "worker_id": None,
+            "open_input_request_id": None,
+            "interaction_count": 0,
+            "max_interactions": 3,
+            "execution_seconds": 1.0,
+            "last_execution_started_at": None,
+            "review_verdict": None,
+            "review_feedback": None,
+            "review_exhausted": False,
+            "error": "remote failure",
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "finished_at": updated_at,
+            "steps": [],
+            "input_requests": [],
+        },
+        "versions": [],
+    }
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_plan_runs()
+    lifecycle = dispatcher._running_tasks[f"worker-plan-{run_id}"]
+    await lifecycle
+
+    async with session_factory() as db:
+        current_plan = await db.get(Plan, plan_id)
+        current_run = await db.get(PlanAgentRun, run_id)
+        assert current_run.status == "failed"
+        assert current_run.error == "remote failure"
+        assert current_plan.active_run_id is None
+    assert any(
+        channel == "plans"
+        and event.get("run_id") == run_id
+        and event.get("status") == "failed"
+        for channel, event in broadcaster.sent
+    )
+
+
 async def test_dispatch_worker_claim_rejects_same_worker_pending_retry_aba(
     session_factory,
     broadcaster,
@@ -3909,7 +4136,12 @@ async def test_worker_pending_marker_blocks_direct_retry_chat_and_plan_approve(
     )
     staged_plan = await client.post(
         f"/api/tasks/{plan.id}/routing-config/stage",
-        json={**payload, "op_id": "block-plan-approve"},
+        json={
+            **payload,
+            "op_id": "block-plan-approve",
+            "model": "gpt-5.5",
+            "codex_service_tier": "default",
+        },
     )
     assert staged_plan.status_code == 200
     approve = await client.post(f"/api/tasks/{plan.id}/plan/approve")
@@ -4360,13 +4592,20 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
             return _routing_snapshot(current)
         assert method == "POST"
         assert path.endswith(f"/{action_path}")
-        assert admission_order[-1] == "skills"
+        if mode == "plan":
+            # Approval is a control-plane decision now. It must not synchronize
+            # execution Skills or start another Agent turn.
+            assert admission_order == []
+        else:
+            assert admission_order[-1] == "skills"
         admission_order.append(action_path)
         return _remote_task(
             current,
-            status="pending",
+            status="completed" if mode == "plan" else "pending",
             retry_count=current.retry_count + retry_delta,
-            completed_at=None,
+            completed_at=(
+                datetime.utcnow().isoformat() if mode == "plan" else None
+            ),
             plan_approved=True if mode == "plan" else current.plan_approved,
         )
 
@@ -4391,21 +4630,26 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
     response = await client.post(f"/api/tasks/{task.id}/{action_path}")
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "pending"
-    assert admission_order == ["skills", action_path]
-    assert len(worker_skill_payloads) == 1
-    assert worker_skill_payloads[0]["enabled_skills"] == {
-        "code-review": True,
-    }
-    assert worker_skill_payloads[0]["selected_user_skills"] == [
-        user_skill_id,
-    ]
-    assert worker_skill_payloads[0]["user_skill_snapshots"] == [{
-        "id": user_skill_id,
-        "name": f"Final {action_path} skill",
-        "description": "Manager-authoritative description",
-        "content": "Manager-authoritative content",
-    }]
+    if mode == "plan":
+        assert response.json()["status"] == "completed"
+        assert admission_order == [action_path]
+        assert worker_skill_payloads == []
+    else:
+        assert response.json()["status"] == "pending"
+        assert admission_order == ["skills", action_path]
+        assert len(worker_skill_payloads) == 1
+        assert worker_skill_payloads[0]["enabled_skills"] == {
+            "code-review": True,
+        }
+        assert worker_skill_payloads[0]["selected_user_skills"] == [
+            user_skill_id,
+        ]
+        assert worker_skill_payloads[0]["user_skill_snapshots"] == [{
+            "id": user_skill_id,
+            "name": f"Final {action_path} skill",
+            "description": "Manager-authoritative description",
+            "content": "Manager-authoritative content",
+        }]
 
 
 @pytest.mark.parametrize(
@@ -4527,12 +4771,12 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
         if action_path == "plan/approve":
             assert path.endswith("/plan/approve")
             assert remote["status"] == "plan_review"
-            remote.update(status="pending", instance_id=None)
+            remote.update(status="completed", instance_id=None)
             return _remote_task(
                 current,
-                status="pending",
+                status="completed",
                 retry_count=remote["retry_count"],
-                completed_at=None,
+                completed_at=datetime.utcnow().isoformat(),
                 plan_approved=True,
             )
         assert path.endswith("/chat")
@@ -4583,12 +4827,17 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
             f"/api/tasks/{task.id}/{action_path}",
         )
         assert response.status_code == 200, response.text
-        assert response.json()["status"] == "pending"
+        assert response.json()["status"] == (
+            "completed" if action_path == "plan/approve" else "pending"
+        )
 
-    assert len(skill_payloads) == 1
-    assert skill_payloads[0]["enabled_skills"] == {
-        "code-review": True,
-    }
+    if action_path == "plan/approve":
+        assert skill_payloads == []
+    else:
+        assert len(skill_payloads) == 1
+        assert skill_payloads[0]["enabled_skills"] == {
+            "code-review": True,
+        }
 
 
 @pytest.mark.parametrize("status", ["pending", "completed"])
@@ -5540,6 +5789,739 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
     assert event["id"] == stored.id
     assert event["task_id"] == t.id
     assert event["timestamp"].endswith("Z")
+
+
+async def test_worker_chat_applies_exact_mirrored_plan_version(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+    from backend.schemas.plan import default_plan_pipeline_config
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        session_id="worker-plan-session",
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Worker Plan",
+            initial_request="Plan this",
+            target_task_id=task.id,
+            # The Task moved after this Version was produced. Application must
+            # materialize immutable content on the Task's current Worker.
+            worker_id=worker.id + 100,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            worker_id=worker.id + 100,
+            worker_version_id=811,
+            version_number=1,
+            content="# Exact Worker Plan",
+            context_session_id=task.session_id,
+            context_log_id=None,
+            review_verdict="approve",
+            human_decision="approved",
+            repo_revision={"available": False, "reason": "not_git"},
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        await db.commit()
+        local_version_id = version.id
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 811
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, path, *_args, **kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        assert kwargs["body"]["plan_version_ids"] == [811]
+        assert kwargs["body"]["confirmed_stale_plan_version_ids"] == [811]
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [811],
+        }
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        result = await _send_worker_chat(
+            current,
+            ChatMessage(
+                message="Implement the selected Version",
+                plan_version_ids=[local_version_id],
+            ),
+            db,
+            request,
+        )
+
+    assert result["applied_plan_version_ids"] == [local_version_id]
+    async with session_factory() as db:
+        application = (
+            await db.execute(
+                select(PlanApplication).where(
+                    PlanApplication.plan_version_id == local_version_id
+                )
+            )
+        ).scalar_one()
+        log = await db.get(LogEntry, application.user_log_id)
+        snapshot = json.loads(log.raw_json)["applied_plans"][0]
+        assert snapshot["version_id"] == local_version_id
+        assert snapshot["content"] == "# Exact Worker Plan"
+
+
+async def _approved_worker_plan_version(session_factory):
+    from backend.schemas.plan import default_plan_pipeline_config
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        session_id="worker-receipt-session",
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Receipt Plan",
+            initial_request="Plan this",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            worker_version_id=912,
+            version_number=1,
+            content="# Receipt-safe Plan",
+            context_session_id=task.session_id,
+            review_verdict="approve",
+            human_decision="approved",
+            repo_revision={"available": False, "reason": "not_git"},
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        await db.commit()
+        return worker, task, version.id
+
+
+async def test_worker_delivery_failure_releases_manager_plan_application(
+    session_factory,
+    broadcaster,
+):
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    receipt_key = "worker-delivery-failed"
+    async with session_factory() as db:
+        version = await db.get(PlanVersion, version_id)
+        log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement once",
+            raw_json=json.dumps({
+                "raw_content": "Implement once",
+                "applied_plans": [{"plan_id": version.plan_id}],
+            }),
+        )
+        db.add(log)
+        await db.flush()
+        db.add(
+            PlanApplicationReceipt(
+                receipt_key=receipt_key,
+                target_task_id=task.id,
+                worker_id=worker.id,
+                manager_user_log_id=log.id,
+                plan_version_ids=[version_id],
+                status="committed",
+                response={"ok": True, "queued": True},
+                delivery_status="queued",
+            )
+        )
+        db.add(
+            PlanApplication(
+                plan_id=version.plan_id,
+                plan_version_id=version_id,
+                application_type="chat_message",
+                target_task_id=task.id,
+                user_log_id=log.id,
+                application_receipt_key=receipt_key,
+            )
+        )
+        await db.commit()
+        log_id = log.id
+
+    relay = WorkerRelay(session_factory, broadcaster)
+    relay._tasks[worker.id] = {task.id}
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "plan_application_delivery_failed",
+                "task_id": task.id,
+                "receipt_key": receipt_key,
+                "delivery_status": "failed",
+                "error": "permanent route mismatch",
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(PlanApplication.id).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        ) is None
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        log = await db.get(LogEntry, log_id)
+        assert receipt.delivery_status == "failed"
+        assert "applied_plans" not in json.loads(log.raw_json)
+    assert any(
+        channel == "plans"
+        and data.get("event") == "plan_application_delivery_failed"
+        for channel, data in broadcaster.sent
+    )
+
+
+async def test_worker_uncertain_delivery_and_resolution_reconcile_manager(
+    session_factory,
+    broadcaster,
+):
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    receipt_key = "worker-delivery-uncertain"
+    async with session_factory() as db:
+        version = await db.get(PlanVersion, version_id)
+        log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement once",
+            raw_json=json.dumps({
+                "raw_content": "Implement once",
+                "applied_plans": [{"plan_id": version.plan_id}],
+            }),
+        )
+        db.add(log)
+        await db.flush()
+        db.add(
+            PlanApplicationReceipt(
+                receipt_key=receipt_key,
+                target_task_id=task.id,
+                worker_id=worker.id,
+                manager_user_log_id=log.id,
+                plan_version_ids=[version_id],
+                status="committed",
+                response={"ok": True, "queued": True},
+                delivery_status="queued",
+            )
+        )
+        db.add(
+            PlanApplication(
+                plan_id=version.plan_id,
+                plan_version_id=version_id,
+                application_type="chat_message",
+                target_task_id=task.id,
+                user_log_id=log.id,
+                application_receipt_key=receipt_key,
+            )
+        )
+        await db.commit()
+
+    relay = WorkerRelay(session_factory, broadcaster)
+    relay._tasks[worker.id] = {task.id}
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "plan_application_delivery_uncertain",
+                "task_id": task.id,
+                "receipt_key": receipt_key,
+                "delivery_status": "uncertain",
+                "error": "Worker restarted after launch claim",
+                "launch_evidence": {
+                    "task_id": task.id,
+                    "instance_id": 12,
+                    "retry_count": 4,
+                },
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        assert receipt.delivery_status == "uncertain"
+        assert receipt.launch_evidence["retry_count"] == 4
+        assert await db.scalar(
+            select(PlanApplication.id).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        ) is not None
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "plan_application_delivery_resolved",
+                "task_id": task.id,
+                "receipt_key": receipt_key,
+                "delivery_status": "cancelled",
+                "action": "release_for_retry",
+                "note": "No exact Worker turn exists",
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        assert receipt.delivery_status == "cancelled"
+        assert receipt.delivery_resolution["action"] == "release_for_retry"
+        assert await db.scalar(
+            select(PlanApplication.id).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        ) is None
+
+
+async def test_worker_plan_can_retry_after_failed_prepared_receipt(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    async with session_factory() as db:
+        old_log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement once",
+            raw_json=json.dumps({
+                "raw_content": "Implement once",
+                "plan_delivery": {
+                    "status": "failed",
+                    "error": "permanent route mismatch",
+                },
+            }),
+        )
+        db.add(old_log)
+        await db.flush()
+        db.add(
+            PlanApplicationReceipt(
+                receipt_key="failed-prepared-receipt",
+                target_task_id=task.id,
+                worker_id=worker.id,
+                manager_user_log_id=old_log.id,
+                plan_version_ids=[version_id],
+                status="prepared",
+                delivery_status="failed",
+                delivery_error="permanent route mismatch",
+            )
+        )
+        await db.commit()
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [912],
+        }
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        result = await _send_worker_chat(
+            current,
+            ChatMessage(
+                message="Implement once",
+                plan_version_ids=[version_id],
+                confirmed_stale_plan_version_ids=[version_id],
+            ),
+            db,
+            request,
+        )
+
+    assert result["applied_plan_version_ids"] == [version_id]
+    assert sum(
+        call.args[1] == "POST"
+        for call in proxy.proxy_to_worker.await_args_list
+    ) == 1
+    async with session_factory() as db:
+        receipts = list(
+            (
+                await db.execute(
+                    select(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.target_task_id == task.id
+                    )
+                    .order_by(PlanApplicationReceipt.id)
+                )
+            ).scalars()
+        )
+        assert [receipt.delivery_status for receipt in receipts] == [
+            "failed",
+            "queued",
+        ]
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+        assert application.application_receipt_key == receipts[1].receipt_key
+
+
+async def test_worker_plan_application_recovers_lost_http_ack(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        raise httpx.ReadTimeout("response was lost after Worker commit")
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    proxy.get_plan_application_receipt.return_value = {
+        "status": "committed",
+        "response": {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [912],
+        },
+    }
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        result = await _send_worker_chat(
+            current,
+            ChatMessage(
+                message="Implement once",
+                plan_version_ids=[version_id],
+            ),
+            db,
+            request,
+        )
+
+    assert result["applied_plan_version_ids"] == [version_id]
+    assert sum(
+        call.args[1] == "POST"
+        for call in proxy.proxy_to_worker.await_args_list
+    ) == 1
+    assert proxy.get_plan_application_receipt.await_count == 1
+    async with session_factory() as db:
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.target_task_id == task.id
+            )
+        )
+        assert application is not None
+        assert receipt.status == "committed"
+
+
+async def test_worker_uncertain_http_reconciliation_consumes_manager_version(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        raise httpx.ReadTimeout("response was lost after Worker launch claim")
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    proxy.get_plan_application_receipt.return_value = {
+        "status": "committed",
+        "delivery_status": "uncertain",
+        "delivery_error": "Worker restarted after launch claim",
+        "launch_evidence": {
+            "task_id": task.id,
+            "instance_id": 17,
+            "retry_count": 5,
+        },
+        "response": {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [912],
+        },
+    }
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        with pytest.raises(HTTPException, match="uncertain") as exc_info:
+            await _send_worker_chat(
+                current,
+                ChatMessage(
+                    message="Implement once",
+                    plan_version_ids=[version_id],
+                ),
+                db,
+                request,
+            )
+    assert exc_info.value.status_code == 409
+
+    async with session_factory() as db:
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.target_task_id == task.id
+            )
+        )
+        log = await db.get(LogEntry, receipt.manager_user_log_id)
+        assert application.application_receipt_key == receipt.receipt_key
+        assert receipt.status == "committed"
+        assert receipt.delivery_status == "uncertain"
+        assert receipt.launch_evidence["retry_count"] == 5
+        assert "applied_plans" in json.loads(log.raw_json)
+
+
+async def test_worker_plan_receipt_cannot_reconcile_a_different_message(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    async with session_factory() as db:
+        prior_log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement the original request",
+            raw_json=json.dumps({"raw_content": "Implement the original request"}),
+            is_error=False,
+        )
+        db.add(prior_log)
+        await db.flush()
+        db.add(PlanApplicationReceipt(
+            receipt_key="receipt-for-original-message",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            manager_user_log_id=prior_log.id,
+            plan_version_ids=[version_id],
+            status="prepared",
+        ))
+        await db.commit()
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        raise AssertionError("A different message must not reach the Worker")
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        with pytest.raises(HTTPException, match="different message") as exc_info:
+            await _send_worker_chat(
+                current,
+                ChatMessage(
+                    message="This is a new and different request",
+                    plan_version_ids=[version_id],
+                    confirmed_stale_plan_version_ids=[version_id],
+                ),
+                db,
+                request,
+            )
+
+    assert exc_info.value.status_code == 409
+    proxy.get_plan_application_receipt.assert_not_awaited()
+    proxy.materialize_plan_version.assert_not_awaited()
+
+
+async def test_worker_plan_preflight_failure_does_not_leave_blocking_receipt(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.proxy_to_worker.side_effect = (
+        lambda _task, method, _path, *_args, **_kwargs:
+        _routing_snapshot(task)
+        if method == "GET"
+        else None
+    )
+    proxy.relay.subscribe_task.side_effect = RuntimeError("relay unavailable")
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        with pytest.raises(RuntimeError, match="relay unavailable"):
+            await _send_worker_chat(
+                current,
+                ChatMessage(
+                    message="Do not consume the Plan",
+                    plan_version_ids=[version_id],
+                ),
+                db,
+                request,
+            )
+
+    async with session_factory() as db:
+        assert await db.scalar(select(PlanApplicationReceipt.id)) is None
+        assert await db.scalar(select(PlanApplication.id)) is None
 
 
 async def test_chat_proxy_rejects_secrets(client, session_factory, monkeypatch):

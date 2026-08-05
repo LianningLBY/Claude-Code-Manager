@@ -6,17 +6,19 @@ Ensures:
 3. The final migrated schema matches the ORM models (no drift).
 """
 import importlib.util
+import hashlib
 import io
 import json
-import re
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+import pytest
 from sqlalchemy import BigInteger, create_engine, inspect, text
+from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.schema import CreateTable
 
 # All ORM models must be imported so Base.metadata is complete.
 from backend.database import Base
@@ -29,6 +31,7 @@ import backend.models.worktree  # noqa: F401
 import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
+import backend.models.plan  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -37,7 +40,25 @@ PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
 PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
-CURRENT_HEAD_REVISION = "2f6c8a1d4e90"
+ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
+PLAN_V2_REVISION = "3f2a9c8e7b10"
+CURRENT_HEAD_REVISION = PLAN_V2_REVISION
+PUBLISHED_PLAN_CLEANUP_SHA256 = (
+    "dd8cce93f05599ebc580cb95cad5d7d8875f03415775312718d3e42ef4369d16"
+)
+REMOVED_UNPUBLISHED_PLAN_REVISIONS = {
+    "a4d9e2c7b1f0",
+    "b5f7c9d1e3a4",
+    "c1a7e4d92f30",
+    "c6e8a1f4d2b7",
+    "d2b8f6a10c43",
+    "d4a7c9e2f1b6",
+    "e5b8d1c4a7f2",
+    "e7c4a21d9b30",
+    "f1a8c4d72e90",
+    "f5b7c9d1e3a2",
+    "f6c8d0e2a4b1",
+}
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -227,6 +248,11 @@ class TestLegacyMigration:
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
         assert "task_retry_count" in log_cols
+
+        plan_step_cols = _get_table_columns(engine, "plan_agent_steps")
+        assert "last_delta_at" in plan_step_cols
+        assert "streamed_output_chars" in plan_step_cols
+        assert "last_event_type" in plan_step_cols
 
         project_cols = _get_table_columns(engine, "projects")
         assert "sort_order" in project_cols
@@ -423,7 +449,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -432,6 +458,9 @@ class TestFreshMigration:
         assert "loop_progress" in task_cols
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
+        assert "plan_target_task_id" in task_cols
+        assert "plan_context_snapshot" in task_cols
+        assert "plan_applied_log_id" in task_cols
         assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
@@ -613,10 +642,13 @@ class TestFreshMigration:
         engine = create_engine(f"sqlite:///{db_path}")
         assert "pr_finding_actions" not in _get_all_tables(engine)
         with engine.connect() as conn:
-            revision = conn.execute(
+            revisions = {
+                row[0]
+                for row in conn.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one()
-        assert revision == PR_REVIEW_PANEL_REVISION
+                ).fetchall()
+            }
+        assert revisions == {PR_REVIEW_PANEL_REVISION}
         engine.dispose()
 
         _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
@@ -915,12 +947,289 @@ class TestAlreadyMigratedDb:
         engine.dispose()
 
 
+class TestVersionedPlanBackfill:
+    """Plan v2 backfills only the legacy Task state still present on main."""
+
+    def test_main_plan_states_and_attachments_are_backfilled(self, tmp_path):
+        db_path = str(tmp_path / "main-plan-states.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, ATTENTION_TAG_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            required = """
+                id, title, description, status, priority, target_branch,
+                merge_status, retry_count, max_retries, mode, created_at
+            """
+            conn.execute(
+                text(
+                    f"""INSERT INTO tasks ({required}, metadata) VALUES
+                    (21, 'Pending legacy Plan', 'Wait to run', 'pending', 0,
+                     'main', 'pending', 0, 2, 'plan',
+                     '2026-08-01 10:00:00', :metadata)"""
+                ),
+                {
+                    "metadata": json.dumps(
+                        {
+                            "file_paths": ["/uploads/requirements.txt"],
+                            "attachments": [
+                                {
+                                    "url": "/api/uploads/requirements.txt",
+                                    "name": "requirements.txt",
+                                    "is_image": False,
+                                }
+                            ],
+                        }
+                    )
+                },
+            )
+            conn.execute(
+                text(
+                    f"""INSERT INTO tasks ({required}, plan_content,
+                    plan_approved, completed_at) VALUES
+                    (22, 'Failed legacy Plan', 'Failed before output',
+                     'failed', 0, 'main', 'pending', 0, 2, 'plan',
+                     '2026-08-01 11:00:00', NULL, NULL,
+                     '2026-08-01 11:30:00'),
+                    (31, 'Needs decision', 'Review this', 'plan_review', 0,
+                     'main', 'pending', 0, 2, 'plan',
+                     '2026-08-01 12:00:00', '# Review', NULL, NULL),
+                    (32, 'Approved and queued', 'Execute this', 'pending', 0,
+                     'main', 'pending', 0, 2, 'plan',
+                     '2026-08-01 13:00:00', '# Queued', 1, NULL),
+                    (33, 'Already executed', 'Was executed', 'completed', 0,
+                     'main', 'pending', 0, 2, 'plan',
+                     '2026-08-01 14:00:00', '# Done', 1,
+                     '2026-08-01 15:00:00'),
+                    (34, 'Rejected', 'Do not execute', 'cancelled', 0,
+                     'main', 'pending', 0, 2, 'plan',
+                     '2026-08-01 16:00:00', '# Rejected', 0,
+                     '2026-08-01 17:00:00')"""
+                )
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """SELECT l.legacy_task_id, l.plan_run_id,
+                    r.status AS run_status, p.active_run_id,
+                    p.initial_attachments, p.pipeline_config,
+                    t.status AS task_status, v.review_verdict,
+                    v.human_decision, a.application_type,
+                    a.execution_task_id
+                    FROM plan_legacy_task_links l
+                    JOIN plan_agent_runs r ON r.id = l.plan_run_id
+                    JOIN plans p ON p.id = l.plan_id
+                    JOIN tasks t ON t.id = l.legacy_task_id
+                    LEFT JOIN plan_versions v ON v.id = l.plan_version_id
+                    LEFT JOIN plan_applications a
+                      ON a.plan_version_id = l.plan_version_id
+                    ORDER BY l.legacy_task_id"""
+                )
+            ).mappings().all()
+
+            assert [row["legacy_task_id"] for row in rows] == [21, 22, 31, 32, 33, 34]
+            assert rows[0]["run_status"] == "queued"
+            assert rows[0]["task_status"] == "superseded"
+            assert rows[0]["active_run_id"] == rows[0]["plan_run_id"]
+            attachments = rows[0]["initial_attachments"]
+            if isinstance(attachments, str):
+                attachments = json.loads(attachments)
+            assert attachments == [
+                {
+                    "url": "/api/uploads/requirements.txt",
+                    "name": "requirements.txt",
+                    "is_image": False,
+                    "path": "/uploads/requirements.txt",
+                }
+            ]
+            pipeline = rows[0]["pipeline_config"]
+            if isinstance(pipeline, str):
+                pipeline = json.loads(pipeline)
+            assert pipeline["planner"]["primary"]["provider"] == "claude"
+            assert pipeline["max_interactions"] == 3
+
+            assert rows[1]["run_status"] == "failed"
+            assert rows[1]["task_status"] == "failed"
+            assert rows[1]["human_decision"] is None
+            assert rows[2]["review_verdict"] == "disabled"
+            assert rows[2]["human_decision"] == "pending"
+            assert rows[2]["application_type"] is None
+            for index, task_id in ((3, 32), (4, 33)):
+                assert rows[index]["human_decision"] == "approved"
+                assert rows[index]["application_type"] == "execution_task"
+                assert rows[index]["execution_task_id"] == task_id
+            assert rows[5]["human_decision"] == "rejected"
+            assert rows[5]["application_type"] is None
+        engine.dispose()
+
+    def test_active_legacy_plan_process_blocks_backfill(self, tmp_path):
+        db_path = str(tmp_path / "active-legacy-plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, ATTENTION_TAG_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                    ) VALUES (
+                    31, 'Active legacy Plan', 'Still running', 'executing', 0,
+                    'main', 'pending', 0, 2, 'plan',
+                    '2026-08-01 10:00:00')"""
+                )
+            )
+            conn.execute(
+                text(
+                    """INSERT INTO instances (
+                    id, name, pid, status, current_task_id, provider, model,
+                    total_tasks_completed, total_cost_usd
+                    ) VALUES (
+                    41, 'legacy-owner', 12345, 'running', 31, 'claude',
+                    'default', 0, 0)"""
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="active process evidence"):
+            _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+
+    def test_active_legacy_plan_task_state_blocks_without_instance(self, tmp_path):
+        db_path = str(tmp_path / "active-plan-without-instance.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, ATTENTION_TAG_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                    ) VALUES (
+                    32, 'Unowned active Plan', 'State is authoritative',
+                    'in_progress', 0, 'main', 'pending', 0, 2, 'plan',
+                    '2026-08-01 10:00:00')"""
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="active state evidence"):
+            _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+
+    def test_plan_v2_roundtrip_restores_pending_legacy_carrier(self, tmp_path):
+        db_path = str(tmp_path / "plan-v2-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, ATTENTION_TAG_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                    ) VALUES (
+                    77, 'Queued Plan', 'Plan it', 'pending', 0, 'main',
+                    'pending', 0, 2, 'plan', '2026-08-01 10:00:00')"""
+                )
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT status FROM tasks WHERE id=77")
+            ).scalar_one() == "superseded"
+            assert conn.execute(
+                text("SELECT COUNT(*) FROM plan_legacy_task_links")
+            ).scalar_one() == 1
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, ATTENTION_TAG_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plans" not in _get_all_tables(engine)
+        with engine.connect() as conn:
+            task = conn.execute(
+                text(
+                    "SELECT status, completed_at, error_message "
+                    "FROM tasks WHERE id=77"
+                )
+            ).mappings().one()
+            assert dict(task) == {
+                "status": "pending",
+                "completed_at": None,
+                "error_message": None,
+            }
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT COUNT(*) FROM plan_legacy_task_links")
+            ).scalar_one() == 1
+            assert conn.execute(
+                text("SELECT status FROM tasks WHERE id=77")
+            ).scalar_one() == "superseded"
+        engine.dispose()
+
+    def test_worker_receipt_and_application_audit_schema_is_complete(self, tmp_path):
+        db_path = str(tmp_path / "plan-delivery-schema.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+
+        receipt_columns = set(_get_table_columns(engine, "plan_application_receipts"))
+        assert {
+            "receipt_key",
+            "worker_id",
+            "manager_user_log_id",
+            "delivery_status",
+            "outbox_payload",
+            "payload_digest",
+            "delivery_error",
+            "launch_evidence",
+            "delivery_resolution",
+        }.issubset(receipt_columns)
+        run_columns = set(_get_table_columns(engine, "plan_agent_runs"))
+        assert {
+            "import_payload_digest",
+            "import_attachment_receipt",
+            "draft_content",
+            "draft_step_id",
+            "draft_repo_revision",
+        }.issubset(run_columns)
+        step_columns = set(_get_table_columns(engine, "plan_agent_steps"))
+        assert {
+            "last_delta_at",
+            "streamed_output_chars",
+            "last_event_type",
+        }.issubset(step_columns)
+        assert "plan_application_attempts" in _get_all_tables(engine)
+        engine.dispose()
+
+
 class TestSchemaConsistency:
     """The schema produced by Alembic migrations matches the ORM models.
 
     This is the critical test: if someone adds a column to an ORM model
     but forgets to create an Alembic migration, this test will catch it.
     """
+
+    def test_plan_application_integrity_constraint_compiles_on_all_dialects(self):
+        table = backend.models.plan.PlanApplication.__table__
+        for dialect in (sqlite.dialect(), postgresql.dialect(), mysql.dialect()):
+            ddl = str(CreateTable(table).compile(dialect=dialect))
+            assert "ck_plan_application_target" in ddl
+            assert "execution_task" in ddl
 
     def test_migrated_schema_matches_orm(self, tmp_path):
         """Compare columns from Alembic-migrated DB vs ORM metadata.create_all."""
@@ -987,7 +1296,7 @@ class TestSchemaConsistency:
             ]
 
             assert len(significant_diffs) == 0, (
-                f"Alembic autogenerate found pending changes (need a new migration!):\n"
+                "Alembic autogenerate found pending changes (need a new migration!):\n"
                 + "\n".join(str(d) for d in significant_diffs)
             )
 
@@ -995,7 +1304,7 @@ class TestSchemaConsistency:
 
 
 class TestPublishedMigrationHistory:
-    """Published sibling histories converge without rewriting either branch."""
+    """Published main history stays intact and Plan v2 advances linearly."""
 
     def _assert_revision_schema(
         self,
@@ -1029,16 +1338,20 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_attention_tag(self, tmp_path):
+    def test_migration_graph_has_one_linear_head_after_plan_v2(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
-            script.get_revision(CURRENT_HEAD_REVISION).down_revision
-            == PR_FINDING_ACTIONS_REVISION
+            script.get_revision(PLAN_V2_REVISION).down_revision
+            == ATTENTION_TAG_REVISION
         )
+        graph_revision_ids = {
+            migration.revision for migration in script.walk_revisions()
+        }
+        assert REMOVED_UNPUBLISHED_PLAN_REVISIONS.isdisjoint(graph_revision_ids)
         assert (
             script.get_revision(PR_FINDING_ACTIONS_REVISION).down_revision
             == PR_REVIEW_PANEL_REVISION
@@ -1047,6 +1360,39 @@ class TestPublishedMigrationHistory:
             script.get_revision(PR_REVIEW_PANEL_REVISION).down_revision
             == PUBLISHED_BRANCH_MERGE_REVISION
         )
+
+    def test_published_plan_cleanup_migration_is_immutable(self):
+        migration_path = (
+            PROJECT_ROOT
+            / "alembic"
+            / "versions"
+            / "f7a1c3d9e5b2_remove_reverted_plan_schema.py"
+        )
+        assert hashlib.sha256(migration_path.read_bytes()).hexdigest() == (
+            PUBLISHED_PLAN_CLEANUP_SHA256
+        )
+
+    def test_deployed_main_head_upgrades_to_plan_v2_head(self, tmp_path):
+        db_path = str(tmp_path / "main-to-plan-v2.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, ATTENTION_TAG_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plans" not in _get_all_tables(engine)
+        assert "attention_tag" in _get_table_columns(engine, "tasks")
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plans" in _get_all_tables(engine)
+        task_columns = _get_table_columns(engine, "tasks")
+        assert "attention_tag" in task_columns
+        assert "plan_target_task_id" in task_columns
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == CURRENT_HEAD_REVISION
+        engine.dispose()
 
     @pytest.mark.parametrize(
         ("start_revision", "plan_schema_present", "snapshot_schema_present"),

@@ -42,6 +42,11 @@ def _instance_generation_predicates(instance: Instance) -> list:
             else Instance.current_task_id == instance.current_task_id
         ),
         (
+            Instance.current_plan_run_id.is_(None)
+            if instance.current_plan_run_id is None
+            else Instance.current_plan_run_id == instance.current_plan_run_id
+        ),
+        (
             Instance.pid.is_(None)
             if instance.pid is None
             else Instance.pid == instance.pid
@@ -104,6 +109,12 @@ async def _reconcile_dead_terminal_pid(
         predicates.append(Instance.current_task_id.is_(None))
     else:
         predicates.append(Instance.current_task_id == instance.current_task_id)
+    if instance.current_plan_run_id is None:
+        predicates.append(Instance.current_plan_run_id.is_(None))
+    else:
+        predicates.append(
+            Instance.current_plan_run_id == instance.current_plan_run_id
+        )
     predicates.append(
         Instance.started_at.is_(None)
         if instance.started_at is None
@@ -112,7 +123,7 @@ async def _reconcile_dead_terminal_pid(
     reconciled = await db.execute(
         update(Instance)
         .where(*predicates)
-        .values(pid=None, current_task_id=None)
+        .values(pid=None, current_task_id=None, current_plan_run_id=None)
     )
     await db.commit()
     return bool(reconciled.rowcount)
@@ -205,7 +216,7 @@ async def cleanup_instances(request: Request, db: AsyncSession = Depends(get_db)
                 if inst is None:
                     await db.rollback()
                     continue
-            if inst.current_task_id is not None:
+            if inst.current_task_id is not None or inst.current_plan_run_id is not None:
                 skipped_running.append(instance_id)
                 await db.rollback()
                 continue
@@ -296,11 +307,11 @@ async def delete_instance(
             if instance is None:
                 await db.rollback()
                 raise HTTPException(404, "Instance not found")
-        if instance.current_task_id is not None:
+        if instance.current_task_id is not None or instance.current_plan_run_id is not None:
             await db.rollback()
             raise HTTPException(
                 status_code=409,
-                detail="Instance still owns a task; reconcile it before deleting",
+                detail="Instance still owns work; reconcile it before deleting",
             )
         if not await _delete_exact_instance_generation(db, instance):
             await db.rollback()
@@ -323,6 +334,8 @@ async def stop_instance(
     if instance is None:
         raise HTTPException(404, "Instance not found")
     if (
+        instance.current_plan_run_id is not None
+        or
         instance.current_task_id != body.expected_task_id
         or instance.pid != body.expected_pid
         or instance.started_at != body.expected_started_at

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import {
   Bot, Menu, X, PanelLeftClose, PanelLeftOpen, LayoutDashboard, ListTodo, FolderGit2, KeyRound,
   FolderOpen, MessagesSquare, GitPullRequest, Server, Sparkles, Users, Globe,
+  ScrollText, Settings,
 } from '../icons';
 import type { ComponentType } from 'react';
 import { api } from '../../api/client';
@@ -89,6 +90,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const [hasWorker, setHasWorker] = useState(isAdmin);
+  const [hasPlanActions, setHasPlanActions] = useState(false);
 
   const refreshWorkerStatus = useCallback(() => {
     if (!isAdmin) {
@@ -109,9 +111,23 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
   // Refresh nav when worker assignments change
   useWebSocket(['workers'], () => { refreshWorkerStatus(); });
 
+  const refreshPlanAttention = useCallback(() => {
+    void api.countPlans({ display_state: 'waiting_user,awaiting_review,approved' })
+      .then((result) => setHasPlanActions(result.total > 0))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshPlanAttention();
+    const timer = window.setInterval(refreshPlanAttention, 30000);
+    return () => window.clearInterval(timer);
+  }, [refreshPlanAttention]);
+  useWebSocket(['plans'], refreshPlanAttention);
+
   const allPages: NavItem[] = [
     { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, show: isAdmin },
     { key: 'tasks', label: 'Tasks', icon: ListTodo, show: true },
+    { key: 'plans', label: 'Plans', icon: ScrollText, show: true },
     { key: 'projects', label: 'Projects', icon: FolderGit2, show: true },
     // These pages expose Manager-host data rather than per-tenant resources.
     // Their backend routers are admin-only, so do not advertise dead links to
@@ -123,6 +139,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
     { key: 'workers', label: 'Workers', icon: Server, show: isAdmin || hasWorker },
     { key: 'skills', label: 'Skills', icon: Sparkles, show: true },
     { key: 'team', label: 'Team', icon: Users, show: true },
+    { key: 'settings', label: 'Settings', icon: Settings, show: isAdmin },
     ...(isCapacitor() ? [{ key: 'server', label: 'Server', icon: Globe, show: true }] : []),
   ];
   const pages = allPages.filter(p => p.show);
@@ -167,16 +184,24 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
                 : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/70'
             }`}
           >
-            {(() => {
-              const themed = getNavIcon(iconSet, p.key);
-              return themed ? (
-                <span data-icon-set={iconSet} className="contents">
-                  {themed({ size: 16, active })}
-                </span>
-              ) : (
-                <Icon size={16} className={active ? 'text-indigo-400' : 'text-gray-500'} />
-              );
-            })()}
+            <span data-nav-icon className="relative inline-flex shrink-0 items-center justify-center">
+              {(() => {
+                const themed = getNavIcon(iconSet, p.key);
+                return themed ? (
+                  <span data-icon-set={iconSet} className="contents">
+                    {themed({ size: 16, active })}
+                  </span>
+                ) : (
+                  <Icon size={16} className={active ? 'text-indigo-400' : 'text-gray-500'} />
+                );
+              })()}
+              {p.key === 'plans' && hasPlanActions && (
+                <span
+                  aria-label="Plans requiring action"
+                  className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-red-500 ring-2 ring-red-500/20"
+                />
+              )}
+            </span>
             {p.label}
           </button>
         );

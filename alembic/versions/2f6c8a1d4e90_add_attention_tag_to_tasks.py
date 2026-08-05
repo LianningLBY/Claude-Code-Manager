@@ -1,7 +1,7 @@
 """add attention tag to tasks
 
 Revision ID: 2f6c8a1d4e90
-Revises: 7a1d4e9c2b60
+Revises: b7c9e2f4a610
 Create Date: 2026-08-05
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = "2f6c8a1d4e90"
-down_revision: Union[str, None] = "7a1d4e9c2b60"
+down_revision: Union[str, None] = "b7c9e2f4a610"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

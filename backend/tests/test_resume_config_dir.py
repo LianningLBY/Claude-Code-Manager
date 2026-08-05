@@ -18,12 +18,14 @@ from unittest.mock import AsyncMock, MagicMock, call
 from backend.services.claude_pool import ClaudePool, PoolAccount
 from backend.services.codex_pool import CodexPool, CodexPoolAccount
 from backend.services.dispatcher import (
+    CODEX_ROUTING_RETRY_DELAY,
     ClaudeAccountRoutingError,
     CodexAccountRoutingError,
     GlobalDispatcher,
     TaskLifecycleSupersededError,
     _TaskStatusGeneration,
 )
+from backend.services.instance_manager import InstanceManager
 
 
 @pytest.fixture
@@ -630,6 +632,86 @@ class TestResolveResumeConfigDirCodex:
         assert task.metadata_["codex_account_id"] == "codex-1"
 
     @pytest.mark.asyncio
+    async def test_fresh_task_skips_a_runtime_blocked_account(self, tmp_path):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        disp.instance_manager.busy_codex_homes.return_value = {
+            str((tmp_path / "codex-1").resolve())
+        }
+
+        result = await disp._resolve_resume_config_dir(None, "codex", task_id=42)
+
+        assert result == str((tmp_path / "codex-2").resolve())
+        assert task.metadata_["codex_account_id"] == "codex-2"
+
+    @pytest.mark.asyncio
+    async def test_all_runtime_blocked_accounts_use_short_retry(self, tmp_path):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        disp.instance_manager.busy_codex_homes.return_value = {
+            str((tmp_path / "codex-1").resolve()),
+            str((tmp_path / "codex-2").resolve()),
+        }
+
+        with pytest.raises(CodexAccountRoutingError) as caught:
+            await disp._resolve_resume_config_dir(None, "codex", task_id=42)
+
+        assert caught.value.permanent is False
+        assert caught.value.retry_after == CODEX_ROUTING_RETRY_DELAY
+        assert task.metadata_ == {}
+
+    @pytest.mark.asyncio
+    async def test_busy_resident_ignores_unrelated_long_cooldown(self, tmp_path):
+        task = MagicMock(id=42, metadata_={"codex_account_id": "codex-1"})
+        disp = self._dispatcher(tmp_path, task)
+        source = tmp_path / "codex-1"
+        _codex_rollout(source, "thread-busy-cooldown")
+        disp.instance_manager.busy_codex_homes.return_value = {
+            str(source.resolve())
+        }
+        disp.codex_pool.mark_rate_limited(
+            str(tmp_path / "codex-2"),
+            duration=3600,
+        )
+
+        with pytest.raises(CodexAccountRoutingError) as caught:
+            await disp._resolve_resume_config_dir(
+                "thread-busy-cooldown",
+                "codex",
+                task_id=42,
+            )
+
+        assert caught.value.permanent is False
+        assert caught.value.retry_after == CODEX_ROUTING_RETRY_DELAY
+        assert task.metadata_["codex_account_id"] == "codex-1"
+
+    @pytest.mark.asyncio
+    async def test_disabled_resident_waits_for_busy_migration_target(
+        self,
+        tmp_path,
+    ):
+        task = MagicMock(id=42, metadata_={"codex_account_id": "codex-1"})
+        disp = self._dispatcher(tmp_path, task)
+        source = tmp_path / "codex-1"
+        target = tmp_path / "codex-2"
+        _codex_rollout(source, "thread-disabled-source")
+        disp.codex_pool.account("codex-1").enabled = False
+        disp.instance_manager.busy_codex_homes.return_value = {
+            str(target.resolve())
+        }
+
+        with pytest.raises(CodexAccountRoutingError) as caught:
+            await disp._resolve_resume_config_dir(
+                "thread-disabled-source",
+                "codex",
+                task_id=42,
+            )
+
+        assert caught.value.permanent is False
+        assert caught.value.retry_after == CODEX_ROUTING_RETRY_DELAY
+        assert task.metadata_["codex_account_id"] == "codex-1"
+
+    @pytest.mark.asyncio
     async def test_fresh_task_pool_exhaustion_never_falls_back_to_default_home(
         self, tmp_path,
     ):
@@ -754,6 +836,67 @@ class TestResolveResumeConfigDirCodex:
             source_codex_home=str(source.resolve()),
             target_codex_home=str(target.resolve()),
         )
+
+    @pytest.mark.asyncio
+    async def test_busy_bound_thread_migrates_to_an_idle_account(self, tmp_path):
+        """An idle task must not queue behind a non-app-server home owner."""
+        task = MagicMock(id=42, metadata_={"codex_account_id": "codex-1"})
+        disp = self._dispatcher(tmp_path, task)
+        source = tmp_path / "codex-1"
+        target = tmp_path / "codex-2"
+        _codex_rollout(source, "thread-busy")
+        disp.instance_manager.busy_codex_homes.return_value = {
+            str(source.resolve())
+        }
+
+        result = await disp._resolve_resume_config_dir(
+            "thread-busy", "codex", task_id=42
+        )
+
+        assert result == str(target.resolve())
+        assert task.metadata_["codex_account_id"] == "codex-2"
+        disp.instance_manager.rebind_codex_thread.assert_awaited_once_with(
+            "thread-busy",
+            source_codex_home=str(source.resolve()),
+            target_codex_home=str(target.resolve()),
+        )
+
+    @pytest.mark.asyncio
+    async def test_busy_resident_migration_failure_retries_instead_of_reusing(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from backend.services.codex_session_migration import (
+            CodexSessionMigrationError,
+        )
+
+        task = MagicMock(id=42, metadata_={"codex_account_id": "codex-1"})
+        disp = self._dispatcher(tmp_path, task)
+        source = tmp_path / "codex-1"
+        _codex_rollout(source, "thread-busy-migration-fail")
+        disp.instance_manager.busy_codex_homes.return_value = {
+            str(source.resolve())
+        }
+
+        def fail_migration(*_args, **_kwargs):
+            raise CodexSessionMigrationError("disk full")
+
+        monkeypatch.setattr(
+            "backend.services.codex_session_migration.migrate_codex_rollout_session",
+            fail_migration,
+        )
+
+        with pytest.raises(CodexAccountRoutingError) as caught:
+            await disp._resolve_resume_config_dir(
+                "thread-busy-migration-fail",
+                "codex",
+                task_id=42,
+            )
+
+        assert caught.value.permanent is False
+        assert caught.value.retry_after == CODEX_ROUTING_RETRY_DELAY
+        assert task.metadata_["codex_account_id"] == "codex-1"
 
     @pytest.mark.asyncio
     async def test_preferred_account_migrates_healthy_bound_thread(
@@ -1209,3 +1352,23 @@ class TestResolveResumeConfigDirCodex:
         _seed_session(tmp_path / "claude-1", "sess-claude")
         result = await dispatcher._resolve_resume_config_dir("sess-claude", "claude")
         assert result == str(tmp_path / "claude-1")
+
+
+def test_busy_codex_homes_includes_non_app_server_runtime_blockers(tmp_path):
+    manager = object.__new__(InstanceManager)
+    exec_home = str(tmp_path / "exec")
+    ephemeral_home = str(tmp_path / "ephemeral")
+    maintenance_home = str(tmp_path / "maintenance")
+    idle_ephemeral_home = str(tmp_path / "idle-ephemeral")
+    manager._codex_exec_homes = {1: exec_home}
+    manager._codex_ephemeral_home_users = {
+        ephemeral_home: 1,
+        idle_ephemeral_home: 0,
+    }
+    manager._codex_home_maintenance = {maintenance_home}
+
+    assert manager.busy_codex_homes() == {
+        str((tmp_path / "exec").resolve()),
+        str((tmp_path / "ephemeral").resolve()),
+        str((tmp_path / "maintenance").resolve()),
+    }

@@ -368,7 +368,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
                 "codex_model_service_tiers": {
                     "gpt-5.6-sol": ["default", "priority"],
                 },
-                "pr_review_snapshot_context_version": 2,
+                "pr_review_snapshot_context_version": 3,
             })
 
         async def post(self, _url, *, headers, json):
@@ -988,6 +988,206 @@ async def test_relay_completed_generation_triggers_manager_pr_finalizer(
     assert relay._backfill_missing_logs.await_args.kwargs == {
         "sync_status": False,
     }
+
+
+async def test_relay_completed_pr_fix_backfills_before_manager_finalizer(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        tags=["pr-review-fix"],
+        metadata_={"pr_finding_action_id": 41},
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status="completed",
+            completed_at=None,
+            background_active=False,
+        )
+    )
+    calls = []
+
+    async def backfill(*_args, **_kwargs):
+        calls.append("backfill")
+        return {task.id}
+
+    async def complete(task_id):
+        calls.append(("complete", task_id))
+
+    relay._backfill_missing_logs = AsyncMock(side_effect=backfill)
+    completion = AsyncMock(side_effect=complete)
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "completed",
+            },
+        },
+        worker,
+    )
+
+    assert calls == ["backfill", ("complete", task.id)]
+    assert relay._backfill_missing_logs.await_args.args[1] == {task.id}
+    assert relay._backfill_missing_logs.await_args.kwargs == {
+        "sync_status": False,
+    }
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "cancelled", "conflict"])
+async def test_relay_unsuccessful_pr_fix_invokes_manager_failure_handler(
+    relay,
+    session_factory,
+    monkeypatch,
+    terminal_status,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        # The metadata marker remains authoritative if an old Manager/client
+        # has removed the presentation tag.
+        tags=[],
+        metadata_={"pr_finding_action_id": 42},
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status=terminal_status,
+            completed_at=None,
+            error_message="remote fix failure",
+            background_active=False,
+        )
+    )
+    relay._backfill_missing_logs = AsyncMock()
+    failure = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pr_review_failure=failure,
+        ),
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": terminal_status,
+            },
+        },
+        worker,
+    )
+
+    failure.assert_awaited_once()
+    failed_task, error = failure.await_args.args
+    assert failed_task.id == task.id
+    assert failed_task.status == terminal_status
+    assert failed_task.retry_count == task.retry_count
+    assert error == "remote fix failure"
+    relay._backfill_missing_logs.assert_not_awaited()
+
+
+async def test_relay_failed_plain_pr_review_keeps_existing_failure_semantics(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        tags=["pr-review"],
+        metadata_={"pr_review_id": 43},
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status="failed",
+            completed_at=None,
+            error_message="review failed",
+            background_active=False,
+        )
+    )
+    failure = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pr_review_failure=failure,
+        ),
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "failed",
+            },
+        },
+        worker,
+    )
+
+    failure.assert_not_awaited()
+
+
+async def test_worker_pr_fix_failure_rechecks_exact_generation(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="failed",
+        tags=["pr-review-fix"],
+        metadata_={"pr_finding_action_id": 44},
+        error_message="old failure",
+    )
+    async with session_factory() as db:
+        generation = await worker_relay_module.read_worker_task_generation(
+            db,
+            task.id,
+            worker.id,
+        )
+    relay._observe_task_generation = AsyncMock(return_value=None)
+    failure = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pr_review_failure=failure,
+        ),
+    )
+
+    await relay._notify_completed_pr_review(generation)
+
+    failure.assert_not_awaited()
 
 
 async def test_worker_pr_finalizer_defers_when_history_sync_fails(

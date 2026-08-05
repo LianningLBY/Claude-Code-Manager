@@ -22,7 +22,9 @@ from backend.services.codex_app_server import (
     CodexRequiredMcpPreTurnError,
     CodexServiceTierUnavailableError,
     CodexThreadHomeMismatchError,
+    CodexThreadIdentityMismatchError,
     CodexThreadNotIdleError,
+    CodexThreadTerminalStateError,
     CodexTurnProcess,
     _format_process_exit,
     codex_project_trust_target,
@@ -323,7 +325,7 @@ async def test_start_turn_uses_native_resume_and_turn_start():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_type", ["active", "notLoaded", None])
+@pytest.mark.parametrize("status_type", ["active", None])
 async def test_start_turn_requires_explicit_idle_before_model_turn(status_type):
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -356,12 +358,190 @@ async def test_start_turn_requires_explicit_idle_before_model_turn(status_type):
 
 
 @pytest.mark.asyncio
+async def test_start_turn_recycles_system_error_once_before_idle_admission():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+    resume_count = 0
+
+    async def request(method, params):
+        nonlocal resume_count
+        calls.append((method, params))
+        if method == "thread/resume":
+            resume_count += 1
+            return {
+                "thread": {
+                    "id": "thread-system-error",
+                    "status": {
+                        "type": "systemError" if resume_count == 1 else "idle"
+                    },
+                }
+            }
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": "thread-system-error"}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-after-recycle"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="continue exactly once",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-system-error",
+        git_env=None,
+        task_id=300,
+    )
+
+    assert thread_id == "thread-system-error"
+    assert [method for method, _ in calls] == [
+        "thread/resume",
+        "thread/archive",
+        "thread/unarchive",
+        "thread/resume",
+        "turn/start",
+    ]
+    turn_params = calls[-1][1]
+    assert turn_params["input"] == [{
+        "type": "text",
+        "text": "continue exactly once",
+    }]
+    assert turn_params["clientUserMessageId"]
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-after-recycle", "status": "completed"},
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_start_turn_stops_after_one_persistent_system_error_recycle():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+
+    async def request(method, params):
+        calls.append((method, params))
+        if method == "thread/resume":
+            return {
+                "thread": {
+                    "id": "thread-still-system-error",
+                    "status": {"type": "systemError"},
+                }
+            }
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": "thread-still-system-error"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+
+    with pytest.raises(CodexThreadTerminalStateError) as caught:
+        await server.start_turn(
+            prompt="must not duplicate",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-still-system-error",
+            git_env=None,
+            task_id=300,
+        )
+
+    assert caught.value.state == "systemError"
+    assert caught.value.recovery_attempted is True
+    assert [method for method, _ in calls] == [
+        "thread/resume",
+        "thread/archive",
+        "thread/unarchive",
+        "thread/resume",
+    ]
+    assert "turn/start" not in [method for method, _ in calls]
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_start_turn_classifies_not_loaded_as_terminal_not_busy():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "thread": {
+            "id": "thread-not-loaded",
+            "status": {"type": "notLoaded"},
+        }
+    })
+
+    with pytest.raises(CodexThreadTerminalStateError) as caught:
+        await server.start_turn(
+            prompt="must remain visible",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-not-loaded",
+            git_env=None,
+            task_id=300,
+        )
+
+    assert caught.value.state == "notLoaded"
+    assert caught.value.recovery_attempted is False
+    assert not isinstance(caught.value, CodexAppServerBusyError)
+    server._request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_different_thread_id_before_terminal_recycle():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+
+    async def request(method, params):
+        calls.append((method, params))
+        return {
+            "thread": {
+                "id": "thread-wrong-response",
+                "status": {"type": "systemError"},
+            }
+        }
+
+    server._request = AsyncMock(side_effect=request)
+
+    with pytest.raises(
+        CodexThreadIdentityMismatchError,
+        match="returned a different thread id",
+    ) as caught:
+        await server.start_turn(
+            prompt="must not touch the wrong thread",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-requested",
+            git_env=None,
+            task_id=300,
+        )
+
+    assert caught.value.expected_thread_id == "thread-requested"
+    assert caught.value.actual_thread_id == "thread-wrong-response"
+    assert [method for method, _params in calls] == ["thread/resume"]
+    assert server._known_threads == set()
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
 async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, params):
         if method == "model/list":
             return {
                 "data": [{
@@ -381,17 +561,25 @@ async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
                 "serviceTier": "priority",
             }
         if method == "turn/start":
-            asyncio.get_running_loop().call_soon(
-                server._handle_notification,
-                "turn/started",
-                {
+            def notify_started_input():
+                server._handle_notification("turn/started", {
                     "threadId": "thread-fast",
                     "turn": {
                         "id": "turn-fast",
                         "status": "inProgress",
                     },
-                },
-            )
+                })
+                server._handle_notification("item/started", {
+                    "threadId": "thread-fast",
+                    "turnId": "turn-fast",
+                    "item": {
+                        "id": "input-fast",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
+                    },
+                })
+
+            asyncio.get_running_loop().call_soon(notify_started_input)
             return {"turn": {"id": "turn-fast"}}
         raise AssertionError(method)
 
@@ -1143,7 +1331,7 @@ async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
     )
     server._actual_tier_proxy = proxy
 
-    async def request(method, _params):
+    async def request(method, params):
         if method == "model/list":
             return {
                 "data": [{
@@ -1160,17 +1348,25 @@ async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
                 "serviceTier": "priority",
             }
         if method == "turn/start":
-            asyncio.get_running_loop().call_soon(
-                server._handle_notification,
-                "turn/started",
-                {
+            def notify_started_input():
+                server._handle_notification("turn/started", {
                     "threadId": "thread-fast-proof",
                     "turn": {
                         "id": "turn-fast-proof",
                         "status": "inProgress",
                     },
-                },
-            )
+                })
+                server._handle_notification("item/started", {
+                    "threadId": "thread-fast-proof",
+                    "turnId": "turn-fast-proof",
+                    "item": {
+                        "id": "input-fast-proof",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
+                    },
+                })
+
+            asyncio.get_running_loop().call_soon(notify_started_input)
             return {"turn": {"id": "turn-fast-proof"}}
         raise AssertionError(method)
 
@@ -1360,7 +1556,7 @@ async def test_fast_proof_precedes_terminal_notification_that_wins_response_race
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, params):
         if method == "model/list":
             return {
                 "data": [{
@@ -1384,6 +1580,11 @@ async def test_fast_proof_precedes_terminal_notification_that_wins_response_race
                     "turn": {
                         "id": "turn-fast-race",
                         "status": "completed",
+                        "items": [{
+                            "id": "input-fast-race",
+                            "type": "userMessage",
+                            "clientId": params["clientUserMessageId"],
+                        }],
                     },
                 },
             )
@@ -1588,17 +1789,25 @@ async def test_loaded_thread_switches_service_tier_before_turn_start(
             )
             return {}
         if method == "turn/start":
-            asyncio.get_running_loop().call_soon(
-                server._handle_notification,
-                "turn/started",
-                {
+            def notify_started_input():
+                server._handle_notification("turn/started", {
                     "threadId": "thread-hot",
                     "turn": {
                         "id": "turn-switched",
                         "status": "inProgress",
                     },
-                },
-            )
+                })
+                server._handle_notification("item/started", {
+                    "threadId": "thread-hot",
+                    "turnId": "turn-switched",
+                    "item": {
+                        "id": "input-switched",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
+                    },
+                })
+
+            asyncio.get_running_loop().call_soon(notify_started_input)
             return {"turn": {"id": "turn-switched"}}
         raise AssertionError(method)
 
@@ -1748,14 +1957,14 @@ async def test_fast_resume_rejects_goal_response_without_explicit_goal_key():
 
 
 @pytest.mark.asyncio
-async def test_fast_admission_ignores_settings_notification_without_turn_id():
+async def test_fast_admission_waits_for_client_id_after_provisional_started():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     settings_seen = asyncio.Event()
     release_turn_identity = asyncio.Event()
 
-    async def request(method, _params):
+    async def request(method, params):
         if method == "model/list":
             return {
                 "data": [{
@@ -1772,6 +1981,13 @@ async def test_fast_admission_ignores_settings_notification_without_turn_id():
                 "serviceTier": "priority",
             }
         if method == "turn/start":
+            server._handle_notification("turn/started", {
+                "threadId": "thread-settings-only",
+                "turn": {
+                    "id": "turn-with-identity",
+                    "status": "inProgress",
+                },
+            })
             server._handle_notification(
                 "thread/settings/updated",
                 {
@@ -1783,16 +1999,15 @@ async def test_fast_admission_ignores_settings_notification_without_turn_id():
 
             async def emit_authoritative_turn_identity():
                 await release_turn_identity.wait()
-                server._handle_notification(
-                    "turn/started",
-                    {
-                        "threadId": "thread-settings-only",
-                        "turn": {
-                            "id": "turn-with-identity",
-                            "status": "inProgress",
-                        },
+                server._handle_notification("item/started", {
+                    "threadId": "thread-settings-only",
+                    "turnId": "turn-with-identity",
+                    "item": {
+                        "id": "input-with-identity",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
                     },
-                )
+                })
 
             asyncio.create_task(emit_authoritative_turn_identity())
             return {"turn": {"id": "turn-with-identity"}}
@@ -1812,6 +2027,9 @@ async def test_fast_admission_ignores_settings_notification_without_turn_id():
     await settings_seen.wait()
     await asyncio.sleep(0)
     assert not admission.done()
+    context = server._contexts_by_thread["thread-settings-only"]
+    assert context.observed_turn_id is None
+    assert context.admission_confirmed is False
 
     release_turn_identity.set()
     process, thread_id = await admission
@@ -1854,16 +2072,24 @@ async def test_fast_adoption_by_older_turn_is_interrupted_without_success_proof(
         if method == "turn/start":
             # The adoption notification arrives only after the RPC response,
             # which is the narrow window that must not publish a Fast proof.
-            asyncio.get_running_loop().call_soon(
-                server._handle_notification,
-                "item/agentMessage/delta",
-                {
+            def notify_adopted_input():
+                server._handle_notification("item/started", {
+                    "threadId": "thread-fast-adopted",
+                    "turnId": "turn-older-goal",
+                    "item": {
+                        "id": "input-older-goal",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
+                    },
+                })
+                server._handle_notification("item/agentMessage/delta", {
                     "threadId": "thread-fast-adopted",
                     "turnId": "turn-older-goal",
                     "itemId": "old-output",
                     "delta": "older turn output",
-                },
-            )
+                })
+
+            asyncio.get_running_loop().call_soon(notify_adopted_input)
             return {"turn": {"id": "turn-new-submission"}}
         if method in {"thread/goal/set", "turn/interrupt"}:
             return {}
@@ -2603,7 +2829,7 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, params):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -2614,6 +2840,15 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
         if method == "turn/start":
             # Task 208's active goal emitted output before the turn/start RPC
             # returned its distinct submission id.
+            server._handle_notification("item/started", {
+                "threadId": "thread-goal",
+                "turnId": "turn-active-goal",
+                "item": {
+                    "id": "input-goal",
+                    "type": "userMessage",
+                    "clientId": params["clientUserMessageId"],
+                },
+            })
             server._handle_notification("item/agentMessage/delta", {
                 "threadId": "thread-goal",
                 "turnId": "turn-active-goal",
@@ -2678,6 +2913,202 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
 
 
 @pytest.mark.asyncio
+async def test_response_first_native_turn_is_correlated_by_client_message_id():
+    """Submission started may precede its RPC response and native identity."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+
+    async def request(method, params):
+        calls.append((method, params))
+        if method == "thread/resume":
+            return {
+                "thread": {
+                    "id": "thread-response-first",
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "turn/start":
+            # Production Task 300 published the submission lifecycle before
+            # the RPC response, then used a different native id for output.
+            server._handle_notification("turn/started", {
+                "threadId": "thread-response-first",
+                "turn": {"id": "turn-submission-first"},
+            })
+            return {"turn": {"id": "turn-submission-first"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="inspect the current state",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-response-first",
+        git_env=None,
+        task_id=300,
+    )
+    client_id = calls[-1][1]["clientUserMessageId"]
+
+    server._handle_notification("turn/started", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-native-adopted"},
+    })
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-wrong",
+        "item": {
+            "id": "wrong-input",
+            "type": "userMessage",
+            "clientId": "another-request",
+        },
+    })
+    assert "turn-wrong" not in server._contexts_by_turn
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-native-adopted",
+        "item": {
+            "id": "native-input",
+            "type": "userMessage",
+            "clientId": client_id,
+        },
+    })
+    context = server._contexts_by_thread[thread_id]
+    assert context.admitted_turn_id == "turn-submission-first"
+    assert context.observed_turn_id == "turn-native-adopted"
+    assert context.turn_id == "turn-native-adopted"
+    assert server._contexts_by_turn["turn-submission-first"] is context
+    assert server._contexts_by_turn["turn-native-adopted"] is context
+
+    server._handle_notification("item/agentMessage/delta", {
+        "threadId": thread_id,
+        "turnId": "turn-wrong-after-proof",
+        "itemId": "wrong-output",
+        "delta": "must not be routed",
+    })
+    server._handle_notification("item/agentMessage/delta", {
+        "threadId": thread_id,
+        "turnId": "turn-native-adopted",
+        "itemId": "native-output",
+        "delta": "native output",
+    })
+    server._handle_notification("item/agentMessage/delta", {
+        "threadId": thread_id,
+        "turnId": "turn-submission-first",
+        "itemId": "submission-output",
+        "delta": "submission alias output",
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-native-adopted",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    assert [row.get("delta") for row in rows if "delta" in row] == [
+        "native output",
+        "submission alias output",
+    ]
+    assert [row.get("type") for row in rows].count("turn.started") == 1
+    assert [row.get("type") for row in rows].count("turn.completed") == 1
+    assert await process.wait() == 0
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    runtime = server._thread_runtime[thread_id]
+    assert runtime.active_turn_ids == set()
+    assert runtime.status_type == "idle"
+
+
+@pytest.mark.asyncio
+async def test_mapped_turn_rejects_contradictory_client_message_identity():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    turn_params = {}
+
+    async def request(method, params):
+        if method == "thread/resume":
+            return {
+                "thread": {
+                    "id": "thread-client-mismatch",
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "turn/start":
+            turn_params.update(params)
+            return {"turn": {"id": "turn-client-mismatch"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="keep exact request identity",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id="thread-client-mismatch",
+        git_env=None,
+        task_id=300,
+    )
+    context = server._contexts_by_thread[thread_id]
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-client-mismatch",
+        "item": {
+            "id": "wrong-input",
+            "type": "userMessage",
+            "clientId": "another-request",
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-client-mismatch",
+            "status": "completed",
+            "items": [{
+                "id": "wrong-input",
+                "type": "userMessage",
+                "clientId": "another-request",
+            }],
+        },
+    })
+
+    assert context.first_input_seen is False
+    assert context.observed_turn_id is None
+    assert process.returncode is None
+    assert server._contexts_by_thread[thread_id] is context
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-client-mismatch",
+        "item": {
+            "id": "matching-input",
+            "type": "userMessage",
+            "clientId": turn_params["clientUserMessageId"],
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-client-mismatch",
+            "status": "completed",
+        },
+    })
+
+    assert await process.wait() == 0
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
 async def test_terminal_first_notification_settles_provisional_context():
     """A hook can finish the adopted active turn before any user item event."""
 
@@ -2685,7 +3116,7 @@ async def test_terminal_first_notification_settles_provisional_context():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, params):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -2700,6 +3131,11 @@ async def test_terminal_first_notification_settles_provisional_context():
                     "id": "turn-active-hook",
                     "status": "completed",
                     "error": None,
+                    "items": [{
+                        "id": "hook-input",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
+                    }],
                 },
             })
             return {"turn": {"id": "turn-submission"}}
@@ -5983,6 +6419,45 @@ async def test_registry_rejects_concurrent_resume_of_same_thread(tmp_path):
 
     assert registry._thread_owners[thread_id] == home
     assert thread_id not in registry._starting_threads
+
+
+@pytest.mark.asyncio
+async def test_registry_terminal_resume_preserves_exact_home_owner(tmp_path):
+    class TerminalResumeServer(_RegistryFakeServer):
+        async def start_turn(self, **kwargs):
+            thread_id = kwargs["resume_session_id"]
+            raise CodexThreadTerminalStateError(
+                thread_id,
+                "systemError",
+                operation="thread/resume turn admission",
+                recovery_attempted=True,
+            )
+
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "terminal-owner")
+    other_home = normalize_codex_home(tmp_path / "other-owner")
+    thread_id = "thread-terminal-owner"
+    registry._servers[home] = TerminalResumeServer(
+        "codex",
+        codex_home=home,
+    )
+
+    with pytest.raises(CodexThreadTerminalStateError):
+        await registry.start_turn(
+            codex_home=home,
+            resume_session_id=thread_id,
+            task_id=300,
+        )
+
+    assert registry._thread_owners[thread_id] == home
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
+    with pytest.raises(CodexThreadHomeMismatchError):
+        await registry.start_turn(
+            codex_home=other_home,
+            resume_session_id=thread_id,
+            task_id=301,
+        )
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,8 @@
 # CCM PR Monitor：从 CI、AI Review 到自动修复与合并
 
 - 文档状态：闭环主体已编码，并通过本地假 GitHub 回归及个人私有 GitHub PR 的 CI失败反馈、原Agent自动修复、Reviewer反馈、再次自动修复和Thread清零联调；真实 Merge Queue 待组织仓库验证
-- 版本：v1.0
-- 更新日期：2026-08-04
+- 版本：v1.1
+- 更新日期：2026-08-05
 - 适用范围：已有 PR 从 CI/AI Review 到修复、重新验证和合并的完整 Monitor Loop
 - 文档定位：本文件是 PR Monitor 唯一权威设计与实现说明；状态机、Prompt、运维和验收均以此为准
 
@@ -93,6 +93,9 @@ Gate 事实。
 - exact-base Guide Pack、exact base/head changed-file 内容包、strict JSON、`PRReviewerRun` 和 `PRFinding`。
 - blocking Finding Gate、GitHub publication outbox、逐 Finding nonce inline comment（不能定位时降级为独立
   PR comment，blocker 不消失）和 Panel UI。
+- Finding 的幂等审计操作：忽略、人工建议，以及 tool-free AI 候选补丁；三类操作都不直接改变 Panel Gate。
+- AI 候选采用每 Finding 唯一 active slot、后端下载回执和显式确认；只有 exact-base/head 校验仍成立时才由
+  后端创建 commit 并以 captured head 为 expected-old 做 CAS push，未知远端结果走 durable outbox 对账。
 - Reviewer Task 可在本机或 `MonitoredRepo.worker_id` 指定的 Worker 执行。
 - `PRMonitorRun` 与原 Developer Task 显式绑定，本机 Task 可通过 durable Repair Wake 恢复原
   session/cwd，在同一个 PR 分支修复并等待新 push。
@@ -557,6 +560,85 @@ GitHub Review Thread 的回复和 resolve 是已实现的独立 durable 副作�
 - 只有新 subject 的 Reviewer 结论或有权限的人类操作可以 resolve。
 - Developer Agent 自报“resolved”不能直接关闭数据库 Finding。
 
+### 8.1 Finding Action 与 AI 候选补丁
+
+Panel Finding 上的 `ignore`、`human_advice` 和 `ai_fix` 是独立的审计链，不是 Gate verdict：
+
+- `ignore` 只记录某个用户选择忽略；Finding 仍保持 open/blocking。
+- `human_advice` 记录有身份的修复建议，后续 AI 候选可把最新建议作为不可信输入；它同样不能放行。
+- `ai_fix` 生成一个待人工核对的候选 diff。它不同于第 7 节恢复原 Developer Task 的自动 Repair Wake：
+  不恢复开发 session、不操作现有 checkout，也不让模型 commit/push。
+
+#### 8.1.1 Active slot 与 Task 隔离
+
+一个 Finding 同时最多有一个 `pending/running/awaiting_confirmation/cancelling` AI fix。`PRFindingAction` 在 active
+状态把 `active_fix_finding_id` 设置为 Finding ID，并用 nullable unique constraint 形成 SQLite、PostgreSQL
+和 MySQL 都可执行的跨进程硬栅栏；进入 `completed/failed/cancelled/stale` 才清空该列。应用锁和
+`SELECT FOR UPDATE` 只能降低冲突，不能替代这个唯一约束。每个请求另有 `idempotency_key`，相同键只能
+返回原 Action，不能换 Finding 或 action type。
+
+Finding Action 与 Rebuttal 也不能并发占用同一 Finding：存在 active adjudication 时拒绝 ignore/advice/fix，
+存在 active AI fix 时拒绝新 Rebuttal。API 进程内按 repo 串行，数据库侧统一使用 repo→review→finding
+锁序；对忽略 `FOR UPDATE` 的 SQLite 先执行同一 repo 行的 no-op UPDATE 获得 writer fence。`synchronize`
+与 Action 共享 repo 写边界并在提交前重验 current snapshot，不能在旧 head 检查与 Action commit 之间插入
+新 head。
+
+AI fix 创建独立 `pr-review-fix` Task，只注入后端冻结的 exact head、结构化 Finding、目标文件完整内容和
+可选人工建议。它使用 Reviewer 的 tool-free runtime v3：无 filesystem、shell、network、GitHub、MCP、
+skills 或项目文档，只能返回一个协议包裹的 canonical unified diff。后端随后在 exact-head 私有 checkout
+真实 apply/stage，并以 NUL-delimited changed paths、diff filter 和 summary 再证明变更集合严格等于
+allowlist，且没有新增、删除、重命名、类型或 mode 变化；仅靠解析 diff header 不足以放行。
+
+Manager 以不可由旧客户端删除的 `pr_finding_action_id` metadata 识别本地 Task；Worker payload 不复制该
+metadata，因此 Worker 还必须保留 `pr-review-fix` tag 并声明 runtime v3 capability。公共 edit、retry、
+chat、live inject、cancel、stop-session 和 delete 一律 409，防止用户在冻结输入后改变生成过程；只有
+PR workflow 的 exact-generation 收尾路径可推进。Worker 成功终态先 backfill 完整 exact-retry 日志，再
+由 Manager 提取候选；`failed/cancelled/conflict` 也必须回调 Manager 将 durable Action 收口，普通
+Reviewer 的既有失败恢复语义不受影响。
+
+#### 8.1.2 Candidate outbox 与下载回执
+
+模型完成后不会产生 GitHub 写入。后端只在候选通过协议和私有 checkout 验证后，把 Action 推进到
+`awaiting_confirmation`，持久保存以下候选 outbox 事实：
+
+```text
+action_id + finding_id + expected_head_sha
+head_repo_full_name + head_ref + allowed_files
+patch (server-only) + patch_sha256 + action_nonce
+confirmation_token + expiry
+```
+
+普通 Action API 必须删除 patch、nonce 和 push-owner token，只展示人工核对所需的 repo/PR/ref/head、
+文件列表和 SHA-256。diff 只能从有 ACL 的后端下载端点取得；成功下载时后端原子签发 opaque receipt，
+并只持久化 receipt hash、`downloaded_by_user_id` 与 UTC 审计时间。receipt 必须绑定 exact Action、patch hash
+和 authenticated user，候选变化、跨用户复制、伪造或仅靠浏览器内“已下载”状态都不能确认。确认请求
+必须同时提交 confirmation token、patch SHA-256 和该 receipt；成功确认再记录
+`confirmed_by_user_id/confirmed_at`。前端按钮只是交互提示，不是授权事实。
+
+#### 8.1.3 确认、exact-old CAS push 与崩溃恢复
+
+确认时后端重新锁定 repo/Action，复查当前 Review、PR base/head/source repo/ref 与候选完全一致，并用数据库
+时间的 `operation_token + operation_expires_at` CAS 独占一个 push generation。私有 checkout 只 fetch
+`expected_head_sha`，apply 已验证 patch，创建一个以该 SHA 为唯一 parent、commit message 含 Action nonce
+的候选 commit，然后仅执行带显式 expected-old 的 compare-and-swap：
+
+```text
+git push --force-with-lease=refs/heads/<captured-head-ref>:<expected-head-sha> \
+  <captured-head-repo> HEAD:refs/heads/<captured-head-ref>
+```
+
+只允许上述绑定完整 expected SHA 的 lease；禁止无条件 `--force`、省略 expected-old 的 lease 或 `+` refspec。
+远端分支被删除或漂移都会由 lease 原子拒绝，不能重建已删除分支或覆盖其他作者的新提交。push 后还要从 GitHub 证明 PR head 等于新 commit、唯一 parent 等于 captured
+head 且 commit 含 nonce，才能把 Action 置为 completed；Finding 只记录 pushed 事实，仍由新 head 的
+CI、完整 Panel 与 Thread Gate 决定是否解决。
+
+以下状态都是持久恢复边界：Task 创建前的 reservation、Finding active slot、已验证 candidate outbox、
+下载/确认审计和 push owner lease。Manager 在创建 Task 前或 Worker 回执前崩溃，可回收过期 reservation
+而不复活新 owner；Worker 重连按 exact generation 重放终态。若 push 已到 GitHub但响应丢失，Action 保留
+为 recoverable `running`，lease 过期后的 claimant 必须先读取当前 PR head，并以 nonce、单一 parent 和
+source repo 对账：证据匹配就完成原 Action，head 未变才允许首次 push，其他变化一律 stale/fail closed。
+进程内 lock 只用于减少同进程竞争，不能代替这些数据库事实。
+
 ## 9. Merge Queue
 
 ### 9.1 进入条件
@@ -673,6 +755,17 @@ UI detail 以 REST snapshot 为事实来源，WebSocket 只提示刷新。至少
 的 nonce/outbox inline comment、降级 comment、Rebut adjudication、GraphQL thread resolve 和
 zero-unresolved-thread Gate 均已编码并通过假 GitHub 回归测试。
 
+### Phase R3：Finding Action 与人工确认候选
+
+- 为 open Finding 增加不改变 Gate 的 ignore/human-advice 审计。
+- tool-free fix Task 只生成 allowlist 内的 canonical diff，后端以真实 staged tree 二次验证。
+- 每 Finding 唯一 active slot；Task 在 Manager/Worker 两端冻结公共修改，Worker exact generation 收口。
+- candidate outbox 经后端下载回执、用户确认和 push lease 后才允许 exact-old CAS push；未知结果按 nonce/parent
+  恢复对账。
+
+当前实现进度（2026-08-05）：上述 Action、候选、下载/确认审计、跨进程栅栏、Worker terminal relay 和
+崩溃恢复边界已编码；任何 Action 都不能直接放行 Panel，新 commit 仍须重新经过 CI/Panel/Thread Gate。
+
 ### Phase D1：绑定与 Shadow Repair
 
 - 新增 `PRMonitorRun` 和 Developer Task 绑定。
@@ -775,6 +868,19 @@ Adjudicator 正确 rejected，Finding 与 GitHub Thread 保持 open/unresolved�
 - SQLite/PostgreSQL/MySQL 的唯一键、CAS、lease 和恢复测试。
 - Manager/Worker 版本能力不匹配时拒绝自动 Repair，不静默回退。
 - Shared Task 只有 owner CCM 可以控制 Monitor；shadow 只读。
+
+### 14.5 Finding Action 候选补丁
+
+- 并发创建同一 Finding 的 AI fix 时，数据库 active slot 只能有一个 winner；不同 idempotency key 也不能双占。
+- tool-free Task 的模型输出、真实 staged tree、allowed files 和 patch SHA-256 必须一致；malformed hunk、路径
+  混淆、新增/删除/rename/mode change 全部失败。
+- 未经后端下载、跨用户 receipt、旧 candidate receipt 或仅修改前端状态都不能确认；下载与确认身份/时间可审计。
+- Manager 与 Worker 上的 fix Task 公共 mutation 全冻结；Worker completion 先 backfill，所有非成功 terminal
+  状态收口 Action，旧 generation 不得覆盖新 owner。
+- 在 Task creation、candidate commit、download、push claim 和 push response 任一边界模拟崩溃；恢复后不得
+  双 Task、双 active Action 或双 push。
+- 确认前外部推进 source ref 必须 stale/non-fast-forward；响应丢失只允许按 exact parent + nonce 对账，
+  测试守卫命令中不得出现任何 force 参数。
 
 ## 15. 可观测性与运维
 

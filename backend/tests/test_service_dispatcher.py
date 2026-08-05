@@ -676,6 +676,85 @@ async def test_lifecycle_failure_max_retries(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_pr_fix_nonzero_exit_exhaustion_runs_exact_failure_consumer(
+    db_factory,
+):
+    """A normal process failure bypasses the lifecycle exception branch."""
+
+    d = _make_dispatcher(db_factory)
+    d._handle_pr_review_failure = AsyncMock()
+
+    async with db_factory() as db:
+        inst = Instance(name="pr-fix-failure-worker")
+        task = Task(
+            title="PR fix exhausts retries",
+            description="generate bounded patch",
+            max_retries=0,
+            retry_count=0,
+            # Exercise the durable Manager marker after presentation-tag
+            # removal rather than relying on the Worker-only tag fallback.
+            tags=[],
+            metadata_={"pr_finding_action_id": 501},
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        task_obj = task
+
+    process = MagicMock(returncode=1, wait=AsyncMock(return_value=1))
+    d.instance_manager.processes = {inst.id: process}
+
+    await _run_claimed_lifecycle(d, db_factory, inst.id, task_obj)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_obj.id)
+        assert current.status == "failed"
+        assert current.retry_count == 0
+        assert current.error_message == "Exit code: 1"
+        expected_completed_at = current.completed_at
+
+    d._handle_pr_review_failure.assert_awaited_once()
+    failed_task, reason = d._handle_pr_review_failure.await_args.args
+    assert failed_task.id == task_obj.id
+    assert failed_task.status == "failed"
+    assert failed_task.retry_count == 0
+    assert failed_task.completed_at == expected_completed_at
+    assert reason == "Exit code: 1"
+
+
+@pytest.mark.asyncio
+async def test_pr_fix_retry_does_not_run_failure_consumer(db_factory):
+    d = _make_dispatcher(db_factory)
+    d._handle_pr_review_failure = AsyncMock()
+
+    async with db_factory() as db:
+        inst = Instance(name="pr-fix-retry-worker")
+        task = Task(
+            title="PR fix retry remains pending",
+            description="generate bounded patch",
+            max_retries=1,
+            retry_count=0,
+            tags=["pr-review-fix"],
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    process = MagicMock(returncode=1, wait=AsyncMock(return_value=1))
+    d.instance_manager.processes = {inst.id: process}
+
+    await _run_claimed_lifecycle(d, db_factory, inst.id, task)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.status == "pending"
+        assert current.retry_count == 1
+    d._handle_pr_review_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_exception(db_factory):
     """Unexpected exception marks task as failed."""
     d = _make_dispatcher(db_factory)
@@ -4219,6 +4298,87 @@ async def test_codex_fast_admission_failure_is_visible_and_not_requeued(
 
 
 @pytest.mark.asyncio
+async def test_codex_terminal_thread_failure_is_visible_and_not_requeued(
+    db_factory,
+):
+    """A persistent terminal thread state must not enter the five-second loop."""
+
+    from backend.services.codex_app_server import (
+        CodexThreadTerminalStateError,
+    )
+
+    d = _make_dispatcher(db_factory)
+    published = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        raise CodexThreadTerminalStateError(
+            "thread-system-error",
+            "systemError",
+            operation="thread/resume turn admission",
+            recovery_attempted=True,
+        )
+
+    async def publish(task_id, exc):
+        assert task_id == 1
+        assert isinstance(exc, CodexThreadTerminalStateError)
+        published.set()
+
+    d._process_queued_message = fake_process
+    d._publish_permanent_account_routing_failure = AsyncMock(
+        side_effect=publish,
+    )
+    await d.enqueue_message(1, "must stop retrying visibly")
+    await asyncio.wait_for(published.wait(), 1)
+    await asyncio.wait_for(d._get_task_queue(1).join(), 1)
+
+    assert len(seen) == 1
+    assert seen[0].prompt == "must stop retrying visibly"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
+async def test_codex_thread_identity_mismatch_is_visible_and_not_requeued(
+    db_factory,
+):
+    """A contradictory resume identity cannot improve through queue retries."""
+
+    from backend.services.codex_app_server import (
+        CodexThreadIdentityMismatchError,
+    )
+
+    d = _make_dispatcher(db_factory)
+    published = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        raise CodexThreadIdentityMismatchError(
+            "thread-requested",
+            "thread-returned",
+            operation="thread/resume",
+        )
+
+    async def publish(task_id, exc):
+        assert task_id == 1
+        assert isinstance(exc, CodexThreadIdentityMismatchError)
+        published.set()
+
+    d._process_queued_message = fake_process
+    d._publish_permanent_account_routing_failure = AsyncMock(
+        side_effect=publish,
+    )
+    await d.enqueue_message(1, "must not cross native threads")
+    await asyncio.wait_for(published.wait(), 1)
+    await asyncio.wait_for(d._get_task_queue(1).join(), 1)
+
+    assert len(seen) == 1
+    assert seen[0].prompt == "must not cross native threads"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
 async def test_claude_routing_failure_requeues_exact_message(
     db_factory,
     monkeypatch,
@@ -5128,6 +5288,63 @@ async def test_owned_mode_publication_cannot_cross_new_generation(
         assert current.retry_count == expected_retry_count
         assert current.instance_id == instance_id
     d.broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pr_fix_failure_consumer_cannot_borrow_retried_generation(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    d._handle_pr_review_failure = AsyncMock()
+    async with db_factory() as db:
+        instance = Instance(name="pr-fix-terminal-race")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="old PR fix generation",
+            status="executing",
+            instance_id=instance.id,
+            retry_count=0,
+            max_retries=0,
+            metadata_={"pr_finding_action_id": 502},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        lifecycle_generation = d._task_lifecycle_generation(task)
+
+    real_publish = d._broadcast_task_status_generation
+
+    async def retry_before_publication(generation, **kwargs):
+        async with db_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status="in_progress",
+                    retry_count=Task.retry_count + 1,
+                    completed_at=None,
+                    error_message=None,
+                )
+            )
+            await db.commit()
+        return await real_publish(generation, **kwargs)
+
+    d._broadcast_task_status_generation = AsyncMock(
+        side_effect=retry_before_publication
+    )
+
+    assert await d._retry_or_fail_mode_task(
+        lifecycle_generation,
+        "old failure",
+    ) == "failed"
+
+    d._handle_pr_review_failure.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "in_progress"
+        assert current.retry_count == 1
+        assert current.error_message is None
 
 
 @pytest.mark.asyncio
@@ -8226,7 +8443,7 @@ def test_loop_prompt_repeats_artifact_policy_each_iteration(
         ("codex", "关键内容必须保持同步"),
     ],
 )
-async def test_pr_review_prompt_omits_host_agent_doc_preamble_by_tag_only(
+async def test_pr_sandbox_prompt_omits_host_agent_doc_preamble_by_marker(
     db_factory,
     provider,
     ordinary_preamble,
@@ -8242,20 +8459,51 @@ async def test_pr_review_prompt_omits_host_agent_doc_preamble_by_tag_only(
         metadata_={"pr_review_id": 17},
     )
     metadata_only = Task(
-        title="ordinary",
-        description="do X",
+        title="review with removed tag",
+        description="READ_METADATA_MARKED_SNAPSHOT",
         provider=provider,
         metadata_={"pr_review_id": 18},
     )
+    fix_tag_only = Task(
+        title="Worker fix mirror",
+        description="GENERATE_WORKER_PATCH",
+        provider=provider,
+        tags=["pr-review-fix"],
+    )
+    fix_metadata_only = Task(
+        title="fix with removed tag",
+        description="GENERATE_MANAGER_PATCH",
+        provider=provider,
+        metadata_={"pr_finding_action_id": 19},
+    )
+    ordinary = Task(
+        title="ordinary",
+        description="do X",
+        provider=provider,
+    )
 
     review_prompt = await dispatcher._build_task_prompt(tagged)
-    ordinary_prompt = await dispatcher._build_task_prompt(metadata_only)
+    metadata_prompt = await dispatcher._build_task_prompt(metadata_only)
+    fix_tag_prompt = await dispatcher._build_task_prompt(fix_tag_only)
+    fix_metadata_prompt = await dispatcher._build_task_prompt(
+        fix_metadata_only
+    )
+    ordinary_prompt = await dispatcher._build_task_prompt(ordinary)
 
     assert review_prompt == "任务:\nREAD_REMOTE_BASE_SNAPSHOT"
-    assert "请阅读项目根目录的 CLAUDE.md" not in review_prompt
-    assert "关键内容必须保持同步" not in review_prompt
-    # The runtime exception is intentionally keyed only by the tag that survives
-    # Manager -> Worker forwarding, never by Manager-only metadata.
+    assert metadata_prompt == "任务:\nREAD_METADATA_MARKED_SNAPSHOT"
+    assert fix_tag_prompt == "任务:\nGENERATE_WORKER_PATCH"
+    assert fix_metadata_prompt == "任务:\nGENERATE_MANAGER_PATCH"
+    # Tags preserve fail-closed isolation on Worker mirrors; durable Manager
+    # metadata prevents an old client from escaping isolation by removing one.
+    for sandbox_prompt in (
+        review_prompt,
+        metadata_prompt,
+        fix_tag_prompt,
+        fix_metadata_prompt,
+    ):
+        assert "请阅读项目根目录的 CLAUDE.md" not in sandbox_prompt
+        assert "关键内容必须保持同步" not in sandbox_prompt
     assert ordinary_preamble in ordinary_prompt
 
 

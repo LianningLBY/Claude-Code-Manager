@@ -3803,6 +3803,60 @@ async def test_stop_session_clears_pending_queue(client):
 
 
 @pytest.mark.asyncio
+async def test_stop_session_closes_auxiliary_producers_before_final_queue_drain(
+    client,
+    session_factory,
+):
+    """A monitor cannot refill the queue after Interrupt drains it."""
+
+    import backend.main
+    from backend.models.monitor_session import MonitorSession
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Stop monitor producer",
+        "description": "d",
+        "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        monitor = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="keeps reporting",
+            status="running",
+        )
+        db.add(monitor)
+        await db.commit()
+        monitor_id = monitor.id
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            side_effect=[46, 1],
+        ) as abort_queue,
+        patch.object(
+            backend.main.dispatcher,
+            "stop_monitor_session_process",
+            new_callable=AsyncMock,
+        ) as stop_monitor,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/stop-session")
+
+    assert response.status_code == 200
+    assert response.json()["cleared_messages"] == 47
+    assert abort_queue.await_count == 2
+    stop_monitor.assert_awaited_once_with(monitor_id, terminal=True)
+    async with session_factory() as db:
+        monitor = await db.get(MonitorSession, monitor_id)
+        assert monitor.status == "cancelled"
+        assert monitor.next_check_at is None
+        assert monitor.active_turn_generation is None
+
+
+@pytest.mark.asyncio
 async def test_stop_session_no_process_reports_not_stopped(client, session_factory):
     """When no process is found but task is executing, response says stopped=False."""
     from backend.models.task import Task

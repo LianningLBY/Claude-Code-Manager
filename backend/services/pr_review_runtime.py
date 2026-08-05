@@ -14,7 +14,11 @@ from pathlib import Path
 
 
 PR_REVIEW_TAG = "pr-review"
-PR_REVIEW_SNAPSHOT_CONTEXT_VERSION = 2
+PR_REVIEW_FIX_TAG = "pr-review-fix"
+# v3 extends the tool-free sandbox contract to ``pr-review-fix`` tasks.  A
+# v2 Worker only understands the original ``pr-review`` tag and must therefore
+# fail closed instead of accepting a fix task with inherited tools.
+PR_REVIEW_SNAPSHOT_CONTEXT_VERSION = 3
 PR_REVIEW_TERMINAL_CHAT_VERSION = 1
 PR_REVIEW_RUNTIME_DIR_ENV = "CCM_PR_REVIEW_RUNTIME_DIR"
 PR_REVIEW_TERMINAL_CHAT_HEADER = "X-CCM-PR-Review-Terminal-Chat"
@@ -24,15 +28,44 @@ _REVIEW_CONTEXT_DOC_NAMES = ("CLAUDE.md", "AGENTS.md", "PROGRESS.md")
 _CREATE_ATTEMPTS = 32
 
 
-def is_pr_review_task(task: object) -> bool:
-    """Return whether the Task is explicitly tagged as a PR review.
+def _has_tag(task: object, tag: str) -> bool:
+    tags = getattr(task, "tags", None)
+    return isinstance(tags, (list, tuple, set, dict)) and tag in tags
 
-    The tag is the only marker used here because Manager metadata is not copied
-    into the Worker-side TaskCreate payload, while tags are preserved.
+
+def _has_int_metadata_marker(task: object, key: str) -> bool:
+    metadata = getattr(task, "metadata_", None)
+    return isinstance(metadata, dict) and type(metadata.get(key)) is int
+
+
+def is_pr_review_task(task: object) -> bool:
+    """Return whether a Task belongs to the automated review workflow.
+
+    Manager Tasks retain the durable ``pr_review_id`` marker even if their
+    presentation tags are edited through an older client.  Worker mirrors do
+    not receive Manager metadata, so the preserved tag remains a deliberate
+    fail-closed compatibility marker there.
     """
 
-    tags = getattr(task, "tags", None)
-    return isinstance(tags, list) and PR_REVIEW_TAG in tags
+    return _has_tag(task, PR_REVIEW_TAG) or _has_int_metadata_marker(
+        task,
+        "pr_review_id",
+    )
+
+
+def is_pr_review_fix_task(task: object) -> bool:
+    """Return whether a Task is an automated finding-repair generation."""
+
+    return _has_tag(task, PR_REVIEW_FIX_TAG) or _has_int_metadata_marker(
+        task,
+        "pr_finding_action_id",
+    )
+
+
+def is_pr_sandbox_task(task: object) -> bool:
+    """Return whether a review or fix Task needs tool-free isolation."""
+
+    return is_pr_review_task(task) or is_pr_review_fix_task(task)
 
 
 def _trusted_runtime_anchor() -> Path:

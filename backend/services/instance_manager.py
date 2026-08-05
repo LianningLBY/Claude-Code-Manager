@@ -343,10 +343,11 @@ class InstanceManager:
         self._codex_home_maintenance: set[str] = set()
         self._codex_home_locks: dict[str, asyncio.Lock] = {}
         self._codex_exec_homes: dict[int, str] = {}
-        # Non-task Codex subprocesses (currently task distillation) share the
-        # same credential-home and app-server admission barrier as normal exec
-        # turns. Count by canonical home because they do not own a reusable
-        # Instance slot and cannot safely be represented in _codex_exec_homes.
+        # Non-task Codex subprocesses (goal evaluation and task distillation)
+        # share the same credential-home and app-server admission barrier as
+        # normal exec turns. Count by canonical home because they do not own a
+        # reusable Instance slot and cannot safely be represented in
+        # _codex_exec_homes.
         self._codex_ephemeral_home_users: dict[str, int] = {}
         # Direct CLI subprocesses start in their own POSIX session.  Remember
         # the exact process generation so stop can signal the whole process
@@ -916,10 +917,10 @@ class InstanceManager:
                         f"Task {task_id} disappeared before launch"
                     )
                 from backend.services.pr_review_runtime import (
-                    is_pr_review_task,
+                    is_pr_sandbox_task,
                 )
 
-                pr_review_task = is_pr_review_task(task)
+                pr_review_task = is_pr_sandbox_task(task)
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -977,6 +978,7 @@ class InstanceManager:
                 CodexRequiredMcpPreTurnError,
                 CodexServiceTierUnavailableError,
                 CodexThreadHomeMismatchError,
+                CodexThreadTerminalStateError,
                 normalize_codex_service_tier,
                 normalize_codex_home,
             )
@@ -1220,6 +1222,7 @@ class InstanceManager:
                     CodexRequiredMcpError,
                     CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
+                    CodexThreadTerminalStateError,
                     CodexLaunchCommitError,
                     InstanceNotFoundError,
                     LaunchSupersededError,
@@ -1489,10 +1492,14 @@ class InstanceManager:
                 # the home first; it can never edit auth.json in the gap.
                 home_lock = self._codex_home_lock(config_dir)
                 async with home_lock:
-                    if config_dir in self._codex_home_maintenance:
-                        raise CodexAppServerBusyError(
-                            f"Codex account is under maintenance: {config_dir}"
-                        )
+                    # The dispatcher snapshot is only a routing hint.  This
+                    # lock-local predicate is the authoritative barrier for
+                    # two fresh tasks that selected the same home, or for an
+                    # ephemeral exec that won admission after selection.
+                    self._assert_codex_app_server_home_available(
+                        config_dir,
+                        replacing_exec_instance_id=instance_id,
+                    )
                     # app-server keeps threads and MCP clients resident in
                     # memory.  Before an exec generation enters the same home,
                     # stop an idle transport or reject an active one.  Holding
@@ -1519,8 +1526,8 @@ class InstanceManager:
                         task_id,
                         cmd,
                         spawn_kwargs,
+                        codex_home=config_dir,
                     )
-                    self._codex_exec_homes[instance_id] = config_dir
             else:
                 spawn_kwargs = {
                     "stdout": asyncio.subprocess.PIPE,
@@ -1798,11 +1805,17 @@ class InstanceManager:
             self._assert_codex_app_server_home_available(home)
             yield home
 
-    def _assert_codex_app_server_home_available(self, codex_home: str) -> None:
-        """Reject app-server admission while another transport owns a home.
+    def _assert_codex_app_server_home_available(
+        self,
+        codex_home: str,
+        *,
+        replacing_exec_instance_id: int | None = None,
+    ) -> None:
+        """Reject exclusive transport admission while a runtime owns a home.
 
         The caller must hold the canonical home's admission lock so the check
-        and the subsequent app-server operation form one atomic admission.
+        and the subsequent app-server/direct-exec operation form one atomic
+        admission.
         """
 
         from backend.services.codex_app_server import CodexAppServerBusyError
@@ -1813,6 +1826,16 @@ class InstanceManager:
             )
         for exec_instance_id, exec_home in self._codex_exec_homes.items():
             if exec_home == codex_home:
+                previous = self.processes.get(exec_instance_id)
+                if (
+                    exec_instance_id == replacing_exec_instance_id
+                    and previous is not None
+                    and self._generation_reap_confirmed(
+                        exec_instance_id,
+                        previous,
+                    )
+                ):
+                    continue
                 raise CodexAppServerBusyError(
                     "Codex account still has an exec generation "
                     f"owned by instance {exec_instance_id}: {codex_home}"
@@ -1821,6 +1844,52 @@ class InstanceManager:
             raise CodexAppServerBusyError(
                 f"Codex account has an active ephemeral exec: {codex_home}"
             )
+        if codex_home in self._codex_retained_ephemeral_homes():
+            raise CodexAppServerBusyError(
+                f"Codex account has a retained ephemeral exec: {codex_home}"
+            )
+
+    @staticmethod
+    def _codex_retained_ephemeral_homes() -> set[str]:
+        """Snapshot exact external runtimes that outlived their guard.
+
+        GoalEvaluator and TaskDistill retain structured process/home evidence
+        until terminal cleanup is proven.  Read those registries directly;
+        their human-facing account-retirement blocker strings are not an
+        admission protocol.
+        """
+
+        from backend.services.goal_evaluator import (
+            codex_goal_evaluator_runtime_homes,
+        )
+        from backend.services.skill_distill import (
+            codex_task_distill_runtime_homes,
+        )
+
+        return (
+            codex_goal_evaluator_runtime_homes()
+            | codex_task_distill_runtime_homes()
+        )
+
+    def busy_codex_homes(self) -> set[str]:
+        """Snapshot homes held by maintenance or non-app-server execs.
+
+        App-server turns are intentionally not included: one account transport
+        can serve independent threads concurrently. This is only a scheduling
+        hint; the per-home launch guard closes the select-to-launch race.
+        """
+
+        from backend.services.codex_app_server import normalize_codex_home
+
+        homes = set(self._codex_home_maintenance)
+        homes.update(self._codex_exec_homes.values())
+        homes.update(
+            home
+            for home, users in self._codex_ephemeral_home_users.items()
+            if users
+        )
+        homes.update(self._codex_retained_ephemeral_homes())
+        return {normalize_codex_home(home) for home in homes}
 
     async def read_codex_thread(
         self, codex_home: str, thread_id: str,
@@ -1940,10 +2009,7 @@ class InstanceManager:
         home = normalize_codex_home(codex_home)
         home_lock = self._codex_home_lock(home)
         async with home_lock:
-            if home in self._codex_home_maintenance:
-                raise CodexAppServerBusyError(
-                    f"Codex account is under maintenance: {home}"
-                )
+            self._assert_codex_app_server_home_available(home)
             registry = self._codex_app_server
             if registry is not None:
                 await registry.shutdown_home(home, require_idle=True)
@@ -2644,6 +2710,10 @@ class InstanceManager:
             if self._codex_ephemeral_home_users.get(home, 0):
                 raise CodexAppServerBusyError(
                     f"Codex account still has an active ephemeral exec: {home}"
+                )
+            if home in self._codex_retained_ephemeral_homes():
+                raise CodexAppServerBusyError(
+                    f"Codex account still has a retained ephemeral exec: {home}"
                 )
             if require_idle:
                 for instance_id, exec_home in self._codex_exec_homes.items():
@@ -8856,6 +8926,8 @@ class InstanceManager:
         task_id: int | None,
         cmd: list[str],
         spawn_kwargs: dict,
+        *,
+        codex_home: str | None = None,
     ) -> asyncio.subprocess.Process:
         """Spawn and register a direct process without a cancellation gap.
 
@@ -8883,6 +8955,12 @@ class InstanceManager:
         self.processes[instance_id] = process
         if os.name == "posix":
             self._process_groups[instance_id] = process
+        if codex_home is not None:
+            # The Codex caller holds this canonical home's admission lock.
+            # Publish the exact process/home pair before delivering a delayed
+            # spawn cancellation so failed cleanup cannot release the home
+            # while the child generation may still be alive.
+            self._codex_exec_homes[instance_id] = codex_home
 
         if cancellation is None:
             return process
@@ -8903,6 +8981,11 @@ class InstanceManager:
                 )
             if self.processes.get(instance_id) is process:
                 self.processes.pop(instance_id, None)
+                if (
+                    codex_home is not None
+                    and self._codex_exec_homes.get(instance_id) == codex_home
+                ):
+                    self._codex_exec_homes.pop(instance_id, None)
             if self._process_groups.get(instance_id) is process:
                 self._process_groups.pop(instance_id, None)
 

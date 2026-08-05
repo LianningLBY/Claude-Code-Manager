@@ -48,6 +48,7 @@ from backend.services.instance_manager import (
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.pr_review_runtime import (
     is_pr_review_task,
+    is_pr_sandbox_task,
     isolated_pr_review_cwd,
 )
 from backend.services.deployment_start_guard import (
@@ -148,7 +149,7 @@ _DOC_SYNC_NOTE = (
 def _task_artifact_policy(task: Task) -> str:
     """Build the provider-neutral, project-scoped artifact contract."""
 
-    if is_pr_review_task(task):
+    if is_pr_sandbox_task(task):
         return ""
 
     task_id = task.id
@@ -3608,6 +3609,25 @@ class GlobalDispatcher:
             return None
         await self._require_task_lifecycle_active(expected_generation)
 
+        # ``select`` only knows account health and quota. Exclude homes held by
+        # maintenance or a non-app-server exec before selecting a fresh route.
+        # App-server turns can share a transport; the per-home launch guard is
+        # authoritative if this scheduling snapshot races a new owner.
+        busy_homes = {
+            pool.canonical_home(home)
+            for home in self.instance_manager.busy_codex_homes()
+        }
+        busy_compatible_homes = {
+            home
+            for home in busy_homes
+            if pool.is_home_available(home)
+            and pool.supports_model_for_home(
+                home,
+                model,
+                service_tier=codex_service_tier,
+            )
+        }
+
         bound_id = await self._codex_task_binding(task_id)
         bound_home = pool.home_for_account(bound_id) if bound_id else None
         matches: list[str] = []
@@ -3624,6 +3644,7 @@ class GlobalDispatcher:
             if (
                 preferred_owner_home
                 and pool.is_home_available(preferred_owner_home)
+                and preferred_owner_home not in busy_homes
                 and pool.supports_model_for_home(
                     preferred_owner_home,
                     model,
@@ -3686,6 +3707,7 @@ class GlobalDispatcher:
         resident_available = bool(
             resident
             and pool.is_home_available(resident)
+            and resident not in busy_homes
             and pool.supports_model_for_home(
                 resident,
                 model,
@@ -3705,6 +3727,10 @@ class GlobalDispatcher:
             return resident
 
         excluded: set[str] = set()
+        for home in busy_homes:
+            busy_account_id = pool.account_id_for_home(home)
+            if busy_account_id:
+                excluded.add(busy_account_id)
         resident_id = pool.account_id_for_home(resident) if resident else None
         if resident_id:
             excluded.add(resident_id)
@@ -3734,6 +3760,12 @@ class GlobalDispatcher:
                     f"service tier {codex_service_tier!r} require quota or "
                     "credential intervention before retrying",
                     permanent=True,
+                )
+            if busy_compatible_homes:
+                raise CodexAccountRoutingError(
+                    "Codex pool has no idle compatible account; one or more "
+                    "otherwise available accounts are temporarily busy",
+                    retry_after=CODEX_ROUTING_RETRY_DELAY,
                 )
             if resident and pool.is_known_account(resident) and pool.is_home_enabled(resident):
                 retry_after = self._codex_pool_retry_after()
@@ -3779,7 +3811,7 @@ class GlobalDispatcher:
                     "because its rollout could not be migrated safely",
                     task_id, session_id, resident, target,
                 )
-                if pool.is_home_available(resident):
+                if resident_available:
                     await self._persist_codex_binding_for_route(
                         task_id=task_id,
                         account_id=pool.account_id_for_home(resident),
@@ -3788,7 +3820,12 @@ class GlobalDispatcher:
                     return resident
                 raise CodexAccountRoutingError(
                     f"Codex session {session_id} could not be migrated from "
-                    f"unavailable account home {resident}"
+                    f"unavailable account home {resident}",
+                    retry_after=(
+                        CODEX_ROUTING_RETRY_DELAY
+                        if resident in busy_homes
+                        else self._codex_pool_retry_after()
+                    ),
                 )
 
         if not binding_persisted:
@@ -4181,7 +4218,7 @@ class GlobalDispatcher:
         # tasks a neutral task-private directory.
         parts = (
             []
-            if is_pr_review_task(task)
+            if is_pr_sandbox_task(task)
             else [_agent_doc_preamble(task)]
         )
         if secrets_block:
@@ -4226,7 +4263,7 @@ class GlobalDispatcher:
         # must therefore resend the complete immutable snapshot contract;
         # sending only "continue" would create an empty-context review turn.
         fresh_codex_pr_review = (
-            task.provider == "codex" and is_pr_review_task(task)
+            task.provider == "codex" and is_pr_sandbox_task(task)
         )
         if session_id and not fresh_codex_pr_review:
             await self.instance_manager.launch(
@@ -4739,6 +4776,7 @@ class GlobalDispatcher:
         generation: _TaskLifecycleGeneration,
         reason: str,
     ) -> str | None:
+        failed_pr_task: Task | None = None
         async with self.db_factory() as db:
             task = await self._read_owned_lifecycle_task(
                 db,
@@ -4799,12 +4837,32 @@ class GlobalDispatcher:
             if resulting_generation is None:
                 await db.rollback()
                 return None
+            if status == "failed" and is_pr_sandbox_task(task):
+                refreshed = await db.get(
+                    Task,
+                    generation.task_id,
+                    populate_existing=True,
+                )
+                if (
+                    refreshed is not None
+                    and self._task_status_generation(refreshed)
+                    == resulting_generation
+                ):
+                    db.expunge(refreshed)
+                    failed_pr_task = refreshed
             await db.commit()
 
-        await self._broadcast_task_status_generation(
+        published = await self._broadcast_task_status_generation(
             resulting_generation,
             instance_id=generation.instance_id,
         )
+        if published and failed_pr_task is not None:
+            # Normal non-zero exits do not enter the lifecycle exception
+            # handler. Consume their exact exhausted generation here so PR
+            # fix actions cannot remain durably ``running`` forever. The
+            # completion/failure handler performs its own DB CAS as a final
+            # fence against a retry that wins after publication.
+            await self._handle_pr_review_failure(failed_pr_task, reason)
         return status
 
     async def _complete_owned_task_result(
@@ -5148,7 +5206,7 @@ class GlobalDispatcher:
 
             # === Step 2: Determine cwd and update task ===
             # 必须是绝对路径：PTY 模式按 cwd 推导 JSONL 轮询路径，"." 会落空
-            review_task = is_pr_review_task(task)
+            review_task = is_pr_sandbox_task(task)
             cwd = (
                 isolated_pr_review_cwd(task)
                 if review_task
@@ -5771,6 +5829,25 @@ class GlobalDispatcher:
 
     async def _handle_pr_review_completion(self, task: Task):
         meta = task.metadata_ or {}
+        fix_action_id = meta.get("pr_finding_action_id")
+        if type(fix_action_id) is int:
+            try:
+                from backend.services.pr_review_fix import handle_fix_task_completion
+                from backend.services.worker_proxy import get_task_operation_lock
+
+                async with get_task_operation_lock(task.id):
+                    async with self.db_factory() as db:
+                        await handle_fix_task_completion(
+                            db,
+                            action_id=fix_action_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                        )
+            except Exception:
+                logger.exception(
+                    "PR fix completion handler error for Task %s", task.id
+                )
+            return
         pr_review_id = meta.get("pr_review_id")
         reviewer_run_id = meta.get("pr_reviewer_run_id")
         adjudication_id = meta.get("pr_adjudication_id")
@@ -5865,6 +5942,26 @@ class GlobalDispatcher:
 
     async def _handle_pr_review_failure(self, task: Task, error: str):
         meta = task.metadata_ or {}
+        fix_action_id = meta.get("pr_finding_action_id")
+        if type(fix_action_id) is int:
+            try:
+                from backend.services.pr_review_fix import handle_fix_task_failure
+                from backend.services.worker_proxy import get_task_operation_lock
+
+                async with get_task_operation_lock(task.id):
+                    async with self.db_factory() as db:
+                        await handle_fix_task_failure(
+                            db,
+                            action_id=fix_action_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                            error=error,
+                        )
+            except Exception:
+                logger.exception(
+                    "PR fix failure handler error for Task %s", task.id
+                )
+            return
         pr_review_id = meta.get("pr_review_id")
         reviewer_run_id = meta.get("pr_reviewer_run_id")
         adjudication_id = meta.get("pr_adjudication_id")
@@ -10550,6 +10647,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         from backend.services.codex_app_server import (
             CodexServiceTierUnavailableError,
+            CodexThreadIdentityMismatchError,
+            CodexThreadTerminalStateError,
         )
 
         provider = (
@@ -10567,6 +10666,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 "Codex Fast 未被当前模型或账号确认，本条消息未执行。"
                 "请切换到支持 Fast 的模型/账号，或将速度改为 Standard 后"
                 f"重新发送。详情：{exc}"
+            )
+        elif isinstance(exc, CodexThreadTerminalStateError):
+            notice = (
+                "Codex 会话进入无法安全恢复的终态，本条消息未执行。"
+                "系统未能取得原线程的 idle 证明；为避免重复执行已停止"
+                f"自动重试。详情：{exc}"
+            )
+        elif isinstance(exc, CodexThreadIdentityMismatchError):
+            notice = (
+                "Codex 返回的会话身份与请求不一致，本条消息未执行。"
+                "为避免串到其他会话或重复执行，系统已停止自动重试。"
+                f"详情：{exc}"
             )
         else:
             notice = (
@@ -10644,6 +10755,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         CodexAppServerBusyError,
                         CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
+                        CodexThreadIdentityMismatchError,
+                        CodexThreadTerminalStateError,
                     )
                     from backend.services.instance_manager import (
                         InstanceAlreadyRunningError,
@@ -10658,6 +10771,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             CodexAppServerBusyError,
                             CodexServiceTierUnavailableError,
                             CodexThreadHomeMismatchError,
+                            CodexThreadTerminalStateError,
                             InstanceAlreadyRunningError,
                         ),
                     ):
@@ -10666,6 +10780,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 exc,
                                 (
                                     CodexServiceTierUnavailableError,
+                                    CodexThreadIdentityMismatchError,
+                                    CodexThreadTerminalStateError,
                                     QueuedMessageRoutingMismatchError,
                                 ),
                             )
@@ -10999,7 +11115,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 ):
                     logger.info("Discarding stale or duplicate Repair Wake for task %s", task_id)
                     return
-            if is_pr_review_task(task):
+            if is_pr_sandbox_task(task):
                 from backend.models.pr_monitor import PRReview, PRReviewerRun
 
                 publishing = await db.execute(
@@ -11725,6 +11841,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     CodexAppServerBusyError,
                     CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
+                    CodexThreadTerminalStateError,
                 )
                 from backend.services.cloudrouter_accounts import (
                     CloudRouterAccountError,
@@ -11743,6 +11860,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         CodexAppServerBusyError,
                         CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
+                        CodexThreadTerminalStateError,
                         InstanceAlreadyRunningError,
                     ),
                 )

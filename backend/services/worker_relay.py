@@ -31,6 +31,10 @@ from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.pr_review_runtime import (
+    is_pr_review_fix_task,
+    is_pr_review_task,
+)
 from backend.services.task_queue import PR_REVIEW_SUPERSEDED_METADATA_KEY
 
 _TASK_STATUSES = frozenset(
@@ -592,17 +596,18 @@ class WorkerRelay:
         self,
         generation: WorkerTaskGeneration,
     ) -> None:
-        """Finalize a Manager-owned PRReview after its Worker generation.
+        """Consume a Manager-owned PR workflow's exact Worker terminal state.
 
         Worker TaskCreate intentionally does not receive Manager metadata such
-        as ``pr_review_id``, so the Worker-side Dispatcher cannot finalize the
-        PRReview. The Manager must do it after the authoritative status/log
-        relay has committed and only when no remote PTY background epoch
-        remains.
+        as ``pr_review_id`` or ``pr_finding_action_id``, so the Worker-side
+        Dispatcher cannot finalize the PRReview/fix action. The Manager must
+        do it after the authoritative status relay has committed and only when
+        no remote PTY background epoch remains. Successful generations also
+        require a complete history backfill before patch parsing.
         """
 
         if (
-            generation.status != "completed"
+            generation.status not in _TERMINAL_TASK_STATUSES
             or generation.pty_background_generation is not None
         ):
             return
@@ -616,11 +621,41 @@ class WorkerRelay:
                     )
                 ).scalar_one_or_none()
                 worker = await db.get(Worker, generation.worker_id)
-            if (
-                task is None
-                or worker is None
-                or "pr-review" not in (task.tags or [])
-            ):
+                if task is not None:
+                    db.expunge(task)
+            if task is None or worker is None:
+                return
+            fix_task = is_pr_review_fix_task(task)
+            review_task = is_pr_review_task(task)
+            if not fix_task and not review_task:
+                return
+
+            if generation.status != "completed":
+                # Ordinary PR-review failure semantics remain owned by the
+                # existing Manager/Worker recovery flow. A fix action has no
+                # such fallback: every unsuccessful terminal generation must
+                # settle its durable ``running`` action.
+                if not fix_task:
+                    return
+                confirmed = await self._observe_task_generation(
+                    generation.worker_id,
+                    generation.task_id,
+                )
+                if confirmed != generation:
+                    logger.info(
+                        "discarding Worker PR fix failure for stale "
+                        "generation of task %s",
+                        generation.task_id,
+                    )
+                    return
+                from backend.main import dispatcher
+
+                if dispatcher is not None:
+                    error = task.error_message or (
+                        "PR fix Task ended with terminal status "
+                        f"{generation.status}"
+                    )
+                    await dispatcher._handle_pr_review_failure(task, error)
                 return
 
             # A Worker status event may overtake a disconnected task-channel
@@ -663,7 +698,7 @@ class WorkerRelay:
                 )
         except Exception:
             logger.exception(
-                "failed to finalize Worker PR review for task %s",
+                "failed to finalize Worker PR workflow for task %s",
                 generation.task_id,
             )
 

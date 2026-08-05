@@ -27,6 +27,7 @@ from backend.services.pr_review_runtime import (
     PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
     PR_REVIEW_TERMINAL_CHAT_VERSION,
     is_pr_review_task,
+    is_pr_sandbox_task,
 )
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
 from backend.services.task_artifact_contract import (
@@ -214,7 +215,7 @@ class WorkerProxy:
             (task.provider or "claude").lower() == "codex"
             and (task.codex_service_tier or "default") == "priority"
         )
-        needs_pr_snapshot_context = is_pr_review_task(task)
+        needs_pr_snapshot_context = is_pr_sandbox_task(task)
         if not needs_fast and not needs_pr_snapshot_context:
             return
 
@@ -338,7 +339,7 @@ class WorkerProxy:
         # docs.  Tags survive Manager→Worker forwarding, unlike metadata.
         worker_project_id = (
             None
-            if is_pr_review_task(task)
+            if is_pr_sandbox_task(task)
             else await self.ensure_worker_project(worker, task)
         )
 

@@ -34,6 +34,8 @@ from backend.services.codex_app_server import (
     CodexServiceTierUnavailableError,
     CodexSharedTransportBusyError,
     CodexThreadHomeMismatchError,
+    CodexThreadIdentityMismatchError,
+    CodexThreadTerminalStateError,
     CodexTurnProcess,
 )
 from backend.services.codex_tier_proxy import CodexTierProxyRoute
@@ -2440,6 +2442,184 @@ async def test_ephemeral_codex_exec_rejects_active_app_server(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ephemeral_codex_exec_rejects_direct_exec_owner(tmp_path):
+    codex_home = str((tmp_path / "codex-ephemeral-vs-direct").resolve())
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_exec_homes[7] = codex_home
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="still has an exec generation",
+    ):
+        async with im.codex_home_exec_guard(codex_home):
+            pytest.fail("direct exec owner must reject ephemeral admission")
+
+    assert im._codex_ephemeral_home_users == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["direct", "ephemeral"])
+async def test_codex_direct_exec_rejects_runtime_owned_home(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    blocker,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name=f"codex-direct-vs-{blocker}")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    codex_home = str((tmp_path / f"codex-direct-vs-{blocker}").resolve())
+    im = InstanceManager(db_factory, MagicMock())
+    if blocker == "direct":
+        im._codex_exec_homes[999] = codex_home
+        error = "still has an exec generation"
+    else:
+        im._codex_ephemeral_home_users[codex_home] = 1
+        error = "active ephemeral exec"
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(CodexAppServerBusyError, match=error):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must not overlap",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_direct_self_retry_replaces_reaped_home_owner(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-direct-self-retry")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    home = str((tmp_path / "codex-direct-self-retry-home").resolve())
+    previous = _make_mock_process(pid=54320, returncode=1)
+    replacement = _make_mock_process(pid=54321, returncode=None)
+    finish_replacement = asyncio.Event()
+
+    async def wait_for_replacement():
+        await finish_replacement.wait()
+        replacement.returncode = 0
+        return 0
+
+    replacement.wait = AsyncMock(side_effect=wait_for_replacement)
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.processes[inst.id] = previous
+    im._codex_exec_homes[inst.id] = home
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=replacement),
+    ) as exec_mock:
+        assert await im.launch(
+            instance_id=inst.id,
+            prompt="retry on the same account",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=home,
+        ) == replacement.pid
+
+    exec_mock.assert_awaited_once()
+    assert im.processes[inst.id] is replacement
+    assert im._codex_exec_homes[inst.id] == home
+
+    finish_replacement.set()
+    await im.wait_for_output_consumer(
+        inst.id,
+        provider="codex",
+        timeout=3,
+        expected_process=replacement,
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_codex_direct_launches_share_atomic_home_admission(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        first = Instance(name="codex-direct-race-first")
+        second = Instance(name="codex-direct-race-second")
+        db.add_all([first, second])
+        await db.commit()
+        await db.refresh(first)
+        await db.refresh(second)
+
+    spawn_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+    finish_process = asyncio.Event()
+    process = _make_mock_process(pid=54321, returncode=None)
+
+    async def spawn(*_args, **_kwargs):
+        spawn_entered.set()
+        await release_spawn.wait()
+        return process
+
+    async def wait_for_process():
+        await finish_process.wait()
+        process.returncode = 0
+        return 0
+
+    process.wait = AsyncMock(side_effect=wait_for_process)
+    home = str((tmp_path / "codex-direct-race-home").resolve())
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=spawn),
+    ) as exec_mock:
+        first_launch = asyncio.create_task(im.launch(
+            instance_id=first.id,
+            prompt="first",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=home,
+        ))
+        await spawn_entered.wait()
+        second_launch = asyncio.create_task(im.launch(
+            instance_id=second.id,
+            prompt="second",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=home,
+        ))
+        await asyncio.sleep(0)
+        assert second_launch.done() is False
+
+        release_spawn.set()
+        await first_launch
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="still has an exec generation",
+        ):
+            await second_launch
+
+    assert exec_mock.await_count == 1
+    finish_process.set()
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
 async def test_codex_exec_shuts_down_idle_app_server_before_spawn(
     db_factory, monkeypatch, tmp_path,
 ):
@@ -2839,9 +3019,28 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
         CodexAppServerBusyError("account busy"),
         CodexRequiredMcpError("required MCP failed"),
         CodexThreadHomeMismatchError("wrong owner"),
+        CodexThreadIdentityMismatchError(
+            "thread-requested",
+            "thread-returned",
+            operation="thread/resume",
+        ),
+        CodexThreadTerminalStateError(
+            "terminal-thread",
+            "systemError",
+            operation="thread/resume turn admission",
+            recovery_attempted=True,
+        ),
         CodexLaunchCommitError("turn already started"),
     ],
-    ids=["timeout", "busy", "required-mcp", "owner-mismatch", "commit-failed"],
+    ids=[
+        "timeout",
+        "busy",
+        "required-mcp",
+        "owner-mismatch",
+        "identity-mismatch",
+        "terminal-thread",
+        "commit-failed",
+    ],
 )
 async def test_launch_codex_does_not_fallback_when_replay_is_unsafe(
     db_factory, monkeypatch, tmp_path, launch_error,
@@ -6217,11 +6416,14 @@ async def test_stop_generation_fence_rejects_same_task_slot_aba(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
+async def test_cancelled_codex_spawn_collects_and_releases_home_admission(
     db_factory,
+    monkeypatch,
+    tmp_path,
 ):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     async with db_factory() as db:
-        instance = Instance(name="cancelled-spawn")
+        instance = Instance(name="cancelled-codex-spawn")
         db.add(instance)
         await db.commit()
         await db.refresh(instance)
@@ -6230,6 +6432,7 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
     process = _make_mock_process(pid=54_332, returncode=None)
     spawn_started = asyncio.Event()
     release_spawn = asyncio.Event()
+    codex_home = str((tmp_path / "cancelled-codex-home").resolve())
 
     async def delayed_spawn(*args, **kwargs):
         spawn_started.set()
@@ -6257,7 +6460,13 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
         ) as wait_tree,
     ):
         launch = asyncio.create_task(
-            im.launch(instance_id, "cancel during OS spawn", cwd="/tmp")
+            im.launch(
+                instance_id,
+                "cancel during OS spawn",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
         )
         await asyncio.wait_for(spawn_started.wait(), timeout=2.0)
         launch.cancel()
@@ -6271,6 +6480,8 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
     wait_tree.assert_awaited_once_with(instance_id, process, 5.0)
     assert instance_id not in im.processes
     assert instance_id not in im._process_groups
+    assert instance_id not in im._codex_exec_homes
+    assert codex_home not in im.busy_codex_homes()
     async with db_factory() as db:
         instance = await db.get(Instance, instance_id)
         assert instance.status == "idle"
@@ -6278,19 +6489,26 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
+async def test_cancelled_codex_spawn_failed_reap_retains_home_admission(
     db_factory,
+    monkeypatch,
+    tmp_path,
 ):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     async with db_factory() as db:
-        instance = Instance(name="cancelled-spawn-unreaped")
-        db.add(instance)
+        instance = Instance(name="cancelled-codex-spawn-unreaped")
+        contender = Instance(name="cancelled-codex-spawn-contender")
+        db.add_all([instance, contender])
         await db.commit()
         await db.refresh(instance)
+        await db.refresh(contender)
         instance_id = instance.id
+        contender_id = contender.id
 
     process = _make_mock_process(pid=54_333, returncode=None)
     spawn_started = asyncio.Event()
     release_spawn = asyncio.Event()
+    codex_home = str((tmp_path / "cancelled-codex-home").resolve())
 
     async def delayed_spawn(*args, **kwargs):
         spawn_started.set()
@@ -6302,7 +6520,7 @@ async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
         patch(
             "backend.services.instance_manager.asyncio.create_subprocess_exec",
             side_effect=delayed_spawn,
-        ),
+        ) as spawn,
         patch.object(im, "_process_group_alive", return_value=True),
         patch.object(im, "_signal_process_tree") as signal_group,
         patch.object(
@@ -6313,7 +6531,13 @@ async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
         ) as wait_tree,
     ):
         launch = asyncio.create_task(
-            im.launch(instance_id, "cancel and fail reaping", cwd="/tmp")
+            im.launch(
+                instance_id,
+                "cancel and fail reaping",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
         )
         await asyncio.wait_for(spawn_started.wait(), timeout=2.0)
         launch.cancel()
@@ -6321,12 +6545,27 @@ async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
         with pytest.raises(asyncio.CancelledError):
             await launch
 
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="still has an exec generation",
+        ):
+            await im.launch(
+                contender_id,
+                "must not overlap retained generation",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
+
+    assert spawn.call_count == 1
     signal_group.assert_called_once_with(
         instance_id, process, signal.SIGKILL
     )
     wait_tree.assert_awaited_once_with(instance_id, process, 5.0)
     assert im.processes[instance_id] is process
     assert im._process_groups[instance_id] is process
+    assert im._codex_exec_homes[instance_id] == codex_home
+    assert codex_home in im.busy_codex_homes()
     async with db_factory() as db:
         instance = await db.get(Instance, instance_id)
         assert instance.status == "error"

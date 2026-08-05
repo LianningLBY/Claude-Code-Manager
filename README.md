@@ -55,7 +55,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 
 ### 项目与协作
 - **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目
-- **PR Monitor** — GitHub PR 自动审核，Webhook 接收 PR 事件后创建审核 Task，Claude 审核代码后自动 approve/merge 或 request-changes
+- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
 - **PWA** — 手机浏览器 Add to Home Screen，原生 App 体验
 - **Android App** — 通过 Capacitor 打包原生 APK，App 内可配置远程服务器地址
 - **主题切换** — v2 主题系统：现代深色（默认，Multica 风格）/ 现代浅色（tonal zinc 灰调分层）/ 飞书（官方色板 + 真实 App 截图取色实证：白底为主 + 经典飞书蓝 #3370FF + N 系中性色 + 低边框风，与浅色主题以「白 vs 灰」区分，飞书客户端式窄图标 rail + IconPark 双色图标集）/ 苹果（apple-design skill 驱动：iOS systemGray 中性色 + apple.com CTA 蓝 #0071E3 + 系统字体优先 + 毛玻璃顶栏 + 按压反馈 + macOS Settings 式侧栏与 Ionicons 图标集，尊重 reduced-motion/transparency），v1 的经典深色、海蓝、森林、莓红完整保留为 Legacy 组，偏好持久化
@@ -396,6 +396,10 @@ PR Monitor 的审核流程会在后端 shell out 调用 `gh pr view` / `gh pr re
 1. **gh CLI 已认证**：运行后端的系统用户必须先执行 `gh auth login` 完成 GitHub 认证
 2. **账号权限**：该 GitHub 账号需要对被监控仓库有 push / review 权限（auto-merge 还需要 merge 权限）
 3. **PUBLIC_BASE_URL**：在 `.env` 中设置 `PUBLIC_BASE_URL`（如 `https://ccm.example.com`），PR Monitor 页面才能显示正确的 Webhook Payload URL
+
+Panel 中的 Finding 操作是独立的审计流程：**Ignore** 和 **Human advice** 只保存决策或供下一次候选生成参考，不会把阻断项改成通过；**Generate AI fix** 会在与 Reviewer 相同的 tool-free 沙箱中读取后端冻结的 exact-head 单文件输入，只输出有界 unified diff，不会直接访问仓库或 GitHub。候选完成后必须从 CCM 后端下载 diff；后端签发并保存与当前用户、Action 和 SHA-256 绑定的下载回执，只有回传同一回执并再次确认 exact base/head/repo/ref 后才会创建 commit。push 以 captured head 为 expected-old 做原子 compare-and-swap，分支被删除、漂移或远端结果无法证明时会拒绝或进入可对账恢复，不覆盖他人提交。
+
+同一 Finding 同时只有一个 active AI fix。自动 fix Task 的编辑、聊天、注入、重试、取消、停止和删除入口均被冻结；本机和 Worker 都由 Manager 按 exact generation 收口结果，Worker 成功前先补齐完整日志，失败或 Manager/Worker 崩溃后则从持久 Action/lease 恢复，不能靠内存状态重复生成或重复 push。详细状态机与安全边界见 [PR Monitor 权威设计](docs/pr-monitor-design.md)。
 
 ## 分布式 Worker
 

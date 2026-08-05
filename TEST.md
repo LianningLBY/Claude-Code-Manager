@@ -201,8 +201,8 @@ websocket identity 校验及固定端口上的孤儿 Chrome 不会被复用；
 |---------|---------|
 | `test_claude_pool.py` | API-first 模型兼容选择、quota/auth fail-closed、Claude session + sidecar 安全迁移，以及候选选择不会提前更新 `last_selected` |
 | `test_codex_pool.py` | API-first 与原生 fallback、独立 round-robin cursor、额度终态分类和最终路由 marker |
-| `test_resume_config_dir.py` | preferred 手动切换、已有会话粘性、Task durable binding、多副本消歧，以及 rollout copy 期间取消/代次变化不会产生无主副本 |
-| `test_service_instance_manager.py` | Claude/Codex reactive/proactive 换号、精确 queued message 保留、Codex copy→rebind→binding 的 cancellation-settled 事务，以及 silent exit/`turn.failed` 按真实 provider 归因且不重复报错 |
+| `test_resume_config_dir.py` | preferred 手动切换、已有会话粘性、Task durable binding、多副本消歧、runtime-busy 短退避、disabled source 等待可迁移目标，以及 rollout copy 期间取消/代次变化不会产生无主副本 |
+| `test_service_instance_manager.py` | Claude/Codex reactive/proactive 换号、精确 queued message 保留、Codex copy→rebind→binding 的 cancellation-settled 事务、direct/ephemeral per-home admission，以及 silent exit/`turn.failed` 按真实 provider 归因且不重复报错 |
 | `PoolDrawer.test.tsx` | Claude/Codex 的「优先账号」「最近使用」独立展示，以及恢复自动后的 API-first/旧会话绑定提示 |
 
 #### `test_api_projects.py` — 项目 API
@@ -1074,6 +1074,30 @@ curl -X POST http://localhost:8000/api/pr-monitor/repos/1/toggle -H "Authorizati
 # 删除
 curl -X DELETE http://localhost:8000/api/pr-monitor/repos/1 -H "Authorization: Bearer <token>"
 ```
+
+### Finding 操作与候选补丁
+
+```bash
+# 后端：Action 状态机、tool-free Task、下载回执、确认/push 恢复、Worker 收口及 Alembic
+uv run pytest -q \
+  backend/tests/test_pr_finding_actions.py \
+  backend/tests/test_api_pr_monitor.py \
+  backend/tests/test_worker_relay_proxy.py \
+  backend/tests/test_alembic_migrations.py
+
+# 前端：下载后才可确认、候选身份变化后回执失效、错误与轮询状态
+cd frontend && npx vitest run src/components/PRReview/FindingActions.test.tsx
+```
+
+| 测试范围 | 必须证明的边界 |
+|----------|----------------|
+| `test_pr_finding_actions.py` | ignore/advice 幂等且不改变 Panel Gate；每 Finding 只有一个数据库唯一 active slot；fix Task 只接收冻结的 exact-head 文件并输出单一有界 diff；真实 staged tree 只能修改 allowlist，禁止新增/删除/重命名/mode change；candidate hash/token、exact-old push lease、未知 push 结果按 nonce/parent 对账，base retarget、分支删除或前进都不得产生覆盖/重建 |
+| `test_api_pr_monitor.py` | Finding/Action ACL；diff 必须由后端下载并签发绑定当前用户、Action 与 patch hash 的持久回执；确认缺失、伪造、跨用户或旧回执均 409；`pr-review-fix` 的 edit/retry/chat/inject/cancel/stop/delete 全部冻结 |
+| `test_worker_relay_proxy.py` | Worker 完成 exact generation 后先补齐日志再由 Manager 解析候选；failed/cancelled/conflict 必须收口 durable Action；旧 generation 与普通 Reviewer 的既有失败语义不串线 |
+| `test_alembic_migrations.py` | `b7c9e2f4a610` 是唯一 head 且继承 `7a1d4e9c2b60`；fresh schema 含 `pr_finding_actions` 的审计/回执列、active-slot unique、idempotency/check/FK 约束；upgrade→downgrade→upgrade 可逆且 ORM 无漂移 |
+| `FindingActions.test.tsx` | 只有当前 snapshot 可创建 Action；下载成功且 receipt/hash 仍匹配当前候选后才开放确认；轮询、重试对账与错误提示不把 candidate 误报为已 push |
+
+手动验收：在当前 Panel 的 open Finding 上先记录 Human advice，再生成 AI fix；确认 Task 页面所有公共修改入口返回 409。候选就绪后刷新页面，直接确认应被后端拒绝；下载 diff 并人工核对 target repo、PR、source ref、expected base/head、文件列表和 SHA-256，再确认应只产生一个以旧 head 为唯一 parent 的普通 commit。确认前 retarget PR、删除源分支或另行 push 改变源分支时，CCM 必须报告 stale/lease rejection，且不得重建或覆盖 ref；模拟确认请求超时后重试时，系统必须先用持久 nonce 与 parent 证据对账，不能重复 push。
 
 ### 手动测试: Webhook（需要构造 HMAC 签名）
 

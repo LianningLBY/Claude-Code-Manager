@@ -10,6 +10,11 @@ export interface TaskArtifactDownload {
   filename: string;
 }
 
+export interface PRFindingDiffDownload extends TaskArtifactDownload {
+  receipt: string;
+  confirmationToken: string;
+}
+
 export function isApiRequestError(error: unknown): error is ApiRequestError {
   return error instanceof Error
     && typeof (error as { status?: unknown }).status === 'number';
@@ -40,6 +45,29 @@ function downloadFilename(
   } catch {
     return basename || 'download';
   }
+}
+
+async function validateAuthenticatedDownloadResponse(res: Response): Promise<void> {
+  if (res.status === 401) {
+    clearToken();
+    window.location.reload();
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) {
+    const error: unknown = await res.json().catch(() => null);
+    const detail = error && typeof error === 'object' && 'detail' in error
+      ? error.detail
+      : null;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail && typeof detail === 'object' && 'error' in detail
+        && typeof detail.error === 'string'
+        ? detail.error
+        : res.statusText;
+    throw new Error(message);
+  }
+  const refreshedToken = res.headers.get('X-Refreshed-Token');
+  if (refreshedToken) setToken(refreshedToken);
 }
 
 export function getToken(): string {
@@ -543,6 +571,7 @@ export interface PRReview {
     observed: Array<RequiredCheckPolicy & { state: string; details_url?: string | null }>;
   } | null;
   reviewer_runs?: PRReviewerRun[];
+  is_current_snapshot?: boolean;
   created_at: string;
   completed_at: string | null;
 }
@@ -595,6 +624,34 @@ export interface PRFindingRebuttal {
   error_message: string | null;
 }
 
+export interface PRFindingAction {
+  id: number;
+  finding_id: number;
+  action_type: 'ignore' | 'human_advice' | 'ai_fix';
+  status: 'pending' | 'running' | 'awaiting_confirmation' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'stale';
+  idempotency_key: string;
+  actor_user_id: number | null;
+  human_advice: string | null;
+  task_id: number | null;
+  expected_head_sha: string;
+  patch_sha256: string | null;
+  downloaded_by_user_id: number | null;
+  downloaded_at: string | null;
+  confirmed_by_user_id: number | null;
+  confirmed_at: string | null;
+  candidate_commit_sha: string | null;
+  candidate_created_at: string | null;
+  push_attempted_at: string | null;
+  cancelled_by_user_id: number | null;
+  cancelled_at: string | null;
+  result: Record<string, unknown> | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  diff_download_url: string | null;
+}
+
 export interface PRFinding {
   id: number;
   reviewer_run_id: number;
@@ -615,6 +672,7 @@ export interface PRFinding {
   github_comment_url: string | null;
   thread_error: string | null;
   rebuttals: PRFindingRebuttal[];
+  latest_action: PRFindingAction | null;
 }
 
 export interface PRReviewerRun {
@@ -1419,19 +1477,7 @@ export const api = {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       },
     );
-    if (res.status === 401) {
-      clearToken();
-      window.location.reload();
-      throw new Error('Unauthorized');
-    }
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(
-        typeof error.detail === 'string' ? error.detail : res.statusText,
-      );
-    }
-    const refreshedToken = res.headers.get('X-Refreshed-Token');
-    if (refreshedToken) setToken(refreshedToken);
+    await validateAuthenticatedDownloadResponse(res);
     return {
       blob: await res.blob(),
       filename: downloadFilename(
@@ -1555,6 +1601,46 @@ export const api = {
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>
     request<PRReview>(`/api/pr-monitor/reviews/${reviewId}`),
+  ignoreReviewFinding: (findingId: number, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/ignore`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),
+    }),
+  saveReviewFindingAdvice: (findingId: number, advice: string, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/advice`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey, advice }),
+    }),
+  createReviewFindingFix: (findingId: number, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/fix`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),
+    }),
+  getReviewFindingAction: (actionId: number) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}`),
+  cancelPRFindingAction: (actionId: number) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}/cancel`, {
+      method: 'POST',
+    }),
+  confirmReviewFindingFix: (actionId: number, confirmationToken: string, patchSha256: string, downloadReceipt: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ confirmation_token: confirmationToken, patch_sha256: patchSha256, download_receipt: downloadReceipt }),
+    }),
+  downloadReviewFindingDiff: async (actionId: number): Promise<PRFindingDiffDownload> => {
+    const token = getToken();
+    const res = await fetch(`${getBase()}/api/pr-monitor/actions/${actionId}/diff`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    await validateAuthenticatedDownloadResponse(res);
+    const receipt = res.headers.get('X-CCM-PR-Fix-Receipt');
+    const confirmationToken = res.headers.get('X-CCM-PR-Fix-Token');
+    if (!receipt) throw new Error('PR fix download receipt is missing');
+    if (!confirmationToken) throw new Error('PR fix confirmation token is missing');
+    return {
+      blob: await res.blob(),
+      filename: downloadFilename(res.headers.get('Content-Disposition'), `pr-fix-${actionId}.diff`),
+      receipt,
+      confirmationToken,
+    };
+  },
   getPRMonitorRun: (runId: number) =>
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}`),
   bindPRMonitorDeveloper: (runId: number, taskId: number) =>

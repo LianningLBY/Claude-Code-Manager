@@ -1585,6 +1585,46 @@ describe('ChatView', () => {
     });
   });
 
+  describe('Attention tag', () => {
+    it('shows an existing attention tag in the chat header', () => {
+      render(
+        <ChatView
+          task={makeTask({ attention_tag: '等待模型结束' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.getByText('等待模型结束')).toBeInTheDocument();
+      expect(screen.getByTitle('Edit attention tag')).toBeInTheDocument();
+    });
+
+    it('adds an attention tag from the chat header and refreshes the task', async () => {
+      vi.mocked(api.updateTask).mockResolvedValueOnce(
+        makeTask({ attention_tag: '需要人工确认' }),
+      );
+      render(
+        <ChatView
+          task={makeTask({ attention_tag: null })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('Add attention tag'));
+      await userEvent.type(screen.getByLabelText('Attention tag'), '需要人工确认');
+      await userEvent.click(screen.getByTitle('Save attention tag'));
+
+      await waitFor(() => {
+        expect(api.updateTask).toHaveBeenCalledWith(1, {
+          attention_tag: '需要人工确认',
+        });
+      });
+      expect(onTaskUpdated).toHaveBeenCalled();
+    });
+  });
+
   describe('Title editing', () => {
     it('enters edit mode on pencil click', async () => {
       const task = makeTask({ title: 'My Title' });

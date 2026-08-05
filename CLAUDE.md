@@ -44,7 +44,7 @@ claude-manager/
 │   │   └── system.py            # 健康检查 + 统计
 │   ├── middleware/auth.py       # Bearer token 认证中间件
 │   ├── models/                  # SQLAlchemy ORM 模型
-│   │   ├── task.py              # Task (含 session_id, last_cwd, project_id, enabled_skills)
+│   │   ├── task.py              # Task (含 session_id, attention_tag, last_cwd, project_id, enabled_skills)
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── project_todo.py      # ProjectTodo (per-project prompt 模板/清单, status open/done/archived, created_task_id 溯源)
@@ -99,7 +99,7 @@ claude-manager/
 │       │   ├── Chat/SubSessionIndicator.tsx   # 子 session 计数指示器
 │       │   ├── Chat/MonitorPanel.tsx          # Monitor 面板 (活跃 monitor 列表 + 历史 checks)
 │       │   ├── Instances/              # InstanceGrid, InstanceLog
-│       │   ├── Tasks/                  # TaskForm (含 Monitor skill 勾选), TaskList
+│       │   ├── Tasks/                  # TaskForm、TaskList、独立 attention tag 编辑
 │       │   ├── Layout/AppShell.tsx     # App 壳 (桌面侧栏导航 + sticky 顶栏 + 移动端抽屉)
 │       │   ├── Layout/PrefsMenu.tsx    # 顶栏齿轮下拉 (时区/主题/PTY/压缩阈值/飞书/密码/退出)
 │       │   ├── Layout/PoolDrawer.tsx   # Pool 额度抽屉 (顶栏 "Pro" 徽标 + 账号额度进度条)

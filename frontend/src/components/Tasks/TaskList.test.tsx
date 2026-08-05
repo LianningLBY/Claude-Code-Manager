@@ -214,6 +214,48 @@ describe('TaskList', () => {
     });
   });
 
+  describe('Attention tag', () => {
+    it('shows an existing attention tag prominently', () => {
+      render(
+        <TaskList
+          tasks={[makeTask({ attention_tag: '等它结束后再看' })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      expect(screen.getByText('等它结束后再看')).toBeInTheDocument();
+      expect(screen.getByTitle('Edit attention tag')).toBeInTheDocument();
+    });
+
+    it('opens the inline editor from the overflow menu and refreshes after save', async () => {
+      vi.mocked(api.updateTask).mockResolvedValueOnce(
+        makeTask({ attention_tag: '今晚继续' }),
+      );
+      render(
+        <TaskList
+          tasks={[makeTask({ attention_tag: null })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+      await userEvent.click(screen.getByText('Add attention tag'));
+      await userEvent.type(screen.getByLabelText('Attention tag'), '今晚继续');
+      await userEvent.click(screen.getByTitle('Save attention tag'));
+
+      await waitFor(() => {
+        expect(api.updateTask).toHaveBeenCalledWith(1, {
+          attention_tag: '今晚继续',
+        });
+      });
+      expect(onRefresh).toHaveBeenCalled();
+    });
+  });
+
   describe('Title editing', () => {
     it('opens inline title editor from overflow menu', async () => {
       const tasks = [makeTask({ title: 'Old Title' })];

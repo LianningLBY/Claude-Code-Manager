@@ -9,6 +9,7 @@ import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
 import { FastModeBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import { AttentionTag } from '../Tasks/AttentionTag';
 import { ExpandableText } from '../ExpandableText';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
@@ -331,6 +332,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(task.context_window_usage ?? null);
   const [editingTitle, setEditingTitle] = useState(false);
+  const [editingAttentionTag, setEditingAttentionTag] = useState(false);
   const [titleDraft, setTitleDraft] = useState(task.title || '');
   const titleInputRef = useRef<HTMLInputElement>(null);
   const [titleExpanded, setTitleExpanded] = useState(false);
@@ -1785,7 +1787,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
         {/* Row 2: title + context usage */}
         <div className="flex items-center gap-2 mt-0.5 pl-7 sm:pl-8">
-          <div className="flex-1 min-w-0">
+          {!editingAttentionTag && <div className="flex-1 min-w-0">
             {editingTitle ? (
               <input
                 ref={titleInputRef}
@@ -1813,7 +1815,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 </button>
               </div>
             )}
-          </div>
+          </div>}
+          <AttentionTag
+            taskId={task.id}
+            value={task.attention_tag}
+            editing={editingAttentionTag}
+            onEdit={() => {
+              setEditingTitle(false);
+              setEditingAttentionTag(true);
+            }}
+            onCancel={() => setEditingAttentionTag(false)}
+            onSaved={() => onTaskUpdated?.()}
+            showAddButton
+            className={editingAttentionTag ? 'flex-1' : 'max-w-[45vw] sm:max-w-xs'}
+          />
           {contextUsage && (
             <span className="flex items-center shrink-0">
               <ContextUsageIndicator usage={contextUsage} />

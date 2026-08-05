@@ -1114,11 +1114,20 @@ async def test_cloned_task_inherits_attention_tag_unless_overridden(client):
         "clone_from_task_id": source_id,
         "attention_tag": "单独关注",
     })
+    cleared = await client.post("/api/tasks", json={
+        "title": "Cleared",
+        "description": "d",
+        "target_repo": "/tmp",
+        "clone_from_task_id": source_id,
+        "attention_tag": None,
+    })
 
     assert inherited.status_code == 201
     assert inherited.json()["attention_tag"] == "等源任务结束"
     assert overridden.status_code == 201
     assert overridden.json()["attention_tag"] == "单独关注"
+    assert cleared.status_code == 201
+    assert cleared.json()["attention_tag"] is None
 
 
 @pytest.mark.asyncio

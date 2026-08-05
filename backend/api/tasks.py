@@ -2926,6 +2926,77 @@ async def _stop_task_session_local_impl(
             ) from exc
         raise
 
+    # stop-session is a Task-wide execution stop, not merely a signal to the
+    # current foreground process.  Monitors and CCM-owned sub-agents are
+    # independent message producers; if they remain ``running`` they can post
+    # a report immediately after the queue drain and resurrect the Task.  Close
+    # those producers durably before resolving/stopping the main owner, then
+    # drain once more to catch a report that was already in flight.
+    from backend.models.monitor_session import MonitorSession
+
+    auxiliary_rows = await db.execute(
+        select(
+            MonitorSession.id,
+            MonitorSession.agent_type,
+            MonitorSession.source,
+        )
+        .where(
+            MonitorSession.task_id == task_id,
+            MonitorSession.status.in_(("running", "cancelled")),
+        )
+        .with_for_update()
+    )
+    auxiliary_sessions = list(auxiliary_rows.all())
+    await db.execute(
+        sa_update(MonitorSession)
+        .where(
+            MonitorSession.task_id == task_id,
+            MonitorSession.status == "running",
+        )
+        .values(
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            next_check_at=None,
+            active_turn_generation=None,
+            turn_started_at=None,
+        )
+    )
+    await db.commit()
+
+    for session_id, agent_type, source in auxiliary_sessions:
+        if source != "ccm":
+            continue
+        try:
+            if agent_type == "sub_agent":
+                await dispatcher.stop_sub_agent_session_process(session_id)
+            elif agent_type == "monitor":
+                await dispatcher.stop_monitor_session_process(
+                    session_id,
+                    terminal=True,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                409,
+                "Task message producers were closed, but auxiliary process "
+                f"cleanup could not be confirmed for session {session_id}",
+            ) from exc
+
+    if auxiliary_sessions:
+        try:
+            cleared += await dispatcher.abort_task_queue(task_id)
+        except Exception as exc:
+            from backend.services.dispatcher import TaskQueueAbortTimeoutError
+
+            if isinstance(exc, TaskQueueAbortTimeoutError):
+                raise HTTPException(
+                    409,
+                    "Task auxiliary producers were stopped, but the queue "
+                    "worker could not be proven stopped",
+                ) from exc
+            raise
+
     # Settle a launch reservation before deciding whether an exact process
     # owner exists. A no-owner Task is safe to terminalize only after this
     # barrier proves no spawned-but-uncommitted generation can appear.

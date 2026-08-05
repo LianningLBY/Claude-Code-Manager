@@ -4298,6 +4298,87 @@ async def test_codex_fast_admission_failure_is_visible_and_not_requeued(
 
 
 @pytest.mark.asyncio
+async def test_codex_terminal_thread_failure_is_visible_and_not_requeued(
+    db_factory,
+):
+    """A persistent terminal thread state must not enter the five-second loop."""
+
+    from backend.services.codex_app_server import (
+        CodexThreadTerminalStateError,
+    )
+
+    d = _make_dispatcher(db_factory)
+    published = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        raise CodexThreadTerminalStateError(
+            "thread-system-error",
+            "systemError",
+            operation="thread/resume turn admission",
+            recovery_attempted=True,
+        )
+
+    async def publish(task_id, exc):
+        assert task_id == 1
+        assert isinstance(exc, CodexThreadTerminalStateError)
+        published.set()
+
+    d._process_queued_message = fake_process
+    d._publish_permanent_account_routing_failure = AsyncMock(
+        side_effect=publish,
+    )
+    await d.enqueue_message(1, "must stop retrying visibly")
+    await asyncio.wait_for(published.wait(), 1)
+    await asyncio.wait_for(d._get_task_queue(1).join(), 1)
+
+    assert len(seen) == 1
+    assert seen[0].prompt == "must stop retrying visibly"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
+async def test_codex_thread_identity_mismatch_is_visible_and_not_requeued(
+    db_factory,
+):
+    """A contradictory resume identity cannot improve through queue retries."""
+
+    from backend.services.codex_app_server import (
+        CodexThreadIdentityMismatchError,
+    )
+
+    d = _make_dispatcher(db_factory)
+    published = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        raise CodexThreadIdentityMismatchError(
+            "thread-requested",
+            "thread-returned",
+            operation="thread/resume",
+        )
+
+    async def publish(task_id, exc):
+        assert task_id == 1
+        assert isinstance(exc, CodexThreadIdentityMismatchError)
+        published.set()
+
+    d._process_queued_message = fake_process
+    d._publish_permanent_account_routing_failure = AsyncMock(
+        side_effect=publish,
+    )
+    await d.enqueue_message(1, "must not cross native threads")
+    await asyncio.wait_for(published.wait(), 1)
+    await asyncio.wait_for(d._get_task_queue(1).join(), 1)
+
+    assert len(seen) == 1
+    assert seen[0].prompt == "must not cross native threads"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
 async def test_claude_routing_failure_requeues_exact_message(
     db_factory,
     monkeypatch,

@@ -34,6 +34,8 @@ from backend.services.codex_app_server import (
     CodexServiceTierUnavailableError,
     CodexSharedTransportBusyError,
     CodexThreadHomeMismatchError,
+    CodexThreadIdentityMismatchError,
+    CodexThreadTerminalStateError,
     CodexTurnProcess,
 )
 from backend.services.codex_tier_proxy import CodexTierProxyRoute
@@ -2839,9 +2841,28 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
         CodexAppServerBusyError("account busy"),
         CodexRequiredMcpError("required MCP failed"),
         CodexThreadHomeMismatchError("wrong owner"),
+        CodexThreadIdentityMismatchError(
+            "thread-requested",
+            "thread-returned",
+            operation="thread/resume",
+        ),
+        CodexThreadTerminalStateError(
+            "terminal-thread",
+            "systemError",
+            operation="thread/resume turn admission",
+            recovery_attempted=True,
+        ),
         CodexLaunchCommitError("turn already started"),
     ],
-    ids=["timeout", "busy", "required-mcp", "owner-mismatch", "commit-failed"],
+    ids=[
+        "timeout",
+        "busy",
+        "required-mcp",
+        "owner-mismatch",
+        "identity-mismatch",
+        "terminal-thread",
+        "commit-failed",
+    ],
 )
 async def test_launch_codex_does_not_fallback_when_replay_is_unsafe(
     db_factory, monkeypatch, tmp_path, launch_error,

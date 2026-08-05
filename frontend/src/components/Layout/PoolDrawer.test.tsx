@@ -851,6 +851,7 @@ describe('PoolDrawer', () => {
       expect(card).toHaveTextContent('分组共享剩余 88 requests');
       expect(card).toHaveTextContent('分组并发上限 3');
       expect(card).toHaveTextContent('5h 请求（分组共享）');
+      expect(card).not.toHaveTextContent('总额度：无法确认');
       expect(card).toHaveTextContent('到期时间：无法确认');
       expect(card).toHaveTextContent('剩余天数：无法确认');
 
@@ -858,6 +859,65 @@ describe('PoolDrawer', () => {
       await waitFor(() => {
         expect(api.refreshCloudRouterAccount).toHaveBeenCalledWith('apex-1');
       });
+    });
+
+    it('renders Apex null quota windows as unlimited instead of unavailable', async () => {
+      enableCodexPool({
+        enabled: true,
+        total: 1,
+        available: 1,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        accounts: [{
+          id: 'apex:apex-1:codex',
+          codex_home: '/tmp/apex-1/codex',
+          email: '',
+          enabled: true,
+          available: true,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'apex_api',
+          api_provider: 'apex',
+          display_name: 'Apex Unlimited',
+          api_account_id: 'apex-1',
+          supported_models: ['gpt-5.4'],
+          api_quota: {
+            state: 'active',
+            mode: 'shared_group',
+            known: true,
+            key_name: 'apex-unlimited-key',
+            group_name: 'apex-unlimited-group',
+            key_usage: { requests_5h: 3 },
+            concurrency: 3,
+            windows: [{
+              id: 'requests_5h',
+              label: '5h 请求（分组共享）',
+              scope: 'group',
+              unlimited: true,
+              key_used: 3,
+              currency: 'requests',
+            }],
+          },
+        }],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+
+      const card = (await screen.findByText('Apex Unlimited')).closest('.rounded-lg') as HTMLElement;
+      await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
+
+      expect(card).toHaveTextContent('状态 active');
+      expect(card).toHaveTextContent('分组不限额');
+      expect(card).toHaveTextContent('本 Key 已用 3 requests');
+      expect(card).not.toHaveTextContent('总额度：无法确认');
+      expect(card).not.toHaveTextContent('分组共享上限');
+      expect(card).not.toHaveTextContent('分组共享剩余');
+      expect(card).not.toHaveTextContent('重置时间无法确认');
+      expect(card).toHaveTextContent('到期时间：无法确认');
     });
 
     it('renders unrestricted CloudRouter usage without presenting informational zeroes as the Key balance', async () => {

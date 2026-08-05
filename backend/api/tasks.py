@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, select, update as sa_update
+from sqlalchemy import func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -38,6 +38,11 @@ from backend.services.task_creation import (
     prepare_task_create_values,
     stage_task_record,
     validate_task_service_tier_configuration,
+)
+from backend.services.pr_review_runtime import (
+    is_pr_review_fix_task,
+    is_pr_review_task,
+    is_pr_sandbox_task,
 )
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
@@ -96,6 +101,212 @@ _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
 )
 _LOCAL_ROUTING_EDITABLE_STATUSES = WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 _WORKER_SKILL_EDITABLE_STATUSES = WORKER_ROUTING_SAFE_STATUSES | {"pending"}
+_PR_REVIEW_CHAT_TERMINAL_STATUSES = frozenset(
+    {"approved", "merged", "commented", "error"}
+)
+
+
+async def _require_no_pr_review_publication(
+    db: AsyncSession,
+    task_id: int,
+) -> None:
+    """Fence Task generation changes while its GitHub outbox is publishing."""
+
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
+
+    publishing = await db.execute(
+        select(PRReview.id).distinct()
+        .outerjoin(
+            PRReviewerRun,
+            PRReviewerRun.pr_review_id == PRReview.id,
+        )
+        .where(
+            or_(
+                PRReview.task_id == task_id,
+                PRReviewerRun.task_id == task_id,
+            ),
+            PRReview.status.in_(("publishing", "superseding")),
+        )
+    )
+    if publishing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            409,
+            "PR review publication/synchronization is in progress; this Task "
+            "generation is frozen",
+        )
+
+
+async def _require_not_pr_review_task_mutation(
+    db: AsyncSession,
+    task_id: int,
+    *,
+    action: str,
+) -> None:
+    """Keep automated review Tasks immutable outside their backend workflow."""
+
+    from backend.models.pr_monitor import PRReview
+
+    linked = await db.execute(
+        select(PRReview.id)
+        .where(PRReview.task_id == task_id)
+        .limit(1)
+    )
+    task = await db.get(Task, task_id)
+    if (
+        linked.scalar_one_or_none() is not None
+        or (task is not None and is_pr_sandbox_task(task))
+    ):
+        raise HTTPException(
+            409,
+            f"Automated PR workflow Tasks cannot be manually {action}; wait "
+            "for the workflow outcome or a new PR snapshot",
+        )
+
+
+async def _require_pr_review_chat_allowed(
+    db: AsyncSession,
+    task_id: int,
+    *,
+    trusted_unlinked_terminal: bool = False,
+) -> bool:
+    """Allow discussion only after the automated review is durably terminal.
+
+    ``reviewing`` must remain immutable until its exact completed Task
+    generation has been claimed by the GitHub publication outbox.  A chat turn
+    admitted in that window could otherwise replace the generation before the
+    completion consumer verifies it.  Once publication is terminal, later
+    turns cannot change the already-recorded GitHub action and are safe.
+
+    Worker mirrors deliberately retain only the ``pr-review`` tag, not the
+    Manager's PRReview row.  ``trusted_unlinked_terminal`` is therefore
+    reserved for an internally authenticated Manager -> Worker request whose
+    Manager-side terminal check ran while holding the Task operation lock.
+
+    Returns ``True`` for a PR review Task and ``False`` for an ordinary Task.
+    """
+
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        return False
+    if is_pr_review_fix_task(task):
+        raise HTTPException(
+            409,
+            "Automated PR fix Tasks cannot accept manual discussion or live "
+            "injection; wait for the generated patch outcome",
+        )
+    metadata = task.metadata_ or {}
+    tags = task.tags
+    tag_marker = (
+        isinstance(tags, (list, tuple, set, dict))
+        and "pr-review" in tags
+    )
+    task_marker = is_pr_review_task(task)
+
+    def allow_terminal_discussion() -> bool:
+        if task.provider == "codex":
+            # Automated Codex reviews run in a tool-free isolated thread.
+            # That transport intentionally refuses native resume, so a
+            # terminal follow-up would otherwise open a context-less thread
+            # containing only the user's new message.
+            raise HTTPException(
+                409,
+                "Terminal discussion is unavailable for isolated Codex PR "
+                "review Tasks; start a separate Task with the review context",
+            )
+        return True
+
+    linked = list((await db.execute(
+        select(PRReview.status).distinct()
+        .outerjoin(
+            PRReviewerRun,
+            PRReviewerRun.pr_review_id == PRReview.id,
+        )
+        .where(
+            or_(
+                PRReview.task_id == task_id,
+                PRReviewerRun.task_id == task_id,
+            )
+        )
+    )).scalars().all())
+    if linked:
+        # One Task belongs to exactly one immutable review snapshot.  Multiple
+        # links or an unknown state indicate corrupt/partially migrated state
+        # and must fail closed rather than guessing which review is current.
+        if (
+            len(linked) == 1
+            and linked[0] in _PR_REVIEW_CHAT_TERMINAL_STATUSES
+            and metadata.get("pr_review_superseded") is not True
+        ):
+            return allow_terminal_discussion()
+        raise HTTPException(
+            409,
+            "Automated PR review discussion is available only after its "
+            "GitHub review workflow is terminal",
+        )
+
+    if not task_marker:
+        return False
+    if (
+        trusted_unlinked_terminal
+        and tag_marker
+        and metadata.get("pr_review_superseded") is not True
+    ):
+        return allow_terminal_discussion()
+    raise HTTPException(
+        409,
+        "Automated PR review Task has no locally verified terminal review "
+        "state",
+    )
+
+
+async def _require_pr_review_retryable(
+    db: AsyncSession,
+    task_id: int,
+) -> None:
+    """Do not run a Task generation whose linked review is already terminal."""
+
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
+
+    result = await db.execute(
+        select(PRReview.status).distinct()
+        .outerjoin(
+            PRReviewerRun,
+            PRReviewerRun.pr_review_id == PRReview.id,
+        )
+        .where(
+            or_(
+                PRReview.task_id == task_id,
+                PRReviewerRun.task_id == task_id,
+            )
+        )
+        .limit(1)
+    )
+    review_status = result.scalar_one_or_none()
+    task = await db.get(Task, task_id)
+    task_marker = bool(task is not None and is_pr_sandbox_task(task))
+    if review_status is not None:
+        if review_status in {"pending", "waiting_ci", "reviewing"}:
+            detail = (
+                "Automated PR review Tasks cannot be manually retried; push a "
+                "new PR snapshot instead"
+            )
+        else:
+            detail = (
+                "This PR review is already terminal; wait for a new PR snapshot "
+                "instead of retrying its old Task"
+            )
+        raise HTTPException(
+            409,
+            detail,
+        )
+    if task_marker:
+        raise HTTPException(
+            409,
+            "Automated PR workflow Tasks cannot be manually retried; wait for "
+            "the workflow outcome or push a new PR snapshot instead",
+        )
 
 
 class _WorkerRoutingConfirmationUnavailable(HTTPException):
@@ -647,6 +858,8 @@ async def create_task(
         if source is None:
             raise HTTPException(404, "Clone source task not found")
         await require_task_control(request, source, db)
+        if "attention_tag" not in body.model_fields_set:
+            data["attention_tag"] = source.attention_tag
         cloned = await _clone_session(clone_from_task_id, db)
         if cloned:
             data["session_id"] = cloned["session_id"]
@@ -1952,6 +2165,11 @@ async def update_task(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, queue.db)
+    await _require_not_pr_review_task_mutation(
+        queue.db,
+        task_id,
+        action="edited",
+    )
     updates = body.model_dump(exclude_unset=True)
     user_skill_snapshots = updates.pop("user_skill_snapshots", None)
     if user_skill_snapshots is not None:
@@ -2420,7 +2638,16 @@ async def delete_task(
 
     if task is None:
         raise HTTPException(404, "Task not found")
-    if task.worker_id is None and task.pty_background_generation is not None:
+    await _require_no_pr_review_publication(db, task_id)
+    await _require_not_pr_review_task_mutation(
+        db,
+        task_id,
+        action="deleted",
+    )
+    if (
+        task.worker_id is None
+        and task.pty_background_generation is not None
+    ):
         raise HTTPException(
             409,
             "Task still has active Claude PTY background output",
@@ -2699,15 +2926,13 @@ async def _internal_pr_review_termination_task(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
+        await _require_no_pr_review_publication(db, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    metadata_marker = type((task.metadata_ or {}).get("pr_review_id")) is int
-    tags = task.tags or []
-    tag_marker = isinstance(tags, (list, tuple, set, dict)) and "pr-review" in tags
-    if not (metadata_marker or tag_marker):
+    if not is_pr_sandbox_task(task):
         raise HTTPException(
             400,
-            "Exact-generation termination is restricted to PR review tasks",
+            "Exact-generation termination is restricted to PR workflow tasks",
         )
     return task
 
@@ -2833,6 +3058,77 @@ async def _stop_task_session_local_under_cancellation_lease(
                 "state was published",
             ) from exc
         raise
+
+    # stop-session is a Task-wide execution stop, not merely a signal to the
+    # current foreground process.  Monitors and CCM-owned sub-agents are
+    # independent message producers; if they remain ``running`` they can post
+    # a report immediately after the queue drain and resurrect the Task.  Close
+    # those producers durably before resolving/stopping the main owner, then
+    # drain once more to catch a report that was already in flight.
+    from backend.models.monitor_session import MonitorSession
+
+    auxiliary_rows = await db.execute(
+        select(
+            MonitorSession.id,
+            MonitorSession.agent_type,
+            MonitorSession.source,
+        )
+        .where(
+            MonitorSession.task_id == task_id,
+            MonitorSession.status.in_(("running", "cancelled")),
+        )
+        .with_for_update()
+    )
+    auxiliary_sessions = list(auxiliary_rows.all())
+    await db.execute(
+        sa_update(MonitorSession)
+        .where(
+            MonitorSession.task_id == task_id,
+            MonitorSession.status == "running",
+        )
+        .values(
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            next_check_at=None,
+            active_turn_generation=None,
+            turn_started_at=None,
+        )
+    )
+    await db.commit()
+
+    for session_id, agent_type, source in auxiliary_sessions:
+        if source != "ccm":
+            continue
+        try:
+            if agent_type == "sub_agent":
+                await dispatcher.stop_sub_agent_session_process(session_id)
+            elif agent_type == "monitor":
+                await dispatcher.stop_monitor_session_process(
+                    session_id,
+                    terminal=True,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                409,
+                "Task message producers were closed, but auxiliary process "
+                f"cleanup could not be confirmed for session {session_id}",
+            ) from exc
+
+    if auxiliary_sessions:
+        try:
+            cleared += await dispatcher.abort_task_queue(task_id)
+        except Exception as exc:
+            from backend.services.dispatcher import TaskQueueAbortTimeoutError
+
+            if isinstance(exc, TaskQueueAbortTimeoutError):
+                raise HTTPException(
+                    409,
+                    "Task auxiliary producers were stopped, but the queue "
+                    "worker could not be proven stopped",
+                ) from exc
+            raise
 
     # Settle a launch reservation before deciding whether an exact process
     # owner exists. A no-owner Task is safe to terminalize only after this
@@ -3224,6 +3520,12 @@ async def stop_task_session(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
+        await _require_no_pr_review_publication(db, task_id)
+        await _require_not_pr_review_task_mutation(
+            db,
+            task_id,
+            action="stopped",
+        )
     wt = await _worker_task_or_none(db, task_id)
     if wt is not None:
         return await _proxy(wt, "POST", f"/api/tasks/{task_id}/stop-session")
@@ -3539,6 +3841,12 @@ async def cancel_task(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
+        await _require_no_pr_review_publication(db, task_id)
+        await _require_not_pr_review_task_mutation(
+            db,
+            task_id,
+            action="cancelled",
+        )
     wt = await _worker_task_or_none(db, task_id)
     if wt is not None:
         observed = worker_task_generation(wt)
@@ -3586,6 +3894,8 @@ async def retry_task(
                 409,
                 f"Task status {current.status} is not retryable",
             )
+        await _require_no_pr_review_publication(db, task_id)
+        await _require_pr_review_retryable(db, task_id)
         if current.pty_background_generation is not None:
             raise HTTPException(
                 409,

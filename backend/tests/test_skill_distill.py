@@ -14,6 +14,7 @@ from backend.services.skill_distill import (
     TaskDistillCleanupError,
     TaskDistillTimeoutError,
     build_task_distill_prompt,
+    codex_task_distill_runtime_homes,
     distill_task_conversation,
     reap_unreaped_task_distills,
     task_distill_runtime_users,
@@ -484,6 +485,84 @@ async def test_task_distill_cleanup_failure_retains_exact_home_blocker(
         blockers = task_distill_runtime_users(provider_home)
         assert len(blockers) == 1
         assert "skill distill process" in blockers[0]
+    finally:
+        skill_distill_module._TASK_DISTILL_PROCESSES.clear()
+
+
+@pytest.mark.asyncio
+async def test_codex_distill_cleanup_failure_keeps_home_admission_blocked(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services.codex_app_server import CodexAppServerBusyError
+    from backend.services.instance_manager import InstanceManager
+
+    codex_home = str((tmp_path / "codex-retained").resolve())
+    pool = MagicMock()
+    pool.home_for_account.return_value = codex_home
+    pool.is_home_available.return_value = True
+    pool.supports_model_for_home.return_value = True
+    pool.canonical_home.return_value = codex_home
+    manager = InstanceManager(MagicMock(), MagicMock())
+    process = _process(stdout=b"")
+    process.returncode = None
+    communicating = asyncio.Event()
+
+    async def communicate(*, input):
+        communicating.set()
+        await asyncio.Event().wait()
+
+    async def failed_cleanup(_retained, _communicate_task):
+        raise RuntimeError("cannot prove child tree terminal")
+
+    process.communicate = AsyncMock(side_effect=communicate)
+    monkeypatch.setattr(
+        skill_distill_module,
+        "_terminate_task_distill_process",
+        failed_cleanup,
+    )
+    try:
+        with patch(
+            "backend.services.skill_distill.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ):
+            request_task = asyncio.create_task(distill_task_conversation(
+                title="Codex task",
+                conversation="[User]: fix it",
+                provider="codex",
+                codex_pool=pool,
+                codex_account_id="codex-1",
+                instance_manager=manager,
+            ))
+            await asyncio.wait_for(communicating.wait(), timeout=1)
+            request_task.cancel()
+            with pytest.raises(TaskDistillCleanupError):
+                await request_task
+
+        assert manager._codex_ephemeral_home_users == {}
+        assert codex_task_distill_runtime_homes() == {codex_home}
+        assert codex_home in manager.busy_codex_homes()
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="retained ephemeral exec",
+        ):
+            async with manager.codex_home_exec_guard(codex_home):
+                pytest.fail("retained distill must block another exec")
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="retained ephemeral exec",
+        ):
+            await manager.begin_codex_home_maintenance(codex_home)
+
+        monkeypatch.setattr(
+            skill_distill_module,
+            "_terminate_task_distill_process",
+            AsyncMock(),
+        )
+        await reap_unreaped_task_distills()
+        assert codex_task_distill_runtime_homes() == set()
+        async with manager.codex_home_exec_guard(codex_home):
+            pass
     finally:
         skill_distill_module._TASK_DISTILL_PROCESSES.clear()
 

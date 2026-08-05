@@ -18,6 +18,13 @@ class LogEntry(Base):
     # nullable：Worker 上执行的远程 task 的日志副本没有本地 instance
     instance_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Exact Task retry generation that produced this event. Legacy and
+    # non-generation-scoped rows remain NULL and must not be used as terminal
+    # evidence for generation-sensitive workflows such as PR Monitor.
+    task_retry_count: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
     event_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     role: Mapped[str | None] = mapped_column(String(20), nullable=True)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)

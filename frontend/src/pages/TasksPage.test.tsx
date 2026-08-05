@@ -7,6 +7,9 @@ import { api } from '../api/client';
 let capturedGlobalWs:
   | ((message: Record<string, unknown>) => void)
   | undefined;
+const taskSearchMock = vi.hoisted(() => ({
+  initialResults: null as Array<Record<string, unknown>> | null,
+}));
 
 vi.mock('../api/client', () => ({
   api: {
@@ -34,9 +37,12 @@ vi.mock('../hooks/useWebSocket', () => ({
   }),
 }));
 
-vi.mock('../hooks/useTaskSearch', () => ({
-  useTaskSearch: () => [null, vi.fn()],
-}));
+vi.mock('../hooks/useTaskSearch', async () => {
+  const React = await import('react');
+  return {
+    useTaskSearch: () => React.useState(taskSearchMock.initialResults),
+  };
+});
 
 vi.mock('../hooks/useTaskReorder', () => ({
   mergeVisibleTaskOrder: (
@@ -56,6 +62,7 @@ vi.mock('../components/Tasks/TaskForm', () => ({
 vi.mock('../components/Tasks/TaskList', () => ({
   TaskList: ({
     tasks,
+    onTaskUpdated,
   }: {
     tasks: Array<{
       id: number;
@@ -66,7 +73,14 @@ vi.mock('../components/Tasks/TaskList', () => ({
       plan_stage_provider?: string | null;
       plan_stage_model?: string | null;
       plan_stage_route_slot?: string | null;
+      attention_tag?: string | null;
     }>;
+    onTaskUpdated?: (task: {
+      id: number;
+      status: string;
+      background_active?: boolean;
+      attention_tag?: string | null;
+    }) => void;
   }) => (
     <div data-testid="task-snapshots">
       {tasks.map((task) => (
@@ -80,8 +94,24 @@ vi.mock('../components/Tasks/TaskList', () => ({
           <span data-testid={`plan-route-${task.id}`}>
             {task.plan_stage_provider || 'none'}:{task.plan_stage_model || 'none'}:{task.plan_stage_route_slot || 'none'}
           </span>
+          <span data-testid={`attention-tag-${task.id}`}>
+            {task.attention_tag ?? ''}
+          </span>
         </div>
       ))}
+      {tasks[0] && onTaskUpdated && (
+        <>
+          <button onClick={() => onTaskUpdated({ ...tasks[0], attention_tag: '新增标签' })}>
+            Simulate add attention tag
+          </button>
+          <button onClick={() => onTaskUpdated({ ...tasks[0], attention_tag: '修改标签' })}>
+            Simulate edit attention tag
+          </button>
+          <button onClick={() => onTaskUpdated({ ...tasks[0], attention_tag: null })}>
+            Simulate clear attention tag
+          </button>
+        </>
+      )}
     </div>
   ),
 }));
@@ -120,6 +150,12 @@ describe('TasksPage realtime reconciliation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     capturedGlobalWs = undefined;
+    taskSearchMock.initialResults = null;
+    localStorage.clear();
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1024,
+    });
     vi.mocked(api.listTasks).mockResolvedValue([task] as never);
     vi.mocked(api.countTasks).mockResolvedValue({ total: 1 });
     vi.mocked(api.listProjects).mockResolvedValue([]);
@@ -258,5 +294,49 @@ describe('TasksPage realtime reconciliation', () => {
     await userEvent.click(screen.getByRole('button', { name: /Filter/ }));
     expect(screen.queryByText('Standalone Plans')).not.toBeInTheDocument();
     expect(screen.queryByText('Related Plans')).not.toBeInTheDocument();
+  });
+
+  it('shows the attention tag in the split-mode task sidebar', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1440,
+    });
+    vi.mocked(api.listTasks).mockResolvedValue([
+      { ...task, attention_tag: '等待任务结束' },
+    ] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={task.id}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('等待任务结束')).toBeInTheDocument();
+  });
+
+  it('immediately reconciles add, edit, and clear into active search results', async () => {
+    taskSearchMock.initialResults = [
+      { ...task, attention_tag: null },
+    ];
+
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    const visibleTag = await screen.findByTestId('attention-tag-7');
+    expect(visibleTag).toBeEmptyDOMElement();
+
+    await userEvent.click(screen.getByText('Simulate add attention tag'));
+    expect(visibleTag).toHaveTextContent('新增标签');
+
+    await userEvent.click(screen.getByText('Simulate edit attention tag'));
+    expect(visibleTag).toHaveTextContent('修改标签');
+
+    await userEvent.click(screen.getByText('Simulate clear attention tag'));
+    expect(visibleTag).toBeEmptyDOMElement();
   });
 });

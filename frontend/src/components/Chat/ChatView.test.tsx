@@ -2,12 +2,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ChatView } from './ChatView';
-import type { Task, Project, ChatMessage, PlanResource, PlanVersion } from '../../api/client';
+import type { Task, Project, ChatMessage, PlanResource, PlanVersion, UploadResult } from '../../api/client';
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
   isApiRequestError: (error: unknown) => (
-    error instanceof Error && 'status' in error
+    error instanceof Error
+    && typeof (error as { status?: unknown }).status === 'number'
   ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
@@ -71,6 +72,10 @@ vi.mock('../../api/client', () => ({
     }),
     createVersionExecutionTask: vi.fn().mockResolvedValue({ execution_task_id: 99 }),
     updatePlan: vi.fn().mockResolvedValue({}),
+    downloadTaskArtifact: vi.fn().mockResolvedValue({
+      blob: new Blob(['artifact']),
+      filename: '汇报稿.md',
+    }),
   },
 }));
 
@@ -221,12 +226,23 @@ function makePlan(overrides: Partial<PlanResource> = {}): PlanResource {
   };
 }
 
+function makeUpload(id: string, filename = `${id}.txt`): UploadResult {
+  return {
+    id,
+    filename,
+    path: `/srv/uploads/${filename}`,
+    url: `/api/uploads/${filename}`,
+    is_image: false,
+  };
+}
+
 describe('ChatView', () => {
   const projects: Project[] = [];
   const onBack = vi.fn();
   const onTaskUpdated = vi.fn();
 
   beforeEach(() => {
+    localStorage.clear();
     vi.clearAllMocks();
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
@@ -255,6 +271,88 @@ describe('ChatView', () => {
     (api.injectTaskMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       injected: true,
+    });
+    (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  });
+
+  it('fits full-screen chat to the iOS visual viewport but leaves inline chat alone', () => {
+    const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const viewport = Object.assign(new EventTarget(), {
+      height: 486,
+      offsetTop: 47,
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: viewport,
+    });
+
+    try {
+      const fullScreen = render(
+        <ChatView task={makeTask()} projects={projects} onBack={onBack} />,
+      );
+      expect(fullScreen.container.firstElementChild).toHaveStyle({
+        height: '486px',
+        top: '47px',
+        bottom: 'auto',
+      });
+      fullScreen.unmount();
+
+      const inline = render(
+        <ChatView task={makeTask()} projects={projects} onBack={onBack} inline />,
+      );
+      expect((inline.container.firstElementChild as HTMLElement).style.height).toBe('');
+      expect((inline.container.firstElementChild as HTMLElement).style.top).toBe('');
+      expect((inline.container.firstElementChild as HTMLElement).style.bottom).toBe('');
+      inline.unmount();
+    } finally {
+      if (originalViewport) {
+        Object.defineProperty(window, 'visualViewport', originalViewport);
+      } else {
+        Reflect.deleteProperty(window, 'visualViewport');
+      }
+    }
+  });
+
+  describe('chat conflict state', () => {
+    it('does not show Interrupt for a non-busy 409 rejection', async () => {
+      const rejection = Object.assign(
+        new Error('PR review workflow is not terminal'),
+        { status: 409, detail: 'PR review workflow is not terminal' },
+      );
+      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(rejection);
+      render(
+        <ChatView
+          task={makeTask({ status: 'completed', tags: ['pr-review'] })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      await userEvent.type(screen.getByRole('textbox'), 'follow up');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      await screen.findByText(/PR review workflow is not terminal/);
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    });
+
+    it('still shows Interrupt for a genuine busy conflict', async () => {
+      const rejection = Object.assign(
+        new Error('The preceding Codex turn is still running'),
+        { status: 409, detail: 'The preceding Codex turn is still running' },
+      );
+      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(rejection);
+      render(
+        <ChatView
+          task={makeTask({ status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      await userEvent.type(screen.getByRole('textbox'), 'follow up');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      expect(await screen.findByTitle('Interrupt session')).toBeInTheDocument();
     });
   });
 
@@ -525,6 +623,25 @@ describe('ChatView', () => {
   });
 
   describe('PTY background activity', () => {
+    it.each([
+      ['claude', 'executing', 'Claude'],
+      ['codex', 'in_progress', 'Codex'],
+    ] as const)(
+      'restores the %s thinking indicator when an already-running task is opened',
+      (provider, status, label) => {
+        render(
+          <ChatView
+            task={makeTask({ id: provider === 'claude' ? 301 : 302, provider, status })}
+            projects={projects}
+            onBack={onBack}
+          />,
+        );
+
+        expect(screen.getByText(`${label} is thinking...`)).toBeInTheDocument();
+        expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
+      },
+    );
+
     it('shows the background badge while the foreground status is still executing', () => {
       const task = makeTask({ id: 31, status: 'executing', background_active: false });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
@@ -834,6 +951,214 @@ describe('ChatView', () => {
       await waitFor(() => {
         expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
       });
+    });
+  });
+
+  describe('queued message attachment editing', () => {
+    beforeEach(() => {
+      localStorage.clear();
+      vi.mocked(api.sendTaskChat).mockResolvedValue({});
+    });
+
+    it('moves merged queue attachments into the composer and sends their existing path', async () => {
+      const task = makeTask({ id: 410, status: 'executing' });
+      const attachment = makeUpload('merge-report', 'report.md');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'review the report', uploadResults: [attachment] }]),
+      );
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+
+      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      expect(screen.getByRole('textbox')).toHaveValue('review the report');
+      expect(screen.getByText('report.md')).toBeInTheDocument();
+      await waitFor(() => {
+        expect(JSON.parse(
+          localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`) || '[]',
+        )).toEqual([attachment]);
+      });
+
+      rerender(
+        <ChatView
+          task={{ ...task, status: 'completed' }}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      await userEvent.click(await screen.findByTitle(/Send \(Ctrl\+Enter\)/));
+
+      await waitFor(() => {
+        expect(api.sendTaskChat).toHaveBeenCalledWith(
+          task.id,
+          'review the report',
+          [attachment.path],
+          undefined,
+          null,
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+        );
+      });
+    });
+
+    it('persists merged attachments with the text draft across a remount', async () => {
+      const task = makeTask({ id: 411, status: 'executing' });
+      const attachment = makeUpload('draft-notes', 'notes.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'continue later', uploadResults: [attachment] }]),
+      );
+      const first = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+      await waitFor(() => {
+        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
+      });
+      first.unmount();
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      expect(screen.getByRole('textbox')).toHaveValue('continue later');
+      expect(screen.getByText('notes.txt')).toBeInTheDocument();
+      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+    });
+
+    it('restores attachments when editing one queued message', async () => {
+      const task = makeTask({ id: 412, status: 'executing' });
+      const attachment = makeUpload('edit-evidence', 'evidence.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'edit this', uploadResults: [attachment] }]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByTitle('Edit in input'));
+
+      expect(screen.getByRole('textbox')).toHaveValue('edit this');
+      expect(screen.getByText('evidence.txt')).toBeInTheDocument();
+      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+    });
+
+    it('keeps merged attachments when the edited message is queued again', async () => {
+      const task = makeTask({ id: 417, status: 'executing' });
+      const attachment = makeUpload('requeue-upload', 'requeue.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'before edit', uploadResults: [attachment] }]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+      const textbox = screen.getByRole('textbox');
+      await userEvent.clear(textbox);
+      await userEvent.type(textbox, 'after edit');
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(screen.getByText('after edit')).toBeInTheDocument();
+      await waitFor(() => {
+        expect(JSON.parse(
+          localStorage.getItem(`ccm-chat-queue-${task.id}`) || '[]',
+        )).toEqual([{
+          text: 'after edit',
+          uploadResults: [attachment],
+        }]);
+      });
+    });
+
+    it('deduplicates attachments while preserving queued message order', async () => {
+      const task = makeTask({ id: 413, status: 'executing' });
+      const repeated = makeUpload('same-upload', 'same.txt');
+      const other = makeUpload('other-upload', 'other.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([
+          { text: 'first', uploadResults: [repeated] },
+          { text: 'second', uploadResults: [repeated, other] },
+        ]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+
+      expect(screen.getByRole('textbox')).toHaveValue('first\n\nsecond');
+      expect(screen.getAllByText('same.txt')).toHaveLength(1);
+      expect(screen.getAllByText('other.txt')).toHaveLength(1);
+    });
+
+    it('rejects an over-limit merge atomically and keeps the queue intact', async () => {
+      const task = makeTask({ id: 414, status: 'executing' });
+      const attachments = Array.from(
+        { length: 11 },
+        (_, index) => makeUpload(`limit-${index}`, `limit-${index}.txt`),
+      );
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([
+          { text: 'first batch', uploadResults: attachments.slice(0, 6) },
+          { text: 'second batch', uploadResults: attachments.slice(6) },
+        ]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+
+      expect(screen.getByText(/合并后将有 11 个附件/)).toBeInTheDocument();
+      expect(screen.getByText('Queued messages (2)')).toBeInTheDocument();
+      expect(screen.getByRole('textbox')).toHaveValue('');
+      expect(screen.queryByText('limit-0.txt')).not.toBeInTheDocument();
+    });
+
+    it('restores a merged attachment when sending fails', async () => {
+      const task = makeTask({ id: 415, status: 'executing' });
+      const attachment = makeUpload('retry-upload', 'retry.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'retry this', uploadResults: [attachment] }]),
+      );
+      vi.mocked(api.sendTaskChat).mockRejectedValueOnce(new Error('send failed'));
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+      rerender(
+        <ChatView
+          task={{ ...task, status: 'completed' }}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      await userEvent.click(await screen.findByTitle(/Send \(Ctrl\+Enter\)/));
+
+      expect(await screen.findByText(/send failed/)).toBeInTheDocument();
+      expect(screen.getByRole('textbox')).toHaveValue('retry this');
+      expect(screen.getByText('retry.txt')).toBeInTheDocument();
+      await waitFor(() => {
+        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
+      });
+    });
+
+    it('keeps the existing text-only merge behavior', async () => {
+      const task = makeTask({ id: 416, status: 'executing' });
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'plain follow-up' }]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+
+      expect(screen.getByRole('textbox')).toHaveValue('plain follow-up');
+      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
     });
   });
 
@@ -1402,6 +1727,48 @@ describe('ChatView', () => {
     });
   });
 
+  describe('Attention tag', () => {
+    it('shows an existing attention tag in the chat header', () => {
+      render(
+        <ChatView
+          task={makeTask({ attention_tag: '等待模型结束' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.getByText('等待模型结束')).toBeInTheDocument();
+      expect(screen.getByTitle('Edit attention tag')).toBeInTheDocument();
+    });
+
+    it('adds an attention tag from the chat header and refreshes the task', async () => {
+      vi.mocked(api.updateTask).mockResolvedValueOnce(
+        makeTask({ attention_tag: '需要人工确认' }),
+      );
+      render(
+        <ChatView
+          task={makeTask({ attention_tag: null })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('Add attention tag'));
+      await userEvent.type(screen.getByLabelText('Attention tag'), '需要人工确认');
+      await userEvent.click(screen.getByTitle('Save attention tag'));
+
+      await waitFor(() => {
+        expect(api.updateTask).toHaveBeenCalledWith(1, {
+          attention_tag: '需要人工确认',
+        });
+      });
+      expect(onTaskUpdated).toHaveBeenCalledWith(
+        expect.objectContaining({ attention_tag: '需要人工确认' }),
+      );
+    });
+  });
+
   describe('Title editing', () => {
     it('enters edit mode on pencil click', async () => {
       const task = makeTask({ title: 'My Title' });
@@ -1568,6 +1935,81 @@ describe('ChatView', () => {
 
       await act(async () => { resolveHistory([]); });
       expect(screen.getByText('live while snapshot is in flight')).toBeInTheDocument();
+    });
+
+    it('pages from the HTTP boundary when an older persisted WS row is retained', async () => {
+      const latest = Array.from({ length: 200 }, (_, index): ChatMessage => ({
+        id: 210 + index,
+        role: 'assistant',
+        event_type: 'message',
+        content: `latest-${index}`,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: `2026-07-30T10:${String(index % 60).padStart(2, '0')}:00Z`,
+        image_urls: null,
+        attachments: null,
+      }));
+      const injected: ChatMessage = {
+        id: 10,
+        role: 'user',
+        event_type: 'user_message',
+        content: '[Admin] early steer',
+        raw_content: 'early steer',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-07-30T09:00:00Z',
+        image_urls: null,
+        attachments: null,
+        source: 'inject',
+      };
+      vi.mocked(api.getTaskChatHistory)
+        .mockResolvedValueOnce(latest)
+        .mockResolvedValueOnce([injected]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 16, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      await screen.findByText('latest-199');
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:16',
+          data: {
+            ...injected,
+            task_id: 16,
+          },
+        });
+      });
+      expect(screen.getAllByText('[Admin] early steer')).toHaveLength(1);
+
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Load older messages' }),
+      );
+
+      await waitFor(() => {
+        expect(api.getTaskChatHistory).toHaveBeenNthCalledWith(
+          2,
+          16,
+          true,
+          200,
+          210,
+        );
+      });
+      await waitFor(() => {
+        expect(screen.getAllByText('[Admin] early steer')).toHaveLength(1);
+      });
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
     });
 
     it('backfills again after the task-channel subscription is acknowledged', async () => {
@@ -2096,6 +2538,70 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     expect(screen.queryByText('检查训练状态')).not.toBeInTheDocument();
   });
 
+  it('权威用户消息即使不是最后一条，也会替换此前的实时气泡', async () => {
+    const task = makeTask({ id: 120, description: null });
+    render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    await act(async () => {
+      wsUserMessage(120, {
+        content: '检查训练状态',
+        raw_content: '检查训练状态',
+      });
+      capturedOnMessage!({
+        channel: 'task:120',
+        data: {
+          id: 700,
+          event_type: 'message',
+          role: 'assistant',
+          content: '正在检查',
+          timestamp: '2026-07-30T10:00:01Z',
+        },
+      });
+      wsUserMessage(120, {
+        id: 699,
+        content: '[Admin] 检查训练状态',
+        raw_content: '检查训练状态',
+        timestamp: '2026-07-30T10:00:00Z',
+      });
+    });
+
+    expect(screen.getByText('[Admin] 检查训练状态')).toBeInTheDocument();
+    expect(screen.queryByText('检查训练状态')).not.toBeInTheDocument();
+    expect(screen.getByText('正在检查')).toBeInTheDocument();
+  });
+
+  it('同一个持久化用户消息重放时按 id 原位更新而不追加', async () => {
+    const task = makeTask({ id: 121, description: null });
+    render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    await act(async () => {
+      wsUserMessage(121, {
+        id: 801,
+        content: '[Admin] 只显示一次',
+        raw_content: '只显示一次',
+      });
+      capturedOnMessage!({
+        channel: 'task:121',
+        data: {
+          id: 802,
+          event_type: 'message',
+          role: 'assistant',
+          content: '中间输出',
+        },
+      });
+      wsUserMessage(121, {
+        id: 801,
+        content: '[Admin] 只显示一次',
+        raw_content: '只显示一次',
+      });
+    });
+
+    expect(screen.getAllByText('[Admin] 只显示一次')).toHaveLength(1);
+    expect(screen.getByText('中间输出')).toBeInTheDocument();
+  });
+
   it('Capacitor（手机 App）下附件相对 URL 必须拼上远程服务器地址', async () => {
     (window as Record<string, unknown>).Capacitor = {};
     localStorage.setItem('cc_server_url', 'https://ccm.example.com');
@@ -2131,6 +2637,142 @@ describe('聊天图片附件展示（2026-07-16 用户反馈：发图后图片�
     render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
     const img = document.querySelector('img[src*="/api/uploads/init.png"]');
     expect(img).not.toBeNull();
+  });
+
+  it('助手消息里的任务文件链接一键下载，外部链接保持原行为', async () => {
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {});
+    const createObjectUrl = vi.fn().mockReturnValue('blob:artifact');
+    const revokeObjectUrl = vi.fn();
+    const NativeURL = URL;
+    class MockURL extends NativeURL {
+      static createObjectURL = createObjectUrl;
+      static revokeObjectURL = revokeObjectUrl;
+    }
+    vi.stubGlobal('URL', MockURL);
+    vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+      {
+        id: 501,
+        role: 'assistant',
+        event_type: 'message',
+        content: '[汇报稿.md](输出/汇报稿.md) [官网](https://example.com)',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      },
+    ]);
+    const task = makeTask({ id: 88 });
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    const artifactLink = await screen.findByRole('link', { name: /汇报稿\.md/ });
+    const externalLink = screen.getByRole('link', { name: '官网' });
+
+    expect(externalLink).toHaveAttribute('href', 'https://example.com');
+    expect(externalLink).toHaveAttribute('target', '_blank');
+    fireEvent.click(artifactLink);
+
+    await waitFor(() => {
+      expect(api.downloadTaskArtifact).toHaveBeenCalledWith(
+        88,
+        '%E8%BE%93%E5%87%BA/%E6%B1%87%E6%8A%A5%E7%A8%BF.md',
+      );
+    });
+    expect(createObjectUrl).toHaveBeenCalled();
+    expect(clickSpy).toHaveBeenCalled();
+    clickSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it('普通文件名链接不误判为产物，显式标记仍可下载', async () => {
+    vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+      {
+        id: 504,
+        role: 'assistant',
+        event_type: 'message',
+        content: '[DEPLOYMENT.md](DEPLOYMENT.md) [下载报告](report.pdf "ccm-task-artifact")',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      },
+    ]);
+
+    render(<ChatView task={makeTask({ id: 91 })} projects={projects} onBack={onBack} />);
+
+    const sourceLink = await screen.findByRole('link', { name: 'DEPLOYMENT.md' });
+    const artifactLink = screen.getByRole('link', { name: /下载报告/ });
+    expect(sourceLink).toHaveAttribute('href', 'DEPLOYMENT.md');
+    expect(sourceLink).not.toHaveAttribute('title', '下载任务文件');
+    expect(artifactLink).toHaveAttribute('title', '下载任务文件');
+  });
+
+  it.each(['claude', 'codex'] as const)(
+    '%s 助手返回裸绝对文件路径时自动显示任务下载链接',
+    async (provider) => {
+      const artifactPath = '/home/ubuntu/Projects/调研coding agent/test-download.txt';
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        {
+          id: 502,
+          role: 'assistant',
+          event_type: 'message',
+          content: `测试下载文件已生成：${artifactPath}\n\n文件约 1 KB。`,
+          tool_name: null,
+          tool_input: null,
+          tool_output: null,
+          is_error: false,
+          loop_iteration: null,
+          timestamp: null,
+          image_urls: null,
+          attachments: null,
+        },
+      ]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 89, provider })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const link = await screen.findByRole('link', { name: /test-download\.txt/ });
+      expect(decodeURI(link.getAttribute('href') || '')).toBe(artifactPath);
+      expect(link).toHaveAttribute('title', '下载任务文件');
+    },
+  );
+
+  it('不把代码中的绝对文件路径兜底改写为下载链接', async () => {
+    vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+      {
+        id: 503,
+        role: 'assistant',
+        event_type: 'message',
+        content: '示例：`/home/ubuntu/report.txt`\n\n```text\n/home/ubuntu/output.txt\n```',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: null,
+        image_urls: null,
+        attachments: null,
+      },
+    ]);
+
+    render(<ChatView task={makeTask({ id: 90 })} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('/home/ubuntu/report.txt')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'report.txt' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'output.txt' })).not.toBeInTheDocument();
   });
 });
 
@@ -2170,6 +2812,58 @@ describe('Codex app-server 增量消息', () => {
       });
     });
     expect(screen.getAllByText('Hello')).toHaveLength(1);
+  });
+
+  it('切走再切回运行中的 task 后保留并继续合并未完成 thinking', async () => {
+    const task = makeTask({ id: 2101, provider: 'codex', status: 'executing' });
+    const first = render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:2101',
+        data: {
+          event_type: 'thinking_delta',
+          item_id: 'reasoning-1',
+          content: 'first half',
+        },
+      });
+    });
+    expect(screen.getByText('first half')).toBeInTheDocument();
+    first.unmount();
+
+    const second = render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    expect(screen.getByText('first half')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:2101',
+        data: {
+          event_type: 'thinking_delta',
+          item_id: 'reasoning-1',
+          content: ' second half',
+        },
+      });
+    });
+    expect(screen.getByText('first half second half')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:2101',
+        data: {
+          id: 991,
+          event_type: 'thinking',
+          item_id: 'reasoning-1',
+          role: 'assistant',
+          content: 'first half second half',
+        },
+      });
+    });
+    expect(screen.getAllByText('first half second half')).toHaveLength(1);
+    second.unmount();
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    expect(screen.queryByText('first half second half')).not.toBeInTheDocument();
   });
 });
 

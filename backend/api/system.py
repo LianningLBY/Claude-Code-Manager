@@ -22,6 +22,13 @@ from backend.services.claude_models import (
     CLAUDE_MODEL_EFFORTS,
 )
 from backend.services.git_info import git_head_commit
+from backend.services.pr_review_runtime import (
+    PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
+    PR_REVIEW_TERMINAL_CHAT_VERSION,
+)
+from backend.services.task_artifact_contract import (
+    TASK_ARTIFACT_SCOPE_VERSION,
+)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -80,9 +87,19 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "codex_service_tier_options": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
         "versioned_plan_worker_protocol": 3,
-        "plan_pipeline_defaults": (
-            plan_pipeline.model_dump(mode="json")
+        "plan_pipeline_defaults": plan_pipeline.model_dump(mode="json"),
+        # Manager must see this exact capability before forwarding a PR review
+        # to a Worker. Older Workers would run it from their CCM checkout and
+        # silently load unrelated CLAUDE.md/AGENTS.md instructions.
+        "pr_review_snapshot_context_version": (
+            PR_REVIEW_SNAPSHOT_CONTEXT_VERSION
         ),
+        # A Manager must confirm this before persisting a terminal PR-review
+        # follow-up for a Worker. Older Workers still freeze every PR chat.
+        "pr_review_terminal_chat_version": PR_REVIEW_TERMINAL_CHAT_VERSION,
+        # Manager-side ACL must not proxy the managed Task namespace to an
+        # older Worker that lacks the same cross-Task path fence.
+        "task_artifact_scope_version": TASK_ARTIFACT_SCOPE_VERSION,
     }
 
 

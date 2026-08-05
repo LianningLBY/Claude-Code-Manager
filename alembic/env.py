@@ -27,7 +27,12 @@ from backend.models.global_settings import GlobalSettings  # noqa: F401
 from backend.models.discussion import Discussion, DiscussionMessage, DiscussionAgent, DiscussionEvent  # noqa: F401
 from backend.models.quick_phrase import QuickPhrase  # noqa: F401
 from backend.models.monitor_session import MonitorSession, MonitorCheck  # noqa: F401
-from backend.models.pr_monitor import MonitoredRepo, PRReview  # noqa: F401
+from backend.models.pr_monitor import (  # noqa: F401
+    MonitoredRepo,
+    PRFinding,
+    PRReview,
+    PRReviewerRun,
+)
 from backend.models.worker import Worker  # noqa: F401
 from backend.models.skill_lesson import SkillLesson, SkillUsage  # noqa: F401
 from backend.models.user_skill import UserSkill  # noqa: F401

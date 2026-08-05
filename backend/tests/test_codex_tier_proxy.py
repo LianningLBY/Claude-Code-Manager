@@ -844,3 +844,27 @@ def test_override_args_are_non_persistent_and_disable_compression():
         ),
     )
     assert args[2:] == ("--disable", "enable_request_compression")
+
+
+def test_native_override_uses_http_only_authenticated_provider():
+    proxy = CodexActualTierProxy(
+        CodexTierProxyRoute(
+            "https://chatgpt.com/backend-api/codex",
+            provider_id="openai",
+            built_in_openai=True,
+        ),
+    )
+    proxy._server = object()  # type: ignore[assignment]
+    proxy._port = 4321
+
+    args = proxy.codex_override_args()
+
+    assert "model_provider=\"ccm_actual_tier\"" in args
+    assert (
+        "model_providers.ccm_actual_tier.base_url="
+        + json.dumps(proxy.local_base_url)
+    ) in args
+    assert "model_providers.ccm_actual_tier.wire_api=\"responses\"" in args
+    assert "model_providers.ccm_actual_tier.requires_openai_auth=true" in args
+    assert "model_providers.ccm_actual_tier.supports_websockets=false" in args
+    assert args[-2:] == ("--disable", "enable_request_compression")

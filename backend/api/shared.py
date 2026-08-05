@@ -118,6 +118,7 @@ async def _start_relay_and_backfill(relay, shared: SharedTaskReceived):
                 shadow.session_id = config.get("session_id") or shadow.session_id
                 shadow.target_repo = config.get("target_repo")
                 shadow.error_message = config.get("error_message")
+                shadow.attention_tag = config.get("attention_tag")
                 await db.commit()
     except Exception:
         logger.debug("failed to fetch initial config for shared %d", shared.id)

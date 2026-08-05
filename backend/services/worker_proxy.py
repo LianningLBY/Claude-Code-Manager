@@ -18,6 +18,8 @@ from weakref import WeakKeyDictionary
 import httpx
 from fastapi import HTTPException
 from sqlalchemy import select
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from backend.config import settings
 from backend.models.project import Project
@@ -25,7 +27,18 @@ from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.services.pr_review_runtime import (
+    PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
+    PR_REVIEW_TERMINAL_CHAT_HEADER,
+    PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    PR_REVIEW_TERMINAL_CHAT_VERSION,
+    is_pr_review_task,
+    is_pr_sandbox_task,
+)
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
+from backend.services.task_artifact_contract import (
+    TASK_ARTIFACT_SCOPE_VERSION,
+)
 from backend.services.worker_relay import worker_task_generation
 
 logger = logging.getLogger(__name__)
@@ -618,16 +631,19 @@ class WorkerProxy:
         worker: Worker,
         task: Task,
     ) -> None:
-        """Fail before remote task creation when a Worker cannot prove Fast.
+        """Fail before creation when a Worker cannot prove required features.
 
         Older Workers ignore unknown Task fields, which would otherwise let a
-        Manager display Fast while the remote turn runs as Standard.
+        Manager display Fast while the remote turn runs as Standard, or run a
+        PR review from the Worker's CCM checkout without snapshot isolation.
         """
 
-        if (
-            (task.provider or "claude").lower() != "codex"
-            or (task.codex_service_tier or "default") != "priority"
-        ):
+        needs_fast = (
+            (task.provider or "claude").lower() == "codex"
+            and (task.codex_service_tier or "default") == "priority"
+        )
+        needs_pr_snapshot_context = is_pr_sandbox_task(task)
+        if not needs_fast and not needs_pr_snapshot_context:
             return
 
         async with httpx.AsyncClient(timeout=30) as c:
@@ -640,12 +656,25 @@ class WorkerProxy:
             config = response.json()
         except Exception as exc:
             raise RuntimeError(
-                f"Worker {worker.name} 无法确认 Codex Fast 能力，任务未转发"
+                f"Worker {worker.name} 无法确认任务所需能力，任务未转发"
             ) from exc
         if not isinstance(config, dict):
             raise RuntimeError(
-                f"Worker {worker.name} 无法确认 Codex Fast 能力，任务未转发"
+                f"Worker {worker.name} 无法确认任务所需能力，任务未转发"
             )
+
+        if (
+            needs_pr_snapshot_context
+            and config.get("pr_review_snapshot_context_version")
+            != PR_REVIEW_SNAPSHOT_CONTEXT_VERSION
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 PR 审核快照隔离能力 v"
+                f"{PR_REVIEW_SNAPSHOT_CONTEXT_VERSION}，任务未转发"
+            )
+
+        if not needs_fast:
+            return
 
         model = task.model
         if not model or model == "default":
@@ -660,6 +689,35 @@ class WorkerProxy:
             raise RuntimeError(
                 f"Worker {worker.name} 未声明模型 {model or 'default'} "
                 "支持 Codex Fast，任务未转发"
+            )
+
+    async def require_terminal_pr_review_chat_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Reject mixed-version PR follow-ups before Manager-side logging."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                f"无法确认 Worker {worker.name} 的 PR 审核续聊能力",
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("pr_review_terminal_chat_version")
+            != PR_REVIEW_TERMINAL_CHAT_VERSION
+        ):
+            raise HTTPException(
+                409,
+                f"Worker {worker.name} 版本过旧，升级后才能继续 PR 审核对话",
             )
 
     async def forward_task_to_worker(
@@ -702,7 +760,15 @@ class WorkerProxy:
             )
 
         await self.require_worker_fast_support(worker, task)
-        worker_project_id = await self.ensure_worker_project(worker, task)
+        # PR reviews use only the remote GitHub snapshot named in their prompt.
+        # Mapping the Manager's synthetic PR-Monitor project would either fail
+        # (it has no repository) or make the Worker load unrelated local agent
+        # docs.  Tags survive Manager→Worker forwarding, unlike metadata.
+        worker_project_id = (
+            None
+            if is_pr_sandbox_task(task)
+            else await self.ensure_worker_project(worker, task)
+        )
 
         metadata = task.metadata_ or {}
         # Related-Plan uploads are validated and marked by the Manager API.
@@ -775,6 +841,7 @@ class WorkerProxy:
             "file_paths": attachment_paths or None,
             "image_paths": image_paths or None,
             "attachments": attachment_records or None,
+            "attention_tag": task.attention_tag,
         }
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(
@@ -890,6 +957,121 @@ class WorkerProxy:
         for path in paths:
             await ssh.copy_file(path, path)
 
+    async def require_task_artifact_scope_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Fail closed when a Worker cannot enforce the managed namespace."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                f"无法确认 Worker {worker.name} 的 Task 产物隔离能力",
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("task_artifact_scope_version")
+            != TASK_ARTIFACT_SCOPE_VERSION
+        ):
+            raise HTTPException(
+                409,
+                f"Worker {worker.name} 版本过旧，升级后才能下载 Task 产物",
+            )
+
+    async def stream_task_artifact(
+        self,
+        task: Task,
+        artifact_path: str,
+    ) -> StreamingResponse:
+        """Stream a task-scoped file from its Worker without buffering it."""
+
+        worker = await self.require_ready_worker(task.worker_id)
+        await self.require_task_artifact_scope_support(worker)
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=None, write=30, pool=10),
+        )
+        try:
+            request = client.build_request(
+                "GET",
+                self._api(
+                    worker,
+                    f"/api/tasks/{task.id}/artifacts/download",
+                ),
+                headers=self._headers(worker),
+                params={"path": artifact_path},
+            )
+            response = await client.send(request, stream=True)
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            await client.aclose()
+            raise HTTPException(
+                503,
+                f"Worker {worker.name} artifact request timed out",
+            ) from exc
+        except (httpx.RequestError, OSError) as exc:
+            await client.aclose()
+            raise HTTPException(
+                502,
+                f"Unable to reach Worker {worker.name}",
+            ) from exc
+
+        if not 200 <= response.status_code < 300:
+            try:
+                payload = await response.aread()
+            finally:
+                await response.aclose()
+                await client.aclose()
+            if response.status_code == 401:
+                raise HTTPException(
+                    502,
+                    f"Worker {worker.name} rejected its internal credential",
+                )
+            status_code = (
+                response.status_code
+                if response.status_code in {400, 403, 404, 413}
+                else 502
+            )
+            detail = "Worker artifact download failed"
+            try:
+                decoded = response.json()
+                if isinstance(decoded, dict) and isinstance(decoded.get("detail"), str):
+                    detail = decoded["detail"]
+            except Exception:
+                if payload:
+                    detail = payload[:300].decode(errors="replace")
+            raise HTTPException(status_code, detail)
+
+        forwarded_headers = {}
+        for header in ("content-disposition", "content-length", "content-type"):
+            value = response.headers.get(header)
+            if value:
+                forwarded_headers[header] = value
+
+        async def close_upstream() -> None:
+            await response.aclose()
+            await client.aclose()
+
+        async def body():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await close_upstream()
+
+        return StreamingResponse(
+            body(),
+            status_code=response.status_code,
+            headers=forwarded_headers,
+            background=BackgroundTask(close_upstream),
+        )
+
     # ------------------------------------------------------------------
     # 通用操作代理（设计 §6.4）
     # ------------------------------------------------------------------
@@ -905,7 +1087,12 @@ class WorkerProxy:
         allow_task_absent: bool = False,
         surface_endpoint_not_found: bool = False,
         operation_lock_held: bool = False,
+        pr_review_terminal_chat: bool = False,
     ):
+        if pr_review_terminal_chat and not is_pr_review_task(task):
+            raise ValueError(
+                "Terminal PR review chat authorization requires a PR review Task"
+            )
         if operation_lock_held:
             return await self._proxy_to_worker_locked(
                 task,
@@ -915,6 +1102,7 @@ class WorkerProxy:
                 require_json=require_json,
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
+                pr_review_terminal_chat=pr_review_terminal_chat,
             )
         async with self.task_operation_lock(task.id):
             return await self._proxy_to_worker_locked(
@@ -925,6 +1113,7 @@ class WorkerProxy:
                 require_json=require_json,
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
+                pr_review_terminal_chat=pr_review_terminal_chat,
             )
 
     async def _proxy_to_worker_locked(
@@ -937,14 +1126,20 @@ class WorkerProxy:
         require_json: bool,
         allow_task_absent: bool,
         surface_endpoint_not_found: bool,
+        pr_review_terminal_chat: bool,
     ):
         worker = await self.require_ready_worker(task.worker_id)
         await self.relay.subscribe_task(worker, task.id)
+        headers = self._headers(worker)
+        if pr_review_terminal_chat:
+            headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
+                PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
+            )
         async with httpx.AsyncClient(timeout=60) as c:
             try:
                 r = await c.request(
                     method, self._api(worker, path),
-                    headers=self._headers(worker), json=body,
+                    headers=headers, json=body,
                 )
             except (httpx.TimeoutException, TimeoutError) as exc:
                 raise HTTPException(

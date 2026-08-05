@@ -22,6 +22,7 @@ from backend.services.goal_evaluator import (
     _GOAL_EVALUATOR_TASK_IDS,
     _UNREAPED_CODEX_GOAL_EVALUATOR_TURNS,
     _UNREAPED_GOAL_EVALUATOR_PROCESSES,
+    codex_goal_evaluator_runtime_homes,
     _register_goal_evaluator_process,
     _terminate_process_shielded,
     goal_evaluator_runtime_users,
@@ -341,6 +342,66 @@ async def test_cleanup_failed_runtime_user_remains_until_reaper_proves_terminal(
         assert goal_evaluator_runtime_users(
             "claude", str(provider_home),
         ) == []
+    finally:
+        process_token = id(mock_proc)
+        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
+        _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
+        _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_codex_evaluator_keeps_home_admission_blocked(
+    tmp_path,
+):
+    from backend.services.codex_app_server import CodexAppServerBusyError
+    from backend.services.instance_manager import InstanceManager
+
+    evaluator = GoalEvaluator()
+    provider_home = str((tmp_path / "codex-retained").resolve())
+    manager = InstanceManager(MagicMock(), MagicMock())
+    mock_proc = MagicMock(pid=55_103, returncode=0)
+    mock_proc.communicate = AsyncMock(return_value=(b"{}", b""))
+
+    try:
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch(
+                "backend.services.goal_evaluator._terminate_process",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("terminal proof unavailable"),
+            ),
+        ):
+            with pytest.raises(GoalEvaluatorCleanupError):
+                async with manager.codex_home_exec_guard(
+                    provider_home
+                ) as admitted_home:
+                    await evaluator.evaluate(
+                        condition="cond",
+                        conversation_summary="conv",
+                        provider="codex",
+                        config_dir=admitted_home,
+                        task_id=903,
+                    )
+
+        assert manager._codex_ephemeral_home_users == {}
+        assert codex_goal_evaluator_runtime_homes() == {provider_home}
+        assert provider_home in manager.busy_codex_homes()
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="retained ephemeral exec",
+        ):
+            async with manager.codex_home_app_server_guard(provider_home):
+                pytest.fail("retained evaluator must block app-server admission")
+
+        with patch(
+            "backend.services.goal_evaluator._terminate_process",
+            new_callable=AsyncMock,
+        ):
+            await reap_unreaped_goal_evaluators()
+
+        assert codex_goal_evaluator_runtime_homes() == set()
+        async with manager.codex_home_exec_guard(provider_home):
+            pass
     finally:
         process_token = id(mock_proc)
         _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)

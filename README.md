@@ -34,6 +34,9 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 
 ### 交互与对话
 - **多轮对话** — 任务完成后可通过 Chat 界面继续追问，自动 `--resume` 同一 session
+- **Session 关注标签** — 每个 Task 可维护一个自定义短标签，在任务列表和 Chat 顶栏醒目展示并随时编辑，便于记录“何时再看/下一步做什么”；该字段与系统内部 `tags` 独立，复制、Fork 和 Worker 迁移时会保留
+- **Task 产物下载** — Claude/Codex 会把明确交付给用户的文件保存到当前 Project 的 `.claude-manager/artifacts/task-<id>/`，聊天中的显式产物链接可直接下载；普通源码和文档引用不会误显示为下载文件
+- **数学公式渲染** — 聊天和 Discussion 中的 Markdown 支持 KaTeX；兼容 Codex 常用的 `\\(...\\)` / 整段 `\\[...\\]` 以及 `$$...$$`，单美元符号内容按普通文本显示，链接、HTML、代码和货币内容保持不变
 - **交互式提问（ask_user）** — 模型调用内置 `AskUserQuestion` 时，聊天里弹出可选卡片（单选/多选/自定义文本），用户选完即把答案喂回模型继续。超时默认 1800s，支持跨页面全局通知（右下角弹窗 + 未读标记），可用 `ASK_USER_ENABLED=false` 关闭
 - **权限透传（PTY 模式）** — CC 请求工具权限时聊天里出现卡片（工具名/描述/输入预览），点允许/拒绝实时回包；120s 超时默认拒绝
 - **语音输入** — 通过 OpenAI Whisper API 语音转文字创建任务
@@ -52,7 +55,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 
 ### 项目与协作
 - **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目
-- **PR Monitor** — GitHub PR 自动审核，Webhook 接收 PR 事件后创建审核 Task，Claude 审核代码后自动 approve/merge 或 request-changes
+- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
 - **PWA** — 手机浏览器 Add to Home Screen，原生 App 体验
 - **Android App** — 通过 Capacitor 打包原生 APK，App 内可配置远程服务器地址
 - **主题切换** — v2 主题系统：现代深色（默认，Multica 风格）/ 现代浅色（tonal zinc 灰调分层）/ 飞书（官方色板 + 真实 App 截图取色实证：白底为主 + 经典飞书蓝 #3370FF + N 系中性色 + 低边框风，与浅色主题以「白 vs 灰」区分，飞书客户端式窄图标 rail + IconPark 双色图标集）/ 苹果（apple-design skill 驱动：iOS systemGray 中性色 + apple.com CTA 蓝 #0071E3 + 系统字体优先 + 毛玻璃顶栏 + 按压反馈 + macOS Settings 式侧栏与 Ionicons 图标集，尊重 reduced-motion/transparency），v1 的经典深色、海蓝、森林、莓红完整保留为 Legacy 组，偏好持久化
@@ -372,6 +375,7 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 2. **Dispatcher** 自动分配任务到空闲 worker → Claude Code 自主完成所有工作（含 worktree 创建和清理） → 取下一个
 3. 点击任务的 **Chat** 按钮，可以对已完成的任务继续追问
 4. 启用 Monitor 的任务中，Agent 可自主创建持久监控子 Agent，Task 列表显示活跃子 Agent 数量
+5. 可在任务卡片菜单添加一个关注标签，或直接点击任务卡片/Chat 顶栏中的标签修改；清空并保存即可移除
 
 ### Interactive Plans
 
@@ -413,6 +417,10 @@ PR Monitor 的审核流程会在后端 shell out 调用 `gh pr view` / `gh pr re
 1. **gh CLI 已认证**：运行后端的系统用户必须先执行 `gh auth login` 完成 GitHub 认证
 2. **账号权限**：该 GitHub 账号需要对被监控仓库有 push / review 权限（auto-merge 还需要 merge 权限）
 3. **PUBLIC_BASE_URL**：在 `.env` 中设置 `PUBLIC_BASE_URL`（如 `https://ccm.example.com`），PR Monitor 页面才能显示正确的 Webhook Payload URL
+
+Panel 中的 Finding 操作是独立的审计流程：**Ignore** 和 **Human advice** 只保存决策或供下一次候选生成参考，不会把阻断项改成通过；**Generate AI fix** 会在与 Reviewer 相同的 tool-free 沙箱中读取后端冻结的 exact-head 单文件输入，只输出有界 unified diff，不会直接访问仓库或 GitHub。候选完成后必须从 CCM 后端下载 diff；后端签发并保存与当前用户、Action 和 SHA-256 绑定的下载回执，只有回传同一回执并再次确认 exact base/head/repo/ref 后才会创建 commit。push 以 captured head 为 expected-old 做原子 compare-and-swap，分支被删除、漂移或远端结果无法证明时会拒绝或进入可对账恢复，不覆盖他人提交。
+
+同一 Finding 同时只有一个 active AI fix。自动 fix Task 的编辑、聊天、注入、重试、取消、停止和删除入口均被冻结；本机和 Worker 都由 Manager 按 exact generation 收口结果，Worker 成功前先补齐完整日志，失败或 Manager/Worker 崩溃后则从持久 Action/lease 恢复，不能靠内存状态重复生成或重复 push。详细状态机与安全边界见 [PR Monitor 权威设计](docs/pr-monitor-design.md)。
 
 ## 分布式 Worker
 
@@ -767,6 +775,7 @@ cloudflared tunnel run <tunnel-name>
 - **Claude Code 集成**：默认 PTY 模式（常驻交互会话，多轮免冷启动）；可切换为 `claude -p` 一次性进程模式（`USE_PTY_MODE=false`）
 - **进程超时保护**：任务执行超过 `TASK_TIMEOUT_SECONDS`（默认 30 分钟）后自动 kill，防止进程挂死
 - **多轮对话**：session_id 绑定在 Task 上，follow-up 时使用 `--resume <session_id>` 续接会话
+- **Codex 共享传输停止**：`stop-session` 只停止目标 turn。若精确中断暂时无法确认，且同一账号 app-server 还在服务其他 turn 或已准入请求，API 返回 409 并保留原任务运行证据，可稍后重试；不会为停一个任务杀掉同账号的其他任务
 - **Codex Fast**：`Task.codex_service_tier` 持久保存 `default|priority`。Standard 会显式清除会话残留的 Fast tier；Fast 必须同时通过当前账号 `model/list` 能力检查、app-server 显式 priority 准入，以及 CCM loopback Responses 代理对上游 `response.created.response.service_tier=priority` 的实际响应验证。成功 SSE 在验证前不会释放；缺字段、不一致、非 2xx、未知 lineage 或代理不可用都会明确失败，且 Fast 禁止回退 `codex exec`。日志与聊天事件会记录 `actual_service_tier_verified=true` 和上游 response id。Fast Goal evaluator 使用与任务相同的模型并走同一实际 tier 证明链路；当前 Distill 无法提供同等证明，因此 Fast Task 会在 Distill 执行前明确返回 409
 - **子 Agent 系统**：统一存 `sub_agent_sessions` 表，`agent_type` 区分类别（monitor / native-agent / native-monitor）。CCM 自有子 agent 拥有独立 MCP server，通过 HTTP API 与系统通信
 - **瞬时过载重试**：Anthropic 基础设施侧 429/overloaded 与账号额度用尽严格区分，前者退避重试同一账号，后者走号池轮换

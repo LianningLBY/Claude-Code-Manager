@@ -71,6 +71,7 @@ _COORDINATED_TASK_UPDATE_FIELDS = frozenset({
     "provider",
     "starred",
     "tags",
+    "attention_tag",
     # Internal transport for validated User Skill snapshots.
     "metadata_",
 })
@@ -1279,6 +1280,7 @@ class TaskMigrator:
             "selected_user_skills": task.selected_user_skills,
             "user_skill_snapshots": user_skill_snapshots,
             "tags": task.tags,
+            "attention_tag": task.attention_tag,
             "starred": task.starred,
             "session_id": task.session_id,
             "last_cwd": task.last_cwd,

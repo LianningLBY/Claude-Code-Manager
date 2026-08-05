@@ -128,6 +128,8 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_delete_task` | DELETE 删除任务 |
 | `test_cancel_task` | 取消任务 |
 | `test_retry_task` | 重试任务 |
+| `test_attention_tag_create_update_and_clear_preserves_system_tags` | 关注标签会裁剪首尾空白、可清空，且不改写系统内部 `tags` |
+| `test_cloned_task_inherits_attention_tag_unless_overridden` | Clone 默认继承关注标签，显式覆盖或清空时按请求处理 |
 | `test_create_task_defaults_to_standard_service_tier` / `test_create_fast_codex_task_persists_priority` | Task 默认持久化 Standard，Codex Fast 持久化 `priority` |
 | `test_create_fast_task_rejects_incompatible_configuration` / `test_update_validates_merged_provider_model_and_service_tier` | Claude、mini/Spark 与合并更新不能绕过 Fast 能力校验 |
 | `test_migration_import_*_fast_service_tier` | Worker migration-import 保留兼容 Fast，拒绝不支持模型 |
@@ -230,8 +232,8 @@ websocket identity 校验及固定端口上的孤儿 Chrome 不会被复用；
 |---------|---------|
 | `test_claude_pool.py` | API-first 模型兼容选择、quota/auth fail-closed、Claude session + sidecar 安全迁移，以及候选选择不会提前更新 `last_selected` |
 | `test_codex_pool.py` | API-first 与原生 fallback、独立 round-robin cursor、额度终态分类和最终路由 marker |
-| `test_resume_config_dir.py` | preferred 手动切换、已有会话粘性、Task durable binding、多副本消歧，以及 rollout copy 期间取消/代次变化不会产生无主副本 |
-| `test_service_instance_manager.py` | Claude/Codex reactive/proactive 换号、精确 queued message 保留、Codex copy→rebind→binding 的 cancellation-settled 事务，以及 silent exit/`turn.failed` 按真实 provider 归因且不重复报错 |
+| `test_resume_config_dir.py` | preferred 手动切换、已有会话粘性、Task durable binding、多副本消歧、runtime-busy 短退避、disabled source 等待可迁移目标，以及 rollout copy 期间取消/代次变化不会产生无主副本 |
+| `test_service_instance_manager.py` | Claude/Codex reactive/proactive 换号、精确 queued message 保留、Codex copy→rebind→binding 的 cancellation-settled 事务、direct/ephemeral per-home admission，以及 silent exit/`turn.failed` 按真实 provider 归因且不重复报错 |
 | `PoolDrawer.test.tsx` | Claude/Codex 的「优先账号」「最近使用」独立展示，以及恢复自动后的 API-first/旧会话绑定提示 |
 
 #### `test_api_projects.py` — 项目 API
@@ -471,6 +473,10 @@ Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；S
 |------|---------|
 | `ChatView > Codex main MCP capability` | Manager 默认开启、紧急关闭、runtime broadcast，以及 Worker 代理 runtime capability 均显示准确 |
 | `PrefsMenu > shows the read-only Codex main MCP runtime capability for admins` | 管理员设置菜单展示只读的实际主任务 MCP capability |
+| `AttentionTag.test.tsx` | 单标签展示、添加、修改、清空、失败后保留草稿 |
+| `TaskList / ChatView > Attention tag` | 任务卡片与 Chat 顶栏可显示和保存关注标签，并刷新 Task 数据 |
+
+关注标签人工冒烟：在无标签任务的卡片菜单选择 `Add attention tag`，输入中文并保存；确认卡片与 Chat 顶栏同步显示。点击标签修改，再清空保存，确认标签消失；Task 原有项目标签、PR/系统标记保持不变。
 
 人工 app-server/exec smoke（仅测试环境）：
 
@@ -614,6 +620,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_codex_app_server.py::test_existing_goal_turn_notification_rebinds_submission_id` | adopted goal 同时保留 active/submission 两个通知 ID，任一 ID 的 assistant/terminal 事件都不能丢 |
 | `test_codex_app_server.py::test_signal_interrupt_reconciles_and_pauses_existing_goal_turn` | adopted goal Interrupt 只做一次 pause RPC，再中断权威 active turn |
 | `test_service_instance_manager.py::test_internal_codex_abort_is_not_a_successful_chat_terminal` | transport/admission 内部 abort 不得伪装成用户 Interrupt 的 completed |
+| `test_codex_app_server.py::test_claimed_stop_preserves_shared_transport_when_interrupt_unconfirmed` / `test_claimed_stop_rejects_an_in_flight_steer_before_interrupt` / `test_unconfirmed_descendant_abandon_escalates_transport_shutdown` | 已持久 claim 的 stop 在 peer/steer 存在时保留共享 transport 与所有 turn；drain 后拒绝新 steer；真正 unclaimed cleanup 仍 fail closed 关闭账号 transport |
+| `test_service_instance_manager.py::test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy` / `test_api_tasks.py::test_stop_session_reports_unresolved_exact_owner` | 无法隔离的停止保留 Task→Instance、process 和 consumer，不影响 peer；API 返回 409 且不写伪终态/广播 |
+| `test_codex_app_server.py::test_reader_exit_zero_during_shutdown_is_not_reported_as_unexpected` / `test_eof_observed_before_shutdown_intent_remains_unexpected` / `test_reader_exit_does_not_leak_shared_stderr_to_tasks` | exact-generation 计划关闭只中断 target，EOF 先发生仍算真实崩溃；账号级 stderr tail 不泄漏给 Task |
 | `test_service_dispatcher.py::test_cancelled_task_followup_reclaims_session_instead_of_dropping` | Cancel 仅终止当前 generation，后续 chat 可安全领取原生 session 并恢复 executing |
 | `test_codex_app_server.py::test_context_window_error_keeps_structured_codex_error_info` | `turn/completed` 失败不得丢弃 `codexErrorInfo=contextWindowExceeded` 与 additionalDetails |
 | `test_context_compaction.py` | provider 共享的上下文超限分类、Codex current-context token 计算及旧 usage fallback |
@@ -626,6 +635,11 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | 前端 `ProjectTodoList.test.tsx` | Todo Run 建 task 带 provider |
 | 前端 `TaskForm.test.tsx::Codex provider UI gating` | Codex 开放普通/User Skills 与 Sub-Agent；仅 capability 已确认的本地 Project 显示 Monitor，Worker Project 与 kill switch 关闭状态隐藏 |
 | 前端 `MonitorPanel.test.tsx` | 本地 Codex capability 已确认时不显示警告；Worker、Shared 或 capability 未知时显示本地范围限制，Claude 无横幅 |
+
+共享 app-server 停止边界修改须先定向运行
+`test_codex_app_server.py`、`test_service_instance_manager.py` 与 `test_api_tasks.py`
+的 claimed/unclaimed、peer/in-flight、planned/unexpected 场景，再运行全部
+`backend/tests/` 和前端 `npx tsc --noEmit`；不能只验证单 turn 的关闭成功路径。
 
 ##### Codex 普通 Skills / User Skills 对等（PR 6）
 
@@ -783,6 +797,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
 | `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障；仅对白名单内的 `systemd --user [--deserialize=N]` user-manager 进程放行不可读 FD |
 | `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
+| `test_alembic_migrations.py::TestPublishedMigrationHistory` | `b6e1f4a2c9d7`、`f7a1c3d9e5b2` 与 sibling `5f7a9c2e4d61` 三种已部署状态都可升级到唯一 merge head；Plan cleanup 和 mergepoint 可降级/再升级，且旧 revision 文件无需改写 |
 | `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
 
 ##### `test_service_pr_review.py` — PR 审核服务
@@ -1098,6 +1113,30 @@ curl -X POST http://localhost:8000/api/pr-monitor/repos/1/toggle -H "Authorizati
 curl -X DELETE http://localhost:8000/api/pr-monitor/repos/1 -H "Authorization: Bearer <token>"
 ```
 
+### Finding 操作与候选补丁
+
+```bash
+# 后端：Action 状态机、tool-free Task、下载回执、确认/push 恢复、Worker 收口及 Alembic
+uv run pytest -q \
+  backend/tests/test_pr_finding_actions.py \
+  backend/tests/test_api_pr_monitor.py \
+  backend/tests/test_worker_relay_proxy.py \
+  backend/tests/test_alembic_migrations.py
+
+# 前端：下载后才可确认、候选身份变化后回执失效、错误与轮询状态
+cd frontend && npx vitest run src/components/PRReview/FindingActions.test.tsx
+```
+
+| 测试范围 | 必须证明的边界 |
+|----------|----------------|
+| `test_pr_finding_actions.py` | ignore/advice 幂等且不改变 Panel Gate；每 Finding 只有一个数据库唯一 active slot；fix Task 只接收冻结的 exact-head 文件并输出单一有界 diff；真实 staged tree 只能修改 allowlist，禁止新增/删除/重命名/mode change；candidate hash/token、exact-old push lease、未知 push 结果按 nonce/parent 对账，base retarget、分支删除或前进都不得产生覆盖/重建 |
+| `test_api_pr_monitor.py` | Finding/Action ACL；diff 必须由后端下载并签发绑定当前用户、Action 与 patch hash 的持久回执；确认缺失、伪造、跨用户或旧回执均 409；`pr-review-fix` 的 edit/retry/chat/inject/cancel/stop/delete 全部冻结 |
+| `test_worker_relay_proxy.py` | Worker 完成 exact generation 后先补齐日志再由 Manager 解析候选；failed/cancelled/conflict 必须收口 durable Action；旧 generation 与普通 Reviewer 的既有失败语义不串线 |
+| `test_alembic_migrations.py` | `b7c9e2f4a610` 是唯一 head 且继承 `7a1d4e9c2b60`；fresh schema 含 `pr_finding_actions` 的审计/回执列、active-slot unique、idempotency/check/FK 约束；upgrade→downgrade→upgrade 可逆且 ORM 无漂移 |
+| `FindingActions.test.tsx` | 只有当前 snapshot 可创建 Action；下载成功且 receipt/hash 仍匹配当前候选后才开放确认；轮询、重试对账与错误提示不把 candidate 误报为已 push |
+
+手动验收：在当前 Panel 的 open Finding 上先记录 Human advice，再生成 AI fix；确认 Task 页面所有公共修改入口返回 409。候选就绪后刷新页面，直接确认应被后端拒绝；下载 diff 并人工核对 target repo、PR、source ref、expected base/head、文件列表和 SHA-256，再确认应只产生一个以旧 head 为唯一 parent 的普通 commit。确认前 retarget PR、删除源分支或另行 push 改变源分支时，CCM 必须报告 stale/lease rejection，且不得重建或覆盖 ref；模拟确认请求超时后重试时，系统必须先用持久 nonce 与 parent 证据对账，不能重复 push。
+
 ### 手动测试: Webhook（需要构造 HMAC 签名）
 
 ```bash
@@ -1114,6 +1153,12 @@ curl -X POST http://localhost:8000/api/github/webhook \
 ```
 
 ### 前端测试
+
+Markdown 数学公式回归：
+
+| 文件 | 覆盖内容 |
+|------|----------|
+| `frontend/src/components/Markdown/MarkdownRenderer.test.tsx` | Codex `\\[...\\]` display math、`\\(...\\)` inline math、`$$...$$`、单 `$`/货币原文、URL/image/autolink/HTML/reference/code 隔离、跨段落分隔符和 KaTeX `maxSize`/`trust` 边界 |
 
 1. 导航到 PR Monitor 页面
 2. 添加仓库 → 验证表格显示
@@ -1207,6 +1252,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/tmp_space_manager.py` | `backend/tests/test_tmp_space_manager.py` |
 | `backend/services/container_manager.py`（容器 `/tmp`） | `backend/tests/test_container_manager.py` |
 | `backend/api/files.py`（SSH 下载临时文件） | `backend/tests/test_api_files.py` |
+| `backend/services/task_artifact_contract.py` + `backend/api/task_artifacts.py` + Task 产物提示/Worker capability | `backend/tests/test_api_task_artifacts.py` + `backend/tests/test_service_dispatcher.py` + `backend/tests/test_api_system.py`（跨 Task namespace、旧 Worker fail-closed、伪造 tag、非法项目根） |
 | `backend/services/token_manager_service.py` | `backend/tests/test_service_token_manager.py` |
 | `backend/schemas/task.py` (datetime serialization) | `backend/tests/test_task_schema.py` |
 | `backend/api/chat.py` (timestamp Z suffix) | `backend/tests/test_chat_timestamp.py` |
@@ -1224,6 +1270,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/pr_review_service.py` | 集成测试（webhook → task 创建） |
 | `frontend/src/pages/PRMonitorPage.tsx` | TypeScript 类型检查 + 手动 UI 测试 |
 | `frontend/src/**` | TypeScript 类型检查 (`tsc --noEmit`) |
+| `frontend/src/components/Chat/TaskArtifactLink.tsx` | `frontend/src/components/Chat/ChatView.test.tsx` + `LoopChatView.test.tsx` |
 
 ## 分布式 Worker 测试
 

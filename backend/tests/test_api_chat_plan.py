@@ -83,6 +83,7 @@ async def test_codex_fork_starts_before_selected_user_message(
         task.last_cwd = "/tmp/project"
         task.enabled_skills = {"code-review": True}
         task.selected_user_skills = [41]
+        task.attention_tag = "等 Fork 完成后继续"
         task.metadata_ = {
             "codex_account_id": "codex-a",
             "attachments": [{
@@ -185,6 +186,7 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert payload["enabled_skills"] == {"code-review": True}
     assert payload["selected_user_skills"] == [41]
     assert payload["codex_service_tier"] == "priority"
+    assert payload["attention_tag"] == "等 Fork 完成后继续"
     assert payload["metadata_"]["codex_account_id"] == "codex-a"
     assert payload["metadata_"]["forked_from_task_id"] == task_id
     assert payload["metadata_"]["forked_from_log_id"] == anchor_id
@@ -1224,7 +1226,142 @@ async def test_shared_chat_sender_prefix_is_display_only(client, session_factory
         )).scalar_one()
     assert stored.content == "[Remote Alice] [TODO] keep the tag"
     assert json.loads(stored.raw_json)["raw_content"] == "[TODO] keep the tag"
-    assert mock_broadcaster.broadcast.call_args.args[1]["content"] == stored.content
+    event = mock_broadcaster.broadcast.call_args.args[1]
+    assert event["content"] == stored.content
+    assert event["id"] == stored.id
+    assert event["task_id"] == task_id
+    assert event["timestamp"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_shared_pr_review_chat_waits_for_terminal_owner_state(
+    client,
+    session_factory,
+):
+    from fastapi import HTTPException
+
+    from backend.api.shared_access import SharedChatMessage, shared_chat
+    from backend.models.pr_monitor import MonitoredRepo, PRReview
+
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+    )
+    async with session_factory() as db:
+        repo = MonitoredRepo(
+            repo_full_name="owner/shared-review",
+            webhook_secret="shared-review-secret",
+        )
+        db.add(repo)
+        await db.flush()
+        review = PRReview(
+            repo_id=repo.id,
+            pr_number=1,
+            pr_title="Shared review",
+            pr_author="alice",
+            pr_url="https://example.test/pr/1",
+            task_id=task_id,
+            status="reviewing",
+        )
+        db.add(review)
+        db.add(TaskShare(
+            task_id=task_id,
+            shared_to_open_id="ou-shared-review",
+            shared_to_name="Remote Reviewer",
+            shared_to_ccm_url="https://receiver.test",
+            share_token="shared-review-token",
+            status="active",
+        ))
+        await db.commit()
+        review_id = review.id
+
+    dispatcher = _mock_dispatcher()
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    async with session_factory() as db:
+        with patch("backend.main.dispatcher", dispatcher), patch(
+            "backend.main.broadcaster",
+            broadcaster,
+        ), pytest.raises(HTTPException) as blocked:
+            await shared_chat(
+                task_id,
+                SharedChatMessage(message="too early"),
+                token="shared-review-token",
+                db=db,
+            )
+    assert blocked.value.status_code == 409
+    broadcaster.broadcast.assert_not_awaited()
+
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        review.status = "approved"
+        await db.commit()
+    async with session_factory() as db:
+        with patch("backend.main.dispatcher", dispatcher), patch(
+            "backend.main.broadcaster",
+            broadcaster,
+        ):
+            accepted = await shared_chat(
+                task_id,
+                SharedChatMessage(message="explain the result"),
+                token="shared-review-token",
+                db=db,
+            )
+
+    assert accepted["queued"] is True
+    dispatcher.enqueue_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
+    client,
+    session_factory,
+):
+    """A shadow Task must never expose the sharer's database id as local."""
+    from types import SimpleNamespace
+
+    from backend.services.shared_relay import SharedRelay
+
+    created = await client.post("/api/tasks", json={
+        "title": "Shadow",
+        "description": "shared relay",
+        "target_repo": "/tmp",
+    })
+    task_id = created.json()["id"]
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    relay = SharedRelay(session_factory, broadcaster)
+
+    await relay._handle(
+        {
+            "data": {
+                "id": 987654,
+                "task_id": 44,
+                "event_type": "message",
+                "role": "assistant",
+                "content": "remote answer",
+                "timestamp": "2026-07-30T01:02:03Z",
+            },
+        },
+        SimpleNamespace(local_task_id=task_id),
+    )
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "message",
+                )
+            )
+        ).scalar_one()
+
+    event = broadcaster.broadcast.call_args.args[1]
+    assert event["id"] == stored.id
+    assert event["id"] != 987654
+    assert event["task_id"] == task_id
+    assert event["timestamp"].endswith("Z")
+    assert event["content"] == "remote answer"
 
 
 @pytest.mark.asyncio
@@ -1511,6 +1648,75 @@ async def test_codex_shared_chat_rejects_monitor_before_local_side_effects(
     assert response.status_code == 400
     assert "does not support Skills: monitor" in response.text
     proxy_chat.assert_not_awaited()
+    broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert stored == []
+
+
+@pytest.mark.asyncio
+async def test_shared_owner_rejection_leaves_no_local_ghost_message(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.models.feishu_binding import FeishuUserBinding
+    from backend.models.task_share import SharedTaskReceived
+    import backend.services.shared_proxy as shared_proxy_module
+
+    engine = session_factory.kw["bind"]
+    async with engine.begin() as conn:
+        await conn.run_sync(FeishuUserBinding.__table__.create, checkfirst=True)
+
+    async with session_factory() as db:
+        shared = SharedTaskReceived(
+            owner_ccm_url="https://owner.test",
+            remote_task_id=92,
+            share_token="active-review-token",
+            task_title="Shared PR review",
+            task_description="d",
+            status="active",
+        )
+        db.add(shared)
+        await db.flush()
+        shadow = Task(
+            title="Shared PR review",
+            description="d",
+            status="completed",
+            provider="claude",
+            shared_from_id=shared.id,
+            session_id="shadow-review-session",
+        )
+        db.add(shadow)
+        await db.flush()
+        shared.local_task_id = shadow.id
+        await db.commit()
+        task_id = shadow.id
+
+    rejection = RuntimeError("owner rejected active review")
+    rejection.response = SimpleNamespace(
+        status_code=409,
+        json=lambda: {"detail": "review is still active"},
+    )
+    proxy_chat = AsyncMock(side_effect=rejection)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    monkeypatch.setattr(shared_proxy_module, "proxy_chat", proxy_chat)
+    monkeypatch.setattr("backend.main.broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/chat",
+        json={"message": "explain this review"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "review is still active"
     broadcaster.broadcast.assert_not_awaited()
     async with session_factory() as db:
         stored = list((await db.execute(
@@ -1994,7 +2200,9 @@ async def test_process_queued_message_uses_task_model(db_factory, fake_session_o
     kwargs = dispatcher.instance_manager.launch.call_args.kwargs
     assert kwargs["model"] == "claude-opus-4-6"
     assert kwargs["resume_session_id"] == "sess-1"
-    assert kwargs["prompt"] == "hi"
+    assert kwargs["prompt"].endswith(
+        "</ccm_task_artifact_policy>\n\nhi"
+    )
     assert kwargs["chat_initiated"] is True
 
 
@@ -2272,7 +2480,23 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     casts = [c for c in mock_broadcaster.broadcast.call_args_list
              if c[0][1].get("source") == "inject"]
     assert len(casts) == 1
-    assert casts[0][0][1]["raw_content"] == "focus on tests"
+    event = casts[0][0][1]
+    assert event["raw_content"] == "focus on tests"
+    assert event["task_id"] == task_id
+    assert isinstance(event["id"], int)
+    assert event["id"] > 0
+    assert event["timestamp"].endswith("Z")
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    assert event["id"] == stored.id
 
 
 @pytest.mark.asyncio
@@ -2347,6 +2571,9 @@ async def test_inject_delivers_uploaded_image_to_pty_and_persists_metadata(
             )
         ).scalar_one()
     metadata = json.loads(stored.raw_json)
+    assert events[0]["id"] == stored.id
+    assert events[0]["task_id"] == task_id
+    assert events[0]["timestamp"].endswith("Z")
     assert metadata["source"] == "inject"
     assert metadata["raw_content"] == ""
     assert metadata["file_paths"] == [str(upload_path)]
@@ -2406,6 +2633,19 @@ async def test_codex_inject_steers_without_pty_mode(
         if call.args[1].get("source") == "inject"
     ]
     assert len(injected) == 1
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    event = injected[0].args[1]
+    assert event["id"] == stored.id
+    assert event["task_id"] == task_id
+    assert event["timestamp"].endswith("Z")
 
 
 @pytest.mark.asyncio

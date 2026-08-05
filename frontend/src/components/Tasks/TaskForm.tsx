@@ -538,7 +538,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             ) : (
               <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-800 text-xs text-gray-300 max-w-[120px]">
                 <Paperclip size={12} className="shrink-0" />
-                <span className="truncate">{upload.file.name}</span>
+                <span className="truncate">
+                  {upload.file?.name || upload.result?.filename || 'attachment'}
+                </span>
               </div>
             )}
             {upload.status === 'uploading' && (

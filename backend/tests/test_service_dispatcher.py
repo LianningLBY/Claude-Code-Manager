@@ -18,12 +18,16 @@ from backend.services.dispatcher import (
     GlobalDispatcher,
     QueuedMessage,
     QueuedMessagePrelaunchError,
+    _prepend_task_artifact_policy,
 )
 from backend.services.deployment_start_guard import (
     DeploymentTaskStartBlocked,
 )
 from backend.services.task_skill_overrides import (
     TEMP_SKILLS_GENERATION_KEY,
+)
+from backend.services.task_artifact_contract import (
+    TASK_ARTIFACT_POLICY_TAG,
 )
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
@@ -795,6 +799,85 @@ async def test_lifecycle_failure_max_retries(db_factory):
     async with db_factory() as db:
         t = await db.get(Task, task_obj.id)
         assert t.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_pr_fix_nonzero_exit_exhaustion_runs_exact_failure_consumer(
+    db_factory,
+):
+    """A normal process failure bypasses the lifecycle exception branch."""
+
+    d = _make_dispatcher(db_factory)
+    d._handle_pr_review_failure = AsyncMock()
+
+    async with db_factory() as db:
+        inst = Instance(name="pr-fix-failure-worker")
+        task = Task(
+            title="PR fix exhausts retries",
+            description="generate bounded patch",
+            max_retries=0,
+            retry_count=0,
+            # Exercise the durable Manager marker after presentation-tag
+            # removal rather than relying on the Worker-only tag fallback.
+            tags=[],
+            metadata_={"pr_finding_action_id": 501},
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        task_obj = task
+
+    process = MagicMock(returncode=1, wait=AsyncMock(return_value=1))
+    d.instance_manager.processes = {inst.id: process}
+
+    await _run_claimed_lifecycle(d, db_factory, inst.id, task_obj)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_obj.id)
+        assert current.status == "failed"
+        assert current.retry_count == 0
+        assert current.error_message == "Exit code: 1"
+        expected_completed_at = current.completed_at
+
+    d._handle_pr_review_failure.assert_awaited_once()
+    failed_task, reason = d._handle_pr_review_failure.await_args.args
+    assert failed_task.id == task_obj.id
+    assert failed_task.status == "failed"
+    assert failed_task.retry_count == 0
+    assert failed_task.completed_at == expected_completed_at
+    assert reason == "Exit code: 1"
+
+
+@pytest.mark.asyncio
+async def test_pr_fix_retry_does_not_run_failure_consumer(db_factory):
+    d = _make_dispatcher(db_factory)
+    d._handle_pr_review_failure = AsyncMock()
+
+    async with db_factory() as db:
+        inst = Instance(name="pr-fix-retry-worker")
+        task = Task(
+            title="PR fix retry remains pending",
+            description="generate bounded patch",
+            max_retries=1,
+            retry_count=0,
+            tags=["pr-review-fix"],
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    process = MagicMock(returncode=1, wait=AsyncMock(return_value=1))
+    d.instance_manager.processes = {inst.id: process}
+
+    await _run_claimed_lifecycle(d, db_factory, inst.id, task)
+
+    async with db_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.status == "pending"
+        assert current.retry_count == 1
+    d._handle_pr_review_failure.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3747,14 +3830,24 @@ async def test_goal_initial_prompt_with_images(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_goal_followup_prompt_contains_reason(db_factory):
+async def test_goal_followup_prompt_contains_reason(db_factory, tmp_path):
     """_build_goal_followup_prompt includes evaluator reason and remaining turns."""
     d = _make_dispatcher(db_factory)
+    task = Task(
+        id=41,
+        title="goal",
+        provider="claude",
+        target_repo=str(tmp_path),
+    )
     prompt = d._build_goal_followup_prompt(
-        "3 tests still failing", turn=2, max_turns=10
+        task,
+        "3 tests still failing",
+        turn=2,
+        max_turns=10,
     )
     assert "3 tests still failing" in prompt
     assert "8" in prompt  # remaining turns
+    assert ".claude-manager/artifacts/task-41" in prompt
 
 
 @pytest.mark.asyncio
@@ -4217,6 +4310,7 @@ class TestResolveTimeout:
         )
         await d._wait_process(p, t, "test", instance_id=1)
         assert p.killed is True
+        assert p.termination_kind == "timeout"
 
 
 @pytest.mark.asyncio
@@ -4562,6 +4656,87 @@ async def test_codex_fast_admission_failure_is_visible_and_not_requeued(
 
 
 @pytest.mark.asyncio
+async def test_codex_terminal_thread_failure_is_visible_and_not_requeued(
+    db_factory,
+):
+    """A persistent terminal thread state must not enter the five-second loop."""
+
+    from backend.services.codex_app_server import (
+        CodexThreadTerminalStateError,
+    )
+
+    d = _make_dispatcher(db_factory)
+    published = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        raise CodexThreadTerminalStateError(
+            "thread-system-error",
+            "systemError",
+            operation="thread/resume turn admission",
+            recovery_attempted=True,
+        )
+
+    async def publish(task_id, exc):
+        assert task_id == 1
+        assert isinstance(exc, CodexThreadTerminalStateError)
+        published.set()
+
+    d._process_queued_message = fake_process
+    d._publish_permanent_account_routing_failure = AsyncMock(
+        side_effect=publish,
+    )
+    await d.enqueue_message(1, "must stop retrying visibly")
+    await asyncio.wait_for(published.wait(), 1)
+    await asyncio.wait_for(d._get_task_queue(1).join(), 1)
+
+    assert len(seen) == 1
+    assert seen[0].prompt == "must stop retrying visibly"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
+async def test_codex_thread_identity_mismatch_is_visible_and_not_requeued(
+    db_factory,
+):
+    """A contradictory resume identity cannot improve through queue retries."""
+
+    from backend.services.codex_app_server import (
+        CodexThreadIdentityMismatchError,
+    )
+
+    d = _make_dispatcher(db_factory)
+    published = asyncio.Event()
+    seen = []
+
+    async def fake_process(task_id, msg):
+        seen.append(msg)
+        raise CodexThreadIdentityMismatchError(
+            "thread-requested",
+            "thread-returned",
+            operation="thread/resume",
+        )
+
+    async def publish(task_id, exc):
+        assert task_id == 1
+        assert isinstance(exc, CodexThreadIdentityMismatchError)
+        published.set()
+
+    d._process_queued_message = fake_process
+    d._publish_permanent_account_routing_failure = AsyncMock(
+        side_effect=publish,
+    )
+    await d.enqueue_message(1, "must not cross native threads")
+    await asyncio.wait_for(published.wait(), 1)
+    await asyncio.wait_for(d._get_task_queue(1).join(), 1)
+
+    assert len(seen) == 1
+    assert seen[0].prompt == "must not cross native threads"
+    d._task_queue_workers[1].cancel()
+
+
+@pytest.mark.asyncio
 async def test_claude_routing_failure_requeues_exact_message(
     db_factory,
     monkeypatch,
@@ -4648,7 +4823,12 @@ async def test_spawn_oserror_requeues_exact_queued_message(
     d._task_queue_workers[task_id] = worker
     try:
         await asyncio.wait_for(launched.wait(), timeout=2)
-        assert seen_prompts == [msg.prompt, msg.prompt]
+        assert len(seen_prompts) == 2
+        assert seen_prompts[0] == seen_prompts[1]
+        assert seen_prompts[0].endswith(msg.prompt)
+        assert seen_prompts[0].count(
+            "<ccm_task_artifact_policy>"
+        ) == 1
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
@@ -6170,6 +6350,63 @@ async def test_owned_mode_publication_cannot_cross_new_generation(
 
 
 @pytest.mark.asyncio
+async def test_pr_fix_failure_consumer_cannot_borrow_retried_generation(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    d._handle_pr_review_failure = AsyncMock()
+    async with db_factory() as db:
+        instance = Instance(name="pr-fix-terminal-race")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="old PR fix generation",
+            status="executing",
+            instance_id=instance.id,
+            retry_count=0,
+            max_retries=0,
+            metadata_={"pr_finding_action_id": 502},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        lifecycle_generation = d._task_lifecycle_generation(task)
+
+    real_publish = d._broadcast_task_status_generation
+
+    async def retry_before_publication(generation, **kwargs):
+        async with db_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status="in_progress",
+                    retry_count=Task.retry_count + 1,
+                    completed_at=None,
+                    error_message=None,
+                )
+            )
+            await db.commit()
+        return await real_publish(generation, **kwargs)
+
+    d._broadcast_task_status_generation = AsyncMock(
+        side_effect=retry_before_publication
+    )
+
+    assert await d._retry_or_fail_mode_task(
+        lifecycle_generation,
+        "old failure",
+    ) == "failed"
+
+    d._handle_pr_review_failure.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "in_progress"
+        assert current.retry_count == 1
+        assert current.error_message is None
+
+
+@pytest.mark.asyncio
 async def test_queued_codex_busy_launch_rolls_back_status_and_temp_skills(
     db_factory,
     monkeypatch,
@@ -6207,6 +6444,31 @@ async def test_queued_codex_busy_launch_rolls_back_status_and_temp_skills(
         assert task.status == "completed"
         assert task.enabled_skills == {"base": True}
     assert msg.source_logged is True
+    from backend.models.log_entry import LogEntry
+
+    async with db_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    user_events = [
+        call.args[1]
+        for call in d.broadcaster.broadcast.await_args_list
+        if (
+            len(call.args) >= 2
+            and call.args[0] == f"task:{task_id}"
+            and call.args[1].get("event_type") == "user_message"
+        )
+    ]
+    assert len(user_events) == 1
+    assert user_events[0]["source"] == "monitor"
+    assert user_events[0]["id"] == stored.id
+    assert user_events[0]["task_id"] == task_id
+    assert user_events[0]["timestamp"].endswith("Z")
     assert not d._launching_instances
 
 
@@ -7193,6 +7455,60 @@ async def test_queued_busy_ignores_lifecycle_that_reused_historical_instance(
 
 
 @pytest.mark.asyncio
+async def test_queued_busy_ignores_stale_consumer_after_instance_reassignment(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        old_task = Task(
+            title="completed owner",
+            description="d",
+            status="completed",
+            session_id="old-session",
+        )
+        new_task = Task(
+            title="new owner",
+            description="d",
+            status="executing",
+            session_id="new-session",
+        )
+        db.add_all([old_task, new_task])
+        await db.flush()
+        instance = Instance(
+            name="reused-slot",
+            status="running",
+            pid=99124,
+            current_task_id=new_task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        old_task.instance_id = instance.id
+        new_task.instance_id = instance.id
+        await db.commit()
+        old_task_id, instance_id = old_task.id, instance.id
+
+    live_new_process = MagicMock(returncode=None)
+    stale_old_consumer = asyncio.create_task(asyncio.Event().wait())
+    d.instance_manager.processes[instance_id] = live_new_process
+    d.instance_manager._tasks[instance_id] = stale_old_consumer
+    d.instance_manager._consumer_records = {
+        instance_id: MagicMock(
+            process=MagicMock(returncode=0),
+            task=stale_old_consumer,
+            task_id=old_task_id,
+        )
+    }
+    try:
+        async with db_factory() as db:
+            assert not await d._queued_task_has_live_generation(
+                db, old_task_id
+            )
+    finally:
+        stale_old_consumer.cancel()
+        await asyncio.gather(stale_old_consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_queued_busy_detects_detached_pty_background_epoch(
     db_factory,
 ):
@@ -8106,6 +8422,63 @@ async def test_stale_pr_failure_cannot_overwrite_superseded_review(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_stale_pr_failure_cannot_overwrite_retried_generation(db_factory):
+    from backend.models.pr_monitor import MonitoredRepo, PRReview
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="retried-review",
+            status="failed",
+            retry_count=0,
+            started_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+            metadata_={},
+        )
+        repo = MonitoredRepo(
+            repo_full_name="owner/repo-retried-failure",
+            webhook_secret="secret",
+        )
+        db.add_all([task, repo])
+        await db.flush()
+        review = PRReview(
+            repo_id=repo.id,
+            pr_number=8,
+            pr_title="retry",
+            pr_author="author",
+            pr_url="https://example.test/pr/8",
+            task_id=task.id,
+            status="reviewing",
+        )
+        db.add(review)
+        await db.flush()
+        task.metadata_ = {"pr_review_id": review.id}
+        await db.commit()
+        task_id = task.id
+        review_id = review.id
+        stale_task = task
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.status = "pending"
+        current.retry_count = 1
+        current.started_at = None
+        current.completed_at = None
+        await db.commit()
+
+    await d._handle_pr_review_failure(stale_task, "late retry-0 failure")
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        review = await db.get(PRReview, review_id)
+        assert current.status == "pending"
+        assert current.retry_count == 1
+        assert review.status == "reviewing"
+        assert review.action_taken is None
+    d.broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_pause_preserves_live_lifecycle_and_process(
     db_factory,
 ):
@@ -8981,6 +9354,203 @@ async def test_build_task_prompt_carries_doc_sync_note(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_build_task_prompt_requires_downloadable_artifact_links(
+    db_factory,
+    tmp_path,
+):
+    """两种 provider 都把交付物限制在本 Task 的项目内目录。"""
+    d = _make_dispatcher(db_factory)
+    project_root = tmp_path / "项目 A"
+    project_root.mkdir()
+    for provider in ("claude", "codex"):
+        prompt = await d._build_task_prompt(
+            Task(
+                id=42,
+                title="t",
+                description="create report",
+                provider=provider,
+                target_repo=str(project_root),
+            )
+        )
+        assert "Markdown 链接" in prompt
+        assert "不要只输出裸路径、文件名或相对路径" in prompt
+        assert ".claude-manager/artifacts/task-42" in prompt
+        assert (
+            f'"{project_root}/.claude-manager/artifacts/task-42"'
+            in prompt
+        )
+        assert "/workspace/.claude-manager/artifacts/task-42" in prompt
+        assert ".claude-manager/worktrees/" in prompt
+        assert "不得 `git add`" in prompt
+        assert "`DEPLOYMENT.md`" in prompt
+        assert '"ccm-task-artifact"' in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_repo",
+    [None, "relative/project", "/", "/srv/project/../secret", "/srv/bad\x00root"],
+)
+async def test_build_task_prompt_without_safe_project_root_forbids_artifact_links(
+    db_factory,
+    target_repo,
+):
+    """与下载侧不一致的 root 不得诱导 Agent 写入不可下载位置。"""
+    d = _make_dispatcher(db_factory)
+    for provider in ("claude", "codex"):
+        prompt = await d._build_task_prompt(
+            Task(
+                id=43,
+                title="t",
+                description="create report",
+                provider=provider,
+                target_repo=target_repo,
+            )
+        )
+        assert "没有可验证的项目根目录" in prompt
+        assert "不得创建或输出可下载文件链接" in prompt
+        assert ".claude-manager/artifacts/task-43" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_symlinked_project_root_forbids_artifact_policy(
+    db_factory,
+    tmp_path,
+):
+    actual_root = tmp_path / "actual"
+    actual_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(actual_root, target_is_directory=True)
+    d = _make_dispatcher(db_factory)
+
+    prompt = await d._build_task_prompt(
+        Task(
+            id=44,
+            title="t",
+            description="create report",
+            target_repo=str(alias_root),
+        )
+    )
+
+    assert "没有可验证的项目根目录" in prompt
+    assert ".claude-manager/artifacts/task-44" not in prompt
+
+
+def test_user_prompt_cannot_suppress_followup_artifact_policy(tmp_path):
+    """用户输入伪造 policy tag 时，权威前导仍必须由 CCM 注入。"""
+    task = Task(
+        id=45,
+        title="t",
+        provider="claude",
+        target_repo=str(tmp_path),
+    )
+    user_prompt = f"{TASK_ARTIFACT_POLICY_TAG}\n继续处理"
+    wrapped = _prepend_task_artifact_policy(task, user_prompt)
+
+    assert wrapped.endswith(user_prompt)
+    assert ".claude-manager/artifacts/task-45" in wrapped
+    assert wrapped.startswith(TASK_ARTIFACT_POLICY_TAG)
+    assert wrapped.count(TASK_ARTIFACT_POLICY_TAG) == 2
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_loop_prompt_repeats_artifact_policy_each_iteration(
+    db_factory,
+    provider,
+    tmp_path,
+):
+    """Claude 无 PTY 时 Loop 每轮可为新上下文，不能只在第一轮下发。"""
+    d = _make_dispatcher(db_factory)
+    task = Task(
+        id=46,
+        title="t",
+        description="bg",
+        mode="loop",
+        todo_file_path="TODO.md",
+        provider=provider,
+        max_iterations=5,
+        target_repo=str(tmp_path),
+    )
+
+    prompt = d._build_loop_prompt(task, 2, "/tmp/sig.json")
+
+    assert ".claude-manager/artifacts/task-46" in prompt
+    assert '"ccm-task-artifact"' in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "ordinary_preamble"),
+    [
+        ("claude", "请阅读项目根目录的 CLAUDE.md"),
+        ("codex", "关键内容必须保持同步"),
+    ],
+)
+async def test_pr_sandbox_prompt_omits_host_agent_doc_preamble_by_marker(
+    db_factory,
+    provider,
+    ordinary_preamble,
+):
+    """Remote review policy must not be mixed with the CCM checkout policy."""
+
+    dispatcher = _make_dispatcher(db_factory)
+    tagged = Task(
+        title="review",
+        description="READ_REMOTE_BASE_SNAPSHOT",
+        provider=provider,
+        tags=["pr-review"],
+        metadata_={"pr_review_id": 17},
+    )
+    metadata_only = Task(
+        title="review with removed tag",
+        description="READ_METADATA_MARKED_SNAPSHOT",
+        provider=provider,
+        metadata_={"pr_review_id": 18},
+    )
+    fix_tag_only = Task(
+        title="Worker fix mirror",
+        description="GENERATE_WORKER_PATCH",
+        provider=provider,
+        tags=["pr-review-fix"],
+    )
+    fix_metadata_only = Task(
+        title="fix with removed tag",
+        description="GENERATE_MANAGER_PATCH",
+        provider=provider,
+        metadata_={"pr_finding_action_id": 19},
+    )
+    ordinary = Task(
+        title="ordinary",
+        description="do X",
+        provider=provider,
+    )
+
+    review_prompt = await dispatcher._build_task_prompt(tagged)
+    metadata_prompt = await dispatcher._build_task_prompt(metadata_only)
+    fix_tag_prompt = await dispatcher._build_task_prompt(fix_tag_only)
+    fix_metadata_prompt = await dispatcher._build_task_prompt(
+        fix_metadata_only
+    )
+    ordinary_prompt = await dispatcher._build_task_prompt(ordinary)
+
+    assert review_prompt == "任务:\nREAD_REMOTE_BASE_SNAPSHOT"
+    assert metadata_prompt == "任务:\nREAD_METADATA_MARKED_SNAPSHOT"
+    assert fix_tag_prompt == "任务:\nGENERATE_WORKER_PATCH"
+    assert fix_metadata_prompt == "任务:\nGENERATE_MANAGER_PATCH"
+    # Tags preserve fail-closed isolation on Worker mirrors; durable Manager
+    # metadata prevents an old client from escaping isolation by removing one.
+    for sandbox_prompt in (
+        review_prompt,
+        metadata_prompt,
+        fix_tag_prompt,
+        fix_metadata_prompt,
+    ):
+        assert "请阅读项目根目录的 CLAUDE.md" not in sandbox_prompt
+        assert "关键内容必须保持同步" not in sandbox_prompt
+    assert ordinary_preamble in ordinary_prompt
+
+
+@pytest.mark.asyncio
 async def test_build_task_prompt_does_not_claim_enabled_skill_was_invoked(
     db_factory,
     monkeypatch,
@@ -9019,6 +9589,47 @@ async def test_build_task_prompt_does_not_claim_enabled_skill_was_invoked(
 
 
 @pytest.mark.asyncio
+async def test_codex_pr_review_relaunch_uses_fresh_thread_and_full_snapshot_prompt(
+    db_factory,
+):
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._task_claim_is_active = AsyncMock(return_value=True)
+    dispatcher._build_task_prompt = AsyncMock(
+        return_value="FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA"
+    )
+    task = Task(
+        id=97,
+        title="PR Review",
+        description="FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA",
+        provider="codex",
+        model="gpt-5.6-sol",
+        tags=["pr-review"],
+        metadata_={"pr_review_id": 17},
+    )
+
+    await dispatcher._relaunch_and_wait(
+        3,
+        task,
+        MagicMock(),
+        "/private/review-cwd",
+        None,
+        "/private/codex-home",
+        "native-thread-from-first-attempt",
+        thinking_budget=None,
+        effort_level="high",
+        label="transient retry",
+    )
+
+    launch = dispatcher.instance_manager.launch.await_args.kwargs
+    assert launch["prompt"] == (
+        "FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA"
+    )
+    assert "resume_session_id" not in launch
+    assert "请继续之前的工作" not in launch["prompt"]
+    dispatcher._build_task_prompt.assert_awaited_once_with(task)
+
+
+@pytest.mark.asyncio
 async def test_build_task_prompt_invokes_explicit_initial_command(
     db_factory,
     monkeypatch,
@@ -9054,20 +9665,18 @@ async def test_build_task_prompt_invokes_explicit_initial_command(
     assert temporary is True
 
 
-def test_loop_prompt_codex_references_agents_md(db_factory):
+def test_loop_prompt_codex_references_agents_md(db_factory, tmp_path):
     """Loop prompts reference AGENTS.md for codex tasks."""
     d = _make_dispatcher(db_factory)
     task = Task(
-        title="t",
-        description="bg",
-        mode="loop",
-        todo_file_path="TODO.md",
-        provider="codex",
-        max_iterations=5,
+        id=44, title="t", description="bg", mode="loop",
+        todo_file_path="TODO.md", provider="codex", max_iterations=5,
+        target_repo=str(tmp_path),
     )
     prompt = d._build_loop_prompt(task, 0, "/tmp/sig.json")
     assert "AGENTS.md" in prompt
     assert "CLAUDE.md" not in prompt
+    assert ".claude-manager/artifacts/task-44" in prompt
 
 
 @pytest.mark.asyncio
@@ -9095,3 +9704,203 @@ async def test_lifecycle_backfills_agents_md(db_factory, tmp_path):
     await _run_claimed_lifecycle(d, db_factory, inst_id, task_obj)
 
     assert (tmp_path / "AGENTS.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
+    db_factory,
+    tmp_path,
+    monkeypatch,
+):
+    """A stale CCM cwd/target must never make a review load host instructions."""
+
+    from backend.services import agent_docs, pr_review_runtime
+
+    host_checkout = tmp_path / "ccm-host"
+    host_checkout.mkdir()
+    (host_checkout / "CLAUDE.md").write_text("# host policy\n")
+    (host_checkout / "AGENTS.md").symlink_to("CLAUDE.md")
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    runtime_root = trusted_home / "review-runtime"
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+    monkeypatch.setattr(
+        pr_review_runtime.secrets,
+        "token_hex",
+        lambda _size: "neutral",
+    )
+    ensure_agents = MagicMock()
+    monkeypatch.setattr(agent_docs, "ensure_agents_md", ensure_agents)
+
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="review-worker")
+        task = Task(
+            title="PR Review",
+            description="READ_REMOTE_BASE_SNAPSHOT",
+            target_repo=str(host_checkout),
+            last_cwd=str(host_checkout),
+            provider="codex",
+            tags=["pr-review"],
+        )
+        db.add_all([instance, task])
+        await db.commit()
+        await db.refresh(instance)
+        await db.refresh(task)
+        instance_id = instance.id
+        task_obj = task
+
+    process = MagicMock(returncode=0)
+    process.wait = AsyncMock(return_value=0)
+    dispatcher.instance_manager.processes = {instance_id: process}
+
+    await _run_claimed_lifecycle(
+        dispatcher,
+        db_factory,
+        instance_id,
+        task_obj,
+    )
+
+    launch = dispatcher.instance_manager.launch.await_args.kwargs
+    neutral_cwds = list(runtime_root.iterdir())
+    assert len(neutral_cwds) == 1
+    neutral_cwd = neutral_cwds[0]
+    assert launch["cwd"] == str(neutral_cwd)
+    assert launch["cwd"] != str(host_checkout)
+    assert launch["prompt"] == "任务:\nREAD_REMOTE_BASE_SNAPSHOT"
+    assert not (neutral_cwd / "CLAUDE.md").exists()
+    assert not (neutral_cwd / "AGENTS.md").exists()
+    ensure_agents.assert_not_called()
+
+
+def test_pr_review_cwd_reuse_requires_private_current_user_directory(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    task_id = 42
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    runtime_root = trusted_home / "review-runtime"
+    runtime_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+    previous = runtime_root / f"ccm-pr-review-{task_id}-previous"
+    previous.mkdir(mode=0o700)
+
+    assert pr_review_runtime._is_reusable_review_cwd(
+        str(previous),
+        task_id,
+    )
+
+    previous.chmod(0o750)
+    assert not pr_review_runtime._is_reusable_review_cwd(
+        str(previous),
+        task_id,
+    )
+
+    previous.chmod(0o700)
+    real_uid = os.getuid()
+    monkeypatch.setattr(pr_review_runtime.os, "getuid", lambda: real_uid + 1)
+    assert not pr_review_runtime._is_reusable_review_cwd(
+        str(previous),
+        task_id,
+    )
+
+
+def test_pr_review_cwd_rejects_progress_doc_in_ancestry(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    trusted_home = tmp_path / "host-context"
+    trusted_home.mkdir(mode=0o700)
+    (trusted_home / "PROGRESS.md").write_text("# host lessons\n")
+    runtime_root = trusted_home / "review-runtime"
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="ancestry contains CLAUDE.md/AGENTS.md/PROGRESS.md",
+    ):
+        pr_review_runtime.isolated_pr_review_cwd(
+            Task(id=9, tags=["pr-review"]),
+        )
+
+
+def test_pr_review_runtime_root_must_be_below_trusted_home(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    outside = tmp_path / "public-temp-style-root"
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(outside),
+    )
+
+    with pytest.raises(RuntimeError, match="trusted home directory"):
+        pr_review_runtime.isolated_pr_review_cwd(
+            Task(id=10, tags=["pr-review"]),
+        )
+    assert not outside.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership/mode contract")
+def test_pr_review_runtime_rejects_insecure_existing_root(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.services import pr_review_runtime
+
+    trusted_home = tmp_path / "trusted-home"
+    trusted_home.mkdir(mode=0o700)
+    runtime_root = trusted_home / "review-runtime"
+    runtime_root.mkdir(mode=0o755)
+    monkeypatch.setattr(
+        pr_review_runtime,
+        "_trusted_runtime_anchor",
+        lambda: trusted_home,
+    )
+    monkeypatch.setenv(
+        pr_review_runtime.PR_REVIEW_RUNTIME_DIR_ENV,
+        str(runtime_root),
+    )
+
+    with pytest.raises(RuntimeError, match="mode 0700"):
+        pr_review_runtime.isolated_pr_review_cwd(
+            Task(id=11, tags=["pr-review"]),
+        )

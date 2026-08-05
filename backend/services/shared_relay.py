@@ -17,6 +17,7 @@ from sqlalchemy import select
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.models.task_share import SharedTaskReceived
+from backend.services.chat_event_identity import persisted_chat_event
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ class SharedRelay:
                     shadow.session_id = config.get("session_id") or shadow.session_id
                     shadow.target_repo = config.get("target_repo")
                     shadow.error_message = config.get("error_message")
+                    shadow.attention_tag = config.get("attention_tag")
                     await db.commit()
         except Exception:
             logger.debug("failed to fetch config for shadow task shared=%d", shared.id)
@@ -208,6 +210,7 @@ class SharedRelay:
                 return  # self-sent, already stored locally
 
         # Write chat events to local log_entries
+        persisted_data = None
         if event_type in CHAT_EVENT_TYPES:
             raw_json = data.get("raw_json")
             metadata_keys = (
@@ -219,7 +222,7 @@ class SharedRelay:
                     k: data[k] for k in metadata_keys if data.get(k) is not None
                 })
             async with self.db_factory() as db:
-                db.add(LogEntry(
+                entry = LogEntry(
                     instance_id=None,
                     task_id=local_task_id,
                     event_type=event_type,
@@ -230,8 +233,17 @@ class SharedRelay:
                     tool_output=data.get("tool_output"),
                     raw_json=raw_json,
                     is_error=data.get("is_error", False),
-                ))
+                )
+                db.add(entry)
                 await db.commit()
+                persisted_data = persisted_chat_event(
+                    entry,
+                    {
+                        key: value
+                        for key, value in data.items()
+                        if key != "raw_json"
+                    },
+                )
 
             if data.get("role") == "assistant" and event_type in ("message", "result"):
                 async with self.db_factory() as db:
@@ -253,7 +265,10 @@ class SharedRelay:
                         await db.commit()
 
         # Broadcast to local frontend (mirror the event on local task channel)
-        await self.broadcaster.broadcast(f"task:{local_task_id}", data)
+        await self.broadcaster.broadcast(
+            f"task:{local_task_id}",
+            persisted_data or data,
+        )
 
     async def backfill_history(self, shared: SharedTaskReceived):
         """Pull full chat history from sharer and store locally."""

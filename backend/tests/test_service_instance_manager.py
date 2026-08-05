@@ -32,7 +32,10 @@ from backend.services.codex_app_server import (
     CodexRequiredMcpError,
     CodexRequiredMcpPreTurnError,
     CodexServiceTierUnavailableError,
+    CodexSharedTransportBusyError,
     CodexThreadHomeMismatchError,
+    CodexThreadIdentityMismatchError,
+    CodexThreadTerminalStateError,
     CodexTurnProcess,
 )
 from backend.services.codex_tier_proxy import CodexTierProxyRoute
@@ -701,6 +704,22 @@ def test_parse_codex_app_server_message_delta():
     assert event["role"] == "assistant"
     assert event["content"] == "Hel"
     assert event["item_id"] == "msg-1"
+
+
+def test_parse_codex_app_server_reasoning_completion_keeps_item_id():
+    im = InstanceManager(MagicMock(), MagicMock())
+    event = im._parse_codex_line(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "id": "reasoning-1",
+            "type": "reasoning",
+            "text": "final reasoning summary",
+        },
+    }))
+
+    assert event["event_type"] == "thinking"
+    assert event["content"] == "final reasoning summary"
+    assert event["item_id"] == "reasoning-1"
 
 
 # === _build_command tests ===
@@ -1378,6 +1397,46 @@ def test_cloudrouter_429_is_transient_only_for_exact_api_account_home(
     )
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "all logged-in accounts are busy",
+        "no eligible logged-in account is ready",
+    ],
+)
+def test_apex_409_capacity_is_transient_only_for_exact_apex_codex_home(
+    db_factory, detail,
+):
+    im = InstanceManager(db_factory, MagicMock())
+    apex_account = types.SimpleNamespace(api_provider="apex")
+    cloudrouter_account = types.SimpleNamespace(api_provider="cloudrouter")
+    store = MagicMock()
+    store.account_for_codex_home.side_effect = lambda path: {
+        "/api/apex": apex_account,
+        "/api/cloudrouter": cloudrouter_account,
+    }.get(path)
+    im.cloudrouter_store = store
+    im._config_dirs.update({
+        1: "/api/apex",
+        2: "/api/cloudrouter",
+        3: "/native/codex",
+    })
+    busy = (
+        'unexpected status 409 Conflict: '
+        f'{{"detail":"{detail}"}}'
+    )
+
+    assert im.is_cloudrouter_transient(1, "codex", busy)
+    assert not im.is_cloudrouter_transient(2, "codex", busy)
+    assert not im.is_cloudrouter_transient(3, "codex", busy)
+    assert not im.is_cloudrouter_transient(
+        1, "codex", "unexpected status 409 Conflict: branch changed",
+    )
+    assert not im.is_cloudrouter_transient(
+        1, "codex", detail,
+    )
+
+
 def test_api_codex_home_scrubs_all_inherited_gateway_keys(db_factory):
     im = InstanceManager(db_factory, MagicMock())
     store = MagicMock()
@@ -1523,6 +1582,232 @@ async def test_launch_with_effort_level(db_factory):
     idx = cmd_args.index("--effort")
     assert cmd_args[idx + 1] == "high"
     await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_claude_pr_review_disables_all_tools_and_bypasses_pty(
+    db_factory,
+    tmp_path,
+):
+    """A PR snapshot turn must not inherit Claude tools, MCP, hooks, or PTY."""
+
+    async with db_factory() as db:
+        inst = Instance(name="claude-pr-review-isolated")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    process = _make_mock_process(returncode=None)
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._pty_enabled = True
+    im._pty_backend = MagicMock()
+    im._launch_pty = AsyncMock(
+        side_effect=AssertionError("PR review must not enter PTY")
+    )
+    im._consume_output = AsyncMock()
+
+    with (
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as exec_mock,
+        patch(
+            "backend.services.mcp_config.generate_mcp_config"
+        ) as generate_mcp,
+        patch(
+            "backend.services.ask_user_settings.ensure_ask_user_hook"
+        ) as ensure_ask_user,
+        patch(
+            "backend.services.skill_loader.discover_skills"
+        ) as discover_skills,
+    ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="review the backend-snapshotted input",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="claude",
+            config_dir=str(tmp_path / "claude-home"),
+            enabled_skills={"monitor": True, "sub-agent": True},
+            system_prompt_mode="append",
+        )
+
+    argv = list(exec_mock.await_args.args)
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--disable-slash-commands" in argv
+    assert "--exclude-dynamic-system-prompt-sections" in argv
+    assert "--mcp-config" not in argv
+    assert "--append-system-prompt-file" not in argv
+    assert "--system-prompt-file" not in argv
+    im._launch_pty.assert_not_awaited()
+    generate_mcp.assert_not_called()
+    ensure_ask_user.assert_not_called()
+    discover_skills.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_pr_review_uses_only_isolated_app_server_route(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """PR reviews pin Codex to read-only app-server with no ambient config."""
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-pr-review-isolated")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(return_value=43_210)
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        pid = await im.launch(
+            instance_id=inst.id,
+            prompt="review the backend-snapshotted input",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            enabled_skills={"monitor": True, "sub-agent": True},
+        )
+
+    assert pid == 43_210
+    kwargs = im._launch_codex_app_server.await_args.kwargs
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["sandbox_mode"] == "read-only"
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["tools_disabled"] is True
+    assert kwargs["mcp_specs"] == ()
+    assert kwargs["skill_context"] == ""
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        (
+            CodexRequiredMcpPreTurnError("sandbox could not be confirmed"),
+            CodexRequiredMcpError,
+        ),
+        (RuntimeError("app-server protocol failed"), CodexRequiredMcpError),
+        (asyncio.TimeoutError(), asyncio.TimeoutError),
+    ],
+)
+async def test_codex_pr_review_app_server_failure_never_falls_back_to_exec(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    failure,
+    expected_error,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name=f"codex-pr-no-fallback-{type(failure).__name__}")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(side_effect=failure)
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(expected_error):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must fail closed",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_pr_review_rejects_disabled_app_server_before_exec(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-pr-app-server-required")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="PR review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="requires the app-server read-only sandbox",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must not use exec",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+            )
+
+    exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1770,6 +2055,16 @@ async def test_launch_codex_prefers_persistent_app_server(
     assert (
         im._launch_codex_app_server.await_args.kwargs[
             "disable_project_config"
+        ]
+        is False
+    )
+    assert (
+        im._launch_codex_app_server.await_args.kwargs["sandbox_mode"]
+        == "danger-full-access"
+    )
+    assert (
+        im._launch_codex_app_server.await_args.kwargs[
+            "disable_autonomous_features"
         ]
         is False
     )
@@ -2144,6 +2439,184 @@ async def test_ephemeral_codex_exec_rejects_active_app_server(tmp_path):
         require_idle=True,
     )
     assert im._codex_ephemeral_home_users == {}
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_codex_exec_rejects_direct_exec_owner(tmp_path):
+    codex_home = str((tmp_path / "codex-ephemeral-vs-direct").resolve())
+    im = InstanceManager(MagicMock(), MagicMock())
+    im._codex_exec_homes[7] = codex_home
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="still has an exec generation",
+    ):
+        async with im.codex_home_exec_guard(codex_home):
+            pytest.fail("direct exec owner must reject ephemeral admission")
+
+    assert im._codex_ephemeral_home_users == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["direct", "ephemeral"])
+async def test_codex_direct_exec_rejects_runtime_owned_home(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    blocker,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name=f"codex-direct-vs-{blocker}")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    codex_home = str((tmp_path / f"codex-direct-vs-{blocker}").resolve())
+    im = InstanceManager(db_factory, MagicMock())
+    if blocker == "direct":
+        im._codex_exec_homes[999] = codex_home
+        error = "still has an exec generation"
+    else:
+        im._codex_ephemeral_home_users[codex_home] = 1
+        error = "active ephemeral exec"
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(CodexAppServerBusyError, match=error):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must not overlap",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_direct_self_retry_replaces_reaped_home_owner(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-direct-self-retry")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    home = str((tmp_path / "codex-direct-self-retry-home").resolve())
+    previous = _make_mock_process(pid=54320, returncode=1)
+    replacement = _make_mock_process(pid=54321, returncode=None)
+    finish_replacement = asyncio.Event()
+
+    async def wait_for_replacement():
+        await finish_replacement.wait()
+        replacement.returncode = 0
+        return 0
+
+    replacement.wait = AsyncMock(side_effect=wait_for_replacement)
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.processes[inst.id] = previous
+    im._codex_exec_homes[inst.id] = home
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=replacement),
+    ) as exec_mock:
+        assert await im.launch(
+            instance_id=inst.id,
+            prompt="retry on the same account",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=home,
+        ) == replacement.pid
+
+    exec_mock.assert_awaited_once()
+    assert im.processes[inst.id] is replacement
+    assert im._codex_exec_homes[inst.id] == home
+
+    finish_replacement.set()
+    await im.wait_for_output_consumer(
+        inst.id,
+        provider="codex",
+        timeout=3,
+        expected_process=replacement,
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_codex_direct_launches_share_atomic_home_admission(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    async with db_factory() as db:
+        first = Instance(name="codex-direct-race-first")
+        second = Instance(name="codex-direct-race-second")
+        db.add_all([first, second])
+        await db.commit()
+        await db.refresh(first)
+        await db.refresh(second)
+
+    spawn_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+    finish_process = asyncio.Event()
+    process = _make_mock_process(pid=54321, returncode=None)
+
+    async def spawn(*_args, **_kwargs):
+        spawn_entered.set()
+        await release_spawn.wait()
+        return process
+
+    async def wait_for_process():
+        await finish_process.wait()
+        process.returncode = 0
+        return 0
+
+    process.wait = AsyncMock(side_effect=wait_for_process)
+    home = str((tmp_path / "codex-direct-race-home").resolve())
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=spawn),
+    ) as exec_mock:
+        first_launch = asyncio.create_task(im.launch(
+            instance_id=first.id,
+            prompt="first",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=home,
+        ))
+        await spawn_entered.wait()
+        second_launch = asyncio.create_task(im.launch(
+            instance_id=second.id,
+            prompt="second",
+            cwd="/tmp",
+            provider="codex",
+            config_dir=home,
+        ))
+        await asyncio.sleep(0)
+        assert second_launch.done() is False
+
+        release_spawn.set()
+        await first_launch
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="still has an exec generation",
+        ):
+            await second_launch
+
+    assert exec_mock.await_count == 1
+    finish_process.set()
+    await asyncio.sleep(0.1)
 
 
 @pytest.mark.asyncio
@@ -2546,9 +3019,28 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
         CodexAppServerBusyError("account busy"),
         CodexRequiredMcpError("required MCP failed"),
         CodexThreadHomeMismatchError("wrong owner"),
+        CodexThreadIdentityMismatchError(
+            "thread-requested",
+            "thread-returned",
+            operation="thread/resume",
+        ),
+        CodexThreadTerminalStateError(
+            "terminal-thread",
+            "systemError",
+            operation="thread/resume turn admission",
+            recovery_attempted=True,
+        ),
         CodexLaunchCommitError("turn already started"),
     ],
-    ids=["timeout", "busy", "required-mcp", "owner-mismatch", "commit-failed"],
+    ids=[
+        "timeout",
+        "busy",
+        "required-mcp",
+        "owner-mismatch",
+        "identity-mismatch",
+        "terminal-thread",
+        "commit-failed",
+    ],
 )
 async def test_launch_codex_does_not_fallback_when_replay_is_unsafe(
     db_factory, monkeypatch, tmp_path, launch_error,
@@ -3618,6 +4110,47 @@ async def test_codex_soft_quota_switch_migrates_rebinds_and_updates_binding(
 
 
 @pytest.mark.asyncio
+async def test_codex_soft_quota_switch_does_not_override_explicit_preference(
+    db_factory, tmp_path,
+):
+    source = tmp_path / "codex-pinned"
+    target = tmp_path / "api-account"
+    config = tmp_path / "codex-pinned-pool.json"
+    config.write_text(json.dumps({"accounts": [
+        {"id": "codex-2", "codex_home": str(source), "enabled": True},
+        {"id": "api-1", "codex_home": str(target), "enabled": True},
+    ]}))
+    pool = CodexPool(config_path=config)
+    assert pool.set_preferred("codex-2") is True
+    pool.select_quota_alternative = AsyncMock(return_value=str(target.resolve()))
+
+    async with db_factory() as db:
+        task = Task(
+            title="keep explicit codex account",
+            provider="codex",
+            status="executing",
+            session_id="thread-pinned",
+            metadata_={"codex_account_id": "codex-2"},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._config_dirs[7] = str(source.resolve())
+    im.rebind_codex_thread = AsyncMock()
+    dispatcher = MagicMock(pool=None, codex_pool=pool)
+
+    with patch("backend.main.dispatcher", dispatcher):
+        switched = await im._try_proactive_pool_switch(7, task.id)
+
+    assert switched is False
+    pool.select_quota_alternative.assert_not_awaited()
+    im.rebind_codex_thread.assert_not_awaited()
+    assert im.get_config_dir(7) == str(source.resolve())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("rollback_fails", [False, True])
 async def test_codex_soft_quota_binding_failure_rolls_back_owner_without_cooldown(
     db_factory, tmp_path, rollback_fails,
@@ -4186,6 +4719,77 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "all logged-in accounts are busy",
+        "no eligible logged-in account is ready",
+    ],
+)
+async def test_apex_409_capacity_terminal_failure_retries_same_account(
+    db_factory, monkeypatch, detail,
+):
+    import backend.services.claude_pool as claude_pool_module
+
+    async with db_factory() as db:
+        task = Task(
+            title="apex busy retry",
+            status="executing",
+            provider="codex",
+            session_id="thread-apex-busy",
+            last_cwd="/tmp/apex-work",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    im._config_dirs[7] = "/api/apex/codex"
+    im._launch_params[7] = {
+        "provider": "codex",
+        "prompt": "continue after gateway capacity recovers",
+        "model": "gpt-5.6-sol",
+    }
+    store = MagicMock()
+    store.account_for_codex_home.return_value = types.SimpleNamespace(
+        api_provider="apex",
+    )
+    im.cloudrouter_store = store
+    im.get_recent_log_contents = AsyncMock(return_value=[json.dumps({
+        "type": "turn.failed",
+        "error": {
+            "message": "Reconnecting... 5/5",
+            "codexErrorInfo": {
+                "responseStreamDisconnected": {"httpStatusCode": 409},
+            },
+            "additionalDetails": (
+                "unexpected status 409 Conflict: "
+                f'{{"detail":"{detail}"}}'
+            ),
+        },
+    })])
+    im.launch = AsyncMock(return_value=12345)
+    monkeypatch.setattr(
+        claude_pool_module, "transient_retry_delay", lambda *_args: 0,
+    )
+
+    launched = await im._try_chat_transient_retry(
+        7, task.id, 1, "Reconnecting... 5/5",
+    )
+
+    assert launched is True
+    im.launch.assert_awaited_once()
+    retry = im.launch.await_args.kwargs
+    assert retry["task_id"] == task.id
+    assert retry["resume_session_id"] == "thread-apex-busy"
+    assert retry["config_dir"] == "/api/apex/codex"
+    assert retry["provider"] == "codex"
+    assert retry["model"] == "gpt-5.6-sol"
+    broadcaster.broadcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
     async with db_factory() as db:
         task = Task(
@@ -4375,7 +4979,7 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
     process = CodexTurnProcess(43_210, interrupt, thread_id="thread-stuck")
     registry = MagicMock()
 
-    async def abort_turn(codex_home, exact_process, *, reason):
+    async def stop_claimed_turn(codex_home, exact_process, *, reason):
         assert codex_home == "/tmp/codex-stop-home"
         assert exact_process is process
         assert reason == "CCM task session interrupted"
@@ -4385,7 +4989,12 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
         )
         return True
 
-    registry.abort_unclaimed_turn = AsyncMock(side_effect=abort_turn)
+    registry.stop_claimed_turn = AsyncMock(side_effect=stop_claimed_turn)
+    registry.abort_unclaimed_turn = AsyncMock(
+        side_effect=AssertionError(
+            "a durable Instance owner must not use unclaimed-turn cleanup"
+        )
+    )
     broadcaster = MagicMock(broadcast=AsyncMock())
     im = InstanceManager(db_factory, broadcaster)
     im._codex_app_server = registry
@@ -4406,7 +5015,8 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
     ):
         assert await im.stop(inst_id) is True
 
-    registry.abort_unclaimed_turn.assert_awaited_once()
+    registry.stop_claimed_turn.assert_awaited_once()
+    registry.abort_unclaimed_turn.assert_not_awaited()
     signal_tree.assert_not_awaited()
     wait_tree.assert_not_awaited()
     assert process.returncode == 130
@@ -4414,6 +5024,159 @@ async def test_stop_codex_turn_uses_registry_fail_closed_cleanup(db_factory):
         inst = await db.get(Instance, inst_id)
         assert inst.status == "idle"
         assert inst.pid is None
+
+
+@pytest.mark.asyncio
+async def test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy(
+    db_factory,
+):
+    """An unisolatable stop must not tear down another turn on the home."""
+
+    shared_pid = 43_211
+    first_started_at = datetime(2026, 8, 3, 11, 13, 30)
+    peer_started_at = datetime(2026, 8, 3, 11, 13, 31)
+    async with db_factory() as db:
+        first_instance = Instance(
+            name="codex-shared-stop-target",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=first_started_at,
+        )
+        peer_instance = Instance(
+            name="codex-shared-stop-peer",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=peer_started_at,
+        )
+        db.add_all([first_instance, peer_instance])
+        await db.flush()
+        first_task = Task(
+            title="shared stop target",
+            status="executing",
+            provider="codex",
+            instance_id=first_instance.id,
+        )
+        peer_task = Task(
+            title="shared stop peer",
+            status="executing",
+            provider="codex",
+            instance_id=peer_instance.id,
+        )
+        db.add_all([first_task, peer_task])
+        await db.flush()
+        first_instance.current_task_id = first_task.id
+        peer_instance.current_task_id = peer_task.id
+        await db.commit()
+        first_instance_id = first_instance.id
+        peer_instance_id = peer_instance.id
+        first_task_id = first_task.id
+        peer_task_id = peer_task.id
+
+    async def interrupt():
+        raise AssertionError("the registry owns exact-turn interruption")
+
+    first_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-stop-target",
+    )
+    peer_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-stop-peer",
+    )
+    first_release = asyncio.Event()
+    peer_release = asyncio.Event()
+    first_consumer = asyncio.create_task(first_release.wait())
+    peer_consumer = asyncio.create_task(peer_release.wait())
+    registry = MagicMock()
+    registry.stop_claimed_turn = AsyncMock(
+        side_effect=CodexSharedTransportBusyError(
+            "cannot isolate the requested turn while a peer is active"
+        )
+    )
+    registry.abort_unclaimed_turn = AsyncMock(
+        side_effect=AssertionError(
+            "a durable Instance owner must not shut down shared transport"
+        )
+    )
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager._codex_app_server = registry
+    manager._config_dirs[first_instance_id] = "/tmp/codex-shared-home"
+    manager._config_dirs[peer_instance_id] = "/tmp/codex-shared-home"
+    manager.processes[first_instance_id] = first_process
+    manager.processes[peer_instance_id] = peer_process
+    manager._track_output_consumer(
+        first_instance_id,
+        first_process,
+        first_consumer,
+        provider="codex",
+        task_id=first_task_id,
+        task_retry_count=0,
+        instance_started_at=first_started_at,
+    )
+    manager._track_output_consumer(
+        peer_instance_id,
+        peer_process,
+        peer_consumer,
+        provider="codex",
+        task_id=peer_task_id,
+        task_retry_count=0,
+        instance_started_at=peer_started_at,
+    )
+
+    try:
+        assert await manager.stop(
+            first_instance_id,
+            expected_task_id=first_task_id,
+            expected_pid=shared_pid,
+            expected_started_at=first_started_at,
+            task_status="completed",
+            consumer_cancel_timeout=0.01,
+        ) is False
+
+        registry.stop_claimed_turn.assert_awaited_once_with(
+            "/tmp/codex-shared-home",
+            first_process,
+            reason="CCM task session interrupted",
+        )
+        registry.abort_unclaimed_turn.assert_not_awaited()
+        assert first_process.returncode is None
+        assert peer_process.returncode is None
+        assert not first_consumer.done()
+        assert not first_consumer.cancelling()
+        assert not peer_consumer.done()
+        assert not peer_consumer.cancelling()
+        assert manager.processes[first_instance_id] is first_process
+        assert manager.processes[peer_instance_id] is peer_process
+        assert manager._tasks[first_instance_id] is first_consumer
+        assert manager._tasks[peer_instance_id] is peer_consumer
+        assert manager._consumer_records[first_instance_id].process is first_process
+        assert manager._consumer_records[peer_instance_id].process is peer_process
+        broadcaster.broadcast.assert_not_awaited()
+
+        async with db_factory() as db:
+            durable_first_instance = await db.get(Instance, first_instance_id)
+            durable_peer_instance = await db.get(Instance, peer_instance_id)
+            durable_first_task = await db.get(Task, first_task_id)
+            durable_peer_task = await db.get(Task, peer_task_id)
+            assert durable_first_instance.status == "running"
+            assert durable_first_instance.pid == shared_pid
+            assert durable_first_instance.current_task_id == first_task_id
+            assert durable_peer_instance.status == "running"
+            assert durable_peer_instance.pid == shared_pid
+            assert durable_peer_instance.current_task_id == peer_task_id
+            assert durable_first_task.status == "executing"
+            assert durable_first_task.instance_id == first_instance_id
+            assert durable_peer_task.status == "executing"
+            assert durable_peer_task.instance_id == peer_instance_id
+    finally:
+        first_release.set()
+        peer_release.set()
+        await asyncio.gather(first_consumer, peer_consumer)
 
 
 @pytest.mark.asyncio
@@ -5768,11 +6531,14 @@ async def test_stop_generation_fence_rejects_same_task_slot_aba(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
+async def test_cancelled_codex_spawn_collects_and_releases_home_admission(
     db_factory,
+    monkeypatch,
+    tmp_path,
 ):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     async with db_factory() as db:
-        instance = Instance(name="cancelled-spawn")
+        instance = Instance(name="cancelled-codex-spawn")
         db.add(instance)
         await db.commit()
         await db.refresh(instance)
@@ -5781,6 +6547,7 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
     process = _make_mock_process(pid=54_332, returncode=None)
     spawn_started = asyncio.Event()
     release_spawn = asyncio.Event()
+    codex_home = str((tmp_path / "cancelled-codex-home").resolve())
 
     async def delayed_spawn(*args, **kwargs):
         spawn_started.set()
@@ -5808,7 +6575,13 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
         ) as wait_tree,
     ):
         launch = asyncio.create_task(
-            im.launch(instance_id, "cancel during OS spawn", cwd="/tmp")
+            im.launch(
+                instance_id,
+                "cancel during OS spawn",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
         )
         await asyncio.wait_for(spawn_started.wait(), timeout=2.0)
         launch.cancel()
@@ -5822,6 +6595,8 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
     wait_tree.assert_awaited_once_with(instance_id, process, 5.0)
     assert instance_id not in im.processes
     assert instance_id not in im._process_groups
+    assert instance_id not in im._codex_exec_homes
+    assert codex_home not in im.busy_codex_homes()
     async with db_factory() as db:
         instance = await db.get(Instance, instance_id)
         assert instance.status == "idle"
@@ -5829,19 +6604,26 @@ async def test_cancelled_direct_spawn_collects_and_reaps_spawn_outcome(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
+async def test_cancelled_codex_spawn_failed_reap_retains_home_admission(
     db_factory,
+    monkeypatch,
+    tmp_path,
 ):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     async with db_factory() as db:
-        instance = Instance(name="cancelled-spawn-unreaped")
-        db.add(instance)
+        instance = Instance(name="cancelled-codex-spawn-unreaped")
+        contender = Instance(name="cancelled-codex-spawn-contender")
+        db.add_all([instance, contender])
         await db.commit()
         await db.refresh(instance)
+        await db.refresh(contender)
         instance_id = instance.id
+        contender_id = contender.id
 
     process = _make_mock_process(pid=54_333, returncode=None)
     spawn_started = asyncio.Event()
     release_spawn = asyncio.Event()
+    codex_home = str((tmp_path / "cancelled-codex-home").resolve())
 
     async def delayed_spawn(*args, **kwargs):
         spawn_started.set()
@@ -5853,7 +6635,7 @@ async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
         patch(
             "backend.services.instance_manager.asyncio.create_subprocess_exec",
             side_effect=delayed_spawn,
-        ),
+        ) as spawn,
         patch.object(im, "_process_group_alive", return_value=True),
         patch.object(im, "_signal_process_tree") as signal_group,
         patch.object(
@@ -5864,7 +6646,13 @@ async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
         ) as wait_tree,
     ):
         launch = asyncio.create_task(
-            im.launch(instance_id, "cancel and fail reaping", cwd="/tmp")
+            im.launch(
+                instance_id,
+                "cancel and fail reaping",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
         )
         await asyncio.wait_for(spawn_started.wait(), timeout=2.0)
         launch.cancel()
@@ -5872,12 +6660,27 @@ async def test_cancelled_direct_spawn_failed_reap_retains_fail_closed_evidence(
         with pytest.raises(asyncio.CancelledError):
             await launch
 
+        with pytest.raises(
+            CodexAppServerBusyError,
+            match="still has an exec generation",
+        ):
+            await im.launch(
+                contender_id,
+                "must not overlap retained generation",
+                cwd="/tmp",
+                provider="codex",
+                config_dir=codex_home,
+            )
+
+    assert spawn.call_count == 1
     signal_group.assert_called_once_with(
         instance_id, process, signal.SIGKILL
     )
     wait_tree.assert_awaited_once_with(instance_id, process, 5.0)
     assert im.processes[instance_id] is process
     assert im._process_groups[instance_id] is process
+    assert im._codex_exec_homes[instance_id] == codex_home
+    assert codex_home in im.busy_codex_homes()
     async with db_factory() as db:
         instance = await db.get(Instance, instance_id)
         assert instance.status == "error"
@@ -6969,6 +7772,114 @@ async def test_codex_turn_failed_does_not_append_generic_process_exit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "notification_type",
+        "will_retry",
+        "message",
+        "expected_status",
+        "expected_error",
+        "expected_exit_code",
+    ),
+    [
+        pytest.param(
+            "turn.retrying", True, "Reconnecting... 1/5",
+            "completed", None, 0, id="retrying",
+        ),
+        pytest.param(
+            "turn.failed", False, "backend failed",
+            "failed", "backend failed", 1, id="non-retry-fatal",
+        ),
+    ],
+)
+async def test_codex_error_notification_respects_will_retry(
+    db_factory,
+    notification_type,
+    will_retry,
+    message,
+    expected_status,
+    expected_error,
+    expected_exit_code,
+):
+    async with db_factory() as db:
+        inst = Instance(name="codex-retrying-inst")
+        task = Task(
+            title="codex retrying task",
+            description="d",
+            status="executing",
+            provider="codex",
+        )
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_id = task.id
+
+    process = _make_mock_process(returncode=0)
+    output = iter([
+        json.dumps({
+            "type": notification_type,
+            "error": {
+                "message": message,
+                "codexErrorInfo": {
+                    "responseStreamDisconnected": {"httpStatusCode": 409},
+                },
+                "additionalDetails": (
+                    "unexpected status 409 Conflict: "
+                    '{"detail":"all logged-in accounts are busy"}'
+                ),
+            },
+            "turn_id": "turn-1",
+            "will_retry": will_retry,
+            "terminal": not will_retry,
+        }).encode() + b"\n",
+        json.dumps({
+            "type": "turn.completed",
+            "turn_id": "turn-1",
+            "usage": {},
+        }).encode() + b"\n",
+        b"",
+    ])
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager._try_proactive_pool_switch = AsyncMock(return_value=False)
+    manager.processes[inst_id] = process
+
+    await manager._consume_output(
+        inst_id,
+        task_id,
+        process,
+        chat_initiated=True,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        error_entries = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalars().all()
+
+    assert task.status == expected_status
+    assert task.error_message == expected_error
+    assert (task.completed_at is not None) == (expected_status == "completed")
+    assert manager.effective_exit_code(inst_id, process) == expected_exit_code
+    assert [entry.content for entry in error_entries] == [message]
+
+
+@pytest.mark.asyncio
 async def test_consume_output_records_fatal_result_for_outer_lifecycle(
     db_factory,
 ):
@@ -7059,6 +7970,8 @@ def test_internal_codex_abort_is_not_a_successful_chat_terminal():
     assert not InstanceManager._chat_terminal_succeeded(process, 130)
     process.termination_kind = "user_interrupt"
     assert InstanceManager._chat_terminal_succeeded(process, 130)
+    process.termination_kind = "timeout"
+    assert not InstanceManager._chat_terminal_succeeded(process, 130)
     assert InstanceManager._chat_terminal_succeeded(process, 0)
 
 
@@ -9291,11 +10204,24 @@ async def test_process_event_reactivates_completed_task(db_factory):
 
         async with db_factory() as db:
             t = await db.get(Task, task_id)
+            stored_log = (
+                await db.execute(
+                    select(LogEntry).where(LogEntry.task_id == task_id)
+                )
+            ).scalar_one()
             assert t.status == "executing"
+            assert stored_log.task_retry_count == retry_count
         assert any(
             p.get("new_status") == "executing"
             for p in _status_change_payloads(broadcaster)
         )
+        task_events = [
+            call.args[1]
+            for call in broadcaster.broadcast.await_args_list
+            if call.args[0] == f"task:{task_id}"
+            and call.args[1].get("event_type") == "message"
+        ]
+        assert task_events[0]["task_retry_count"] == retry_count
     finally:
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)

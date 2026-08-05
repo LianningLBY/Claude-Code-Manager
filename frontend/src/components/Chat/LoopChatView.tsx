@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import type { Components } from 'react-markdown';
 import { api } from '../../api/client';
 import type { ChatMessage, Task } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
@@ -9,6 +8,9 @@ import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
 } from './messageMerge';
+import { TaskArtifactLink } from './TaskArtifactLink';
+import { remarkTaskArtifactPaths } from './taskArtifactMarkdown';
+import { MarkdownRenderer } from '../Markdown/MarkdownRenderer';
 
 interface LoopChatViewProps {
   task: Task;
@@ -231,8 +233,7 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-const remarkPlugins = [remarkGfm];
-
+const taskRemarkPlugins = [remarkTaskArtifactPaths];
 const markdownComponents: Components = {
   pre({ children }) {
     let codeText = '';
@@ -256,20 +257,25 @@ const markdownComponents: Components = {
   },
 };
 
-const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
+const MarkdownContent = memo(function MarkdownContent({ content, taskId }: { content: string; taskId: number }) {
+  const taskComponents = useMemo<Components>(() => ({
+    ...markdownComponents,
+    a({ href, title, children }) {
+      return <TaskArtifactLink taskId={taskId} href={href} linkTitle={title}>{children}</TaskArtifactLink>;
+    },
+  }), [taskId]);
   return (
     <div className="markdown-body">
-      <ReactMarkdown
-        remarkPlugins={remarkPlugins}
-        components={markdownComponents}
-      >
-        {content}
-      </ReactMarkdown>
+      <MarkdownRenderer
+        content={content}
+        components={taskComponents}
+        remarkPlugins={taskRemarkPlugins}
+      />
     </div>
   );
 });
 
-const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMessage }) {
+const MessageBubble = memo(function MessageBubble({ message, taskId }: { message: ChatMessage; taskId: number }) {
   if (message.event_type === 'thinking') {
     return (
       <div className="mx-4 px-3 py-2 bg-gray-800/30 rounded text-xs border border-gray-700/30">
@@ -294,7 +300,7 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMe
   return (
     <div className="flex justify-start">
       <div className="max-w-[85%] rounded-2xl rounded-bl-md px-4 py-2.5 text-sm bg-gray-800 text-gray-200">
-        <MarkdownContent content={message.content || ''} />
+        <MarkdownContent content={message.content || ''} taskId={taskId} />
       </div>
     </div>
   );
@@ -345,7 +351,7 @@ function IterationPanel({ iteration, messages, meta, isActive, defaultOpen, task
             group.type === 'tool-group' ? (
               <ToolGroup key={i} messages={group.messages} taskId={taskId} />
             ) : (
-              <MessageBubble key={group.message.id} message={group.message} />
+              <MessageBubble key={group.message.id} message={group.message} taskId={taskId} />
             )
           )}
           {isActive && (

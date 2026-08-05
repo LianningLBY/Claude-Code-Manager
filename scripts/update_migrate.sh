@@ -1147,6 +1147,9 @@ for pid, command, cgroup, error in uninspectable:
     in_user_manager_init = (
         f"/user-{own_uid}.slice/user@{own_uid}.service/init.scope" in cgroup
     )
+    # After a daemon-reexec the user manager's cmdline gains extra arguments
+    # (e.g. "systemd --user --deserialize=19"), so match tokens, not a suffix.
+    command_tokens = command.split()
     fixed_system_helper = (
         command == "(sd-pam)"
         or fixed_systemd_user_manager(command)

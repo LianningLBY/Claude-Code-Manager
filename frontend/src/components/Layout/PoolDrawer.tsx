@@ -266,6 +266,7 @@ function ApiQuotaPanel({ quota, onRefresh }: {
     && quota.days_until_expiry == null;
   const total = quota.quota;
   const hasSharedGroup = Boolean(quota.group_name);
+  const hasWindows = Boolean(quota.windows?.length);
   const totalUtilization = total?.used != null && total.limit != null && total.limit > 0
     ? Math.min(100, Math.max(0, (total.used / total.limit) * 100))
     : null;
@@ -354,9 +355,9 @@ function ApiQuotaPanel({ quota, onRefresh }: {
             <span className="text-gray-400">余额 <span className="font-medium text-foreground">{formatApiAmount(quota.balance, currency)}</span></span>
           )}
         </div>
-      ) : (
+      ) : !hasWindows ? (
         <div className="text-xs text-gray-500">总额度：无法确认</div>
-      )}
+      ) : null}
       <ApiUsageDetails quota={quota} currency={currency} />
       <div className="grid grid-cols-1 gap-1 text-[10px] text-gray-500">
         <span>到期时间：<span className="text-gray-300">
@@ -379,17 +380,22 @@ function ApiQuotaPanel({ quota, onRefresh }: {
         )}
       </div>
       {quota.windows?.map((window, index) => {
-        const utilization = window.utilization != null
-          ? window.utilization
-          : window.used != null && window.limit != null && window.limit > 0
-            ? (window.used / window.limit) * 100
-            : null;
+        const windowUnlimited = window.unlimited === true;
+        const utilization = windowUnlimited
+          ? null
+          : window.utilization != null
+            ? window.utilization
+            : window.used != null && window.limit != null && window.limit > 0
+              ? (window.used / window.limit) * 100
+              : null;
         const pct = utilization == null ? null : Math.min(100, Math.max(0, utilization));
         const resetAt = window.reset_at ?? window.resets_at ?? null;
         const windowId = window.id || `${window.label || 'window'}-${index}`;
         const isSharedWindow = window.scope === 'group' || hasSharedGroup;
         const keyUsed = window.key_used ?? quota.key_usage?.[window.id || ''];
         const windowLabel = window.label || window.id || `额度窗口 ${index + 1}`;
+        const hasFiniteAmounts = !windowUnlimited
+          && (window.used != null || window.limit != null || window.remaining != null);
         return (
           <div key={windowId} className="space-y-1">
             <div className="flex items-center justify-between gap-2 text-[10px]">
@@ -397,8 +403,10 @@ function ApiQuotaPanel({ quota, onRefresh }: {
                 {windowLabel}
                 {isSharedWindow && !windowLabel.includes('分组共享') ? '（分组共享）' : ''}
               </span>
-              <span className="text-gray-500">
-                {resetAt == null ? '重置时间无法确认' : formatApiTimestamp(resetAt)}
+              <span className={windowUnlimited ? 'font-medium text-emerald-300' : 'text-gray-500'}>
+                {windowUnlimited
+                  ? isSharedWindow ? '分组不限额' : '不限额'
+                  : resetAt == null ? '重置时间无法确认' : formatApiTimestamp(resetAt)}
               </span>
             </div>
             {pct != null && (
@@ -409,11 +417,11 @@ function ApiQuotaPanel({ quota, onRefresh }: {
                 <span className={`w-10 shrink-0 text-right text-xs font-medium ${textColor(pct)}`}>{pct.toFixed(0)}%</span>
               </div>
             )}
-            {(window.used != null || window.limit != null || window.remaining != null || keyUsed != null) && (
+            {(hasFiniteAmounts || keyUsed != null) && (
               <div className="flex flex-wrap gap-x-3 text-[10px] text-gray-500">
-                {window.used != null && <span>{isSharedWindow ? '分组共享已用' : '已用'} {formatApiAmount(window.used, window.currency || quota.currency)}</span>}
-                {window.limit != null && <span>{isSharedWindow ? '分组共享上限' : '上限'} {formatApiAmount(window.limit, window.currency || quota.currency)}</span>}
-                {window.remaining != null && <span>{isSharedWindow ? '分组共享剩余' : '剩余'} {formatApiAmount(window.remaining, window.currency || quota.currency)}</span>}
+                {!windowUnlimited && window.used != null && <span>{isSharedWindow ? '分组共享已用' : '已用'} {formatApiAmount(window.used, window.currency || quota.currency)}</span>}
+                {!windowUnlimited && window.limit != null && <span>{isSharedWindow ? '分组共享上限' : '上限'} {formatApiAmount(window.limit, window.currency || quota.currency)}</span>}
+                {!windowUnlimited && window.remaining != null && <span>{isSharedWindow ? '分组共享剩余' : '剩余'} {formatApiAmount(window.remaining, window.currency || quota.currency)}</span>}
                 {keyUsed != null && <span>本 Key 已用 {formatApiAmount(keyUsed, window.currency || quota.currency)}</span>}
               </div>
             )}

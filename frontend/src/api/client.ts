@@ -5,6 +5,16 @@ export interface ApiRequestError extends Error {
   detail: unknown;
 }
 
+export interface TaskArtifactDownload {
+  blob: Blob;
+  filename: string;
+}
+
+export interface PRFindingDiffDownload extends TaskArtifactDownload {
+  receipt: string;
+  confirmationToken: string;
+}
+
 export function isApiRequestError(error: unknown): error is ApiRequestError {
   return error instanceof Error
     && typeof (error as { status?: unknown }).status === 'number';
@@ -12,6 +22,52 @@ export function isApiRequestError(error: unknown): error is ApiRequestError {
 
 function getBase(): string {
   return getApiBase();
+}
+
+function downloadFilename(
+  contentDisposition: string | null,
+  artifactPath: string,
+): string {
+  if (contentDisposition) {
+    const encoded = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+    if (encoded) {
+      try {
+        return decodeURIComponent(encoded);
+      } catch { /* fall through to the plain filename */ }
+    }
+    const plain = contentDisposition.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1];
+    if (plain) return plain;
+  }
+  const withoutSuffix = artifactPath.split(/[?#]/, 1)[0];
+  const basename = withoutSuffix.split(/[\\/]/).pop();
+  try {
+    return decodeURIComponent(basename || '') || 'download';
+  } catch {
+    return basename || 'download';
+  }
+}
+
+async function validateAuthenticatedDownloadResponse(res: Response): Promise<void> {
+  if (res.status === 401) {
+    clearToken();
+    window.location.reload();
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) {
+    const error: unknown = await res.json().catch(() => null);
+    const detail = error && typeof error === 'object' && 'detail' in error
+      ? error.detail
+      : null;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail && typeof detail === 'object' && 'error' in detail
+        && typeof detail.error === 'string'
+        ? detail.error
+        : res.statusText;
+    throw new Error(message);
+  }
+  const refreshedToken = res.headers.get('X-Refreshed-Token');
+  if (refreshedToken) setToken(refreshedToken);
 }
 
 export function getToken(): string {
@@ -261,6 +317,7 @@ export interface Task {
   active_sub_agents: number;
   background_active?: boolean;
   tags: string[] | null;
+  attention_tag?: string | null;
   metadata_: {
     file_paths?: string[];
     image_paths?: string[];
@@ -341,6 +398,8 @@ export interface ChatMessage {
   is_error: boolean;
   pty_cold_start?: boolean;
   loop_iteration: number | null;
+  /** Exact Task retry generation that persisted this history row. */
+  task_retry_count?: number | null;
   timestamp: string | null;
   image_urls: string[] | null;
   attachments: FileAttachment[] | null;
@@ -769,6 +828,12 @@ export interface MonitoredRepo {
   provider: string;
   review_model: string | null;
   review_effort: string | null;
+  review_mode: 'single' | 'panel';
+  wait_for_ci: boolean;
+  required_checks: RequiredCheckPolicy[];
+  auto_repair: boolean;
+  max_repair_attempts: number;
+  merge_queue_mode: 'manual' | 'shadow' | 'auto';
   default_branch: string;
   allowed_authors: string[];
   status: string;
@@ -777,10 +842,18 @@ export interface MonitoredRepo {
   updated_at: string;
 }
 
+export interface RequiredCheckPolicy {
+  kind: 'check_run' | 'status';
+  name: string;
+  app_slug: string;
+}
+
 export interface PRReview {
   id: number;
+  monitor_run_id: number | null;
   repo_id: number;
   pr_number: number;
+  base_sha: string | null;
   head_sha: string | null;
   delivery_id: string | null;
   pr_title: string;
@@ -790,8 +863,131 @@ export interface PRReview {
   status: string;
   review_summary: string | null;
   action_taken: string | null;
+  ci_status: string | null;
+  ci_summary: string | null;
+  ci_details: {
+    head_sha: string;
+    required: RequiredCheckPolicy[];
+    observed: Array<RequiredCheckPolicy & { state: string; details_url?: string | null }>;
+  } | null;
+  reviewer_runs?: PRReviewerRun[];
+  is_current_snapshot?: boolean;
   created_at: string;
   completed_at: string | null;
+}
+
+export interface PRRepairWake {
+  id: number;
+  developer_task_id: number | null;
+  trigger_head_sha: string;
+  reason_kind: string;
+  status: string;
+  attempt: number;
+  last_error: string | null;
+}
+
+export interface PRMonitorRun {
+  id: number;
+  repo_id: number;
+  pr_number: number;
+  status: string;
+  current_head_sha: string;
+  developer_task_id: number | null;
+  repair_attempts: number;
+  max_repair_attempts: number;
+  pause_reason: string | null;
+  wakes: PRRepairWake[];
+  merge_actions: PRMergeQueueAction[];
+}
+
+export interface PRMergeQueueAction {
+  id: number;
+  review_id: number;
+  trigger_head_sha: string;
+  status: string;
+  github_queue_entry_id: string | null;
+  merge_group_sha: string | null;
+  ci_status: string | null;
+  attempt_count: number;
+  last_error: string | null;
+}
+
+export interface PRFindingRebuttal {
+  id: number;
+  finding_id: number;
+  task_id: number | null;
+  attempt: number;
+  evidence: string;
+  status: string;
+  verdict: string | null;
+  result_body: string | null;
+  error_message: string | null;
+}
+
+export interface PRFindingAction {
+  id: number;
+  finding_id: number;
+  action_type: 'ignore' | 'human_advice' | 'ai_fix';
+  status: 'pending' | 'running' | 'awaiting_confirmation' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'stale';
+  idempotency_key: string;
+  actor_user_id: number | null;
+  human_advice: string | null;
+  task_id: number | null;
+  expected_head_sha: string;
+  patch_sha256: string | null;
+  downloaded_by_user_id: number | null;
+  downloaded_at: string | null;
+  confirmed_by_user_id: number | null;
+  confirmed_at: string | null;
+  candidate_commit_sha: string | null;
+  candidate_created_at: string | null;
+  push_attempted_at: string | null;
+  cancelled_by_user_id: number | null;
+  cancelled_at: string | null;
+  result: Record<string, unknown> | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  diff_download_url: string | null;
+}
+
+export interface PRFinding {
+  id: number;
+  reviewer_run_id: number;
+  role: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  category: string;
+  path: string;
+  line: number | null;
+  hunk: string | null;
+  title: string;
+  evidence: string;
+  impact: string;
+  required_fix: string;
+  test: string;
+  status: string;
+  thread_status: 'pending' | 'published_inline' | 'published_fallback' | 'resolved';
+  github_comment_id: number | null;
+  github_comment_url: string | null;
+  thread_error: string | null;
+  rebuttals: PRFindingRebuttal[];
+  latest_action: PRFindingAction | null;
+}
+
+export interface PRReviewerRun {
+  id: number;
+  role: string;
+  task_id: number | null;
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  status: string;
+  verdict: string | null;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+  findings: PRFinding[];
 }
 
 export interface PoolUsageWindow {
@@ -810,6 +1006,8 @@ export interface CloudRouterQuotaWindow {
   resets_at?: string | number | null;
   currency?: string | null;
   scope?: string | null;
+  /** This quota window has no configured limit. */
+  unlimited?: boolean;
   /** Usage attributed to this individual API key for a shared window. */
   key_used?: number | null;
 }
@@ -1456,9 +1654,9 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
-  updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null }) =>
+  updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteTask: (id: number) =>
     request<{ ok: boolean }>(`/api/tasks/${id}`, { method: 'DELETE' }),
@@ -1764,6 +1962,27 @@ export const api = {
   // Files (download)
   downloadFileUrl: (path: string) =>
     `${getBase()}/api/files/download?path=${encodeURIComponent(path)}`,
+  downloadTaskArtifact: async (
+    taskId: number,
+    artifactPath: string,
+  ): Promise<TaskArtifactDownload> => {
+    const token = getToken();
+    const query = new URLSearchParams({ path: artifactPath });
+    const res = await fetch(
+      `${getBase()}/api/tasks/${taskId}/artifacts/download?${query}`,
+      {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      },
+    );
+    await validateAuthenticatedDownloadResponse(res);
+    return {
+      blob: await res.blob(),
+      filename: downloadFilename(
+        res.headers.get('Content-Disposition'),
+        artifactPath,
+      ),
+    };
+  },
 
   // Files (SSH)
   sshListDir: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>
@@ -1865,9 +2084,9 @@ export const api = {
   // PR Monitor
   getMonitoredRepos: () =>
     request<MonitoredRepo[]>('/api/pr-monitor/repos'),
-  createMonitoredRepo: (data: { repo_full_name: string; project_id?: number; worker_id?: number; auto_merge?: boolean; provider?: string; review_model?: string; review_effort?: string; default_branch?: string; allowed_authors?: string[] }) =>
+  createMonitoredRepo: (data: { repo_full_name: string; project_id?: number; worker_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string; review_effort?: string; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[] }) =>
     request<MonitoredRepo>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
-  updateMonitoredRepo: (id: number, data: { project_id?: number; auto_merge?: boolean; provider?: string; review_model?: string | null; review_effort?: string | null; default_branch?: string; allowed_authors?: string[]; enabled?: boolean }) =>
+  updateMonitoredRepo: (id: number, data: { project_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string | null; review_effort?: string | null; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[]; enabled?: boolean }) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteMonitoredRepo: (id: number) =>
     request<{ ok: boolean }>(`/api/pr-monitor/repos/${id}`, { method: 'DELETE' }),
@@ -1879,6 +2098,60 @@ export const api = {
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>
     request<PRReview>(`/api/pr-monitor/reviews/${reviewId}`),
+  ignoreReviewFinding: (findingId: number, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/ignore`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),
+    }),
+  saveReviewFindingAdvice: (findingId: number, advice: string, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/advice`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey, advice }),
+    }),
+  createReviewFindingFix: (findingId: number, idempotencyKey: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/fix`, {
+      method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),
+    }),
+  getReviewFindingAction: (actionId: number) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}`),
+  cancelPRFindingAction: (actionId: number) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}/cancel`, {
+      method: 'POST',
+    }),
+  confirmReviewFindingFix: (actionId: number, confirmationToken: string, patchSha256: string, downloadReceipt: string) =>
+    request<PRFindingAction>(`/api/pr-monitor/actions/${actionId}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ confirmation_token: confirmationToken, patch_sha256: patchSha256, download_receipt: downloadReceipt }),
+    }),
+  downloadReviewFindingDiff: async (actionId: number): Promise<PRFindingDiffDownload> => {
+    const token = getToken();
+    const res = await fetch(`${getBase()}/api/pr-monitor/actions/${actionId}/diff`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    await validateAuthenticatedDownloadResponse(res);
+    const receipt = res.headers.get('X-CCM-PR-Fix-Receipt');
+    const confirmationToken = res.headers.get('X-CCM-PR-Fix-Token');
+    if (!receipt) throw new Error('PR fix download receipt is missing');
+    if (!confirmationToken) throw new Error('PR fix confirmation token is missing');
+    return {
+      blob: await res.blob(),
+      filename: downloadFilename(res.headers.get('Content-Disposition'), `pr-fix-${actionId}.diff`),
+      receipt,
+      confirmationToken,
+    };
+  },
+  getPRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}`),
+  bindPRMonitorDeveloper: (runId: number, taskId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/bind-developer`, { method: 'POST', body: JSON.stringify({ task_id: taskId }) }),
+  pausePRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/pause`, { method: 'POST' }),
+  resumePRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/resume`, { method: 'POST' }),
+  unbindPRMonitorDeveloper: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/unbind-developer`, { method: 'POST' }),
+  submitPRFindingRebuttal: (findingId: number, evidence: string) =>
+    request<PRFindingRebuttal>(`/api/pr-monitor/findings/${findingId}/rebut`, { method: 'POST', body: JSON.stringify({ evidence }) }),
+  enqueuePRMonitorMerge: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/enqueue-merge`, { method: 'POST' }),
   getWebhookInfo: () =>
     request<{ webhook_url: string | null }>('/api/pr-monitor/webhook-info'),
 

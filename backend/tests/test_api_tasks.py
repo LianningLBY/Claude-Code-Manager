@@ -1046,6 +1046,91 @@ async def test_update_task(client):
 
 
 @pytest.mark.asyncio
+async def test_attention_tag_create_update_and_clear_preserves_system_tags(client):
+    created = await client.post("/api/tasks", json={
+        "title": "Tagged session",
+        "description": "d",
+        "target_repo": "/tmp",
+        "attention_tag": "  等它结束后再看  ",
+        "tags": ["existing-system-marker"],
+    })
+
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+    assert created.json()["attention_tag"] == "等它结束后再看"
+    assert created.json()["tags"] == ["existing-system-marker"]
+
+    updated = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"attention_tag": "  今晚继续  "},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["attention_tag"] == "今晚继续"
+    assert updated.json()["tags"] == ["existing-system-marker"]
+
+    cleared = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"attention_tag": "   "},
+    )
+
+    assert cleared.status_code == 200
+    assert cleared.json()["attention_tag"] is None
+    assert cleared.json()["tags"] == ["existing-system-marker"]
+
+
+@pytest.mark.asyncio
+async def test_attention_tag_rejects_values_longer_than_80_characters(client):
+    created = await client.post("/api/tasks", json={
+        "title": "Tagged session",
+        "description": "d",
+        "target_repo": "/tmp",
+        "attention_tag": "x" * 81,
+    })
+
+    assert created.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_cloned_task_inherits_attention_tag_unless_overridden(client):
+    source = await client.post("/api/tasks", json={
+        "title": "Source",
+        "description": "d",
+        "target_repo": "/tmp",
+        "attention_tag": "等源任务结束",
+    })
+    source_id = source.json()["id"]
+
+    inherited = await client.post("/api/tasks", json={
+        "title": "Inherited",
+        "description": "d",
+        "target_repo": "/tmp",
+        "clone_from_task_id": source_id,
+    })
+    overridden = await client.post("/api/tasks", json={
+        "title": "Overridden",
+        "description": "d",
+        "target_repo": "/tmp",
+        "clone_from_task_id": source_id,
+        "attention_tag": "单独关注",
+    })
+    cleared = await client.post("/api/tasks", json={
+        "title": "Cleared",
+        "description": "d",
+        "target_repo": "/tmp",
+        "clone_from_task_id": source_id,
+        "attention_tag": None,
+    })
+
+    assert inherited.status_code == 201
+    assert inherited.json()["attention_tag"] == "等源任务结束"
+    assert overridden.status_code == 201
+    assert overridden.json()["attention_tag"] == "单独关注"
+    assert cleared.status_code == 201
+    assert cleared.json()["attention_tag"] is None
+
+
+@pytest.mark.asyncio
 async def test_update_task_not_found(client):
     resp = await client.put("/api/tasks/9999", json={"title": "X"})
     assert resp.status_code == 404
@@ -3912,6 +3997,60 @@ async def test_stop_session_clears_pending_queue(client):
     assert mock_clear.await_args.args == (task_id,)
     assert mock_clear.await_args.kwargs["durable_db"] is not None
     mock_stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_session_closes_auxiliary_producers_before_final_queue_drain(
+    client,
+    session_factory,
+):
+    """A monitor cannot refill the queue after Interrupt drains it."""
+
+    import backend.main
+    from backend.models.monitor_session import MonitorSession
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Stop monitor producer",
+        "description": "d",
+        "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        monitor = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="keeps reporting",
+            status="running",
+        )
+        db.add(monitor)
+        await db.commit()
+        monitor_id = monitor.id
+
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            side_effect=[46, 1],
+        ) as abort_queue,
+        patch.object(
+            backend.main.dispatcher,
+            "stop_monitor_session_process",
+            new_callable=AsyncMock,
+        ) as stop_monitor,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/stop-session")
+
+    assert response.status_code == 200
+    assert response.json()["cleared_messages"] == 47
+    assert abort_queue.await_count == 2
+    stop_monitor.assert_awaited_once_with(monitor_id, terminal=True)
+    async with session_factory() as db:
+        monitor = await db.get(MonitorSession, monitor_id)
+        assert monitor.status == "cancelled"
+        assert monitor.next_check_at is None
+        assert monitor.active_turn_generation is None
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,7 @@ from backend.services.context_compaction import (
     context_tokens_used,
     is_context_window_exceeded,
 )
+from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.instance_capacity import (
     active_capacity_predicate,
     instance_capacity_lock,
@@ -50,6 +51,10 @@ from backend.services.instance_manager import (
     InstanceManager,
 )
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.pr_review_runtime import (
+    is_pr_sandbox_task,
+    isolated_pr_review_cwd,
+)
 from backend.services.deployment_start_guard import (
     DeploymentTaskStartBlocked,
 )
@@ -61,6 +66,12 @@ from backend.services.task_queue import (
 from backend.services.task_skill_overrides import (
     TEMP_SKILLS_GENERATION_KEY,
     clear_temporary_skills_marker,
+)
+from backend.services.task_artifact_contract import (
+    TASK_ARTIFACT_LINK_TITLE,
+    TASK_ARTIFACT_POLICY_TAG,
+    configured_workspace_root,
+    workspace_root_is_secure_directory,
 )
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
@@ -143,7 +154,74 @@ _DOC_SYNC_NOTE = (
 )
 
 
-def _agent_doc_preamble(provider: str | None) -> str:
+def _task_artifact_policy(task: Task) -> str:
+    """Build the provider-neutral, project-scoped artifact contract."""
+
+    if is_pr_sandbox_task(task):
+        return ""
+
+    task_id = task.id
+    raw_root = str(task.target_repo or "")
+    try:
+        project_root = configured_workspace_root(raw_root)
+    except ValueError:
+        project_root = None
+    if (
+        project_root is not None
+        and not workspace_root_is_secure_directory(project_root)
+    ):
+        project_root = None
+    if (
+        task_id is None
+        or task_id <= 0
+        or project_root is None
+    ):
+        return (
+            f"{TASK_ARTIFACT_POLICY_TAG}\n"
+            "此 Task 没有可验证的项目根目录，因此不得创建或输出可下载文件链接。"
+            "普通文件名和项目文件只用反引号表示，不要写成本地 Markdown 链接。\n"
+            "</ccm_task_artifact_policy>"
+        )
+
+    relative_dir = f".claude-manager/artifacts/task-{task_id}"
+    host_dir = project_root / relative_dir
+    return (
+        f"{TASK_ARTIFACT_POLICY_TAG}\n"
+        "任务下载产物规则（Claude/Codex 均必须遵守）：\n"
+        f"- 当前 Task 的宿主机项目根目录（JSON 字符串）是 "
+        f"{json.dumps(str(project_root), ensure_ascii=False)}。若 Claude 在共享项目容器内运行，"
+        "运行时项目根目录以 `/workspace` 为准。\n"
+        f"- 只有用户明确要求查看、交付或下载的生成文件才是下载产物。所有下载产物必须放在项目根目录下 "
+        f"`{relative_dir}/`；宿主机目录是 "
+        f"{json.dumps(str(host_dir), ensure_ascii=False)}，容器内目录是 "
+        f"`/workspace/{relative_dir}/`。\n"
+        "- 禁止把下载产物留在 `/tmp`、用户主目录、项目外目录或 "
+        "`.claude-manager/worktrees/` 临时 worktree 中。若文件在 worktree 中生成，"
+        "必须在清理 worktree 前复制到上述 Task 专用目录。\n"
+        "- Task 专用目录是运行时交付区，不得 `git add` 或提交其中的文件。"
+        "若项目尚未忽略 `.claude-manager/`，只写入该仓库本地的 Git exclude，"
+        "不要为了产物修改项目的共享 `.gitignore`。\n"
+        "- 源码、配置、普通项目文档以及变更摘要中提到的文件默认不是下载产物，"
+        "用反引号表示（例如 `DEPLOYMENT.md`），不要自动生成 Markdown 链接。"
+        "即使用户明确要求下载某个项目文件，也应先复制一份到 Task 专用目录。\n"
+        "- 回复前逐个确认产物仍然存在、是普通文件而非符号链接，且最终路径位于本 Task 专用目录内。"
+        "无法确认时不要输出下载链接。\n"
+        "- 最终回复必须使用文件最终位置的绝对路径和专用标题标记，"
+        "不要只输出裸路径、文件名或相对路径。格式："
+        f"`[下载报告](</绝对路径/{relative_dir}/report.pdf> \"{TASK_ARTIFACT_LINK_TITLE}\")`。"
+        "路径包含空格时必须保留尖括号。\n"
+        "</ccm_task_artifact_policy>"
+    )
+
+
+def _prepend_task_artifact_policy(task: Task, prompt: str) -> str:
+    """Attach the artifact contract to one Task turn prompt."""
+
+    policy = _task_artifact_policy(task)
+    return f"{policy}\n\n{prompt}" if policy else prompt
+
+
+def _agent_doc_preamble(task: Task) -> str:
     """First-line prompt preamble pointing the agent at the project doc.
 
     Codex automatically loads AGENTS.md.  Explicitly telling it to read the
@@ -151,10 +229,10 @@ def _agent_doc_preamble(provider: str | None) -> str:
     operations.  Keep only the cross-document synchronization rule for Codex;
     Claude still needs the explicit CLAUDE.md workflow reminder.
     """
-    if (provider or "claude").lower() == "codex":
-        return _DOC_SYNC_NOTE
+    if (task.provider or "claude").lower() == "codex":
+        return f"{_DOC_SYNC_NOTE}\n{_task_artifact_policy(task)}"
     read_line = "请阅读项目根目录的 CLAUDE.md 了解项目规范和任务完成后的 git 流程。"
-    return f"{read_line}\n{_DOC_SYNC_NOTE}"
+    return f"{read_line}\n{_DOC_SYNC_NOTE}\n{_task_artifact_policy(task)}"
 
 
 # Priority levels for the per-task message queue
@@ -1055,6 +1133,20 @@ class GlobalDispatcher:
         """Return queued/in-flight resume task IDs under the admission lock."""
         async with self._dispatch_claim_lock:
             return set(self._pending_task_starts)
+
+    async def has_task_queue_work(self, task_id: int) -> bool:
+        """Return exact in-process evidence for queued or claimed task work.
+
+        Looking only at ``Queue.empty()`` is insufficient because ``q.get()``
+        happens just before the consumer records the message as in-flight.
+        """
+        async with self._dispatch_claim_lock:
+            queue = self._task_queues.get(task_id)
+            return bool(
+                task_id in self._pending_task_starts
+                or self._task_queue_inflight.get(task_id, 0)
+                or (queue is not None and not queue.empty())
+            )
 
     @asynccontextmanager
     async def maintenance_shutdown_guard(self):
@@ -2464,6 +2556,14 @@ class GlobalDispatcher:
                     task.id,
                     timeout,
                 )
+                # A provider may report the forced interrupt as the same
+                # SIGINT/130 terminal used for a user-requested stop.  Stamp
+                # the process before signalling it so the output consumer
+                # cannot publish a timed-out, partial reply as completed.
+                try:
+                    process.termination_kind = "timeout"
+                except (AttributeError, TypeError):
+                    pass
                 killed = await self.instance_manager.kill_process_generation(
                     instance_id,
                     process,
@@ -4224,6 +4324,25 @@ class GlobalDispatcher:
             return None
         await self._require_task_lifecycle_active(expected_generation)
 
+        # ``select`` only knows account health and quota. Exclude homes held by
+        # maintenance or a non-app-server exec before selecting a fresh route.
+        # App-server turns can share a transport; the per-home launch guard is
+        # authoritative if this scheduling snapshot races a new owner.
+        busy_homes = {
+            pool.canonical_home(home)
+            for home in self.instance_manager.busy_codex_homes()
+        }
+        busy_compatible_homes = {
+            home
+            for home in busy_homes
+            if pool.is_home_available(home)
+            and pool.supports_model_for_home(
+                home,
+                model,
+                service_tier=codex_service_tier,
+            )
+        }
+
         bound_id = await self._codex_task_binding(task_id)
         bound_home = pool.home_for_account(bound_id) if bound_id else None
         matches: list[str] = []
@@ -4240,6 +4359,7 @@ class GlobalDispatcher:
             if (
                 preferred_owner_home
                 and pool.is_home_available(preferred_owner_home)
+                and preferred_owner_home not in busy_homes
                 and pool.supports_model_for_home(
                     preferred_owner_home,
                     model,
@@ -4305,6 +4425,7 @@ class GlobalDispatcher:
         resident_available = bool(
             resident
             and pool.is_home_available(resident)
+            and resident not in busy_homes
             and pool.supports_model_for_home(
                 resident,
                 model,
@@ -4324,6 +4445,10 @@ class GlobalDispatcher:
             return resident
 
         excluded: set[str] = set()
+        for home in busy_homes:
+            busy_account_id = pool.account_id_for_home(home)
+            if busy_account_id:
+                excluded.add(busy_account_id)
         resident_id = pool.account_id_for_home(resident) if resident else None
         if resident_id:
             excluded.add(resident_id)
@@ -4353,6 +4478,12 @@ class GlobalDispatcher:
                     f"service tier {codex_service_tier!r} require quota or "
                     "credential intervention before retrying",
                     permanent=True,
+                )
+            if busy_compatible_homes:
+                raise CodexAccountRoutingError(
+                    "Codex pool has no idle compatible account; one or more "
+                    "otherwise available accounts are temporarily busy",
+                    retry_after=CODEX_ROUTING_RETRY_DELAY,
                 )
             if (
                 resident
@@ -4405,7 +4536,7 @@ class GlobalDispatcher:
                     resident,
                     target,
                 )
-                if pool.is_home_available(resident):
+                if resident_available:
                     await self._persist_codex_binding_for_route(
                         task_id=task_id,
                         account_id=pool.account_id_for_home(resident),
@@ -4414,7 +4545,12 @@ class GlobalDispatcher:
                     return resident
                 raise CodexAccountRoutingError(
                     f"Codex session {session_id} could not be migrated from "
-                    f"unavailable account home {resident}"
+                    f"unavailable account home {resident}",
+                    retry_after=(
+                        CODEX_ROUTING_RETRY_DELAY
+                        if resident in busy_homes
+                        else self._codex_pool_retry_after()
+                    ),
                 )
 
         if not binding_persisted:
@@ -4826,7 +4962,16 @@ class GlobalDispatcher:
         image_paths = metadata.get("image_paths") or []
         secret_ids = metadata.get("secret_ids") or []
         secrets_block = await _build_secrets_block(self.db_factory, secret_ids)
-        parts = [_agent_doc_preamble(task.provider)]
+        # PR reviews run against an immutable remote GitHub snapshot described
+        # by their own prompt.  Adding the normal preamble here would tell
+        # Claude to read the CCM checkout's CLAUDE.md; Codex would likewise load
+        # its AGENTS.md from cwd.  The lifecycle therefore also gives these
+        # tasks a neutral task-private directory.
+        parts = (
+            []
+            if is_pr_sandbox_task(task)
+            else [_agent_doc_preamble(task)]
+        )
         if secrets_block:
             parts.append(secrets_block)
         if image_paths:
@@ -4866,10 +5011,20 @@ class GlobalDispatcher:
                 instance_id,
             )
             return -2
-        if session_id:
+        # Tool-free Codex PR reviews deliberately start a fresh isolated
+        # thread even when a previous native thread id exists.  A relaunch
+        # must therefore resend the complete immutable snapshot contract;
+        # sending only "continue" would create an empty-context review turn.
+        fresh_codex_pr_review = (
+            task.provider == "codex" and is_pr_sandbox_task(task)
+        )
+        if session_id and not fresh_codex_pr_review:
             await self.instance_manager.launch(
                 instance_id=instance_id,
-                prompt="请继续之前的工作。",
+                prompt=_prepend_task_artifact_policy(
+                    task,
+                    "请继续之前的工作。",
+                ),
                 task_id=task.id,
                 cwd=cwd,
                 model=task.model,
@@ -5366,6 +5521,7 @@ class GlobalDispatcher:
         generation: _TaskLifecycleGeneration,
         reason: str,
     ) -> str | None:
+        failed_pr_task: Task | None = None
         async with self.db_factory() as db:
             task = await self._read_owned_lifecycle_task(
                 db,
@@ -5422,12 +5578,32 @@ class GlobalDispatcher:
             if resulting_generation is None:
                 await db.rollback()
                 return None
+            if status == "failed" and is_pr_sandbox_task(task):
+                refreshed = await db.get(
+                    Task,
+                    generation.task_id,
+                    populate_existing=True,
+                )
+                if (
+                    refreshed is not None
+                    and self._task_status_generation(refreshed)
+                    == resulting_generation
+                ):
+                    db.expunge(refreshed)
+                    failed_pr_task = refreshed
             await db.commit()
 
-        await self._broadcast_task_status_generation(
+        published = await self._broadcast_task_status_generation(
             resulting_generation,
             instance_id=generation.instance_id,
         )
+        if published and failed_pr_task is not None:
+            # Normal non-zero exits do not enter the lifecycle exception
+            # handler. Consume their exact exhausted generation here so PR
+            # fix actions cannot remain durably ``running`` forever. The
+            # completion/failure handler performs its own DB CAS as a final
+            # fence against a retry that wins after publication.
+            await self._handle_pr_review_failure(failed_pr_task, reason)
         return status
 
     async def _complete_owned_task_result(
@@ -5796,14 +5972,20 @@ class GlobalDispatcher:
 
             # === Step 2: Determine cwd and update task ===
             # 必须是绝对路径：PTY 模式按 cwd 推导 JSONL 轮询路径，"." 会落空
-            cwd = task.last_cwd or task.target_repo or os.getcwd()
+            review_task = is_pr_sandbox_task(task)
+            cwd = (
+                isolated_pr_review_cwd(task)
+                if review_task
+                else task.last_cwd or task.target_repo or os.getcwd()
+            )
 
             # 存量项目统一补 AGENTS.md（Codex 指令文件）：有 CLAUDE.md 而无
             # AGENTS.md 时注入 symlink，任何项目下次跑任务时自动补齐。
             # 不 commit（由 agent 的正常 git 流程带入），幂等且绝不阻断任务。
-            from backend.services.agent_docs import ensure_agents_md
+            if not review_task:
+                from backend.services.agent_docs import ensure_agents_md
 
-            ensure_agents_md(task.target_repo or cwd)
+                ensure_agents_md(task.target_repo or cwd)
             thinking_budget = task.thinking_budget
             effort_level = task.effort_level or settings.default_effort
             async with self.db_factory() as db:
@@ -6425,86 +6607,239 @@ class GlobalDispatcher:
 
     async def _handle_pr_review_completion(self, task: Task):
         meta = task.metadata_ or {}
+        fix_action_id = meta.get("pr_finding_action_id")
+        if type(fix_action_id) is int:
+            try:
+                from backend.services.pr_review_fix import handle_fix_task_completion
+                from backend.services.worker_proxy import get_task_operation_lock
+
+                async with get_task_operation_lock(task.id):
+                    async with self.db_factory() as db:
+                        await handle_fix_task_completion(
+                            db,
+                            action_id=fix_action_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                        )
+            except Exception:
+                logger.exception(
+                    "PR fix completion handler error for Task %s", task.id
+                )
+            return
         pr_review_id = meta.get("pr_review_id")
+        reviewer_run_id = meta.get("pr_reviewer_run_id")
+        adjudication_id = meta.get("pr_adjudication_id")
         if not pr_review_id:
             return
         try:
             from backend.models.pr_monitor import MonitoredRepo, PRReview
             from backend.services.pr_review_service import check_and_update_review
+            from backend.services.worker_proxy import get_task_operation_lock
 
-            async with self.db_factory() as db:
-                current_task = await db.get(Task, task.id)
-                session_id = (
-                    current_task.session_id if current_task is not None else None
-                )
-
-                def background_handoff_pending() -> bool:
-                    return bool(
-                        session_id
-                        and self.instance_manager.has_pty_autonomous_activity_handoff(
-                            task.id, session_id
-                        )
+            # Serialize the reviewing->publishing/terminal transition with
+            # retry, chat, delete, migration, and Worker mutations. The Task
+            # row is a generation fence, but a no-op row lock alone does not
+            # stop a later API operation from changing that generation after
+            # this transaction commits.
+            async with get_task_operation_lock(task.id):
+                async with self.db_factory() as db:
+                    current_task = await db.get(Task, task.id)
+                    session_id = (
+                        current_task.session_id
+                        if current_task is not None
+                        else None
                     )
 
-                if (
-                    current_task is None
-                    or current_task.status != "completed"
-                    or current_task.retry_count != task.retry_count
-                    or current_task.pty_background_generation is not None
-                    or background_handoff_pending()
-                ):
-                    return
-                review = await db.get(PRReview, pr_review_id)
-                if not review:
-                    return
-                repo = await db.get(MonitoredRepo, review.repo_id)
-                if not repo:
-                    return
-                await check_and_update_review(
-                    db,
-                    pr_review_id,
-                    repo.repo_full_name,
-                    terminal_task_id=task.id,
-                    terminal_task_retry_count=task.retry_count,
-                    background_handoff_pending=background_handoff_pending,
-                )
+                    def background_handoff_pending() -> bool:
+                        return bool(
+                            session_id
+                            and self.instance_manager
+                            .has_pty_autonomous_activity_handoff(
+                                task.id, session_id
+                            )
+                        )
+
+                    if (
+                        current_task is None
+                        or current_task.status != "completed"
+                        or current_task.retry_count != task.retry_count
+                        or current_task.pty_background_generation is not None
+                        or background_handoff_pending()
+                    ):
+                        return
+                    if adjudication_id:
+                        from backend.services.pr_review_adjudication import (
+                            complete_adjudication,
+                        )
+
+                        await complete_adjudication(
+                            db,
+                            adjudication_id=adjudication_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                        )
+                        from backend.services.pr_review_adjudication import (
+                            reconcile_rebuttal_resolutions,
+                        )
+                        await reconcile_rebuttal_resolutions(self.db_factory)
+                        return
+                    if reviewer_run_id:
+                        from backend.services.pr_review_panel import (
+                            check_and_update_reviewer_run,
+                        )
+                        from backend.services.pr_review_service import (
+                            pr_review_action_lock,
+                        )
+
+                        async with pr_review_action_lock(pr_review_id):
+                            await check_and_update_reviewer_run(
+                                db,
+                                reviewer_run_id=reviewer_run_id,
+                                task_id=task.id,
+                                retry_count=task.retry_count,
+                                db_factory=self.db_factory,
+                            )
+                        return
+                    review = await db.get(PRReview, pr_review_id)
+                    if not review:
+                        return
+                    repo = await db.get(MonitoredRepo, review.repo_id)
+                    if not repo:
+                        return
+                    await check_and_update_review(
+                        db,
+                        pr_review_id,
+                        repo.repo_full_name,
+                        terminal_task_id=task.id,
+                        terminal_task_retry_count=task.retry_count,
+                        background_handoff_pending=background_handoff_pending,
+                        db_factory=self.db_factory,
+                    )
         except Exception as e:
             logger.error(f"PR review completion handler error: {e}", exc_info=True)
 
     async def _handle_pr_review_failure(self, task: Task, error: str):
         meta = task.metadata_ or {}
+        fix_action_id = meta.get("pr_finding_action_id")
+        if type(fix_action_id) is int:
+            try:
+                from backend.services.pr_review_fix import handle_fix_task_failure
+                from backend.services.worker_proxy import get_task_operation_lock
+
+                async with get_task_operation_lock(task.id):
+                    async with self.db_factory() as db:
+                        await handle_fix_task_failure(
+                            db,
+                            action_id=fix_action_id,
+                            task_id=task.id,
+                            retry_count=task.retry_count,
+                            error=error,
+                        )
+            except Exception:
+                logger.exception(
+                    "PR fix failure handler error for Task %s", task.id
+                )
+            return
         pr_review_id = meta.get("pr_review_id")
+        reviewer_run_id = meta.get("pr_reviewer_run_id")
+        adjudication_id = meta.get("pr_adjudication_id")
         if not pr_review_id:
             return
         try:
             from backend.models.pr_monitor import PRReview
+            from backend.services.worker_proxy import get_task_operation_lock
             from datetime import datetime
 
-            async with self.db_factory() as db:
-                failed = await db.execute(
-                    update(PRReview)
-                    .where(
-                        PRReview.id == pr_review_id,
-                        PRReview.task_id == task.id,
-                        PRReview.status.in_(("pending", "reviewing")),
+            async with get_task_operation_lock(task.id):
+                async with self.db_factory() as db:
+                    current = await db.get(
+                        Task,
+                        task.id,
+                        populate_existing=True,
                     )
-                    .values(
-                        status="error",
-                        action_taken="error",
-                        review_summary=f"Task failed: {error[:500]}",
-                        completed_at=datetime.utcnow(),
+                    if (
+                        current is None
+                        or current.status != "failed"
+                        or current.retry_count != task.retry_count
+                        or current.pty_background_generation is not None
+                    ):
+                        return
+                    # Revalidate the exact failed Task generation while holding
+                    # the same operation lock used by manual retry.
+                    task_guard = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == current.id,
+                            Task.status == "failed",
+                            Task.retry_count == current.retry_count,
+                            (
+                                Task.started_at.is_(None)
+                                if current.started_at is None
+                                else Task.started_at == current.started_at
+                            ),
+                            (
+                                Task.completed_at.is_(None)
+                                if current.completed_at is None
+                                else Task.completed_at == current.completed_at
+                            ),
+                            Task.pty_background_generation.is_(None),
+                        )
+                        .values(status=Task.status)
                     )
-                )
-                await db.commit()
-                if failed.rowcount:
-                    await self.broadcaster.broadcast(
-                        "pr-monitor",
-                        {
+                    if task_guard.rowcount != 1:
+                        await db.rollback()
+                        return
+                    if adjudication_id:
+                        from backend.services.pr_review_adjudication import (
+                            fail_adjudication,
+                        )
+
+                        await fail_adjudication(
+                            db,
+                            adjudication_id=adjudication_id,
+                            task_id=task.id,
+                            error=error,
+                        )
+                        return
+                    if reviewer_run_id:
+                        from backend.services.pr_review_panel import (
+                            fail_reviewer_run,
+                        )
+
+                        changed_review_id = await fail_reviewer_run(
+                            db,
+                            reviewer_run_id=reviewer_run_id,
+                            task_id=task.id,
+                            error=error,
+                        )
+                        if changed_review_id:
+                            await self.broadcaster.broadcast("pr-monitor", {
+                                "type": "review_updated",
+                                "review_id": changed_review_id,
+                                "status": "error",
+                            })
+                        return
+                    failed = await db.execute(
+                        update(PRReview)
+                        .where(
+                            PRReview.id == pr_review_id,
+                            PRReview.task_id == task.id,
+                            PRReview.status.in_(("pending", "reviewing")),
+                        )
+                        .values(
+                            status="error",
+                            action_taken="error",
+                            review_summary=f"Task failed: {error[:500]}",
+                            completed_at=datetime.utcnow(),
+                        )
+                    )
+                    await db.commit()
+                    if failed.rowcount:
+                        await self.broadcaster.broadcast("pr-monitor", {
                             "type": "review_updated",
                             "review_id": pr_review_id,
                             "status": "error",
-                        },
-                    )
+                        })
         except Exception as e:
             logger.error(f"PR review failure handler error: {e}", exc_info=True)
 
@@ -7439,11 +7774,12 @@ class GlobalDispatcher:
                     codex_service_tier=task.codex_service_tier,
                 )
             else:
-                resume_reason = (
-                    last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
-                )
+                resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
                 turn_prompt = self._build_goal_followup_prompt(
-                    resume_reason, turn, max_turns
+                    task,
+                    resume_reason,
+                    turn,
+                    max_turns,
                 )
                 turn_resume_session = session_id
                 # Resume on the session's resident account (no config_dir drift →
@@ -7576,7 +7912,7 @@ class GlobalDispatcher:
 
     def _build_goal_initial_prompt(self, task: Task) -> str:
         """Build the first-turn prompt for a goal task."""
-        parts = [_agent_doc_preamble(task.provider)]
+        parts = [_agent_doc_preamble(task)]
 
         metadata = task.metadata_ or {}
         image_paths = metadata.get("image_paths") or []
@@ -7597,16 +7933,21 @@ class GlobalDispatcher:
         return "\n\n".join(parts)
 
     def _build_goal_followup_prompt(
-        self, last_reason: str, turn: int, max_turns: int
+        self,
+        task: Task,
+        last_reason: str,
+        turn: int,
+        max_turns: int,
     ) -> str:
         """Build follow-up prompt for subsequent goal turns."""
         remaining = max_turns - turn
-        return (
+        prompt = (
             f"评估器判断目标尚未达成。\n\n"
             f"评估器反馈: {last_reason}\n\n"
             f"请继续工作以满足目标条件。你还有 {remaining} 轮机会。\n"
             f"本轮结束时请简要说明完成了什么、当前状态如何。"
         )
+        return _prepend_task_artifact_policy(task, prompt)
 
     async def _collect_goal_conversation(self, task_id: int, current_turn: int) -> str:
         """Collect recent conversation log entries for the evaluator.
@@ -7661,7 +8002,8 @@ class GlobalDispatcher:
         Only describes todo-related responsibilities. Git/commit/worktree lifecycle
         is already covered by CLAUDE.md — no need to repeat it here.
         """
-        parts = []
+        artifact_policy = _task_artifact_policy(task)
+        parts = [artifact_policy] if artifact_policy else []
         doc = _agent_doc_name(task.provider)
         max_iterations = task.max_iterations or 50
         remaining = max_iterations - iteration
@@ -11713,6 +12055,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         from backend.services.codex_app_server import (
             CodexServiceTierUnavailableError,
+            CodexThreadIdentityMismatchError,
+            CodexThreadTerminalStateError,
         )
 
         provider = "Claude" if isinstance(exc, ClaudeAccountRoutingError) else "Codex"
@@ -11726,6 +12070,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 "Codex Fast 未被当前模型或账号确认，本条消息未执行。"
                 "请切换到支持 Fast 的模型/账号，或将速度改为 Standard 后"
                 f"重新发送。详情：{exc}"
+            )
+        elif isinstance(exc, CodexThreadTerminalStateError):
+            notice = (
+                "Codex 会话进入无法安全恢复的终态，本条消息未执行。"
+                "系统未能取得原线程的 idle 证明；为避免重复执行已停止"
+                f"自动重试。详情：{exc}"
+            )
+        elif isinstance(exc, CodexThreadIdentityMismatchError):
+            notice = (
+                "Codex 返回的会话身份与请求不一致，本条消息未执行。"
+                "为避免串到其他会话或重复执行，系统已停止自动重试。"
+                f"详情：{exc}"
             )
         else:
             notice = (
@@ -11813,6 +12169,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         CodexAppServerBusyError,
                         CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
+                        CodexThreadIdentityMismatchError,
+                        CodexThreadTerminalStateError,
                     )
                     from backend.services.instance_manager import (
                         InstanceAlreadyRunningError,
@@ -11827,6 +12185,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             CodexAppServerBusyError,
                             CodexServiceTierUnavailableError,
                             CodexThreadHomeMismatchError,
+                            CodexThreadTerminalStateError,
                             InstanceAlreadyRunningError,
                         ),
                     ):
@@ -11835,6 +12194,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 exc,
                                 (
                                     CodexServiceTierUnavailableError,
+                                    CodexThreadIdentityMismatchError,
+                                    CodexThreadTerminalStateError,
                                     QueuedMessageRoutingMismatchError,
                                 ),
                             )
@@ -11990,6 +12351,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             return False
         instance_id = task.instance_id
 
+        instance = await db.get(Instance, instance_id, populate_existing=True)
+        if (
+            instance is not None
+            and instance.current_task_id is not None
+            and instance.current_task_id != task_id
+        ):
+            # The instance has been durably reassigned.  Consumer records and
+            # launch params are in-memory terminal bookkeeping and can briefly
+            # retain the previous task id after the slot is reused.  Combining
+            # one of those stale records with the new generation's live
+            # process would otherwise keep chat for the completed task queued
+            # forever.
+            return False
+
         lifecycle = self._running_tasks.get(instance_id)
         if lifecycle is not None and not lifecycle.done():
             lifecycle_task_id = getattr(lifecycle, "_ccm_task_id", None)
@@ -12026,7 +12401,6 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # stronger identity during that terminal window.
             return True
 
-        instance = await db.get(Instance, instance_id, populate_existing=True)
         if instance is None or instance.current_task_id != task_id:
             return False
 
@@ -12155,6 +12529,46 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task_id,
                 )
                 return
+            repair_wake_identity = None
+            if msg.source.startswith("pr-repair:"):
+                from backend.services.pr_monitor_loop import (
+                    admit_repair_wake,
+                    parse_repair_wake_source,
+                )
+
+                repair_wake_identity = parse_repair_wake_source(msg.source)
+                if repair_wake_identity is None or not await admit_repair_wake(
+                    db,
+                    wake_id=repair_wake_identity[0],
+                    delivery_token=repair_wake_identity[1],
+                    task=task,
+                ):
+                    logger.info("Discarding stale or duplicate Repair Wake for task %s", task_id)
+                    return
+            if is_pr_sandbox_task(task):
+                from backend.models.pr_monitor import PRReview, PRReviewerRun
+
+                publishing = await db.execute(
+                    select(PRReview.id).distinct()
+                    .outerjoin(
+                        PRReviewerRun,
+                        PRReviewerRun.pr_review_id == PRReview.id,
+                    )
+                    .where(
+                        or_(
+                            PRReview.task_id == task_id,
+                            PRReviewerRun.task_id == task_id,
+                        ),
+                        PRReview.status.in_(("publishing", "superseding")),
+                    )
+                )
+                if publishing.scalar_one_or_none() is not None:
+                    logger.info(
+                        "Discarding queued message for publishing PR review "
+                        "task %s",
+                        task_id,
+                    )
+                    return
             current_expected_route = (
                 (task.provider or "claude").lower(),
                 msg.model_override or task.model,
@@ -12620,7 +13034,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # Capture launch params before closing DB session
             launch_kwargs = dict(
                 instance_id=inst.id,
-                prompt=msg.prompt,
+                prompt=_prepend_task_artifact_policy(task, msg.prompt),
                 task_id=task_id,
                 cwd=task.last_cwd or task.target_repo or os.getcwd(),
                 model=effective_model,
@@ -12885,6 +13299,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if monitor_log is not None:
                     msg.source_log_id = monitor_log.id
                     launch_kwargs["source_log_id"] = monitor_log.id
+                    if broadcast_data is not None:
+                        broadcast_data = persisted_chat_event(
+                            monitor_log,
+                            broadcast_data,
+                        )
             if broadcast_data is not None:
                 await self.broadcaster.broadcast(f"task:{task_id}", broadcast_data)
                 msg.source_logged = True
@@ -12908,6 +13327,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     CodexAppServerBusyError,
                     CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
+                    CodexThreadTerminalStateError,
                 )
                 from backend.services.cloudrouter_accounts import (
                     CloudRouterAccountError,
@@ -12926,6 +13346,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         CodexAppServerBusyError,
                         CodexServiceTierUnavailableError,
                         CodexThreadHomeMismatchError,
+                        CodexThreadTerminalStateError,
                         InstanceAlreadyRunningError,
                     ),
                 )
@@ -13129,6 +13550,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # Task→Instance finalizer. A queue cancellation or wait failure
             # must never manufacture a successful ``completed`` generation.
             await self._mark_plan_delivery(msg.delivery_key, "launched")
+            if repair_wake_identity is not None:
+                from backend.services.pr_monitor_loop import finish_repair_wake
+
+                async with self.db_factory() as repair_db:
+                    await finish_repair_wake(
+                        repair_db,
+                        wake_id=repair_wake_identity[0],
+                        delivery_token=repair_wake_identity[1],
+                        task_id=task_id,
+                    )
 
     async def _compact_session(
         self,

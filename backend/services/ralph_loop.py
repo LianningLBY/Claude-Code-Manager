@@ -181,6 +181,7 @@ class RalphLoop:
         """
 
         from backend.main import dispatcher
+        from backend.services.dispatcher import _prepend_task_artifact_policy
 
         config_dir = await dispatcher._resolve_resume_config_dir(
             task.session_id,
@@ -196,7 +197,7 @@ class RalphLoop:
         )
         return await self.instance_manager.launch(
             instance_id=instance_id,
-            prompt=prompt,
+            prompt=_prepend_task_artifact_policy(task, prompt),
             task_id=task.id,
             cwd=cwd,
             model=task.model,

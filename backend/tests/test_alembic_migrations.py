@@ -5,6 +5,8 @@ Ensures:
 2. A fresh database can be created from scratch via migrations.
 3. The final migrated schema matches the ORM models (no drift).
 """
+import importlib.util
+import io
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +15,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import BigInteger, create_engine, inspect, text
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.schema import CreateTable
 
@@ -31,6 +33,15 @@ import backend.models.quick_phrase  # noqa: F401
 import backend.models.plan  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
+PLAN_CLEANUP_REVISION = "f7a1c3d9e5b2"
+PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
+PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
+PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
+PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
+ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
+FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
+CURRENT_HEAD_REVISION = "e5b8d1c4a7f2"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -215,9 +226,11 @@ class TestLegacyMigration:
         assert "loop_progress" in task_cols
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
+        assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
+        assert "task_retry_count" in log_cols
 
         plan_step_cols = _get_table_columns(engine, "plan_agent_steps")
         assert "last_delta_at" in plan_step_cols
@@ -229,6 +242,7 @@ class TestLegacyMigration:
         assert "tags" in project_cols
 
         pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" in pr_review_cols
         assert "head_sha" in pr_review_cols
         assert "delivery_id" in pr_review_cols
 
@@ -418,7 +432,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -430,23 +444,141 @@ class TestFreshMigration:
         assert "plan_target_task_id" in task_cols
         assert "plan_context_snapshot" in task_cols
         assert "plan_applied_log_id" in task_cols
+        assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
+        assert "task_retry_count" in log_cols
 
         project_cols = _get_table_columns(engine, "projects")
         assert "sort_order" in project_cols
         assert "tags" in project_cols
 
         pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" in pr_review_cols
         assert "head_sha" in pr_review_cols
         assert "delivery_id" in pr_review_cols
         unique_column_sets = {
             tuple(constraint["column_names"])
             for constraint in inspect(engine).get_unique_constraints("pr_reviews")
         }
-        assert ("repo_id", "pr_number", "head_sha") in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) in unique_column_sets
+        assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         assert ("repo_id", "delivery_id") in unique_column_sets
+
+        pr_finding_cols = {
+            item["name"]: item
+            for item in inspect(engine).get_columns("pr_findings")
+        }
+        assert "resolution_lease_token" in pr_finding_cols
+        assert "resolution_lease_expires_at" in pr_finding_cols
+        assert "fixed_resolution_actor" in pr_finding_cols
+        assert "BIGINT" in str(pr_finding_cols["github_comment_id"]["type"]).upper()
+        assert isinstance(
+            Base.metadata.tables["pr_findings"].c.github_comment_id.type,
+            BigInteger,
+        )
+
+        action_columns = {
+            item["name"]
+            for item in inspect(engine).get_columns("pr_finding_actions")
+        }
+        assert {
+            "finding_id",
+            "action_type",
+            "status",
+            "idempotency_key",
+            "actor_user_id",
+            "human_advice",
+            "task_id",
+            "expected_head_sha",
+            "active_fix_finding_id",
+            "patch_sha256",
+            "download_receipt_hash",
+            "downloaded_by_user_id",
+            "downloaded_at",
+            "confirmed_by_user_id",
+            "confirmed_at",
+            "candidate_commit_sha",
+            "candidate_created_at",
+            "push_attempted_at",
+            "cancelled_by_user_id",
+            "cancelled_at",
+            "operation_token",
+            "operation_expires_at",
+            "result",
+            "error_message",
+            "created_at",
+            "updated_at",
+            "completed_at",
+        }.issubset(action_columns)
+        action_unique_constraints = {
+            (constraint["name"], tuple(constraint["column_names"]))
+            for constraint in inspect(engine).get_unique_constraints(
+                "pr_finding_actions"
+            )
+        }
+        assert (
+            "uq_pr_finding_actions_idempotency_key",
+            ("idempotency_key",),
+        ) in action_unique_constraints
+        assert (
+            "uq_pr_finding_actions_active_fix",
+            ("active_fix_finding_id",),
+        ) in action_unique_constraints
+        action_check_constraints = {
+            constraint["name"]: constraint.get("sqltext", "")
+            for constraint in inspect(engine).get_check_constraints(
+                "pr_finding_actions"
+            )
+        }
+        assert set(action_check_constraints) == {
+            "ck_pr_finding_actions_active_slot",
+            "ck_pr_finding_actions_status",
+            "ck_pr_finding_actions_type",
+        }
+        active_slot_sql = " ".join(
+            action_check_constraints["ck_pr_finding_actions_active_slot"]
+            .lower()
+            .split()
+        )
+        assert "active_fix_finding_id is not null" in active_slot_sql
+        assert "active_fix_finding_id = finding_id" in active_slot_sql
+        action_foreign_keys = {
+            (
+                tuple(constraint["constrained_columns"]),
+                constraint["referred_table"],
+                tuple(constraint["referred_columns"]),
+                (constraint.get("options") or {}).get("ondelete"),
+            )
+            for constraint in inspect(engine).get_foreign_keys(
+                "pr_finding_actions"
+            )
+        }
+        assert (("finding_id",), "pr_findings", ("id",), "CASCADE") in (
+            action_foreign_keys
+        )
+        assert (("task_id",), "tasks", ("id",), None) in action_foreign_keys
+        action_indexes = {
+            (index["name"], tuple(index["column_names"]))
+            for index in inspect(engine).get_indexes("pr_finding_actions")
+        }
+        assert {
+            ("ix_pr_finding_actions_finding_id", ("finding_id",)),
+            ("ix_pr_finding_actions_status", ("status",)),
+            ("ix_pr_finding_actions_actor_user_id", ("actor_user_id",)),
+            ("ix_pr_finding_actions_task_id", ("task_id",)),
+        }.issubset(action_indexes)
+        assert (
+            Base.metadata.tables["monitored_repos"]
+            .c.required_checks.server_default
+            is None
+        )
 
         # Verify alembic_version at head
         with engine.connect() as conn:
@@ -476,6 +608,43 @@ class TestFreshMigration:
         engine = create_engine(f"sqlite:///{db_path}")
         task_cols = _get_table_columns(engine, "tasks")
         assert "todo_file_path" in task_cols
+        engine.dispose()
+
+    def test_finding_actions_revision_downgrades_and_reupgrades(self, tmp_path):
+        """The finding-action table is owned by the new linear head."""
+
+        db_path = str(tmp_path / "finding-actions-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "pr_finding_actions" in _get_all_tables(engine)
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, PR_REVIEW_PANEL_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "pr_finding_actions" not in _get_all_tables(engine)
+        with engine.connect() as conn:
+            revisions = {
+                row[0]
+                for row in conn.execute(
+                text("SELECT version_num FROM alembic_version")
+                ).fetchall()
+            }
+        assert revisions == {
+            PR_REVIEW_PANEL_REVISION,
+            FIRST_CLASS_PLAN_HEAD_REVISION,
+        }
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "pr_finding_actions" in _get_all_tables(engine)
+        with engine.connect() as conn:
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+        assert revision == CURRENT_HEAD_REVISION
         engine.dispose()
 
 
@@ -531,9 +700,236 @@ class TestAlreadyMigratedDb:
         engine = create_engine(f"sqlite:///{db_path}")
         with engine.connect() as conn:
             rows = conn.execute(text(
-                "SELECT head_sha, delivery_id FROM pr_reviews ORDER BY id"
+                "SELECT base_sha, head_sha, delivery_id "
+                "FROM pr_reviews ORDER BY id"
             )).fetchall()
-            assert rows == [(None, None), (None, None)]
+            assert rows == [(None, None, None), (None, None, None)]
+            required_checks = conn.execute(text(
+                "SELECT required_checks FROM monitored_repos WHERE id = 1"
+            )).scalar_one()
+            if isinstance(required_checks, str):
+                required_checks = json.loads(required_checks)
+            assert required_checks == []
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    repo_full_name, enabled, auto_merge, webhook_secret,
+                    provider, default_branch, allowed_authors, required_checks, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'owner/default-checks', 1, 0, 'secret', 'codex', 'main',
+                    '[]', '[]', 'active', '2026-07-22 00:02:00',
+                    '2026-07-22 00:02:00'
+                )
+            """))
+            inserted_default = conn.execute(text(
+                "SELECT required_checks FROM monitored_repos "
+                "WHERE repo_full_name = 'owner/default-checks'"
+            )).scalar_one()
+            if isinstance(inserted_default, str):
+                inserted_default = json.loads(inserted_default)
+            assert inserted_default == []
+        required_column = next(
+            item for item in inspect(engine).get_columns("monitored_repos")
+            if item["name"] == "required_checks"
+        )
+        assert required_column["nullable"] is False
+        assert required_column["default"] is None
+        engine.dispose()
+
+    @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
+    def test_pr_panel_migration_compiles_portable_schema(self, dialect_name):
+        """The Panel schema uses portable Boolean/JSON defaults and bigint IDs."""
+
+        migration_path = (
+            PROJECT_ROOT
+            / "alembic"
+            / "versions"
+            / "7a1d4e9c2b60_add_pr_review_panel.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            f"pr_panel_migration_for_{dialect_name}", migration_path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name=dialect_name,
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(context)):
+            module.upgrade()
+        ddl = output.getvalue().lower()
+        if dialect_name == "postgresql":
+            assert "boolean default false not null" in ddl
+            assert "required_checks set not null" in ddl
+            assert "cast('[]' as json)" in ddl
+        else:
+            assert "bool not null default false" in ddl
+            assert "modify required_checks json not null" in ddl
+            assert "required_checks = json_array()" in ddl
+        assert "boolean default 0" not in ddl
+        assert all(
+            "default" not in line
+            for line in ddl.splitlines()
+            if "required_checks" in line
+        )
+        assert "github_comment_id bigint" in ddl
+
+    def test_base_sha_migration_preserves_existing_snapshot_keys(self, tmp_path):
+        db_path = str(tmp_path / "existing_pr_review_snapshot.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "c8f5d3a72b10")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    repo_full_name, enabled, auto_merge, webhook_secret,
+                    provider, default_branch, allowed_authors, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'owner/repo', 1, 0, 'secret', 'codex', 'main', '[]',
+                    'active', '2026-07-31 00:00:00', '2026-07-31 00:00:00'
+                )
+            """))
+            conn.execute(
+                text("""
+                    INSERT INTO pr_reviews (
+                        repo_id, pr_number, head_sha, delivery_id, pr_title,
+                        pr_author, pr_url, status, created_at
+                    ) VALUES (
+                        1, 42, :head_sha, 'delivery-1', 'Title', 'alice',
+                        'https://github.com/owner/repo/pull/42',
+                        'approved', '2026-07-31 00:00:00'
+                    )
+                """),
+                {"head_sha": "a" * 40},
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT base_sha, head_sha, delivery_id, action_nonce, "
+                "pending_action, pending_review_body, publishing_actor, "
+                "publishing_retry_count, publishing_task_started_at, "
+                "publishing_started_at FROM pr_reviews"
+            )).one()
+            assert row == (
+                None,
+                "a" * 40,
+                "delivery-1",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+            unique_column_sets = {
+                tuple(constraint["column_names"])
+                for constraint in inspect(conn).get_unique_constraints("pr_reviews")
+            }
+            assert (
+                "repo_id",
+                "pr_number",
+                "base_sha",
+                "head_sha",
+            ) in unique_column_sets
+            assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
+        engine.dispose()
+
+    def test_base_sha_migration_downgrade_restores_head_constraint(self, tmp_path):
+        db_path = str(tmp_path / "base_sha_roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    repo_full_name, enabled, auto_merge, webhook_secret,
+                    provider, default_branch, allowed_authors, required_checks, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'owner/rollback', 1, 0, 'secret', 'claude', 'main', '[]',
+                    '[]', 'active', '2026-07-31 00:00:00',
+                    '2026-07-31 00:00:00'
+                )
+            """))
+            for base_sha in ("1" * 40, "2" * 40):
+                conn.execute(
+                    text("""
+                        INSERT INTO pr_reviews (
+                            repo_id, pr_number, base_sha, head_sha, pr_title,
+                            pr_author, pr_url, status, created_at
+                        ) VALUES (
+                            1, 42, :base_sha, :head_sha, 'Title', 'alice',
+                            'https://github.com/owner/rollback/pull/42',
+                            'approved', '2026-07-31 00:00:00'
+                        )
+                    """),
+                    {"base_sha": base_sha, "head_sha": "a" * 40},
+                )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, "c8f5d3a72b10")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" not in pr_review_cols
+        assert "publishing_actor" not in pr_review_cols
+        log_cols = _get_table_columns(engine, "log_entries")
+        assert "task_retry_count" not in log_cols
+        unique_column_sets = {
+            tuple(constraint["column_names"])
+            for constraint in inspect(engine).get_unique_constraints("pr_reviews")
+        }
+        assert ("repo_id", "pr_number", "head_sha") in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) not in unique_column_sets
+        with engine.connect() as conn:
+            heads = [
+                row[0]
+                for row in conn.execute(
+                    text("SELECT head_sha FROM pr_reviews ORDER BY id")
+                ).fetchall()
+            ]
+            assert heads == [None, "a" * 40]
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_sha" in pr_review_cols
+        assert "publishing_actor" in pr_review_cols
+        log_cols = _get_table_columns(engine, "log_entries")
+        assert "task_retry_count" in log_cols
+        unique_column_sets = {
+            tuple(constraint["column_names"])
+            for constraint in inspect(engine).get_unique_constraints("pr_reviews")
+        }
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) in unique_column_sets
+        assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         engine.dispose()
 
 
@@ -1207,6 +1603,184 @@ class TestSchemaConsistency:
                 + "\n".join(str(d) for d in significant_diffs)
             )
 
+        engine.dispose()
+
+
+class TestPublishedMigrationHistory:
+    """Published sibling histories converge without rewriting either branch."""
+
+    def _assert_revision_schema(
+        self,
+        engine,
+        *,
+        revisions,
+        plan_schema_present,
+        snapshot_schema_present,
+    ):
+        tables = _get_all_tables(engine)
+        task_columns = _get_table_columns(engine, "tasks")
+        log_columns = _get_table_columns(engine, "log_entries")
+        review_columns = _get_table_columns(engine, "pr_reviews")
+
+        assert ("plan_agent_runs" in tables) is plan_schema_present
+        assert ("plan_agent_steps" in tables) is plan_schema_present
+        assert (
+            "plan_target_task_id" in task_columns
+        ) is plan_schema_present
+        assert (
+            "task_retry_count" in log_columns
+        ) is snapshot_schema_present
+        assert ("base_sha" in review_columns) is snapshot_schema_present
+
+        with engine.connect() as conn:
+            current_revisions = {
+                row[0]
+                for row in conn.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).fetchall()
+            }
+        assert current_revisions == set(revisions)
+
+    def test_migration_graph_has_one_head_after_plan_main_merge(self, tmp_path):
+        cfg = _alembic_cfg(str(tmp_path / "graph.db"))
+        script = ScriptDirectory.from_config(cfg)
+
+        assert script.get_heads() == [CURRENT_HEAD_REVISION]
+        assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == (FIRST_CLASS_PLAN_HEAD_REVISION, ATTENTION_TAG_REVISION)
+        )
+        assert (
+            script.get_revision(PR_FINDING_ACTIONS_REVISION).down_revision
+            == PR_REVIEW_PANEL_REVISION
+        )
+        assert (
+            script.get_revision(PR_REVIEW_PANEL_REVISION).down_revision
+            == PUBLISHED_BRANCH_MERGE_REVISION
+        )
+
+    def test_deployed_main_head_upgrades_to_combined_plan_head(self, tmp_path):
+        db_path = str(tmp_path / "main-to-combined.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, ATTENTION_TAG_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plans" not in _get_all_tables(engine)
+        assert "attention_tag" in _get_table_columns(engine, "tasks")
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plans" in _get_all_tables(engine)
+        task_columns = _get_table_columns(engine, "tasks")
+        assert "attention_tag" in task_columns
+        assert "plan_target_task_id" in task_columns
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == CURRENT_HEAD_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("start_revision", "plan_schema_present", "snapshot_schema_present"),
+        [
+            (PUBLISHED_PLAN_REVISION, True, False),
+            (PLAN_CLEANUP_REVISION, False, False),
+            (PR_REVIEW_SNAPSHOT_REVISION, False, True),
+        ],
+    )
+    def test_each_published_branch_upgrades_to_merge_head(
+        self,
+        tmp_path,
+        start_revision,
+        plan_schema_present,
+        snapshot_schema_present,
+    ):
+        db_path = str(tmp_path / f"published-{start_revision}.db")
+        cfg = _alembic_cfg(db_path)
+
+        # Each revision was a deployable branch head before the histories met.
+        _run_alembic(cfg, command.upgrade, start_revision)
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={start_revision},
+            plan_schema_present=plan_schema_present,
+            snapshot_schema_present=snapshot_schema_present,
+        )
+        engine.dispose()
+
+        # The no-op merge applies the missing sibling branch and converges all
+        # deployed states on one schema/head.
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={PUBLISHED_BRANCH_MERGE_REVISION},
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+    def test_merge_revision_downgrades_and_reupgrades(self, tmp_path):
+        db_path = str(tmp_path / "merge-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
+        # Relative ``-1`` is ambiguous at a mergepoint, so select either
+        # published parent explicitly; Alembic retains the sibling head.
+        _run_alembic(cfg, command.downgrade, PLAN_CLEANUP_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={
+                PLAN_CLEANUP_REVISION,
+                PR_REVIEW_SNAPSHOT_REVISION,
+            },
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={PUBLISHED_BRANCH_MERGE_REVISION},
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+    def test_reverted_plan_cleanup_downgrades_and_reupgrades(self, tmp_path):
+        db_path = str(tmp_path / "plan-cleanup-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
+        _run_alembic(cfg, command.downgrade, PUBLISHED_PLAN_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={
+                PUBLISHED_PLAN_REVISION,
+                PR_REVIEW_SNAPSHOT_REVISION,
+            },
+            plan_schema_present=True,
+            snapshot_schema_present=True,
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PUBLISHED_BRANCH_MERGE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_revision_schema(
+            engine,
+            revisions={PUBLISHED_BRANCH_MERGE_REVISION},
+            plan_schema_present=False,
+            snapshot_schema_present=True,
+        )
         engine.dispose()
 
 

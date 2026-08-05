@@ -2,8 +2,9 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 
 import { api } from '../../api/client';
 import type { Task, Project } from '../../api/client';
-import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus } from '../icons';
+import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin } from '../icons';
 import { FastModeBadge, PlanPipelineBadge, PlanRevisionBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
+import { AttentionTag } from './AttentionTag';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
 import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
@@ -14,6 +15,7 @@ interface TaskListProps {
   tasks: Task[];
   projects: Project[];
   onRefresh: () => void;
+  onTaskUpdated?: (task: Task) => void;
   onOpenChat: (task: Task) => void;
   activeTaskId?: number | null;
   autoSortOnAccess?: boolean;
@@ -33,7 +35,7 @@ const statusColors: Record<string, string> = {
   cancelled: 'bg-gray-500',
 };
 
-export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
+export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
   const projectMap = useMemo(() => {
     const map: Record<number, { name: string; color: string | null }> = {};
     for (const p of projects) map[p.id] = { name: p.name, color: p.badge_color };
@@ -43,6 +45,7 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [menuOpenId, setMenuOpenId] = useState<number | null>(null);
   const [editingTitleId, setEditingTitleId] = useState<number | null>(null);
+  const [editingAttentionTagId, setEditingAttentionTagId] = useState<number | null>(null);
   const [titleDraft, setTitleDraft] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -125,6 +128,12 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
     } catch { /* ignore */ }
   };
 
+  const handleAttentionTagSaved = (updated: Task) => {
+    setEditingAttentionTagId(null);
+    if (onTaskUpdated) onTaskUpdated(updated);
+    else onRefresh();
+  };
+
   // 拖拽排序（长按/拖动；标星置顶保留，仅同组内移动）
   const handleReordered = useCallback((optimistic?: Task[]) => {
     if (optimistic) {
@@ -171,6 +180,17 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
             <span className={`w-2.5 h-2.5 rounded-full shrink-0 self-start mt-[9px] ${statusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`} />
             <div className="flex items-center gap-2 flex-wrap flex-1 min-w-0 min-h-[28px]">
               <span className="text-xs text-gray-500">#{t.id}</span>
+              {editingAttentionTagId !== t.id && (
+                <AttentionTag
+                  taskId={t.id}
+                  value={t.attention_tag}
+                  editing={false}
+                  onEdit={() => setEditingAttentionTagId(t.id)}
+                  onCancel={() => setEditingAttentionTagId(null)}
+                  onSaved={handleAttentionTagSaved}
+                  className="max-w-[min(16rem,55vw)]"
+                />
+              )}
               {t.shared_from_id && (
                 <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Shared</span>
               )}
@@ -269,6 +289,14 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
                     >
                       <Pencil size={14} /> Edit title
                     </button>
+                    {!t.attention_tag && (
+                      <button
+                        onClick={() => { setEditingAttentionTagId(t.id); setMenuOpenId(null); }}
+                        className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-amber-300 hover:bg-gray-800 text-left"
+                      >
+                        <Pin size={14} /> Add attention tag
+                      </button>
+                    )}
 
                     <button
                       onClick={(e) => {
@@ -318,6 +346,17 @@ export function TaskList({ tasks, projects, onRefresh, onOpenChat, activeTaskId,
           </div>
           {/* Row 2: title + description (full width; pr 留出右下角手柄位) */}
           <div className="mt-1 pl-[1.125rem] pr-7">
+            {editingAttentionTagId === t.id && (
+              <AttentionTag
+                taskId={t.id}
+                value={t.attention_tag}
+                editing
+                onEdit={() => setEditingAttentionTagId(t.id)}
+                onCancel={() => setEditingAttentionTagId(null)}
+                onSaved={handleAttentionTagSaved}
+                className="mb-1 w-full"
+              />
+            )}
             {/* Title (editable) */}
             {editingTitleId === t.id ? (
               <input

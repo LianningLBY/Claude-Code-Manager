@@ -3,7 +3,8 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime
-from unittest.mock import AsyncMock, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -416,6 +417,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
                 "codex_model_service_tiers": {
                     "gpt-5.6-sol": ["default", "priority"],
                 },
+                "pr_review_snapshot_context_version": 3,
             })
 
         async def post(self, _url, *, headers, json):
@@ -449,6 +451,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         enable_workflows=False,
         selected_user_skills=[5],
         tags=["pr-review"],
+        attention_tag="等审核发布后再看",
         metadata_={"pr_review_id": 123},
     )
     proxy.get_worker = AsyncMock(return_value=worker)
@@ -464,6 +467,7 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
 
     parsed_on_worker = TaskCreate.model_validate(captured_payload)
     assert captured_payload["tags"] == ["pr-review"]
+    assert captured_payload["attention_tag"] == "等审核发布后再看"
     assert captured_payload["selected_user_skills"] == [5]
     assert captured_payload["user_skill_snapshots"] == [{
         "id": 5,
@@ -472,8 +476,12 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         "content": "body",
     }]
     assert captured_payload["codex_service_tier"] == "priority"
+    assert captured_payload["project_id"] is None
     assert parsed_on_worker.tags == ["pr-review"]
+    assert parsed_on_worker.attention_tag == "等审核发布后再看"
+    assert parsed_on_worker.project_id is None
     assert parsed_on_worker.codex_service_tier == "priority"
+    proxy.ensure_worker_project.assert_not_awaited()
     # metadata_ is intentionally not a public TaskCreate field; the hidden
     # termination endpoint accepts the forwarded tag only for Worker copies.
     assert not hasattr(parsed_on_worker, "metadata_")
@@ -800,6 +808,64 @@ async def test_worker_fast_fails_before_forward_when_capability_is_unproven(
     post.assert_not_awaited()
 
 
+async def test_worker_pr_review_fails_before_forward_without_snapshot_isolation(
+    monkeypatch,
+):
+    post = AsyncMock()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # Older Workers accept the tag but run from their CCM cwd.
+            return {"default_provider": "claude"}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    relay = AsyncMock()
+    proxy = WorkerProxy(None, relay)
+    worker = Worker(
+        id=80,
+        name="old-pr-worker",
+        status="ready",
+        private_ip="10.0.0.80",
+        auth_token="token",
+    )
+    task = Task(
+        id=904,
+        title="PR Review: owner/repo#1",
+        description="review captured snapshot",
+        worker_id=worker.id,
+        provider="claude",
+        tags=["pr-review"],
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=34)
+
+    with pytest.raises(RuntimeError, match="PR 审核快照隔离能力"):
+        await proxy._forward_task_to_worker_locked(task)
+
+    proxy.ensure_worker_project.assert_not_awaited()
+    relay.subscribe_task.assert_not_awaited()
+    post.assert_not_awaited()
+
+
 async def test_worker_fast_preflight_resolves_default_model_alias(
     monkeypatch,
 ):
@@ -860,8 +926,14 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
 
     await relay._handle({
         "channel": f"task:{t.id}",
-        "data": {"event_type": "message", "role": "assistant", "content": "hi",
-                 "instance_id": 7},
+        "data": {
+            "id": 987654,
+            "event_type": "message",
+            "role": "assistant",
+            "content": "hi",
+            "instance_id": 7,
+            "task_retry_count": t.retry_count,
+        },
     }, w)
 
     async with session_factory() as db:
@@ -870,9 +942,79 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
     assert len(logs) == 1
     assert logs[0].instance_id is None
     assert logs[0].content == "hi"
+    assert logs[0].task_retry_count == t.retry_count
     assert task.has_unread is True
-    # 镜像广播到同名 channel，且剥掉 worker 的 instance_id
-    assert broadcaster.sent == [(f"task:{t.id}", {"event_type": "message", "role": "assistant", "content": "hi"})]
+    # 镜像广播到同名 channel，剥掉 worker 的 instance_id，并以 Manager
+    # 本地 LogEntry 身份覆盖远端数据库 id。
+    assert len(broadcaster.sent) == 1
+    channel, event = broadcaster.sent[0]
+    assert channel == f"task:{t.id}"
+    assert event["event_type"] == "message"
+    assert event["role"] == "assistant"
+    assert event["content"] == "hi"
+    assert "instance_id" not in event
+    assert event["id"] == logs[0].id
+    assert event["id"] != 987654
+    assert event["task_id"] == t.id
+    assert event["task_retry_count"] == t.retry_count
+    assert event["timestamp"].endswith("Z")
+
+
+@pytest.mark.parametrize(
+    ("event_type", "role", "event_retry_count"),
+    [
+        ("result", "assistant", 4),
+        ("message", "assistant", None),
+        ("result", "assistant", True),
+    ],
+)
+async def test_relay_drops_pr_terminal_event_without_exact_retry_generation(
+    relay,
+    broadcaster,
+    session_factory,
+    event_type,
+    role,
+    event_retry_count,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=5,
+        tags=["pr-review"],
+        has_unread=False,
+    )
+    relay._tasks[worker.id] = {task.id}
+    data = {
+        "event_type": event_type,
+        "role": role,
+        "content": (
+            "PR_REVIEW_BODY_BEGIN\nLGTM\nPR_REVIEW_BODY_END\n"
+            "PR_REVIEW_RESULT: approved_merged"
+        ),
+    }
+    if event_retry_count is not None:
+        data["task_retry_count"] = event_retry_count
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": data,
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        logs = (
+            await db.execute(
+                select(LogEntry).where(LogEntry.task_id == task.id)
+            )
+        ).scalars().all()
+    assert current.has_unread is False
+    assert logs == []
+    assert broadcaster.sent == []
 
 
 async def test_relay_skips_user_message_and_unsubscribed(relay, broadcaster, session_factory):
@@ -925,6 +1067,342 @@ async def test_relay_status_change_syncs_task(relay, session_factory):
             },
         )
     ]
+
+
+async def test_relay_completed_generation_triggers_manager_pr_finalizer(
+    relay,
+    session_factory,
+):
+    import backend.main
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        tags=["pr-review"],
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status="completed",
+            completed_at=None,
+            background_active=False,
+        )
+    )
+    relay._backfill_missing_logs = AsyncMock(return_value={task.id})
+    completion = AsyncMock()
+
+    with patch.object(
+        backend.main,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    ):
+        await relay._handle(
+            {
+                "channel": "tasks",
+                "data": {
+                    "event": "status_change",
+                    "task_id": task.id,
+                    "new_status": "completed",
+                },
+            },
+            worker,
+        )
+
+    completion.assert_awaited_once_with(task.id)
+    relay._backfill_missing_logs.assert_awaited_once()
+    assert relay._backfill_missing_logs.await_args.args[1] == {task.id}
+    assert relay._backfill_missing_logs.await_args.kwargs == {
+        "sync_status": False,
+    }
+
+
+async def test_relay_completed_pr_fix_backfills_before_manager_finalizer(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        tags=["pr-review-fix"],
+        metadata_={"pr_finding_action_id": 41},
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status="completed",
+            completed_at=None,
+            background_active=False,
+        )
+    )
+    calls = []
+
+    async def backfill(*_args, **_kwargs):
+        calls.append("backfill")
+        return {task.id}
+
+    async def complete(task_id):
+        calls.append(("complete", task_id))
+
+    relay._backfill_missing_logs = AsyncMock(side_effect=backfill)
+    completion = AsyncMock(side_effect=complete)
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "completed",
+            },
+        },
+        worker,
+    )
+
+    assert calls == ["backfill", ("complete", task.id)]
+    assert relay._backfill_missing_logs.await_args.args[1] == {task.id}
+    assert relay._backfill_missing_logs.await_args.kwargs == {
+        "sync_status": False,
+    }
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "cancelled", "conflict"])
+async def test_relay_unsuccessful_pr_fix_invokes_manager_failure_handler(
+    relay,
+    session_factory,
+    monkeypatch,
+    terminal_status,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        # The metadata marker remains authoritative if an old Manager/client
+        # has removed the presentation tag.
+        tags=[],
+        metadata_={"pr_finding_action_id": 42},
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status=terminal_status,
+            completed_at=None,
+            error_message="remote fix failure",
+            background_active=False,
+        )
+    )
+    relay._backfill_missing_logs = AsyncMock()
+    failure = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pr_review_failure=failure,
+        ),
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": terminal_status,
+            },
+        },
+        worker,
+    )
+
+    failure.assert_awaited_once()
+    failed_task, error = failure.await_args.args
+    assert failed_task.id == task.id
+    assert failed_task.status == terminal_status
+    assert failed_task.retry_count == task.retry_count
+    assert error == "remote fix failure"
+    relay._backfill_missing_logs.assert_not_awaited()
+
+
+async def test_relay_failed_plain_pr_review_keeps_existing_failure_semantics(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        tags=["pr-review"],
+        metadata_={"pr_review_id": 43},
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status="failed",
+            completed_at=None,
+            error_message="review failed",
+            background_active=False,
+        )
+    )
+    failure = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pr_review_failure=failure,
+        ),
+    )
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "failed",
+            },
+        },
+        worker,
+    )
+
+    failure.assert_not_awaited()
+
+
+async def test_worker_pr_fix_failure_rechecks_exact_generation(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="failed",
+        tags=["pr-review-fix"],
+        metadata_={"pr_finding_action_id": 44},
+        error_message="old failure",
+    )
+    async with session_factory() as db:
+        generation = await worker_relay_module.read_worker_task_generation(
+            db,
+            task.id,
+            worker.id,
+        )
+    relay._observe_task_generation = AsyncMock(return_value=None)
+    failure = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pr_review_failure=failure,
+        ),
+    )
+
+    await relay._notify_completed_pr_review(generation)
+
+    failure.assert_not_awaited()
+
+
+async def test_worker_pr_finalizer_defers_when_history_sync_fails(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        tags=["pr-review"],
+    )
+    async with session_factory() as db:
+        generation = await worker_relay_module.read_worker_task_generation(
+            db,
+            task.id,
+            worker.id,
+        )
+    relay._backfill_missing_logs = AsyncMock(return_value=set())
+    completion = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
+
+    await relay._notify_completed_pr_review(generation)
+
+    relay._backfill_missing_logs.assert_awaited_once()
+    completion.assert_not_awaited()
+
+
+async def test_worker_pr_finalizer_rechecks_generation_after_history_sync(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        tags=["pr-review"],
+    )
+    async with session_factory() as db:
+        generation = await worker_relay_module.read_worker_task_generation(
+            db,
+            task.id,
+            worker.id,
+        )
+
+    async def retry_during_sync(*_args, **_kwargs):
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(
+                    status="executing",
+                    retry_count=Task.retry_count + 1,
+                    completed_at=None,
+                )
+            )
+            await db.commit()
+        return {task.id}
+
+    relay._backfill_missing_logs = AsyncMock(
+        side_effect=retry_during_sync
+    )
+    completion = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
+
+    await relay._notify_completed_pr_review(generation)
+
+    completion.assert_not_awaited()
 
 
 async def test_relay_status_uses_authoritative_background_not_event_payload(
@@ -985,17 +1463,28 @@ async def test_relay_background_event_syncs_controlled_marker(
     relay,
     broadcaster,
     session_factory,
+    monkeypatch,
 ):
     worker = await _mk_worker(session_factory)
     task = await _mk_task(
         session_factory,
         worker_id=worker.id,
         status="completed",
+        tags=["pr-review"],
     )
     relay._tasks[worker.id] = {task.id}
+    completion = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
     relay._fetch_task_snapshot = AsyncMock(
         return_value=_remote_task(task, background_active=True)
     )
+    relay._backfill_missing_logs = AsyncMock(return_value={task.id})
 
     await relay._handle(
         {
@@ -1028,6 +1517,7 @@ async def test_relay_background_event_syncs_controlled_marker(
             },
         )
     ]
+    completion.assert_not_awaited()
 
     relay._fetch_task_snapshot.return_value = _remote_task(
         task,
@@ -1056,6 +1546,8 @@ async def test_relay_background_event_syncs_controlled_marker(
             "background_active": False,
         },
     )
+    completion.assert_awaited_once_with(task.id)
+    relay._backfill_missing_logs.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
@@ -1651,6 +2143,153 @@ async def test_reconnect_backfill_cannot_write_after_task_moves_local(
     assert current.session_id == "local-session"
     assert logs == []
     assert broadcaster.sent == []
+
+
+async def test_backfill_only_imports_exact_worker_retry_generation(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+    )
+    async with session_factory() as db:
+        db.add(LogEntry(
+            task_id=task.id,
+            task_retry_count=task.retry_count - 1,
+            event_type="message",
+            role="assistant",
+            content="same content",
+        ))
+        await db.commit()
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "same content",
+                    "task_retry_count": task.retry_count,
+                },
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "stale",
+                    "task_retry_count": task.retry_count - 1,
+                },
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "unscoped",
+                    "task_retry_count": None,
+                },
+            ]
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+    relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(task)
+    )
+
+    await relay._backfill_missing_logs(worker, {task.id})
+
+    async with session_factory() as db:
+        logs = (
+            await db.execute(
+                select(LogEntry)
+                .where(LogEntry.task_id == task.id)
+                .order_by(LogEntry.id)
+            )
+        ).scalars().all()
+    assert [
+        (row.content, row.task_retry_count)
+        for row in logs
+    ] == [
+        ("same content", task.retry_count - 1),
+        ("same content", task.retry_count),
+    ]
+
+
+async def test_completion_backfill_syncs_logs_without_recursive_status(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        tags=["pr-review"],
+    )
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [{
+                "event_type": "result",
+                "role": "assistant",
+                "content": "terminal",
+                "task_retry_count": task.retry_count,
+            }]
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+    relay._fetch_task_snapshot = AsyncMock()
+    relay._publish_status_generation = AsyncMock()
+    relay._publish_background_generation = AsyncMock()
+
+    synced = await relay._backfill_missing_logs(
+        worker,
+        {task.id},
+        sync_status=False,
+    )
+
+    assert synced == {task.id}
+    relay._fetch_task_snapshot.assert_not_awaited()
+    relay._publish_status_generation.assert_not_awaited()
+    relay._publish_background_generation.assert_not_awaited()
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(LogEntry.task_id == task.id)
+            )
+        ).scalar_one()
+    assert stored.content == "terminal"
+    assert stored.task_retry_count == task.retry_count
 
 
 async def test_backfill_syncs_and_broadcasts_background_marker(
@@ -2741,6 +3380,88 @@ async def test_generic_worker_proxy_can_require_json_confirmation(
 
     assert caught.value.status_code == 502
     assert "invalid confirmation" in caught.value.detail
+
+
+async def test_worker_proxy_marks_manager_confirmed_terminal_pr_chat(
+    session_factory,
+    monkeypatch,
+):
+    from backend.services.pr_review_runtime import (
+        PR_REVIEW_TERMINAL_CHAT_HEADER,
+        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    )
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        tags=["pr-review"],
+    )
+    requests = _install_proxy_transport(
+        monkeypatch,
+        _ProxyResponse(200, {"ok": True}),
+    )
+    proxy = WorkerProxy(session_factory, AsyncMock())
+
+    await proxy.proxy_to_worker(
+        task,
+        "POST",
+        f"/api/tasks/{task.id}/chat",
+        pr_review_terminal_chat=True,
+    )
+
+    assert requests[0][2]["headers"] == {
+        "Authorization": "Bearer wtoken",
+        PR_REVIEW_TERMINAL_CHAT_HEADER:
+        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
+    }
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_status"),
+    [
+        ({"pr_review_terminal_chat_version": 1}, None),
+        ({}, 409),
+    ],
+)
+async def test_worker_terminal_pr_chat_capability_preflight(
+    session_factory,
+    monkeypatch,
+    config,
+    expected_status,
+):
+    worker = await _mk_worker(session_factory)
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return config
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(session_factory, AsyncMock())
+
+    if expected_status is None:
+        await proxy.require_terminal_pr_review_chat_support(worker)
+    else:
+        with pytest.raises(HTTPException) as caught:
+            await proxy.require_terminal_pr_review_chat_support(worker)
+        assert caught.value.status_code == expected_status
+        assert "升级" in caught.value.detail
 
 
 async def test_generic_worker_proxy_can_confirm_task_already_absent(
@@ -5063,7 +5784,11 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
         )).scalar_one()
     assert stored.content == "[Worker Alice] [FIX] preserve this tag"
     assert json.loads(stored.raw_json)["raw_content"] == "[FIX] preserve this tag"
-    assert broadcaster.sent[0][1]["content"] == stored.content
+    event = broadcaster.sent[0][1]
+    assert event["content"] == stored.content
+    assert event["id"] == stored.id
+    assert event["task_id"] == t.id
+    assert event["timestamp"].endswith("Z")
 
 
 async def test_worker_chat_applies_exact_mirrored_plan_version(

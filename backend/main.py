@@ -27,6 +27,7 @@ from backend.api.uploads import router as uploads_router
 from backend.api.secrets import router as secrets_router
 from backend.api.tags import router as tags_router
 from backend.api.files import router as files_router
+from backend.api.task_artifacts import router as task_artifacts_router
 from backend.api.pool import router as pool_router
 from backend.api.codex_pool import (
     recover_pending_codex_login_transactions,
@@ -422,6 +423,7 @@ async def _shutdown_runtime_services(
     upload_cleanup_task,
     tmp_cleanup_task,
     backup_svc,
+    pr_review_recovery_task=None,
 ) -> None:
     """Run every shutdown stage and re-raise the first teardown failure."""
 
@@ -438,6 +440,7 @@ async def _shutdown_runtime_services(
             worker_health_task,
             upload_cleanup_task,
             tmp_cleanup_task,
+            pr_review_recovery_task,
         )
         if task is not None
     ]
@@ -574,6 +577,62 @@ async def _shutdown_runtime_services(
         raise failures[0]
 
 
+async def _recover_pending_pr_review_publications() -> bool:
+    """Run one bounded recovery pass for incomplete PR-review actions."""
+
+    try:
+        from backend.services import pr_review_service
+
+        recover = getattr(
+            pr_review_service,
+            "recover_incomplete_pr_reviews",
+            None,
+        )
+        if recover is None:
+            logger.warning(
+                "PR review recovery is unavailable; incomplete actions were "
+                "not resumed"
+            )
+            return False
+        await recover(async_session)
+        return True
+    except Exception:
+        # A transient GitHub/API failure must not take the entire CCM runtime
+        # offline. The durable publishing rows remain available for a later
+        # recovery attempt.
+        logger.exception("Incomplete PR review recovery pass failed")
+        return False
+
+
+async def _pr_review_recovery_loop() -> None:
+    """Continuously close completion/publication crash windows.
+
+    A healthy pass runs every 30 seconds. Infrastructure failures back off
+    exponentially, while per-review publication leases prevent overlapping
+    CCM processes from issuing the same GitHub mutation.
+    """
+
+    delay = 0.0
+    while True:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            recovered = await _recover_pending_pr_review_publications()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The one-shot helper already isolates ordinary recovery errors;
+            # this guard protects the producer itself from an unexpected bug.
+            logger.exception("PR review recovery loop failed")
+            delay = min(300.0, max(5.0, delay * 2.0))
+        else:
+            delay = (
+                30.0
+                if recovered
+                else min(300.0, max(5.0, delay * 2.0))
+            )
+
+
 
 def _prepare_deployment_start() -> StartDecision:
     """Fail closed before startup can perform an implicit DB migration."""
@@ -663,6 +722,7 @@ async def _runtime_lifespan(app: FastAPI):
     await _ensure_claude_warmup()
     if settings.auto_start_dispatcher:
         await dispatcher.start()
+    pr_review_recovery_task = None
 
     # Worker 健康监控循环 + Manager 重启后恢复所有 relay 连接
     worker_health_task = None
@@ -705,6 +765,12 @@ async def _runtime_lifespan(app: FastAPI):
     # Org registry heartbeat — periodically re-register with the registry
     heartbeat_task = None
 
+    # Recovery performs bounded GitHub I/O and must never delay ASGI startup.
+    # Start it only after all fallible startup stages above have completed, so
+    # an exception cannot leak an unowned producer before the shutdown guard.
+    pr_review_recovery_task = asyncio.create_task(
+        _pr_review_recovery_loop()
+    )
     try:
         yield
     finally:
@@ -714,6 +780,7 @@ async def _runtime_lifespan(app: FastAPI):
             upload_cleanup_task=upload_cleanup_task,
             tmp_cleanup_task=tmp_cleanup_task,
             backup_svc=backup_svc,
+            pr_review_recovery_task=pr_review_recovery_task,
         )
 
 
@@ -742,7 +809,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Refreshed-Token"],
+    expose_headers=[
+        "X-Refreshed-Token",
+        "Content-Disposition",
+        "X-CCM-PR-Fix-Receipt",
+        "X-CCM-PR-Fix-Token",
+    ],
 )
 
 app.include_router(tasks_router)
@@ -760,6 +832,7 @@ app.include_router(uploads_router)
 app.include_router(secrets_router)
 app.include_router(tags_router)
 app.include_router(files_router)
+app.include_router(task_artifacts_router)
 app.include_router(pool_router)
 app.include_router(codex_pool_router)
 app.include_router(cloudrouter_accounts_router)

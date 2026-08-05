@@ -1,9 +1,9 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useMemo, useRef } from 'react';
 import { api, type UploadResult } from '../api/client';
 
 export interface UploadEntry {
   id: string;
-  file: File;
+  file?: File;
   preview: string;
   status: 'uploading' | 'uploaded' | 'failed';
   result?: UploadResult;
@@ -11,19 +11,63 @@ export interface UploadEntry {
 }
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
-const MAX_FILES = 10;
+export const MAX_FILES = 10;
 const BLOCKED_EXTENSIONS = new Set(['.exe']);
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
 const isImageFile = (name: string) => IMAGE_EXTS.some(ext => name.toLowerCase().endsWith(ext));
 
-export function useFileUpload() {
-  const [uploads, setUploads] = useState<UploadEntry[]>([]);
+export function isUploadResult(value: unknown): value is UploadResult {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<UploadResult>;
+  return (
+    typeof candidate.id === 'string'
+    && candidate.id.length > 0
+    && (candidate.filename === null || typeof candidate.filename === 'string')
+    && typeof candidate.path === 'string'
+    && candidate.path.length > 0
+    && typeof candidate.url === 'string'
+    && candidate.url.length > 0
+    && typeof candidate.is_image === 'boolean'
+  );
+}
+
+export function sameUploadResult(left: UploadResult, right: UploadResult): boolean {
+  return left.id === right.id || left.path === right.path;
+}
+
+export function dedupeUploadResults(results: UploadResult[]): UploadResult[] {
+  const unique: UploadResult[] = [];
+  for (const result of results) {
+    if (!unique.some((existing) => sameUploadResult(existing, result))) {
+      unique.push(result);
+    }
+  }
+  return unique;
+}
+
+function restoredUploadEntry(result: UploadResult): UploadEntry {
+  return {
+    id: `uploaded:${result.id}:${result.path}`,
+    preview: '',
+    status: 'uploaded',
+    result,
+  };
+}
+
+export function useFileUpload(initialUploadedResults: UploadResult[] = []) {
+  const [uploads, setUploads] = useState<UploadEntry[]>(() =>
+    dedupeUploadResults(initialUploadedResults)
+      .slice(0, MAX_FILES)
+      .map(restoredUploadEntry)
+  );
   const uploadsRef = useRef<UploadEntry[]>([]);
   uploadsRef.current = uploads;
 
   const doUpload = useCallback(async (entry: UploadEntry) => {
+    const file = entry.file;
+    if (!file) return;
     try {
-      const results = await api.uploadImages([entry.file]);
+      const results = await api.uploadImages([file]);
       setUploads(prev => prev.map(u =>
         u.id === entry.id ? { ...u, status: 'uploaded' as const, result: results[0] } : u
       ));
@@ -73,6 +117,25 @@ export function useFileUpload() {
     newEntries.forEach(entry => doUpload(entry));
   }, [doUpload]);
 
+  const addUploadedResults = useCallback((incoming: UploadResult[]): boolean => {
+    const current = uploadsRef.current;
+    const existingResults = current
+      .map((entry) => entry.result)
+      .filter((result): result is UploadResult => !!result);
+    const additions = dedupeUploadResults(incoming).filter(
+      (result) => !existingResults.some((existing) => sameUploadResult(existing, result)),
+    );
+    if (current.length + additions.length > MAX_FILES) return false;
+    if (additions.length === 0) return true;
+    const next = [
+      ...current,
+      ...additions.map(restoredUploadEntry),
+    ];
+    uploadsRef.current = next;
+    setUploads(next);
+    return true;
+  }, []);
+
   const removeFile = useCallback((id: string) => {
     setUploads(prev => {
       const removed = prev.find(u => u.id === id);
@@ -90,21 +153,27 @@ export function useFileUpload() {
   }, [doUpload]);
 
   const clear = useCallback(() => {
-    setUploads(prev => {
-      prev.forEach(u => { if (u.preview) URL.revokeObjectURL(u.preview); });
-      return [];
-    });
+    const current = uploadsRef.current;
+    current.forEach(u => { if (u.preview) URL.revokeObjectURL(u.preview); });
+    uploadsRef.current = [];
+    setUploads([]);
   }, []);
+
+  const uploadedResults = useMemo(
+    () => uploads
+      .filter((u): u is UploadEntry & { result: UploadResult } => u.status === 'uploaded' && !!u.result)
+      .map(u => u.result),
+    [uploads],
+  );
 
   return {
     uploads,
     addFiles,
+    addUploadedResults,
     removeFile,
     retryFile,
     clear,
-    uploadedResults: uploads
-      .filter((u): u is UploadEntry & { result: UploadResult } => u.status === 'uploaded' && !!u.result)
-      .map(u => u.result),
+    uploadedResults,
     isUploading: uploads.some(u => u.status === 'uploading'),
     hasFailed: uploads.some(u => u.status === 'failed'),
     allDone: uploads.length > 0 && uploads.every(u => u.status !== 'uploading'),

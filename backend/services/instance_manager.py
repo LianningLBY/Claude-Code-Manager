@@ -66,6 +66,17 @@ _CLOUDROUTER_TRANSIENT_RE = re.compile(
     r"[^\n]{0,120}(?:API|HTTP|request|upstream|error)",
     re.IGNORECASE,
 )
+_APEX_BUSY_TRANSIENT_RE = re.compile(
+    r"(?:unexpected status\s+409|httpStatusCode[\"']?\s*:\s*409|"
+    r"\bHTTP(?:/\d(?:\.\d)?)?\s+409\b|\b409\s+Conflict\b)"
+    r"[^\n]{0,600}\b(?:all logged-in accounts are busy"
+    r"|no eligible logged-in account is ready)\b"
+    r"|\b(?:all logged-in accounts are busy"
+    r"|no eligible logged-in account is ready)\b[^\n]{0,600}"
+    r"(?:unexpected status\s+409|httpStatusCode[\"']?\s*:\s*409|"
+    r"\bHTTP(?:/\d(?:\.\d)?)?\s+409\b|\b409\s+Conflict\b)",
+    re.IGNORECASE,
+)
 _CLOUDROUTER_AUTH_RE = re.compile(
     r"\b401\b[^\n]{0,120}(?:unauthori[sz]ed|invalid|API[ _-]?key)"
     r"|\b403\b[^\n]{0,120}(?:forbidden|unauthori[sz]ed|API[ _-]?key)"
@@ -332,10 +343,11 @@ class InstanceManager:
         self._codex_home_maintenance: set[str] = set()
         self._codex_home_locks: dict[str, asyncio.Lock] = {}
         self._codex_exec_homes: dict[int, str] = {}
-        # Non-task Codex subprocesses (currently task distillation) share the
-        # same credential-home and app-server admission barrier as normal exec
-        # turns. Count by canonical home because they do not own a reusable
-        # Instance slot and cannot safely be represented in _codex_exec_homes.
+        # Non-task Codex subprocesses (goal evaluation and task distillation)
+        # share the same credential-home and app-server admission barrier as
+        # normal exec turns. Count by canonical home because they do not own a
+        # reusable Instance slot and cannot safely be represented in
+        # _codex_exec_homes.
         self._codex_ephemeral_home_users: dict[str, int] = {}
         # Direct CLI subprocesses start in their own POSIX session.  Remember
         # the exact process generation so stop can signal the whole process
@@ -878,6 +890,7 @@ class InstanceManager:
         task_retry_count: int | None = None
         task_skill_context = ""
         codex_monitor_enabled = False
+        pr_review_task = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -903,6 +916,11 @@ class InstanceManager:
                     raise LaunchSupersededError(
                         f"Task {task_id} disappeared before launch"
                     )
+                from backend.services.pr_review_runtime import (
+                    is_pr_sandbox_task,
+                )
+
+                pr_review_task = is_pr_sandbox_task(task)
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -929,6 +947,12 @@ class InstanceManager:
                         project_dir=cwd,
                         enabled_skills=enabled_skills,
                     )
+                if pr_review_task:
+                    # PR input is already snapshotted into the fixed prompt.
+                    # No ambient skills or monitor capability may reintroduce
+                    # filesystem/network tools.
+                    task_skill_context = ""
+                    codex_monitor_enabled = False
         if provider == "codex":
             # A Codex turn is not reusable when its process adapter reaches a
             # terminal returncode: the output consumer may still be migrating
@@ -954,6 +978,7 @@ class InstanceManager:
                 CodexRequiredMcpPreTurnError,
                 CodexServiceTierUnavailableError,
                 CodexThreadHomeMismatchError,
+                CodexThreadTerminalStateError,
                 normalize_codex_service_tier,
                 normalize_codex_home,
             )
@@ -977,13 +1002,13 @@ class InstanceManager:
         self._effective_exit_codes.pop(instance_id, None)
 
         mcp_config_path = None
-        if provider == "claude" and task_id:
+        if provider == "claude" and task_id and not pr_review_task:
             from backend.services.mcp_config import generate_mcp_config
             mcp_config_path = generate_mcp_config(task_id, enabled_skills or {})
 
         # ask_user：把 AskUserQuestion 拦截 hook 注入本次使用的 config_dir（-p 与 PTY 统一）。
         # config_dir 为空时落到默认 ~/.claude。失败不阻断 launch。
-        if provider == "claude":
+        if provider == "claude" and not pr_review_task:
             from backend.services.ask_user_settings import ensure_ask_user_hook
             ensure_ask_user_hook(config_dir or os.path.expanduser("~/.claude"))
 
@@ -1043,12 +1068,14 @@ class InstanceManager:
             provider == "codex"
             and task_id is not None
             and settings.codex_main_mcp_enabled
+            and not pr_review_task
         )
         codex_sub_agent_mcp_required = bool(
             provider == "codex"
             and task_id is not None
             and enabled_skills
             and enabled_skills.get("sub-agent")
+            and not pr_review_task
         )
         codex_mcp_required = (
             codex_main_mcp_required or codex_sub_agent_mcp_required
@@ -1099,6 +1126,16 @@ class InstanceManager:
                 "the app-server transport is disabled"
             )
 
+        if (
+            provider == "codex"
+            and pr_review_task
+            and not settings.codex_app_server_enabled
+        ):
+            raise CodexRequiredMcpError(
+                "Codex PR review isolation requires the app-server read-only "
+                "sandbox; exec fallback is disabled"
+            )
+
         if provider == "codex" and settings.codex_app_server_enabled:
             async with self.codex_home_app_server_guard(config_dir):
                 try:
@@ -1122,8 +1159,18 @@ class InstanceManager:
                         source_log_id=source_log_id,
                         current_message=current_message,
                         queue_timestamp=queue_timestamp,
-                        disable_project_config=cloudrouter_account is not None,
+                        disable_project_config=(
+                            cloudrouter_account is not None
+                            or pr_review_task
+                        ),
                         codex_service_tier=codex_service_tier,
+                        sandbox_mode=(
+                            "read-only"
+                            if pr_review_task
+                            else "danger-full-access"
+                        ),
+                        disable_autonomous_features=pr_review_task,
+                        tools_disabled=pr_review_task,
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -1135,6 +1182,11 @@ class InstanceManager:
                     )
                     return pid
                 except CodexRequiredMcpPreTurnError as exc:
+                    if pr_review_task:
+                        raise CodexRequiredMcpError(
+                            "Codex PR review read-only sandbox could not be "
+                            "confirmed before turn/start"
+                        ) from exc
                     if codex_service_tier == "priority":
                         raise CodexServiceTierUnavailableError(
                             "Codex Fast could not be confirmed before "
@@ -1170,6 +1222,7 @@ class InstanceManager:
                     CodexRequiredMcpError,
                     CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
+                    CodexThreadTerminalStateError,
                     CodexLaunchCommitError,
                     InstanceNotFoundError,
                     LaunchSupersededError,
@@ -1187,6 +1240,15 @@ class InstanceManager:
                     )
                     raise
                 except Exception as exc:
+                    if pr_review_task:
+                        logger.exception(
+                            "Codex PR review app-server failed; refusing "
+                            "unsandboxed exec fallback task_id=%s",
+                            task_id,
+                        )
+                        raise CodexRequiredMcpError(
+                            "Codex PR review isolation could not be guaranteed"
+                        ) from exc
                     if codex_service_tier == "priority":
                         # exec --json does not expose an accepted/effective
                         # service tier before it executes the prompt.  A
@@ -1226,7 +1288,11 @@ class InstanceManager:
                         config_dir,
                     )
 
-        if provider == "claude" and self.pty_mode_enabled:
+        if (
+            provider == "claude"
+            and self.pty_mode_enabled
+            and not pr_review_task
+        ):
             return await self._launch_pty(
                 instance_id=instance_id,
                 prompt=prompt,
@@ -1253,6 +1319,11 @@ class InstanceManager:
                 queue_timestamp=queue_timestamp,
             )
 
+        if provider == "codex" and pr_review_task:
+            raise CodexRequiredMcpError(
+                "Codex PR review isolation forbids exec fallback"
+            )
+
         cmd = self._build_command(
             provider=provider,
             prompt=prompt,
@@ -1271,6 +1342,7 @@ class InstanceManager:
             ),
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
+            tools_disabled=pr_review_task,
         )
         if provider == "codex":
             logger.info(
@@ -1420,10 +1492,14 @@ class InstanceManager:
                 # the home first; it can never edit auth.json in the gap.
                 home_lock = self._codex_home_lock(config_dir)
                 async with home_lock:
-                    if config_dir in self._codex_home_maintenance:
-                        raise CodexAppServerBusyError(
-                            f"Codex account is under maintenance: {config_dir}"
-                        )
+                    # The dispatcher snapshot is only a routing hint.  This
+                    # lock-local predicate is the authoritative barrier for
+                    # two fresh tasks that selected the same home, or for an
+                    # ephemeral exec that won admission after selection.
+                    self._assert_codex_app_server_home_available(
+                        config_dir,
+                        replacing_exec_instance_id=instance_id,
+                    )
                     # app-server keeps threads and MCP clients resident in
                     # memory.  Before an exec generation enters the same home,
                     # stop an idle transport or reject an active one.  Holding
@@ -1450,8 +1526,8 @@ class InstanceManager:
                         task_id,
                         cmd,
                         spawn_kwargs,
+                        codex_home=config_dir,
                     )
-                    self._codex_exec_homes[instance_id] = config_dir
             else:
                 spawn_kwargs = {
                     "stdout": asyncio.subprocess.PIPE,
@@ -1677,12 +1753,22 @@ class InstanceManager:
         provider: str,
         text: str,
     ) -> bool:
-        """Classify gateway 429s only for a proven API-account launch."""
+        """Classify retryable gateway capacity only for a proven API account."""
 
         config_dir = self._config_dirs.get(instance_id)
-        if self._cloudrouter_account_for_runtime_home(provider, config_dir) is None:
+        account = self._cloudrouter_account_for_runtime_home(
+            provider, config_dir,
+        )
+        if account is None:
             return False
-        return bool(_CLOUDROUTER_TRANSIENT_RE.search(text or ""))
+        value = text or ""
+        if _CLOUDROUTER_TRANSIENT_RE.search(value):
+            return True
+        return bool(
+            provider == "codex"
+            and getattr(account, "api_provider", None) == "apex"
+            and _APEX_BUSY_TRANSIENT_RE.search(value)
+        )
 
     def is_cloudrouter_auth_failure(
         self,
@@ -1719,11 +1805,17 @@ class InstanceManager:
             self._assert_codex_app_server_home_available(home)
             yield home
 
-    def _assert_codex_app_server_home_available(self, codex_home: str) -> None:
-        """Reject app-server admission while another transport owns a home.
+    def _assert_codex_app_server_home_available(
+        self,
+        codex_home: str,
+        *,
+        replacing_exec_instance_id: int | None = None,
+    ) -> None:
+        """Reject exclusive transport admission while a runtime owns a home.
 
         The caller must hold the canonical home's admission lock so the check
-        and the subsequent app-server operation form one atomic admission.
+        and the subsequent app-server/direct-exec operation form one atomic
+        admission.
         """
 
         from backend.services.codex_app_server import CodexAppServerBusyError
@@ -1734,6 +1826,16 @@ class InstanceManager:
             )
         for exec_instance_id, exec_home in self._codex_exec_homes.items():
             if exec_home == codex_home:
+                previous = self.processes.get(exec_instance_id)
+                if (
+                    exec_instance_id == replacing_exec_instance_id
+                    and previous is not None
+                    and self._generation_reap_confirmed(
+                        exec_instance_id,
+                        previous,
+                    )
+                ):
+                    continue
                 raise CodexAppServerBusyError(
                     "Codex account still has an exec generation "
                     f"owned by instance {exec_instance_id}: {codex_home}"
@@ -1742,6 +1844,52 @@ class InstanceManager:
             raise CodexAppServerBusyError(
                 f"Codex account has an active ephemeral exec: {codex_home}"
             )
+        if codex_home in self._codex_retained_ephemeral_homes():
+            raise CodexAppServerBusyError(
+                f"Codex account has a retained ephemeral exec: {codex_home}"
+            )
+
+    @staticmethod
+    def _codex_retained_ephemeral_homes() -> set[str]:
+        """Snapshot exact external runtimes that outlived their guard.
+
+        GoalEvaluator and TaskDistill retain structured process/home evidence
+        until terminal cleanup is proven.  Read those registries directly;
+        their human-facing account-retirement blocker strings are not an
+        admission protocol.
+        """
+
+        from backend.services.goal_evaluator import (
+            codex_goal_evaluator_runtime_homes,
+        )
+        from backend.services.skill_distill import (
+            codex_task_distill_runtime_homes,
+        )
+
+        return (
+            codex_goal_evaluator_runtime_homes()
+            | codex_task_distill_runtime_homes()
+        )
+
+    def busy_codex_homes(self) -> set[str]:
+        """Snapshot homes held by maintenance or non-app-server execs.
+
+        App-server turns are intentionally not included: one account transport
+        can serve independent threads concurrently. This is only a scheduling
+        hint; the per-home launch guard closes the select-to-launch race.
+        """
+
+        from backend.services.codex_app_server import normalize_codex_home
+
+        homes = set(self._codex_home_maintenance)
+        homes.update(self._codex_exec_homes.values())
+        homes.update(
+            home
+            for home, users in self._codex_ephemeral_home_users.items()
+            if users
+        )
+        homes.update(self._codex_retained_ephemeral_homes())
+        return {normalize_codex_home(home) for home in homes}
 
     async def read_codex_thread(
         self, codex_home: str, thread_id: str,
@@ -1861,10 +2009,7 @@ class InstanceManager:
         home = normalize_codex_home(codex_home)
         home_lock = self._codex_home_lock(home)
         async with home_lock:
-            if home in self._codex_home_maintenance:
-                raise CodexAppServerBusyError(
-                    f"Codex account is under maintenance: {home}"
-                )
+            self._assert_codex_app_server_home_available(home)
             registry = self._codex_app_server
             if registry is not None:
                 await registry.shutdown_home(home, require_idle=True)
@@ -1904,6 +2049,9 @@ class InstanceManager:
         queue_timestamp: float | None = None,
         disable_project_config: bool = False,
         codex_service_tier: str = "default",
+        sandbox_mode: str = "danger-full-access",
+        disable_autonomous_features: bool = False,
+        tools_disabled: bool = False,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -1923,6 +2071,9 @@ class InstanceManager:
             disable_project_config=disable_project_config,
             skill_context=skill_context,
             codex_service_tier=codex_service_tier,
+            sandbox_mode=sandbox_mode,
+            disable_autonomous_features=disable_autonomous_features,
+            tools_disabled=tools_disabled,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -2564,6 +2715,10 @@ class InstanceManager:
             if self._codex_ephemeral_home_users.get(home, 0):
                 raise CodexAppServerBusyError(
                     f"Codex account still has an active ephemeral exec: {home}"
+                )
+            if home in self._codex_retained_ephemeral_homes():
+                raise CodexAppServerBusyError(
+                    f"Codex account still has a retained ephemeral exec: {home}"
                 )
             if require_idle:
                 for instance_id, exec_home in self._codex_exec_homes.items():
@@ -4909,6 +5064,7 @@ class InstanceManager:
                     failure_notice = LogEntry(
                         instance_id=instance_id,
                         task_id=task_id,
+                        task_retry_count=expected_retry_count,
                         event_type="system_event",
                         role="system",
                         content=(
@@ -5050,6 +5206,7 @@ class InstanceManager:
         codex_mcp_specs: Sequence["McpServerSpec"] = (),
         codex_api_account: bool = False,
         codex_service_tier: str = "default",
+        tools_disabled: bool = False,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -5066,6 +5223,25 @@ class InstanceManager:
                 cmd.extend(["--model", model])
             if effort_level:
                 cmd.extend(["--effort", effort_level])
+            if tools_disabled:
+                # PR review prompts contain the complete backend-snapshotted
+                # input. An empty allow-list is the actual credential/tool
+                # boundary; the prompt's "do not write" sentence is only
+                # defense in depth.
+                cmd.extend([
+                    "--tools",
+                    "",
+                    # Ignore user/project/local settings (including hooks and
+                    # CLAUDE.md discovery) while retaining the account's normal
+                    # OAuth/keychain authentication path; ``--bare`` cannot be
+                    # used because it intentionally disables that auth path.
+                    "--setting-sources",
+                    "",
+                    "--strict-mcp-config",
+                    "--disable-slash-commands",
+                    "--exclude-dynamic-system-prompt-sections",
+                ])
+                return cmd
             from backend.services.skill_loader import (
                 discover_skills,
                 get_skill_disallowed_tools,
@@ -6114,6 +6290,9 @@ class InstanceManager:
                         failure_notice = LogEntry(
                             instance_id=instance_id,
                             task_id=task_id,
+                            task_retry_count=(
+                                current_task_generation.retry_count
+                            ),
                             event_type="system_event",
                             role="system",
                             content=(
@@ -6988,6 +7167,20 @@ class InstanceManager:
                 pool = dispatcher.codex_pool
                 if not (pool and pool.enabled):
                     return False
+                # An explicit UI selection is a routing lock, not merely a
+                # hint for fresh tasks.  In particular, do not let the
+                # completed-turn quota balancer undo "switch to this
+                # account" by moving the same thread back to an API account.
+                # The normal next-turn resolver owns migration to the pinned
+                # account when the selection was made while a turn was busy.
+                if pool.preferred_account_id is not None:
+                    logger.info(
+                        "Codex quota switch skipped for task %d: account %s "
+                        "is explicitly preferred",
+                        task_id,
+                        pool.preferred_account_id,
+                    )
+                    return False
                 old_home = self._config_dirs.get(instance_id)
                 if not old_home and isinstance(bound_codex_id, str):
                     old_home = pool.home_for_account(bound_codex_id)
@@ -7000,6 +7193,16 @@ class InstanceManager:
                     service_tier=task_service_tier,
                 )
                 if not await generation_is_current(generation):
+                    return False
+                # set_preferred() can race the asynchronous quota lookup.  A
+                # late pin must still win before any rollout/owner mutation.
+                if pool.preferred_account_id is not None:
+                    logger.info(
+                        "Codex quota switch abandoned for task %d: account %s "
+                        "was explicitly preferred during quota selection",
+                        task_id,
+                        pool.preferred_account_id,
+                    )
                     return False
                 if not new_home:
                     logger.info(
@@ -7094,6 +7297,11 @@ class InstanceManager:
                             raise RuntimeError(
                                 "task generation changed after rollout copy"
                             )
+                        if pool.preferred_account_id is not None:
+                            raise RuntimeError(
+                                "explicit Codex account preference changed "
+                                "during quota switch"
+                            )
                         await self.rebind_codex_thread(
                             session_id,
                             source_codex_home=old_home,
@@ -7103,6 +7311,11 @@ class InstanceManager:
                         if not await generation_is_current(generation):
                             raise RuntimeError(
                                 "task generation changed after owner rebind"
+                            )
+                        if pool.preferred_account_id is not None:
+                            raise RuntimeError(
+                                "explicit Codex account preference changed "
+                                "after quota owner rebind"
                             )
                         binding_changed = await (
                             dispatcher._persist_codex_binding_for_route(
@@ -7371,6 +7584,12 @@ class InstanceManager:
         item_type = item.get("type")
 
         event = self._base_codex_event(line, now)
+        item_id = data.get("item_id") or data.get("itemId") or item.get("id")
+        if item_id:
+            # Keep the native item identity on the durable completion event as
+            # well as its deltas. The frontend uses it to replace a partial
+            # live bubble after a task-channel resubscription.
+            event["item_id"] = str(item_id)
 
         if codex_type == "item.agent_message.delta":
             event.update({
@@ -8145,9 +8364,32 @@ class InstanceManager:
                     task_id,
                 )
                 return
+            persisted_task_retry_count = None
+            if task_id is not None:
+                if event_record is not None:
+                    persisted_task_retry_count = (
+                        event_record.task_retry_count
+                    )
+                elif detached_autonomous:
+                    persisted_task_retry_count = (
+                        await db.execute(
+                            select(Task.retry_count).where(
+                                *task_event_predicates()
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if persisted_task_retry_count is None:
+                        await db.rollback()
+                        logger.info(
+                            "Dropping autonomous event without an exact retry "
+                            "generation for task %s",
+                            task_id,
+                        )
+                        return
             entry = LogEntry(
                 instance_id=instance_id,
                 task_id=task_id,
+                task_retry_count=persisted_task_retry_count,
                 event_type=event["event_type"],
                 role=event.get("role"),
                 content=event.get("content"),
@@ -8316,6 +8558,8 @@ class InstanceManager:
             task_id=task_id,
             timestamp=(entry.timestamp or datetime.utcnow()).isoformat(),
         )
+        if entry.task_retry_count is not None:
+            broadcast_data["task_retry_count"] = entry.task_retry_count
         if loop_iteration is not None:
             broadcast_data["loop_iteration"] = loop_iteration
         if not detached_autonomous:
@@ -8687,6 +8931,8 @@ class InstanceManager:
         task_id: int | None,
         cmd: list[str],
         spawn_kwargs: dict,
+        *,
+        codex_home: str | None = None,
     ) -> asyncio.subprocess.Process:
         """Spawn and register a direct process without a cancellation gap.
 
@@ -8714,6 +8960,12 @@ class InstanceManager:
         self.processes[instance_id] = process
         if os.name == "posix":
             self._process_groups[instance_id] = process
+        if codex_home is not None:
+            # The Codex caller holds this canonical home's admission lock.
+            # Publish the exact process/home pair before delivering a delayed
+            # spawn cancellation so failed cleanup cannot release the home
+            # while the child generation may still be alive.
+            self._codex_exec_homes[instance_id] = codex_home
 
         if cancellation is None:
             return process
@@ -8734,6 +8986,11 @@ class InstanceManager:
                 )
             if self.processes.get(instance_id) is process:
                 self.processes.pop(instance_id, None)
+                if (
+                    codex_home is not None
+                    and self._codex_exec_homes.get(instance_id) == codex_home
+                ):
+                    self._codex_exec_homes.pop(instance_id, None)
             if self._process_groups.get(instance_id) is process:
                 self._process_groups.pop(instance_id, None)
 
@@ -9720,7 +9977,10 @@ class InstanceManager:
             and self._pty_backend is not None
             and instance_id in getattr(self._pty_backend, "_sessions", {})
         )
-        from backend.services.codex_app_server import CodexTurnProcess
+        from backend.services.codex_app_server import (
+            CodexSharedTransportBusyError,
+            CodexTurnProcess,
+        )
 
         codex_app_server_managed = (
             process_live and isinstance(process, CodexTurnProcess)
@@ -9735,10 +9995,11 @@ class InstanceManager:
             # active: descendant cleanup can fail, yet killing the adapter
             # cannot reap that native work.
             #
-            # The registry owns the required fail-closed escalation.  It first
-            # interrupts the exact parent/descendant turn and, if that cannot
-            # be confirmed, drains and shuts down only this account's
-            # transport before finishing the adapter.
+            # This is a durably claimed turn, so the registry may escalate to
+            # account transport shutdown only when no peer turn shares that
+            # process.  If isolation cannot be proven, retain every runtime
+            # and durable owner so the API can return a conflict without
+            # killing unrelated tasks.
             registry = self._codex_app_server
             codex_home = self._config_dirs.get(instance_id)
             if registry is None or not codex_home:
@@ -9746,11 +10007,20 @@ class InstanceManager:
                     "Codex app-server turn has no registered account owner "
                     f"for instance {instance_id}"
                 )
-            await registry.abort_unclaimed_turn(
-                codex_home,
-                process,
-                reason="CCM task session interrupted",
-            )
+            try:
+                await registry.stop_claimed_turn(
+                    codex_home,
+                    process,
+                    reason="CCM task session interrupted",
+                )
+            except CodexSharedTransportBusyError as exc:
+                logger.warning(
+                    "Keeping claimed Codex turn active because its shared "
+                    "transport cannot be isolated for instance %s: %s",
+                    instance_id,
+                    exc,
+                )
+                return False
             try:
                 await asyncio.wait_for(
                     asyncio.shield(process.wait()),
@@ -10462,7 +10732,7 @@ class InstanceManager:
             return False
         return (
             getattr(process, "termination_kind", None)
-            != "internal_abort"
+            not in {"internal_abort", "timeout"}
         )
 
     def get_config_dir(self, instance_id: int) -> str | None:

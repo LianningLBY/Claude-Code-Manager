@@ -30,6 +30,11 @@ from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.pr_review_runtime import (
+    is_pr_review_fix_task,
+    is_pr_review_task,
+)
 from backend.services.task_queue import PR_REVIEW_SUPERSEDED_METADATA_KEY
 
 _TASK_STATUSES = frozenset(
@@ -605,7 +610,118 @@ class WorkerRelay:
                     generation.task_id,
                 )
             await db.commit()
-            return True
+        await self._notify_completed_pr_review(generation)
+        return True
+
+    async def _notify_completed_pr_review(
+        self,
+        generation: WorkerTaskGeneration,
+    ) -> None:
+        """Consume a Manager-owned PR workflow's exact Worker terminal state.
+
+        Worker TaskCreate intentionally does not receive Manager metadata such
+        as ``pr_review_id`` or ``pr_finding_action_id``, so the Worker-side
+        Dispatcher cannot finalize the PRReview/fix action. The Manager must
+        do it after the authoritative status relay has committed and only when
+        no remote PTY background epoch remains. Successful generations also
+        require a complete history backfill before patch parsing.
+        """
+
+        if (
+            generation.status not in _TERMINAL_TASK_STATUSES
+            or generation.pty_background_generation is not None
+        ):
+            return
+        try:
+            async with self.db_factory() as db:
+                task = (
+                    await db.execute(
+                        select(Task).where(
+                            *worker_task_generation_predicates(generation)
+                        )
+                    )
+                ).scalar_one_or_none()
+                worker = await db.get(Worker, generation.worker_id)
+                if task is not None:
+                    db.expunge(task)
+            if task is None or worker is None:
+                return
+            fix_task = is_pr_review_fix_task(task)
+            review_task = is_pr_review_task(task)
+            if not fix_task and not review_task:
+                return
+
+            if generation.status != "completed":
+                # Ordinary PR-review failure semantics remain owned by the
+                # existing Manager/Worker recovery flow. A fix action has no
+                # such fallback: every unsuccessful terminal generation must
+                # settle its durable ``running`` action.
+                if not fix_task:
+                    return
+                confirmed = await self._observe_task_generation(
+                    generation.worker_id,
+                    generation.task_id,
+                )
+                if confirmed != generation:
+                    logger.info(
+                        "discarding Worker PR fix failure for stale "
+                        "generation of task %s",
+                        generation.task_id,
+                    )
+                    return
+                from backend.main import dispatcher
+
+                if dispatcher is not None:
+                    error = task.error_message or (
+                        "PR fix Task ended with terminal status "
+                        f"{generation.status}"
+                    )
+                    await dispatcher._handle_pr_review_failure(task, error)
+                return
+
+            # A Worker status event may overtake a disconnected task-channel
+            # tail. Pull the authoritative history first, but explicitly skip
+            # status synchronization here: publishing that status would call
+            # this completion hook recursively.
+            synced = await self._backfill_missing_logs(
+                worker,
+                {generation.task_id},
+                sync_status=False,
+            )
+            if generation.task_id not in synced:
+                logger.warning(
+                    "deferring Worker PR review completion for task %s "
+                    "because exact-generation history could not be synced",
+                    generation.task_id,
+                )
+                return
+
+            # The history request and DB insert are asynchronous boundaries.
+            # Retry/reassignment/background handoff may have won meanwhile, so
+            # the dispatcher callback must borrow no newer generation.
+            confirmed = await self._observe_task_generation(
+                generation.worker_id,
+                generation.task_id,
+            )
+            if confirmed != generation:
+                logger.info(
+                    "discarding Worker PR review completion for stale "
+                    "generation of task %s",
+                    generation.task_id,
+                )
+                return
+
+            from backend.main import dispatcher
+
+            if dispatcher is not None:
+                await dispatcher._handle_pty_background_completion(
+                    generation.task_id
+                )
+        except Exception:
+            logger.exception(
+                "failed to finalize Worker PR workflow for task %s",
+                generation.task_id,
+            )
 
     async def _publish_background_generation(
         self,
@@ -666,7 +782,8 @@ class WorkerRelay:
                     generation.task_id,
                 )
             await db.commit()
-            return True
+        await self._notify_completed_pr_review(generation)
+        return True
 
     # ------------------------------------------------------------------
     # 事件中继主循环
@@ -967,7 +1084,21 @@ class WorkerRelay:
             )
             return
 
+        event_retry_count: int | None = None
+        if event_type in CHAT_EVENT_TYPES:
+            event_retry_count = data.get("task_retry_count")
+            if (
+                type(event_retry_count) is not int
+                or event_retry_count != observed.retry_count
+            ):
+                # Chat/result events are terminal evidence for generation-
+                # sensitive consumers such as PR Monitor.  A delayed event from
+                # an older retry must never borrow the Manager's current retry
+                # merely because the task id and Worker assignment still match.
+                return
+
         # 2) chat 事件双写 LogEntry（instance_id=None；广播 payload 无 raw_json，存 None）
+        persisted_forward = None
         if event_type in CHAT_EVENT_TYPES:
             async with self.db_factory() as db:
                 guard_values = {"status": observed.status}
@@ -984,9 +1115,10 @@ class WorkerRelay:
                 if guarded.rowcount != 1:
                     await db.rollback()
                     return
-                db.add(LogEntry(
+                entry = LogEntry(
                     instance_id=None,
                     task_id=task_id,
+                    task_retry_count=event_retry_count,
                     event_type=event_type,
                     role=data.get("role"),
                     content=data.get("content"),
@@ -996,8 +1128,22 @@ class WorkerRelay:
                     raw_json=data.get("raw_json"),
                     is_error=data.get("is_error", False),
                     loop_iteration=data.get("loop_iteration"),
-                ))
+                )
+                db.add(entry)
                 await db.commit()
+                persisted_forward = persisted_chat_event(
+                    entry,
+                    {
+                        key: value
+                        for key, value in data.items()
+                        if key not in (
+                            "instance_id",
+                            "raw_json",
+                            "task_retry_count",
+                        )
+                    },
+                )
+                persisted_forward["task_retry_count"] = event_retry_count
             # session_id 同步：worker 广播前 pop 了 session_id，首条事件到达时从 Worker 拉取
             if event_type == "system_init":
                 session_observed = await self._observe_task_generation(
@@ -1253,7 +1399,9 @@ class WorkerRelay:
                 await db.commit()
 
         # 4) 镜像广播到来源同名 channel（剥 worker 的 instance_id，对 Manager 无意义）
-        forward = {k: v for k, v in data.items() if k != "instance_id"}
+        forward = persisted_forward or {
+            k: v for k, v in data.items() if k != "instance_id"
+        }
         if channel.startswith("task:"):
             await self.broadcaster.broadcast(f"task:{task_id}", forward)
         elif channel == "tasks":
@@ -1274,9 +1422,22 @@ class WorkerRelay:
     # Worker API 辅助
     # ------------------------------------------------------------------
 
-    async def _backfill_missing_logs(self, worker: Worker, task_ids: set[int]):
+    async def _backfill_missing_logs(
+        self,
+        worker: Worker,
+        task_ids: set[int],
+        *,
+        sync_status: bool = True,
+    ) -> set[int]:
         """断连/重启后补日志。用「非 user_message 条数」对比（user_message 由
-        chat 代理直接入 Manager DB，不经 relay，按总条数比会错位重复）。"""
+        chat 代理直接入 Manager DB，不经 relay，按总条数比会错位重复）。
+
+        Returns task ids whose history response was valid and committed under
+        the exact observed Manager generation. ``sync_status=False`` is used
+        by the completion hook to avoid recursively publishing the same
+        completed status while it closes a possible task-channel log gap.
+        """
+        history_synced: set[int] = set()
         async with httpx.AsyncClient(timeout=30) as client:
             for tid in task_ids:
                 try:
@@ -1296,87 +1457,113 @@ class WorkerRelay:
                     if history_response.status_code == 200:
                         remote = history_response.json()
                         if isinstance(remote, dict):
-                            remote = remote.get("messages", [])
+                            remote = remote.get("messages")
                         if not isinstance(remote, list):
-                            remote = []
-                        remote_non_user = [
-                            message
-                            for message in remote
-                            if isinstance(message, dict)
-                            and message.get("event_type") != "user_message"
-                        ]
-                        async with self.db_factory() as db:
-                            guarded = await db.execute(
-                                update(Task)
-                                .where(
-                                    *worker_task_generation_predicates(
-                                        history_observed
-                                    )
-                                )
-                                .values(status=history_observed.status)
-                            )
-                            if guarded.rowcount != 1:
-                                await db.rollback()
-                            else:
-                                # Re-read after acquiring the Task generation
-                                # lock so a live relay insert which won the race
-                                # is included in fingerprint deduplication.
-                                local_rows = (
-                                    await db.execute(
-                                        select(
-                                            LogEntry.event_type,
-                                            LogEntry.role,
-                                            LogEntry.content,
-                                            LogEntry.tool_name,
-                                            LogEntry.tool_input,
-                                            LogEntry.tool_output,
-                                            LogEntry.loop_iteration,
-                                        ).where(
-                                            LogEntry.task_id == tid,
-                                            LogEntry.event_type
-                                            != "user_message",
+                            remote = None
+                        if remote is None:
+                            if not sync_status:
+                                continue
+                        else:
+                            remote_non_user = [
+                                message
+                                for message in remote
+                                if isinstance(message, dict)
+                                and message.get("event_type") != "user_message"
+                                and type(message.get("task_retry_count")) is int
+                                and message["task_retry_count"]
+                                == history_observed.retry_count
+                            ]
+                            async with self.db_factory() as db:
+                                guarded = await db.execute(
+                                    update(Task)
+                                    .where(
+                                        *worker_task_generation_predicates(
+                                            history_observed
                                         )
                                     )
-                                ).all()
-                                local_entries = [
-                                    dict(row._mapping)
-                                    for row in local_rows
-                                ]
-                                missing = _missing_by_fingerprint(
-                                    local_entries,
-                                    remote_non_user,
+                                    .values(status=history_observed.status)
                                 )
-                                for message in missing:
-                                    db.add(
-                                        LogEntry(
-                                            instance_id=None,
-                                            task_id=tid,
-                                            event_type=(
-                                                message.get("event_type")
-                                                or "message"
-                                            ),
-                                            role=message.get("role"),
-                                            content=message.get("content"),
-                                            tool_name=message.get("tool_name"),
-                                            tool_input=message.get("tool_input"),
-                                            tool_output=message.get("tool_output"),
-                                            raw_json=message.get("raw_json"),
-                                            is_error=message.get(
-                                                "is_error",
-                                                False,
-                                            ),
-                                            loop_iteration=message.get(
-                                                "loop_iteration"
-                                            ),
+                                if guarded.rowcount != 1:
+                                    await db.rollback()
+                                else:
+                                    # Re-read after acquiring the Task
+                                    # generation lock so a live relay insert
+                                    # which won the race is included in
+                                    # fingerprint deduplication.
+                                    local_rows = (
+                                        await db.execute(
+                                            select(
+                                                LogEntry.event_type,
+                                                LogEntry.role,
+                                                LogEntry.content,
+                                                LogEntry.tool_name,
+                                                LogEntry.tool_input,
+                                                LogEntry.tool_output,
+                                                LogEntry.loop_iteration,
+                                            ).where(
+                                                LogEntry.task_id == tid,
+                                                LogEntry.task_retry_count
+                                                == history_observed.retry_count,
+                                                LogEntry.event_type
+                                                != "user_message",
+                                            )
                                         )
+                                    ).all()
+                                    local_entries = [
+                                        dict(row._mapping)
+                                        for row in local_rows
+                                    ]
+                                    missing = _missing_by_fingerprint(
+                                        local_entries,
+                                        remote_non_user,
                                     )
-                                await db.commit()
-                                if missing:
-                                    logger.info(
-                                        "backfilled %d log entries for task %s",
-                                        len(missing),
-                                        tid,
-                                    )
+                                    for message in missing:
+                                        db.add(
+                                            LogEntry(
+                                                instance_id=None,
+                                                task_id=tid,
+                                                task_retry_count=(
+                                                    history_observed.retry_count
+                                                ),
+                                                event_type=(
+                                                    message.get("event_type")
+                                                    or "message"
+                                                ),
+                                                role=message.get("role"),
+                                                content=message.get("content"),
+                                                tool_name=message.get(
+                                                    "tool_name"
+                                                ),
+                                                tool_input=message.get(
+                                                    "tool_input"
+                                                ),
+                                                tool_output=message.get(
+                                                    "tool_output"
+                                                ),
+                                                raw_json=message.get(
+                                                    "raw_json"
+                                                ),
+                                                is_error=message.get(
+                                                    "is_error",
+                                                    False,
+                                                ),
+                                                loop_iteration=message.get(
+                                                    "loop_iteration"
+                                                ),
+                                            )
+                                        )
+                                    await db.commit()
+                                    history_synced.add(tid)
+                                    if missing:
+                                        logger.info(
+                                            "backfilled %d log entries for "
+                                            "task %s",
+                                            len(missing),
+                                            tid,
+                                        )
+
+                    if not sync_status:
+                        continue
 
                     # The status request gets its own pre-request observation.
                     # Never re-read the current Task only after the network
@@ -1417,3 +1604,4 @@ class WorkerRelay:
                         )
                 except Exception:
                     logger.exception("backfill task %s from worker %s failed", tid, worker.id)
+        return history_synced

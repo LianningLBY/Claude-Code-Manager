@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
+import type { Components } from 'react-markdown';
 import { api, isApiRequestError } from '../../api/client';
 import type {
   AskUserAnswer,
@@ -23,24 +24,34 @@ import { ListFilter, Syringe } from '../icons';
 import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
 import { VersionedPlansDialog } from '../PlanReview/VersionedPlansDialog';
 import { planStalenessConfirmationMessage } from '../PlanReview/planStaleness';
+import { AttentionTag } from '../Tasks/AttentionTag';
 import { ExpandableText } from '../ExpandableText';
 import { copyToClipboard } from '../clipboard';
-import { MarkdownContent } from '../MarkdownContent';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
-import { useFileUpload } from '../../hooks/useFileUpload';
+import { useVisualViewportBounds } from '../../hooks/useVisualViewportBounds';
+import {
+  dedupeUploadResults,
+  isUploadResult,
+  MAX_FILES,
+  sameUploadResult,
+  useFileUpload,
+} from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
 import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
 } from './messageMerge';
+import { TaskArtifactLink } from './TaskArtifactLink';
+import { remarkTaskArtifactPaths } from './taskArtifactMarkdown';
+import { MarkdownRenderer } from '../Markdown/MarkdownRenderer';
 
 interface ChatViewProps {
   task: Task;
   projects: Project[];
   onBack: () => void;
-  onTaskUpdated?: () => void;
+  onTaskUpdated?: (task?: Task) => void;
   onTaskForked?: (task: Task) => void;
   inline?: boolean;
 }
@@ -50,6 +61,84 @@ interface QueuedMessage {
   uploadResults?: UploadResult[];
   planTaskIds?: number[];
   planVersionIds?: number[];
+}
+
+interface LiveStreamCacheEntry {
+  messages: ChatMessage[];
+  updatedAt: number;
+}
+
+const LIVE_STREAM_CACHE_MAX_TASKS = 16;
+const LIVE_STREAM_CACHE_MAX_ITEMS = 8;
+const LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM = 200_000;
+const LIVE_STREAM_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const liveStreamCache = new Map<number, LiveStreamCacheEntry>();
+
+function taskHasActiveStream(task: Task): boolean {
+  return (
+    task.background_active === true
+    || task.status === 'in_progress'
+    || task.status === 'executing'
+  );
+}
+
+function clearLiveStreamCache(taskId: number): void {
+  liveStreamCache.delete(taskId);
+}
+
+function pruneLiveStreamCache(now: number): void {
+  for (const [taskId, entry] of liveStreamCache) {
+    if (now - entry.updatedAt > LIVE_STREAM_CACHE_TTL_MS) {
+      liveStreamCache.delete(taskId);
+    }
+  }
+  while (liveStreamCache.size > LIVE_STREAM_CACHE_MAX_TASKS) {
+    const oldestTaskId = liveStreamCache.keys().next().value as number | undefined;
+    if (oldestTaskId === undefined) break;
+    liveStreamCache.delete(oldestTaskId);
+  }
+}
+
+function syncLiveStreamCache(taskId: number, messages: ChatMessage[]): void {
+  const liveMessages = messages
+    .filter((message) => (
+      !message.persisted
+      && Boolean(message.stream_item_id)
+      && (message.event_type === 'message' || message.event_type === 'thinking')
+    ))
+    .slice(-LIVE_STREAM_CACHE_MAX_ITEMS)
+    .map((message) => ({
+      ...message,
+      content: message.content?.slice(-LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM) ?? null,
+    }));
+  if (liveMessages.length === 0) {
+    clearLiveStreamCache(taskId);
+    return;
+  }
+
+  const now = Date.now();
+  liveStreamCache.delete(taskId);
+  liveStreamCache.set(taskId, { messages: liveMessages, updatedAt: now });
+  pruneLiveStreamCache(now);
+}
+
+function restoreLiveStreamCache(task: Task): ChatMessage[] {
+  if (!taskHasActiveStream(task)) {
+    clearLiveStreamCache(task.id);
+    return [];
+  }
+  pruneLiveStreamCache(Date.now());
+  return (liveStreamCache.get(task.id)?.messages || []).map((message) => ({ ...message }));
+}
+
+function loadStoredUploadResults(key: string): UploadResult[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return dedupeUploadResults(parsed.filter(isUploadResult)).slice(0, MAX_FILES);
+  } catch {
+    return [];
+  }
 }
 
 type MessageGroup =
@@ -173,10 +262,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return p?.name ?? null;
   }, [task.project_id, projects]);
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
   const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
   const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
   const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
+  const draftUploadsKey = `ccm-chat-draft-uploads-${task.id}`;
   const [forkSeedUploads, setForkSeedUploads] = useState<UploadResult[]>(() => {
     try {
       if (localStorage.getItem(forkSeedUploadsConsumedKey)) return [];
@@ -240,19 +330,39 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [stillRunning, setStillRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
-  const fileUpload = useFileUpload();
+  const initialDraftUploads = useMemo(
+    () => loadStoredUploadResults(draftUploadsKey),
+    [draftUploadsKey],
+  );
+  const fileUpload = useFileUpload(initialDraftUploads);
   const addChatFiles = fileUpload.addFiles;
+  const consumeForkSeedUploads = useCallback(() => {
+    if (forkSeedUploads.length === 0) return;
+    try {
+      localStorage.setItem(forkSeedUploadsConsumedKey, '1');
+      localStorage.removeItem(forkSeedUploadsKey);
+    } catch { /* storage may be unavailable */ }
+    setForkSeedUploads([]);
+  }, [
+    forkSeedUploads.length,
+    forkSeedUploadsConsumedKey,
+    forkSeedUploadsKey,
+  ]);
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(task.context_window_usage ?? null);
   const [editingTitle, setEditingTitle] = useState(false);
+  const [editingAttentionTag, setEditingAttentionTag] = useState(false);
   const [titleDraft, setTitleDraft] = useState(task.title || '');
   const titleInputRef = useRef<HTMLInputElement>(null);
   const [titleExpanded, setTitleExpanded] = useState(false);
+  const chatRootRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [starred, setStarred] = useState(task.starred);
+
+  useVisualViewportBounds(chatRootRef, !inline);
 
   // Temp model override (one-shot per message, not persisted to the task)
   const [modelOverride, setModelOverride] = useState<string | null>(null);
@@ -365,13 +475,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         current.trim() === text ? '' : current
       ));
       fileUpload.clear();
-      if (forkSeedUploads.length > 0) {
-        try {
-          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
-          localStorage.removeItem(forkSeedUploadsKey);
-        } catch { /* storage may be unavailable */ }
-        setForkSeedUploads([]);
-      }
+      consumeForkSeedUploads();
     } catch (e) {
       setError(
         `未收到注入成功确认，消息和附件已保留；请先查看聊天记录或运行日志，再决定是否重试：${
@@ -393,6 +497,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       else localStorage.removeItem(`ccm-chat-draft-${task.id}`);
     } catch { /* storage may be unavailable */ }
   }, [input, task.id]);
+  useEffect(() => {
+    try {
+      if (fileUpload.uploadedResults.length > 0) {
+        localStorage.setItem(
+          draftUploadsKey,
+          JSON.stringify(fileUpload.uploadedResults),
+        );
+      } else {
+        localStorage.removeItem(draftUploadsKey);
+      }
+    } catch { /* storage may be unavailable */ }
+  }, [draftUploadsKey, fileUpload.uploadedResults]);
   useEffect(() => {
     try {
       if (localStorage.getItem(forkSeedUploadsConsumedKey)) {
@@ -480,6 +596,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   ).length;
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const historyCursorRef = useRef<{
+    taskId: number;
+    beforeId: number | null;
+  }>({
+    taskId: task.id,
+    beforeId: null,
+  });
+  if (historyCursorRef.current.taskId !== task.id) {
+    historyCursorRef.current = {
+      taskId: task.id,
+      beforeId: null,
+    };
+  }
   const HISTORY_PAGE_SIZE = 200;
 
   const navigateUserMessage = useCallback((direction: 'up' | 'down') => {
@@ -525,7 +654,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
         return (parsed as string[]).map(text => ({ text }));
       }
-      return parsed;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((item): QueuedMessage[] => {
+        if (!item || typeof item !== 'object') return [];
+        const candidate = item as Partial<QueuedMessage>;
+        if (typeof candidate.text !== 'string') return [];
+        const uploadResults = Array.isArray(candidate.uploadResults)
+          ? dedupeUploadResults(candidate.uploadResults.filter(isUploadResult))
+          : undefined;
+        return [{
+          text: candidate.text,
+          uploadResults: uploadResults?.length ? uploadResults : undefined,
+        }];
+      });
     } catch { return []; }
   });
   const messageQueueRef = useRef(messageQueue);
@@ -572,9 +713,45 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     });
   }, []);
 
+  const restoreQueuedUploads = useCallback((items: QueuedMessage[]): boolean => {
+    const queuedUploads = dedupeUploadResults(
+      items.flatMap((item) => item.uploadResults || []),
+    );
+    const existingUploaded = dedupeUploadResults([
+      ...forkSeedUploads,
+      ...fileUpload.uploadedResults,
+    ]);
+    const additions = queuedUploads.filter(
+      (upload) => !existingUploaded.some(
+        (existing) => sameUploadResult(existing, upload),
+      ),
+    );
+    const uploadsWithoutResults = (
+      fileUpload.uploads.length - fileUpload.uploadedResults.length
+    );
+    const projectedCount = (
+      existingUploaded.length + uploadsWithoutResults + additions.length
+    );
+    if (projectedCount > MAX_FILES) {
+      setError(
+        `合并后将有 ${projectedCount} 个附件，单条消息最多支持 ${MAX_FILES} 个；`
+        + '请先删除部分附件或队列消息。',
+      );
+      return false;
+    }
+    if (!fileUpload.addUploadedResults(additions)) {
+      setError(
+        `合并后附件超过 ${MAX_FILES} 个，队列已保持原样；请先删除部分附件。`,
+      );
+      return false;
+    }
+    return true;
+  }, [fileUpload, forkSeedUploads]);
+
   const editQueueItem = useCallback((index: number) => {
     const item = messageQueueRef.current[index];
     if (!item) return;
+    if (!restoreQueuedUploads([item])) return;
     setInput(prev => prev.trim() ? `${prev.trim()}\n\n${item.text}` : item.text);
     if (item.planTaskIds?.length) {
       setSelectedPlanIds((current) => [
@@ -590,11 +767,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
     setMessageQueue(prev => prev.filter((_, i) => i !== index));
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  }, [restoreQueuedUploads]);
 
   const mergeQueueToInput = useCallback(() => {
     const queued = messageQueueRef.current;
     if (queued.length === 0) return;
+    if (!restoreQueuedUploads(queued)) return;
     setInput(prev => {
       const current = prev.trim();
       const merged = queued.map(q => q.text).join('\n\n');
@@ -620,7 +798,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
     setMessageQueue([]);
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  }, [restoreQueuedUploads]);
 
   const clearMessageQueue = useCallback(() => {
     const queuedPlanIds = [
@@ -969,6 +1147,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
 
     if (eventType === 'process_exit') {
+      clearLiveStreamCache(task.id);
       // Small delay so any final output messages queued just before
       // process_exit are rendered before the "thinking" indicator hides.
       setTimeout(() => {
@@ -1015,48 +1194,70 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const persistedId = Number(msg.data.id);
       const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
       const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
+      const entry: ChatMessage = {
+        id: isPersisted ? persistedId : Date.now() + Math.random(),
+        role: 'user',
+        event_type: 'user_message',
+        content,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: eventTimestamp,
+        image_urls: imageUrls,
+        attachments,
+        source,
+        raw_content: rawContent,
+        applied_plans: appliedPlans,
+        persisted: isPersisted,
+      };
       setSending(true);
       setMessages((prev) => {
+        if (isPersisted) {
+          return mergeChatHistory([entry], prev);
+        }
+
         // Reconcile the optimistic bubble with the authoritative broadcast.
         // The optimistic content can be raw text while the server content is
         // prefixed with the sender name, so display content alone is not a
         // stable identity. raw_content is the canonical user input.
-        const last = prev[prev.length - 1];
-        const matchesOptimistic = Boolean(
-          last
-          && last.role === 'user'
-          && last.event_type === 'user_message'
-          && (
-            last.content === content
-            || (
-              rawContent !== null
-              && last.raw_content === rawContent
+        let optimisticIndex = -1;
+        for (let index = prev.length - 1; index >= 0; index -= 1) {
+          const candidate = prev[index];
+          if (
+            !candidate.persisted
+            && candidate.role === 'user'
+            && candidate.event_type === 'user_message'
+            && (
+              candidate.content === content
+              || (
+                rawContent !== null
+                && candidate.raw_content === rawContent
+              )
             )
-          )
-        );
-        if (last && matchesOptimistic) {
-          return [...prev.slice(0, -1), {
-            ...last,
-            id: isPersisted ? persistedId : last.id,
+          ) {
+            optimisticIndex = index;
+            break;
+          }
+        }
+        if (optimisticIndex >= 0) {
+          const optimistic = prev[optimisticIndex];
+          const next = [...prev];
+          next[optimisticIndex] = {
+            ...optimistic,
             content,
             source,
-            raw_content: rawContent ?? last.raw_content,
+            raw_content: rawContent ?? optimistic.raw_content,
             timestamp: eventTimestamp,
-            image_urls: imageUrls?.length ? imageUrls : last.image_urls,
-            attachments: attachments?.length ? attachments : last.attachments,
-            applied_plans: appliedPlans?.length ? appliedPlans : last.applied_plans,
-            persisted: isPersisted || last.persisted,
-          }];
+            image_urls: imageUrls?.length ? imageUrls : optimistic.image_urls,
+            attachments: attachments?.length ? attachments : optimistic.attachments,
+            applied_plans: appliedPlans?.length ? appliedPlans : optimistic.applied_plans,
+            persisted: optimistic.persisted,
+          };
+          return next;
         }
-        return [...prev, {
-          id: isPersisted ? persistedId : Date.now() + Math.random(), role: 'user', event_type: 'user_message',
-          content, tool_name: null, tool_input: null, tool_output: null,
-          is_error: false, loop_iteration: null,
-          timestamp: eventTimestamp,
-          image_urls: imageUrls, attachments: attachments, source, raw_content: rawContent,
-          applied_plans: appliedPlans,
-          persisted: isPersisted,
-        }];
+        return [...prev, entry];
       });
       return;
     }
@@ -1074,14 +1275,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         if (index >= 0) {
           const next = [...prev];
           next[index] = { ...next[index], content: `${next[index].content || ''}${delta}` };
+          syncLiveStreamCache(task.id, next);
           return next;
         }
-        return [...prev, {
+        const next = [...prev, {
           id: Date.now() + Math.random(), role: 'assistant', event_type: renderedType,
           content: delta, tool_name: null, tool_input: null, tool_output: null,
           is_error: false, loop_iteration: null, timestamp: new Date().toISOString(),
           image_urls: null, attachments: null, stream_item_id: itemId,
         }];
+        syncLiveStreamCache(task.id, next);
+        return next;
       });
       return;
     }
@@ -1130,21 +1334,26 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       persisted: isPersisted,
     };
     setMessages((prev) => {
-      if (itemId) {
-        const index = prev.findIndex((candidate) => candidate.stream_item_id === itemId);
-        if (index >= 0) {
-          const next = [...prev];
-          next[index] = entry;
-          return next;
-        }
-      }
-      // A PTY recovery notice describes only the active reconnect interval.
-      // The first durable event proves recovery progressed, so retire the
-      // notice instead of allowing later history merges to move it downward.
       const current = isPersisted
         ? prev.filter((candidate) => !candidate.pty_cold_start)
         : prev;
-      return [...current, entry];
+      if (isPersisted) {
+        const next = mergeChatHistory([entry], current);
+        syncLiveStreamCache(task.id, next);
+        return next;
+      }
+      if (itemId) {
+        const index = current.findIndex((candidate) => candidate.stream_item_id === itemId);
+        if (index >= 0) {
+          const next = [...current];
+          next[index] = entry;
+          syncLiveStreamCache(task.id, next);
+          return next;
+        }
+      }
+      const next = [...current, entry];
+      syncLiveStreamCache(task.id, next);
+      return next;
     });
   }, [markAskUserResolved, refreshVersionedPlans, task.id, task.worker_id]);
 
@@ -1160,6 +1369,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((m) => ({ ...m, persisted: true }));
+      const pageOldestId = filtered.reduce<number | null>(
+        (oldest, message) => (
+          oldest === null ? message.id : Math.min(oldest, message.id)
+        ),
+        null,
+      );
+      if (
+        pageOldestId !== null
+        && historyCursorRef.current.taskId === task.id
+      ) {
+        historyCursorRef.current.beforeId = (
+          historyCursorRef.current.beforeId === null
+            ? pageOldestId
+            : Math.min(historyCursorRef.current.beforeId, pageOldestId)
+        );
+      }
       setHasMoreHistory(msgs.length >= HISTORY_PAGE_SIZE);
       const existingIds = new Set(
         filtered.filter((m) => m.event_type === 'ask_user_question').map((m) => m.request_id)
@@ -1187,7 +1412,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           ask_status: 'pending',
         }));
       const snapshot = cards.length ? [...filtered, ...cards] : filtered;
-      setMessages((current) => mergeChatHistory(snapshot, current));
+      setMessages((current) => {
+        const next = mergeChatHistory(snapshot, current);
+        syncLiveStreamCache(task.id, next);
+        return next;
+      });
     }).catch(() => {}).finally(() => setHistoryLoading(false));
   }, [task.id]);
   useEffect(() => {
@@ -1198,12 +1427,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   const loadMoreHistory = useCallback(() => {
     if (loadingMore || !hasMoreHistory || messages.length === 0) return;
-    const oldestId = messages[0]?.id;
-    if (!oldestId) return;
+    const oldestHistoryId = (
+      historyCursorRef.current.taskId === task.id
+        ? historyCursorRef.current.beforeId
+        : null
+    );
+    if (oldestHistoryId === null) return;
     const container = messagesContainerRef.current;
     if (container) scrollRestorationRef.current = container.scrollHeight;
     setLoadingMore(true);
-    api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, oldestId).then((msgs) => {
+    api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, oldestHistoryId).then((msgs) => {
       const filtered = msgs
         .filter((m) =>
           !isLegacyCodexCollabCompleted(m) &&
@@ -1211,7 +1444,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         )
         .map((m) => ({ ...m, persisted: true }));
       if (filtered.length > 0) {
-        setMessages((prev) => [...filtered, ...prev]);
+        const pageOldestId = filtered.reduce(
+          (oldest, message) => Math.min(oldest, message.id),
+          filtered[0].id,
+        );
+        if (historyCursorRef.current.taskId === task.id) {
+          historyCursorRef.current.beforeId = pageOldestId;
+        }
+        setMessages((prev) => mergeChatHistory(filtered, prev));
       }
       setHasMoreHistory(msgs.length >= HISTORY_PAGE_SIZE);
     }).catch(() => {}).finally(() => setLoadingMore(false));
@@ -1301,10 +1541,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       !backgroundActive
       && ['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)
     ) {
+      clearLiveStreamCache(task.id);
       setSending(false);
       setAutoDequeueFlag(f => f + 1);
     }
-  }, [backgroundActive, effectiveStatus]);
+  }, [backgroundActive, effectiveStatus, task.id]);
 
   // Load chat history
   useEffect(() => {
@@ -1513,9 +1754,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const planVersionIdsForTurn = fromQueue
       ? (preSelectedPlanVersionIds || [])
       : selectedPlanVersionIds;
-    const sendableAttachmentCount = fromQueue
-      ? (preUploadedResults?.length || 0)
-      : fileUpload.uploadedResults.length + forkSeedUploads.length;
+    const fileUploadResultsForTurn = dedupeUploadResults(
+      fileUpload.uploadedResults,
+    );
+    const uploadedResultsForTurn = fromQueue
+      ? dedupeUploadResults(preUploadedResults || [])
+      : dedupeUploadResults([
+        ...forkSeedUploads,
+        ...fileUploadResultsForTurn,
+      ]);
+    const sendableAttachmentCount = uploadedResultsForTurn.length;
     if (!text && sendableAttachmentCount === 0) return;
 
     if (!fromQueue && fileUpload.isUploading) {
@@ -1534,23 +1782,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       await handleInject(
         text,
-        [...forkSeedUploads, ...fileUpload.uploadedResults],
+        uploadedResultsForTurn,
       );
       return;
     }
 
     // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
     if (isProcessing && !fromQueue) {
-      if (text || fileUpload.uploads.length > 0) {
-        const results = fileUpload.uploadedResults.length > 0 ? [...fileUpload.uploadedResults] : undefined;
+      if (text || sendableAttachmentCount > 0) {
         addToQueue(
           text,
-          results,
+          uploadedResultsForTurn.length > 0 ? uploadedResultsForTurn : undefined,
           planIdsForTurn.length > 0 ? [...planIdsForTurn] : undefined,
           planVersionIdsForTurn.length > 0 ? [...planVersionIdsForTurn] : undefined,
         );
         setInput('');
         fileUpload.clear();
+        consumeForkSeedUploads();
       }
       return;
     }
@@ -1564,15 +1812,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     let optimisticMessageId: number | null = null;
     try {
       let uploadedPaths: string[] | undefined;
-      let uploadedResults: UploadResult[] = [];
-      if (preUploadedResults && preUploadedResults.length > 0) {
-        uploadedResults = preUploadedResults;
-      } else if (fileUpload.uploadedResults.length > 0) {
-        uploadedResults = fileUpload.uploadedResults;
-      }
-      if (!fromQueue && forkSeedUploads.length > 0) {
-        uploadedResults = [...forkSeedUploads, ...uploadedResults];
-      }
+      const uploadedResults = uploadedResultsForTurn;
       if (uploadedResults.length > 0) uploadedPaths = uploadedResults.map((r) => r.path);
       if (!fromQueue) fileUpload.clear();
 
@@ -1720,11 +1960,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         fetchHistory();
       }
       if (!fromQueue) {
-        try {
-          localStorage.setItem(forkSeedUploadsConsumedKey, '1');
-          localStorage.removeItem(forkSeedUploadsKey);
-        } catch { /* storage may be unavailable */ }
-        setForkSeedUploads([]);
+        consumeForkSeedUploads();
       }
       setModelOverride(null);
     } catch (e) {
@@ -1737,21 +1973,25 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       onTaskUpdated?.();
       fetchHistory();
       const errMsg = String(e);
-      const conflictDetail = isApiRequestError(e) && typeof e.detail === 'string'
-        ? e.detail.toLowerCase()
-        : '';
-      if (
-        isApiRequestError(e)
-        && e.status === 409
+      const conflictDetail = (
+        isApiRequestError(e) && typeof e.detail === 'string'
+          ? e.detail
+          : errMsg
+      ).toLowerCase();
+      const isBusyConflict = (
+        (!isApiRequestError(e) || e.status === 409)
         && (
-          conflictDetail.includes('preceding codex turn is still running')
-          || conflictDetail.includes('currently being processed')
+          conflictDetail.includes('currently being processed')
+          || conflictDetail.includes('still running')
+          || conflictDetail.includes('current turn to finish')
         )
-      ) {
-        setStillRunning(true);
-      }
+      );
+      setStillRunning(isBusyConflict);
       setError(errMsg);
       if (!fromQueue && text) setInput(text);
+      if (!fromQueue && fileUploadResultsForTurn.length > 0) {
+        fileUpload.addUploadedResults(fileUploadResultsForTurn);
+      }
       if (fromQueue && (text || preUploadedResults?.length)) {
         setMessageQueue(prev => [{
           text,
@@ -1779,7 +2019,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   };
 
   return (
-    <div className={inline ? "flex flex-col h-full bg-gray-950" : "fixed inset-0 bg-gray-950 flex flex-col z-50"}>
+    <div ref={chatRootRef} className={inline ? "flex flex-col h-full bg-gray-950" : "fixed inset-0 bg-gray-950 flex flex-col z-50"}>
       {/* Header — two rows */}
       <div className="px-3 sm:px-4 py-1.5 pt-[max(0.375rem,env(safe-area-inset-top))] border-b border-gray-800 bg-gray-900">
         {/* Row 1: back + task info + action buttons */}
@@ -1921,7 +2161,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
         {/* Row 2: title + context usage */}
         <div className="flex items-center gap-2 mt-0.5 pl-7 sm:pl-8">
-          <div className="flex-1 min-w-0">
+          {!editingAttentionTag && <div className="flex-1 min-w-0">
             {editingTitle ? (
               <input
                 ref={titleInputRef}
@@ -1949,7 +2189,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 </button>
               </div>
             )}
-          </div>
+          </div>}
+          <AttentionTag
+            taskId={task.id}
+            value={task.attention_tag}
+            editing={editingAttentionTag}
+            onEdit={() => {
+              setEditingTitle(false);
+              setEditingAttentionTag(true);
+            }}
+            onCancel={() => setEditingAttentionTag(false)}
+            onSaved={(updated) => onTaskUpdated?.(updated)}
+            showAddButton
+            className={editingAttentionTag ? 'flex-1' : 'max-w-[45vw] sm:max-w-xs'}
+          />
           {contextUsage && (
             <span className="flex items-center shrink-0">
               <ContextUsageIndicator usage={contextUsage} />
@@ -2336,7 +2589,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
           )
         )}
-        {sending && (
+        {isProcessing && (
           <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
             <span>{providerLabel} is thinking...</span>
@@ -2490,16 +2743,28 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   </button>
                 </div>
               ))}
-              {fileUpload.uploads.map((upload) => (
+              {fileUpload.uploads.map((upload) => {
+                const preview = upload.preview || (
+                  upload.result?.is_image
+                    ? resolveAssetUrl(upload.result.url)
+                    : ''
+                );
+                const filename = (
+                  upload.file?.name
+                  || upload.result?.filename
+                  || upload.result?.url.split('/').pop()
+                  || 'attachment'
+                );
+                return (
                 <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
-                  {upload.preview ? (
+                  {preview ? (
                     <div className="w-14 h-14">
-                      <img src={upload.preview} alt="" className="w-full h-full object-cover" />
+                      <img src={preview} alt={filename} className="w-full h-full object-cover" />
                     </div>
                   ) : (
                     <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-800 text-xs text-gray-300 max-w-[150px]">
                       <Paperclip size={12} className="shrink-0" />
-                      <span className="truncate">{upload.file.name}</span>
+                      <span className="truncate">{filename}</span>
                     </div>
                   )}
                   {upload.status === 'uploading' && (
@@ -2520,6 +2785,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   )}
                   <button
                     type="button"
+                    aria-label={`Remove ${filename}`}
                     onClick={() => fileUpload.removeFile(upload.id)}
                     disabled={injecting}
                     className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
@@ -2527,7 +2793,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     <X size={10} />
                   </button>
                 </div>
-              ))}
+              );
+              })}
             </div>
           )}
           <div className="space-y-1.5">
@@ -2544,7 +2811,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={injecting || (!task.session_id && !task.shared_from_id) || fileUpload.uploads.length >= 10}
+              disabled={
+                injecting
+                || (!task.session_id && !task.shared_from_id)
+                || fileUpload.uploads.length + forkSeedUploads.length >= MAX_FILES
+              }
               className="p-2 text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed"
               title="Attach files"
             >
@@ -2906,6 +3177,25 @@ function MessageCopyButton({ text }: { text: string }) {
   );
 }
 
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    copyToClipboard(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+  return (
+    <button
+      onClick={handleCopy}
+      className="copy-btn pointer-events-none absolute right-2 top-2 rounded bg-gray-700/80 p-1 text-gray-400 opacity-0 transition-opacity hover:bg-gray-600 hover:text-gray-200 group-hover:pointer-events-auto group-hover:opacity-100"
+      title="Copy"
+    >
+      {copied ? <Check size={12} /> : <Copy size={12} />}
+    </button>
+  );
+}
+
 function ForkButton({ onClick, disabled = false }: { onClick: () => void; disabled?: boolean }) {
   return (
     <button
@@ -2925,6 +3215,69 @@ function stripSenderPrefix(text: string): string {
   return text.replace(/^\[[^\]\r\n]+\][ \t]+/, '');
 }
 
+const taskRemarkPlugins = [remarkTaskArtifactPaths];
+const markdownComponents: Components = {
+  pre({ children }) {
+    let codeText = '';
+    if (children && typeof children === 'object' && 'props' in (children as React.ReactElement)) {
+      const codeEl = children as React.ReactElement<{ children?: React.ReactNode }>;
+      codeText = typeof codeEl.props.children === 'string' ? codeEl.props.children : '';
+    }
+    return (
+      <div className="relative group my-2">
+        {codeText && <CopyButton text={codeText} />}
+        <pre className="bg-gray-900 rounded-lg p-3 overflow-x-auto text-xs">{children}</pre>
+      </div>
+    );
+  },
+  code({ className: codeClassName, children, ...props }) {
+    const isInline = !codeClassName;
+    if (isInline) {
+      return <code className="bg-gray-700/60 px-1.5 py-0.5 rounded text-xs" {...props}>{children}</code>;
+    }
+    return <code className={`${codeClassName || ''} text-xs`} {...props}>{children}</code>;
+  },
+  a({ href, children }) {
+    return <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:text-indigo-300 underline">{children}</a>;
+  },
+  table({ children }) {
+    return <div className="overflow-x-auto my-2"><table className="border-collapse text-xs w-full">{children}</table></div>;
+  },
+  th({ children }) {
+    return <th className="border border-gray-700 px-2 py-1 bg-gray-800/50 text-left">{children}</th>;
+  },
+  td({ children }) {
+    return <td className="border border-gray-700 px-2 py-1">{children}</td>;
+  },
+};
+
+const MarkdownContent = memo(function MarkdownContent({
+  content,
+  taskId,
+  className,
+}: {
+  content: string;
+  taskId?: number;
+  className?: string;
+}) {
+  const taskComponents = useMemo<Components>(() => ({
+    ...markdownComponents,
+    a({ href, title, children }) {
+      return taskId == null
+        ? <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:text-indigo-300 underline">{children}</a>
+        : <TaskArtifactLink taskId={taskId} href={href} linkTitle={title}>{children}</TaskArtifactLink>;
+    },
+  }), [taskId]);
+  return (
+    <div className={`markdown-body ${className || ''}`}>
+      <MarkdownRenderer
+        content={content}
+        components={taskComponents}
+        remarkPlugins={taskRemarkPlugins}
+      />
+    </div>
+  );
+});
 function MessageTimestamp({ timestamp, className }: { timestamp: string | null; className?: string }) {
   if (!timestamp) return null;
   return (
@@ -3200,7 +3553,7 @@ const MessageBubble = memo(function MessageBubble({
   onAskUserResolved,
 }: {
   message: ChatMessage;
-  taskId?: number;
+  taskId: number;
   onAskUserResolved?: (requestId: string, status: 'answered' | 'expired') => void;
 }) {
   const isUser = message.role === 'user';
@@ -3270,7 +3623,7 @@ const MessageBubble = memo(function MessageBubble({
       // (new messages arrive as user_message with source=monitor/sub-agent)
       return (
         <div className="border-l-2 border-gray-600 pl-2 py-1 my-0.5 opacity-50">
-          <MarkdownContent content={content} className="text-xs text-gray-500" />
+          <MarkdownContent content={content} taskId={taskId} className="text-xs text-gray-500" />
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} className="mt-0.5" />}
         </div>
       );
@@ -3378,7 +3731,7 @@ const MessageBubble = memo(function MessageBubble({
               )}
             </>
           ) : (
-            <MarkdownContent content={message.content || ''} />
+            <MarkdownContent content={message.content || ''} taskId={taskId} />
           )}
         </div>
         <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end pr-1' : 'pl-1'}`}>

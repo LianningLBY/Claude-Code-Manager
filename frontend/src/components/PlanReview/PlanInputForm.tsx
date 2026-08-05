@@ -165,12 +165,12 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
           {uploads.uploads.map((upload) => (
             <span key={upload.id} className="flex max-w-full items-center gap-1 rounded-lg border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-300">
               {upload.preview && <img src={upload.preview} alt="" className="h-8 w-8 rounded object-cover" />}
-              <span className="max-w-40 truncate">{upload.file.name}</span>
+              <span className="max-w-40 truncate">{upload.file?.name || upload.result?.filename || 'file'}</span>
               {upload.status === 'uploading' && <Loader2 size={11} className="animate-spin" />}
               {upload.status === 'failed' && (
                 <button type="button" className="rounded px-1 py-0.5 text-red-300 transition-colors hover:bg-red-500/10 hover:text-red-200" onClick={() => uploads.retryFile(upload.id)}>Retry</button>
               )}
-              <button type="button" aria-label={`Remove ${upload.file.name}`} onClick={() => uploads.removeFile(upload.id)} className="rounded p-0.5 text-gray-500 transition-colors hover:bg-gray-700 hover:text-gray-200"><X size={11} /></button>
+              <button type="button" aria-label={`Remove ${upload.file?.name || upload.result?.filename || 'file'}`} onClick={() => uploads.removeFile(upload.id)} className="rounded p-0.5 text-gray-500 transition-colors hover:bg-gray-700 hover:text-gray-200"><X size={11} /></button>
             </span>
           ))}
         </div>

@@ -283,6 +283,31 @@ def goal_evaluator_runtime_users(
     return sorted(users)
 
 
+def codex_goal_evaluator_runtime_homes() -> set[str]:
+    """Return canonical homes owned by external Codex evaluator processes.
+
+    The structured snapshot is consumed by Codex home admission.  In
+    particular, it remains populated when evaluator cleanup fails after the
+    caller's ephemeral-home guard has unwound.  Codex Fast turns are excluded:
+    they remain owned by the app-server transport and its own admission path.
+    """
+
+    homes: set[str] = set()
+    for process_token, process in list(
+        _UNREAPED_GOAL_EVALUATOR_PROCESSES.items()
+    ):
+        route = _GOAL_EVALUATOR_RUNTIME_ROUTES.get(process_token)
+        if (
+            route is not None
+            and route.provider == "codex"
+            and route.provider_home is not None
+            and _UNREAPED_GOAL_EVALUATOR_PROCESSES.get(process_token)
+            is process
+        ):
+            homes.add(route.provider_home)
+    return homes
+
+
 def _managed_process_group_pid(
     process: asyncio.subprocess.Process | None,
     managed_process_group: bool,

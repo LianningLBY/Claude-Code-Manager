@@ -986,3 +986,43 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **纵深保护**：Codex 结构化 assistant JSON 在字符串外连续输出达到 `PLAN_STRUCTURED_OUTPUT_WHITESPACE_LIMIT`（默认 4,096）时，精确 interrupt 并删除 disposable thread 后才允许 route fallback；JSON 字符串内的长 Plan/问题及 reasoning 不计入。不要用总输出上限或缩短复杂 Plan 的阶段预算代替该保护，也不要回滚 `codex exec` 作为修复。
 - **长期约定**：模型 wire schema 与领域/API schema 必须允许使用不同字段名；遇到可能与 JSON Schema 关键字冲突的模型-facing 属性，应在边界显式映射并用真实 provider A/B 验证，不能只靠 mock/本地 schema validation 推断生成稳定性。真实模型回归是手工测试，不进入 CI；CI 固定 schema alias、映射、歧义输入拒绝及 runaway cleanup。
 - **验证**：先以旧实现跑出 2 个确定性红测，再完成 schema/映射/非法输入覆盖；`backend/tests/test_plan_agent_runner.py` 最终 `25 passed`。未限制合法问题数量、Plan 正文长度或 reasoning，未触碰生产服务。
+### 2026-07-30 — Coding Agent 前沿调研 + main 测试基线清零（commit 4f72c7b / 5bfc36e）
+
+- **调研**：五路并行（Claude Code 生态 / Codex 生态 / 竞品产品 / 学术与基准 / harness 实践与同类项目）交叉整合成 `docs/coding-agent-frontier-2026H1.md`（commit 5bfc36e），全部条目附一手来源与日期，含对 CCM 分优先级（P0 验证与完成判定 / P1 官方原语迁移与 best-of-n / P2 沙箱与记忆蒸馏）的机会点分析与定位判断。
+- **基线清零（commit 4f72c7b）**：调研前基线 8 failed，三个根因全部修复至 `3041 passed`：
+  1. **系统 bug**——`update_migrate.sh` 的 same-uid 不可探查进程白名单用 `command.endswith('systemd --user')` 匹配，systemd re-exec 后 cmdline 变成 `systemd --user --deserialize=N` 即失配 → `restore_database` 永远失败（**本机生产回滚同样会挂**，不只是测试问题）。改为 token 匹配，cgroup `init.scope` 锚点不变。
+  2. **过时断言**——7-29 monitor 重构（544c128）确立「睡眠中的 Monitor 不阻塞更新」，7-24 写的 blocker 测试仍断言纯 `_monitor_tasks` lifecycle 应阻塞；改为 `_monitor_active_turns` 作运行证据并反向断言睡眠 lifecycle 不阻塞。
+  3. **密闭性缺陷**×2——start guard 测试默认读机器全局 `/tmp/ccm-update-status-8000.json`（撞宿主 7-19 真实部署残留）；WS identity 测试隐式依赖 `.env` 的 `AUTH_TOKEN` 非空（空则 `_ws_identity` 短路 super_admin，JWT 分支根本没被执行）。均改为测试内显式注入。
+- **预防**：涉及扫描 `/proc`、`/tmp` 全局路径或 `settings.*` 环境值的测试必须显式注入被测状态，不能假设宿主干净；同类先例已写进 CLAUDE.md「pytest 外部状态隔离」，本次是该规则的两个漏网点。
+
+### 2026-07-31 — 恢复已发布 Alembic revision，修复生产更新失败（commit e69e11a）
+
+- **事故**：生产数据库已经记录 `b6e1f4a2c9d7`，功能回滚却直接删除了对应 migration；新代码执行 `alembic current` 时无法定位该 revision，事务化更新只能回滚到旧版本。
+- **修复**：原样恢复 `b6e1f4a2c9d7`，新增以它为父 revision 的 `f7a1c3d9e5b2` 前向清理 migration，移除已回滚 Plan 功能的表、索引和字段。这样既保留不可变的部署历史，又让旧生产库和全新数据库最终收敛到当前 ORM schema。
+- **预防与验证**：CLAUDE.md、DATABASE.md 明确已发布 revision 永久保留；新增从 `b6e1f4a2c9d7` 升级到 head、降级恢复、再次升级的回归。`backend/tests/test_alembic_migrations.py` 共 `15 passed`，`alembic heads` 仅有 `f7a1c3d9e5b2`，`git diff --check` 通过。
+- **PR #88 合并修复（2026-08-03）**：main 又从共同父节点 `c8f5d3a72b10` 发布了 sibling `5f7a9c2e4d61`。保留 `b6e1f4a2c9d7` / `f7a1c3d9e5b2` 原始字节，并新增无 schema 操作的 `7e4b9c1d2a63` merge revision；全新库及三个已发布 branch 状态都会汇合到同一 head，Plan cleanup 与 mergepoint 继续覆盖 downgrade/re-upgrade。完整 migration/ORM 一致性矩阵 `22 passed`，`alembic heads` 仅有 `7e4b9c1d2a63`。
+
+### 2026-07-31 — PR Monitor 按 base 项目约定审核与持久发布（开发环境未提交）
+
+- **需求与风险**：PR Agent 每次审核都应读取项目根目录的 `CLAUDE.md`、可选 `PROGRESS.md`，但不能误读 PR head 或 CCM/Worker 本地副本。PR 内容本身不可信；仅靠 prompt 禁止 `gh` 写操作仍会让恶意 diff 接触宿主工具、凭据，并且进程在 review/merge 返回前崩溃会造成重复外部写。
+- **实现**：Webhook 固定并去重 exact `(base_sha, head_sha)`；后端在任何 Task/旧代终止前通过 Git Data API 校验并注入 base 根文档，再在双 snapshot guard 中注入 bounded metadata/完整 patch。Claude PR turn 使用私有中性 cwd、空 setting sources、strict MCP、禁用 slash skills及 `--tools ""`；Codex 强制 app-server read-only/network false，禁用 native shell/browser/web/apps/plugins/hooks，并先 `config/read` 枚举后逐个关闭 inherited MCP。Worker 用 capability version fail closed。`opened`/`synchronize`/删除共用 repo 写屏障与数据库行锁并在最终写入前复查远端 snapshot；PR Review Task 的公共编辑、对话、注入、重试、取消、停止和删除入口全部冻结。
+- **发布与代次**：Agent 只产出严格 body/result block；exact `task_retry_count` 从本地/Worker live/backfill 日志贯穿到完成回调。后端先把 recommendation、随机 nonce、GitHub actor、Task generation 持久化为 `publishing` outbox，再执行 head-pinned review/merge；自审 fallback 为 `COMMENT` review。重启先按 nonce/actor/time/commit evidence 对账，已成功不重写；`synchronize` 保留在途 outbox并为新 head 另建审核。
+- **验证**：PR Monitor API/service 定向矩阵 `156 passed`，受影响后端矩阵 `989 passed`，最终 Claude/Codex 隔离全文件复跑 `410 passed`；前端 `502 passed` 且 production build 通过；Alembic upgrade/downgrade/re-upgrade、startup recovery 与 publishing synchronize 均有回归。最终后端全量 `3184 passed, 1 failed`；唯一失败为本分支修改前已可独立复现的 `login_runtime` stale-socket 既有断言，单独复跑仍同样失败。
+
+### 2026-08-01 — PR Monitor 终态 Task 恢复续聊（开发环境未提交）
+
+- **问题**：此前为保护 exact review generation，把所有 `pr-review` Task 的 chat/inject 永久 409；GitHub 评论或合并已经落定后仍无法追问。前端又把任意 409 当成 Agent 忙碌，错误显示 Interrupt。
+- **解决**：只在 Review 已持久进入 `approved/merged/commented/error` 后开放普通续聊和 live inject；审查/发布/替换中的快照及 `superseded` 仍 fail closed，edit/retry/cancel/stop/delete 不变。Manager→Worker 在落用户消息前先握手 `pr_review_terminal_chat_version`，再用 service-token 认证的终态断言，混跑旧 Worker 时明确 409 而不留幽灵消息；Shared shadow 不复制 owner-only review 状态，因此所有 Shared chat 都改为先让 owner 在同一 Task operation lock 内准入、再本地落消息。前端仅对真实 busy conflict 显示 Interrupt。
+- **验证**：覆盖四种终态、五种非终态/替换态、本地注入、Worker 内部断言/能力握手、Shared owner 准入/无幽灵消息及前端 409 分类；受影响后端矩阵 `328 passed`，前端 `508 passed`，production build、`compileall` 与 `git diff --check` 通过。后端全量 `3202 passed, 1 failed`；唯一失败仍是 7 月 31 日已记录的 `login_runtime` stale-socket 基线断言，单项复跑稳定复现。
+
+### 2026-08-03 — PR #93：Project-scoped Task 产物契约评审修复
+
+- **发现**：续聊用用户可控的 XML tag 判断“已注入”，用户可伪造 tag 让权威产物规则缺席；提示侧只检查 `target_repo` 是绝对路径，会接受 `/`、NUL 或 `..`，但下载侧必然拒绝；Manager 又会把 Worker 产物请求直接代理给旧版本，混跑时缺少新的跨 Task namespace fence。
+- **修复与预防**：项目根准入与下载端集中到 `task_artifact_contract.configured_workspace_root`；每个 turn 都由 CCM 无条件前置 policy，不再从不可信 prompt 猜是否注入。`/api/system/config` 声明 `task_artifact_scope_version=1`，Manager 流式代理前必须精确握手，旧 Worker 在发出文件请求前 409 fail closed。能力升级属于安全边界时必须显式版本化，不能假设 Manager/Worker 同步部署。
+- **验证**：Task artifact、System、Dispatcher、Ralph 四个完整后端文件 `302 passed`；前端全量 `40 files / 525 tests`，production build、Python compile 与 `git diff --check` 通过。Loop/TaskArtifact 改动文件 ESLint 通过；ChatView 仍有 main 未改行上的 3 个既有 lint error 与 1 warning。
+
+### 2026-08-03 — Codex 共享 app-server 精确停止隔离（commit b22c2e6）
+
+- **事故**：停止一个 Codex Task 时，未确认 `turn/interrupt` 的兜底路径会关闭该账号共享的 app-server，使同一 `CODEX_HOME` 上的其他 Task 一并失败；clean exit 0 又被误报为 unexpected，并把账号级历史 stderr 拼到每个 Task 的错误中。
+- **修复**：已领取 turn 改走 exact-generation `stop_claimed_turn`。只有目标仍是权威 live turn、没有 peer turn、没有已准入 RPC 时才允许关闭 transport；存在 peer、并发 steer/RPC 或目标已变化时保留原 process/consumer/DB owner 并向停止接口返回 409。未领取 turn 的清理仍保持 fail-closed。transport EOF 时冻结精确 shutdown intent，计划关闭与真实异常分开归因；共享 stderr 只留服务日志，不再泄漏到 Task 错误。
+- **验证**：Codex app-server 与 InstanceManager 完整文件 `456 passed`，关键停止/EOF/steer 并发矩阵 `10 passed`；后端全量 `3247 passed, 2 failed`，两项均与修改前基线相同（queued-message 旧 prompt 断言、login-runtime stale socket 环境断言），无新增回归。前端全量 `40 files / 525 tests`、`tsc --noEmit`、production build、Python compile 与 `git diff --check` 均通过。

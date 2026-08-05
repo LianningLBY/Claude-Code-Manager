@@ -131,7 +131,10 @@ describe('AppShell layout and z-index architecture', () => {
     vi.mocked(api.countPlans).mockResolvedValue({ total: 2 });
     renderShell();
 
-    expect(await screen.findByLabelText('Plans requiring action')).toBeInTheDocument();
+    const marker = await screen.findByLabelText('Plans requiring action');
+    expect(marker).toBeInTheDocument();
+    expect(marker.parentElement).toHaveAttribute('data-nav-icon');
+    expect(marker.className).toContain('absolute');
   });
 
   describe('header stacking context', () => {

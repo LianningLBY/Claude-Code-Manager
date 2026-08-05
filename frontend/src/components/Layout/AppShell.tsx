@@ -184,18 +184,25 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
                 : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/70'
             }`}
           >
-            {(() => {
-              const themed = getNavIcon(iconSet, p.key);
-              return themed ? (
-                <span data-icon-set={iconSet} className="contents">
-                  {themed({ size: 16, active })}
-                </span>
-              ) : (
-                <Icon size={16} className={active ? 'text-indigo-400' : 'text-gray-500'} />
-              );
-            })()}
+            <span data-nav-icon className="relative inline-flex shrink-0 items-center justify-center">
+              {(() => {
+                const themed = getNavIcon(iconSet, p.key);
+                return themed ? (
+                  <span data-icon-set={iconSet} className="contents">
+                    {themed({ size: 16, active })}
+                  </span>
+                ) : (
+                  <Icon size={16} className={active ? 'text-indigo-400' : 'text-gray-500'} />
+                );
+              })()}
+              {p.key === 'plans' && hasPlanActions && (
+                <span
+                  aria-label="Plans requiring action"
+                  className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-red-500 ring-2 ring-red-500/20"
+                />
+              )}
+            </span>
             {p.label}
-            {p.key === 'plans' && hasPlanActions && <span aria-label="Plans requiring action" className="ml-auto h-2 w-2 shrink-0 rounded-full bg-red-500 ring-2 ring-red-500/20" />}
           </button>
         );
       })}

@@ -1822,6 +1822,24 @@ class InstanceManager:
                 f"Codex account has an active ephemeral exec: {codex_home}"
             )
 
+    def busy_codex_homes(self) -> set[str]:
+        """Return canonical homes that cannot admit another Codex turn.
+
+        This is a scheduling hint, not an admission guarantee. Callers still
+        use ``codex_home_app_server_guard`` to close the select-to-launch race.
+        """
+
+        from backend.services.codex_app_server import normalize_codex_home
+
+        homes = set(self._codex_home_maintenance)
+        homes.update(self._codex_exec_homes.values())
+        homes.update(
+            home
+            for home, users in self._codex_ephemeral_home_users.items()
+            if users
+        )
+        return {normalize_codex_home(home) for home in homes}
+
     async def read_codex_thread(
         self, codex_home: str, thread_id: str,
     ) -> dict:

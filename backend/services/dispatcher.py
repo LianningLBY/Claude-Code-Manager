@@ -3608,6 +3608,16 @@ class GlobalDispatcher:
             return None
         await self._require_task_lifecycle_active(expected_generation)
 
+        # ``select`` only knows account health and quota. Account-local
+        # app-server ownership lives in InstanceManager, so exclude homes that
+        # cannot admit another native turn before selecting a fresh route.
+        # The admission guard remains authoritative for races after this
+        # snapshot is taken.
+        busy_homes = {
+            pool.canonical_home(home)
+            for home in self.instance_manager.busy_codex_homes()
+        }
+
         bound_id = await self._codex_task_binding(task_id)
         bound_home = pool.home_for_account(bound_id) if bound_id else None
         matches: list[str] = []
@@ -3624,6 +3634,7 @@ class GlobalDispatcher:
             if (
                 preferred_owner_home
                 and pool.is_home_available(preferred_owner_home)
+                and preferred_owner_home not in busy_homes
                 and pool.supports_model_for_home(
                     preferred_owner_home,
                     model,
@@ -3686,6 +3697,7 @@ class GlobalDispatcher:
         resident_available = bool(
             resident
             and pool.is_home_available(resident)
+            and resident not in busy_homes
             and pool.supports_model_for_home(
                 resident,
                 model,
@@ -3705,6 +3717,11 @@ class GlobalDispatcher:
             return resident
 
         excluded: set[str] = set()
+        excluded.update(
+            account_id
+            for home in busy_homes
+            if (account_id := pool.account_id_for_home(home))
+        )
         resident_id = pool.account_id_for_home(resident) if resident else None
         if resident_id:
             excluded.add(resident_id)

@@ -9,7 +9,7 @@ import { usePlanEvents } from '../components/PlanReview/usePlanEvents';
 import { VersionedPlanPanel } from '../components/PlanReview/VersionedPlanPanel';
 import { ProjectSelect } from '../components/ProjectSelect';
 import { useDialogA11y } from '../hooks/useDialogA11y';
-import { Archive, ChevronLeft, ChevronRight, Search, X } from '../components/icons';
+import { Archive, ChevronLeft, ChevronRight, Search, Settings, X } from '../components/icons';
 
 const PAGE_SIZE = 20;
 type KindFilter = 'all' | 'standalone' | 'related';
@@ -53,6 +53,8 @@ interface Props {
 }
 
 export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask, onNavigateSettings }: Props) {
+  const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
+  const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedPlan, setSelectedPlan] = useState<PlanResource | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -171,7 +173,12 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
   };
 
   return <div className="space-y-6">
-    <PlanCreateForm onCreated={created} onNavigateSettings={onNavigateSettings} />
+    {isAdmin && <div className="flex justify-end">
+      <button type="button" onClick={onNavigateSettings} className="inline-flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-300 hover:border-indigo-500/50 hover:text-indigo-300">
+        <Settings size={14} /> Plan settings
+      </button>
+    </div>}
+    <PlanCreateForm onCreated={created} />
 
     <section className={needsInputVisible || reviewVisible ? 'space-y-4' : ''} aria-label={needsInputVisible || reviewVisible ? 'Plans requiring action' : undefined}>
       {(needsInputVisible || reviewVisible) && <h2 className="text-base font-semibold text-gray-200">Plans requiring action</h2>}

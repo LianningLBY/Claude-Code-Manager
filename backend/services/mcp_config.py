@@ -85,6 +85,8 @@ CCM_WORKSPACE_REVIEW_TOOLS = (
     "test_current_changes",
     "check_current_changes_review",
     "stop_current_changes_review",
+    "test_git_target",
+    "compare_test_runs",
 )
 
 

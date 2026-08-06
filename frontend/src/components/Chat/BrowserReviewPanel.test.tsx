@@ -357,7 +357,11 @@ describe('BrowserReviewPanel', () => {
       'src',
       'blob:frontend-review-screenshot',
     );
-    expect(screen.getByText('模型观察与操作轨迹')).toBeInTheDocument();
+    const screenshotHeading = screen.getByText('最新浏览器画面');
+    const traceHeading = screen.getByText('模型观察与操作轨迹');
+    expect(screenshotHeading.compareDocumentPosition(traceHeading)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
 
     const dragHandle = panel.querySelector('[data-floating-drag-handle="true"]');
     expect(dragHandle).not.toBeNull();
@@ -606,7 +610,11 @@ describe('BrowserReviewPanel', () => {
       />,
     );
 
-    expect(await screen.findByText('等待父 Agent 调用浏览器审查工具')).toBeInTheDocument();
+    expect(await screen.findByText('正在创建新的前端测试')).toBeInTheDocument();
+    expect(screen.getByText('上一轮测试仍保留在历史记录中，本页不会继续展示其内容。')).toBeInTheDocument();
+    expect(screen.queryByText('历史前端验收')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('test-harness-progress')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('workspace-review-progress')).not.toBeInTheDocument();
     fireEvent.click(screen.getByTitle('刷新审查进度'));
 
     expect((await screen.findAllByText('本轮 PR99 前端验收')).length).toBeGreaterThan(0);

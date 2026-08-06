@@ -11,6 +11,7 @@ from backend.mcp import (
     ccm_monitor_agent_server,
     ccm_skills_server,
     ccm_sub_agent_server,
+    ccm_workspace_review_server,
 )
 from backend.services import mcp_config
 from backend.services import internal_api_endpoint
@@ -21,6 +22,7 @@ from backend.services.mcp_config import (
     CCM_SKILLS_TOOLS,
     CCM_SUB_AGENT_CONTROLLER_TOOLS,
     CCM_SUB_AGENT_TOOLS,
+    CCM_WORKSPACE_REVIEW_TOOLS,
     McpServerSpec,
     build_mcp_server_specs,
     build_browser_review_mcp_server_specs,
@@ -28,6 +30,7 @@ from backend.services.mcp_config import (
     build_monitor_agent_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
     build_sub_agent_mcp_server_specs,
+    build_workspace_review_mcp_server_specs,
     cleanup_mcp_config,
     cleanup_monitor_agent_mcp_config,
     cleanup_sub_agent_mcp_config,
@@ -153,6 +156,20 @@ def test_ordinary_task_adds_repeatable_frontend_review_server():
     assert frontend_spec.enabled_tools == CCM_FRONTEND_REVIEW_TOOLS
     assert "--task-id" in frontend_spec.args
     assert "73" in frontend_spec.args
+    workspace_spec = specs[2]
+    assert workspace_spec == build_workspace_review_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+    )[0]
+    assert workspace_spec.enabled_tools == CCM_WORKSPACE_REVIEW_TOOLS
+    assert workspace_spec.enabled_tools == (
+        "workspace_review_capabilities",
+        "test_current_changes",
+        "check_current_changes_review",
+        "stop_current_changes_review",
+        "test_git_target",
+        "compare_test_runs",
+    )
 
 
 def test_generate_mcp_config_monitor_enabled():
@@ -340,6 +357,7 @@ def test_sub_agent_controller_spec_is_narrow_and_required(monkeypatch):
         (ccm_skills_server, CCM_SKILLS_TOOLS),
         (ccm_monitor_agent_server, CCM_MONITOR_AGENT_TOOLS),
         (ccm_sub_agent_server, CCM_SUB_AGENT_TOOLS),
+        (ccm_workspace_review_server, CCM_WORKSPACE_REVIEW_TOOLS),
     ],
 )
 def test_spec_enabled_tools_match_registered_server_tools(

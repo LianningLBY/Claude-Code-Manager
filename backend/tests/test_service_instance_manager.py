@@ -2220,6 +2220,8 @@ async def test_rollout_enabled_routes_fresh_and_resume_with_task_scoped_mcp(
         for spec in specs
     )
     assert "ccm_command_help" in specs[0].enabled_tools
+    assert "test_git_target" in specs[2].enabled_tools
+    assert "compare_test_runs" in specs[2].enabled_tools
 
 
 @pytest.mark.asyncio

@@ -140,6 +140,9 @@ export function BrowserReviewPanel({
   const [runs, setRuns] = useState<TestHarnessRun[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [waitingForWorkspaceReview, setWaitingForWorkspaceReview] = useState(
+    expectedWorkspaceReviewBaseline !== undefined,
+  );
   const [error, setError] = useState<string | null>(null);
   const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
   const screenshotObjectUrlRef = useRef<string | null>(null);
@@ -186,6 +189,7 @@ export function BrowserReviewPanel({
       ));
       if (expectedWorkspaceRun) {
         expectedWorkspaceReviewBaselineRef.current = undefined;
+        setWaitingForWorkspaceReview(false);
         setMinimized(false);
         onExpectedWorkspaceReviewFound?.();
         onNewReview();
@@ -208,6 +212,7 @@ export function BrowserReviewPanel({
     setRuns([]);
     setSelectedId(null);
     setLoading(true);
+    setWaitingForWorkspaceReview(false);
     latestReviewIdRef.current = null;
     onAvailableChange(false);
     void refresh();
@@ -230,6 +235,7 @@ export function BrowserReviewPanel({
 
   useEffect(() => {
     expectedWorkspaceReviewBaselineRef.current = expectedWorkspaceReviewBaseline;
+    setWaitingForWorkspaceReview(expectedWorkspaceReviewBaseline !== undefined);
     if (expectedWorkspaceReviewBaseline === undefined) return;
     setLoading(true);
     setError(null);
@@ -238,7 +244,6 @@ export function BrowserReviewPanel({
   }, [expectedWorkspaceReviewBaseline, refresh]);
 
   const hasActiveReview = runs.some((run) => !TERMINAL.has(run.status));
-  const waitingForWorkspaceReview = expectedWorkspaceReviewBaseline !== undefined;
   useEffect(() => {
     if (!taskActive && !hasActiveReview && !waitingForWorkspaceReview) return;
     const timer = window.setInterval(() => { void refresh(); }, 1000);
@@ -248,6 +253,7 @@ export function BrowserReviewPanel({
   const harnessRun = runs.find((item) => item.id === selectedId)
     ?? runs[0]
     ?? null;
+  const displayedRun = waitingForWorkspaceReview ? null : harnessRun;
   const selectedRunIndex = harnessRun
     ? runs.findIndex((item) => item.id === harnessRun.id)
     : -1;
@@ -256,9 +262,9 @@ export function BrowserReviewPanel({
     const nextRun = runs[selectedRunIndex + offset];
     if (nextRun) setSelectedId(nextRun.id);
   };
-  const workspaceRun: WorkspaceReviewRun | null = harnessRun?.workspace_review ?? null;
-  const job: BrowserReviewJob | null = harnessRun?.browser_review ?? null;
-  const harnessRunId = harnessRun?.id ?? null;
+  const workspaceRun: WorkspaceReviewRun | null = displayedRun?.workspace_review ?? null;
+  const job: BrowserReviewJob | null = displayedRun?.browser_review ?? null;
+  const harnessRunId = displayedRun?.id ?? null;
   const latestScreenshot = job?.latest_screenshot ?? null;
 
   useEffect(() => {
@@ -437,8 +443,8 @@ export function BrowserReviewPanel({
           <div className="truncate text-[10px] text-gray-500">
             Task #{taskId}{displayedGoalRound ? ` · Goal 第 ${displayedGoalRound} 轮` : ''} · {waitingForWorkspaceReview
               ? '等待 Agent 创建新的浏览器审查'
-              : harnessRun
-              ? STAGE_LABELS[harnessRun.stage] || harnessRun.stage
+              : displayedRun
+              ? STAGE_LABELS[displayedRun.stage] || displayedRun.stage
               : '加载审查进度'}
           </div>
         </div>
@@ -492,7 +498,7 @@ export function BrowserReviewPanel({
         </button>
       </div>
 
-      {!minimized && runs.length > 1 && (
+      {!minimized && !waitingForWorkspaceReview && runs.length > 1 && (
         <div className="border-b border-gray-800 px-3 py-2">
           <div className="flex items-center gap-1.5">
             <select
@@ -533,17 +539,23 @@ export function BrowserReviewPanel({
 
       {!minimized && <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
         {waitingForWorkspaceReview && (
-          <section data-testid="workspace-review-expected" className="flex items-start gap-2 rounded-lg border border-cyan-500/25 bg-cyan-500/8 p-3 text-xs text-cyan-200">
-            <Loader2 size={14} className="mt-0.5 shrink-0 animate-spin" />
-            <div>
-              <div className="font-medium">等待父 Agent 调用浏览器审查工具</div>
-              <div className="mt-1 text-[10px] leading-relaxed text-gray-500">
-                已识别为前端运行验收请求；创建新 run 后会自动切换到实时进度、截图和操作轨迹。
-              </div>
+          <section data-testid="workspace-review-expected" className="flex min-h-64 flex-col items-center justify-center rounded-lg border border-cyan-500/25 bg-cyan-500/8 px-5 py-8 text-center">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-cyan-400/25 bg-cyan-400/10">
+              <Loader2 size={18} className="animate-spin text-cyan-300" />
             </div>
+            <div className="mt-3 text-sm font-medium text-cyan-100">正在创建新的前端测试</div>
+            <div className="mt-1 max-w-72 text-[11px] leading-relaxed text-gray-400">
+              已收到本次测试请求，正在等待 Agent 创建独立的 Harness Run。新 Run 就绪后，右栏会自动切换到它的实时截图和操作轨迹。
+            </div>
+            <div className="mt-4 grid w-full max-w-72 gap-1.5 text-left text-[10px] text-gray-500">
+              <div className="rounded bg-gray-950/45 px-2.5 py-1.5">1 · 识别本次测试目标</div>
+              <div className="rounded bg-gray-950/45 px-2.5 py-1.5">2 · 创建独立 Harness Run</div>
+              <div className="rounded bg-gray-950/45 px-2.5 py-1.5">3 · 绑定浏览器 Agent</div>
+            </div>
+            <div className="mt-3 text-[10px] text-gray-600">上一轮测试仍保留在历史记录中，本页不会继续展示其内容。</div>
           </section>
         )}
-        {loading && !waitingForWorkspaceReview && !harnessRun && (
+        {loading && !waitingForWorkspaceReview && !displayedRun && (
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500">
             <Loader2 size={15} className="animate-spin" />
             加载审查运行…
@@ -555,58 +567,58 @@ export function BrowserReviewPanel({
             <span className="break-words">{error}</span>
           </div>
         )}
-        {harnessRun && (
+        {displayedRun && (
           <section data-testid="test-harness-progress" className="rounded-lg border border-indigo-500/25 bg-indigo-500/8 p-3">
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-xs font-medium text-indigo-200">Test Harness · {harnessRun.target_kind}</div>
+                <div className="text-xs font-medium text-indigo-200">Test Harness · {displayedRun.target_kind}</div>
                 <div className="mt-0.5 line-clamp-2 text-[10px] text-gray-500">
-                  {String(harnessRun.test_plan.objective || '前端黑盒测试')}
+                  {String(displayedRun.test_plan.objective || '前端黑盒测试')}
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
-                {!TERMINAL.has(harnessRun.status) && (
+                {!TERMINAL.has(displayedRun.status) && (
                   <button
                     type="button"
                     onClick={() => void stopReview()}
-                    disabled={cancellingJobId === harnessRun.id}
+                    disabled={cancellingJobId === displayedRun.id}
                     className="inline-flex items-center gap-1 rounded border border-red-500/30 px-1.5 py-0.5 text-[10px] text-red-300 hover:bg-red-500/10 disabled:cursor-wait disabled:opacity-60"
                     aria-label="Stop test run"
                   >
-                    {cancellingJobId === harnessRun.id
+                    {cancellingJobId === displayedRun.id
                       ? <Loader2 size={10} className="animate-spin" />
                       : <Square size={9} />}
-                    {cancellingJobId === harnessRun.id ? '停止中' : '停止'}
+                    {cancellingJobId === displayedRun.id ? '停止中' : '停止'}
                   </button>
                 )}
-                {TERMINAL.has(harnessRun.status) && !taskActive && (
+                {TERMINAL.has(displayedRun.status) && !taskActive && (
                   <button
                     type="button"
                     onClick={() => void repeatReview()}
-                    disabled={repeatingRunId === harnessRun.id}
+                    disabled={repeatingRunId === displayedRun.id}
                     className="inline-flex items-center gap-1 rounded border border-indigo-500/30 px-1.5 py-0.5 text-[10px] text-indigo-300 hover:bg-indigo-500/10 disabled:cursor-wait disabled:opacity-60"
                     aria-label="Repeat test run"
                   >
-                    <RefreshCw size={10} className={repeatingRunId === harnessRun.id ? 'animate-spin' : ''} />
-                    {repeatingRunId === harnessRun.id ? '创建中' : '重新测试'}
+                    <RefreshCw size={10} className={repeatingRunId === displayedRun.id ? 'animate-spin' : ''} />
+                    {repeatingRunId === displayedRun.id ? '创建中' : '重新测试'}
                   </button>
                 )}
-                <span className={`rounded-full border px-2 py-0.5 text-[10px] ${statusClass(harnessRun.status)}`}>
-                  {STAGE_LABELS[harnessRun.stage] || harnessRun.stage}
+                <span className={`rounded-full border px-2 py-0.5 text-[10px] ${statusClass(displayedRun.status)}`}>
+                  {STAGE_LABELS[displayedRun.stage] || displayedRun.stage}
                 </span>
               </div>
             </div>
             <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-gray-500">
-              <div className="truncate rounded bg-gray-950/60 px-2 py-1.5" title={harnessRun.source_git_head || ''}>
-                {harnessRun.source_git_head ? `HEAD ${harnessRun.source_git_head.slice(0, 10)}` : `Run ${harnessRun.id.slice(0, 10)}`}
+              <div className="truncate rounded bg-gray-950/60 px-2 py-1.5" title={displayedRun.source_git_head || ''}>
+                {displayedRun.source_git_head ? `HEAD ${displayedRun.source_git_head.slice(0, 10)}` : `Run ${displayedRun.id.slice(0, 10)}`}
               </div>
-              <div className={`rounded px-2 py-1.5 ${harnessRun.stale ? 'bg-amber-500/10 text-amber-300' : 'bg-gray-950/60'}`}>
-                {harnessRun.stale ? '代码已变化 · 结果过期' : `结论 ${harnessRun.verdict || '待定'}`}
+              <div className={`rounded px-2 py-1.5 ${displayedRun.stale ? 'bg-amber-500/10 text-amber-300' : 'bg-gray-950/60'}`}>
+                {displayedRun.stale ? '代码已变化 · 结果过期' : `结论 ${displayedRun.verdict || '待定'}`}
               </div>
             </div>
-            {(harnessRun.error || harnessRun.cleanup_error) && (
+            {(displayedRun.error || displayedRun.cleanup_error) && (
               <div className="mt-2 whitespace-pre-wrap break-words text-[10px] text-red-300">
-                {harnessRun.error || harnessRun.cleanup_error}
+                {displayedRun.error || displayedRun.cleanup_error}
               </div>
             )}
           </section>
@@ -644,17 +656,32 @@ export function BrowserReviewPanel({
             )}
           </section>
         )}
-        {harnessRun && (
+        {job && (
+          <section className="overflow-hidden rounded-lg border border-gray-800 bg-black">
+            <div className="flex items-center gap-1.5 border-b border-gray-800 bg-gray-900 px-2.5 py-2 text-[11px] text-gray-400">
+              <Image size={13} />
+              最新浏览器画面
+            </div>
+            {screenshotUrl ? (
+              <img src={screenshotUrl} alt="Latest frontend review screenshot" className="block h-auto w-full" />
+            ) : (
+              <div className="flex aspect-video items-center justify-center text-xs text-gray-600">
+                {TERMINAL.has(job.status) ? '没有可用截图' : '等待浏览器截图…'}
+              </div>
+            )}
+          </section>
+        )}
+        {displayedRun && (
           <section className="rounded-lg border border-gray-800 bg-gray-900/55">
             <div className="flex items-center gap-1.5 border-b border-gray-800 px-3 py-2 text-xs font-medium text-gray-200">
               <Activity size={13} className="text-indigo-400" />
               模型观察与操作轨迹
             </div>
             <div className="max-h-72 space-y-0 overflow-y-auto px-3 py-1">
-              {harnessRun.events.length === 0 && (
+              {displayedRun.events.length === 0 && (
                 <div className="py-5 text-center text-[11px] text-gray-600">等待测试 Harness 开始…</div>
               )}
-              {harnessRun.events.map((event, index) => (
+              {displayedRun.events.map((event, index) => (
                 <div key={event.id} className="relative border-l border-gray-700 py-2 pl-4">
                   <span className={`absolute -left-1 top-3 h-2 w-2 rounded-full ${event.event_type === 'decision' ? 'bg-indigo-400' : 'bg-cyan-400'}`} />
                   <div className="flex items-center justify-between gap-2">
@@ -721,20 +748,6 @@ export function BrowserReviewPanel({
               </div>
             </section>
 
-            <section className="overflow-hidden rounded-lg border border-gray-800 bg-black">
-              <div className="flex items-center gap-1.5 border-b border-gray-800 bg-gray-900 px-2.5 py-2 text-[11px] text-gray-400">
-                <Image size={13} />
-                最新浏览器画面
-              </div>
-              {screenshotUrl ? (
-                <img src={screenshotUrl} alt="Latest frontend review screenshot" className="block h-auto w-full" />
-              ) : (
-                <div className="flex aspect-video items-center justify-center text-xs text-gray-600">
-                  {TERMINAL.has(job.status) ? '没有可用截图' : '等待浏览器截图…'}
-                </div>
-              )}
-            </section>
-
             {telemetry.length > 0 && (
               <section className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
                 <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-amber-300">
@@ -750,24 +763,24 @@ export function BrowserReviewPanel({
               </section>
             )}
 
-            {(harnessRun?.report || job.report) && (
+            {(displayedRun?.report || job.report) && (
               <section className="rounded-lg border border-emerald-500/20 bg-emerald-500/5">
                 <div className="flex items-center gap-1.5 border-b border-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300">
                   <FileText size={13} />审查报告
                 </div>
                 <div className="prose prose-invert prose-sm max-w-none px-3 py-2 text-xs text-gray-300">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{harnessRun?.report || job.report}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayedRun?.report || job.report}</ReactMarkdown>
                 </div>
               </section>
             )}
 
-            {(harnessRun?.findings.length ?? 0) > 0 && (
+            {(displayedRun?.findings.length ?? 0) > 0 && (
               <section className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
                 <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-amber-300">
                   <AlertCircle size={13} />结构化发现
                 </div>
                 <div className="space-y-2">
-                  {harnessRun!.findings.map((finding) => (
+                  {displayedRun!.findings.map((finding) => (
                     <div key={finding.fingerprint || `${finding.scenario_id}-${finding.title}`} className="rounded border border-gray-800 bg-gray-950/55 p-2">
                       <div className="flex items-center gap-2">
                         <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[9px] uppercase text-gray-300">{finding.severity}</span>
@@ -780,9 +793,9 @@ export function BrowserReviewPanel({
               </section>
             )}
 
-            {(harnessRun?.evidence.length ?? 0) > 0 && (
+            {(displayedRun?.evidence.length ?? 0) > 0 && (
               <section className="flex flex-wrap gap-1.5">
-                {harnessRun!.evidence.map((item) => (
+                {displayedRun!.evidence.map((item) => (
                   <button
                     key={item.id}
                     type="button"

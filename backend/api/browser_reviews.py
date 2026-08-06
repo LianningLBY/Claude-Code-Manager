@@ -263,7 +263,7 @@ async def start_task_browser_review_internal(
         )
         job = await test_harness_service.start_fixed_url_browser(
             run_id=run.id,
-            inline=True,
+            inline=False,
         )
     except (BrowserReviewBusyError, TestHarnessBusyError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -281,7 +281,7 @@ async def get_task_browser_review_internal_status(
 ) -> dict[str, Any]:
     require_internal_service(request)
     job = await manager.get(job_id)
-    if job is None or job.task_id != task_id or not job.inline_tool:
+    if job is None or (job.owner_task_id or job.task_id) != task_id:
         raise HTTPException(status_code=404, detail="Task Browser Review not found")
     return job.as_dict()
 

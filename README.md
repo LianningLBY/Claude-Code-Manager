@@ -171,6 +171,7 @@ claude-manager/
 │       ├── browser_review.py    # 隔离 Playwright 浏览器、安全动作与 CLI harness
 │       ├── browser_review_jobs.py # CCM Task-backed browser review job/证据管理
 │       ├── test_harness.py      # provider-neutral 测试门面与持久化生命周期
+│       ├── test_harness_runtime.py # 每 Task 独立 Browser Agent 模型/强度配置
 │       ├── test_harness_targets.py # 精确 PR/ref detached worktree
 │       ├── ask_user.py          # ask_user 注册表 + Future 管理
 │       ├── ask_user_settings.py # ask_user hook 注入/移除
@@ -269,6 +270,11 @@ CCM 的 Web 浏览器测试现在统一由持久化 Test Harness 管理。普通
 结构化 Finding 与最终 Verdict。右侧栏或浮窗会自动切到同一 Task 的最新 Run；终态
 Run 可以直接“重新测试”，也可以比较两轮 finding fingerprint。服务重启后历史记录
 仍在，未完成的运行会明确标为 interrupted，而不会伪装成通过。
+
+Browser Agent 的 provider、模型、推理强度和 Codex Fast/Standard 可在右侧测试栏单独
+配置，默认才跟随父 Task。该选择按 Task 保存，并统一用于普通对话触发、一次性测试、
+Goal 复查、固定 URL 以及 PR/ref 审查；每个 Run 启动后会冻结实际路由，因此父 Task 与
+黑盒审查 Agent 可以使用不同模型，也不会在运行中因设置变化而漂移。
 
 当前工作区测试会先使用 Project 中管理员确认过的 Preview 配置启动 loopback 隔离
 预览；PR/ref 测试会解析精确 Git SHA，在临时 detached worktree 中启动预览，绝不

@@ -14,7 +14,6 @@ from typing import Any, Awaitable, Callable
 
 from sqlalchemy import delete, select
 
-from backend.config import settings
 from backend.database import async_session
 from backend.models.project import Project
 from backend.models.task import Task
@@ -39,6 +38,7 @@ from backend.services.test_harness_targets import (
     TestHarnessTargetManager,
     test_harness_target_manager,
 )
+from backend.services.test_harness_runtime import resolve_harness_runtime
 
 
 logger = logging.getLogger(__name__)
@@ -249,15 +249,15 @@ class TestHarnessService:
 
     @staticmethod
     def _runtime_for_task(task: Task, spec: TestHarnessSpec) -> dict[str, Any]:
-        provider = task.provider if task.provider in {"claude", "codex"} else "codex"
-        model = task.model or (
-            settings.default_codex_model if provider == "codex" else settings.default_model
+        selected = resolve_harness_runtime(
+            task,
+            provider=spec.provider,
+            model=spec.model,
+            reasoning_effort=spec.reasoning_effort,
+            codex_service_tier=spec.codex_service_tier,
         )
         return {
-            "provider": provider,
-            "model": model,
-            "reasoning_effort": task.effort_level or settings.default_effort,
-            "codex_service_tier": task.codex_service_tier or "default",
+            **selected,
             "profile": spec.profile,
             "allow_actions": spec.allow_actions,
             "browser_channel": spec.browser_channel,
@@ -309,6 +309,7 @@ class TestHarnessService:
             workspace_override=prepared.workspace if prepared is not None else None,
             preview_config_override=preview_config if prepared is not None else None,
             test_plan=test_plan,
+            runtime_config=run.runtime_config,
         )
         await self._update_run(
             run_id,
@@ -1388,6 +1389,10 @@ class TestHarnessService:
             viewport_height=int(runtime.get("viewport_height", 900)),
             max_steps=int(runtime.get("max_steps", 20)),
             max_actions=int(runtime.get("max_actions", 0)),
+            provider=runtime.get("provider"),
+            model=runtime.get("model"),
+            reasoning_effort=runtime.get("reasoning_effort"),
+            codex_service_tier=runtime.get("codex_service_tier"),
             test_plan=source.test_plan,
             parent_run_id=source.id,
         )

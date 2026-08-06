@@ -154,6 +154,8 @@ def test_ordinary_task_adds_repeatable_frontend_review_server():
         api_base="http://127.0.0.1:8795",
     )[0]
     assert frontend_spec.enabled_tools == CCM_FRONTEND_REVIEW_TOOLS
+    assert frontend_spec.enabled_tools == ("start_review", "check_review", "stop_review")
+    assert "browser_open" not in frontend_spec.enabled_tools
     assert "--task-id" in frontend_spec.args
     assert "73" in frontend_spec.args
     workspace_spec = specs[2]
@@ -219,6 +221,7 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_skills",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
@@ -229,6 +232,7 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
                 "secret-token",
             ),
             cwd="/srv/ccm",
+            env={"PYTHONPATH": "/srv/ccm"},
             required=True,
             enabled_tools=EXPECTED_MAIN_TOOLS,
             default_tools_approval_mode="approve",
@@ -255,6 +259,7 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_monitor_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -267,6 +272,7 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
                 "secret-token",
             ),
             cwd="/srv/ccm",
+            env={"PYTHONPATH": "/srv/ccm"},
             required=True,
             enabled_tools=EXPECTED_MONITOR_TOOLS,
             default_tools_approval_mode="approve",
@@ -287,7 +293,7 @@ def test_monitor_agent_mcp_spec_carries_exact_turn_generation(monkeypatch):
         turn_generation=9,
     )[0]
 
-    assert spec.args[2:8] == (
+    assert spec.args[3:9] == (
         "--monitor-session-id",
         "7",
         "--task-id",
@@ -309,6 +315,7 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_sub_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -321,6 +328,7 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
                 "secret-token",
             ),
             cwd="/srv/ccm",
+            env={"PYTHONPATH": "/srv/ccm"},
             required=True,
             enabled_tools=EXPECTED_SUB_AGENT_TOOLS,
             default_tools_approval_mode="approve",
@@ -376,6 +384,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_mcp_config(42),
             "ccm_skills",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
@@ -388,6 +397,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_monitor_agent_mcp_config(7),
             "ccm_monitor_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -402,6 +412,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_sub_agent_mcp_config(9),
             "ccm_sub_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -436,6 +447,7 @@ def test_claude_json_output_remains_compatible(
                 "secret-token",
             ],
             "cwd": "/srv/ccm",
+            "env": {"PYTHONPATH": "/srv/ccm"},
         }
         expected_names = {expected_name}
         if expected_name == "ccm_skills":
@@ -513,8 +525,13 @@ def test_platform_paths_are_preserved(monkeypatch, root, python):
 
     assert spec.command == python
     assert spec.cwd == root
+    assert spec.args[:3] == ("-P", "-m", "backend.mcp.ccm_skills_server")
+    assert dict(spec.env) == {"PYTHONPATH": root}
     assert rendered["mcpServers"]["ccm_skills"]["command"] == python
     assert rendered["mcpServers"]["ccm_skills"]["cwd"] == root
+    assert rendered["mcpServers"]["ccm_skills"]["env"] == {
+        "PYTHONPATH": root,
+    }
 
 
 def test_claude_renderer_includes_env_but_not_provider_metadata():

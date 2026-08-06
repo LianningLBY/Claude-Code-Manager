@@ -309,6 +309,13 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
         goal="Test the settings page as a user",
         mode="review_only",
         profile="standard",
+        runtime_config={
+            "provider": "claude",
+            "model": "claude-opus-5",
+            "reasoning_effort": "max",
+            "codex_service_tier": "default",
+            "selection_source": "browser_review_config",
+        },
     )
     for _ in range(100):
         async with db_factory() as db:
@@ -329,6 +336,11 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
     assert created_child["target_repo"] == str(preview_temp)
     assert created_child["archived"] is True
     assert created_child["enabled_skills"] == {"browser-review": "browser-job-1"}
+    assert created_child["provider"] == "claude"
+    assert created_child["model"] == "claude-opus-5"
+    assert created_child["effort_level"] == "max"
+    assert browser_job.options.model == "claude-opus-5"
+    assert browser_job.options.reasoning_effort == "max"
     assert created_child["metadata_"]["isolated_browser_agent"] is True
     assert "Private parent conversation" not in created_child["description"]
     assert "intentionally received no parent conversation" in created_child["description"]

@@ -28,6 +28,11 @@ from backend.services.test_harness_contracts import (
     TestHarnessContractError,
     TestHarnessSpec,
 )
+from backend.services.test_harness_runtime import (
+    HARNESS_RUNTIME_METADATA_KEY,
+    build_saved_harness_runtime,
+    harness_runtime_config_payload,
+)
 from backend.services.workspace_review import workspace_review_capability
 
 
@@ -49,9 +54,23 @@ class TestHarnessRunStart(BaseModel):
     viewport_height: int = Field(default=900, ge=320, le=2160)
     max_steps: int | None = Field(default=None, ge=1, le=50)
     max_actions: int | None = Field(default=None, ge=0, le=200)
+    provider: Literal["claude", "codex"] | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=100)
+    reasoning_effort: str | None = Field(default=None, min_length=1, max_length=20)
+    codex_service_tier: Literal["default", "priority"] | None = None
     test_plan: dict[str, Any] | None = None
     parent_run_id: str | None = Field(default=None, min_length=32, max_length=32)
     idempotency_key: str | None = Field(default=None, max_length=200)
+
+
+class TestHarnessRuntimeConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inherit_task: bool = True
+    provider: Literal["claude", "codex"] | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=100)
+    reasoning_effort: str | None = Field(default=None, min_length=1, max_length=20)
+    codex_service_tier: Literal["default", "priority"] | None = None
 
 
 async def _task_or_404(task_id: int, db: AsyncSession) -> Task:
@@ -73,6 +92,10 @@ def _spec(body: TestHarnessRunStart) -> TestHarnessSpec:
         viewport_height=body.viewport_height,
         max_steps=body.max_steps,
         max_actions=body.max_actions,
+        provider=body.provider,
+        model=body.model,
+        reasoning_effort=body.reasoning_effort,
+        codex_service_tier=body.codex_service_tier,
         test_plan=body.test_plan,
         parent_run_id=body.parent_run_id,
         idempotency_key=body.idempotency_key,
@@ -118,13 +141,20 @@ async def get_test_harness_capabilities(
     await require_task_access(request, task, db)
     project = await db.get(Project, task.project_id) if task.project_id else None
     workspace = workspace_review_capability(task, project)
-    provider = task.provider if task.provider in {"claude", "codex"} else "codex"
+    try:
+        runtime = harness_runtime_config_payload(task)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    provider = runtime["provider"]
     return {
         "contract_version": 1,
         "available": workspace["available"],
         "reason": workspace["reason"],
         "provider": provider,
+        "task_provider": task.provider,
         "provider_browser_capability": provider in {"claude", "codex"},
+        "runtime_configurable": True,
+        "runtime": runtime,
         "context_policy": "isolated_black_box_v1",
         "targets": {
             "current_workspace": workspace["available"],
@@ -136,6 +166,55 @@ async def get_test_harness_capabilities(
         "supports_repeat": True,
         "supports_compare": True,
     }
+
+
+@router.get("/{task_id}/test-runs/config")
+async def get_test_harness_runtime_config(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    task = await _task_or_404(task_id, db)
+    await require_task_access(request, task, db)
+    try:
+        return harness_runtime_config_payload(task)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.put("/{task_id}/test-runs/config")
+async def update_test_harness_runtime_config(
+    task_id: int,
+    body: TestHarnessRuntimeConfigUpdate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    task = await _task_or_404(task_id, db)
+    await require_task_control(request, task, db)
+    if task.status not in {"completed", "failed", "cancelled", "conflict"}:
+        raise HTTPException(
+            status_code=409,
+            detail="等待当前 Task 回合结束后再修改 Browser Agent 配置",
+        )
+    try:
+        saved = build_saved_harness_runtime(
+            inherit_task=body.inherit_task,
+            provider=body.provider,
+            model=body.model,
+            reasoning_effort=body.reasoning_effort,
+            codex_service_tier=body.codex_service_tier,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    task.metadata_ = {
+        **(task.metadata_ or {}),
+        HARNESS_RUNTIME_METADATA_KEY: saved,
+    }
+    await db.commit()
+    try:
+        return harness_runtime_config_payload(task)
+    except ValueError as exc:  # pragma: no cover - just-validated assignment
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/{task_id}/test-runs", status_code=status.HTTP_202_ACCEPTED)
@@ -177,7 +256,10 @@ async def start_test_harness_run_internal(
             status_code=409,
             detail="Test Harness tool requires its parent Task to be running",
         )
-    return await _start(task=task, body=body, owner_user_id=task.created_by, inline=True)
+    # The ordinary Task only orchestrates and polls this run. Browser actions
+    # belong to a separately routed black-box child Task so its model/effort
+    # can differ from the parent Task without recording a false runtime.
+    return await _start(task=task, body=body, owner_user_id=task.created_by, inline=False)
 
 
 @router.get("/{task_id}/test-runs")

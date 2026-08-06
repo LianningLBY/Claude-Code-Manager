@@ -5,7 +5,13 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 import { api } from '../../api/client';
-import type { BrowserReviewJob, TestHarnessRun, WorkspaceReviewRun } from '../../api/client';
+import type {
+  BrowserReviewJob,
+  CodexServiceTier,
+  TestHarnessRun,
+  TestHarnessRuntimeConfig,
+  WorkspaceReviewRun,
+} from '../../api/client';
 import {
   Activity,
   AlertCircle,
@@ -183,6 +189,18 @@ export function BrowserReviewPanel({
   const [configuredViewport, setConfiguredViewport] = useState('1440x900');
   const [configuredBrowserChannel, setConfiguredBrowserChannel] = useState<'chrome' | 'chromium'>('chrome');
   const [configuredAllowActions, setConfiguredAllowActions] = useState(false);
+  const [runtimeConfig, setRuntimeConfig] = useState<TestHarnessRuntimeConfig | null>(null);
+  const [runtimeConfigLoading, setRuntimeConfigLoading] = useState(false);
+  const [runtimeConfigSaving, setRuntimeConfigSaving] = useState(false);
+  const [inheritTaskRuntime, setInheritTaskRuntime] = useState(true);
+  const [reviewProvider, setReviewProvider] = useState<'claude' | 'codex'>(
+    taskProvider === 'claude' ? 'claude' : 'codex',
+  );
+  const [reviewModel, setReviewModel] = useState(taskModel || '');
+  const [reviewEffort, setReviewEffort] = useState(taskEffort || 'medium');
+  const [reviewServiceTier, setReviewServiceTier] = useState<CodexServiceTier>(
+    taskServiceTier === 'priority' ? 'priority' : 'default',
+  );
   const [startingConfiguredReview, setStartingConfiguredReview] = useState(false);
   const [floatingPosition, setFloatingPosition] = useState<FloatingPosition>(loadFloatingPosition);
   const floatingPanelRef = useRef<HTMLElement | null>(null);
@@ -192,6 +210,29 @@ export function BrowserReviewPanel({
   const expectedWorkspaceReviewBaselineRef = useRef<string | null | undefined>(undefined);
   const expectedGoalReviewBaselineRef = useRef<string | null | undefined>(undefined);
   const goalReviewRequestIdRef = useRef<number | null>(null);
+
+  const applyRuntimeConfig = useCallback((config: TestHarnessRuntimeConfig) => {
+    setRuntimeConfig(config);
+    setInheritTaskRuntime(config.inherit_task);
+    setReviewProvider(config.provider);
+    setReviewModel(config.model);
+    setReviewEffort(config.reasoning_effort);
+    setReviewServiceTier(config.codex_service_tier);
+  }, []);
+
+  const loadRuntimeConfig = useCallback(async () => {
+    setRuntimeConfigLoading(true);
+    try {
+      const config = await api.getTestHarnessRuntimeConfig(taskId);
+      applyRuntimeConfig(config);
+      return config;
+    } catch (nextError) {
+      setError(`加载 Browser Agent 配置失败：${errorText(nextError)}`);
+      return null;
+    } finally {
+      setRuntimeConfigLoading(false);
+    }
+  }, [applyRuntimeConfig, taskId]);
 
   const refresh = useCallback(async () => {
     try {
@@ -272,6 +313,17 @@ export function BrowserReviewPanel({
     onAvailableChange(false);
     void refresh();
   }, [onAvailableChange, refresh, taskId]);
+
+  useEffect(() => {
+    setRuntimeConfig(null);
+    setRuntimeConfigLoading(false);
+    setRuntimeConfigSaving(false);
+    setInheritTaskRuntime(true);
+    setReviewProvider(taskProvider === 'claude' ? 'claude' : 'codex');
+    setReviewModel(taskModel || '');
+    setReviewEffort(taskEffort || 'medium');
+    setReviewServiceTier(taskServiceTier === 'priority' ? 'priority' : 'default');
+  }, [taskEffort, taskId, taskModel, taskProvider, taskServiceTier]);
 
   useEffect(() => {
     if (!startedWorkspaceRun || startedWorkspaceRun.task_id !== taskId) return;
@@ -384,6 +436,81 @@ export function BrowserReviewPanel({
     .filter((entry): entry is [string, Record<string, unknown>[]] => Array.isArray(entry[1]))
     .filter(([, entries]) => entries.length > 0), [job?.telemetry]);
 
+  const reviewModels = runtimeConfig?.models_by_provider[reviewProvider]
+    || (reviewModel ? [reviewModel] : []);
+  const reviewEfforts = runtimeConfig?.model_efforts[reviewProvider]?.[reviewModel]
+    || runtimeConfig?.effort_options[reviewProvider]
+    || (reviewEffort ? [reviewEffort] : []);
+  const reviewServiceTiers = reviewProvider === 'codex'
+    ? runtimeConfig?.codex_model_service_tiers[reviewModel]
+      || runtimeConfig?.codex_service_tiers
+      || ['default']
+    : ['default'];
+
+  const openRuntimeSettings = () => {
+    setSettingsOpen(true);
+    if (!runtimeConfig && !runtimeConfigLoading) void loadRuntimeConfig();
+  };
+
+  const selectReviewProvider = (provider: 'claude' | 'codex') => {
+    setReviewProvider(provider);
+    const nextModel = runtimeConfig?.default_models[provider]
+      || runtimeConfig?.models_by_provider[provider]?.[0]
+      || '';
+    const nextEfforts = runtimeConfig?.model_efforts[provider]?.[nextModel]
+      || runtimeConfig?.effort_options[provider]
+      || [];
+    setReviewModel(nextModel);
+    setReviewEffort(nextEfforts.includes(runtimeConfig?.default_effort || '')
+      ? runtimeConfig!.default_effort
+      : nextEfforts[0] || 'medium');
+    setReviewServiceTier('default');
+  };
+
+  const selectReviewModel = (model: string) => {
+    setReviewModel(model);
+    const nextEfforts = runtimeConfig?.model_efforts[reviewProvider]?.[model]
+      || runtimeConfig?.effort_options[reviewProvider]
+      || [];
+    if (!nextEfforts.includes(reviewEffort)) {
+      setReviewEffort(nextEfforts.includes(runtimeConfig?.default_effort || '')
+        ? runtimeConfig!.default_effort
+        : nextEfforts[0] || 'medium');
+    }
+    const nextTiers = reviewProvider === 'codex'
+      ? runtimeConfig?.codex_model_service_tiers[model] || ['default']
+      : ['default'];
+    if (!nextTiers.includes(reviewServiceTier)) setReviewServiceTier('default');
+  };
+
+  const persistRuntimeConfig = async () => {
+    setRuntimeConfigSaving(true);
+    try {
+      const saved = await api.updateTestHarnessRuntimeConfig(taskId, inheritTaskRuntime
+        ? { inherit_task: true }
+        : {
+            inherit_task: false,
+            provider: reviewProvider,
+            model: reviewModel,
+            reasoning_effort: reviewEffort,
+            codex_service_tier: reviewProvider === 'codex' ? reviewServiceTier : 'default',
+          });
+      applyRuntimeConfig(saved);
+      return saved;
+    } finally {
+      setRuntimeConfigSaving(false);
+    }
+  };
+
+  const saveRuntimeConfig = async () => {
+    setError(null);
+    try {
+      await persistRuntimeConfig();
+    } catch (nextError) {
+      setError(`保存 Browser Agent 配置失败：${errorText(nextError)}`);
+    }
+  };
+
   const download = async (name: string) => {
     if (!harnessRun) return;
     try {
@@ -463,6 +590,7 @@ export function BrowserReviewPanel({
     setError(null);
     const [viewportWidth, viewportHeight] = configuredViewport.split('x').map(Number);
     try {
+      const savedRuntime = await persistRuntimeConfig();
       const started = await api.startTestRun(taskId, {
         target_kind: 'fixed_url',
         target: { url },
@@ -474,6 +602,12 @@ export function BrowserReviewPanel({
         viewport_height: viewportHeight,
         max_steps: 20,
         max_actions: 60,
+        ...(savedRuntime.inherit_task ? {} : {
+          provider: savedRuntime.provider,
+          model: savedRuntime.model,
+          reasoning_effort: savedRuntime.reasoning_effort,
+          codex_service_tier: savedRuntime.codex_service_tier,
+        }),
       });
       startedWorkspaceRunRef.current = started;
       latestReviewIdRef.current = started.id;
@@ -588,7 +722,10 @@ export function BrowserReviewPanel({
         </div>
         <button
           type="button"
-          onClick={() => setSettingsOpen((value) => !value)}
+          onClick={() => {
+            if (settingsOpen) setSettingsOpen(false);
+            else openRuntimeSettings();
+          }}
           className={`rounded p-1.5 transition-colors ${settingsOpen
             ? 'bg-indigo-500/15 text-indigo-300'
             : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'}`}
@@ -706,20 +843,121 @@ export function BrowserReviewPanel({
               </div>
             )}
 
-            <section className="rounded-lg border border-gray-600/60 bg-gray-900/55 p-3">
+            <section className="space-y-3 rounded-lg border border-gray-600/60 bg-gray-900/55 p-3">
               <div className="flex items-start gap-2">
                 <Shield size={14} className="mt-0.5 shrink-0 text-emerald-400" />
-                <div className="min-w-0">
-                  <div className="text-xs font-medium text-gray-200">沿用当前 Task 运行配置</div>
-                  <div className="mt-1 break-words text-[10px] leading-relaxed text-gray-500">
-                    {taskProvider === 'claude' ? 'Claude' : 'Codex'} · {taskModel || '默认模型'} · effort {taskEffort || '默认'}
-                    {taskProvider === 'codex' ? ` · ${taskServiceTier === 'priority' ? 'Fast' : 'Standard'}` : ''}
-                  </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-medium text-gray-200">Browser Agent 独立运行配置</div>
                   <div className="mt-1 text-[10px] leading-relaxed text-gray-500">
-                    Provider、模型和速度由 Task Config 统一管理，测试会冻结启动时的配置。
+                    这组设置只控制浏览器审查 Agent，不会修改当前 Task 的模型或推理强度。普通对话、单次审查、PR/分支审查和 Goal 复查都会使用它。
                   </div>
                 </div>
               </div>
+
+              {runtimeConfigLoading ? (
+                <div className="flex items-center gap-2 rounded border border-gray-600/45 bg-gray-950/40 px-2.5 py-2 text-[10px] text-gray-500">
+                  <Loader2 size={12} className="animate-spin" />正在加载可用模型…
+                </div>
+              ) : (
+                <>
+                  <label className="flex cursor-pointer items-start gap-2 rounded border border-gray-600/45 bg-gray-950/40 px-2.5 py-2 text-xs text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={inheritTaskRuntime}
+                      onChange={(event) => {
+                        const inherit = event.target.checked;
+                        setInheritTaskRuntime(inherit);
+                        if (inherit && runtimeConfig) {
+                          setReviewProvider(runtimeConfig.task_runtime.provider);
+                          setReviewModel(runtimeConfig.task_runtime.model);
+                          setReviewEffort(runtimeConfig.task_runtime.reasoning_effort);
+                          setReviewServiceTier(runtimeConfig.task_runtime.codex_service_tier);
+                        }
+                      }}
+                      className="mt-0.5 rounded border-gray-600 bg-gray-800 text-indigo-500"
+                    />
+                    <span>
+                      跟随当前 Task
+                      <span className="mt-0.5 block text-[10px] text-gray-500">
+                        {taskProvider === 'claude' ? 'Claude' : 'Codex'} · {taskModel || '默认模型'} · effort {taskEffort || '默认'}
+                        {taskProvider === 'codex' ? ` · ${taskServiceTier === 'priority' ? 'Fast' : 'Standard'}` : ''}
+                      </span>
+                    </span>
+                  </label>
+
+                  {!inheritTaskRuntime && (
+                    <div className="grid grid-cols-1 gap-3">
+                      <div>
+                        <label htmlFor={`frontend-test-provider-${taskId}`} className="mb-1 block text-[10px] font-medium text-gray-400">审查 Provider</label>
+                        <select
+                          id={`frontend-test-provider-${taskId}`}
+                          value={reviewProvider}
+                          onChange={(event) => selectReviewProvider(event.target.value as 'claude' | 'codex')}
+                          className="w-full rounded border border-gray-600/60 bg-gray-950 px-2.5 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
+                        >
+                          {(runtimeConfig?.providers || ['claude', 'codex']).map((provider) => (
+                            <option key={provider} value={provider}>{provider === 'claude' ? 'Claude' : 'Codex'}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor={`frontend-test-model-${taskId}`} className="mb-1 block text-[10px] font-medium text-gray-400">审查模型</label>
+                        <select
+                          id={`frontend-test-model-${taskId}`}
+                          value={reviewModel}
+                          onChange={(event) => selectReviewModel(event.target.value)}
+                          className="w-full rounded border border-gray-600/60 bg-gray-950 px-2.5 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
+                        >
+                          {reviewModels.map((model) => <option key={model} value={model}>{model}</option>)}
+                        </select>
+                      </div>
+                      <div className={`grid gap-3 ${reviewProvider === 'codex' ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                        <div>
+                          <label htmlFor={`frontend-test-effort-${taskId}`} className="mb-1 block text-[10px] font-medium text-gray-400">推理强度</label>
+                          <select
+                            id={`frontend-test-effort-${taskId}`}
+                            value={reviewEffort}
+                            onChange={(event) => setReviewEffort(event.target.value)}
+                            className="w-full rounded border border-gray-600/60 bg-gray-950 px-2.5 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
+                          >
+                            {reviewEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+                          </select>
+                        </div>
+                        {reviewProvider === 'codex' && (
+                          <div>
+                            <label htmlFor={`frontend-test-tier-${taskId}`} className="mb-1 block text-[10px] font-medium text-gray-400">速度</label>
+                            <select
+                              id={`frontend-test-tier-${taskId}`}
+                              value={reviewServiceTier}
+                              onChange={(event) => setReviewServiceTier(event.target.value as CodexServiceTier)}
+                              className="w-full rounded border border-gray-600/60 bg-gray-950 px-2.5 py-2 text-xs text-gray-100 outline-none focus:border-indigo-500"
+                            >
+                              {reviewServiceTiers.map((tier) => (
+                                <option key={tier} value={tier}>{tier === 'priority' ? 'Fast' : 'Standard'}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => void saveRuntimeConfig()}
+                    disabled={runtimeConfigSaving || runtimeConfigLoading || taskActive || (!inheritTaskRuntime && (!reviewModel || !reviewEffort))}
+                    className="inline-flex w-full items-center justify-center gap-1.5 rounded border border-indigo-500/35 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-300 hover:bg-indigo-500/15 disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    {runtimeConfigSaving ? <Loader2 size={13} className="animate-spin" /> : <Settings size={13} />}
+                    {runtimeConfigSaving ? '正在保存…' : '保存审查 Agent 配置'}
+                  </button>
+                  {taskActive && (
+                    <div className="text-center text-[10px] leading-relaxed text-amber-300">
+                      当前 Task 回合结束后可保存；已经启动的 Harness Run 始终使用冻结配置。
+                    </div>
+                  )}
+                </>
+              )}
             </section>
 
             <div>
@@ -804,7 +1042,7 @@ export function BrowserReviewPanel({
 
             <button
               type="submit"
-              disabled={startingConfiguredReview || taskActive || hasActiveReview || !canStartConfiguredReview || !configuredUrl.trim() || !configuredGoal.trim()}
+              disabled={startingConfiguredReview || runtimeConfigSaving || runtimeConfigLoading || taskActive || hasActiveReview || !canStartConfiguredReview || !configuredUrl.trim() || !configuredGoal.trim() || (!inheritTaskRuntime && (!reviewModel || !reviewEffort))}
               className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white shadow-md shadow-indigo-600/20 transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-45"
             >
               {startingConfiguredReview ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
@@ -885,7 +1123,7 @@ export function BrowserReviewPanel({
             </p>
             <button
               type="button"
-              onClick={() => setSettingsOpen(true)}
+              onClick={openRuntimeSettings}
               className="mt-5 inline-flex items-center gap-2 rounded-lg border border-indigo-500/35 bg-indigo-500/10 px-3.5 py-2 text-xs font-medium text-indigo-300 transition-colors hover:bg-indigo-500/15"
             >
               <Settings size={14} />配置网站测试
@@ -909,6 +1147,12 @@ export function BrowserReviewPanel({
                 <div className="mt-0.5 line-clamp-2 text-[10px] text-gray-500">
                   {displayedObjective}
                 </div>
+                {typeof displayedRun.runtime.provider === 'string' && (
+                  <div className="mt-1 truncate text-[10px] text-indigo-300/80" title={`${String(displayedRun.runtime.provider)} · ${String(displayedRun.runtime.model || '')} · ${String(displayedRun.runtime.reasoning_effort || '')}`}>
+                    Browser Agent · {displayedRun.runtime.provider === 'claude' ? 'Claude' : 'Codex'} · {String(displayedRun.runtime.model || '默认模型')} · effort {String(displayedRun.runtime.reasoning_effort || '默认')}
+                    {displayedRun.runtime.provider === 'codex' ? ` · ${displayedRun.runtime.codex_service_tier === 'priority' ? 'Fast' : 'Standard'}` : ''}
+                  </div>
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
                 {!TERMINAL.has(displayedRun.status) && (

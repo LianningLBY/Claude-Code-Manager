@@ -199,7 +199,7 @@ async def test_browser_review_api_rejects_unsafe_url(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ordinary_task_can_start_and_list_inline_browser_review(
+async def test_ordinary_task_can_start_and_list_isolated_browser_review(
     monkeypatch,
     tmp_path,
 ):
@@ -228,8 +228,10 @@ async def test_ordinary_task_can_start_and_list_inline_browser_review(
     async def allow_task_access(*_args):
         return None
 
+    task_state = {"status": "in_progress", "trace_events": []}
+
     async def read_task(_task_id: int):
-        return {"status": "in_progress", "trace_events": []}
+        return dict(task_state)
 
     monkeypatch.setattr(
         "backend.services.browser_review_jobs.tempfile.mkdtemp",
@@ -247,8 +249,8 @@ async def test_ordinary_task_can_start_and_list_inline_browser_review(
 
         async def start_fixed_url_browser(self, *, run_id, inline):
             assert run_id == "i" * 32
-            assert inline is True
-            return await manager.prepare_task_tool(
+            assert inline is False
+            job = await manager.prepare_agent(
                 BrowserReviewOptions(
                     url=self.spec.target["url"],
                     goal=self.spec.goal,
@@ -263,11 +265,12 @@ async def test_ordinary_task_can_start_and_list_inline_browser_review(
                     max_steps=self.spec.max_steps,
                     max_actions=self.spec.max_actions,
                 ),
-                task_id=task.id,
                 provider=task.provider,
                 codex_service_tier=task.codex_service_tier,
                 harness_run_id=run_id,
             )
+            await manager.attach_task(job.id, task.id, owner_task_id=task.id)
+            return job
 
         async def sync_browser_job(self, _job):
             return None
@@ -299,7 +302,7 @@ async def test_ordinary_task_can_start_and_list_inline_browser_review(
         assert started.status_code == 201, started.text
         payload = started.json()
         assert payload["task_id"] == 73
-        assert payload["inline_tool"] is True
+        assert payload["inline_tool"] is False
         assert payload["provider"] == "claude"
         assert payload["model"] == "claude-opus-4-6"
         assert payload["viewport_width"] == 390
@@ -317,6 +320,10 @@ async def test_ordinary_task_can_start_and_list_inline_browser_review(
             },
         )
         assert completed.status_code == 200, completed.text
+        task_state["status"] = "completed"
+        job = await manager.get(job_id)
+        assert job is not None and job.task is not None
+        await asyncio.wait_for(job.task, timeout=1)
 
         status_response = await client.get(
             f"/api/tasks/73/browser-reviews/{job_id}/internal/status"

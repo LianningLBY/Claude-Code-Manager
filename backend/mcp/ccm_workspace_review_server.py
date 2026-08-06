@@ -70,13 +70,19 @@ async def test_current_changes(
     browser_channel: str = "chrome",
     viewport_width: int = 1440,
     viewport_height: int = 900,
+    provider: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    codex_service_tier: str | None = None,
 ) -> str:
     """Test this Task's exact branch and uncommitted changes in a fresh preview.
 
     Do not ask the user for a URL. CCM fingerprints the current worktree,
     starts its trusted isolated Preview profile, and creates a separate
-    black-box Browser Agent. Use review_only unless the Task is already in an
-    explicit fix-and-retest Goal. Poll the returned run with
+    black-box Browser Agent. Omit provider/model/reasoning_effort to use the
+    Browser Review configuration saved in CCM; it is independent from the
+    parent Task. Use review_only unless the Task is already in an explicit
+    fix-and-retest Goal. Poll the returned run with
     check_current_changes_review; do not claim success until it is completed,
     not stale, and contains a report.
     """
@@ -97,6 +103,10 @@ async def test_current_changes(
             "browser_channel": browser_channel,
             "viewport_width": viewport_width,
             "viewport_height": viewport_height,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "codex_service_tier": codex_service_tier,
         },
     )
     return json.dumps(result, ensure_ascii=False)
@@ -135,8 +145,16 @@ async def test_git_target(
     browser_channel: str = "chrome",
     viewport_width: int = 1440,
     viewport_height: int = 900,
+    provider: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    codex_service_tier: str | None = None,
 ) -> str:
-    """Test an exact PR or Git ref in a detached worktree, without switching the developer tree."""
+    """Test an exact PR or Git ref in a detached worktree.
+
+    Omit the runtime fields to use the saved Browser Review configuration,
+    which may intentionally differ from the parent Task.
+    """
 
     if target_kind == "pull_request":
         target: dict[str, Any] = {"pr_number": pr_number, "remote": remote}
@@ -156,6 +174,10 @@ async def test_git_target(
             "browser_channel": browser_channel,
             "viewport_width": viewport_width,
             "viewport_height": viewport_height,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "codex_service_tier": codex_service_tier,
         },
     )
     return json.dumps(result, ensure_ascii=False)

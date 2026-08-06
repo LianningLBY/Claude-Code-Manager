@@ -38,6 +38,7 @@ from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.task_queue import TaskQueue
+from backend.services.test_harness_runtime import resolve_harness_runtime
 
 
 logger = logging.getLogger(__name__)
@@ -818,6 +819,7 @@ class WorkspaceReviewManager:
         workspace_override: Path | None = None,
         preview_config_override: dict[str, Any] | None = None,
         test_plan: dict[str, Any] | None = None,
+        runtime_config: dict[str, Any] | None = None,
     ) -> WorkspaceReviewRun:
         if mode not in _ALLOWED_MODES:
             raise WorkspaceReviewError("workspace review mode must be review_only or fix_loop")
@@ -859,6 +861,11 @@ class WorkspaceReviewManager:
                     )
                 config = validate_preview_config(configured_preview, workspace)
                 snapshot = await capture_workspace_snapshot(workspace, config)
+                selected_runtime = (
+                    dict(runtime_config)
+                    if runtime_config is not None
+                    else resolve_harness_runtime(task)
+                )
                 run = WorkspaceReviewRun(
                     id=uuid.uuid4().hex,
                     task_id=task.id,
@@ -889,6 +896,7 @@ class WorkspaceReviewManager:
                     max_steps=max_steps,
                     max_actions=max_actions,
                     test_plan=test_plan,
+                    runtime_config=selected_runtime,
                 ),
                 name=f"workspace-review-{run.id}",
             )
@@ -917,6 +925,7 @@ class WorkspaceReviewManager:
         max_steps: int | None,
         max_actions: int | None,
         test_plan: dict[str, Any] | None,
+        runtime_config: dict[str, Any],
     ) -> None:
         handle: PreviewHandle | None = None
         job_id: str | None = None
@@ -933,12 +942,10 @@ class WorkspaceReviewManager:
                 if run is None or parent is None:
                     raise WorkspaceReviewError("Workspace review owner Task disappeared")
                 config = dict(run.preview_config)
-                provider = parent.provider or "codex"
-                model = parent.model or (
-                    settings.default_codex_model if provider == "codex" else settings.default_model
-                )
-                effort = parent.effort_level or settings.default_effort
-                tier = parent.codex_service_tier or "default"
+                provider = str(runtime_config["provider"])
+                model = str(runtime_config["model"])
+                effort = str(runtime_config["reasoning_effort"])
+                tier = str(runtime_config["codex_service_tier"])
                 created_by = parent.created_by
 
             await self._update(run_id, stage="starting_preview")

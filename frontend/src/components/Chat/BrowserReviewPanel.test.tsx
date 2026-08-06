@@ -1,7 +1,12 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
-import type { BrowserReviewJob, TestHarnessRun, WorkspaceReviewRun } from '../../api/client';
+import type {
+  BrowserReviewJob,
+  TestHarnessRun,
+  TestHarnessRuntimeConfig,
+  WorkspaceReviewRun,
+} from '../../api/client';
 import { BrowserReviewPanel } from './BrowserReviewPanel';
 
 vi.mock('../../api/client', () => ({
@@ -11,10 +16,54 @@ vi.mock('../../api/client', () => ({
     cancelTestRun: vi.fn(),
     repeatTestRun: vi.fn(),
     startTestRun: vi.fn(),
+    getTestHarnessRuntimeConfig: vi.fn(),
+    updateTestHarnessRuntimeConfig: vi.fn(),
   },
 }));
 
 import { api } from '../../api/client';
+
+const defaultRuntimeConfig: TestHarnessRuntimeConfig = {
+  inherit_task: true,
+  provider: 'codex',
+  model: 'gpt-5.6-sol',
+  reasoning_effort: 'high',
+  codex_service_tier: 'priority',
+  source: 'task',
+  task_runtime: {
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    reasoning_effort: 'high',
+    codex_service_tier: 'priority',
+  },
+  default_provider: 'codex',
+  providers: ['claude', 'codex'],
+  default_models: {
+    claude: 'claude-opus-4-6',
+    codex: 'gpt-5.6-sol',
+  },
+  models_by_provider: {
+    claude: ['claude-opus-4-6', 'claude-opus-5'],
+    codex: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+  },
+  default_effort: 'medium',
+  effort_options: {
+    claude: ['low', 'medium', 'high', 'xhigh', 'max'],
+    codex: ['low', 'medium', 'high', 'xhigh'],
+  },
+  model_efforts: {
+    claude: { 'claude-opus-5': ['low', 'medium', 'high', 'xhigh', 'max'] },
+    codex: {
+      'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+      'gpt-5.6-terra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    },
+  },
+  codex_service_tiers: ['default', 'priority'],
+  codex_model_service_tiers: {
+    'gpt-5.6-sol': ['default', 'priority'],
+    'gpt-5.6-terra': ['default', 'priority'],
+  },
+};
 
 const completedJob: BrowserReviewJob = {
   id: 'inline-review-1',
@@ -167,6 +216,20 @@ function makeHarnessRun(overrides: Partial<TestHarnessRun> = {}): TestHarnessRun
     ...overrides,
   };
 }
+
+beforeEach(() => {
+  vi.mocked(api.listTestRuns).mockResolvedValue([]);
+  vi.mocked(api.getTestHarnessRuntimeConfig).mockResolvedValue(defaultRuntimeConfig);
+  vi.mocked(api.updateTestHarnessRuntimeConfig).mockImplementation(async (_taskId, update) => ({
+    ...defaultRuntimeConfig,
+    inherit_task: update.inherit_task,
+    source: update.inherit_task ? 'task' : 'browser_review_config',
+    provider: update.provider || defaultRuntimeConfig.task_runtime.provider,
+    model: update.model || defaultRuntimeConfig.task_runtime.model,
+    reasoning_effort: update.reasoning_effort || defaultRuntimeConfig.task_runtime.reasoning_effort,
+    codex_service_tier: update.codex_service_tier || defaultRuntimeConfig.task_runtime.codex_service_tier,
+  }));
+});
 
 afterEach(() => {
   cleanup();
@@ -347,7 +410,7 @@ describe('BrowserReviewPanel', () => {
     );
 
     fireEvent.click(await screen.findByRole('button', { name: '配置网站测试' }));
-    expect(screen.getByText(/Codex · gpt-5.6-sol · effort high · Fast/)).toBeInTheDocument();
+    expect(await screen.findByText(/Codex · gpt-5.6-sol · effort high · Fast/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('待检测网站'), {
       target: { value: 'http://127.0.0.1:5173' },
     });
@@ -360,6 +423,9 @@ describe('BrowserReviewPanel', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /允许安全的点击和输入/ }));
     fireEvent.click(screen.getByRole('button', { name: '开始网站测试' }));
 
+    await waitFor(() => expect(api.updateTestHarnessRuntimeConfig).toHaveBeenCalledWith(73, {
+      inherit_task: true,
+    }));
     await waitFor(() => expect(api.startTestRun).toHaveBeenCalledWith(73, {
       target_kind: 'fixed_url',
       target: { url: 'http://127.0.0.1:5173' },
@@ -374,6 +440,72 @@ describe('BrowserReviewPanel', () => {
     }));
     expect(await screen.findByText('Test Harness · fixed_url')).toBeInTheDocument();
     expect(screen.queryByTestId('frontend-test-settings')).not.toBeInTheDocument();
+  });
+
+  it('runs the Browser Agent with a model and effort independent from the Task', async () => {
+    const startedRun = makeHarnessRun({
+      id: 'harness-independent-runtime',
+      root_run_id: 'harness-independent-runtime',
+      status: 'queued',
+      stage: 'waiting_for_browser',
+      runtime: {
+        provider: 'claude',
+        model: 'claude-opus-5',
+        reasoning_effort: 'max',
+        codex_service_tier: 'default',
+        selection_source: 'run_override',
+      },
+      report: null,
+      completed_at: null,
+    });
+    vi.mocked(api.startTestRun).mockResolvedValue(startedRun);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        taskProvider="codex"
+        taskModel="gpt-5.6-sol"
+        taskEffort="high"
+        taskServiceTier="priority"
+        canStartConfiguredReview
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置网站测试' }));
+    await screen.findByText('Browser Agent 独立运行配置');
+    fireEvent.click(screen.getByRole('checkbox', { name: /跟随当前 Task/ }));
+    fireEvent.change(screen.getByLabelText('审查 Provider'), { target: { value: 'claude' } });
+    fireEvent.change(screen.getByLabelText('审查模型'), { target: { value: 'claude-opus-5' } });
+    fireEvent.change(screen.getByLabelText('推理强度'), { target: { value: 'max' } });
+    fireEvent.change(screen.getByLabelText('待检测网站'), {
+      target: { value: 'http://127.0.0.1:5173' },
+    });
+    fireEvent.change(screen.getByLabelText('测试目标'), {
+      target: { value: '使用独立 Claude 模型审查页面' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '开始网站测试' }));
+
+    await waitFor(() => expect(api.updateTestHarnessRuntimeConfig).toHaveBeenCalledWith(73, {
+      inherit_task: false,
+      provider: 'claude',
+      model: 'claude-opus-5',
+      reasoning_effort: 'max',
+      codex_service_tier: 'default',
+    }));
+    await waitFor(() => expect(api.startTestRun).toHaveBeenCalledWith(73, expect.objectContaining({
+      provider: 'claude',
+      model: 'claude-opus-5',
+      reasoning_effort: 'max',
+      codex_service_tier: 'default',
+    })));
+    expect(await screen.findByText(/Browser Agent · Claude · claude-opus-5 · effort max/)).toBeInTheDocument();
   });
 
   it('supports floating, minimizing, restoring, and docking the review window', async () => {

@@ -85,6 +85,10 @@ class TestHarnessSpec:
     viewport_height: int = 900
     max_steps: int | None = None
     max_actions: int | None = None
+    provider: Literal["claude", "codex"] | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    codex_service_tier: Literal["default", "priority"] | None = None
     test_plan: dict[str, Any] | None = None
     parent_run_id: str | None = None
     idempotency_key: str | None = None
@@ -120,6 +124,27 @@ class TestHarnessSpec:
             raise TestHarnessContractError("max_actions must be between 0 and 200")
         if not self.allow_actions and max_actions != 0:
             raise TestHarnessContractError("read-only harness runs must use max_actions=0")
+        if self.provider is not None and self.provider not in {"claude", "codex"}:
+            raise TestHarnessContractError("test harness provider is invalid")
+        if self.codex_service_tier is not None and self.codex_service_tier not in {
+            "default",
+            "priority",
+        }:
+            raise TestHarnessContractError("test harness Codex service tier is invalid")
+        model = self.model.strip() if self.model is not None else None
+        if model is not None and (not model or len(model) > 100 or "\x00" in model):
+            raise TestHarnessContractError("test harness model is invalid")
+        reasoning_effort = (
+            self.reasoning_effort.strip().lower()
+            if self.reasoning_effort is not None
+            else None
+        )
+        if reasoning_effort is not None and (
+            not reasoning_effort
+            or len(reasoning_effort) > 20
+            or "\x00" in reasoning_effort
+        ):
+            raise TestHarnessContractError("test harness reasoning effort is invalid")
         target = normalize_target(self.target_kind, self.target)
         idempotency_key = self.idempotency_key.strip() if self.idempotency_key else None
         if idempotency_key is not None and (
@@ -137,6 +162,10 @@ class TestHarnessSpec:
             viewport_height=self.viewport_height,
             max_steps=max_steps,
             max_actions=max_actions,
+            provider=self.provider,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            codex_service_tier=self.codex_service_tier,
             test_plan=self.test_plan,
             parent_run_id=self.parent_run_id,
             idempotency_key=idempotency_key,

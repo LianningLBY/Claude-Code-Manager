@@ -53,6 +53,10 @@ class WorkspaceReviewStart(BaseModel):
     browser_channel: Literal["chrome", "chromium"] = "chrome"
     viewport_width: int = Field(default=1440, ge=320, le=3840)
     viewport_height: int = Field(default=900, ge=320, le=2160)
+    provider: Literal["claude", "codex"] | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=100)
+    reasoning_effort: str | None = Field(default=None, min_length=1, max_length=20)
+    codex_service_tier: Literal["default", "priority"] | None = None
 
 
 async def _task_or_404(task_id: int, db: AsyncSession) -> Task:
@@ -80,6 +84,10 @@ async def _start_review(task_id: int, body: WorkspaceReviewStart) -> dict[str, A
                 browser_channel=body.browser_channel,
                 viewport_width=body.viewport_width,
                 viewport_height=body.viewport_height,
+                provider=body.provider,
+                model=body.model,
+                reasoning_effort=body.reasoning_effort,
+                codex_service_tier=body.codex_service_tier,
             ),
         )
         payload = await test_harness_service.get_run(harness_run.id)

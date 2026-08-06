@@ -183,3 +183,114 @@ async def test_public_test_run_waits_for_parent_task_terminal(db_factory):
 
     assert response.status_code == 409
     assert "Agent 可直接调用测试工具" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_task_can_save_and_use_browser_runtime_independent_from_parent(
+    monkeypatch,
+    db_factory,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="Codex parent with Claude browser",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            codex_service_tier="priority",
+            metadata_={"keep": "account-binding"},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    service = HarnessService(db_factory=db_factory, poll_interval=0.01)
+    start_browser = AsyncMock(return_value=object())
+    monkeypatch.setattr(service, "start_fixed_url_browser", start_browser)
+    monkeypatch.setattr(test_harness_api, "test_harness_service", service)
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _admin(request: Request, call_next):
+        request.state.user_role = "admin"
+        request.state.auth_type = "token"
+        return await call_next(request)
+
+    async def _get_db():
+        async with db_factory() as db:
+            yield db
+
+    app.include_router(test_harness_api.router)
+    app.dependency_overrides[get_db] = _get_db
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        inherited = await client.get(f"/api/tasks/{task_id}/test-runs/config")
+        assert inherited.status_code == 200, inherited.text
+        assert inherited.json()["inherit_task"] is True
+        assert inherited.json()["provider"] == "codex"
+        assert inherited.json()["model"] == "gpt-5.6-sol"
+
+        saved = await client.put(
+            f"/api/tasks/{task_id}/test-runs/config",
+            json={
+                "inherit_task": False,
+                "provider": "claude",
+                "model": "claude-opus-5",
+                "reasoning_effort": "max",
+                "codex_service_tier": "default",
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["source"] == "browser_review_config"
+        assert saved.json()["provider"] == "claude"
+        assert saved.json()["model"] == "claude-opus-5"
+        assert saved.json()["reasoning_effort"] == "max"
+        assert saved.json()["task_runtime"] == {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "codex_service_tier": "priority",
+        }
+
+        started = await client.post(
+            f"/api/tasks/{task_id}/test-runs",
+            json={
+                "target_kind": "fixed_url",
+                "target": {"url": "http://127.0.0.1:5173"},
+                "goal": "Use the independently configured Browser Agent",
+            },
+        )
+        assert started.status_code == 202, started.text
+        assert started.json()["runtime"]["provider"] == "claude"
+        assert started.json()["runtime"]["model"] == "claude-opus-5"
+        assert started.json()["runtime"]["reasoning_effort"] == "max"
+        assert started.json()["runtime"]["selection_source"] == "browser_review_config"
+
+        invalid = await client.put(
+            f"/api/tasks/{task_id}/test-runs/config",
+            json={
+                "inherit_task": False,
+                "provider": "claude",
+                "model": "claude-opus-4-6",
+                "reasoning_effort": "ultra",
+            },
+        )
+        assert invalid.status_code == 422
+
+    async with db_factory() as db:
+        persisted = await db.get(Task, task_id)
+        assert persisted is not None
+        assert persisted.metadata_["keep"] == "account-binding"
+        assert persisted.metadata_["test_harness_runtime"] == {
+            "version": 1,
+            "inherit_task": False,
+            "provider": "claude",
+            "model": "claude-opus-5",
+            "reasoning_effort": "max",
+            "codex_service_tier": "default",
+        }
+    start_browser.assert_awaited_once()

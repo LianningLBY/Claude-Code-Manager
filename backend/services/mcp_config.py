@@ -76,7 +76,6 @@ CCM_BROWSER_REVIEW_TOOLS = (
 )
 CCM_FRONTEND_REVIEW_TOOLS = (
     "start_review",
-    *CCM_BROWSER_REVIEW_TOOLS,
     "check_review",
     "stop_review",
 )
@@ -131,6 +130,12 @@ def _ccm_server_spec(
 ) -> McpServerSpec:
     resolved_api_base, auth_token = _api_base_and_auth_token(api_base)
     args = [
+        # Claude Code currently ignores the non-standard ``cwd`` field in an
+        # --mcp-config stdio entry.  Without safe-path mode, ``python -m``
+        # therefore imports ``backend`` from the Task checkout when that
+        # checkout is another CCM clone.  Pin module resolution to the running
+        # Manager checkout instead of whichever repository the agent reviews.
+        "-P",
         "-m",
         module,
         *context_args,
@@ -145,6 +150,7 @@ def _ccm_server_spec(
         command=_VENV_PYTHON,
         args=tuple(args),
         cwd=_CCM_ROOT,
+        env={"PYTHONPATH": _CCM_ROOT},
         required=True,
         enabled_tools=enabled_tools,
         # These are CCM-owned, task-scoped tools whose handlers enforce the

@@ -233,9 +233,43 @@ export interface TestHarnessRunStart {
   viewport_height?: number;
   max_steps?: number;
   max_actions?: number;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
   test_plan?: Record<string, unknown>;
   parent_run_id?: string;
   idempotency_key?: string;
+}
+
+export interface TestHarnessRuntimeSelection {
+  provider: 'claude' | 'codex';
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+}
+
+export interface TestHarnessRuntimeConfig extends TestHarnessRuntimeSelection {
+  inherit_task: boolean;
+  source: 'task' | 'browser_review_config' | 'run_override';
+  task_runtime: TestHarnessRuntimeSelection;
+  default_provider: 'claude' | 'codex';
+  providers: ('claude' | 'codex')[];
+  default_models: Record<'claude' | 'codex', string>;
+  models_by_provider: Record<'claude' | 'codex', string[]>;
+  default_effort: string;
+  effort_options: Record<'claude' | 'codex', string[]>;
+  model_efforts: Record<'claude' | 'codex', Record<string, string[]>>;
+  codex_service_tiers: CodexServiceTier[];
+  codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+}
+
+export interface TestHarnessRuntimeConfigUpdate {
+  inherit_task: boolean;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
 }
 
 export interface WorkspaceReviewStart {
@@ -246,6 +280,10 @@ export interface WorkspaceReviewStart {
   browser_channel?: 'chrome' | 'chromium';
   viewport_width?: number;
   viewport_height?: number;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
 }
 
 export interface BrowserReviewConfig {
@@ -2444,6 +2482,13 @@ export const api = {
   // Durable, provider-neutral frontend Test Harness
   getTestHarnessCapabilities: (taskId: number) =>
     request<Record<string, unknown>>(`/api/tasks/${taskId}/test-runs/capabilities`),
+  getTestHarnessRuntimeConfig: (taskId: number) =>
+    request<TestHarnessRuntimeConfig>(`/api/tasks/${taskId}/test-runs/config`),
+  updateTestHarnessRuntimeConfig: (taskId: number, data: TestHarnessRuntimeConfigUpdate) =>
+    request<TestHarnessRuntimeConfig>(`/api/tasks/${taskId}/test-runs/config`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
   startTestRun: (taskId: number, data: TestHarnessRunStart) =>
     request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs`, {
       method: 'POST',

@@ -5637,12 +5637,14 @@ class CodexAppServerRegistry:
         *,
         reason: str,
     ) -> bool:
-        """Stop one durably-owned turn without killing peers on its transport.
+        """Stop one durably-owned turn, recycling its transport if necessary.
 
-        A failed exact interrupt is safe to escalate to account transport
-        shutdown only when no other live turn or admitted RPC shares that
-        server generation.  Otherwise the caller must retain its Task,
-        Instance and consumer ownership and surface a retryable conflict.
+        Exact thread/turn interruption is always attempted first.  If Codex
+        cannot confirm that interrupt (notably while native descendants are
+        wedged), an explicit user stop must still have a terminal outcome.
+        Once admission is drained, recycle the account transport.  Non-target
+        adapters fail and use the ordinary task retry path; leaving the target
+        permanently uninterruptible is not an acceptable alternative.
 
         Returns whether transport shutdown was required.
         """
@@ -5713,8 +5715,6 @@ class CodexAppServerRegistry:
                 blockers: list[str] = []
                 if not server_is_current or not target_is_current:
                     blockers.append("the exact target generation changed")
-                if has_peer_turns:
-                    blockers.append("another live turn shares the transport")
                 if starting:
                     blockers.append(
                         f"{starting} admitted app-server request(s) are in flight"
@@ -5728,6 +5728,14 @@ class CodexAppServerRegistry:
                         + "; ".join(blockers)
                     )
 
+                if has_peer_turns:
+                    logger.warning(
+                        "Recycling shared Codex app-server transport after "
+                        "an unconfirmed explicit turn interrupt; peer turns "
+                        "will fail and retry: %s",
+                        home,
+                    )
+
                 # Admission is drained and the target is the only remaining
                 # live adapter.  A verified transport stop is now isolated to
                 # this claimed task generation.
@@ -5737,12 +5745,24 @@ class CodexAppServerRegistry:
                     reason=reason,
                 )
 
-                # Real servers finish the target in their reader.  Preserve
+                # Real servers finish all adapters in their reader. Preserve
                 # the same guarantee for test doubles and an already-settled
-                # reader cancellation race.
+                # reader cancellation race. Peers are failures, never false
+                # successful completions.
                 for context in list(server._contexts_by_thread.values()):
                     if context.process is process:
-                        server._detach_turn_context(context)
+                        context.process.finish(
+                            130,
+                            reason,
+                            termination_kind="internal_abort",
+                        )
+                    else:
+                        context.process.finish(
+                            1,
+                            "Codex app-server recycled after another turn's "
+                            "explicit interrupt could not be confirmed",
+                        )
+                    server._detach_turn_context(context)
                 process.finish(
                     130,
                     reason,

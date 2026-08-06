@@ -27,6 +27,7 @@ from backend.api.uploads import router as uploads_router
 from backend.api.secrets import router as secrets_router
 from backend.api.tags import router as tags_router
 from backend.api.files import router as files_router
+from backend.api.ssh_profiles import router as ssh_profiles_router
 from backend.api.task_artifacts import router as task_artifacts_router
 from backend.api.pool import router as pool_router
 from backend.api.codex_pool import (
@@ -832,6 +833,7 @@ app.include_router(uploads_router)
 app.include_router(secrets_router)
 app.include_router(tags_router)
 app.include_router(files_router)
+app.include_router(ssh_profiles_router)
 app.include_router(task_artifacts_router)
 app.include_router(pool_router)
 app.include_router(codex_pool_router)

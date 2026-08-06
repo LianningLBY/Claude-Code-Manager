@@ -6,7 +6,7 @@ const DISPLAY_STATES = {
   reviewer: { label: 'Reviewing', className: 'border-violet-500/40 bg-violet-500/15 text-violet-300' },
   running: { label: 'Running', className: 'border-blue-400/40 bg-blue-400/15 text-blue-200' },
   waiting_user: { label: 'Needs input', className: 'border-amber-500/40 bg-amber-500/15 text-amber-300' },
-  awaiting_review: { label: 'Awaiting review', className: 'border-purple-500/40 bg-purple-500/15 text-purple-300' },
+  awaiting_review: { label: 'Needs approval', className: 'border-purple-500/40 bg-purple-500/15 text-purple-300' },
   approved: { label: 'Approved', className: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' },
   rejected: { label: 'Rejected', className: 'border-rose-500/40 bg-rose-500/15 text-rose-300' },
   applied: { label: 'Applied', className: 'border-teal-500/40 bg-teal-500/15 text-teal-300' },

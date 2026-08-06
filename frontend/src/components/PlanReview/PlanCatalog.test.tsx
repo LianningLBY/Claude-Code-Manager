@@ -47,11 +47,13 @@ describe('PlanCatalog', () => {
     ['approved', 'text-emerald-300'],
     ['applied', 'text-teal-300'],
     ['failed', 'text-red-300'],
+    ['rejected', 'text-rose-300'],
+    ['cancelled', 'text-orange-300'],
     ['archived', 'text-gray-400'],
     ['draft', 'text-gray-400'],
   ])('uses a semantic badge color for %s', (displayState, expectedClass) => {
     render(<PlanCatalog plans={[{ ...plan(1, 'Plan'), display_state: displayState }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onSetArchived={vi.fn()} />);
-    expect(screen.getByText(displayState === 'waiting_user' ? 'Needs input' : displayState === 'awaiting_review' ? 'Awaiting review' : displayState[0].toUpperCase() + displayState.slice(1))).toHaveClass(expectedClass);
+    expect(screen.getByText(displayState === 'waiting_user' ? 'Needs input' : displayState === 'awaiting_review' ? 'Needs approval' : displayState[0].toUpperCase() + displayState.slice(1))).toHaveClass(expectedClass);
   });
 
   it('archives and restores without selecting the Plan', async () => {

@@ -13,16 +13,17 @@ import { Archive, ChevronLeft, ChevronRight, Search, Settings, X } from '../comp
 
 const PAGE_SIZE = 20;
 type KindFilter = 'all' | 'standalone' | 'related';
-type StatusFilter = 'all' | 'waiting_user' | 'awaiting_review' | 'running' | 'approved' | 'applied' | 'failed';
+type StatusFilter = 'all' | 'waiting_user' | 'awaiting_review' | 'running' | 'approved' | 'applied' | 'failed' | 'rejected_cancelled';
 
 const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'waiting_user', label: 'Input' },
-  { value: 'awaiting_review', label: 'Review' },
+  { value: 'awaiting_review', label: 'Needs approval' },
   { value: 'running', label: 'Running' },
   { value: 'approved', label: 'Approved' },
   { value: 'applied', label: 'Applied' },
   { value: 'failed', label: 'Failed' },
+  { value: 'rejected_cancelled', label: 'Rejected / Cancelled' },
 ];
 
 const DISPLAY_STATE_QUERY: Record<StatusFilter, string | undefined> = {
@@ -33,6 +34,7 @@ const DISPLAY_STATE_QUERY: Record<StatusFilter, string | undefined> = {
   approved: 'approved',
   applied: 'applied',
   failed: 'failed',
+  rejected_cancelled: 'rejected,cancelled',
 };
 
 const EMPTY_STATUS_COUNTS: Record<StatusFilter, number> = {
@@ -43,6 +45,7 @@ const EMPTY_STATUS_COUNTS: Record<StatusFilter, number> = {
   approved: 0,
   applied: 0,
   failed: 0,
+  rejected_cancelled: 0,
 };
 
 interface Props {

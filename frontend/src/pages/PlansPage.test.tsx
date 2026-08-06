@@ -164,17 +164,19 @@ describe('PlansPage', () => {
       approved: 7,
       applied: 8,
       failed: 9,
+      'rejected,cancelled': 10,
     };
     vi.mocked(api.countPlans).mockImplementation(async (params = {}) => ({ total: totals[params.display_state || 'all'] }));
     render(<StatefulPlansPage />);
 
     expect(await screen.findByRole('button', { name: 'All 70' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Input 4' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Review 5' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Needs approval 5' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Running 6' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approved 7' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Applied 8' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Failed 9' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Rejected / Cancelled 10' })).toBeInTheDocument();
 
     await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Plan kind' }), 'standalone');
     await userEvent.click(screen.getByRole('button', { name: 'Select project' }));
@@ -184,7 +186,7 @@ describe('PlansPage', () => {
     const base = { kind: 'standalone', project_id: 3, q: 'architecture', archived_only: true };
     await waitFor(() => {
       expect(api.countPlans).toHaveBeenCalledWith(base);
-      for (const display_state of ['waiting_user', 'awaiting_review', 'planner,reviewer,queued,running', 'approved', 'applied', 'failed']) {
+      for (const display_state of ['waiting_user', 'awaiting_review', 'planner,reviewer,queued,running', 'approved', 'applied', 'failed', 'rejected,cancelled']) {
         expect(api.countPlans).toHaveBeenCalledWith({ ...base, display_state });
       }
     });
@@ -248,7 +250,7 @@ describe('PlansPage', () => {
 
     resolveRefresh([createdPlan, plan]);
     await waitFor(() => expect(api.listPlans).toHaveBeenCalledTimes(2));
-    expect(api.countPlans).toHaveBeenCalledTimes(16);
+    expect(api.countPlans).toHaveBeenCalledTimes(18);
   });
 
   it('archives through the optimistic-lock API and refreshes the catalog and counts', async () => {
@@ -261,7 +263,7 @@ describe('PlansPage', () => {
 
     expect(api.updatePlan).toHaveBeenCalledWith(plan.id, { archived: true, expected_lock_version: plan.lock_version });
     await waitFor(() => expect(screen.queryByRole('button', { name: plan.title })).not.toBeInTheDocument());
-    expect(vi.mocked(api.countPlans).mock.calls.length).toBeGreaterThanOrEqual(countCallsBefore + 8);
+    expect(vi.mocked(api.countPlans).mock.calls.length).toBeGreaterThanOrEqual(countCallsBefore + 9);
   });
 
   it('keeps the Plan and reports the API error when archiving fails', async () => {

@@ -12,13 +12,15 @@ vi.mock('../api/client', () => ({
     countPlans: vi.fn(),
     listProjects: vi.fn(),
     getPlan: vi.fn(),
+    updatePlan: vi.fn(),
   },
 }));
 
 vi.mock('../components/PlanReview/PlanCreateForm', () => ({
-  PlanCreateForm: ({ onCreated }: { onCreated: (plan: PlanResource) => void }) => (
+  PlanCreateForm: ({ onCreated, onNavigateSettings }: { onCreated: (plan: PlanResource) => void; onNavigateSettings: () => void }) => <div>
     <button type="button" onClick={() => onCreated(createdPlan)}>Create standalone Plan</button>
-  ),
+    <button type="button" onClick={onNavigateSettings}>Plan settings</button>
+  </div>,
 }));
 vi.mock('../components/PlanReview/PlanNeedsInputPanel', () => ({
   PlanNeedsInputPanel: ({ onVisibilityChange }: { onVisibilityChange?: (visible: boolean) => void }) => (
@@ -33,19 +35,17 @@ vi.mock('../components/PlanReview/PlanCatalog', () => ({
     plans,
     selectedPlanId,
     onSelectPlan,
+    onSetArchived,
   }: {
     plans: PlanResource[];
     selectedPlanId: number | null;
     onSelectPlan: (id: number) => void;
+    onSetArchived: (plan: PlanResource, archived: boolean) => Promise<void>;
   }) => <div>{plans.map((item) => (
-    <button
-      key={item.id}
-      type="button"
-      aria-pressed={selectedPlanId === item.id}
-      onClick={() => onSelectPlan(item.id)}
-    >
-      {item.title}
-    </button>
+    <div key={item.id}>
+      <button type="button" aria-pressed={selectedPlanId === item.id} onClick={() => onSelectPlan(item.id)}>{item.title}</button>
+      {item.active_run_id == null && <button type="button" onClick={() => void onSetArchived(item, item.archived_at == null)}>{item.archived_at ? `Restore Plan #${item.id}` : `Archive Plan #${item.id}`}</button>}
+    </div>
   ))}</div>,
 }));
 vi.mock('../components/PlanReview/PlanDetail', () => ({
@@ -59,7 +59,7 @@ vi.mock('../components/PlanReview/usePlanEvents', () => ({
   usePlanEvents: vi.fn(),
 }));
 vi.mock('../components/ProjectSelect', () => ({
-  ProjectSelect: () => null,
+  ProjectSelect: ({ onChange }: { onChange: (value: string) => void }) => <button type="button" onClick={() => onChange('3')}>Select project</button>,
 }));
 vi.mock('../hooks/useDialogA11y', () => ({
   useDialogA11y: () => ({ current: null }),
@@ -117,6 +117,7 @@ describe('PlansPage', () => {
     vi.mocked(api.countPlans).mockResolvedValue({ total: 1 });
     vi.mocked(api.listProjects).mockResolvedValue([]);
     vi.mocked(api.getPlan).mockResolvedValue(plan);
+    vi.mocked(api.updatePlan).mockResolvedValue(plan);
   });
 
   it('owns the Plan catalog, hides an empty action heading, and supports deep-link selection', async () => {
@@ -153,6 +154,58 @@ describe('PlansPage', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Create standalone Plan' }));
     expect(onSelectedPlanChange).not.toHaveBeenCalled();
     expect(screen.queryByText(`Detail for ${plan.title}`)).not.toBeInTheDocument();
+  });
+
+  it('shows status counts and applies base filters to every mapped count query', async () => {
+    const totals: Record<string, number> = {
+      all: 70,
+      waiting_user: 4,
+      awaiting_review: 5,
+      'planner,reviewer,queued,running': 6,
+      approved: 7,
+      applied: 8,
+      failed: 9,
+    };
+    vi.mocked(api.countPlans).mockImplementation(async (params = {}) => ({ total: totals[params.display_state || 'all'] }));
+    render(<StatefulPlansPage />);
+
+    expect(await screen.findByRole('button', { name: 'All 70' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Input 4' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Review 5' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Running 6' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approved 7' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Applied 8' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Failed 9' })).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Plan kind' }), 'standalone');
+    await userEvent.click(screen.getByRole('button', { name: 'Select project' }));
+    await userEvent.type(screen.getByPlaceholderText('Search Plans'), 'architecture');
+    await userEvent.click(screen.getByRole('button', { name: 'Archived only' }));
+
+    const base = { kind: 'standalone', project_id: 3, q: 'architecture', archived_only: true };
+    await waitFor(() => {
+      expect(api.countPlans).toHaveBeenCalledWith(base);
+      for (const display_state of ['waiting_user', 'awaiting_review', 'planner,reviewer,queued,running', 'approved', 'applied', 'failed']) {
+        expect(api.countPlans).toHaveBeenCalledWith({ ...base, display_state });
+      }
+    });
+  });
+
+  it('uses the selected status for the catalog and pagination total without changing preview counts', async () => {
+    vi.mocked(api.countPlans).mockImplementation(async (params = {}) => ({
+      total: params.display_state === 'planner,reviewer,queued,running' ? 23 : 61,
+    }));
+    render(<StatefulPlansPage />);
+    await screen.findByRole('button', { name: 'Running 23' });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Running 23' }));
+    await waitFor(() => expect(api.listPlans).toHaveBeenCalledWith(expect.objectContaining({
+      display_state: 'planner,reviewer,queued,running',
+      limit: 20,
+      offset: 0,
+    })));
+    expect(screen.getByText('1 / 2 · 23 Plans')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'All 61' })).toBeInTheDocument();
   });
 
   it('keeps the existing catalog visible while Plan detail opens and closes', async () => {
@@ -196,6 +249,31 @@ describe('PlansPage', () => {
 
     resolveRefresh([createdPlan, plan]);
     await waitFor(() => expect(api.listPlans).toHaveBeenCalledTimes(2));
+    expect(api.countPlans).toHaveBeenCalledTimes(16);
+  });
+
+  it('archives through the optimistic-lock API and refreshes the catalog and counts', async () => {
+    vi.mocked(api.listPlans).mockResolvedValueOnce([plan]).mockResolvedValue([]);
+    render(<StatefulPlansPage />);
+    await screen.findByRole('button', { name: plan.title });
+    const countCallsBefore = vi.mocked(api.countPlans).mock.calls.length;
+
+    await userEvent.click(screen.getByRole('button', { name: `Archive Plan #${plan.id}` }));
+
+    expect(api.updatePlan).toHaveBeenCalledWith(plan.id, { archived: true, expected_lock_version: plan.lock_version });
+    await waitFor(() => expect(screen.queryByRole('button', { name: plan.title })).not.toBeInTheDocument());
+    expect(vi.mocked(api.countPlans).mock.calls.length).toBeGreaterThanOrEqual(countCallsBefore + 8);
+  });
+
+  it('keeps the Plan and reports the API error when archiving fails', async () => {
+    vi.mocked(api.updatePlan).mockRejectedValueOnce(new Error('Plan was changed elsewhere'));
+    render(<StatefulPlansPage />);
+    await screen.findByRole('button', { name: plan.title });
+
+    await userEvent.click(screen.getByRole('button', { name: `Archive Plan #${plan.id}` }));
+
+    expect(await screen.findByText('Plan was changed elsewhere')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: plan.title })).toBeInTheDocument();
   });
 
   it('uses the app navigation callback for a related Plan Task', async () => {

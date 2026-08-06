@@ -11,6 +11,9 @@ const plan = (id: number, title: string) => ({
   target_task_id: null,
   project_id: null,
   display_state: 'awaiting_review',
+  active_run_id: null,
+  archived_at: null,
+  lock_version: 2,
   current_version: null,
   applications: [],
 } as PlanResource);
@@ -24,15 +27,62 @@ describe('PlanCatalog', () => {
         projects={[]}
         selectedPlanId={2}
         onSelectPlan={onSelectPlan}
+        onSetArchived={vi.fn()}
       />,
     );
 
     const selected = screen.getByRole('button', { name: /Second Plan/ });
     expect(selected).toHaveAttribute('aria-current', 'true');
-    expect(selected.className).toContain('border-indigo-500/70');
+    expect(selected.parentElement?.className).toContain('border-indigo-500/70');
     expect(screen.getByRole('button', { name: /First Plan/ })).not.toHaveAttribute('aria-current');
 
     await userEvent.click(screen.getByRole('button', { name: /First Plan/ }));
     expect(onSelectPlan).toHaveBeenCalledWith(1);
+  });
+
+  it.each([
+    ['queued', 'text-blue-300'],
+    ['waiting_user', 'text-amber-300'],
+    ['awaiting_review', 'text-purple-300'],
+    ['approved', 'text-emerald-300'],
+    ['applied', 'text-teal-300'],
+    ['failed', 'text-red-300'],
+    ['archived', 'text-gray-400'],
+    ['draft', 'text-gray-400'],
+  ])('uses a semantic badge color for %s', (displayState, expectedClass) => {
+    render(<PlanCatalog plans={[{ ...plan(1, 'Plan'), display_state: displayState }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onSetArchived={vi.fn()} />);
+    expect(screen.getByText(displayState === 'waiting_user' ? 'Needs input' : displayState === 'awaiting_review' ? 'Awaiting review' : displayState[0].toUpperCase() + displayState.slice(1))).toHaveClass(expectedClass);
+  });
+
+  it('archives and restores without selecting the Plan', async () => {
+    const onSelectPlan = vi.fn();
+    const onSetArchived = vi.fn().mockResolvedValue(undefined);
+    const archived = { ...plan(2, 'Archived Plan'), archived_at: '2026-08-01T00:00:00Z' };
+    render(<PlanCatalog plans={[plan(1, 'Current Plan'), archived]} projects={[]} selectedPlanId={null} onSelectPlan={onSelectPlan} onSetArchived={onSetArchived} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Archive Plan #1' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Restore Plan #2' }));
+
+    expect(onSetArchived).toHaveBeenNthCalledWith(1, expect.objectContaining({ id: 1 }), true);
+    expect(onSetArchived).toHaveBeenNthCalledWith(2, expect.objectContaining({ id: 2 }), false);
+    expect(onSelectPlan).not.toHaveBeenCalled();
+  });
+
+  it('hides archive actions for active Plans', () => {
+    render(<PlanCatalog plans={[{ ...plan(1, 'Running Plan'), active_run_id: 42 }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onSetArchived={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: 'Archive Plan #1' })).not.toBeInTheDocument();
+  });
+
+  it('disables the archive action while it is pending and keeps its accessible name', async () => {
+    let resolve!: () => void;
+    const pending = new Promise<void>((done) => { resolve = done; });
+    render(<PlanCatalog plans={[plan(1, 'Current Plan')]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onSetArchived={() => pending} />);
+
+    const archive = screen.getByRole('button', { name: 'Archive Plan #1' });
+    await userEvent.click(archive);
+    expect(archive).toBeDisabled();
+    expect(archive).toHaveAttribute('title', 'Archive');
+    resolve();
+    await vi.waitFor(() => expect(archive).not.toBeDisabled());
   });
 });

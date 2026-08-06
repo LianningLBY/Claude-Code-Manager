@@ -99,6 +99,13 @@ function App() {
   }, []);
 
   const handleNavigate = (p: string) => {
+    const nextHash = `#/${p}`;
+    if (window.location.hash !== nextHash) {
+      // Page navigation must create a history entry so the browser Back button
+      // returns to the exact page URL that preceded it. The state-sync effect
+      // continues to use replaceState for modal/chat URL updates.
+      window.history.pushState(null, '', nextHash);
+    }
     setPage(p);
     if (p !== 'tasks') setChatTaskId(null);
     if (p !== 'plans') setPlanId(null);
@@ -182,7 +189,7 @@ function App() {
       <AppShell currentPage={page} onNavigate={handleNavigate} wide={page === 'tasks' && !!chatTaskId}>
         {page === 'dashboard' && <Dashboard />}
         {page === 'tasks' && <TasksPage chatTaskId={chatTaskId} onChatTaskChange={setChatTaskId} />}
-        {page === 'plans' && <PlansPage selectedPlanId={planId} onSelectedPlanChange={setPlanId} onNavigateTask={handleNavigateTask} />}
+        {page === 'plans' && <PlansPage selectedPlanId={planId} onSelectedPlanChange={setPlanId} onNavigateTask={handleNavigateTask} onNavigateSettings={() => handleNavigate('settings')} />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'secrets' && <SecretsPage />}
         {page === 'files' && <FilesPage />}

@@ -1,11 +1,11 @@
 import type { ReactNode } from 'react';
 import {
   DashboardTwo, ListCheckbox, FolderCode, Key, FolderClose, CommentOne,
-  PullRequests, Server, Magic, Peoples, International, PreviewOpen,
+  PullRequests, Server, Magic, Peoples, International,
 } from '@icon-park/react';
 import {
   IoGrid, IoList, IoFolder, IoKey, IoDocuments, IoChatbubbles,
-  IoGitPullRequest, IoServer, IoSparkles, IoPeople, IoGlobe, IoEye,
+  IoGitPullRequest, IoServer, IoSparkles, IoPeople, IoGlobe,
 } from 'react-icons/io5';
 
 /**
@@ -30,7 +30,7 @@ import {
 /** 导航语义图标名 = AppShell 导航项的 key */
 export const NAV_ICON_KEYS = [
   'dashboard', 'tasks', 'projects', 'secrets', 'files', 'discussions',
-  'pr-monitor', 'browser-review', 'workers', 'skills', 'team', 'server',
+  'pr-monitor', 'workers', 'skills', 'team', 'server',
 ] as const;
 export type NavIconKey = typeof NAV_ICON_KEYS[number];
 
@@ -65,7 +65,6 @@ export const ICON_SETS: Record<string, IconSet> = {
     files: fs(FolderClose),
     discussions: fs(CommentOne),
     'pr-monitor': fs(PullRequests),
-    'browser-review': fs(PreviewOpen),
     workers: fs(Server),
     skills: fs(Magic),
     team: fs(Peoples),
@@ -79,7 +78,6 @@ export const ICON_SETS: Record<string, IconSet> = {
     files: sf(IoDocuments),
     discussions: sf(IoChatbubbles),
     'pr-monitor': sf(IoGitPullRequest),
-    'browser-review': sf(IoEye),
     workers: sf(IoServer),
     skills: sf(IoSparkles),
     team: sf(IoPeople),

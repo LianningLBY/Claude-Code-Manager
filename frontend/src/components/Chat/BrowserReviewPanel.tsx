@@ -18,7 +18,10 @@ import {
   Image,
   Loader2,
   PanelLeftOpen,
+  Play,
   RefreshCw,
+  Settings,
+  Shield,
   Square,
   ChevronDown,
   ChevronUp,
@@ -60,6 +63,12 @@ const STAGE_LABELS: Record<string, string> = {
 interface BrowserReviewPanelProps {
   taskId: number;
   taskActive: boolean;
+  taskProvider?: string;
+  taskModel?: string | null;
+  taskEffort?: string | null;
+  taskServiceTier?: string;
+  canStartConfiguredReview?: boolean;
+  configuredReviewUnavailableReason?: string;
   open: boolean;
   displayMode: BrowserReviewDisplayMode;
   onAvailableChange: (available: boolean) => void;
@@ -99,6 +108,7 @@ const FLOATING_POSITION_KEY = 'ccm-browser-review-floating-position';
 const FLOATING_WIDTH = 430;
 const FLOATING_MARGIN = 12;
 const FLOATING_HEADER_HEIGHT = 54;
+const DEFAULT_REVIEW_GOAL = '审查这个前端页面的视觉布局、交互反馈、明显的可访问性问题，以及控制台和网络错误。按严重程度输出问题、证据和复现步骤。';
 
 function clampFloatingPosition(position: FloatingPosition): FloatingPosition {
   const width = Math.min(FLOATING_WIDTH, Math.max(280, window.innerWidth - FLOATING_MARGIN * 2));
@@ -135,6 +145,12 @@ function statusClass(status: string): string {
 export function BrowserReviewPanel({
   taskId,
   taskActive,
+  taskProvider = 'codex',
+  taskModel = null,
+  taskEffort = null,
+  taskServiceTier = 'default',
+  canStartConfiguredReview = !taskActive,
+  configuredReviewUnavailableReason,
   open,
   displayMode,
   onAvailableChange,
@@ -160,6 +176,14 @@ export function BrowserReviewPanel({
   const [minimized, setMinimized] = useState(false);
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
   const [repeatingRunId, setRepeatingRunId] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [configuredUrl, setConfiguredUrl] = useState('');
+  const [configuredGoal, setConfiguredGoal] = useState(DEFAULT_REVIEW_GOAL);
+  const [configuredProfile, setConfiguredProfile] = useState<'quick' | 'standard' | 'exhaustive'>('standard');
+  const [configuredViewport, setConfiguredViewport] = useState('1440x900');
+  const [configuredBrowserChannel, setConfiguredBrowserChannel] = useState<'chrome' | 'chromium'>('chrome');
+  const [configuredAllowActions, setConfiguredAllowActions] = useState(false);
+  const [startingConfiguredReview, setStartingConfiguredReview] = useState(false);
   const [floatingPosition, setFloatingPosition] = useState<FloatingPosition>(loadFloatingPosition);
   const floatingPanelRef = useRef<HTMLElement | null>(null);
   const dragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
@@ -209,16 +233,19 @@ export function BrowserReviewPanel({
       if (expectedGoalRun) {
         expectedGoalReviewBaselineRef.current = undefined;
         setMinimized(false);
+        setSettingsOpen(false);
         onGoalReviewFound?.();
         onNewReview();
       } else if (expectedWorkspaceRun) {
         expectedWorkspaceReviewBaselineRef.current = undefined;
         setWaitingForWorkspaceReview(false);
         setMinimized(false);
+        setSettingsOpen(false);
         onExpectedWorkspaceReviewFound?.();
         onNewReview();
       } else if (hasNewReview) {
         setMinimized(false);
+        setSettingsOpen(false);
         onNewReview();
       }
       setError(null);
@@ -239,6 +266,8 @@ export function BrowserReviewPanel({
     setSelectedId(null);
     setLoading(true);
     setWaitingForWorkspaceReview(false);
+    setSettingsOpen(false);
+    setConfiguredUrl('');
     latestReviewIdRef.current = null;
     onAvailableChange(false);
     void refresh();
@@ -256,6 +285,7 @@ export function BrowserReviewPanel({
     setLoading(false);
     setError(null);
     setMinimized(false);
+    setSettingsOpen(false);
     onAvailableChange(true);
   }, [onAvailableChange, startedWorkspaceRun, taskId]);
 
@@ -266,6 +296,7 @@ export function BrowserReviewPanel({
     setLoading(true);
     setError(null);
     setMinimized(false);
+    setSettingsOpen(false);
     void refresh();
   }, [expectedWorkspaceReviewBaseline, refresh]);
 
@@ -281,6 +312,7 @@ export function BrowserReviewPanel({
     setLoading(true);
     setError(null);
     setMinimized(false);
+    setSettingsOpen(false);
     void refresh();
   }, [goalStart, refresh]);
 
@@ -408,6 +440,59 @@ export function BrowserReviewPanel({
       setRepeatingRunId(null);
     }
   };
+  const startConfiguredReview = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (startingConfiguredReview || taskActive || hasActiveReview || !canStartConfiguredReview) return;
+
+    const url = configuredUrl.trim();
+    const goal = configuredGoal.trim();
+    if (!url || !goal) return;
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('只支持 http:// 或 https:// 地址');
+      }
+    } catch (nextError) {
+      setError(nextError instanceof Error && nextError.message === '只支持 http:// 或 https:// 地址'
+        ? nextError.message
+        : '请输入完整的 http:// 或 https:// 网站地址');
+      return;
+    }
+
+    setStartingConfiguredReview(true);
+    setError(null);
+    const [viewportWidth, viewportHeight] = configuredViewport.split('x').map(Number);
+    try {
+      const started = await api.startTestRun(taskId, {
+        target_kind: 'fixed_url',
+        target: { url },
+        goal,
+        profile: configuredProfile,
+        allow_actions: configuredAllowActions,
+        browser_channel: configuredBrowserChannel,
+        viewport_width: viewportWidth,
+        viewport_height: viewportHeight,
+        max_steps: 20,
+        max_actions: 60,
+      });
+      startedWorkspaceRunRef.current = started;
+      latestReviewIdRef.current = started.id;
+      setRuns((current) => [
+        started,
+        ...current.filter((item) => item.id !== started.id),
+      ]);
+      setSelectedId(started.id);
+      setLoading(false);
+      setMinimized(false);
+      setSettingsOpen(false);
+      onAvailableChange(true);
+      onNewReview();
+    } catch (nextError) {
+      setError(`启动测试失败：${errorText(nextError)}`);
+    } finally {
+      setStartingConfiguredReview(false);
+    }
+  };
   const displayedGoalRound = goalProgress
     ? Math.min(
       Math.max(1, goalProgress.maxTurns),
@@ -464,10 +549,7 @@ export function BrowserReviewPanel({
     if (displayMode === 'docked') setMinimized(false);
   }, [displayMode]);
 
-  if (
-    !open
-    || (!waitingForWorkspaceReview && !waitingForGoalReview && !loading && runs.length === 0)
-  ) return null;
+  if (!open) return null;
 
   const panel = (
     <aside
@@ -489,7 +571,9 @@ export function BrowserReviewPanel({
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium text-gray-100">前端运行审查</div>
           <div className="truncate text-[10px] text-gray-500">
-            Task #{taskId}{displayedGoalRound ? ` · Goal Agent 第 ${displayedGoalRound} 轮` : ''} · {waitingForGoalReview
+            Task #{taskId}{displayedGoalRound ? ` · Goal Agent 第 ${displayedGoalRound} 轮` : ''} · {settingsOpen
+              ? '测试配置'
+              : waitingForGoalReview
               ? goalStart?.phase === 'starting_review'
                 ? '正在创建新的浏览器复查'
                 : '正在启动循环审查'
@@ -497,9 +581,23 @@ export function BrowserReviewPanel({
               ? '等待 Agent 创建新的浏览器审查'
               : displayedRun
               ? STAGE_LABELS[displayedRun.stage] || displayedRun.stage
-              : '加载审查进度'}
+              : loading
+                ? '加载测试记录'
+                : '待机 · 尚未启动测试'}
           </div>
         </div>
+        <button
+          type="button"
+          onClick={() => setSettingsOpen((value) => !value)}
+          className={`rounded p-1.5 transition-colors ${settingsOpen
+            ? 'bg-indigo-500/15 text-indigo-300'
+            : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'}`}
+          title={settingsOpen ? '返回测试进度' : '配置并启动网站测试'}
+          aria-label="Configure frontend test"
+          aria-pressed={settingsOpen}
+        >
+          <Settings size={14} />
+        </button>
         <button
           type="button"
           onClick={() => void refresh()}
@@ -550,7 +648,7 @@ export function BrowserReviewPanel({
         </button>
       </div>
 
-      {!minimized && !waitingForWorkspaceReview && !waitingForGoalReview && runs.length > 1 && (
+      {!minimized && !settingsOpen && !waitingForWorkspaceReview && !waitingForGoalReview && runs.length > 1 && (
         <div className="border-b border-gray-600/50 px-3 py-2">
           <div className="flex items-center gap-1.5">
             <select
@@ -589,7 +687,141 @@ export function BrowserReviewPanel({
         </div>
       )}
 
-      {!minimized && <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+      {!minimized && settingsOpen && (
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          <form onSubmit={startConfiguredReview} className="space-y-4" data-testid="frontend-test-settings">
+            <section className="rounded-lg border border-indigo-500/25 bg-indigo-500/8 p-3">
+              <div className="flex items-center gap-2 text-sm font-medium text-indigo-300">
+                <Settings size={15} />网站测试配置
+              </div>
+              <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
+                直接在当前 Task 中创建固定 URL 的独立 Harness Run。当前分支和循环审查仍可从输入框上方的测试按钮启动。
+              </p>
+            </section>
+
+            {error && (
+              <div role="alert" className="flex items-start gap-2 rounded border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-xs text-red-300">
+                <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                <span className="break-words">{error}</span>
+              </div>
+            )}
+
+            <section className="rounded-lg border border-gray-600/60 bg-gray-900/55 p-3">
+              <div className="flex items-start gap-2">
+                <Shield size={14} className="mt-0.5 shrink-0 text-emerald-400" />
+                <div className="min-w-0">
+                  <div className="text-xs font-medium text-gray-200">沿用当前 Task 运行配置</div>
+                  <div className="mt-1 break-words text-[10px] leading-relaxed text-gray-500">
+                    {taskProvider === 'claude' ? 'Claude' : 'Codex'} · {taskModel || '默认模型'} · effort {taskEffort || '默认'}
+                    {taskProvider === 'codex' ? ` · ${taskServiceTier === 'priority' ? 'Fast' : 'Standard'}` : ''}
+                  </div>
+                  <div className="mt-1 text-[10px] leading-relaxed text-gray-500">
+                    Provider、模型和速度由 Task Config 统一管理，测试会冻结启动时的配置。
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <div>
+              <label htmlFor={`frontend-test-url-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">待检测网站</label>
+              <input
+                id={`frontend-test-url-${taskId}`}
+                type="url"
+                required
+                value={configuredUrl}
+                onChange={(event) => setConfiguredUrl(event.target.value)}
+                placeholder="https://example.com 或 http://127.0.0.1:5173"
+                className="w-full rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2.5 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label htmlFor={`frontend-test-goal-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">测试目标</label>
+              <textarea
+                id={`frontend-test-goal-${taskId}`}
+                required
+                rows={4}
+                value={configuredGoal}
+                onChange={(event) => setConfiguredGoal(event.target.value)}
+                className="w-full resize-y rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2.5 text-sm leading-relaxed text-gray-100 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 lg:grid-cols-1">
+              <div>
+                <label htmlFor={`frontend-test-profile-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">测试深度</label>
+                <select
+                  id={`frontend-test-profile-${taskId}`}
+                  value={configuredProfile}
+                  onChange={(event) => setConfiguredProfile(event.target.value as 'quick' | 'standard' | 'exhaustive')}
+                  className="w-full rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+                >
+                  <option value="quick">快速</option>
+                  <option value="standard">标准</option>
+                  <option value="exhaustive">完整</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor={`frontend-test-viewport-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">视口</label>
+                <select
+                  id={`frontend-test-viewport-${taskId}`}
+                  value={configuredViewport}
+                  onChange={(event) => setConfiguredViewport(event.target.value)}
+                  className="w-full rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+                >
+                  <option value="1440x900">桌面 1440×900</option>
+                  <option value="1280x720">桌面 1280×720</option>
+                  <option value="768x1024">平板 768×1024</option>
+                  <option value="390x844">手机 390×844</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor={`frontend-test-browser-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">浏览器</label>
+                <select
+                  id={`frontend-test-browser-${taskId}`}
+                  value={configuredBrowserChannel}
+                  onChange={(event) => setConfiguredBrowserChannel(event.target.value as 'chrome' | 'chromium')}
+                  className="w-full rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+                >
+                  <option value="chrome">系统 Chrome</option>
+                  <option value="chromium">Playwright Chromium</option>
+                </select>
+              </div>
+            </div>
+
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-600/45 bg-gray-900/55 px-3 py-2.5 text-xs text-gray-300">
+              <input
+                type="checkbox"
+                checked={configuredAllowActions}
+                onChange={(event) => setConfiguredAllowActions(event.target.checked)}
+                className="mt-0.5 rounded border-gray-600 bg-gray-800 text-indigo-500"
+              />
+              <span>
+                允许安全的点击和输入
+                <span className="mt-0.5 block text-[10px] leading-relaxed text-gray-500">仍会阻止跨域顶层跳转、弹窗和下载；不要用于生产写操作或含敏感账号的页面。</span>
+              </span>
+            </label>
+
+            <button
+              type="submit"
+              disabled={startingConfiguredReview || taskActive || hasActiveReview || !canStartConfiguredReview || !configuredUrl.trim() || !configuredGoal.trim()}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white shadow-md shadow-indigo-600/20 transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              {startingConfiguredReview ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
+              {startingConfiguredReview ? '正在创建测试…' : '开始网站测试'}
+            </button>
+            {(taskActive || hasActiveReview || !canStartConfiguredReview) && (
+              <p className="text-center text-[10px] leading-relaxed text-amber-300">
+                {hasActiveReview
+                  ? '当前已有测试正在执行，请等待结束或先停止。'
+                  : configuredReviewUnavailableReason || '等待当前 Task 回合结束后再从界面启动测试。'}
+              </p>
+            )}
+          </form>
+        </div>
+      )}
+
+      {!minimized && !settingsOpen && <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
         {waitingForGoalReview && goalStart && (
           <section data-testid="frontend-review-goal-starting" className="flex min-h-72 flex-col items-center justify-center rounded-lg border border-indigo-500/35 bg-indigo-500/8 px-5 py-8 text-center">
             <div className="flex h-11 w-11 items-center justify-center rounded-full border border-indigo-400/35 bg-indigo-400/10">
@@ -639,8 +871,29 @@ export function BrowserReviewPanel({
         {loading && !waitingForWorkspaceReview && !waitingForGoalReview && !displayedRun && (
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500">
             <Loader2 size={15} className="animate-spin" />
-            加载审查运行…
+            加载测试记录…
           </div>
+        )}
+        {!loading && !waitingForWorkspaceReview && !waitingForGoalReview && !displayedRun && (
+          <section data-testid="frontend-test-idle" className="flex min-h-80 flex-col items-center justify-center rounded-xl border border-dashed border-gray-600/60 bg-gray-900/35 px-6 py-10 text-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-indigo-500/25 bg-indigo-500/10 text-indigo-300">
+              <Eye size={22} />
+            </div>
+            <div className="mt-4 text-sm font-medium text-gray-100">尚未启动前端测试</div>
+            <p className="mt-1 max-w-72 text-[11px] leading-relaxed text-gray-400">
+              这里会显示实时浏览器画面、操作轨迹、运行时错误和最终报告。
+            </p>
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className="mt-5 inline-flex items-center gap-2 rounded-lg border border-indigo-500/35 bg-indigo-500/10 px-3.5 py-2 text-xs font-medium text-indigo-300 transition-colors hover:bg-indigo-500/15"
+            >
+              <Settings size={14} />配置网站测试
+            </button>
+            <div className="mt-4 max-w-72 text-[10px] leading-relaxed text-gray-500">
+              也可以使用输入框上方的“单次审查”或“循环审查”，测试当前分支的新功能。
+            </div>
+          </section>
         )}
         {error && (
           <div role="alert" className="flex items-start gap-2 rounded border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-xs text-red-300">

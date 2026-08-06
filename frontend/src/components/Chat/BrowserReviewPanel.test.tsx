@@ -10,6 +10,7 @@ vi.mock('../../api/client', () => ({
     getTestRunEvidence: vi.fn(),
     cancelTestRun: vi.fn(),
     repeatTestRun: vi.fn(),
+    startTestRun: vi.fn(),
   },
 }));
 
@@ -284,11 +285,11 @@ describe('BrowserReviewPanel', () => {
     await waitFor(() => expect(onAvailableChange).toHaveBeenCalledWith(true));
   });
 
-  it('stays hidden until the task has called the review tool', async () => {
+  it('shows a standby page before the task has started a test', async () => {
     vi.mocked(api.listTestRuns).mockResolvedValue([]);
     const onAvailableChange = vi.fn();
 
-    const { container } = render(
+    render(
       <BrowserReviewPanel
         taskId={73}
         taskActive={false}
@@ -302,7 +303,77 @@ describe('BrowserReviewPanel', () => {
     );
 
     await waitFor(() => expect(onAvailableChange).toHaveBeenCalledWith(false));
-    expect(container).toBeEmptyDOMElement();
+    expect(await screen.findByTestId('frontend-test-idle')).toBeInTheDocument();
+    expect(screen.getByText('尚未启动前端测试')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置网站测试' }));
+    expect(screen.getByTestId('frontend-test-settings')).toBeInTheDocument();
+    expect(screen.getByLabelText('待检测网站')).toBeInTheDocument();
+  });
+
+  it('starts a fixed URL Harness run from the right-panel configuration', async () => {
+    vi.mocked(api.listTestRuns).mockResolvedValue([]);
+    const startedRun = makeHarnessRun({
+      id: 'harness-configured-url',
+      root_run_id: 'harness-configured-url',
+      status: 'queued',
+      stage: 'waiting_for_browser',
+      target_kind: 'fixed_url',
+      target: { url: 'http://127.0.0.1:5173' },
+      test_plan: { version: 1, objective: '检查设置保存流程', scenarios: [] },
+      browser_review: null,
+      report: null,
+      verdict: null,
+      completed_at: null,
+      cleanup_status: 'pending',
+    });
+    vi.mocked(api.startTestRun).mockResolvedValue(startedRun);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        taskProvider="codex"
+        taskModel="gpt-5.6-sol"
+        taskEffort="high"
+        taskServiceTier="priority"
+        canStartConfiguredReview
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置网站测试' }));
+    expect(screen.getByText(/Codex · gpt-5.6-sol · effort high · Fast/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('待检测网站'), {
+      target: { value: 'http://127.0.0.1:5173' },
+    });
+    fireEvent.change(screen.getByLabelText('测试目标'), {
+      target: { value: '检查设置保存流程' },
+    });
+    fireEvent.change(screen.getByLabelText('测试深度'), { target: { value: 'exhaustive' } });
+    fireEvent.change(screen.getByLabelText('视口'), { target: { value: '390x844' } });
+    fireEvent.change(screen.getByLabelText('浏览器'), { target: { value: 'chromium' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /允许安全的点击和输入/ }));
+    fireEvent.click(screen.getByRole('button', { name: '开始网站测试' }));
+
+    await waitFor(() => expect(api.startTestRun).toHaveBeenCalledWith(73, {
+      target_kind: 'fixed_url',
+      target: { url: 'http://127.0.0.1:5173' },
+      goal: '检查设置保存流程',
+      profile: 'exhaustive',
+      allow_actions: true,
+      browser_channel: 'chromium',
+      viewport_width: 390,
+      viewport_height: 844,
+      max_steps: 20,
+      max_actions: 60,
+    }));
+    expect(await screen.findByText('Test Harness · fixed_url')).toBeInTheDocument();
+    expect(screen.queryByTestId('frontend-test-settings')).not.toBeInTheDocument();
   });
 
   it('supports floating, minimizing, restoring, and docking the review window', async () => {

@@ -670,6 +670,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     && !isProcessing
     && workspaceReviewCanBeConfigured
   );
+  const canStartConfiguredBrowserReview = (
+    task.worker_id == null
+    && task.shared_from_id == null
+    && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
+    && !isProcessing
+  );
   const canStartFrontendReviewGoal = (
     task.worker_id == null
     && task.shared_from_id == null
@@ -693,6 +699,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       : frontendReviewGoalCapabilityLoading
         ? '正在确认可修改的本地 Git 仓库…'
         : workspaceReviewCapability?.reason || frontendReviewGoalCapability?.reason || '尚未确认存在可修改的本地 Git 仓库';
+  const configuredBrowserReviewUnavailableReason = task.worker_id != null
+    ? 'Worker Task 暂不支持从 Manager 界面直接启动网站测试'
+    : task.shared_from_id != null
+      ? '共享 Task 只能查看已有测试记录'
+      : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+        ? 'Task 正在执行；Agent 可在对话中调用测试工具，或等待完成后从这里启动'
+        : null;
   const isFrontendReviewGoal = task.metadata_?.frontend_review?.mode === 'goal';
   const frontendReviewGoalTaskActive = ['pending', 'in_progress', 'executing'].includes(effectiveStatus);
   const showFrontendReviewGoal = frontendReviewGoalStart !== null
@@ -2117,22 +2130,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               active={monitorCount > 0}
               onNavigate={() => setShowMonitorPanel(!showMonitorPanel)}
             />
-            {browserReviewAvailable && (
-              <button
-                type="button"
-                onClick={() => setShowBrowserReviewPanel((value) => !value)}
-                className={`relative rounded p-1.5 transition-colors ${
-                  showBrowserReviewPanel
-                    ? 'bg-indigo-500/15 text-indigo-300'
-                    : 'text-gray-600 hover:text-indigo-400'
-                }`}
-                title={browserReviewDisplayMode === 'floating' ? '查看前端运行审查浮窗' : '查看前端运行审查'}
-                aria-label="Toggle Frontend Review panel"
-              >
-                <Eye size={18} />
-                <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => setShowBrowserReviewPanel((value) => !value)}
+              className={`relative rounded p-1.5 transition-colors ${
+                showBrowserReviewPanel
+                  ? 'bg-indigo-500/15 text-indigo-300'
+                  : 'text-gray-600 hover:text-indigo-400'
+              }`}
+              title={browserReviewDisplayMode === 'floating' ? '打开前端测试浮窗' : '打开前端测试栏'}
+              aria-label="Toggle Frontend Review panel"
+            >
+              <Eye size={18} />
+              <span
+                className={`absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full ${browserReviewAvailable ? 'bg-emerald-400' : 'bg-gray-500'}`}
+                aria-hidden="true"
+              />
+            </button>
             <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
             <button
               onClick={() => {
@@ -3065,6 +3079,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         <BrowserReviewPanel
           taskId={task.id}
           taskActive={isProcessing}
+          taskProvider={task.provider}
+          taskModel={task.model}
+          taskEffort={task.effort_level}
+          taskServiceTier={task.codex_service_tier}
+          canStartConfiguredReview={canStartConfiguredBrowserReview}
+          configuredReviewUnavailableReason={configuredBrowserReviewUnavailableReason || undefined}
           open={showBrowserReviewPanel}
           displayMode={browserReviewDisplayMode}
           onAvailableChange={handleBrowserReviewAvailable}

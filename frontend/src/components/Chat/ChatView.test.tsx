@@ -902,6 +902,29 @@ describe('ChatView', () => {
   });
 
   describe('follow-up 循环审查模式', () => {
+    it('keeps the right-side test entry visible and opens the standby page without runs', async () => {
+      const task = makeTask({
+        id: 406,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      vi.mocked(api.listTestRuns).mockResolvedValue([]);
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const testPanelButton = screen.getByRole('button', { name: 'Toggle Frontend Review panel' });
+      expect(testPanelButton).toBeInTheDocument();
+      await userEvent.click(testPanelButton);
+      expect(await screen.findByText('尚未启动前端测试')).toBeInTheDocument();
+    });
+
     it('普通对话识别为前端验收后立即打开右栏等待新的浏览器 run', async () => {
       const task = makeTask({
         id: 407,

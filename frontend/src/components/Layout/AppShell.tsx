@@ -3,7 +3,6 @@ import type { ReactNode } from 'react';
 import {
   Bot, Menu, X, PanelLeftClose, PanelLeftOpen, LayoutDashboard, ListTodo, FolderGit2, KeyRound,
   FolderOpen, MessagesSquare, GitPullRequest, Server, Sparkles, Users, Globe,
-  Eye,
 } from '../icons';
 import type { ComponentType } from 'react';
 import { api } from '../../api/client';
@@ -121,7 +120,6 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
     { key: 'files', label: 'Files', icon: FolderOpen, show: isAdmin },
     { key: 'discussions', label: 'Discussions', icon: MessagesSquare, show: true },
     { key: 'pr-monitor', label: 'PR Monitor', icon: GitPullRequest, show: isAdmin || hasWorker },
-    { key: 'browser-review', label: 'Browser Review', icon: Eye, show: isAdmin },
     { key: 'workers', label: 'Workers', icon: Server, show: isAdmin || hasWorker },
     { key: 'skills', label: 'Skills', icon: Sparkles, show: true },
     { key: 'team', label: 'Team', icon: Users, show: true },

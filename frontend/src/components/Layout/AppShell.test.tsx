@@ -122,6 +122,7 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Browser Review' })).not.toBeInTheDocument();
   });
 
   describe('header stacking context', () => {

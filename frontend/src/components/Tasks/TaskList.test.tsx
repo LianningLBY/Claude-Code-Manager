@@ -15,6 +15,26 @@ vi.mock('../../api/client', () => ({
     starTask: vi.fn().mockResolvedValue({}),
     archiveTask: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
+    getDeliveryRun: vi.fn().mockResolvedValue({
+      id: 17,
+      phase: 'monitoring',
+      activity: 'waiting',
+      outcome: null,
+      cycle_count: 1,
+      max_cycles: 10,
+      turn_count: 1,
+      delivery_branch: 'ccm/delivery/17-controlled-delivery',
+      wait_reason: 'pr_monitor',
+      pause_reason: null,
+      error_code: null,
+      error_message: null,
+      pr_number: null,
+      pr_url: null,
+      allowed_actions: [],
+    }),
+    pauseDeliveryRun: vi.fn(),
+    resumeDeliveryRun: vi.fn(),
+    cancelDeliveryRun: vi.fn(),
   },
 }));
 
@@ -79,6 +99,40 @@ describe('TaskList', () => {
     render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('Custom Title')).toBeInTheDocument();
     expect(screen.getByText('The prompt')).toBeInTheDocument();
+  });
+
+  it('renders a Delivery-owned scheduler shell with Run controls but no Task mutations', async () => {
+    const tasks = [makeTask({
+      mode: 'delivery_loop',
+      status: 'failed',
+      title: 'Controlled delivery',
+      session_id: 'delivery-session',
+      delivery_run_id: 17,
+      delivery_phase: 'monitoring',
+      delivery_activity: 'waiting',
+      attention_tag: 'operator note',
+    })];
+
+    render(
+      <TaskList
+        tasks={tasks}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    const runButton = screen.getByRole('button', { name: 'Delivery #17' });
+    expect(runButton).toBeInTheDocument();
+    expect(screen.getByText('operator note')).toBeInTheDocument();
+    expect(screen.getByTitle('Chat')).toBeInTheDocument();
+    expect(screen.queryByTitle('More actions')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('按住拖动排序')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Edit attention tag')).not.toBeInTheDocument();
+    await userEvent.click(runButton);
+    expect(await screen.findByRole('region', { name: 'Delivery Run #17' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+    expect(screen.getByText(/observation-only/)).toBeInTheDocument();
   });
 
   it.each([

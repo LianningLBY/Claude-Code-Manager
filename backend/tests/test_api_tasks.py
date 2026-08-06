@@ -29,6 +29,37 @@ async def test_create_task(client):
 
 
 @pytest.mark.asyncio
+async def test_create_task_with_explicit_id_uses_internal_service_gate(client):
+    from fastapi import HTTPException
+
+    with patch(
+        "backend.api.tasks.require_internal_service",
+        side_effect=HTTPException(
+            403,
+            "Internal service authentication required",
+        ),
+    ) as require_internal:
+        rejected = await client.post("/api/tasks", json={
+            "id": 7001,
+            "title": "caller-chosen identity",
+            "description": "must be internal",
+        })
+
+    assert rejected.status_code == 403
+    require_internal.assert_called_once()
+
+    # Auth-disabled installations intentionally preserve their historical
+    # fully-open semantics through the real guard.
+    allowed = await client.post("/api/tasks", json={
+        "id": 7001,
+        "title": "manager-forwarded identity",
+        "description": "accepted without configured auth",
+    })
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["id"] == 7001
+
+
+@pytest.mark.asyncio
 async def test_create_task_rejects_unknown_mode_before_write(
     client,
     session_factory,

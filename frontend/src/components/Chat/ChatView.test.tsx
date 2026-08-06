@@ -76,6 +76,26 @@ vi.mock('../../api/client', () => ({
       blob: new Blob(['artifact']),
       filename: '汇报稿.md',
     }),
+    getDeliveryRun: vi.fn().mockResolvedValue({
+      id: 42,
+      phase: 'monitoring',
+      activity: 'waiting',
+      outcome: null,
+      cycle_count: 2,
+      max_cycles: 10,
+      turn_count: 2,
+      delivery_branch: 'ccm/delivery/42-controlled-delivery',
+      wait_reason: 'pr_monitor',
+      pause_reason: null,
+      error_code: null,
+      error_message: null,
+      pr_number: 123,
+      pr_url: 'https://github.com/acme/repo/pull/123',
+      allowed_actions: [],
+    }),
+    pauseDeliveryRun: vi.fn(),
+    resumeDeliveryRun: vi.fn(),
+    cancelDeliveryRun: vi.fn(),
   },
 }));
 
@@ -311,6 +331,43 @@ describe('ChatView', () => {
         Reflect.deleteProperty(window, 'visualViewport');
       }
     }
+  });
+
+  it('renders Delivery-owned developer conversations as read-only', async () => {
+    render(
+      <ChatView
+        task={makeTask({
+          mode: 'delivery_loop',
+          delivery_run_id: 42,
+          delivery_role: 'developer',
+          status: 'in_progress',
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+        })}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+
+    expect(screen.getByTestId('delivery-read-only')).toHaveTextContent(
+      'Delivery Run #42 owns this Developer Task',
+    );
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Plans' })).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Edit title')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Fork Codex session')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Distill skill from conversation')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Add attention tag')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: 'Delivery Run #42' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+    expect(screen.getByText(/observation-only/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'PR #123' })).toHaveAttribute(
+      'href',
+      'https://github.com/acme/repo/pull/123',
+    );
+    expect(screen.getByTitle('Star')).toBeInTheDocument();
   });
 
   describe('chat conflict state', () => {

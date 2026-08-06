@@ -35,6 +35,7 @@ from backend.models.plan import Plan
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
+from backend.services.pr_review_runtime import is_pr_sandbox_task
 from backend.services.task_queue import (
     PR_REVIEW_SUPERSEDED_METADATA_KEY,
     task_retry_not_superseded_predicate,
@@ -280,6 +281,16 @@ class TaskMigrator:
                         "Coordinated updates require a Worker location change"
                     )
                 return  # 已在目标位置
+            if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+                raise MigrationError(
+                    "Delivery Loop V1 is local-only; pause and finish the Run "
+                    "on its owning Manager instead of migrating its Developer Task"
+                )
+            if is_pr_sandbox_task(task):
+                raise MigrationError(
+                    "Automated PR workflow Tasks are bound to their isolated "
+                    "review runtime and cannot be migrated"
+                )
             if (
                 (task.metadata_ or {}).get(
                     PR_REVIEW_SUPERSEDED_METADATA_KEY

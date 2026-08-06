@@ -2722,6 +2722,7 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
             "task_status": "completed",
             "terminal_consumer_timeout": 30.0,
             "consumer_cancel_timeout": 10.0,
+            "allow_delivery_effect_stop": True,
         }
         async with session_factory() as db:
             stopped_task = await db.get(Task, old_task_id)

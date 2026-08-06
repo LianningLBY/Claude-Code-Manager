@@ -1,4 +1,5 @@
 from datetime import datetime
+import secrets
 
 from sqlalchemy import (
     CheckConstraint,
@@ -8,6 +9,7 @@ from sqlalchemy import (
     Text,
     DateTime,
     JSON,
+    UniqueConstraint,
     select,
     func,
 )
@@ -23,9 +25,33 @@ class Task(Base):
             "codex_service_tier IN ('default', 'priority')",
             name="ck_tasks_codex_service_tier",
         ),
+        CheckConstraint(
+            "(mode = 'delivery_loop' AND delivery_run_id IS NOT NULL "
+            "AND delivery_role = 'developer') OR "
+            "(mode <> 'delivery_loop' AND delivery_run_id IS NULL "
+            "AND delivery_role IS NULL)",
+            name="ck_tasks_delivery_owner_shape",
+        ),
+        UniqueConstraint(
+            "incarnation_id",
+            name="uq_tasks_incarnation_id",
+        ),
+        # Task ids are external security identities (HTTP resources, WS
+        # channels, share tokens, Worker mirrors).  SQLite's default ROWID may
+        # reuse the deleted highest id; AUTOINCREMENT permanently forbids that
+        # cross-incarnation aliasing.  Other dialects ignore this table option.
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Durable random incarnation used whenever an external integer Task id is
+    # observed before a lock and acted on afterwards.  Nullable keeps legacy
+    # rows readable; every newly constructed Task receives a token.
+    incarnation_id: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        default=lambda: secrets.token_hex(16),
+    )
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)  # nullable for loop tasks
     status: Mapped[str] = mapped_column(
@@ -44,7 +70,14 @@ class Task(Base):
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
-    mode: Mapped[str] = mapped_column(String(20), default="auto")  # "auto", "plan", or "loop"
+    mode: Mapped[str] = mapped_column(String(20), default="auto")  # auto/plan/loop/goal/delivery_loop
+    # DeliveryRun is Manager authority and is not mirrored as a foreign key on
+    # remote Workers.  The controller is the only writer of these routing
+    # fields; ordinary Task APIs must not synthesize a delivery-owned Task.
+    delivery_run_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    delivery_role: Mapped[str | None] = mapped_column(String(24), nullable=True)
     todo_file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)  # loop only: path relative to target_repo
     loop_progress: Mapped[str | None] = mapped_column(String(200), nullable=True)  # loop only: e.g. "3/5", written by Claude
     max_iterations: Mapped[int] = mapped_column(Integer, default=50)  # loop only: max iterations before auto-abort
@@ -156,6 +189,7 @@ class Task(Base):
 
 
 def _configure_task_properties():
+    from backend.models.delivery import DeliveryRun
     from backend.models.monitor_session import MonitorSession
     from backend.models.plan import PlanLegacyTaskLink
     from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
@@ -164,6 +198,7 @@ def _configure_task_properties():
     legacy_plan_links = PlanLegacyTaskLink.__table__
     plan_runs = PlanAgentRun.__table__
     plan_steps = PlanAgentStep.__table__
+    delivery_runs = DeliveryRun.__table__
     # Always show real running sub-agent count — background agents can
     # outlive the main turn, so even completed tasks may have active sub-agents.
     Task.active_sub_agents = column_property(
@@ -235,6 +270,27 @@ def _configure_task_properties():
     )
     Task.plan_stage_route_slot = column_property(
         latest_plan_step_value(plan_steps.c.route_slot)
+    )
+    Task.delivery_phase = column_property(
+        select(delivery_runs.c.phase)
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    Task.delivery_activity = column_property(
+        select(delivery_runs.c.activity)
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    Task.delivery_outcome = column_property(
+        select(delivery_runs.c.outcome)
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
     )
 
 _configure_task_properties()

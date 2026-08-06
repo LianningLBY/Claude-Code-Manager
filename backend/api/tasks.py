@@ -106,6 +106,19 @@ _PR_REVIEW_CHAT_TERMINAL_STATUSES = frozenset(
 )
 
 
+def _require_not_delivery_owned_task(task: Task, *, action: str) -> None:
+    """Route lifecycle mutations through DeliveryRun, never its worker Task."""
+
+    if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+        run_id = task.delivery_run_id
+        suffix = f" #{run_id}" if isinstance(run_id, int) else ""
+        raise HTTPException(
+            409,
+            f"Delivery-owned Tasks cannot be manually {action}; use Delivery Run"
+            f"{suffix} controls so the Plan/Code/Review/PR evidence stays fenced",
+        )
+
+
 async def _require_no_pr_review_publication(
     db: AsyncSession,
     task_id: int,
@@ -198,6 +211,23 @@ async def _require_pr_review_chat_allowed(
         )
     metadata = task.metadata_ or {}
     tags = task.tags
+    from backend.services.pr_review_runtime import PRE_PR_CODE_REVIEW_TAG
+
+    pre_pr_capability_marker = (
+        isinstance(tags, (list, tuple, set, dict))
+        and PRE_PR_CODE_REVIEW_TAG in tags
+    ) or (
+        type(metadata.get("code_review_run_id")) is int
+        and type(metadata.get("capability_invocation_id")) is int
+        and type(metadata.get("capability_execution_id")) is int
+    )
+    if pre_pr_capability_marker:
+        raise HTTPException(
+            409,
+            "Pre-PR Code Review Capability Tasks cannot accept manual "
+            "discussion or live injection; their immutable prompt and exact "
+            "structured verdict are Controller-owned",
+        )
     tag_marker = (
         isinstance(tags, (list, tuple, set, dict))
         and "pr-review" in tags
@@ -649,10 +679,21 @@ async def create_task(
     db: AsyncSession = Depends(get_db),
 ):
     user_id = get_current_user_id(request)
+    if body.id is not None:
+        # Only Manager -> Worker forwarding may choose the globally allocated
+        # Task id.  Letting an ordinary JWT caller choose it makes identifier
+        # reuse and cross-node identity collisions externally controllable.
+        require_internal_service(request)
     if body.mode == "plan":
         raise HTTPException(
             410,
             "Legacy mode=plan Task creation is closed; use POST /api/plans",
+        )
+    if body.session_id is not None or body.last_cwd is not None:
+        raise HTTPException(
+            422,
+            "session_id and last_cwd are internal execution state; use "
+            "clone_from_task_id or the migration-import protocol",
         )
     if body.secret_ids:
         require_admin(request)
@@ -708,7 +749,18 @@ async def create_task(
                 400,
                 "Task Worker must match the selected Project location",
             )
+        if (
+            body.target_repo is not None
+            and body.target_repo != project.local_path
+        ):
+            raise HTTPException(
+                422,
+                "Task target_repo must match the selected Project local_path",
+            )
         data["worker_id"] = project.worker_id
+        # Project is the execution authority for its repository path.  Never
+        # retain a client-supplied alias (or a stale path copied from a Task).
+        data["target_repo"] = project.local_path
 
     target_worker_id = data.get("worker_id")
     if project is None:
@@ -858,6 +910,7 @@ async def create_task(
         if source is None:
             raise HTTPException(404, "Clone source task not found")
         await require_task_control(request, source, db)
+        _require_not_delivery_owned_task(source, action="used as clone sources")
         if "attention_tag" not in body.model_fields_set:
             data["attention_tag"] = source.attention_tag
         cloned = await _clone_session(clone_from_task_id, db)
@@ -981,6 +1034,17 @@ async def import_migrated_task(
     """
     require_admin(request)
 
+    if body.mode == "delivery_loop":
+        raise HTTPException(
+            409,
+            "Delivery-owned Tasks cannot be imported; DeliveryRun remains "
+            "the only orchestration authority",
+        )
+
+    existing = await db.get(Task, body.id)
+    if existing is not None:
+        _require_not_delivery_owned_task(existing, action="migration-imported")
+
     data = body.model_dump()
     source_status = data.pop("source_status")
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
@@ -1033,7 +1097,6 @@ async def import_migrated_task(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    existing = await db.get(Task, body.id)
     if existing is None:
         # The first visible state is already inert.  In particular there is no
         # pending commit and no dispatcher.wake() between create and cancel.
@@ -1049,7 +1112,11 @@ async def import_migrated_task(
     values = {key: value for key, value in data.items() if key != "id"}
     result = await db.execute(
         sa_update(Task)
-        .where(*_task_generation_fence(body.id, existing))
+        .where(
+            *_task_generation_fence(body.id, existing),
+            Task.mode != "delivery_loop",
+            Task.delivery_run_id.is_(None),
+        )
         .values(**values)
     )
     if result.rowcount != 1:
@@ -1258,6 +1325,7 @@ async def _lock_worker_local_routing_task(
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
+        _require_not_delivery_owned_task(current, action="routing-configured")
         if current.worker_id is not None or current.shared_from_id is not None:
             raise HTTPException(
                 409,
@@ -1278,6 +1346,7 @@ async def _lock_worker_local_routing_task(
         await db.rollback()
         raise HTTPException(404, "Task not found")
     await require_task_control(request, current, db)
+    _require_not_delivery_owned_task(current, action="routing-configured")
     reverse_owner = (
         await db.execute(
             select(Instance.id)
@@ -1339,6 +1408,7 @@ async def stage_worker_routing_config(
     task = await db.get(Task, task_id)
     if task is not None:
         await require_task_control(request, task, db)
+        _require_not_delivery_owned_task(task, action="routing-configured")
     await db.rollback()
     candidate = _routing_request_tuple(body)
 
@@ -1351,6 +1421,7 @@ async def stage_worker_routing_config(
         if observed is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, observed, db)
+        _require_not_delivery_owned_task(observed, action="routing-configured")
         try:
             validate_task_service_tier_configuration(
                 provider=candidate.provider,
@@ -1505,6 +1576,7 @@ async def ack_worker_routing_config(
     task = await db.get(Task, task_id)
     if task is not None:
         await require_task_control(request, task, db)
+        _require_not_delivery_owned_task(task, action="routing-configured")
     await db.rollback()
     candidate = _routing_request_tuple(body)
     async with get_task_operation_lock(task_id):
@@ -1566,6 +1638,7 @@ async def reconcile_worker_routing_config(
     task = await db.get(Task, task_id)
     if task is not None:
         await require_task_control(request, task, db)
+        _require_not_delivery_owned_task(task, action="routing-configured")
     await db.rollback()
     authoritative = _routing_request_tuple(body)
 
@@ -2165,6 +2238,7 @@ async def update_task(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, queue.db)
+    _require_not_delivery_owned_task(task, action="edited")
     await _require_not_pr_review_task_mutation(
         queue.db,
         task_id,
@@ -2638,6 +2712,7 @@ async def delete_task(
 
     if task is None:
         raise HTTPException(404, "Task not found")
+    _require_not_delivery_owned_task(task, action="deleted")
     await _require_no_pr_review_publication(db, task_id)
     await _require_not_pr_review_task_mutation(
         db,
@@ -2992,6 +3067,7 @@ async def terminate_task_generation(
                 completed_at=body.expected_completed_at,
                 pty_background_generation=(body.expected_pty_background_generation),
             ),
+            allow_delivery_effect_stop=True,
         )
     except TaskTerminationConflict as exc:
         await db.rollback()
@@ -3520,6 +3596,7 @@ async def stop_task_session(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
+        _require_not_delivery_owned_task(task, action="stopped")
         await _require_no_pr_review_publication(db, task_id)
         await _require_not_pr_review_task_mutation(
             db,
@@ -3841,6 +3918,7 @@ async def cancel_task(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
+        _require_not_delivery_owned_task(task, action="cancelled")
         await _require_no_pr_review_publication(db, task_id)
         await _require_not_pr_review_task_mutation(
             db,
@@ -3884,6 +3962,7 @@ async def retry_task(
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
+        _require_not_delivery_owned_task(current, action="retried")
         _require_expected_task_routing(
             current,
             body.expected_routing if body is not None else None,
@@ -4025,6 +4104,7 @@ async def archive_task(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
+        _require_not_delivery_owned_task(task, action="archived")
     task = await queue.archive(task_id)
     if not task:
         raise HTTPException(404, "Task not found")

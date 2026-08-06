@@ -88,6 +88,11 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
         "versioned_plan_worker_protocol": 3,
         "plan_pipeline_defaults": plan_pipeline.model_dump(mode="json"),
+        "capability_core_enabled": settings.capability_core_enabled,
+        "delivery_loop_enabled": (
+            settings.delivery_loop_enabled
+            and settings.capability_core_enabled
+        ),
         # Manager must see this exact capability before forwarding a PR review
         # to a Worker. Older Workers would run it from their CCM checkout and
         # silently load unrelated CLAUDE.md/AGENTS.md instructions.

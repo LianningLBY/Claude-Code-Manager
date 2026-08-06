@@ -28,6 +28,8 @@ claude-manager/
 │   │   ├── tasks.py             # 任务 CRUD + plan 审批 + conflict 解决
 │   │   ├── plans.py             # 关联 Plan 历史/stale/revision/执行 Task
 │   │   ├── plan_resources.py    # 一等 Plan/Version/Run/Input/Application API
+│   │   ├── capabilities.py      # 通用 Capability Invocation/Execution API
+│   │   ├── delivery_runs.py     # Delivery Loop Run/Cycle/Turn/Transition API
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
 │   │   ├── task_artifacts.py    # Task 工作区内安全文件下载 + Worker 分流
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop 控制 + Dispatcher 端点
@@ -49,6 +51,9 @@ claude-manager/
 │   │   ├── task.py              # Task (含 session_id, attention_tag, last_cwd, project_id, enabled_skills)
 │   │   ├── plan_agent.py        # Planner/Reviewer run + step 审计
 │   │   ├── plan.py              # Plan/Version/Input/Application 聚合模型
+│   │   ├── capability.py        # Provider-neutral Capability Invocation/Execution
+│   │   ├── code_review.py       # Pre-PR Code Review Run/Result
+│   │   ├── delivery.py          # Delivery Run/Cycle/Turn/Event/Action/Transition
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── project_todo.py      # ProjectTodo (per-project prompt 模板/清单, status open/done/archived, created_task_id 溯源)
@@ -74,6 +79,15 @@ claude-manager/
 │       ├── plan_agent_runner.py # 严格只读 Planner/Reviewer pipeline + exact process cleanup
 │       ├── plan_tasks.py        # Plan 上下文快照、repo 指纹、stale/附件校验
 │       ├── plan_service.py      # Version 状态机、输入/审批、执行 Task 物化与 Worker outcome 导入
+│       ├── capability_service.py # 通用 Capability 持久状态、CAS 与取消协议
+│       ├── capability_coordinator.py # Capability executor 恢复/调度器
+│       ├── plan_capability.py   # Plan Pipeline 的通用 Capability adapter
+│       ├── code_review_capability.py # exact commit-range Pre-PR Review adapter
+│       ├── delivery_controller.py # Plan→Code→Review→PR Monitor 持久循环
+│       ├── delivery_workspace.py # Delivery 固定 worktree 验证 + Controller fenced commit
+│       ├── delivery_publisher.py # exact push/PR/Monitor outbox 与终态复验
+│       ├── delivery_reducer.py  # DeliveryRun 纯状态转换与不变量
+│       ├── delivery_service.py  # Delivery admission、policy snapshot 与审计
 │       ├── mcp_config.py        # Provider-neutral MCP specs + Claude/Codex renderers
 │       ├── skill_context.py     # Task-scoped 普通/User Skill 目录与 provider adapter
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
@@ -212,8 +226,11 @@ claude-manager/
 - **Goal 模式**: `mode="goal"` 任务使用自然语言完成条件（`goal_condition`），每 turn 后由独立评估器判断是否达成，使用 provider 原生 session resume 保持上下文。评估器跟随 Task provider：Claude 走 `claude -p`，Codex 走绑定账号的 ephemeral `codex exec`；Codex evaluator 的 usage-limit/auth 失败会换号后只重试评估，不重复工作 turn
 - **Goal 评估器**: `GoalEvaluator`（`backend/services/goal_evaluator.py`）读取对话日志摘要，发给轻量模型判断条件是否满足。Claude 默认 `claude-haiku-4-5`，Codex 使用 `default_codex_goal_evaluator_model`，均可由 `goal_evaluator_model` 覆盖；进程超时/非零退出属于运行错误，不得误记为“目标未达成”并消耗 turn
 - **交互式版本化 Plan（2026-08-04）**: 新 Plan 不再创建 `Task(mode=plan)`；`Plan` 是稳定聚合根，一次规划执行是可暂停/恢复的 `PlanAgentRun`。Planner 中间产物只覆盖 Run-scoped `draft_content`，Reviewer 内部 revise 不增加 Version；完整 Pipeline approve/disabled/exhausted 后才把最终 candidate 与审查结论原子发布为一个不可变 `PlanVersion`。Planner/Reviewer 的必要问题持久化为 `PlanInputRequest`，active Run 立即展示已回答输入，完成后由 `produced_by_run_id` 归入最终 Version 审计。顶级 **Plans** 页面负责 standalone 创建、完整目录和行动队列，行动区固定名为 `Plans requiring action`；**Tasks** 页面及其搜索展示全部真实 Task，迁移后的旧 `Task(mode=plan)` 作为只读历史保留并链接 canonical Plan；New Task 不提供 Plan mode。旧数据迁移只承认 `origin/main` 能产生的单 carrier schema：每个旧 Task 映射一个 Plan 和至多一个 v1，Main approve 映射为指回同一 carrier Task 的 execution Application；本功能分支早期产生的 revision chain、无 Main source Plan 和 Run/Input/Application 测试数据由 reconciliation 清理，但旧 Task 行不删除。Plan 目录支持 kind/status/Project/search/Archived only；Archive 是保留全部 Version/Run/Q&A/Application 的可恢复软归档。Planner/Reviewer 只允许全局配置并在新 Plan 冻结完整快照；同一请求的问题数量没有业务上限，独立 `plan_max_interactions` 只限制一个 Run 的暂停/回答轮数且范围为 0–5。Plan 创建/标题/Revise/Fork/回答都会持久化，高置信 API key/token/private key 必须拒绝并引导使用 Secrets 引用。澄清回答恢复同一 Run，用户 Revise/Refresh 在同一 Plan 下创建新 Run并在 Pipeline 完成后产出下一 Version，Fork 才创建新 Plan；同一 Task 的活跃 Plan 数量必须在 Task 行写锁后的统一服务边界检查，create/Fork 不得绕过。等待用户时必须释放 Instance/process/thread/account 与 update blocker。approve/reject/apply/create-execution-task 都绑定 exact Version；`human_decision` 只保存 pending/approved/rejected 审计事实，UI 由 application/decision/superseded/review 派生 Version 状态，Application 必须蕴含 approved；execution Task 后续缺失只保留历史并禁用跳转。迁移 Version 缺少历史 repo 指纹只算可确认 stale，Reject 直接允许，Approve/Apply/create-execution-task 经用户明确确认可继续；`Refresh contexts and regenerate Plan` 只在 stale 时展示，真正的 target/project/worker/repo 不可用才是 hard conflict。standalone Version 创建 execution Task 必须统一调用 `plan_service.materialize_execution_task`，exact `plan_version_id` 是幂等键，API/Auto 不得复制 ORM 物化逻辑。approve 不自动唤醒主 Task，真实 chat 通过 `plan_version_ids` 应用一次并保存 Version 快照；PlanApplication、用户日志与完整 queue envelope 必须同事务进入 durable outbox，内存队列以 receipt key 幂等准入，未确认 launch 的投递由 Dispatcher 启动恢复。Plan WebSocket 只作 ACL-scoped invalidation，HTTP aggregate snapshot 才是权威；Plan 目录必须先在 SQL 中完成 ACL/display-state/count/limit/offset，再批量聚合关联资源，禁止逐 Plan N+1。Dispatcher 以 `Instance.current_plan_run_id` 和 generation CAS 直接领取本地 Run；Manager 是 Worker Plan/Version/Input/Application 的权威，Worker protocol v3 先握手并同步 candidate/final Version 边界，Manager claim generation 与 Worker-local Run generation 独立，重放只接受排除 Manager claim 后完全相同的 import payload digest，并返回首次持久化的附件 receipt；旧协议必须 fail closed。断线时答案留在 Manager，恢复后继续，跨 Worker Apply 会先 materialize exact Version。通用 `POST /api/tasks mode=plan` 已关闭；旧 `Task.plan_*`、`plan_task_ids` 与 `docs/plans/plan-agent-design.md` 只作 legacy contract 兼容。Auto Mode 交接见 `docs/plans/auto-mode-plan-integration-handoff.md`；完整设计/验收见 `docs/plans/interactive-versioned-plan-design.md`
+- **Capability Core（2026-08-05）**: Plan 与 Pre-PR Code Review 是可复用、provider-neutral 的 Capability，不是 Delivery Controller 私有实现。`CapabilityInvocation` 冻结 Task generation、request、executor config 与 policy，`CapabilityExecution` 保存 attempt/handle/output；状态推进统一使用 Task-scoped lock + state-version CAS，等待 Plan 输入时不占 Developer Instance。`source=delivery_controller` 是 required gate；普通 Auto Task 可通过 human-facing Capability API 创建 `source=human_request` 的 advisory invocation。模型自助 terminal-action 协议已定义，但在没有 exact native-turn fence 前 `create_agent_invocation` 必须 fail closed；以后把 Plan/Review 接成 Auto 的 tool/sub-agent 时必须复用该协议，禁止复制 runner。Capability-owned Plan 只允许读取和回答 `waiting_user` 输入，其他 Plan API 写操作与 Reviewer Task 的 chat/inject/retry/edit/share 都必须拒绝。`CAPABILITY_CORE_ENABLED` 只限制新 admission；数据库中已接纳的 queued/running/cancelling work即使重启后开关关闭也必须继续恢复或收口。
+- **Delivery Loop V1（2026-08-05）**: `mode=delivery_loop` 是独立模式，只能经 `POST /api/delivery-runs` 原子创建 `DeliveryRun + Developer Task + first Cycle`；普通 Task API 不得伪造 `delivery_run_id/delivery_role`。V1 仅支持本地、有 GitHub remote 的 Project，并冻结为 `Plan Capability → bounded Developer turn → Controller commit → exact commit-range Code Review Capability → Controller exact non-force push/PR bind → PR Monitor exact-head CI+Panel → blocked 时新 Cycle`。等待 Capability、CI 或 Monitor 时不占 Developer Instance。Developer Task 是只读 scheduler shell，edit/chat/inject/fork/retry/stop/delete/migrate/share 不能绕过 Run；TaskQueue 只有在 Run 为 `coding/running` 且存在匹配 active `DeliveryTurn` 时才可领取，并在 SELECT 与 claim UPDATE 两层应用同一 durable fence。V1 Developer 固定 Codex-only/app-server-only：provider/model/tier/effort 全部按 frozen policy 复验，`writableRoots` 只显式列出受管 worktree且 `networkAccess=false`，不注入 Git credential/MCP/Apps/web/autonomous features；任何 app-server/隔离失败都禁止 exec fallback。
+- **Delivery 发布与终态**: Developer 只在固定受管 worktree 修改、测试、自审并留下未提交 diff；不得 commit/push、创建/修改/merge PR。Developer terminal 且 exact Task/Instance/Turn owner 已释放后，Controller 验证 linked-worktree control metadata、旧 head 与 branch，再创建带 `CCM-Delivery-Run/Turn` trailer 的 commit；commit 后、DB finalize 前崩溃只能按 exact parent+trailer恢复。Publisher 的 durable Action 负责 query-before-write 的 exact non-force push、PR create-or-bind 与 PR Monitor bind；每次 effect 前复验有效 Run owner/generation lease、Action id/token lease、base/head/tree/patch 与 payload hash，heartbeat 同时续两层 lease，响应丢失先远端对账。每个 Cycle 的 Plan/Review subject 都绑定 base/head/tree/patch；任何 workspace、remote branch、GitHub PR、Monitor id/state-version/current Review 或 `delivery:{run}:{head}` ownership 漂移都使旧证据 stale。V1 唯一成功终点是远程 exact-head `ready_to_merge`，绝不自动 merge；Delivery-owned review 无条件强制 `pr_auto_merge=false`，不得进入 legacy repair/auto-merge/Merge Queue。`DELIVERY_LOOP_ENABLED` 与 `CAPABILITY_CORE_ENABLED` 只 gate 新 Run admission；已接纳 Run 的恢复顺序是 Dispatcher → Capability Coordinator → Delivery Controller，停机严格反序。完整 V1 与后续范围见 `docs/autonomous-delivery-loop-design.md`。
 - **Plan chat outbox 恢复**: queue envelope 使用可跨重启比较的 epoch 排队时间。receipt 的 DB CAS、内存 delivery key/队列登记和 Task queue generation 必须在 `_dispatch_claim_lock` 下统一准入；创建 receipt 前保存 process epoch + queue generation fence，stop/cancel 在同一锁内推进 generation、按 Task 回收尚未进入内存的 durable receipt，CAS/fence 失败不得发布队列项。仅 `pending/queued` receipt 可在启动或暂停恢复后重排；重启遗留的 `launching` 必须携带 exact Task/Instance/generation 证据转为 `uncertain` 并禁止自动重放。管理员对账确认 exact turn 已执行后可审计标记 `launched`；确认未启动则先保存不可变 `PlanApplicationAttempt`，再删除活动 Application、清理日志中的 applied snapshot 并释放 Version 重试，Plan aggregate 必须独立展示 attempt 对应的 resolution/note/evidence；无法确认时保持冲突。只有能证明尚未启动的永久失败或显式取消才能自动释放；实际停服保留 pending，同进程恢复则立即重新准入
-- **调度器**: `GlobalDispatcher` 只负责分配任务、启动 Claude Code、判断成败。所有 git 操作（worktree、commit、merge、push）全由 Claude Code 自主完成
+- **调度器**: `GlobalDispatcher` 只负责分配任务、启动 Agent、判断回合成败。普通 Auto/Goal/Loop 的 git 操作仍由 Agent 自主完成；Delivery 是明确例外：Agent 只留下未提交 diff，固定 worktree、commit、push、PR/Monitor 绑定由 Delivery Controller 管理，且 V1 不 merge
 - **任务生命周期**: pending → in_progress → executing → completed（失败回 pending 重试）
 - **项目**: `Project` 模型管理 git repo，支持 clone 已有仓库（has_remote=True）和本地 git init（has_remote=False）
 - **Task.project_id**: 可选关联 Project，dispatcher 自动解析为 target_repo
@@ -331,6 +348,8 @@ DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/claude_manager
 # MySQL（需安装: uv sync --extra mysql）
 DATABASE_URL=mysql+aiomysql://user:pass@host:3306/claude_manager
 ```
+
+MySQL 最低支持版本为 **8.0.16**；完整性约束依赖该版本起正式执行的 `CHECK` 语义。
 
 **数据迁移脚本**：在数据库之间迁移全部数据（注意使用同步 URL）：
 ```bash

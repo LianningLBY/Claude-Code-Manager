@@ -2364,6 +2364,15 @@ async def create_pr_review_task(
     db.add(review)
     await db.flush()
 
+    from backend.services.delivery_pr_policy import frozen_delivery_pr_policy
+
+    delivery_policy = await frozen_delivery_pr_policy(db, review)
+    frozen_auto_merge = (
+        delivery_policy.auto_merge
+        if delivery_policy is not None
+        else bool(repo.auto_merge)
+    )
+
     provider = (repo.provider or "claude").lower()
     task = await stage_task_record(
         db,
@@ -2375,7 +2384,7 @@ async def create_pr_review_task(
             "pr_review_id": review.id,
             "pr_base_sha": base_sha,
             "pr_head_sha": head_sha,
-            "pr_auto_merge": bool(repo.auto_merge),
+            "pr_auto_merge": frozen_auto_merge,
             "pr_action_nonce": action_nonce,
         },
         provider=provider,
@@ -2767,6 +2776,7 @@ async def _publication_is_current(
     task_started_at: datetime,
     nonce: str,
     lease_token: str,
+    expected_delivery_id: str | None,
     lease_lost: asyncio.Event | None = None,
 ) -> bool:
     """Fresh guard used immediately before each GitHub mutation."""
@@ -2786,6 +2796,7 @@ async def _publication_is_current(
                 PRReview.publishing_lease_token == lease_token,
                 PRReview.publishing_lease_expires_at
                 > db_now + _PUBLICATION_MUTATION_GUARD,
+                PRReview.delivery_id == expected_delivery_id,
             )
         )
         if review_result.scalar_one_or_none() != review_id:
@@ -3007,6 +3018,7 @@ async def _resume_publishing_review_under_lease(
     pr_number = review.pr_number
     base_sha = review.base_sha
     head_sha = review.head_sha
+    delivery_id = review.delivery_id
     repo = await db.get(
         MonitoredRepo,
         repo_id,
@@ -3029,8 +3041,24 @@ async def _resume_publishing_review_under_lease(
         if task is not None
         else None
     )
+    from backend.services.delivery_pr_policy import (
+        DeliveryPRPolicyError,
+        frozen_delivery_pr_policy,
+    )
+
+    try:
+        delivery_policy = await frozen_delivery_pr_policy(
+            db,
+            review,
+            monitor_run_id=review.monitor_run_id,
+        )
+        delivery_policy_error = None
+    except DeliveryPRPolicyError as exc:
+        delivery_policy = None
+        delivery_policy_error = str(exc)
     valid = (
-        repo is not None
+        delivery_policy_error is None
+        and repo is not None
         and repo.repo_full_name == repo_full_name
         and task is not None
         and task_id == task.id
@@ -3049,6 +3077,13 @@ async def _resume_publishing_review_under_lease(
         and nonce is not None
         and type(frozen_auto_merge) is bool
         and (
+            delivery_policy is None
+            or (
+                frozen_auto_merge is False
+                and action != "approved_merged"
+            )
+        )
+        and (
             action == "review_comments"
             or (action == "approved_merged" and frozen_auto_merge)
             or (action == "lgtm_comment" and not frozen_auto_merge)
@@ -3065,7 +3100,12 @@ async def _resume_publishing_review_under_lease(
             task_id=task_id,
             retry_count=retry_count,
             task_started_at=task_started_at,
-            summary="Durable PR publication state is invalid",
+            summary=(
+                "Delivery PR publication policy is invalid: "
+                f"{delivery_policy_error}"
+                if delivery_policy_error is not None
+                else "Durable PR publication state is invalid"
+            ),
             lease_token=lease_token,
         )
         return
@@ -3090,6 +3130,7 @@ async def _resume_publishing_review_under_lease(
             task_started_at=task_started_at,
             nonce=nonce,
             lease_token=lease_token,
+            expected_delivery_id=delivery_id,
             lease_lost=lease_lost,
         )
 
@@ -3512,6 +3553,7 @@ async def recover_superseding_pr_reviews(
                                         db,
                                         reason="Superseded by new push",
                                         operation_locks_held=True,
+                                        allow_delivery_effect_stop=True,
                                     )
                                 )
                         except TaskTerminationConflict:

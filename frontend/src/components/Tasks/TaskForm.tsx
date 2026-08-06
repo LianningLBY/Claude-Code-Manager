@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { api } from '../../api/client';
 import type {
   CodexServiceTier,
+  MonitoredRepo,
   Project,
   TagItem,
   Task,
@@ -13,6 +14,11 @@ import { SecretPicker } from '../Secrets/SecretPicker';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { skillSupportedByProvider } from '../../config/skillCapabilities';
+import {
+  acknowledgeDeliveryAdmission,
+  prepareDeliveryAdmission,
+} from './deliveryAdmission';
+import { filterDeliveryRepos } from './deliveryCompatibility';
 
 interface TaskFormProps {
   onCreated: () => void;
@@ -20,6 +26,7 @@ interface TaskFormProps {
 
 const NEW_PROJECT_VALUE = '__new__';
 const STORAGE_KEY = 'cc_default_task_config';
+const DELIVERY_ADMISSION_SCOPE = 'task-form';
 
 interface StoredTaskDefaults {
   priority?: number;
@@ -56,6 +63,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [newProjectUrl, setNewProjectUrl] = useState('');
   const [priority, setPriority] = useState(0);
   const [mode, setMode] = useState('auto');
+  const [deliveryLoopEnabled, setDeliveryLoopEnabled] = useState(false);
+  const [monitoredRepos, setMonitoredRepos] = useState<MonitoredRepo[]>([]);
+  const [deliveryRepoId, setDeliveryRepoId] = useState<number | ''>('');
+  const [deliveryReposLoading, setDeliveryReposLoading] = useState(false);
   const [provider, setProvider] = useState('codex');
   // 分布式 Worker：执行位置（'' = 本机）
   const [workerId, setWorkerId] = useState('');
@@ -90,6 +101,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [hasWorker, setHasWorker] = useState(isAdmin);
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
   const fileUpload = useFileUpload();
+  const clearFileUploads = fileUpload.clear;
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
   const [dropError, setDropError] = useState('');
   const [enabledPlugins, setEnabledPlugins] = useState<Record<string, boolean>>({});
@@ -108,14 +120,21 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const applyStoredDefaults = (
     stored: StoredTaskDefaults | null,
     fallbackProvider: string,
+    allowDeliveryLoop = false,
   ) => {
     setPriority(stored?.priority ?? 0);
     // Plan creation now lives on the first-class Plans page. Normalize the
     // legacy saved value so an old browser preference cannot recreate the
     // removed Task-form mode invisibly.
-    setMode(stored?.mode === 'plan' ? 'auto' : stored?.mode || 'auto');
-    setProvider(stored?.provider || fallbackProvider);
-    setModel(stored?.model || '');
+    const storedMode = stored?.mode || 'auto';
+    const normalizedMode = (
+      storedMode === 'plan' || (storedMode === 'delivery_loop' && !allowDeliveryLoop)
+        ? 'auto'
+        : storedMode
+    );
+    setMode(normalizedMode);
+    setProvider(normalizedMode === 'delivery_loop' ? 'codex' : (stored?.provider || fallbackProvider));
+    setModel(normalizedMode === 'delivery_loop' ? '' : (stored?.model || ''));
     setEffort(stored?.effort || '');
     setCodexServiceTier(stored?.codexServiceTier === 'priority' ? 'priority' : 'default');
     setThinkingBudget(stored?.thinkingBudget || '');
@@ -133,7 +152,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     // Restore persisted user choices independently of the server request.
     // A slow or unavailable backend must not make local defaults disappear.
-    applyStoredDefaults(readStoredTaskDefaults(), 'codex');
+    applyStoredDefaults(readStoredTaskDefaults(), 'codex', false);
     api.config().then((c) => {
       const configuredProvider = c.default_provider || 'codex';
       setDefaultProvider(configuredProvider);
@@ -148,13 +167,16 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexModelEfforts(c.codex_model_efforts || {});
       setCodexModelServiceTiers(c.codex_model_service_tiers || {});
       setCodexCapabilitiesLoaded(true);
+      const deliveryEnabled = c.delivery_loop_enabled === true;
+      setDeliveryLoopEnabled(deliveryEnabled);
       // Re-read after the async request so a default saved while it was in
       // flight still wins over the server defaults.
-      applyStoredDefaults(readStoredTaskDefaults(), configuredProvider);
+      applyStoredDefaults(readStoredTaskDefaults(), configuredProvider, deliveryEnabled);
     }).catch(() => {
       setCodexModelServiceTiers({});
       setCodexCapabilitiesLoaded(true);
-      applyStoredDefaults(readStoredTaskDefaults(), 'codex');
+      setDeliveryLoopEnabled(false);
+      applyStoredDefaults(readStoredTaskDefaults(), 'codex', false);
     });
     api.getRuntimeSettings()
       .then((runtime) => {
@@ -165,6 +187,28 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (mode !== 'delivery_loop' || !deliveryLoopEnabled) {
+      setDeliveryRepoId('');
+      return;
+    }
+    let active = true;
+    setDeliveryReposLoading(true);
+    api.getMonitoredRepos()
+      .then((repos) => {
+        if (active) setMonitoredRepos(repos);
+      })
+      .catch(() => {
+        if (active) setMonitoredRepos([]);
+      })
+      .finally(() => {
+        if (active) setDeliveryReposLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [mode, deliveryLoopEnabled]);
 
   useEffect(() => {
     if (!projectId) {
@@ -181,8 +225,36 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const selectedProject = projectId
     ? projects.find((project) => project.id === projectId)
     : undefined;
+  const compatibleDeliveryRepos = useMemo(
+    () => filterDeliveryRepos(selectedProject, monitoredRepos),
+    [monitoredRepos, selectedProject],
+  );
   const remoteTaskScope = Boolean(workerId)
     || selectedProject?.worker_id != null;
+
+  useEffect(() => {
+    if (
+      deliveryRepoId !== ''
+      && !compatibleDeliveryRepos.some((repo) => repo.id === deliveryRepoId)
+    ) {
+      setDeliveryRepoId('');
+    }
+  }, [deliveryRepoId, compatibleDeliveryRepos]);
+
+  useEffect(() => {
+    if (mode !== 'delivery_loop') return;
+    clearFileUploads();
+    setSelectedSecretIds([]);
+    setCloneFromTaskId('');
+    setPriority(0);
+    setThinkingBudget('');
+    setSystemPromptMode('');
+    setStarOnCreate(false);
+    setEnabledPlugins({});
+    setEnabledUserSkills({});
+    setShowPluginsDropdown(false);
+    setShowSkillsDropdown(false);
+  }, [clearFileUploads, mode]);
   useEffect(() => {
     api.listSkillsCached()
       .then((skills) => setAvailableSkills(
@@ -349,10 +421,12 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   useFileDrop({
     targetRef: formRef,
     onDrop: (files) => fileUpload.addFiles(files, (msg) => setDropError(msg)),
-    disabled: false,
+    disabled: mode === 'delivery_loop',
   });
 
   useEffect(() => {
+    if (mode === 'delivery_loop') return;
+
     const handlePaste = (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
@@ -373,7 +447,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       form.addEventListener('paste', handlePaste);
       return () => form.removeEventListener('paste', handlePaste);
     }
-  }, [fileUpload.addFiles]);
+  }, [fileUpload.addFiles, mode]);
 
   useEffect(() => {
     if (dropError) {
@@ -389,10 +463,19 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     e.target.value = '';
   };
 
+  const normalizedDeliveryRequirements = description.trim();
   const canSubmit =
-    (description || mode === 'loop') &&
+    ((mode === 'delivery_loop' ? normalizedDeliveryRequirements : description) || mode === 'loop') &&
     (mode !== 'loop' || todoFilePath) &&
     (mode !== 'goal' || goalCondition) &&
+    (mode !== 'delivery_loop' || (
+      deliveryLoopEnabled
+      && !isNewProject
+      && selectedProject?.worker_id == null
+      && selectedProject?.has_remote === true
+      && selectedProject?.local_path != null
+      && deliveryRepoId !== ''
+    )) &&
     (projectId || (isNewProject && newProjectName)) &&
     !fileUpload.isUploading &&
     !fileUpload.hasFailed;
@@ -431,57 +514,95 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         is_image: r.is_image,
       }));
 
-      await api.createTask({
-        description: description || undefined,
-        project_id: pid as number,
-        priority,
-        mode,
-        ...(mode === 'loop' ? { todo_file_path: todoFilePath, max_iterations: parseInt(maxIterations) || 50, must_complete: mustComplete } : {}),
-        ...(mode === 'goal' ? { goal_condition: goalCondition, goal_max_turns: parseInt(goalMaxTurns) || 30 } : {}),
-        ...(uploadedPaths.length > 0 ? { file_paths: uploadedPaths } : {}),
-        ...(attachments.length > 0 ? { attachments } : {}),
-        ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
-        ...(workerId ? { worker_id: parseInt(workerId) } : {}),
-        provider,
-        model: model || activeDefaultModel,
-        ...(effort ? { effort_level: effort } : {}),
-        ...(provider === 'codex'
-          ? { codex_service_tier: codexServiceTier }
-          : {}),
-        ...(thinkingBudget ? { thinking_budget: parseInt(thinkingBudget) || null } : {}),
-        ...(systemPromptMode ? { system_prompt_mode: systemPromptMode } : {}),
-        ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
-        enabled_skills: (() => {
-          const skills = Object.entries(enabledPlugins)
-            .filter(([key, enabled]) => (
-              enabled && skillSupportedByProvider(
-                provider,
-                key,
-                codexTaskSkillsEnabled,
-                codexMonitorEnabled,
-                remoteTaskScope,
-              )
-            ))
-            .reduce((acc, [k]) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
-          return Object.keys(skills).length > 0 ? skills : undefined;
-        })(),
-        ...(enabledUserSkillCount > 0
-          && (provider !== 'codex' || codexTaskSkillsEnabled) ? {
-          selected_user_skills: Object.entries(enabledUserSkills)
-            .filter(([, v]) => v)
-            .map(([k]) => Number(k)),
-        } : {}),
-        ...(starOnCreate ? { starred: true } : {}),
-        ...(provider === 'claude' && cloneFromTaskId
-          ? { clone_from_task_id: cloneFromTaskId as number }
-          : {}),
-      });
+      if (mode === 'delivery_loop') {
+        if (uploadedPaths.length > 0 || selectedSecretIds.length > 0) {
+          throw new Error(
+            'Delivery Loop V1 does not accept Task attachments or Task secrets. '
+            + 'Put durable requirements in the prompt or repository.',
+          );
+        }
+        const deliveryRepo = compatibleDeliveryRepos.find(
+          (repo) => repo.id === deliveryRepoId,
+        );
+        if (!selectedProject || !deliveryRepo) {
+          throw new Error('Select a compatible local PR Monitor repository.');
+        }
+        const title = normalizedDeliveryRequirements
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .find(Boolean)!
+          .slice(0, 200);
+        const request = prepareDeliveryAdmission(DELIVERY_ADMISSION_SCOPE, {
+          project_id: selectedProject.id,
+          monitored_repo_id: deliveryRepo.id,
+          title,
+          requirements: normalizedDeliveryRequirements,
+          base_branch: selectedProject.default_branch,
+          provider: 'codex',
+          model: model || activeDefaultModel,
+          ...(effort ? { effort_level: effort } : {}),
+          codex_service_tier: codexServiceTier,
+          ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
+        });
+        await api.createDeliveryRun(request);
+        acknowledgeDeliveryAdmission(DELIVERY_ADMISSION_SCOPE, request);
+      } else {
+        await api.createTask({
+          description: description || undefined,
+          project_id: pid as number,
+          priority,
+          mode,
+          ...(mode === 'loop' ? { todo_file_path: todoFilePath, max_iterations: parseInt(maxIterations) || 50, must_complete: mustComplete } : {}),
+          ...(mode === 'goal' ? { goal_condition: goalCondition, goal_max_turns: parseInt(goalMaxTurns) || 30 } : {}),
+          ...(uploadedPaths.length > 0 ? { file_paths: uploadedPaths } : {}),
+          ...(attachments.length > 0 ? { attachments } : {}),
+          ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
+          ...(workerId ? { worker_id: parseInt(workerId) } : {}),
+          provider,
+          model: model || activeDefaultModel,
+          ...(effort ? { effort_level: effort } : {}),
+          ...(provider === 'codex'
+            ? { codex_service_tier: codexServiceTier }
+            : {}),
+          ...(thinkingBudget ? { thinking_budget: parseInt(thinkingBudget) || null } : {}),
+          ...(systemPromptMode ? { system_prompt_mode: systemPromptMode } : {}),
+          ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
+          enabled_skills: (() => {
+            const skills = Object.entries(enabledPlugins)
+              .filter(([key, enabled]) => (
+                enabled && skillSupportedByProvider(
+                  provider,
+                  key,
+                  codexTaskSkillsEnabled,
+                  codexMonitorEnabled,
+                  remoteTaskScope,
+                )
+              ))
+              .reduce((acc, [k]) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
+            return Object.keys(skills).length > 0 ? skills : undefined;
+          })(),
+          ...(enabledUserSkillCount > 0
+            && (provider !== 'codex' || codexTaskSkillsEnabled) ? {
+            selected_user_skills: Object.entries(enabledUserSkills)
+              .filter(([, v]) => v)
+              .map(([k]) => Number(k)),
+          } : {}),
+          ...(starOnCreate ? { starred: true } : {}),
+          ...(provider === 'claude' && cloneFromTaskId
+            ? { clone_from_task_id: cloneFromTaskId as number }
+            : {}),
+        });
+      }
       setDescription('');
       fileUpload.clear();
       setSelectedSecretIds([]);
       setCloneFromTaskId('');
       // Restore localStorage defaults (or fall back to server defaults)
-      applyStoredDefaults(readStoredTaskDefaults(), defaultProvider);
+      applyStoredDefaults(
+        readStoredTaskDefaults(),
+        defaultProvider,
+        deliveryLoopEnabled,
+      );
       onCreated();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create task');
@@ -512,57 +633,65 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       <div className="flex gap-2">
         <textarea
           className="flex-1 bg-gray-700 text-foreground rounded-lg px-3 py-2 text-sm h-24 resize-none border border-gray-600/50 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 transition-colors"
-          placeholder={mode === 'loop' ? 'Background / context (optional)' : `Prompt / Description (this will be sent to ${provider === 'codex' ? 'Codex' : 'Claude Code'})`}
+          placeholder={
+            mode === 'loop'
+              ? 'Background / context (optional)'
+              : mode === 'delivery_loop'
+                ? 'Delivery requirements (Plan → Code → Review → PR Monitor)'
+                : `Prompt / Description (this will be sent to ${provider === 'codex' ? 'Codex' : 'Claude Code'})`
+          }
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           required={mode !== 'loop'}
         />
         <VoiceButton onTranscribed={(text) => setDescription((prev) => prev ? prev + ' ' + text : text)} />
       </div>
-      {/* Image attachments */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          className="hidden"
-          onChange={handleFileSelect}
-        />
-        <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />
-        {fileUpload.uploads.map((upload) => (
-          <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
-            {upload.preview ? (
-              <div className="w-12 h-12">
-                <img src={upload.preview} alt="" className="w-full h-full object-cover" />
-              </div>
-            ) : (
-              <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-800 text-xs text-gray-300 max-w-[120px]">
-                <Paperclip size={12} className="shrink-0" />
-                <span className="truncate">
-                  {upload.file?.name || upload.result?.filename || 'attachment'}
-                </span>
-              </div>
-            )}
-            {upload.status === 'uploading' && (
-              <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                <Loader2 size={16} className="animate-spin text-white" />
-              </div>
-            )}
-            {upload.status === 'failed' && (
-              <div className="absolute inset-0 bg-red-900/50 flex items-center justify-center cursor-pointer" onClick={() => fileUpload.retryFile(upload.id)} title="Click to retry">
-                <AlertCircle size={16} className="text-red-400" />
-              </div>
-            )}
-            <button
-              type="button"
-              onClick={() => fileUpload.removeFile(upload.id)}
-              className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
-            >
-              <X size={10} />
-            </button>
-          </div>
-        ))}
-      </div>
+      {/* Delivery V1 accepts only durable text/repository context. */}
+      {mode !== 'delivery_loop' && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={handleFileSelect}
+          />
+          <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />
+          {fileUpload.uploads.map((upload) => (
+            <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
+              {upload.preview ? (
+                <div className="w-12 h-12">
+                  <img src={upload.preview} alt="" className="w-full h-full object-cover" />
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-800 text-xs text-gray-300 max-w-[120px]">
+                  <Paperclip size={12} className="shrink-0" />
+                  <span className="truncate">
+                    {upload.file?.name || upload.result?.filename || 'attachment'}
+                  </span>
+                </div>
+              )}
+              {upload.status === 'uploading' && (
+                <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                  <Loader2 size={16} className="animate-spin text-white" />
+                </div>
+              )}
+              {upload.status === 'failed' && (
+                <div className="absolute inset-0 bg-red-900/50 flex items-center justify-center cursor-pointer" onClick={() => fileUpload.retryFile(upload.id)} title="Click to retry">
+                  <AlertCircle size={16} className="text-red-400" />
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => fileUpload.removeFile(upload.id)}
+                className="absolute top-0 right-0 bg-gray-900/80 rounded-bl p-0.5 text-gray-300 hover:text-foreground"
+              >
+                <X size={10} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="space-y-2">
         <ProjectSelect
           projects={projects.filter((p) => p.show_in_selector)}
@@ -592,7 +721,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           </div>
         )}
       </div>
-      {provider === 'claude' && contextTasks.length > 0 && (
+      {mode !== 'delivery_loop' && provider === 'claude' && contextTasks.length > 0 && (
         <div className="flex items-center gap-2 min-w-0">
           <label className="text-sm text-gray-400 whitespace-nowrap shrink-0">Copy context from:</label>
           <select
@@ -610,7 +739,39 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           </select>
         </div>
       )}
-      {/* Mode-specific inputs (loop/goal) */}
+      {/* Mode-specific inputs */}
+      {mode === 'delivery_loop' && (
+        <div className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 p-3 space-y-2">
+          <label className="block space-y-1">
+            <span className="text-xs text-indigo-200">PR Monitor repository</span>
+            <select
+              aria-label="Delivery PR Monitor repository"
+              className="w-full bg-gray-700 text-foreground rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={deliveryRepoId}
+              onChange={(e) => setDeliveryRepoId(e.target.value ? Number(e.target.value) : '')}
+              required
+              disabled={deliveryReposLoading || compatibleDeliveryRepos.length === 0}
+            >
+              <option value="">
+                {deliveryReposLoading ? 'Loading repositories…' : 'Select a compatible repository…'}
+              </option>
+              {compatibleDeliveryRepos.map((repo) => (
+                <option key={repo.id} value={repo.id}>{repo.repo_full_name}</option>
+              ))}
+            </select>
+          </label>
+          <p className="text-[11px] leading-relaxed text-indigo-200/70">
+            Requires a local project and an enabled PR Monitor using panel review,
+            exact-head required CI checks, manual merge, and no Merge Queue. The
+            loop stops at ready to merge; it never merges automatically.
+          </p>
+          {!deliveryReposLoading && selectedProject && compatibleDeliveryRepos.length === 0 && (
+            <p className="text-xs text-amber-300">
+              No compatible PR Monitor configuration is bound to this project.
+            </p>
+          )}
+        </div>
+      )}
       {mode === 'loop' && (
         <div className="flex items-center gap-2 flex-wrap">
           <input
@@ -669,16 +830,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       {/* Bottom action row */}
       <div className="flex items-center gap-2 flex-wrap">
         {/* Attach files */}
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={fileUpload.uploads.length >= 10}
-          className="flex items-center gap-1 text-xs px-2 py-1.5 rounded border transition-colors bg-gray-700 text-gray-400 border-gray-600 hover:bg-gray-600 hover:text-gray-300 disabled:opacity-40"
-        >
-          <Paperclip size={13} />
-          <span className="hidden sm:inline">{fileUpload.uploads.length > 0 ? `${fileUpload.uploads.length}/10 files` : 'Attach files'}</span>
-          {fileUpload.uploads.length > 0 && <span className="sm:hidden">{fileUpload.uploads.length}</span>}
-        </button>
+        {mode !== 'delivery_loop' && (
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={fileUpload.uploads.length >= 10}
+            className="flex items-center gap-1 text-xs px-2 py-1.5 rounded border transition-colors bg-gray-700 text-gray-400 border-gray-600 hover:bg-gray-600 hover:text-gray-300 disabled:opacity-40"
+          >
+            <Paperclip size={13} />
+            <span className="hidden sm:inline">{fileUpload.uploads.length > 0 ? `${fileUpload.uploads.length}/10 files` : 'Attach files'}</span>
+            {fileUpload.uploads.length > 0 && <span className="sm:hidden">{fileUpload.uploads.length}</span>}
+          </button>
+        )}
         {/* Config dropdown */}
         <div ref={configRef} className="relative">
           <button
@@ -696,26 +859,40 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           {showConfigPanel && (
             <div className="absolute top-full mt-1 left-0 bg-gray-800 border border-gray-600 rounded shadow-lg z-20 p-3 min-w-[280px]">
               <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 items-center text-xs">
-                <span className="text-gray-400">Priority</span>
-                <select
-                  className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
-                  value={priority}
-                  onChange={(e) => setPriority(Number(e.target.value))}
-                >
-                  {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((p) => (
-                    <option key={p} value={p}>{p}</option>
-                  ))}
-                </select>
+                {mode !== 'delivery_loop' && (
+                  <>
+                    <span className="text-gray-400">Priority</span>
+                    <select
+                      className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
+                      value={priority}
+                      onChange={(e) => setPriority(Number(e.target.value))}
+                    >
+                      {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((p) => (
+                        <option key={p} value={p}>{p}</option>
+                      ))}
+                    </select>
+                  </>
+                )}
 
                 <span className="text-gray-400">Mode</span>
                 <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={mode}
-                  onChange={(e) => setMode(e.target.value)}
+                  onChange={(e) => {
+                    const nextMode = e.target.value;
+                    setMode(nextMode);
+                    if (nextMode === 'delivery_loop') {
+                      setProvider('codex');
+                      setModel('');
+                    }
+                  }}
                 >
                   <option value="auto">Auto</option>
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
+                  {deliveryLoopEnabled && (
+                    <option value="delivery_loop">Delivery Loop</option>
+                  )}
                 </select>
 
                 {false && (
@@ -731,6 +908,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                 <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={provider}
+                  disabled={mode === 'delivery_loop'}
                   onChange={(e) => {
                     const nextProvider = e.target.value;
                     setProvider(nextProvider);
@@ -739,7 +917,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                     if (nextProvider !== 'codex') setCodexServiceTier('default');
                   }}
                 >
-                  {providerOptions.map((p) => (
+                  {(mode === 'delivery_loop' ? ['codex'] : providerOptions).map((p) => (
                     <option key={p} value={p}>{p === 'claude' ? 'Claude' : p === 'codex' ? 'Codex' : p}</option>
                   ))}
                 </select>
@@ -806,7 +984,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
 
                 {/* Thinking 预算走 MAX_THINKING_TOKENS，claude 专属
                     （codex 的推理强度就是上面的 Effort）——codex 下隐藏幽灵选项 */}
-                {provider === 'claude' && (
+                {mode !== 'delivery_loop' && provider === 'claude' && (
                   <>
                     <span className="text-gray-400">Thinking</span>
                     <select
@@ -842,16 +1020,20 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   <option value="0">No limit</option>
                 </select>
 
-                <span className="text-gray-400">System Prompt</span>
-                <select
-                  className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
-                  value={systemPromptMode}
-                  onChange={(e) => setSystemPromptMode(e.target.value)}
-                >
-                  <option value="">Off</option>
-                  <option value="append">Fable 5 (Append)</option>
-                  <option value="replace">Fable 5 (Replace)</option>
-                </select>
+                {mode !== 'delivery_loop' && (
+                  <>
+                    <span className="text-gray-400">System Prompt</span>
+                    <select
+                      className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
+                      value={systemPromptMode}
+                      onChange={(e) => setSystemPromptMode(e.target.value)}
+                    >
+                      <option value="">Off</option>
+                      <option value="append">Fable 5 (Append)</option>
+                      <option value="replace">Fable 5 (Replace)</option>
+                    </select>
+                  </>
+                )}
               </div>
               <div className="flex items-center gap-2 mt-3 pt-2 border-t border-gray-700">
                 <button
@@ -875,18 +1057,20 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           )}
         </div>
         {/* Star */}
-        <button
-          type="button"
-          onClick={() => setStarOnCreate(!starOnCreate)}
-          className={`flex items-center gap-1 text-xs px-2 py-1.5 rounded border transition-colors ${
-            starOnCreate
-              ? 'bg-yellow-600/30 text-yellow-300 border-yellow-500/50 hover:bg-yellow-600/40'
-              : 'bg-gray-700 text-gray-400 border-gray-600 hover:bg-gray-600 hover:text-gray-300'
-          }`}
-        >
-          <Star size={13} fill={starOnCreate ? 'currentColor' : 'none'} />
-        </button>
-        {(provider !== 'codex' || codexTaskSkillsEnabled) && (
+        {mode !== 'delivery_loop' && (
+          <button
+            type="button"
+            onClick={() => setStarOnCreate(!starOnCreate)}
+            className={`flex items-center gap-1 text-xs px-2 py-1.5 rounded border transition-colors ${
+              starOnCreate
+                ? 'bg-yellow-600/30 text-yellow-300 border-yellow-500/50 hover:bg-yellow-600/40'
+                : 'bg-gray-700 text-gray-400 border-gray-600 hover:bg-gray-600 hover:text-gray-300'
+            }`}
+          >
+            <Star size={13} fill={starOnCreate ? 'currentColor' : 'none'} />
+          </button>
+        )}
+        {mode !== 'delivery_loop' && (provider !== 'codex' || codexTaskSkillsEnabled) && (
           <div ref={skillsRef} className="relative">
             <button
               type="button"
@@ -935,7 +1119,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             )}
           </div>
         )}
-        {provider === 'codex' && (
+        {mode !== 'delivery_loop' && provider === 'codex' && (
           <span
             className="text-xs text-gray-500 px-1 py-1.5 whitespace-nowrap"
             title={!codexTaskSkillsEnabled
@@ -956,7 +1140,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           </span>
         )}
         {/* Plugins dropdown */}
-        {AVAILABLE_PLUGINS.length > 0 && (
+        {mode !== 'delivery_loop' && AVAILABLE_PLUGINS.length > 0 && (
           <div ref={pluginsRef} className="relative">
             <button
               type="button"

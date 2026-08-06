@@ -47,7 +47,7 @@ def _normalize_attention_tag(value: object) -> object:
 
 
 class TaskCreate(BaseModel):
-    # Manager→Worker 转发时指定 ID（task ID 全局由 Manager 分配，见设计文档 §2）
+    # Internal Manager→Worker forwarding only: Manager allocates the global ID.
     id: int | None = None
     # None = 本机执行；有值 = 创建后由 Dispatcher 转发到该 Worker
     worker_id: int | None = None
@@ -62,6 +62,12 @@ class TaskCreate(BaseModel):
     priority: int = 0
     max_retries: int = 2
     mode: TaskMode = "auto"
+    # Reserved for the Delivery Controller.  They are declared explicitly so
+    # a public caller cannot smuggle ownership hints through Pydantic's legacy
+    # extra-field compatibility.  ``None`` remains harmless for clients that
+    # serialize the read model back into a create form.
+    delivery_run_id: int | None = Field(default=None, exclude=True)
+    delivery_role: str | None = Field(default=None, exclude=True)
     todo_file_path: str | None = None  # required when mode="loop"
     max_iterations: int = 50  # loop only: max iterations before auto-abort
     must_complete: bool = False  # loop only: reject done until all items finished
@@ -115,6 +121,11 @@ class TaskCreate(BaseModel):
 
     @model_validator(mode='after')
     def validate_mode_fields(self):
+        if self.delivery_run_id is not None or self.delivery_role is not None:
+            raise ValueError(
+                "delivery_run_id and delivery_role are reserved for the "
+                "Delivery Controller"
+            )
         if self.mode not in ('loop',) and not self.description:
             raise ValueError('description is required for non-loop tasks')
         if self.mode == 'loop' and not self.todo_file_path:
@@ -132,6 +143,10 @@ class TaskMigrationImport(TaskCreate):
     """
 
     id: int
+    # Accept the reserved wire value so the internal endpoint can reject it
+    # with a lifecycle conflict (409) instead of letting schema validation
+    # disguise an attempted Delivery ownership migration as malformed input.
+    mode: Literal["auto", "plan", "loop", "goal", "delivery_loop"] = "auto"
     # Keep Manager and destination Worker retry generations monotonic. This is
     # intentionally internal-only; public task creation always starts at zero.
     retry_count: int = Field(default=0, ge=0)
@@ -297,6 +312,13 @@ class TaskResponse(BaseModel):
     retry_count: int
     max_retries: int
     mode: str
+    delivery_run_id: int | None = None
+    delivery_role: str | None = None
+    # Read-only DeliveryRun projection.  A Delivery-owned Task remains a
+    # scheduler shell; the Run is the authority for its user-facing lifecycle.
+    delivery_phase: str | None = None
+    delivery_activity: str | None = None
+    delivery_outcome: str | None = None
     todo_file_path: str | None
     loop_progress: str | None
     max_iterations: int

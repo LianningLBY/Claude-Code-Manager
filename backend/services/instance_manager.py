@@ -131,6 +131,232 @@ class LiveAttachmentInjectionUnsupportedError(RuntimeError):
     """The active transport cannot safely access Manager upload paths."""
 
 
+def _path_forms(value: str | None) -> tuple[str, ...]:
+    """Return lexical and symlink-resolved absolute forms for a path."""
+
+    if not isinstance(value, str) or not value.strip():
+        return ()
+    absolute = os.path.normcase(
+        os.path.abspath(os.path.expanduser(value.strip()))
+    )
+    resolved = os.path.normcase(os.path.realpath(absolute))
+    return (absolute,) if resolved == absolute else (absolute, resolved)
+
+
+def _path_is_within(value: str | None, root: str | None) -> bool:
+    for candidate in _path_forms(value):
+        for boundary in _path_forms(root):
+            try:
+                if os.path.commonpath((candidate, boundary)) == boundary:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _is_conventional_delivery_workspace_path(value: str | None) -> bool:
+    """Recognize the reserved ``.claude-manager/worktrees/delivery-*`` tree."""
+
+    for candidate in _path_forms(value):
+        parts = Path(candidate).parts
+        for index in range(len(parts) - 2):
+            if (
+                parts[index] == ".claude-manager"
+                and parts[index + 1] == "worktrees"
+                and parts[index + 2].startswith("delivery-")
+                and len(parts[index + 2]) > len("delivery-")
+            ):
+                return True
+    return False
+
+
+async def _task_has_protected_delivery_effect(
+    db: AsyncSession,
+    task_id: int,
+) -> bool:
+    """Return whether stopping this Task could mutate an owned workflow effect."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        # An Instance that names a missing Task has unresolved ownership.  A
+        # default stop must not turn that uncertainty into an external-effect
+        # cancellation.
+        return True
+    from backend.services.pr_review_runtime import is_pr_sandbox_task
+
+    if (
+        task.mode == "delivery_loop"
+        or task.delivery_run_id is not None
+        or is_pr_sandbox_task(task)
+    ):
+        return True
+
+    # Durable reverse links remain authoritative even if an old client or a
+    # partial migration stripped presentation tags/metadata from the Task.
+    from backend.models.code_review import CodeReviewRun
+    from backend.models.pr_monitor import (
+        PRFindingAction,
+        PRFindingRebuttal,
+        PRReview,
+        PRReviewerRun,
+    )
+
+    linked_queries = (
+        select(CodeReviewRun.id).where(CodeReviewRun.reviewer_task_id == task_id),
+        select(PRReview.id).where(PRReview.task_id == task_id),
+        select(PRReviewerRun.id).where(PRReviewerRun.task_id == task_id),
+        select(PRFindingAction.id).where(PRFindingAction.task_id == task_id),
+        select(PRFindingRebuttal.id).where(PRFindingRebuttal.task_id == task_id),
+    )
+    for query in linked_queries:
+        if (await db.execute(query.limit(1))).scalar_one_or_none() is not None:
+            return True
+    return False
+
+
+async def _require_delivery_workspace_launch_boundary(
+    db: AsyncSession,
+    task: Task,
+    *,
+    cwd: str | None,
+) -> bool:
+    """Keep ordinary Tasks out of Controller-owned Delivery worktrees."""
+
+    from backend.models.delivery import (
+        DeliveryCycle,
+        DELIVERY_TURN_ACTIVE_STATUSES,
+        DeliveryRun,
+        DeliveryTurn,
+    )
+    from backend.models.worktree import Worktree
+    from backend.services.delivery_service import value_hash
+
+    # ``worktrees`` is also the legacy registry for ordinary ``task-*``
+    # isolation. Only rows with a durable Delivery owner reserve a path for
+    # this boundary; treating every historical row as protected would block
+    # normal auto Tasks from their own managed worktrees. The conventional
+    # ``delivery-*`` path check below remains an independent fail-closed guard
+    # for a missing or partially committed Delivery row.
+    worktrees = list(
+        (
+            await db.execute(
+                select(Worktree).where(
+                    Worktree.delivery_run_id.is_not(None)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    candidates = (cwd, task.target_repo)
+    registered_matches = {
+        worktree.id
+        for worktree in worktrees
+        for candidate in candidates
+        if _path_is_within(candidate, worktree.worktree_path)
+    }
+    protected = bool(registered_matches) or any(
+        _is_conventional_delivery_workspace_path(candidate)
+        for candidate in candidates
+    )
+    delivery_owned = (
+        isinstance(task.mode, str)
+        and task.mode == "delivery_loop"
+    ) or type(task.delivery_run_id) is int
+    if not protected:
+        if delivery_owned:
+            raise LaunchSupersededError(
+                f"Delivery Task {task.id} is outside its managed worktree"
+            )
+        return False
+
+    bound = next(
+        (
+            worktree
+            for worktree in worktrees
+            if worktree.task_id == task.id
+            and worktree.delivery_run_id == task.delivery_run_id
+        ),
+        None,
+    )
+    run = (
+        await db.get(DeliveryRun, task.delivery_run_id)
+        if type(task.delivery_run_id) is int
+        else None
+    )
+    cycle = (
+        await db.get(DeliveryCycle, run.current_cycle_id)
+        if run is not None and type(run.current_cycle_id) is int
+        else None
+    )
+    active_turn = (
+        (
+            await db.execute(
+                select(DeliveryTurn)
+                .where(
+                    DeliveryTurn.active_run_id == task.delivery_run_id,
+                    DeliveryTurn.status.in_(DELIVERY_TURN_ACTIVE_STATUSES),
+                )
+                .limit(1)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if type(task.delivery_run_id) is int
+        else None
+    )
+    policy = run.policy_snapshot if run is not None else None
+    exact_binding = bool(
+        task.mode == "delivery_loop"
+        and task.delivery_role == "developer"
+        and bound is not None
+        and bound.status == "active"
+        and bound.cleanup_status == "retained"
+        and run is not None
+        and run.developer_task_id == task.id
+        and run.worktree_id == bound.id
+        and run.workspace_path == bound.worktree_path
+        and run.phase == "coding"
+        and run.activity == "running"
+        and cycle is not None
+        and cycle.run_id == run.id
+        and cycle.active_run_id == run.id
+        and cycle.status == "coding"
+        and active_turn is not None
+        and active_turn.run_id == run.id
+        and active_turn.cycle_id == cycle.id
+        and active_turn.generation == run.turn_count
+        and active_turn.purpose == "code"
+        and active_turn.task_id == task.id
+        and active_turn.task_retry_count == task.retry_count
+        and task.project_id == run.project_id
+        and task.worker_id is None
+        and task.shared_from_id is None
+        and isinstance(policy, dict)
+        and value_hash(policy) == run.policy_hash
+        and policy.get("provider") == "codex"
+        and task.provider == policy.get("provider")
+        and task.model == policy.get("model")
+        and task.codex_service_tier == policy.get("codex_service_tier")
+        and task.effort_level == policy.get("effort_level")
+        and not task.enable_workflows
+        and not (task.enabled_skills or {})
+        and _path_is_within(cwd, bound.worktree_path)
+        and _path_is_within(task.last_cwd, bound.worktree_path)
+        and all(
+            not _is_conventional_delivery_workspace_path(candidate)
+            or _path_is_within(candidate, bound.worktree_path)
+            for candidate in candidates
+        )
+        and all(match_id == bound.id for match_id in registered_matches)
+    )
+    if not exact_binding:
+        raise LaunchSupersededError(
+            f"Task {task.id} is not the exact active owner of the requested "
+            "Delivery worktree"
+        )
+    return True
+
+
 @dataclass(frozen=True)
 class _OutputConsumerRecord:
     """Identity of one output-bookkeeping generation for a reusable slot."""
@@ -891,6 +1117,7 @@ class InstanceManager:
         task_skill_context = ""
         codex_monitor_enabled = False
         pr_review_task = False
+        delivery_task = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -916,6 +1143,30 @@ class InstanceManager:
                     raise LaunchSupersededError(
                         f"Task {task_id} disappeared before launch"
                     )
+                delivery_task = await _require_delivery_workspace_launch_boundary(
+                    db,
+                    task,
+                    cwd=cwd,
+                )
+                if delivery_task:
+                    if (
+                        provider != "codex"
+                        or task.provider != "codex"
+                        or model != task.model
+                        or codex_service_tier != task.codex_service_tier
+                        or effort_level != task.effort_level
+                        or enable_workflows
+                        or bool(enabled_skills)
+                    ):
+                        raise LaunchSupersededError(
+                            "Delivery Developer launch no longer matches its "
+                            "frozen Codex execution policy"
+                        )
+                    # Dispatcher normally builds project Git credentials before
+                    # it knows which pending Task won the queue.  The Delivery
+                    # boundary deliberately drops that ambient authority here;
+                    # only the Controller publisher may receive push credentials.
+                    git_env = None
                 from backend.services.pr_review_runtime import (
                     is_pr_sandbox_task,
                 )
@@ -947,7 +1198,7 @@ class InstanceManager:
                         project_dir=cwd,
                         enabled_skills=enabled_skills,
                     )
-                if pr_review_task:
+                if pr_review_task or delivery_task:
                     # PR input is already snapshotted into the fixed prompt.
                     # No ambient skills or monitor capability may reintroduce
                     # filesystem/network tools.
@@ -1069,6 +1320,7 @@ class InstanceManager:
             and task_id is not None
             and settings.codex_main_mcp_enabled
             and not pr_review_task
+            and not delivery_task
         )
         codex_sub_agent_mcp_required = bool(
             provider == "codex"
@@ -1076,6 +1328,7 @@ class InstanceManager:
             and enabled_skills
             and enabled_skills.get("sub-agent")
             and not pr_review_task
+            and not delivery_task
         )
         codex_mcp_required = (
             codex_main_mcp_required or codex_sub_agent_mcp_required
@@ -1128,9 +1381,14 @@ class InstanceManager:
 
         if (
             provider == "codex"
-            and pr_review_task
+            and (pr_review_task or delivery_task)
             and not settings.codex_app_server_enabled
         ):
+            if delivery_task:
+                raise CodexRequiredMcpError(
+                    "Codex Delivery isolation requires the app-server sandbox; "
+                    "exec fallback is disabled"
+                )
             raise CodexRequiredMcpError(
                 "Codex PR review isolation requires the app-server read-only "
                 "sandbox; exec fallback is disabled"
@@ -1162,14 +1420,19 @@ class InstanceManager:
                         disable_project_config=(
                             cloudrouter_account is not None
                             or pr_review_task
+                            or delivery_task
                         ),
                         codex_service_tier=codex_service_tier,
                         sandbox_mode=(
                             "read-only"
                             if pr_review_task
+                            else "workspace-write"
+                            if delivery_task
                             else "danger-full-access"
                         ),
-                        disable_autonomous_features=pr_review_task,
+                        disable_user_mcp=(pr_review_task or delivery_task),
+                        disable_autonomous_features=(pr_review_task or delivery_task),
+                        network_isolated=delivery_task,
                         tools_disabled=pr_review_task,
                     )
                     logger.info(
@@ -1182,6 +1445,11 @@ class InstanceManager:
                     )
                     return pid
                 except CodexRequiredMcpPreTurnError as exc:
+                    if delivery_task:
+                        raise CodexRequiredMcpError(
+                            "Codex Delivery workspace/network isolation could "
+                            "not be confirmed before turn/start"
+                        ) from exc
                     if pr_review_task:
                         raise CodexRequiredMcpError(
                             "Codex PR review read-only sandbox could not be "
@@ -1240,6 +1508,15 @@ class InstanceManager:
                     )
                     raise
                 except Exception as exc:
+                    if delivery_task:
+                        logger.exception(
+                            "Codex Delivery app-server failed; refusing exec "
+                            "fallback task_id=%s",
+                            task_id,
+                        )
+                        raise CodexRequiredMcpError(
+                            "Codex Delivery isolation could not be guaranteed"
+                        ) from exc
                     if pr_review_task:
                         logger.exception(
                             "Codex PR review app-server failed; refusing "
@@ -1319,9 +1596,9 @@ class InstanceManager:
                 queue_timestamp=queue_timestamp,
             )
 
-        if provider == "codex" and pr_review_task:
+        if provider == "codex" and (pr_review_task or delivery_task):
             raise CodexRequiredMcpError(
-                "Codex PR review isolation forbids exec fallback"
+                "Codex isolated workflow execution forbids exec fallback"
             )
 
         cmd = self._build_command(
@@ -2048,9 +2325,11 @@ class InstanceManager:
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         disable_project_config: bool = False,
+        disable_user_mcp: bool = False,
         codex_service_tier: str = "default",
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
+        network_isolated: bool = False,
         tools_disabled: bool = False,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
@@ -2069,10 +2348,12 @@ class InstanceManager:
             task_id=task_id,
             mcp_specs=mcp_specs,
             disable_project_config=disable_project_config,
+            disable_user_mcp=disable_user_mcp,
             skill_context=skill_context,
             codex_service_tier=codex_service_tier,
             sandbox_mode=sandbox_mode,
             disable_autonomous_features=disable_autonomous_features,
+            network_isolated=network_isolated,
             tools_disabled=tools_disabled,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
@@ -4748,6 +5029,7 @@ class InstanceManager:
                     expected_started_at=owner.started_at,
                     task_status="failed",
                     task_error_message=error,
+                    allow_delivery_effect_stop=True,
                 )
             else:
                 succeeded = (
@@ -9323,6 +9605,7 @@ class InstanceManager:
             DEFAULT_TERMINAL_CONSUMER_TIMEOUT
         ),
         consumer_cancel_timeout: float | None = DEFAULT_CONSUMER_CANCEL_TIMEOUT,
+        allow_delivery_effect_stop: bool = False,
     ) -> bool:
         """Cancellation-safe stop of one reusable worker slot.
 
@@ -9333,6 +9616,10 @@ class InstanceManager:
         disables that one fence). All are verified under the launch lock and
         again in the terminal DB CAS, so a recycled slot cannot stop a newer
         generation even when it belongs to the same task.
+
+        Workflow-owned Delivery/PR effect Tasks are fail-closed by default.
+        Only an internal controller shutdown or exact recovery path may opt in
+        with ``allow_delivery_effect_stop=True``.
         """
 
         if task_status not in {
@@ -9353,6 +9640,7 @@ class InstanceManager:
                 task_error_message=task_error_message,
                 terminal_consumer_timeout=terminal_consumer_timeout,
                 consumer_cancel_timeout=consumer_cancel_timeout,
+                allow_delivery_effect_stop=allow_delivery_effect_stop,
             )
         )
         cancellation: asyncio.CancelledError | None = None
@@ -9512,6 +9800,7 @@ class InstanceManager:
         task_error_message: str | None,
         terminal_consumer_timeout: float | None,
         consumer_cancel_timeout: float | None,
+        allow_delivery_effect_stop: bool,
     ) -> bool:
         """Serialize stop against launch without cancelling terminal bookkeeping."""
 
@@ -9565,12 +9854,66 @@ class InstanceManager:
                             )
                         expected_owner_verified = True
                     if not stop_fence_registered:
-                        # Register exactly one token owned by this stop call.
-                        # Do this only after any requested generation fence has
-                        # succeeded, so a stale/mismatched stop cannot tear down
-                        # or contribute a fence for the current owner.
+                        # Publish the stop intent after exact-owner validation,
+                        # but before any slower workflow ownership lookup.  It
+                        # is only an admission fence; no consumer or process is
+                        # touched until the guard below succeeds.
                         self._begin_stopping(instance_id)
                         stop_fence_registered = True
+                    pre_guard_record = self._consumer_records.get(instance_id)
+                    pre_guard_process = (
+                        pre_guard_record.process
+                        if pre_guard_record is not None
+                        else self.processes.get(instance_id)
+                    )
+                    protected_task_id = expected_task_id
+                    if protected_task_id is None:
+                        guard_owner = (
+                            owner
+                            if isinstance(owner, Instance)
+                            else None
+                        )
+                        if guard_owner is None:
+                            async with self.db_factory() as db:
+                                guard_owner = await db.get(Instance, instance_id)
+                        if guard_owner is not None:
+                            protected_task_id = guard_owner.current_task_id
+                    if protected_task_id is None:
+                        guard_record = self._consumer_records.get(instance_id)
+                        if guard_record is not None:
+                            protected_task_id = guard_record.task_id
+                    if (
+                        protected_task_id is not None
+                        and not allow_delivery_effect_stop
+                    ):
+                        async with self.db_factory() as db:
+                            if await _task_has_protected_delivery_effect(
+                                db,
+                                protected_task_id,
+                            ):
+                                logger.warning(
+                                    "Refused generic stop of workflow-owned "
+                                    "Task %s on instance %s",
+                                    protected_task_id,
+                                    instance_id,
+                                )
+                                return False
+                    if (
+                        pre_guard_record is not None
+                        and pre_guard_record.task.done()
+                        and pre_guard_process is not None
+                        and self._generation_reap_confirmed(
+                            instance_id,
+                            pre_guard_process,
+                        )
+                        and self._consumer_records.get(instance_id)
+                        is not pre_guard_record
+                    ):
+                        # The ownership query deliberately awaits before any
+                        # signal.  A terminal consumer may finish and remove
+                        # its exact maps during that await; preserve the same
+                        # settled-cleanup proof the pre-guard loop observed.
+                        settled_terminal_consumer = True
                     process = (
                         self.processes.get(instance_id)
                         or self._process_groups.get(instance_id)

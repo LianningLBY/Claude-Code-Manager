@@ -1318,8 +1318,7 @@ async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
     session_factory,
 ):
     """A shadow Task must never expose the sharer's database id as local."""
-    from types import SimpleNamespace
-
+    from backend.models.task_share import SharedTaskReceived
     from backend.services.shared_relay import SharedRelay
 
     created = await client.post("/api/tasks", json={
@@ -1328,6 +1327,19 @@ async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
         "target_repo": "/tmp",
     })
     task_id = created.json()["id"]
+    async with session_factory() as db:
+        shared = SharedTaskReceived(
+            owner_ccm_url="https://owner.example.test",
+            remote_task_id=44,
+            share_token="relay-test-token",
+            local_task_id=task_id,
+            status="active",
+        )
+        db.add(shared)
+        await db.flush()
+        shadow = await db.get(Task, task_id)
+        shadow.shared_from_id = shared.id
+        await db.commit()
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     relay = SharedRelay(session_factory, broadcaster)
@@ -1343,7 +1355,7 @@ async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
                 "timestamp": "2026-07-30T01:02:03Z",
             },
         },
-        SimpleNamespace(local_task_id=task_id),
+        shared,
     )
 
     async with session_factory() as db:

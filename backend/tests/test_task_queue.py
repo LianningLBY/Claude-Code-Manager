@@ -1,19 +1,32 @@
 """Tests for TaskQueue — priority ordering, dequeue, status transitions."""
 import asyncio
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.sql.dml import Update
 
 from backend.config import settings
 from backend.database import Base
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.capability import CapabilityExecution, CapabilityInvocation
+from backend.models.code_review import CodeReviewResult, CodeReviewRun
+from backend.models.delivery import DeliveryCycle, DeliveryRun, DeliveryTurn
+from backend.models.plan import Plan
+from backend.models.plan_agent import PlanAgentRun
+from backend.models.pr_monitor import MonitoredRepo
+from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.task_share import TaskShare
+from backend.models.team_share import TeamTaskShare
+from backend.services.delivery_service import DeliveryCreateSpec, create_delivery_run
+from backend.services.task_sharing import lock_task_share_authority
 from backend.services.task_queue import (
     TaskQueue,
     _effective_key_expr,
@@ -25,6 +38,72 @@ from backend.services.task_queue import (
 @pytest_asyncio.fixture
 async def queue(db_session):
     return TaskQueue(db_session)
+
+
+async def _pending_delivery_task(queue: TaskQueue, *, admitted: bool) -> Task:
+    repo_full_name = f"example/queue-delivery-{id(queue)}-{int(admitted)}"
+    project = Project(
+        name=f"queue-delivery-{id(queue)}-{int(admitted)}",
+        git_url=f"https://github.com/{repo_full_name}.git",
+        has_remote=True,
+        local_path="/tmp/queue-delivery",
+        default_branch="main",
+        status="ready",
+    )
+    queue.db.add(project)
+    await queue.db.flush()
+    repo = MonitoredRepo(
+        repo_full_name=repo_full_name,
+        project_id=project.id,
+        webhook_secret="queue-secret",
+        review_mode="panel",
+        wait_for_ci=True,
+        required_checks=["tests"],
+        merge_queue_mode="manual",
+        default_branch="main",
+    )
+    queue.db.add(repo)
+    await queue.db.commit()
+    run = await create_delivery_run(
+        queue.db,
+        DeliveryCreateSpec(
+            idempotency_key="queue-owned-delivery",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Queue-owned delivery",
+            requirements="Implement the queued change",
+        ),
+    )
+    task = await queue.db.get(Task, run.developer_task_id)
+    cycle = await queue.db.get(DeliveryCycle, run.current_cycle_id)
+    assert task is not None and cycle is not None
+    task.status = "pending"
+    task.priority = -10
+    if admitted:
+        run.phase = "coding"
+        run.activity = "running"
+        cycle.status = "coding"
+        queue.db.add(
+            DeliveryTurn(
+                run_id=run.id,
+                cycle_id=cycle.id,
+                generation=1,
+                correlation_id=f"delivery:{run.id}:turn:1",
+                active_run_id=run.id,
+                purpose="code",
+                trigger_kind="plan_ready",
+                trigger_payload={},
+                prompt_payload={"schema_version": 1},
+                prompt_hash="a" * 64,
+                status="queued",
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                attempts=1,
+            )
+        )
+    await queue.db.commit()
+    await queue.db.refresh(task)
+    return task
 
 
 @pytest.mark.asyncio
@@ -138,6 +217,96 @@ async def test_dequeue_skips_temporarily_excluded_task(queue):
     assert selected is not None
     assert selected.id == runnable.id
     assert (await queue.get(waiting.id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_dequeue_recovers_admitted_delivery_when_admission_is_disabled(
+    queue,
+    monkeypatch,
+):
+    delivery = await _pending_delivery_task(queue, admitted=True)
+    monkeypatch.setattr(settings, "capability_core_enabled", False)
+    monkeypatch.setattr(settings, "delivery_loop_enabled", False)
+
+    selected = await queue.dequeue()
+
+    assert selected is not None and selected.id == delivery.id
+    assert selected.status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_dequeue_rechecks_delivery_admission_during_claim_cas(
+    queue,
+    monkeypatch,
+):
+    delivery = await _pending_delivery_task(queue, admitted=True)
+    delivery_id = delivery.id
+    runnable = await queue.create(
+        title="ordinary after stale delivery",
+        description="d",
+        priority=0,
+    )
+    turn = (
+        await queue.db.execute(
+            select(DeliveryTurn).where(DeliveryTurn.task_id == delivery_id)
+        )
+    ).scalar_one()
+    original_execute = queue.db.execute
+    invalidated = False
+
+    async def invalidate_before_claim(statement, *args, **kwargs):
+        nonlocal invalidated
+        if (
+            not invalidated
+            and isinstance(statement, Update)
+            and statement.table.name == Task.__tablename__
+        ):
+            invalidated = True
+            turn.status = "stale"
+            turn.active_run_id = None
+            await queue.db.flush()
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(queue.db, "execute", invalidate_before_claim)
+
+    selected = await queue.dequeue()
+
+    assert invalidated is True
+    assert selected is not None and selected.id == runnable.id
+    assert (await queue.get(delivery_id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_dequeue_requires_active_delivery_turn(queue, monkeypatch):
+    delivery = await _pending_delivery_task(queue, admitted=False)
+    runnable = await queue.create(
+        title="ordinary fallback",
+        description="d",
+        priority=0,
+    )
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    monkeypatch.setattr(settings, "delivery_loop_enabled", True)
+
+    selected = await queue.dequeue()
+
+    assert selected is not None and selected.id == runnable.id
+    assert (await queue.get(delivery.id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_dequeue_claims_controller_admitted_delivery_turn(
+    queue,
+    monkeypatch,
+):
+    delivery = await _pending_delivery_task(queue, admitted=True)
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    monkeypatch.setattr(settings, "delivery_loop_enabled", True)
+
+    selected = await queue.dequeue(instance_id=41)
+
+    assert selected is not None and selected.id == delivery.id
+    assert selected.status == "in_progress"
+    assert selected.instance_id == 41
 
 
 @pytest.mark.asyncio
@@ -389,6 +558,200 @@ async def test_delete_conflict_task(queue):
     assert result is True
 
 
+def _task_access_grants(task_id: int, *, suffix: str):
+    return (
+        TaskShare(
+            task_id=task_id,
+            shared_to_open_id=f"open-{suffix}",
+            shared_to_name="Old recipient",
+            shared_to_ccm_url="https://peer.example",
+            share_token=f"token-{suffix}",
+        ),
+        TeamTaskShare(
+            task_id=task_id,
+            target_type="user",
+            target_id=41,
+            permission="chat",
+            shared_by=7,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_task_explicitly_removes_all_access_grants(queue):
+    task = await queue.create(title="old secret", description="delete me")
+    task.status = "completed"
+    queue.db.add_all(_task_access_grants(task.id, suffix="delete"))
+    await queue.db.commit()
+    task_id = task.id
+
+    assert await queue.delete(task_id) is True
+    assert await queue.db.get(Task, task_id) is None
+    assert await queue.db.scalar(
+        select(TaskShare.id).where(TaskShare.task_id == task_id)
+    ) is None
+    assert await queue.db.scalar(
+        select(TeamTaskShare.id).where(TeamTaskShare.task_id == task_id)
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_restores_access_grants_when_final_cas_loses(queue):
+    task = await queue.create(title="CAS owner", description="keep private")
+    task.status = "completed"
+    grants = _task_access_grants(task.id, suffix="rollback")
+    queue.db.add_all(grants)
+    await queue.db.commit()
+    task_id = task.id
+    grant_ids = (grants[0].id, grants[1].id)
+    original_execute = queue.db.execute
+
+    async def lose_final_task_delete(statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if (
+            getattr(statement, "is_delete", False)
+            and getattr(table, "name", None) == "tasks"
+        ):
+            return MagicMock(rowcount=0)
+        return await original_execute(statement, *args, **kwargs)
+
+    with patch.object(
+        queue.db,
+        "execute",
+        new=AsyncMock(side_effect=lose_final_task_delete),
+    ):
+        assert await queue.delete(task_id) is False
+
+    queue.db.expire_all()
+    assert await queue.db.get(Task, task_id) is not None
+    assert await queue.db.scalar(
+        select(TaskShare.id).where(TaskShare.task_id == task_id)
+    ) == grant_ids[0]
+    assert await queue.db.scalar(
+        select(TeamTaskShare.id).where(TeamTaskShare.task_id == task_id)
+    ) == grant_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_task_creation_purges_pre_upgrade_acl_for_reused_id(queue):
+    old = await queue.create(title="old incarnation", description="private")
+    old_id = old.id
+    queue.db.add_all(_task_access_grants(old_id, suffix="reused"))
+    await queue.db.commit()
+
+    # Simulate an older SQLite deployment deleting the Task without FK
+    # enforcement or explicit ACL cleanup, then reusing its integer id.
+    await queue.db.execute(delete(Task).where(Task.id == old_id))
+    await queue.db.commit()
+    assert await queue.db.scalar(
+        select(TaskShare.id).where(TaskShare.task_id == old_id)
+    ) is not None
+    assert await queue.db.scalar(
+        select(TeamTaskShare.id).where(TeamTaskShare.task_id == old_id)
+    ) is not None
+
+    replacement = await queue.create(
+        id=old_id,
+        title="new incarnation",
+        description="must stay private",
+    )
+
+    assert replacement.id == old_id
+    assert await queue.db.scalar(
+        select(TaskShare.id).where(TaskShare.task_id == old_id)
+    ) is None
+    assert await queue.db.scalar(
+        select(TeamTaskShare.id).where(TeamTaskShare.task_id == old_id)
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_share_write_fence_rejects_reused_task_incarnation(queue):
+    old = await queue.create(title="old share owner", description="private")
+    observed = SimpleNamespace(id=old.id, incarnation_id=old.incarnation_id)
+    await queue.db.execute(delete(Task).where(Task.id == old.id))
+    await queue.db.commit()
+    replacement = await queue.create(
+        id=old.id,
+        title="new share owner",
+        description="different private task",
+        # Equal timestamps prove the fence does not depend on dialect-specific
+        # DateTime precision.
+        created_at=old.created_at,
+    )
+
+    assert replacement.created_at == old.created_at
+    assert replacement.incarnation_id != observed.incarnation_id
+    assert not await lock_task_share_authority(queue.db, observed)
+
+
+@pytest.mark.asyncio
+async def test_canonical_task_creation_replaces_caller_incarnation(queue):
+    caller_value = "0" * 32
+    task = await queue.create(
+        title="system-owned incarnation",
+        description="caller value must be ignored",
+        incarnation_id=caller_value,
+    )
+
+    assert task.incarnation_id
+    assert task.incarnation_id != caller_value
+
+
+@pytest.mark.asyncio
+async def test_delivery_creation_purges_pre_upgrade_acl_for_next_id(queue):
+    repo_full_name = f"example/delivery-acl-{id(queue)}"
+    project = Project(
+        name=f"delivery-acl-{id(queue)}",
+        git_url=f"https://github.com/{repo_full_name}.git",
+        has_remote=True,
+        local_path="/tmp/delivery-acl",
+        default_branch="main",
+        status="ready",
+    )
+    queue.db.add(project)
+    await queue.db.flush()
+    repo = MonitoredRepo(
+        repo_full_name=repo_full_name,
+        project_id=project.id,
+        webhook_secret="delivery-acl-secret",
+        review_mode="panel",
+        wait_for_ci=True,
+        required_checks=["tests"],
+        merge_queue_mode="manual",
+        default_branch="main",
+    )
+    queue.db.add(repo)
+    seed = await queue.create(title="retired", description="old task")
+    seed_id = seed.id
+    next_id = seed_id + 1
+    await queue.db.execute(delete(Task).where(Task.id == seed_id))
+    # Simulate an orphan grant imported from a pre-upgrade database at the id
+    # SQLite AUTOINCREMENT will allocate next.  Canonical creation must purge
+    # it even though structural id non-reuse is now active.
+    queue.db.add_all(_task_access_grants(next_id, suffix="delivery"))
+    await queue.db.commit()
+
+    run = await create_delivery_run(
+        queue.db,
+        DeliveryCreateSpec(
+            idempotency_key="delivery-reused-acl",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Fresh private delivery",
+            requirements="Do not inherit old readers",
+        ),
+    )
+
+    assert run.developer_task_id == next_id
+    assert await queue.db.scalar(
+        select(TaskShare.id).where(TaskShare.task_id == next_id)
+    ) is None
+    assert await queue.db.scalar(
+        select(TeamTaskShare.id).where(TeamTaskShare.task_id == next_id)
+    ) is None
+
+
 @pytest.mark.asyncio
 async def test_delete_rejects_completed_task_with_live_pty_background(queue):
     task = await queue.create(title="background", description="tail")
@@ -561,6 +924,257 @@ async def test_delete_task_explicitly_removes_terminal_capability_history(queue)
     assert await queue.db.get(Task, task_id) is None
     assert await queue.db.get(CapabilityInvocation, invocation_id) is None
     assert await queue.db.get(CapabilityExecution, execution_id) is None
+
+
+async def _completed_code_review_graph(
+    queue: TaskQueue,
+) -> tuple[Task, Task, CapabilityInvocation, CapabilityExecution, CodeReviewRun, CodeReviewResult]:
+    developer = await queue.create(title="review developer", description="d")
+    reviewer = await queue.create(title="reviewer", description="d")
+    developer.status = "completed"
+    reviewer.status = "completed"
+    reviewer.started_at = datetime.utcnow()
+    reviewer.completed_at = datetime.utcnow()
+
+    invocation = _capability_invocation_for_delete(
+        developer.id,
+        status="failed",
+    )
+    invocation.capability_key = "code_review"
+    invocation.executor_kind = "code_review"
+    queue.db.add(invocation)
+    await queue.db.flush()
+    execution = CapabilityExecution(
+        invocation_id=invocation.id,
+        attempt=1,
+        status="failed",
+        state_version=2,
+        active_invocation_id=None,
+        idempotency_key=f"{invocation.id}:1",
+        executor_kind="code_review",
+        input_hash=invocation.input_hash,
+        error_code="finished",
+    )
+    queue.db.add(execution)
+    await queue.db.flush()
+    run = CodeReviewRun(
+        capability_invocation_id=invocation.id,
+        capability_execution_id=execution.id,
+        attempt=1,
+        status="completed",
+        state_version=2,
+        developer_task_id=developer.id,
+        reviewer_task_id=reviewer.id,
+        reviewer_task_retry_count=0,
+        repo_path="/repo",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        head_tree_sha="c" * 40,
+        patch_sha256="d" * 64,
+        subject_ref={"kind": "commit_range"},
+        subject_hash="e" * 64,
+        prompt_hash="f" * 64,
+        completed_at=datetime.utcnow(),
+    )
+    queue.db.add(run)
+    await queue.db.flush()
+    result = CodeReviewResult(
+        run_id=run.id,
+        capability_invocation_id=invocation.id,
+        capability_execution_id=execution.id,
+        developer_task_id=developer.id,
+        reviewer_task_id=reviewer.id,
+        reviewer_task_retry_count=0,
+        reviewer_task_instance_id=None,
+        reviewer_task_started_at=reviewer.started_at,
+        reviewer_task_completed_at=reviewer.completed_at,
+        output_log_id=1,
+        schema_version=1,
+        role="reviewer",
+        verdict="approved",
+        summary="approved",
+        findings=[],
+        subject_ref=run.subject_ref,
+        subject_hash=run.subject_hash,
+        result_hash="1" * 64,
+    )
+    queue.db.add(result)
+    await queue.db.flush()
+    invocation.status = "completed"
+    invocation.result_kind = "code_review_result"
+    invocation.result_id = result.id
+    invocation.result_hash = result.result_hash
+    execution.status = "completed"
+    execution.output_kind = invocation.result_kind
+    execution.output_id = result.id
+    execution.output_hash = result.result_hash
+    await queue.db.commit()
+    return developer, reviewer, invocation, execution, run, result
+
+
+@pytest.mark.asyncio
+async def test_delete_task_preserves_code_review_aggregate(queue):
+    graph = await _completed_code_review_graph(queue)
+    developer, reviewer, invocation, execution, run, result = graph
+    row_ids = (
+        developer.id,
+        reviewer.id,
+        invocation.id,
+        execution.id,
+        run.id,
+        result.id,
+    )
+
+    assert await queue.delete(row_ids[0]) is False
+    assert await queue.delete(row_ids[1]) is False
+
+    for model, row_id in zip(
+        (
+            Task,
+            Task,
+            CapabilityInvocation,
+            CapabilityExecution,
+            CodeReviewRun,
+            CodeReviewResult,
+        ),
+        row_ids,
+        strict=True,
+    ):
+        assert await queue.db.get(model, row_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse_row", ["run", "result"])
+async def test_delete_task_preserves_code_review_reverse_linked_by_capability_ids(
+    queue,
+    reverse_row,
+):
+    graph = await _completed_code_review_graph(queue)
+    owner, reviewer, invocation, execution, run, result = graph
+    wrong_developer = await queue.create(
+        title="mislinked review developer",
+        description="d",
+    )
+    wrong_developer.status = "completed"
+    alternate_invocation = _capability_invocation_for_delete(
+        wrong_developer.id,
+        status="failed",
+    )
+    alternate_invocation.capability_key = "code_review"
+    alternate_invocation.executor_kind = "code_review"
+    queue.db.add(alternate_invocation)
+    await queue.db.flush()
+    alternate_execution = CapabilityExecution(
+        invocation_id=alternate_invocation.id,
+        attempt=1,
+        status="failed",
+        state_version=2,
+        active_invocation_id=None,
+        idempotency_key=f"{alternate_invocation.id}:1",
+        executor_kind="code_review",
+        input_hash=alternate_invocation.input_hash,
+        error_code="finished",
+    )
+    queue.db.add(alternate_execution)
+    await queue.db.flush()
+    run.developer_task_id = wrong_developer.id
+    result.developer_task_id = wrong_developer.id
+    if reverse_row == "run":
+        result.capability_invocation_id = alternate_invocation.id
+        result.capability_execution_id = alternate_execution.id
+    else:
+        run.capability_invocation_id = alternate_invocation.id
+        run.capability_execution_id = alternate_execution.id
+    await queue.db.commit()
+    row_ids = (
+        owner.id,
+        reviewer.id,
+        wrong_developer.id,
+        invocation.id,
+        execution.id,
+        run.id,
+        result.id,
+        alternate_invocation.id,
+        alternate_execution.id,
+    )
+
+    assert await queue.delete(owner.id) is False
+
+    for model, row_id in zip(
+        (
+            Task,
+            Task,
+            Task,
+            CapabilityInvocation,
+            CapabilityExecution,
+            CodeReviewRun,
+            CodeReviewResult,
+            CapabilityInvocation,
+            CapabilityExecution,
+        ),
+        row_ids,
+        strict=True,
+    ):
+        assert await queue.db.get(model, row_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_preserves_first_class_plan_aggregate(queue):
+    task = await queue.create(title="plan target", description="d")
+    task.status = "completed"
+    plan = Plan(
+        title="Durable plan",
+        initial_request="Plan the task",
+        target_task_id=task.id,
+        pipeline_config={},
+    )
+    queue.db.add(plan)
+    await queue.db.commit()
+    task_id = task.id
+    plan_id = plan.id
+
+    assert await queue.delete(task_id) is False
+    assert await queue.db.get(Task, task_id) is not None
+    assert await queue.db.get(Plan, plan_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_preserves_capability_plan_run_without_target_link(queue):
+    task = await queue.create(title="plan capability target", description="d")
+    task.status = "completed"
+    invocation = _capability_invocation_for_delete(task.id, status="failed")
+    invocation.capability_key = "plan"
+    invocation.executor_kind = "plan_agent"
+    queue.db.add(invocation)
+    await queue.db.flush()
+    execution = CapabilityExecution(
+        invocation_id=invocation.id,
+        attempt=1,
+        status="failed",
+        state_version=2,
+        active_invocation_id=None,
+        idempotency_key=f"{invocation.id}:1",
+        executor_kind="plan_agent",
+        input_hash=invocation.input_hash,
+        error_code="finished",
+    )
+    queue.db.add(execution)
+    await queue.db.flush()
+    run = PlanAgentRun(
+        capability_execution_id=execution.id,
+        run_type="capability",
+        status="failed",
+        current_stage="planner",
+    )
+    queue.db.add(run)
+    await queue.db.commit()
+    row_ids = (task.id, invocation.id, execution.id, run.id)
+
+    assert await queue.delete(row_ids[0]) is False
+    assert await queue.db.get(Task, row_ids[0]) is not None
+    assert await queue.db.get(CapabilityInvocation, row_ids[1]) is not None
+    assert await queue.db.get(CapabilityExecution, row_ids[2]) is not None
+    assert await queue.db.get(PlanAgentRun, row_ids[3]) is not None
 
 
 @pytest.mark.asyncio

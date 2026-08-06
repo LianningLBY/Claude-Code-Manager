@@ -695,6 +695,17 @@ async def test_panel_recovery_fails_closed_for_malformed_or_local_missing_output
         db_session,
         worker_id=worker_id,
     )
+    monitor = PRMonitorRun(
+        repo_id=review.repo_id,
+        pr_number=review.pr_number,
+        current_base_sha=review.base_sha,
+        current_head_sha=review.head_sha,
+        current_review_id=review.id,
+        status="reviewing",
+    )
+    db_session.add(monitor)
+    await db_session.flush()
+    review.monitor_run_id = monitor.id
     if candidate is not None:
         db_session.add(LogEntry(
             task_id=task.id,
@@ -704,7 +715,7 @@ async def test_panel_recovery_fails_closed_for_malformed_or_local_missing_output
             content=candidate,
             timestamp=task.started_at,
         ))
-        await db_session.commit()
+    await db_session.commit()
     with patch(
         "backend.services.pr_review_service._broadcast_review_update",
         AsyncMock(),
@@ -721,9 +732,80 @@ async def test_panel_recovery_fails_closed_for_malformed_or_local_missing_output
         run.id,
         populate_existing=True,
     )
+    refreshed_monitor = await db_session.get(
+        PRMonitorRun,
+        monitor.id,
+        populate_existing=True,
+    )
     assert refreshed_review.status == "error"
     assert refreshed_run.status == "error"
     assert expected_error in refreshed_run.error_message
+    assert refreshed_monitor.status == "paused"
+    assert refreshed_monitor.pause_reason.startswith(
+        f"review_error:{review.id}:"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "review model returned a terminal provider error",
+        "review transport disconnected after retries",
+    ],
+)
+async def test_reviewer_task_failure_pauses_exact_monitor_once(
+    db_session,
+    failure,
+):
+    review, reviewer_run, task = await _create_recoverable_panel_run(
+        db_session,
+        worker_id=None,
+    )
+    monitor = PRMonitorRun(
+        repo_id=review.repo_id,
+        pr_number=review.pr_number,
+        current_base_sha=review.base_sha,
+        current_head_sha=review.head_sha,
+        current_review_id=review.id,
+        status="reviewing",
+    )
+    db_session.add(monitor)
+    await db_session.flush()
+    review.monitor_run_id = monitor.id
+    review_id = review.id
+    reviewer_run_id = reviewer_run.id
+    task_id = task.id
+    monitor_id = monitor.id
+    await db_session.commit()
+
+    assert await pr_review_panel.fail_reviewer_run(
+        db_session,
+        reviewer_run_id=reviewer_run_id,
+        task_id=task_id,
+        error=failure,
+    ) == review_id
+    refreshed = await db_session.get(
+        PRMonitorRun,
+        monitor_id,
+        populate_existing=True,
+    )
+    assert refreshed.status == "paused"
+    assert failure[:500] in (refreshed.pause_reason or "")
+    terminal_version = refreshed.state_version
+
+    assert await pr_review_panel.fail_reviewer_run(
+        db_session,
+        reviewer_run_id=reviewer_run_id,
+        task_id=task_id,
+        error=failure,
+    ) is None
+    refreshed = await db_session.get(
+        PRMonitorRun,
+        monitor_id,
+        populate_existing=True,
+    )
+    assert refreshed.state_version == terminal_version
 
 
 @pytest.mark.asyncio

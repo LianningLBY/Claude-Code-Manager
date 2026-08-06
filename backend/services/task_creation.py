@@ -1,12 +1,32 @@
 """Canonical transaction-aware creation boundary for executable Tasks."""
 
 from collections.abc import Mapping
+import secrets
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
 from backend.models.task import Task
+from backend.models.task_share import TaskShare
+from backend.models.team_share import TeamTaskShare
 from backend.services.codex_models import validate_codex_service_tier
+
+
+async def purge_task_access_grants(db: AsyncSession, task_id: int) -> None:
+    """Remove every ACL row whose authority is one exact Task id.
+
+    SQLite deployments have historically run without foreign-key enforcement,
+    and ``TeamTaskShare`` has no database foreign key at all.  Explicit cleanup
+    is therefore required both when deleting a Task and when admitting a new
+    Task whose integer id may have been reused.
+    """
+
+    from sqlalchemy import delete
+
+    await db.execute(delete(TaskShare).where(TaskShare.task_id == task_id))
+    await db.execute(
+        delete(TeamTaskShare).where(TeamTaskShare.task_id == task_id)
+    )
 
 
 def resolve_task_runtime_defaults(
@@ -58,6 +78,9 @@ async def stage_task_record(db: AsyncSession, **values) -> Task:
     """
 
     prepared = prepare_task_create_values(values)
+    # Incarnations are system authority, never caller-controlled.  This also
+    # upgrades explicit-id/internal creation paths to the same ABA fence.
+    prepared["incarnation_id"] = secrets.token_hex(16)
     validate_task_service_tier_configuration(
         provider=prepared["provider"],
         model=prepared["model"],
@@ -68,6 +91,10 @@ async def stage_task_record(db: AsyncSession, **values) -> Task:
     task = Task(**prepared)
     db.add(task)
     await db.flush()
+    # A newly flushed Task cannot yet have legitimate grants.  Clear orphaned
+    # rows left by older deployments before this reused integer id becomes
+    # visible, otherwise the new Task would inherit the previous Task's ACL.
+    await purge_task_access_grants(db, task.id)
     return task
 
 

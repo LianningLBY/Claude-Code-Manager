@@ -17,7 +17,7 @@ import type {
 } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Pin } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -25,6 +25,7 @@ import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/Task
 import { VersionedPlansDialog } from '../PlanReview/VersionedPlansDialog';
 import { planStalenessConfirmationMessage } from '../PlanReview/planStaleness';
 import { AttentionTag } from '../Tasks/AttentionTag';
+import { DeliveryRunPanel } from '../Tasks/DeliveryRunPanel';
 import { ExpandableText } from '../ExpandableText';
 import { copyToClipboard } from '../clipboard';
 import { formatMessageTime } from '../../config/timezone';
@@ -262,6 +263,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return p?.name ?? null;
   }, [task.project_id, projects]);
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
+  const deliveryReadOnly = task.mode === 'delivery_loop' || task.delivery_run_id != null;
   const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
   const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
   const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
@@ -378,7 +380,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const injectingRef = useRef(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
   const [injectMode, setInjectMode] = useState(false);
-  const canInject = task.worker_id == null && task.shared_from_id == null && (
+  const canInject = !deliveryReadOnly && task.worker_id == null && task.shared_from_id == null && (
     task.provider === 'codex' ? codexAppServerEnabled : ptyMode
   );
   const injectTransport = task.provider === 'codex' ? 'Codex turn/steer' : 'Claude PTY';
@@ -1630,11 +1632,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         addChatFiles(files, (msg) => setDropError(msg));
       }
     },
-    disabled: injecting || (!task.session_id && !task.shared_from_id),
+    disabled: deliveryReadOnly || injecting || (!task.session_id && !task.shared_from_id),
   });
 
   useEffect(() => {
-    if (injecting || (!task.session_id && !task.shared_from_id)) return;
+    if (deliveryReadOnly || injecting || (!task.session_id && !task.shared_from_id)) return;
     const handlePaste = (e: ClipboardEvent) => {
       if (injectingRef.current) return;
       const target = e.target;
@@ -1659,6 +1661,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     task.session_id,
     task.shared_from_id,
     addChatFiles,
+    deliveryReadOnly,
     injecting,
   ]);
 
@@ -2044,7 +2047,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 后台运行中
               </span>
             )}
-            {task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
+            {!deliveryReadOnly && task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
                 className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
@@ -2072,7 +2075,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               active={monitorCount > 0}
               onNavigate={() => setShowMonitorPanel(!showMonitorPanel)}
             />
-            {task.session_id && task.shared_from_id == null && (
+            {!deliveryReadOnly && task.session_id && task.shared_from_id == null && (
               <button
                 onClick={() => setPlansOpen((open) => !open)}
                 className={`flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors ${
@@ -2092,22 +2095,24 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 )}
               </button>
             )}
-            {task.mode !== 'plan' && (
+            {!deliveryReadOnly && task.mode !== 'plan' && (
               <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
             )}
-            <button
-              onClick={() => {
-                setDistillOpen(true);
-                setDistillResult(null);
-                setDistillError(null);
-                setDistilling(false);
-              }}
-              disabled={messages.length === 0}
-              className="p-1.5 transition-colors text-gray-600 hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed"
-              title="Distill skill from conversation"
-            >
-              <Sparkles size={18} />
-            </button>
+            {!deliveryReadOnly && (
+              <button
+                onClick={() => {
+                  setDistillOpen(true);
+                  setDistillResult(null);
+                  setDistillError(null);
+                  setDistilling(false);
+                }}
+                disabled={messages.length === 0}
+                className="p-1.5 transition-colors text-gray-600 hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Distill skill from conversation"
+              >
+                <Sparkles size={18} />
+              </button>
+            )}
             <button
               onClick={handleStar}
               className={`p-1.5 transition-colors ${starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
@@ -2115,7 +2120,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Star size={18} fill={starred ? 'currentColor' : 'none'} />
             </button>
-            {(isProcessing || stillRunning) && (
+            {!deliveryReadOnly && (isProcessing || stillRunning) && (
               <button
                 onClick={async () => {
                   setInterrupting(true);
@@ -2180,29 +2185,43 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   onClick={() => setTitleExpanded(!titleExpanded)}
                   className="text-[10px] text-gray-600 hover:text-gray-300 shrink-0 whitespace-nowrap"
                 >{titleExpanded ? 'less' : 'more'}</button>
-                <button
-                  onClick={() => { setTitleDraft(task.title || ''); setEditingTitle(true); }}
-                  className="text-gray-600 hover:text-gray-400 opacity-0 group-hover/title:opacity-100 transition-opacity shrink-0"
-                  title="Edit title"
-                >
-                  <Pencil size={10} />
-                </button>
+                {!deliveryReadOnly && (
+                  <button
+                    onClick={() => { setTitleDraft(task.title || ''); setEditingTitle(true); }}
+                    className="text-gray-600 hover:text-gray-400 opacity-0 group-hover/title:opacity-100 transition-opacity shrink-0"
+                    title="Edit title"
+                  >
+                    <Pencil size={10} />
+                  </button>
+                )}
               </div>
             )}
           </div>}
-          <AttentionTag
-            taskId={task.id}
-            value={task.attention_tag}
-            editing={editingAttentionTag}
-            onEdit={() => {
-              setEditingTitle(false);
-              setEditingAttentionTag(true);
-            }}
-            onCancel={() => setEditingAttentionTag(false)}
-            onSaved={(updated) => onTaskUpdated?.(updated)}
-            showAddButton
-            className={editingAttentionTag ? 'flex-1' : 'max-w-[45vw] sm:max-w-xs'}
-          />
+          {deliveryReadOnly ? (
+            task.attention_tag ? (
+              <span
+                className="inline-flex min-w-0 max-w-[45vw] items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300 sm:max-w-xs"
+                title="Delivery-owned Task attention tag"
+              >
+                <Pin size={11} className="shrink-0" />
+                <span className="truncate">{task.attention_tag}</span>
+              </span>
+            ) : null
+          ) : (
+            <AttentionTag
+              taskId={task.id}
+              value={task.attention_tag}
+              editing={editingAttentionTag}
+              onEdit={() => {
+                setEditingTitle(false);
+                setEditingAttentionTag(true);
+              }}
+              onCancel={() => setEditingAttentionTag(false)}
+              onSaved={(updated) => onTaskUpdated?.(updated)}
+              showAddButton
+              className={editingAttentionTag ? 'flex-1' : 'max-w-[45vw] sm:max-w-xs'}
+            />
+          )}
           {contextUsage && (
             <span className="flex items-center shrink-0">
               <ContextUsageIndicator usage={contextUsage} />
@@ -2210,6 +2229,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           )}
         </div>
       </div>
+
+      {deliveryReadOnly && task.delivery_run_id != null && (
+        <div className="border-b border-gray-800 bg-gray-950 px-3 py-2 sm:px-4">
+          <DeliveryRunPanel runId={task.delivery_run_id} />
+        </div>
+      )}
 
       {task.metadata_?.forked_from_task_id && (
         <div className="px-4 py-1.5 border-b border-indigo-500/20 bg-indigo-500/5 text-xs text-indigo-300 flex items-center gap-1.5">
@@ -2611,7 +2636,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )}
 
       {/* Message Queue Display */}
-      {messageQueue.length > 0 && (
+      {!deliveryReadOnly && messageQueue.length > 0 && (
         <div className="border-t border-gray-800 bg-gray-900/50 px-4 py-2">
           <div className="max-w-3xl mx-auto">
             <div className="flex items-center justify-between mb-1.5">
@@ -2698,6 +2723,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )}
 
       {/* Input */}
+      {deliveryReadOnly ? (
+        <div
+          className="border-t border-indigo-500/20 bg-indigo-500/5 px-4 py-3 text-center text-xs text-indigo-200"
+          data-testid="delivery-read-only"
+        >
+          Delivery Run #{task.delivery_run_id ?? '?'} owns this Developer Task. Its conversation is read-only; workflow controls and PR status are shown above.
+        </div>
+      ) : (
       <div className="border-t border-gray-800 bg-gray-900 p-3">
         <div className="flex flex-col gap-2 max-w-3xl mx-auto">
           {selectedPlanVersionIds.length > 0 && (
@@ -2961,6 +2994,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 }

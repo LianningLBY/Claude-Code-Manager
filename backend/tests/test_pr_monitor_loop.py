@@ -1,6 +1,7 @@
 """Durable PR lifecycle and Shadow Repair evidence tests."""
 
 import asyncio
+from contextlib import asynccontextmanager
 
 import pytest
 from datetime import datetime, timedelta
@@ -22,6 +23,7 @@ from backend.services.pr_monitor_loop import (
     reconcile_terminal_review_runs,
     record_blocking_evidence,
     record_gate_pass,
+    record_review_error,
 )
 
 
@@ -60,6 +62,226 @@ async def test_terminal_pass_review_recovers_monitor_run_gate(
     recovered = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
     assert recovered.status == "ready_to_merge"
     assert await reconcile_terminal_review_runs(db_factory) == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_review_recovery_pauses_exact_monitor_once(
+    db_session,
+    db_factory,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/error-gap",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=19,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        status="reviewing",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=19,
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="failed review",
+        pr_author="alice",
+        pr_url="https://github.com/owner/error-gap/pull/19",
+        status="error",
+        action_taken="error",
+        review_summary="review model transport failed",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    await db_session.commit()
+
+    assert await reconcile_terminal_review_runs(db_factory) == 1
+    recovered = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    assert recovered.status == "paused"
+    assert recovered.pause_reason == (
+        f"review_error:{review.id}:review model transport failed"
+    )
+    recovered_version = recovered.state_version
+
+    assert await reconcile_terminal_review_runs(db_factory) == 0
+    recovered = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    assert recovered.state_version == recovered_version
+
+
+@pytest.mark.asyncio
+async def test_stale_error_review_cannot_pause_replacement_webhook_generation(
+    db_session,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/error-replaced",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    old_review = PRReview(
+        repo_id=repo.id,
+        pr_number=20,
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="old failed review",
+        pr_author="alice",
+        pr_url="https://github.com/owner/error-replaced/pull/20",
+        status="error",
+        action_taken="error",
+        review_summary="late model failure",
+    )
+    db_session.add(old_review)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=20,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        current_review_id=old_review.id,
+        status="reviewing",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    old_review.monitor_run_id = run.id
+    replacement = PRReview(
+        repo_id=repo.id,
+        pr_number=20,
+        base_sha=BASE,
+        head_sha="c" * 40,
+        pr_title="replacement review",
+        pr_author="alice",
+        pr_url="https://github.com/owner/error-replaced/pull/20",
+        status="reviewing",
+    )
+    db_session.add(replacement)
+    await db_session.commit()
+    await attach_review_to_run(db_session, repo=repo, review=replacement)
+
+    current = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    current_version = current.state_version
+    assert await record_review_error(db_session, review_id=old_review.id) is False
+    current = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    assert current.current_review_id == replacement.id
+    assert current.current_head_sha == replacement.head_sha
+    assert current.status == "reviewing"
+    assert current.pause_reason is None
+    assert current.state_version == current_version
+
+
+@pytest.mark.asyncio
+async def test_reconciler_discards_error_candidate_replaced_after_scan(
+    db_session,
+    db_factory,
+):
+    """A candidate captured before synchronize cannot pause its replacement."""
+
+    repo = MonitoredRepo(
+        repo_full_name="owner/error-scan-race",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=21,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        status="reviewing",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    old_review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=21,
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="old failed review",
+        pr_author="alice",
+        pr_url="https://github.com/owner/error-scan-race/pull/21",
+        status="error",
+        action_taken="error",
+        review_summary="late failure from the old head",
+    )
+    db_session.add(old_review)
+    await db_session.flush()
+    run.current_review_id = old_review.id
+    await db_session.commit()
+    repo_id = repo.id
+    run_id = run.id
+    old_review_id = old_review.id
+
+    candidate_scanned = asyncio.Event()
+    replacement_committed = asyncio.Event()
+    factory_calls = 0
+
+    @asynccontextmanager
+    async def barrier_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        call_number = factory_calls
+        async with db_factory() as db:
+            yield db
+        if call_number == 1:
+            # ``reconcile_terminal_review_runs`` has materialized review_ids and
+            # closed that read transaction, but has not opened the per-candidate
+            # row-lock transaction yet.
+            candidate_scanned.set()
+            await replacement_committed.wait()
+
+    reconcile_task = asyncio.create_task(
+        reconcile_terminal_review_runs(barrier_factory)
+    )
+    await asyncio.wait_for(candidate_scanned.wait(), timeout=2)
+
+    replacement_id = None
+    try:
+        async with db_factory() as replacement_db:
+            locked_repo = await replacement_db.get(MonitoredRepo, repo_id)
+            replacement = PRReview(
+                repo_id=repo_id,
+                pr_number=21,
+                base_sha=BASE,
+                head_sha="c" * 40,
+                pr_title="replacement review",
+                pr_author="alice",
+                pr_url=(
+                    "https://github.com/owner/error-scan-race/pull/21"
+                ),
+                status="reviewing",
+            )
+            replacement_db.add(replacement)
+            await replacement_db.flush()
+            replacement_id = replacement.id
+            await attach_review_to_run(
+                replacement_db,
+                repo=locked_repo,
+                review=replacement,
+            )
+    finally:
+        replacement_committed.set()
+
+    assert await asyncio.wait_for(reconcile_task, timeout=2) == 0
+    assert factory_calls == 2
+    async with db_factory() as assertion_db:
+        current = await assertion_db.get(PRMonitorRun, run_id)
+        old = await assertion_db.get(PRReview, old_review_id)
+        assert current.current_review_id == replacement_id
+        assert current.current_head_sha == "c" * 40
+        assert current.status == "reviewing"
+        assert current.pause_reason is None
+        assert old.status == "error"
+        assert old.action_taken == "error"
 
 
 @pytest.mark.asyncio

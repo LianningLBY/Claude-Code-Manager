@@ -286,6 +286,8 @@ DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/claude_manager
 DATABASE_URL=mysql+aiomysql://user:pass@host:3306/claude_manager
 ```
 
+MySQL 要求 **8.0.16 或更高版本**；CCM 的完整性约束依赖该版本起正式执行的 `CHECK` 约束语义。
+
 ### Schema 迁移（Alembic）
 
 使用 Alembic 管理 schema 版本。**启动时自动执行 `alembic upgrade head`**，无需手动操作。

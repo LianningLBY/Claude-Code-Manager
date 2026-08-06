@@ -29,6 +29,14 @@ class CapabilityInvocationCancel(BaseModel):
     expected_state_version: int = Field(ge=1)
 
 
+class CapabilityInvocationConsume(BaseModel):
+    """Acknowledge one exact ready result and release the Task slot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_state_version: int = Field(ge=1)
+
+
 class CapabilityExecutionResource(BaseModel):
     id: int
     invocation_id: int
@@ -94,3 +102,40 @@ class CapabilityInvocationResource(BaseModel):
 class CapabilityInvocationCreateResource(BaseModel):
     invocation: CapabilityInvocationResource
     created: bool
+
+
+class CodeReviewResultResource(BaseModel):
+    id: int
+    run_id: int
+    capability_invocation_id: int
+    capability_execution_id: int
+    developer_task_id: int
+    reviewer_task_id: int
+    reviewer_task_retry_count: int
+    reviewer_task_instance_id: int | None
+    reviewer_task_started_at: datetime
+    reviewer_task_completed_at: datetime
+    output_log_id: int
+    schema_version: int
+    role: str
+    verdict: str
+    summary: str
+    findings: list
+    subject_ref: dict
+    subject_hash: str
+    result_hash: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CapabilityResultResource(BaseModel):
+    """ACL-scoped materialization of an Invocation's exact output."""
+
+    invocation_id: int
+    invocation_status: str
+    kind: str
+    id: int
+    hash: str
+    resource_url: str
+    data: dict

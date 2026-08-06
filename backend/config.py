@@ -78,6 +78,19 @@ class Settings(BaseSettings):
     # Generic Plan/review capability admission. The storage/API can deploy
     # dark; new invocations remain disabled until an executor adapter ships.
     capability_core_enabled: bool = False
+    capability_coordinator_poll_interval_seconds: float = 2.0
+    capability_coordinator_max_concurrency: int = 4
+    capability_coordinator_scan_limit: int = 64
+    capability_coordinator_initial_backoff_seconds: float = 1.0
+    capability_coordinator_max_backoff_seconds: float = 60.0
+    # Autonomous Plan -> Code -> Review -> PR Monitor controller. Admission is
+    # dark by default because enabling it can push a branch and create a PR;
+    # V1 still stops before merge.
+    delivery_loop_enabled: bool = False
+    delivery_controller_poll_interval_seconds: float = 2.0
+    delivery_controller_lease_seconds: int = 30
+    delivery_controller_scan_limit: int = 32
+    delivery_controller_reconcile_interval_seconds: float = 5.0
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---

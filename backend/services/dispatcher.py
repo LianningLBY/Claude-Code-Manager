@@ -1995,6 +1995,7 @@ class GlobalDispatcher:
                     task_status=task_status,
                     terminal_consumer_timeout=(SHUTDOWN_TERMINAL_CONSUMER_TIMEOUT),
                     consumer_cancel_timeout=SHUTDOWN_CONSUMER_CANCEL_TIMEOUT,
+                    allow_delivery_effect_stop=True,
                 )
                 if not stopped and self.instance_manager.is_running(instance_id):
                     stop_failed = True

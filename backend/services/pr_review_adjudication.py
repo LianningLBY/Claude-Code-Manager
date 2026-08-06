@@ -220,7 +220,10 @@ async def create_rebuttal_task(
     model = repo.review_model or (
         settings.default_codex_model if provider == "codex" else None
     )
-    task = Task(
+    from backend.services.task_creation import stage_task_record
+
+    task = await stage_task_record(
+        db,
         title=f"PR Rebuttal Adjudication: {repo.repo_full_name}#{review.pr_number}",
         description=build_adjudication_prompt(
             repo_name=repo.repo_full_name, pr_number=review.pr_number,
@@ -240,8 +243,6 @@ async def create_rebuttal_task(
         project_id=await _get_or_create_pr_monitor_project(db),
         worker_id=repo.worker_id,
     )
-    db.add(task)
-    await db.flush()
     rebuttal.task_id = task.id
     run.status = "adjudicating"
     run.state_version += 1

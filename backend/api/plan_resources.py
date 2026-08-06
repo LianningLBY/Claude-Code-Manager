@@ -74,6 +74,7 @@ from backend.services.plan_service import (
     plan_operation_lock,
     plan_resource,
     plan_resources,
+    reject_capability_owned_plan_mutation,
     resolve_legacy_task,
     run_resource,
     version_resource,
@@ -781,17 +782,19 @@ async def import_worker_plan_run(
         except Exception as exc:
             await db.rollback()
             raise HTTPException(409, "Worker Plan id collides with local data") from exc
-    elif (
-        plan.relay_origin != "manager_v1"
-        or plan.initial_request != body.initial_request
-        or plan.target_task_id != body.target_task_id
-        or plan.project_id != body.project_id
-        or plan.target_branch != body.target_branch
-        or plan.priority != body.priority
-        or plan.timeout_hours != body.timeout_hours
-        or plan.pipeline_config != body.pipeline_config.model_dump(mode="json")
-    ):
-        raise HTTPException(409, "Worker Plan mirror identity changed")
+    else:
+        await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
+        if (
+            plan.relay_origin != "manager_v1"
+            or plan.initial_request != body.initial_request
+            or plan.target_task_id != body.target_task_id
+            or plan.project_id != body.project_id
+            or plan.target_branch != body.target_branch
+            or plan.priority != body.priority
+            or plan.timeout_hours != body.timeout_hours
+            or plan.pipeline_config != body.pipeline_config.model_dump(mode="json")
+        ):
+            raise HTTPException(409, "Worker Plan mirror identity changed")
     plan.title = body.title
 
     existing = await db.get(PlanAgentRun, body.run_id)
@@ -917,15 +920,17 @@ async def materialize_worker_plan_version(
         except Exception as exc:
             await db.rollback()
             raise HTTPException(409, "Worker Plan id collides with local data") from exc
-    elif (
-        plan.relay_origin != "manager_v1"
-        or plan.initial_request != body.initial_request
-        or plan.target_task_id != body.target_task_id
-        or plan.project_id != body.project_id
-        or plan.target_branch != body.target_branch
-        or plan.pipeline_config != pipeline
-    ):
-        raise HTTPException(409, "Worker Plan mirror identity changed")
+    else:
+        await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
+        if (
+            plan.relay_origin != "manager_v1"
+            or plan.initial_request != body.initial_request
+            or plan.target_task_id != body.target_task_id
+            or plan.project_id != body.project_id
+            or plan.target_branch != body.target_branch
+            or plan.pipeline_config != pipeline
+        ):
+            raise HTTPException(409, "Worker Plan mirror identity changed")
     plan.title = body.title
     if plan.active_run_id is not None:
         raise HTTPException(409, "Worker Plan has an active Run")
@@ -1043,7 +1048,8 @@ async def resolve_plan_application_delivery(
     if not note:
         raise HTTPException(422, "Resolution note cannot be blank")
     async with plan_operation_lock(plan_id):
-        await _require_plan(request, db, plan_id, control=True)
+        plan = await _require_plan(request, db, plan_id, control=True)
+        await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
         receipt = (
             await db.execute(
                 select(PlanApplicationReceipt).where(
@@ -1122,6 +1128,7 @@ async def patch_plan(
     _reject_durable_plan_secrets(body.title)
     async with plan_operation_lock(plan_id):
         plan = await _require_plan(request, db, plan_id, control=True)
+        await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
         if body.archived is True and plan.active_run_id is not None:
             raise HTTPException(409, "Cancel the active Plan Run before archiving")
         values: dict = {
@@ -1163,6 +1170,7 @@ async def create_run(
     uploads = _validated_uploads(body)
     async with plan_operation_lock(plan_id):
         plan = await _require_plan(request, db, plan_id, control=True)
+        await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
         target = await db.get(Task, plan.target_task_id) if plan.target_task_id is not None else None
         if plan.target_task_id is not None and target is None:
             raise HTTPException(409, "Plan target no longer exists")
@@ -1224,40 +1232,59 @@ async def fork_plan(
     db: AsyncSession = Depends(get_db),
 ):
     _reject_durable_plan_secrets(body.title, body.request)
-    source = await _require_plan(request, db, plan_id, control=True)
-    version = await db.get(PlanVersion, body.base_version_id)
-    if version is None or version.plan_id != source.id:
-        raise HTTPException(400, "Fork Version does not belong to this Plan")
-    target = await db.get(Task, source.target_task_id) if source.target_task_id is not None else None
-    if target is not None and target.status == "migrating":
-        raise HTTPException(409, "Plan target is changing execution location")
-    fork_worker_id = target.worker_id if target is not None else source.worker_id
-    context = await _capture_context_for_plan(
-        db, target=target, target_repo=source.target_repo, worker_id=fork_worker_id
-    )
-    request_text = body.request.strip() if body.request else (
-        f"Fork this planning direction from v{version.version_number}.\n\n{version.content}"
-    )
-    fork, _run = await create_plan_with_run(
-        db,
-        title=(body.title.strip() if body.title else f"Fork of {source.title}")[:200],
-        initial_request=request_text,
-        attachments=deepcopy(source.initial_attachments),
-        target_task_id=source.target_task_id,
-        project_id=source.project_id,
-        target_repo=source.target_repo,
-        target_branch=source.target_branch,
-        worker_id=fork_worker_id,
-        priority=source.priority,
-        timeout_hours=source.timeout_hours,
-        created_by=get_current_user_id(request),
-        pipeline_config=deepcopy(source.pipeline_config),
-        context_session_id=context[0], context_log_id=context[1],
-        context_snapshot=context[2], repo_revision=context[3],
-        forked_from_version_id=version.id,
-        base_version_id=version.id,
-        run_type="fork",
-    )
+    async with plan_operation_lock(plan_id):
+        source = await _require_plan(request, db, plan_id, control=True)
+        await reject_capability_owned_plan_mutation(db, plan_ids=(source.id,))
+        version = await db.get(PlanVersion, body.base_version_id)
+        if version is None or version.plan_id != source.id:
+            raise HTTPException(400, "Fork Version does not belong to this Plan")
+        target = (
+            await db.get(Task, source.target_task_id)
+            if source.target_task_id is not None
+            else None
+        )
+        if target is not None and target.status == "migrating":
+            raise HTTPException(409, "Plan target is changing execution location")
+        fork_worker_id = target.worker_id if target is not None else source.worker_id
+        context = await _capture_context_for_plan(
+            db,
+            target=target,
+            target_repo=source.target_repo,
+            worker_id=fork_worker_id,
+        )
+        request_text = (
+            body.request.strip()
+            if body.request
+            else (
+                f"Fork this planning direction from v{version.version_number}."
+                f"\n\n{version.content}"
+            )
+        )
+        fork, _run = await create_plan_with_run(
+            db,
+            title=(
+                body.title.strip() if body.title else f"Fork of {source.title}"
+            )[:200],
+            initial_request=request_text,
+            attachments=deepcopy(source.initial_attachments),
+            target_task_id=source.target_task_id,
+            project_id=source.project_id,
+            target_repo=source.target_repo,
+            target_branch=source.target_branch,
+            worker_id=fork_worker_id,
+            priority=source.priority,
+            timeout_hours=source.timeout_hours,
+            created_by=get_current_user_id(request),
+            pipeline_config=deepcopy(source.pipeline_config),
+            context_session_id=context[0],
+            context_log_id=context[1],
+            context_snapshot=context[2],
+            repo_revision=context[3],
+            forked_from_version_id=version.id,
+            base_version_id=version.id,
+            run_type="fork",
+        )
+        resource = await plan_resource(db, fork, include_audit=True)
     await _wake_dispatcher()
     await broadcast_plan_event(
         event="plan_created",
@@ -1265,7 +1292,7 @@ async def fork_plan(
         target_task_id=fork.target_task_id,
         forked_from_plan_id=source.id,
     )
-    return await plan_resource(db, fork, include_audit=True)
+    return resource
 
 
 @router.get("/api/plans/{plan_id}/versions", response_model=list[PlanVersionResource])
@@ -1304,6 +1331,7 @@ async def _decide(
     plan, _ = await _require_version(request, db, version_id, control=True)
     async with plan_operation_lock(plan.id):
         plan, version = await _require_version(request, db, version_id, control=True)
+        await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
         stale = await _version_staleness(db, plan, version)
         if stale["hard_conflict"]:
             raise HTTPException(
@@ -1380,6 +1408,7 @@ async def cancel_plan_run(
         raise HTTPException(404, "Plan Run not found")
     async with plan_operation_lock(run.plan_id):
         plan = await _require_plan(request, db, run.plan_id, control=True)
+        await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
         run = await db.get(PlanAgentRun, run_id)
         owned_instance_id = run.instance_id
         worker_id = run.worker_id

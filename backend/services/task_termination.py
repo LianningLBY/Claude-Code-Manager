@@ -213,6 +213,7 @@ async def stop_task_process(
     *,
     expected_generations: list[tuple[int, int | None, datetime | None]],
     task_status: str = "completed",
+    allow_delivery_effect_stop: bool = False,
 ) -> bool:
     """Stop only exact Instance generations invalidated by the caller.
 
@@ -227,6 +228,11 @@ async def stop_task_process(
 
     stopped = False
     for instance_id, expected_pid, expected_started_at in expected_generations:
+        protected_stop_kwargs = (
+            {"allow_delivery_effect_stop": True}
+            if allow_delivery_effect_stop
+            else {}
+        )
         generation_stopped = await instance_manager.stop(
             instance_id,
             expected_task_id=task_id,
@@ -235,6 +241,7 @@ async def stop_task_process(
             task_status=task_status,
             terminal_consumer_timeout=30.0,
             consumer_cancel_timeout=10.0,
+            **protected_stop_kwargs,
         )
         if not generation_stopped:
             # ``stop(False)`` can still mean that terminal bookkeeping won
@@ -608,6 +615,7 @@ async def _terminate_local_task_generation_impl(
         "cancelled",
         "conflict",
     ),
+    allow_delivery_effect_stop: bool = False,
 ) -> TaskTerminationResult:
     """Safely terminalize one local Task and reap its exact Instance owners.
 
@@ -759,6 +767,7 @@ async def _terminate_local_task_generation_impl(
                     if terminal_status in {"completed", "cancelled"}
                     else "completed"
                 ),
+                allow_delivery_effect_stop=allow_delivery_effect_stop,
             )
         except asyncio.CancelledError:
             raise
@@ -1069,6 +1078,7 @@ async def _terminate_local_task_generation_with_cancellation_lease(
     expected_generation: LocalTaskGeneration | None,
     active_statuses: tuple[str, ...],
     terminal_statuses: tuple[str, ...],
+    allow_delivery_effect_stop: bool,
 ) -> TaskTerminationResult:
     """Fence new messages through the exact terminal generation commit."""
 
@@ -1082,6 +1092,7 @@ async def _terminate_local_task_generation_with_cancellation_lease(
             expected_generation=expected_generation,
             active_statuses=active_statuses,
             terminal_statuses=terminal_statuses,
+            allow_delivery_effect_stop=allow_delivery_effect_stop,
         )
 
 
@@ -1103,6 +1114,7 @@ async def terminate_local_task_generation(
         "cancelled",
         "conflict",
     ),
+    allow_delivery_effect_stop: bool = False,
 ) -> TaskTerminationResult:
     """Run the complete termination transaction despite caller cancellation.
 
@@ -1121,6 +1133,7 @@ async def terminate_local_task_generation(
             expected_generation=expected_generation,
             active_statuses=active_statuses,
             terminal_statuses=terminal_statuses,
+            allow_delivery_effect_stop=allow_delivery_effect_stop,
         )
     )
 
@@ -1388,6 +1401,8 @@ async def terminate_authoritative_task_generation(
     *,
     reason: str,
     operation_locks_held: bool = False,
+    expected_local_generation: LocalTaskGeneration | None = None,
+    allow_delivery_effect_stop: bool = False,
 ) -> TaskTerminationResult | WorkerTaskTerminationResult:
     """Route termination to the currently authoritative local/Worker owner."""
 
@@ -1410,6 +1425,13 @@ async def terminate_authoritative_task_generation(
             task_id,
             db,
             reason=reason,
+            expected_generation=expected_local_generation,
+            allow_delivery_effect_stop=allow_delivery_effect_stop,
+        )
+    if expected_local_generation is not None:
+        raise TaskGenerationTerminationConflict(
+            f"Task {task_id} moved to a Worker after its local generation "
+            "was captured"
         )
     if type(authority.worker_id) is not int:
         raise TaskTerminationConflict(

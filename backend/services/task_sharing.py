@@ -4,7 +4,7 @@ import logging
 import secrets
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -12,8 +12,50 @@ from backend.models.feishu_binding import FeishuUserBinding
 from backend.models.task import Task
 from backend.models.project import Project
 from backend.models.task_share import TaskShare, ProjectShare
+from backend.services.pr_review_runtime import is_pr_sandbox_task
 
 logger = logging.getLogger(__name__)
+
+
+async def lock_task_share_authority(db: AsyncSession, task: Task) -> bool:
+    """Fence a share write to the Task incarnation that authorized it.
+
+    The no-op UPDATE is intentional: it takes the Task write lock before an
+    ACL row is inserted, including on SQLite where ``FOR UPDATE`` is ignored.
+    The random durable incarnation distinguishes a deleted Task from a later
+    row that explicitly reused the same integer primary key.
+    """
+
+    incarnation_id = getattr(task, "incarnation_id", None)
+    incarnation_predicate = (
+        Task.incarnation_id.is_(None)
+        if incarnation_id is None
+        else Task.incarnation_id == incarnation_id
+    )
+    locked = await db.execute(
+        update(Task)
+        .where(Task.id == task.id, incarnation_predicate)
+        .values(id=Task.id)
+    )
+    if locked.rowcount != 1:
+        await db.rollback()
+        return False
+    await db.refresh(task)
+    return True
+
+
+def _writable_share_block_reason(task: Task) -> str | None:
+    if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+        return (
+            "Delivery-owned Tasks cannot be shared as writable remote chat "
+            "sessions; use Delivery Run controls"
+        )
+    if is_pr_sandbox_task(task):
+        return (
+            "Automated PR workflow Tasks cannot be shared as writable remote "
+            "chat sessions; use the workflow result"
+        )
+    return None
 
 
 async def _get_my_identity(db: AsyncSession) -> dict | None:
@@ -41,6 +83,11 @@ async def share_task(
     task = await db.get(Task, task_id)
     if not task:
         raise ValueError(f"Task {task_id} not found")
+    if not await lock_task_share_authority(db, task):
+        raise ValueError(f"Task {task_id} changed while sharing")
+    blocked = _writable_share_block_reason(task)
+    if blocked is not None:
+        raise ValueError(blocked)
 
     identity = await _get_my_identity(db)
     if not identity:
@@ -68,7 +115,7 @@ async def share_task(
                 TaskShare.task_id == task_id,
                 TaskShare.shared_to_open_id == open_id,
                 TaskShare.status == "active",
-            )
+            ).with_for_update()
         )
         if existing.scalar_one_or_none():
             continue
@@ -79,7 +126,7 @@ async def share_task(
                 TaskShare.task_id == task_id,
                 TaskShare.shared_to_open_id == open_id,
                 TaskShare.status == "revoked",
-            )
+            ).with_for_update()
         )
         share = revoked.scalar_one_or_none()
         if share:
@@ -132,12 +179,15 @@ async def revoke_task_share(
     task_id: int,
     open_id: str,
 ) -> bool:
+    task = await db.get(Task, task_id)
+    if task is None or not await lock_task_share_authority(db, task):
+        return False
     result = await db.execute(
         select(TaskShare).where(
             TaskShare.task_id == task_id,
             TaskShare.shared_to_open_id == open_id,
             TaskShare.status == "active",
-        )
+        ).with_for_update()
     )
     share = result.scalar_one_or_none()
     if not share:
@@ -156,11 +206,14 @@ async def revoke_task_share(
 
 
 async def get_task_shares(db: AsyncSession, task_id: int) -> list[dict]:
+    task = await db.get(Task, task_id)
+    if task is None or not await lock_task_share_authority(db, task):
+        return []
     result = await db.execute(
         select(TaskShare).where(
             TaskShare.task_id == task_id,
             TaskShare.status == "active",
-        )
+        ).with_for_update()
     )
     shares = result.scalars().all()
     return [
@@ -237,6 +290,10 @@ async def share_project(
     )
     tasks = task_result.scalars().all()
     for task in tasks:
+        # Project visibility may be shared, but Controller-owned workflow
+        # Tasks must never become writable remote shadow sessions.
+        if _writable_share_block_reason(task) is not None:
+            continue
         await share_task(db, task.id, targets)
 
     return created
@@ -294,6 +351,9 @@ async def get_project_shares(db: AsyncSession, project_id: int) -> list[dict]:
 
 async def auto_share_new_task(db: AsyncSession, task_id: int, project_id: int):
     """Called when a new task is created under a shared project — auto-share to all project recipients."""
+    task = await db.get(Task, task_id)
+    if task is None or _writable_share_block_reason(task) is not None:
+        return
     result = await db.execute(
         select(ProjectShare).where(
             ProjectShare.project_id == project_id,

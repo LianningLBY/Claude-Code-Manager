@@ -31,6 +31,7 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
 )
 from backend.models.task import Task
+from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
 from backend.services.pr_review_actions import (
     FindingActionConflict,
     is_current_review_snapshot,
@@ -835,6 +836,23 @@ async def create_fix_task(
         if existing.finding_id != finding_id or existing.action_type != "ai_fix":
             await db.rollback()
             raise FindingActionConflict("Idempotency key is already in use")
+        review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == review_id,
+                    PRReview.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise FindingActionConflict("Finding is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         existing_id = existing.id
         expired = await _expire_creation_reservation(db, existing)
         if expired:
@@ -876,6 +894,23 @@ async def create_fix_task(
             or fenced_existing.action_type != "ai_fix"
         ):
             raise FindingActionConflict("Idempotency key is already in use")
+        review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == review_id,
+                    PRReview.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise FindingActionConflict("Finding is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         return fenced_existing
     review = (
         await db.execute(
@@ -905,6 +940,10 @@ async def create_fix_task(
         finding_id=finding_id,
     ):
         raise FindingActionConflict("Finding is not available for AI repair")
+    if await legacy_pr_effect_is_forbidden(db, review=review):
+        raise FindingActionConflict(
+            "Delivery-owned PR findings cannot use legacy AI repair"
+        )
     if not await is_current_review_snapshot(db, review):
         raise FindingActionConflict(
             "This finding belongs to a superseded PR snapshot"
@@ -970,6 +1009,10 @@ async def create_fix_task(
         ):
             raise FindingActionConflict(
                 "Finding is no longer available for AI repair"
+            )
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
             )
     active_action = (
         await db.execute(
@@ -1186,7 +1229,10 @@ async def create_fix_task(
 
         model = app_settings.default_codex_model
     try:
-        task = Task(
+        from backend.services.task_creation import stage_task_record
+
+        task = await stage_task_record(
+            db,
             title=(
                 f"PR Fix: {repo.repo_full_name}#{review.pr_number} / "
                 f"{finding.title}"
@@ -1205,8 +1251,6 @@ async def create_fix_task(
             project_id=await _get_or_create_pr_monitor_project(db),
             worker_id=repo.worker_id,
         )
-        db.add(task)
-        await db.flush()
         action_result = dict(action.result or {})
         action_result.update({
             "head_repo_full_name": source_repo,
@@ -2200,6 +2244,10 @@ async def confirm_fix(
         repo = await db.get(MonitoredRepo, review.repo_id) if review else None
         if finding is None or review is None or repo is None:
             raise FixConfirmationError("PR fix action is not available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FixConfirmationError(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         if action.status == "completed":
             return action
         recovering_push = (
@@ -2234,6 +2282,11 @@ async def confirm_fix(
         ):
             await db.rollback()
             raise FixConfirmationError("PR fix action is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            await db.rollback()
+            raise FixConfirmationError(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         if action.status == "completed":
             await db.rollback()
             completed = await db.get(
@@ -2653,6 +2706,7 @@ async def _finish_cancelled_fix_action(
                 task_id,
                 db,
                 reason="PR finding fix action cancelled",
+                allow_delivery_effect_stop=True,
             )
         except TaskTerminationConflict as exc:
             raise FixConfirmationError(

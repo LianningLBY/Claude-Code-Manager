@@ -19,6 +19,7 @@ from backend.services.task_migrator import (
     TaskMigrator,
     migration_task_generation,
 )
+from backend.services.pr_review_runtime import PRE_PR_CODE_REVIEW_TAG
 from backend.services.worker_proxy import WorkerProxy, get_task_operation_lock
 
 
@@ -101,6 +102,41 @@ async def test_migrate_local_to_worker(db_factory, session_factory, monkeypatch)
     assert (w.id, t.id) in relay.subscribed
     m._move_session.assert_called_once()
     m._ensure_worker_task.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("tags", "metadata"),
+    [
+        ([PRE_PR_CODE_REVIEW_TAG], {}),
+        (
+            [],
+            {
+                "code_review_run_id": 11,
+                "capability_invocation_id": 12,
+                "capability_execution_id": 13,
+            },
+        ),
+    ],
+)
+async def test_pre_pr_review_task_cannot_migrate_out_of_sandbox(
+    db_factory,
+    session_factory,
+    tags,
+    metadata,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        tags=tags,
+        metadata_=metadata,
+    )
+    migrator = _migrator(db_factory)
+
+    with pytest.raises(MigrationError, match="Automated PR workflow"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

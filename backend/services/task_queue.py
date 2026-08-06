@@ -2,7 +2,7 @@ import errno
 import os
 from datetime import datetime
 
-from sqlalchemy import Float, and_, delete as sa_delete, func, select, update
+from sqlalchemy import Float, and_, delete as sa_delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
@@ -10,7 +10,10 @@ from sqlalchemy.sql.functions import FunctionElement
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
-from backend.services.task_creation import stage_task_record
+from backend.services.task_creation import (
+    purge_task_access_grants,
+    stage_task_record,
+)
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
@@ -27,6 +30,49 @@ PLAN_DELETABLE_TASK_STATUSES = BASE_DELETABLE_TASK_STATUSES | {
 TASK_KIND_STANDALONE_PLAN = "standalone_plan"
 TASK_KIND_RELATED_PLAN = "related_plan"
 TASK_KIND_MAIN = "main"
+
+
+def _dispatcher_scope_predicate():
+    """Require durable Controller admission for Delivery-owned Tasks.
+
+    A Delivery Task is only an execution shell. Ordinary pending Tasks remain
+    dispatchable, while a Delivery shell additionally needs one active Turn
+    belonging to a coding/running Run. Feature flags gate new
+    Run admission, not recovery of work already committed before a restart.
+    This is the final queue-level fence for orphans and any API path that
+    accidentally writes ``pending`` directly.
+    """
+
+    from backend.models.delivery import (
+        DELIVERY_TURN_ACTIVE_STATUSES,
+        DeliveryRun,
+        DeliveryTurn,
+    )
+
+    admitted_turn = (
+        select(DeliveryTurn.id)
+        .join(DeliveryRun, DeliveryRun.id == DeliveryTurn.run_id)
+        .where(
+            DeliveryTurn.task_id == Task.id,
+            DeliveryTurn.run_id == Task.delivery_run_id,
+            DeliveryTurn.active_run_id == Task.delivery_run_id,
+            DeliveryTurn.status.in_(DELIVERY_TURN_ACTIVE_STATUSES),
+            DeliveryRun.id == Task.delivery_run_id,
+            DeliveryRun.developer_task_id == Task.id,
+            DeliveryRun.phase == "coding",
+            DeliveryRun.activity == "running",
+        )
+        .correlate(Task)
+        .exists()
+    )
+    return or_(
+        Task.mode != "delivery_loop",
+        and_(
+            Task.delivery_run_id.is_not(None),
+            Task.delivery_role == "developer",
+            admitted_turn,
+        ),
+    )
 
 
 def _task_kind_predicate(task_kind: str):
@@ -439,6 +485,22 @@ class TaskQueue:
         if (observed_worker_id is not None) != remote_worker_deleted:
             return False
 
+        # Code Review completion locks its aggregate in Developer Task ->
+        # Invocation -> Execution -> Run -> Reviewer Task order.  A reviewer
+        # Task is newly created with (and can never later be attached to) its
+        # Run, so reject that immutable child before taking the reviewer Task
+        # write lock; locking Task -> Run here would invert the completion
+        # order and permit a database deadlock.
+        from backend.models.code_review import CodeReviewResult, CodeReviewRun
+
+        reviewer_run_id = await self.db.scalar(
+            select(CodeReviewRun.id)
+            .where(CodeReviewRun.reviewer_task_id == task_id)
+            .limit(1)
+        )
+        if reviewer_run_id is not None:
+            return False
+
         task_predicates = [
             Task.id == task_id,
             Task.status == observed_status,
@@ -536,6 +598,99 @@ class TaskQueue:
         ):
             await self.db.rollback()
             return False
+
+        # First-class Plans likewise retain a complete version/run/history
+        # aggregate around their target Task.  ``Task.plan_target_task_id``
+        # only covers the legacy Task-shaped planner and cannot protect the
+        # newer ``plans.target_task_id`` link.  Keep the target until callers
+        # explicitly remove its Plan aggregate.
+        from backend.models.plan import Plan
+
+        linked_plan_id = await self.db.scalar(
+            select(Plan.id)
+            .where(Plan.target_task_id == task_id)
+            .order_by(Plan.id)
+            .with_for_update()
+            .limit(1)
+        )
+        if linked_plan_id is not None:
+            await self.db.rollback()
+            return False
+
+        from backend.models.plan_agent import PlanAgentRun
+
+        capability_execution_ids = {
+            execution.id for execution in capability_executions
+        }
+
+        # Prove both adapter tables have no reverse ownership of this Task's
+        # Core aggregate.  Do not trust their denormalized developer_task_id:
+        # a corrupt cross-link must not let ordinary Task deletion cascade or
+        # strand a Code Review Run/Result through Invocation/Execution IDs.
+        code_review_run_predicates = [
+            CodeReviewRun.developer_task_id == task_id,
+        ]
+        code_review_result_predicates = [
+            CodeReviewResult.developer_task_id == task_id,
+        ]
+        if capability_invocation_ids:
+            code_review_run_predicates.append(
+                CodeReviewRun.capability_invocation_id.in_(
+                    capability_invocation_ids
+                )
+            )
+            code_review_result_predicates.append(
+                CodeReviewResult.capability_invocation_id.in_(
+                    capability_invocation_ids
+                )
+            )
+        if capability_execution_ids:
+            code_review_run_predicates.append(
+                CodeReviewRun.capability_execution_id.in_(
+                    capability_execution_ids
+                )
+            )
+            code_review_result_predicates.append(
+                CodeReviewResult.capability_execution_id.in_(
+                    capability_execution_ids
+                )
+            )
+        linked_code_review_id = await self.db.scalar(
+            select(CodeReviewRun.id)
+            .where(or_(*code_review_run_predicates))
+            .order_by(CodeReviewRun.id)
+            .with_for_update()
+            .limit(1)
+        )
+        if linked_code_review_id is not None:
+            await self.db.rollback()
+            return False
+        linked_code_review_result_id = await self.db.scalar(
+            select(CodeReviewResult.id)
+            .where(or_(*code_review_result_predicates))
+            .order_by(CodeReviewResult.id)
+            .with_for_update()
+            .limit(1)
+        )
+        if linked_code_review_result_id is not None:
+            await self.db.rollback()
+            return False
+
+        if capability_execution_ids:
+            linked_plan_run_id = await self.db.scalar(
+                select(PlanAgentRun.id)
+                .where(
+                    PlanAgentRun.capability_execution_id.in_(
+                        capability_execution_ids
+                    )
+                )
+                .order_by(PlanAgentRun.id)
+                .with_for_update()
+                .limit(1)
+            )
+            if linked_plan_run_id is not None:
+                await self.db.rollback()
+                return False
 
         # A failed task may be the only durable identity for an unmanaged
         # process retained by startup recovery. Never delete that evidence
@@ -719,6 +874,11 @@ class TaskQueue:
                 await self.db.rollback()
                 return False
 
+        # Neither task_shares nor team_task_shares can be left to database
+        # cascades: SQLite may not enforce the former FK, while the latter has
+        # no Task FK.  Keeping this inside the fenced delete transaction also
+        # prevents future Task-id reuse from inheriting stale access.
+        await purge_task_access_grants(self.db, task_id)
         await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
         if capability_invocation_ids:
             await self.db.execute(
@@ -733,7 +893,7 @@ class TaskQueue:
                     CapabilityInvocation.task_id == task_id
                 )
             )
-        from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+        from backend.models.plan_agent import PlanAgentStep
 
         plan_run_ids = list(
             (
@@ -801,6 +961,7 @@ class TaskQueue:
 
         blocked_ids = set(exclude_ids or ())
         while True:
+            dispatcher_scope = _dispatcher_scope_predicate()
             stmt = (
                 select(Task.id)
                 # worker task 不走本地 instance；shadow task (shared_from_id) 不执行
@@ -809,6 +970,7 @@ class TaskQueue:
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    dispatcher_scope,
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(1)
@@ -852,6 +1014,7 @@ class TaskQueue:
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    dispatcher_scope,
                 )
                 .values(**values)
             )

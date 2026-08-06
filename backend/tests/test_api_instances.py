@@ -754,7 +754,6 @@ async def test_direct_run_codex_task_is_also_retired(client):
         "description": "Continue work",
         "target_repo": "/tmp",
         "provider": "codex",
-        "session_id": "thread-manual-1",
     })
     task_id = task_resp.json()["id"]
 

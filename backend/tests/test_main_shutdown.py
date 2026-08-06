@@ -6,6 +6,103 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
+    import backend.main as main
+
+    calls: list[str] = []
+
+    async def record(name: str) -> None:
+        calls.append(name)
+
+    async def start_dispatcher() -> None:
+        await record("dispatcher")
+
+    async def start_capability() -> None:
+        await record("capability")
+
+    async def start_delivery() -> None:
+        await record("delivery")
+
+    monkeypatch.setattr(main.settings, "auto_start_dispatcher", True)
+    monkeypatch.setattr(
+        main.dispatcher,
+        "start",
+        AsyncMock(side_effect=start_dispatcher),
+    )
+    monkeypatch.setattr(
+        main.capability_coordinator,
+        "start",
+        AsyncMock(side_effect=start_capability),
+    )
+    monkeypatch.setattr(
+        main.delivery_controller,
+        "start",
+        AsyncMock(side_effect=start_delivery),
+    )
+
+    await main._start_execution_runtimes()
+
+    assert calls == ["dispatcher", "capability", "delivery"]
+
+
+@pytest.mark.asyncio
+async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
+    monkeypatch,
+):
+    import backend.main as main
+
+    calls: list[str] = []
+
+    async def stop_delivery() -> None:
+        calls.append("delivery")
+        raise RuntimeError("delivery shutdown failed")
+
+    async def record(name: str) -> None:
+        calls.append(name)
+
+    async def stop_capability() -> None:
+        await record("capability")
+
+    async def stop_dispatcher() -> None:
+        await record("dispatcher")
+
+    monkeypatch.setattr(main.ralph_loop, "shutdown", AsyncMock())
+    monkeypatch.setattr(
+        main.delivery_controller,
+        "shutdown",
+        AsyncMock(side_effect=stop_delivery),
+    )
+    monkeypatch.setattr(
+        main.capability_coordinator,
+        "shutdown",
+        AsyncMock(side_effect=stop_capability),
+    )
+    monkeypatch.setattr(
+        main.dispatcher,
+        "shutdown",
+        AsyncMock(side_effect=stop_dispatcher),
+    )
+    monkeypatch.setattr(main.instance_manager, "_pty_backend", None)
+    monkeypatch.setattr(
+        main.instance_manager,
+        "shutdown_codex_app_server",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(main.sub_agent_watcher, "shutdown", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="delivery shutdown failed"):
+        await main._shutdown_runtime_services(
+            heartbeat_task=None,
+            worker_health_task=None,
+            upload_cleanup_task=None,
+            tmp_cleanup_task=None,
+            backup_svc=None,
+        )
+
+    assert calls == ["delivery", "capability", "dispatcher"]
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_shutdown_error_propagates_after_other_cleanup(
     monkeypatch,
 ):

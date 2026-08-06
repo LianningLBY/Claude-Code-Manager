@@ -46,9 +46,13 @@ from backend.services.mcp_config import (
     render_codex_exec_config_args,
 )
 from backend.config import Settings, settings
+from backend.models.delivery import DeliveryCycle, DeliveryRun, DeliveryTurn
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.worktree import Worktree
+from backend.services.delivery_service import value_hash
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +82,114 @@ def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
         claude_config_dir=str(root / "claude"),
         codex_home=str(root / "codex"),
     )
+
+
+async def _delivery_launch_scope(db_factory, tmp_path):
+    repo_path = tmp_path / "delivery-project"
+    workspace_path = (
+        repo_path / ".claude-manager" / "worktrees" / "delivery-1"
+    )
+    policy = {
+        "schema_version": 1,
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "codex_service_tier": "default",
+        "effort_level": "high",
+    }
+    async with db_factory() as db:
+        project = Project(
+            name="delivery-launch-project",
+            local_path=str(repo_path),
+            status="ready",
+        )
+        instance = Instance(name="delivery-launch-instance")
+        db.add_all([project, instance])
+        await db.flush()
+        run = DeliveryRun(
+            admission_scope="test:instance-manager",
+            idempotency_key="delivery-launch",
+            request_hash="a" * 64,
+            project_id=project.id,
+            title="Delivery launch",
+            requirements="Implement safely",
+            requirements_hash="b" * 64,
+            policy_snapshot=policy,
+            policy_hash=value_hash(policy),
+            base_branch="main",
+            delivery_branch="ccm/delivery/1-launch",
+            workspace_path=str(workspace_path),
+            phase="coding",
+            activity="running",
+            turn_count=1,
+            max_cycles=4,
+            max_no_progress=2,
+        )
+        db.add(run)
+        await db.flush()
+        task = Task(
+            title="Delivery developer",
+            description="Implement safely",
+            status="executing",
+            instance_id=instance.id,
+            project_id=project.id,
+            target_repo=str(workspace_path),
+            last_cwd=str(workspace_path),
+            target_branch="main",
+            mode="delivery_loop",
+            delivery_run_id=run.id,
+            delivery_role="developer",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="high",
+            enable_workflows=False,
+            enabled_skills=None,
+        )
+        db.add(task)
+        await db.flush()
+        cycle = DeliveryCycle(
+            run_id=run.id,
+            cycle_number=1,
+            active_run_id=run.id,
+            status="coding",
+            trigger_kind="initial_request",
+            trigger_payload={},
+            trigger_hash="c" * 64,
+        )
+        db.add(cycle)
+        await db.flush()
+        turn = DeliveryTurn(
+            run_id=run.id,
+            cycle_id=cycle.id,
+            generation=1,
+            correlation_id=f"delivery:{run.id}:turn:1",
+            active_run_id=run.id,
+            purpose="code",
+            trigger_kind="plan_ready",
+            trigger_payload={},
+            prompt_payload={},
+            prompt_hash="d" * 64,
+            status="queued",
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+        )
+        worktree = Worktree(
+            repo_path=str(repo_path),
+            worktree_path=str(workspace_path),
+            branch_name=run.delivery_branch,
+            base_branch="main",
+            task_id=task.id,
+            delivery_run_id=run.id,
+            cleanup_status="retained",
+            status="active",
+        )
+        db.add_all([turn, worktree])
+        await db.flush()
+        run.developer_task_id = task.id
+        run.current_cycle_id = cycle.id
+        run.worktree_id = worktree.id
+        await db.commit()
+        return instance.id, task.id, str(workspace_path)
 
 
 @pytest.mark.asyncio
@@ -1805,6 +1917,116 @@ async def test_codex_pr_review_rejects_disabled_app_server_before_exec(
                 cwd=str(tmp_path),
                 provider="codex",
                 config_dir=str(tmp_path / "codex-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_delivery_uses_network_isolated_app_server_without_credentials(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._launch_codex_app_server = AsyncMock(return_value=54_321)
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        pid = await manager.launch(
+            instance_id=instance_id,
+            prompt="implement the approved plan",
+            task_id=task_id,
+            cwd=workspace,
+            model="gpt-5.6-sol",
+            provider="codex",
+            config_dir=str(tmp_path / "delivery-codex-home"),
+            git_env={"GH_TOKEN": "must-not-reach-model"},
+            effort_level="high",
+            codex_service_tier="default",
+        )
+
+    assert pid == 54_321
+    kwargs = manager._launch_codex_app_server.await_args.kwargs
+    assert kwargs["git_env"] is None
+    assert kwargs["mcp_specs"] == ()
+    assert kwargs["skill_context"] == ""
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_user_mcp"] is True
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["sandbox_mode"] == "workspace-write"
+    assert kwargs["network_isolated"] is True
+    assert kwargs["tools_disabled"] is False
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "app_server_enabled,failure,expected_error",
+    [
+        (False, None, CodexRequiredMcpError),
+        (
+            True,
+            RuntimeError("app-server protocol failed"),
+            CodexRequiredMcpError,
+        ),
+        (
+            True,
+            CodexRequiredMcpPreTurnError("sandbox proof failed"),
+            CodexRequiredMcpError,
+        ),
+        (True, asyncio.TimeoutError(), asyncio.TimeoutError),
+        (
+            True,
+            CodexAppServerBusyError("account maintenance"),
+            CodexAppServerBusyError,
+        ),
+    ],
+)
+async def test_codex_delivery_never_falls_back_to_exec(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    app_server_enabled,
+    failure,
+    expected_error,
+):
+    monkeypatch.setattr(
+        settings,
+        "codex_app_server_enabled",
+        app_server_enabled,
+    )
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    if failure is not None:
+        manager._launch_codex_app_server = AsyncMock(side_effect=failure)
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(expected_error):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="must remain isolated",
+                task_id=task_id,
+                cwd=workspace,
+                model="gpt-5.6-sol",
+                provider="codex",
+                config_dir=str(tmp_path / "delivery-codex-home"),
+                effort_level="high",
+                codex_service_tier="default",
             )
 
     exec_mock.assert_not_awaited()

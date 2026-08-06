@@ -8761,6 +8761,7 @@ async def test_dispatcher_shutdown_quiesces_before_reaping_generations(
         task_status="pending",
         terminal_consumer_timeout=10,
         consumer_cancel_timeout=5,
+        allow_delivery_effect_stop=True,
     )
     assert not d._running_tasks
     with pytest.raises(RuntimeError, match="shutting down"):
@@ -9156,6 +9157,7 @@ async def test_shutdown_failed_reap_preserves_live_task_owner(db_factory):
         task_status="pending",
         terminal_consumer_timeout=10,
         consumer_cancel_timeout=5,
+        allow_delivery_effect_stop=True,
     )
     async with db_factory() as db:
         task = await db.get(Task, task_id)

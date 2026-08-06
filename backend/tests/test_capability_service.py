@@ -121,6 +121,8 @@ async def test_one_active_invocation_per_task_under_concurrency(
 async def test_feature_flag_blocks_new_but_allows_replay_and_cancel(db_session):
     task = await _task(db_session)
     invocation, _ = await _create(db_session, task.id)
+    invocation_id = invocation.id
+    invocation_version = invocation.state_version
     settings.capability_core_enabled = False
 
     replay, created = await _create(db_session, task.id)
@@ -128,11 +130,19 @@ async def test_feature_flag_blocks_new_but_allows_replay_and_cancel(db_session):
     assert replay.id == invocation.id
     with pytest.raises(service.CapabilityDisabledError):
         await _create(db_session, task.id, key="new-while-disabled")
+    with pytest.raises(service.CapabilityDisabledError):
+        await service.create_controller_invocation(
+            db_session,
+            task_id=task.id,
+            capability_key="plan",
+            request_payload={"prompt": "not an admitted delivery run"},
+            idempotency_key="controller-new-while-disabled",
+        )
 
     cancelled = await service.cancel_invocation(
         db_session,
-        invocation_id=invocation.id,
-        expected_state_version=invocation.state_version,
+        invocation_id=invocation_id,
+        expected_state_version=invocation_version,
     )
     assert cancelled.status == "cancelled"
     assert cancelled.active_task_id is None
@@ -224,6 +234,57 @@ async def test_ready_result_keeps_slot_until_consumed(db_session):
     )
     assert created is True
     assert next_invocation.id != invocation_id
+
+
+@pytest.mark.asyncio
+async def test_consume_ready_result_requires_exact_completed_output_execution(
+    db_session,
+):
+    task = await _task(db_session)
+    invocation, _ = await _create(db_session, task.id)
+    execution = await service.active_execution_for(db_session, invocation.id)
+    assert execution is not None
+    invocation, execution = await service.claim_execution(
+        db_session,
+        invocation_id=invocation.id,
+        expected_invocation_version=invocation.state_version,
+        expected_execution_version=execution.state_version,
+        handle_kind="fake_run",
+        handle_id="tampered-ready-run",
+    )
+    invocation, execution = await service.complete_execution(
+        db_session,
+        invocation_id=invocation.id,
+        expected_invocation_version=invocation.state_version,
+        expected_execution_version=execution.state_version,
+        output_kind="plan_version",
+        output_id=123,
+        output_hash="a" * 64,
+    )
+    invocation_id = invocation.id
+    task_id = task.id
+    ready_version = invocation.state_version
+    execution.output_hash = "b" * 64
+    await db_session.commit()
+
+    with pytest.raises(
+        service.CapabilityConflictError,
+        match="exact completed output execution",
+    ):
+        await service.consume_ready_invocation(
+            db_session,
+            invocation_id=invocation_id,
+            expected_state_version=ready_version,
+        )
+
+    stored = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    assert stored is not None
+    assert stored.status == "ready"
+    assert stored.active_task_id == task_id
 
 
 @pytest.mark.asyncio
@@ -405,3 +466,153 @@ async def test_active_cancel_waits_for_executor_cleanup(db_session):
     assert invocation.status == "cancelled"
     assert invocation.active_task_id is None
     assert execution.active_invocation_id is None
+
+
+@pytest.mark.asyncio
+async def test_atomic_stage_callback_failure_rolls_back_everything(db_session):
+    task = await _task(db_session)
+    task_id = task.id
+    invocation, _ = await _create(db_session, task.id)
+    invocation_id = invocation.id
+    execution = await service.active_execution_for(db_session, invocation_id)
+    assert execution is not None
+
+    async def stage(db, locked_task, _invocation, _execution):
+        locked_task.description = "must roll back"
+        await db.flush()
+        raise service.CapabilityConflictError("stage failed")
+
+    with pytest.raises(service.CapabilityConflictError, match="stage failed"):
+        await service.stage_and_claim_execution(
+            db_session,
+            invocation_id=invocation_id,
+            expected_invocation_version=invocation.state_version,
+            expected_execution_version=execution.state_version,
+            stage=stage,
+        )
+
+    stored_task = await db_session.get(Task, task_id, populate_existing=True)
+    stored_invocation = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    stored_execution = await service.active_execution_for(db_session, invocation_id)
+    assert stored_task.description is None
+    assert stored_invocation.status == "queued"
+    assert stored_execution is not None
+    assert stored_execution.status == "queued"
+    assert stored_execution.handle_id is None
+
+
+@pytest.mark.asyncio
+async def test_atomic_stage_cancellation_rolls_back_callback_writes(db_session):
+    task = await _task(db_session)
+    task_id = task.id
+    invocation, _ = await _create(db_session, task.id)
+    invocation_id = invocation.id
+    execution = await service.active_execution_for(db_session, invocation_id)
+    assert execution is not None
+
+    async def stage(db, locked_task, _invocation, _execution):
+        locked_task.description = "cancelled staging"
+        await db.flush()
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.stage_and_claim_execution(
+            db_session,
+            invocation_id=invocation_id,
+            expected_invocation_version=invocation.state_version,
+            expected_execution_version=execution.state_version,
+            stage=stage,
+        )
+
+    stored_task = await db_session.get(Task, task_id, populate_existing=True)
+    stored_invocation = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    assert stored_task.description is None
+    assert stored_invocation.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_locked_aggregate_refreshes_preloaded_stale_rows(
+    db_session,
+    db_factory,
+):
+    task = await _task(db_session)
+    invocation, _ = await _create(db_session, task.id)
+    invocation_id = invocation.id
+
+    async with db_factory() as stale_db:
+        stale = await stale_db.get(CapabilityInvocation, invocation_id)
+        assert stale is not None and stale.state_version == 1
+
+        execution = await service.active_execution_for(db_session, invocation_id)
+        assert execution is not None
+        running, _ = await service.claim_execution(
+            db_session,
+            invocation_id=invocation_id,
+            expected_invocation_version=1,
+            expected_execution_version=1,
+            handle_kind="fake_run",
+            handle_id="fresh-owner",
+        )
+
+        with pytest.raises(service.CapabilityConflictError, match="Stale invocation"):
+            await service.cancel_invocation(
+                stale_db,
+                invocation_id=invocation_id,
+                expected_state_version=1,
+            )
+        refreshed = await stale_db.get(
+            CapabilityInvocation,
+            invocation_id,
+            populate_existing=True,
+        )
+        assert refreshed.status == "running"
+        assert refreshed.state_version == running.state_version
+
+
+@pytest.mark.asyncio
+async def test_ready_result_can_be_invalidated_without_mutating_execution(db_session):
+    task = await _task(db_session)
+    invocation, _ = await _create(db_session, task.id)
+    execution = await service.active_execution_for(db_session, invocation.id)
+    assert execution is not None
+    invocation, execution = await service.claim_execution(
+        db_session,
+        invocation_id=invocation.id,
+        expected_invocation_version=1,
+        expected_execution_version=1,
+        handle_kind="fake_run",
+        handle_id="ready-stale",
+    )
+    invocation, execution = await service.complete_execution(
+        db_session,
+        invocation_id=invocation.id,
+        expected_invocation_version=invocation.state_version,
+        expected_execution_version=execution.state_version,
+        output_kind="plan_version",
+        output_id=123,
+        output_hash="f" * 64,
+    )
+
+    stale, completed = await service.mark_ready_invocation_stale(
+        db_session,
+        invocation_id=invocation.id,
+        expected_invocation_version=invocation.state_version,
+        expected_execution_version=execution.state_version,
+        error_code="subject_changed",
+        error_message="HEAD moved",
+    )
+
+    assert stale.status == "stale"
+    assert stale.active_task_id is None
+    assert stale.result_hash == "f" * 64
+    assert completed.status == "completed"
+    assert completed.output_id == 123
+    assert completed.output_hash == "f" * 64

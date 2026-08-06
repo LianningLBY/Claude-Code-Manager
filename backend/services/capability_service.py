@@ -9,15 +9,16 @@ adapter after the claim has committed.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
 import secrets
-from typing import Any, Literal
+from typing import Any, Generic, Literal, TypeVar
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +30,8 @@ from backend.models.capability import (
     CapabilityExecution,
     CapabilityInvocation,
 )
+from backend.models.delivery import DeliveryRun
+from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.services.capability_events import broadcast_capability_event
 from backend.services.capability_registry import CAPABILITY_KEY_RE, resolve_capability
@@ -62,14 +65,64 @@ class CapabilityUnavailableError(CapabilityError):
     pass
 
 
-_task_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_task_locks: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
 MAX_CAPABILITY_REQUEST_BYTES = 32 * 1024
+
+_StageValue = TypeVar("_StageValue")
+_CompletionValue = TypeVar("_CompletionValue")
+
+
+@dataclass(frozen=True, slots=True)
+class StagedCapabilityHandle(Generic[_StageValue]):
+    """Durable executor handle produced by a DB-only staging callback.
+
+    The callback passed to :func:`stage_and_claim_execution` may insert and
+    flush adapter-owned rows, but it must not commit, roll back, start a
+    process, or acquire ``capability_task_lock`` recursively.  The Core owns
+    the only commit that publishes both those rows and this handle.
+    """
+
+    handle_kind: str
+    handle_id: str
+    value: _StageValue
+    handle_generation: int | None = None
+    lease_token: str | None = None
+    lease_expires_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedCapabilityOutput(Generic[_CompletionValue]):
+    """Exact output returned by a DB-only completion validator."""
+
+    output_kind: str
+    output_id: int
+    output_hash: str
+    value: _CompletionValue
+
+
+StageCapabilityCallback = Callable[
+    [AsyncSession, Task, CapabilityInvocation, CapabilityExecution],
+    Awaitable[StagedCapabilityHandle[_StageValue]],
+]
+ValidateCapabilityOutputCallback = Callable[
+    [AsyncSession, Task, CapabilityInvocation, CapabilityExecution],
+    Awaitable[ValidatedCapabilityOutput[_CompletionValue]],
+]
 
 
 def capability_task_lock(task_id: int) -> asyncio.Lock:
     """Return the process-local half of the per-Task admission fence."""
 
-    return _task_locks[task_id]
+    loop = asyncio.get_running_loop()
+    entry = _task_locks.get(task_id)
+    if entry is None or entry[0] is not loop:
+        if entry is not None and entry[1].locked():
+            raise RuntimeError(
+                "Capability Task lock is active on a different event loop"
+            )
+        entry = (loop, asyncio.Lock())
+        _task_locks[task_id] = entry
+    return entry[1]
 
 
 def _canonical_json(value: Any) -> str:
@@ -117,6 +170,19 @@ def _task_subject(task: Task) -> tuple[dict, str]:
         "instance_id": task.instance_id,
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "session_id": task.session_id,
+        "title": task.title,
+        "description": task.description,
+        "project_id": task.project_id,
+        "target_repo": task.target_repo,
+        "last_cwd": task.last_cwd,
+        "target_branch": task.target_branch,
+        "mode": task.mode,
+        "provider": task.provider,
+        "model": task.model,
+        "codex_service_tier": task.codex_service_tier,
+        "effort_level": task.effort_level,
+        "priority": task.priority,
+        "timeout_hours": task.timeout_hours,
     }
     return subject, capability_value_hash(subject)
 
@@ -134,6 +200,41 @@ def _ensure_local_task(task: Task) -> None:
         raise CapabilityUnsupportedScopeError(
             "Capabilities cannot be created while a task is migrating"
         )
+
+
+async def _ensure_admitted_delivery_controller_task(
+    db: AsyncSession,
+    task: Task,
+) -> None:
+    """Allow a disabled Core to finish only an already-admitted Delivery Run.
+
+    The rollout switches gate admission of new work.  A Delivery Run and its
+    Developer Task are admitted durably in one transaction, so disabling the
+    switches later must not strand that Run between cycles.  The reverse
+    ownership check keeps this controller-only exception from becoming a
+    general internal bypass.  Deliberately do not lock the Run here: Capability
+    Core owns Task-first lock ordering, while the Delivery Controller owns
+    Run-first ordering.
+    """
+
+    if (
+        task.mode != "delivery_loop"
+        or task.delivery_run_id is None
+        or task.delivery_role != "developer"
+    ):
+        raise CapabilityDisabledError("Capability Core is disabled")
+
+    admitted_run_id = await db.scalar(
+        select(DeliveryRun.id)
+        .where(
+            DeliveryRun.id == task.delivery_run_id,
+            DeliveryRun.developer_task_id == task.id,
+            DeliveryRun.activity != "terminal",
+        )
+        .limit(1)
+    )
+    if admitted_run_id is None:
+        raise CapabilityDisabledError("Capability Core is disabled")
 
 
 def _same_logical_request(
@@ -180,7 +281,10 @@ async def _lock_task(db: AsyncSession, task_id: int) -> Task:
         raise CapabilityNotFoundError("Task not found")
     task = (
         await db.execute(
-            select(Task).where(Task.id == task_id).with_for_update()
+            select(Task)
+            .where(Task.id == task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if task is None:
@@ -230,7 +334,7 @@ async def _create_invocation(
             )
         return existing, False
 
-    if not settings.capability_core_enabled:
+    if not settings.capability_core_enabled and source != "delivery_controller":
         raise CapabilityDisabledError("Capability Core is disabled")
 
     definition = resolve_capability(capability_key)
@@ -264,6 +368,11 @@ async def _create_invocation(
                 await db.commit()
                 return existing, False
 
+            if not settings.capability_core_enabled:
+                if source != "delivery_controller":
+                    raise CapabilityDisabledError("Capability Core is disabled")
+                await _ensure_admitted_delivery_controller_task(db, task)
+
             active_id = await db.scalar(
                 select(CapabilityInvocation.id)
                 .where(CapabilityInvocation.active_task_id == task_id)
@@ -275,6 +384,14 @@ async def _create_invocation(
                 )
 
             subject_ref, subject_hash = _task_subject(task)
+            if request_source_log_id is None:
+                request_source_log_id = await db.scalar(
+                    select(func.max(LogEntry.id)).where(
+                        LogEntry.task_id == task.id,
+                        LogEntry.role.in_(("user", "assistant")),
+                        LogEntry.event_type.in_(("message", "user_message")),
+                    )
+                )
             executor_config = deepcopy(definition.executor_config)
             policy_snapshot = deepcopy(definition.policy_snapshot)
             invocation = CapabilityInvocation(
@@ -443,10 +560,12 @@ async def active_execution_for(
 ) -> CapabilityExecution | None:
     return (
         await db.execute(
-            select(CapabilityExecution).where(
+            select(CapabilityExecution)
+            .where(
                 CapabilityExecution.invocation_id == invocation_id,
                 CapabilityExecution.active_invocation_id == invocation_id,
             )
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
 
@@ -476,6 +595,7 @@ async def _lock_aggregate(
             select(CapabilityInvocation)
             .where(CapabilityInvocation.id == invocation_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if invocation is None or invocation.task_id != task.id:
@@ -487,6 +607,7 @@ async def _lock_aggregate(
                 .where(CapabilityExecution.invocation_id == invocation.id)
                 .order_by(CapabilityExecution.attempt)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalars()
     )
@@ -516,6 +637,25 @@ def _active_execution(
     return active[0]
 
 
+def _exact_completed_output_execution(
+    invocation: CapabilityInvocation,
+    executions: list[CapabilityExecution],
+) -> CapabilityExecution:
+    completed = [
+        execution
+        for execution in executions
+        if execution.status == "completed"
+        and execution.output_kind == invocation.result_kind
+        and execution.output_id == invocation.result_id
+        and execution.output_hash == invocation.result_hash
+    ]
+    if len(completed) != 1:
+        raise CapabilityConflictError(
+            "Ready capability has no exact completed output execution"
+        )
+    return completed[0]
+
+
 async def _commit_transition(
     db: AsyncSession,
     invocation: CapabilityInvocation,
@@ -525,6 +665,271 @@ async def _commit_transition(
     invocation.updated_at = datetime.utcnow()
     await db.commit()
     await broadcast_capability_event(event_type, invocation)
+
+
+async def _rollback_safely(db: AsyncSession) -> None:
+    """Finish rollback even when the caller was cancelled mid-transition."""
+
+    rollback = asyncio.create_task(db.rollback())
+    try:
+        await asyncio.shield(rollback)
+    except asyncio.CancelledError:
+        # A second cancellation must not leave a transaction containing
+        # adapter-owned staged rows open for accidental reuse.
+        await rollback
+        raise
+
+
+async def _end_routing_read(db: AsyncSession) -> None:
+    """End the pre-fence lookup without discarding or publishing mutations."""
+
+    if db.new or db.dirty or db.deleted:
+        raise CapabilityConflictError(
+            "Capability atomic operations require a clean database session"
+        )
+    await db.commit()
+
+
+def _validate_handle(
+    *,
+    handle_kind: str,
+    handle_id: str,
+) -> tuple[str, str]:
+    kind = handle_kind.strip()
+    identifier = handle_id.strip()
+    if not kind or not identifier:
+        raise CapabilityValidationError("Executor handle kind and id are required")
+    return kind, identifier
+
+
+def _claim_locked_execution(
+    invocation: CapabilityInvocation,
+    execution: CapabilityExecution,
+    *,
+    handle_kind: str,
+    handle_id: str,
+    handle_generation: int | None,
+    lease_token: str | None,
+    lease_expires_at: datetime | None,
+) -> None:
+    if invocation.status != "queued" or execution.status != "queued":
+        raise CapabilityConflictError("Capability execution is not claimable")
+    if execution.handle_kind is not None or execution.handle_id is not None:
+        raise CapabilityConflictError(
+            "Queued capability execution already has a durable handle"
+        )
+    now = datetime.utcnow()
+    invocation.status = "running"
+    invocation.state_version += 1
+    execution.status = "running"
+    execution.state_version += 1
+    execution.handle_kind = handle_kind
+    execution.handle_id = handle_id
+    execution.handle_generation = handle_generation
+    execution.lease_token = lease_token or secrets.token_hex(32)
+    execution.lease_expires_at = lease_expires_at
+    execution.heartbeat_at = now
+    execution.started_at = now
+
+
+def _validated_output_fields(
+    *,
+    output_kind: str,
+    output_id: int,
+    output_hash: str,
+) -> tuple[str, int, str]:
+    kind = output_kind.strip()
+    if not kind:
+        raise CapabilityValidationError("Output kind is required")
+    if isinstance(output_id, bool) or not isinstance(output_id, int) or output_id <= 0:
+        raise CapabilityValidationError("output_id must be a positive integer")
+    return kind, output_id, _validate_hash(output_hash, field="output_hash")
+
+
+def _complete_locked_execution(
+    invocation: CapabilityInvocation,
+    execution: CapabilityExecution,
+    *,
+    output_kind: str,
+    output_id: int,
+    output_hash: str,
+) -> None:
+    if (
+        invocation.status not in {"running", "waiting_user"}
+        or execution.status not in {"running", "waiting_user"}
+    ):
+        raise CapabilityConflictError(
+            "Capability execution cannot complete from its current state"
+        )
+    now = datetime.utcnow()
+    execution.status = "completed"
+    execution.state_version += 1
+    execution.active_invocation_id = None
+    execution.output_kind = output_kind
+    execution.output_id = output_id
+    execution.output_hash = output_hash
+    execution.completed_at = now
+    invocation.status = "ready"
+    invocation.state_version += 1
+    invocation.result_kind = output_kind
+    invocation.result_id = output_id
+    invocation.result_hash = output_hash
+    invocation.ready_at = now
+
+
+async def stage_and_claim_execution(
+    db: AsyncSession,
+    *,
+    invocation_id: int,
+    expected_invocation_version: int,
+    expected_execution_version: int,
+    stage: StageCapabilityCallback[_StageValue],
+) -> tuple[CapabilityInvocation, CapabilityExecution, _StageValue]:
+    """Atomically stage adapter rows and claim their exact durable handle.
+
+    Lock order is always process-local Task fence, then fresh
+    Task -> Invocation -> all Executions database rows.  ``stage`` runs only
+    after those locks are held and shares the single Core-owned commit.  This
+    closes the crash window where an adapter row could become durable without
+    its CapabilityExecution handle (or vice versa).
+    """
+
+    task_id = await _invocation_task_id(db, invocation_id)
+    # Resolve routing before the process-local fence, then end that read-only
+    # transaction so the critical section always starts process lock first.
+    await _end_routing_read(db)
+    invocation: CapabilityInvocation | None = None
+    async with capability_task_lock(task_id):
+        try:
+            task, invocation, executions = await _lock_aggregate(db, invocation_id)
+            execution = _active_execution(invocation, executions)
+            _expect_version(
+                invocation.state_version,
+                expected_invocation_version,
+                resource="invocation",
+            )
+            _expect_version(
+                execution.state_version,
+                expected_execution_version,
+                resource="execution",
+            )
+            if invocation.status != "queued" or execution.status != "queued":
+                raise CapabilityConflictError(
+                    "Capability execution is not claimable"
+                )
+            if execution.handle_kind is not None or execution.handle_id is not None:
+                raise CapabilityConflictError(
+                    "Queued capability execution already has a durable handle"
+                )
+
+            transaction = db.get_transaction()
+            if transaction is None:
+                raise CapabilityConflictError(
+                    "Capability staging transaction is unavailable"
+                )
+            staged = await stage(db, task, invocation, execution)
+            if not isinstance(staged, StagedCapabilityHandle):
+                raise CapabilityValidationError(
+                    "Capability staging callback returned an invalid handle"
+                )
+            if db.get_transaction() is not transaction:
+                raise CapabilityConflictError(
+                    "Capability staging callback ended the owned transaction"
+                )
+            kind, identifier = _validate_handle(
+                handle_kind=staged.handle_kind,
+                handle_id=staged.handle_id,
+            )
+            await db.flush()
+            _claim_locked_execution(
+                invocation,
+                execution,
+                handle_kind=kind,
+                handle_id=identifier,
+                handle_generation=staged.handle_generation,
+                lease_token=staged.lease_token,
+                lease_expires_at=staged.lease_expires_at,
+            )
+            invocation.updated_at = datetime.utcnow()
+            await db.commit()
+            value = staged.value
+        except BaseException:
+            await _rollback_safely(db)
+            raise
+
+    assert invocation is not None
+    await broadcast_capability_event("capability_invocation_running", invocation)
+    return invocation, execution, value
+
+
+async def validate_and_complete_execution(
+    db: AsyncSession,
+    *,
+    invocation_id: int,
+    expected_invocation_version: int,
+    expected_execution_version: int,
+    validate: ValidateCapabilityOutputCallback[_CompletionValue],
+) -> tuple[CapabilityInvocation, CapabilityExecution, _CompletionValue]:
+    """Validate adapter output under the aggregate locks and publish it once.
+
+    The validator may lock and inspect adapter-owned rows but must remain
+    DB-only and must not end the transaction.  Its identity checks and the
+    Capability transition therefore share one commit boundary.
+    """
+
+    task_id = await _invocation_task_id(db, invocation_id)
+    await _end_routing_read(db)
+    invocation: CapabilityInvocation | None = None
+    async with capability_task_lock(task_id):
+        try:
+            task, invocation, executions = await _lock_aggregate(db, invocation_id)
+            execution = _active_execution(invocation, executions)
+            _expect_version(
+                invocation.state_version,
+                expected_invocation_version,
+                resource="invocation",
+            )
+            _expect_version(
+                execution.state_version,
+                expected_execution_version,
+                resource="execution",
+            )
+            transaction = db.get_transaction()
+            if transaction is None:
+                raise CapabilityConflictError(
+                    "Capability completion transaction is unavailable"
+                )
+            validated = await validate(db, task, invocation, execution)
+            if not isinstance(validated, ValidatedCapabilityOutput):
+                raise CapabilityValidationError(
+                    "Capability completion validator returned invalid output"
+                )
+            if db.get_transaction() is not transaction:
+                raise CapabilityConflictError(
+                    "Capability completion validator ended the owned transaction"
+                )
+            kind, output_id, output_hash = _validated_output_fields(
+                output_kind=validated.output_kind,
+                output_id=validated.output_id,
+                output_hash=validated.output_hash,
+            )
+            _complete_locked_execution(
+                invocation,
+                execution,
+                output_kind=kind,
+                output_id=output_id,
+                output_hash=output_hash,
+            )
+            invocation.updated_at = datetime.utcnow()
+            await db.commit()
+            value = validated.value
+        except BaseException:
+            await _rollback_safely(db)
+            raise
+
+    assert invocation is not None
+    await broadcast_capability_event("capability_invocation_ready", invocation)
+    return invocation, execution, value
 
 
 async def claim_execution(
@@ -788,6 +1193,117 @@ async def fail_execution(
             ) from exc
 
 
+async def mark_execution_stale(
+    db: AsyncSession,
+    *,
+    invocation_id: int,
+    expected_invocation_version: int,
+    expected_execution_version: int,
+    error_code: str,
+    error_message: str,
+) -> tuple[CapabilityInvocation, CapabilityExecution]:
+    """Terminalize an attempt whose immutable subject no longer matches.
+
+    ``stale`` is intentionally non-retryable at the Capability Core layer. A
+    controller must capture a new subject and create a new logical invocation;
+    retrying the old input would blur two code snapshots into one audit row.
+    """
+
+    task_id = await _invocation_task_id(db, invocation_id)
+    async with capability_task_lock(task_id):
+        try:
+            _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            execution = _active_execution(invocation, executions)
+            _expect_version(
+                invocation.state_version,
+                expected_invocation_version,
+                resource="invocation",
+            )
+            _expect_version(
+                execution.state_version,
+                expected_execution_version,
+                resource="execution",
+            )
+            if execution.status not in ACTIVE_EXECUTION_STATUSES:
+                raise CapabilityConflictError(
+                    "Capability execution is already terminal"
+                )
+            now = datetime.utcnow()
+            code = error_code[:64] or "subject_stale"
+            execution.status = "stale"
+            execution.state_version += 1
+            execution.active_invocation_id = None
+            execution.error_code = code
+            execution.error_message = error_message
+            execution.completed_at = now
+            invocation.status = "stale"
+            invocation.state_version += 1
+            invocation.active_task_id = None
+            invocation.error_code = code
+            invocation.error_message = error_message
+            invocation.completed_at = now
+            await _commit_transition(
+                db,
+                invocation,
+                event_type="capability_invocation_stale",
+            )
+            return invocation, execution
+        except CapabilityError:
+            await db.rollback()
+            raise
+
+
+async def mark_ready_invocation_stale(
+    db: AsyncSession,
+    *,
+    invocation_id: int,
+    expected_invocation_version: int,
+    expected_execution_version: int,
+    error_code: str,
+    error_message: str,
+) -> tuple[CapabilityInvocation, CapabilityExecution]:
+    """Invalidate a ready result whose immutable external subject changed.
+
+    The completed Execution and its output remain immutable audit evidence;
+    only the still-active ready Invocation becomes terminal ``stale`` and
+    releases the Task admission slot.
+    """
+
+    task_id = await _invocation_task_id(db, invocation_id)
+    async with capability_task_lock(task_id):
+        try:
+            _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            execution = _exact_completed_output_execution(invocation, executions)
+            _expect_version(
+                invocation.state_version,
+                expected_invocation_version,
+                resource="invocation",
+            )
+            _expect_version(
+                execution.state_version,
+                expected_execution_version,
+                resource="execution",
+            )
+            if invocation.status != "ready" or invocation.active_task_id is None:
+                raise CapabilityConflictError("Capability result is not ready")
+            now = datetime.utcnow()
+            invocation.status = "stale"
+            invocation.state_version += 1
+            invocation.active_task_id = None
+            invocation.error_code = error_code[:64] or "result_subject_stale"
+            invocation.error_message = error_message
+            invocation.completed_at = now
+            await _commit_transition(
+                db,
+                invocation,
+                event_type="capability_invocation_stale",
+            )
+            return invocation, execution
+        except CapabilityError:
+            await db.rollback()
+            raise
+
+
 async def consume_ready_invocation(
     db: AsyncSession,
     *,
@@ -797,10 +1313,11 @@ async def consume_ready_invocation(
     task_id = await _invocation_task_id(db, invocation_id)
     async with capability_task_lock(task_id):
         try:
-            _, invocation, _ = await _lock_aggregate(db, invocation_id)
+            _, invocation, executions = await _lock_aggregate(db, invocation_id)
             _expect_version(invocation.state_version, expected_state_version, resource="invocation")
             if invocation.status != "ready":
                 raise CapabilityConflictError("Capability result is not ready")
+            _exact_completed_output_execution(invocation, executions)
             invocation.status = "completed"
             invocation.state_version += 1
             invocation.active_task_id = None

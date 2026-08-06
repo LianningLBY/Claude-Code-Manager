@@ -519,7 +519,12 @@ async def send_chat_message(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
-    from backend.api.tasks import _require_expected_task_routing
+    from backend.api.tasks import (
+        _require_expected_task_routing,
+        _require_not_delivery_owned_task,
+    )
+
+    _require_not_delivery_owned_task(task, action="sent direct chat messages")
 
     _require_expected_task_routing(
         task,
@@ -1068,6 +1073,9 @@ async def list_codex_fork_anchors(
     if not source:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, source, db)
+    from backend.api.tasks import _require_not_delivery_owned_task
+
+    _require_not_delivery_owned_task(source, action="forked")
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if not source.session_id:
@@ -1128,6 +1136,9 @@ async def fork_codex_task(
     if not source:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, source, db)
+    from backend.api.tasks import _require_not_delivery_owned_task
+
+    _require_not_delivery_owned_task(source, action="forked")
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if source.shared_from_id is not None:
@@ -1377,15 +1388,29 @@ async def _send_shared_chat(
     if command is None:
         command, _command_args = _parse_chat_command(body.message)
     await db.refresh(task)
-    await _validate_chat_command_admission(task, command, db)
 
-    # Find the shared record
+    # Prove both sides of the receiver mapping before any remote side effect.
+    # ``shared_from_id`` alone is unsafe: a revoked SharedTaskReceived id could
+    # historically be recycled while its cancelled shadow Task remained.
     result = await db.execute(
-        select(SharedTaskReceived).where(SharedTaskReceived.id == task.shared_from_id)
+        select(SharedTaskReceived)
+        .where(
+            SharedTaskReceived.id == task.shared_from_id,
+            SharedTaskReceived.local_task_id == task.id,
+            SharedTaskReceived.status == "active",
+        )
+        .with_for_update()
     )
     shared = result.scalar_one_or_none()
     if not shared:
         raise HTTPException(400, "Shared task record not found")
+    from backend.services.shared_shadow import lock_owned_shadow
+
+    owned = await lock_owned_shadow(db, shared)
+    if owned is None or owned[1].id != task.id:
+        raise HTTPException(400, "Shared task ownership changed")
+    _, task = owned
+    await _validate_chat_command_admission(task, command, db)
     owner_ccm_url = shared.owner_ccm_url
     remote_task_id = shared.remote_task_id
     share_token = shared.share_token
@@ -2541,6 +2566,9 @@ async def inject_capabilities(
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
+    from backend.api.tasks import _require_not_delivery_owned_task
+
+    _require_not_delivery_owned_task(task, action="received direct injection")
     return {
         "attachment_protocol": 1,
         "codex_native_inputs": True,
@@ -2569,6 +2597,12 @@ async def inject_message(
         if task is None:
             raise HTTPException(404, "Task not found")
         await require_task_access(request, task, db)
+        from backend.api.tasks import _require_not_delivery_owned_task
+
+        _require_not_delivery_owned_task(
+            task,
+            action="received direct injection",
+        )
         if task_is_pr_review_superseded(task):
             raise HTTPException(
                 409,

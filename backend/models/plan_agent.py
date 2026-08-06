@@ -10,6 +10,12 @@ from backend.database import Base
 
 class PlanAgentRun(Base):
     __tablename__ = "plan_agent_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "capability_execution_id",
+            name="uq_plan_agent_runs_capability_execution",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
@@ -17,6 +23,12 @@ class PlanAgentRun(Base):
     # Nullable legacy mapping during cutover. New runs are owned by ``plan_id``.
     plan_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Exact reverse owner for Capability-backed Runs.  Nullable keeps legacy,
+    # ordinary and Worker-imported Plan Runs compatible; uniqueness prevents
+    # one execution from acquiring two planner pipelines.
+    capability_execution_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     run_type: Mapped[str] = mapped_column(String(30), nullable=False, default="legacy")
     source_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)

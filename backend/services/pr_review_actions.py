@@ -16,6 +16,7 @@ from backend.models.pr_monitor import (
     PRMonitorRun,
     PRReview,
 )
+from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
 
 
 class FindingActionConflict(RuntimeError):
@@ -171,6 +172,14 @@ async def create_immediate_finding_action(
     ).scalar_one_or_none()
     if finding is None or review is None or not repo.enabled:
         raise FindingActionConflict("Finding is no longer available")
+    # The API performs an optimistic ownership check before remote/auth work,
+    # but Delivery adoption can win while this request waits for the shared
+    # repository writer fence.  Recheck under that fence so an opaque webhook
+    # Review cannot acquire a legacy effect after it becomes Delivery-owned.
+    if await legacy_pr_effect_is_forbidden(db, review=review):
+        raise FindingActionConflict(
+            "Delivery-owned PR findings cannot use legacy finding actions"
+        )
     if not await is_current_review_snapshot(db, review):
         raise FindingActionConflict(
             "This finding belongs to a superseded PR snapshot"

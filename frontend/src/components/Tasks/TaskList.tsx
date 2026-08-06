@@ -10,6 +10,7 @@ import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
 import { useTaskReorder } from '../../hooks/useTaskReorder';
 import { getTaskStatusLabel } from './taskStatus';
+import { DeliveryRunPanel } from './DeliveryRunPanel';
 
 interface TaskListProps {
   tasks: Task[];
@@ -28,6 +29,7 @@ const statusColors: Record<string, string> = {
   in_progress: 'bg-blue-500',
   executing: 'bg-blue-400 animate-pulse',
   background: 'bg-teal-400 animate-pulse',
+  delivery_waiting: 'bg-indigo-400',
   plan_review: 'bg-purple-500',
   superseded: 'bg-gray-500',
   completed: 'bg-green-500',
@@ -46,6 +48,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
   const [menuOpenId, setMenuOpenId] = useState<number | null>(null);
   const [editingTitleId, setEditingTitleId] = useState<number | null>(null);
   const [editingAttentionTagId, setEditingAttentionTagId] = useState<number | null>(null);
+  const [openDeliveryRunId, setOpenDeliveryRunId] = useState<number | null>(null);
   const [titleDraft, setTitleDraft] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -168,19 +171,39 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
         >
           {/* 拖拽手柄（右下角，空间更宽裕）：卡片正文是可选中文字，整卡
               draggable 会被文本选择手势抢走，必须用显式手柄拖动 */}
-          <span
-            {...pointerHandleProps(t, idx)}
-            className="absolute bottom-1.5 right-1.5 p-1 cursor-grab active:cursor-grabbing text-gray-600 hover:text-gray-400 select-none"
-            title="按住拖动排序"
-          >
-            <GripVertical size={16} />
-          </span>
+          {t.mode !== 'delivery_loop' && (
+            <span
+              {...pointerHandleProps(t, idx)}
+              className="absolute bottom-1.5 right-1.5 p-1 cursor-grab active:cursor-grabbing text-gray-600 hover:text-gray-400 select-none"
+              title="按住拖动排序"
+            >
+              <GripVertical size={16} />
+            </span>
+          )}
           {/* Row 1: status dot + badges (left, wraps) | action buttons (right, no wrap) */}
           <div className="flex items-center gap-2">
-            <span className={`w-2.5 h-2.5 rounded-full shrink-0 self-start mt-[9px] ${statusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`} />
+            <span className={`w-2.5 h-2.5 rounded-full shrink-0 self-start mt-[9px] ${statusColors[
+              t.background_active
+                ? 'background'
+                : t.mode === 'delivery_loop' && t.delivery_activity === 'running'
+                  ? 'executing'
+                  : t.mode === 'delivery_loop' && t.delivery_activity === 'waiting'
+                    ? 'delivery_waiting'
+                    : t.mode === 'delivery_loop' && t.delivery_activity === 'paused'
+                      ? 'plan_review'
+                      : t.status
+            ] || 'bg-gray-500'}`} />
             <div className="flex items-center gap-2 flex-wrap flex-1 min-w-0 min-h-[28px]">
               <span className="text-xs text-gray-500">#{t.id}</span>
-              {editingAttentionTagId !== t.id && (
+              {t.mode === 'delivery_loop' && t.attention_tag ? (
+                <span
+                  className="inline-flex min-w-0 max-w-[min(16rem,55vw)] items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300"
+                  title="Delivery-owned Task attention tag"
+                >
+                  <Pin size={11} className="shrink-0" />
+                  <span className="truncate">{t.attention_tag}</span>
+                </span>
+              ) : editingAttentionTagId !== t.id && (
                 <AttentionTag
                   taskId={t.id}
                   value={t.attention_tag}
@@ -205,12 +228,26 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                 <span className="text-xs bg-indigo-600/30 text-indigo-300 px-1.5 rounded">P{t.priority}</span>
               )}
               <span className={`text-xs text-gray-500 ${
-                t.mode === 'plan' && ['in_progress', 'executing'].includes(t.status)
+                (t.mode === 'plan' && ['in_progress', 'executing'].includes(t.status))
+                  || t.mode === 'delivery_loop'
                   ? ''
                   : 'hidden sm:inline'
               }`}>
                 {getTaskStatusLabel(t)}
               </span>
+              {t.mode === 'delivery_loop' && t.delivery_run_id != null && (
+                <button
+                  type="button"
+                  onClick={() => setOpenDeliveryRunId((current) => (
+                    current === t.delivery_run_id ? null : t.delivery_run_id!
+                  ))}
+                  aria-expanded={openDeliveryRunId === t.delivery_run_id}
+                  className="rounded bg-indigo-600/20 px-1.5 text-[10px] font-medium text-indigo-300 hover:bg-indigo-600/30"
+                  title={`Delivery Run #${t.delivery_run_id}`}
+                >
+                  Delivery #{t.delivery_run_id}
+                </button>
+              )}
               {t.mode === 'plan' ? (
                 <>
                   {t.canonical_plan_id != null && (
@@ -232,8 +269,12 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                     {t.provider === 'codex' ? 'Codex' : 'Claude'}
                   </span>
                   <FastModeBadge task={t} />
-                  <TaskConfigBadge task={t} onRefresh={onRefresh} />
-                  <PluginsBadge task={t} onRefresh={onRefresh} />
+                  {t.mode !== 'delivery_loop' && (
+                    <>
+                      <TaskConfigBadge task={t} onRefresh={onRefresh} />
+                      <PluginsBadge task={t} onRefresh={onRefresh} />
+                    </>
+                  )}
                   <SubAgentsBadge task={t} />
                 </>
               )}
@@ -270,8 +311,8 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               >
                 {copiedId === t.id ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
               </button>
-              {/* Overflow menu */}
-              <div className="relative">
+              {/* Controller-owned Delivery Tasks are read-only scheduler shells. */}
+              {t.mode !== 'delivery_loop' && <div className="relative">
                 <button
                   onClick={() => {
                     setMenuOpenId(menuOpenId === t.id ? null : t.id);
@@ -341,12 +382,12 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                     )}
                   </div>
                 )}
-              </div>
+              </div>}
             </div>
           </div>
           {/* Row 2: title + description (full width; pr 留出右下角手柄位) */}
           <div className="mt-1 pl-[1.125rem] pr-7">
-            {editingAttentionTagId === t.id && (
+            {t.mode !== 'delivery_loop' && editingAttentionTagId === t.id && (
               <AttentionTag
                 taskId={t.id}
                 value={t.attention_tag}
@@ -358,7 +399,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               />
             )}
             {/* Title (editable) */}
-            {editingTitleId === t.id ? (
+            {t.mode !== 'delivery_loop' && editingTitleId === t.id ? (
               <input
                 ref={titleInputRef}
                 value={titleDraft}
@@ -411,6 +452,14 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               <p className="text-red-400 text-xs mt-1">{t.error_message}</p>
             )}
           </div>
+          {t.mode === 'delivery_loop'
+            && t.delivery_run_id != null
+            && openDeliveryRunId === t.delivery_run_id && (
+            <DeliveryRunPanel
+              runId={t.delivery_run_id}
+              className="mt-3"
+            />
+          )}
         </div>
       ))}
     </div>

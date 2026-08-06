@@ -97,6 +97,7 @@ def _format_process_exit(returncode: int | None) -> str:
 # this exact profile, rather than an inherited :read-only profile, was selected
 # before any model turn is admitted.
 _TOOL_FREE_PERMISSION_PROFILE = "ccm_pr_review_no_access_v1"
+_NETWORK_ISOLATED_PERMISSION_PROFILE_PREFIX = "ccm_delivery_workspace_v1_"
 _TOOL_FREE_DISABLED_FEATURES = frozenset({
     "apps",
     "artifact",
@@ -133,6 +134,44 @@ _TOOL_FREE_DISABLED_FEATURES = frozenset({
     "tool_call_mcp_elicitation",
     "tool_suggest",
     "unified_exec",
+    "workspace_dependencies",
+})
+# Delivery turns still need the local shell and patch tools, but every native
+# route that can add remote capabilities, background work, or a second model
+# lineage must remain off.  In particular ``shell_snapshot`` is security
+# relevant here: Codex snapshots a login shell before applying the per-turn
+# environment policy, so replaying one could otherwise resurrect GH_TOKEN or
+# an SSH agent that the Delivery profile deliberately did not inherit.
+_NETWORK_ISOLATED_DISABLED_FEATURES = frozenset({
+    "apps",
+    "artifact",
+    "auth_elicitation",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "default_mode_request_user_input",
+    "deferred_executor",
+    "enable_fanout",
+    "enable_mcp_apps",
+    "goals",
+    "guardian_approval",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "plugin_sharing",
+    "realtime_conversation",
+    "remote_compaction_v2",
+    "remote_plugin",
+    "request_permissions_tool",
+    "shell_snapshot",
+    "skill_mcp_dependency_install",
+    "standalone_web_search",
+    "tool_call_mcp_elicitation",
+    "tool_suggest",
     "workspace_dependencies",
 })
 _TOOL_FREE_PASSIVE_ITEM_TYPES = frozenset({
@@ -384,6 +423,57 @@ def _audit_tool_free_thread_response(response: Any) -> None:
         raise ValueError(
             "deny-all profile did not resolve to restricted sandbox"
         )
+
+
+def _audit_network_isolated_thread_response(
+    response: Any,
+    *,
+    cwd: str,
+    permission_profile_id: str,
+) -> None:
+    """Prove the Delivery thread kept its exact local sandbox boundary."""
+
+    if not isinstance(response, dict):
+        raise ValueError("thread response is not an object")
+    response_cwd = response.get("cwd")
+    if (
+        not isinstance(response_cwd, str)
+        or _canonical_path(response_cwd) != _canonical_path(cwd)
+    ):
+        raise ValueError("thread response changed the Delivery cwd")
+    permission_profile = response.get("activePermissionProfile")
+    if (
+        not isinstance(permission_profile, dict)
+        or permission_profile.get("id")
+        != permission_profile_id
+        or permission_profile.get("extends") is not None
+    ):
+        raise ValueError("Delivery permission profile was not selected")
+    sandbox = response.get("sandbox")
+    if (
+        not isinstance(sandbox, dict)
+        or sandbox.get("type") != "workspaceWrite"
+        or sandbox.get("networkAccess") is not False
+        or sandbox.get("excludeTmpdirEnvVar") is not True
+        or sandbox.get("excludeSlashTmp") is not True
+    ):
+        raise ValueError(
+            "Delivery workspace-write network isolation was not admitted"
+        )
+    writable_roots = sandbox.get("writableRoots")
+    if not isinstance(writable_roots, list):
+        raise ValueError("Delivery writable roots were not reported")
+    workspace = _canonical_path(cwd)
+    for value in writable_roots:
+        if not isinstance(value, str):
+            raise ValueError("Delivery writable root is malformed")
+        candidate = _canonical_path(value)
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError(
+                "Delivery sandbox admitted a writable root outside the worktree"
+            ) from exc
 
 
 def _tool_free_disabled_skill_config(
@@ -2362,6 +2452,7 @@ class CodexAppServer:
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
+        network_isolated: bool = False,
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
         on_thread_started: (
@@ -2410,6 +2501,26 @@ class CodexAppServer:
                     resume_session_id,
                 )
                 resume_session_id = None
+        if network_isolated:
+            if sandbox_mode != "workspace-write":
+                raise CodexRequiredMcpPreTurnError(
+                    "Network-isolated Codex execution requires workspace-write"
+                )
+            if mcp_specs or git_env:
+                raise CodexRequiredMcpPreTurnError(
+                    "Network-isolated Codex execution forbids MCP and Git "
+                    "credential environment injection"
+                )
+            if not disable_user_mcp or not disable_autonomous_features:
+                raise CodexRequiredMcpPreTurnError(
+                    "Network-isolated Codex execution requires user MCP and "
+                    "autonomous features to be disabled"
+                )
+        network_permission_profile = (
+            f"{_NETWORK_ISOLATED_PERMISSION_PROFILE_PREFIX}{uuid.uuid4().hex}"
+            if network_isolated
+            else None
+        )
         service_tier = normalize_codex_service_tier(codex_service_tier)
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2461,6 +2572,76 @@ class CodexAppServer:
             _deep_merge_config(
                 thread_config,
                 codex_untrusted_project_config(cwd),
+            )
+        if network_isolated:
+            # Built-in web search, Apps and ambient MCP run outside the local
+            # shell sandbox. Disable those routes and every autonomous/remote
+            # capability while retaining the local coding tools. ``core`` is
+            # Codex's fixed PATH/HOME/etc allow-list; explicit excludes and a
+            # disabled shell snapshot keep Git/GitHub credentials out even if
+            # a future core list expands.
+            _deep_merge_config(
+                thread_config,
+                {
+                    "web_search": "disabled",
+                    "allow_login_shell": False,
+                    "features": {
+                        feature: False
+                        for feature in _NETWORK_ISOLATED_DISABLED_FEATURES
+                    },
+                    "tools": {
+                        "experimental_request_user_input": {
+                            "enabled": False,
+                        },
+                    },
+                    "orchestrator": {
+                        "skills": {"enabled": False},
+                        "mcp": {"enabled": False},
+                    },
+                    "skills": {
+                        "include_instructions": False,
+                        "bundled": {"enabled": False},
+                        "config": [],
+                    },
+                    # WorkspaceWrite alone only narrows writes; its legacy
+                    # profile can still read the entire host. This named
+                    # request-local profile defaults the filesystem to deny,
+                    # admits only Codex's minimal executable/runtime roots for
+                    # reading, and grants the exact managed worktree read/write.
+                    "default_permissions": (
+                        network_permission_profile
+                    ),
+                    "permissions": {
+                        network_permission_profile: {
+                            "filesystem": {
+                                ":root": "deny",
+                                ":minimal": "read",
+                                os.path.abspath(cwd): "write",
+                            },
+                            "network": {
+                                "enabled": False,
+                                "allow_local_binding": False,
+                            },
+                        },
+                    },
+                    "shell_environment_policy": {
+                        "inherit": "core",
+                        "ignore_default_excludes": False,
+                        "exclude": [
+                            "GIT_*",
+                            "GH_*",
+                            "GITHUB_*",
+                            "SSH_*",
+                        ],
+                        "set": {
+                            "GIT_TERMINAL_PROMPT": "0",
+                            "GCM_INTERACTIVE": "never",
+                            "GIT_CONFIG_GLOBAL": os.devnull,
+                            "GIT_CONFIG_NOSYSTEM": "1",
+                            "GH_PROMPT_DISABLED": "1",
+                        },
+                    },
+                },
             )
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2582,6 +2763,43 @@ class CodexAppServer:
                     + str(exc)
                 ) from exc
             raise
+        if network_isolated:
+            try:
+                effective = await self._request(
+                    "config/read",
+                    {
+                        "cwd": os.path.abspath(cwd),
+                        "includeLayers": False,
+                    },
+                )
+                effective_config = (
+                    effective.get("config")
+                    if isinstance(effective, dict)
+                    else None
+                )
+                if not isinstance(effective_config, dict):
+                    raise ValueError("effective Codex configuration is malformed")
+                inherited_mcp = effective_config.get("mcp_servers", {})
+                if not isinstance(inherited_mcp, dict) or any(
+                    not isinstance(name, str) or not name
+                    for name in inherited_mcp
+                ):
+                    raise ValueError(
+                        "effective MCP server configuration is malformed"
+                    )
+                # Codex merges nested tables across config layers. An empty
+                # request-local table does not erase account-level servers,
+                # so explicitly disable every effective inherited name. The
+                # common no-MCP case remains the required literal ``{}``.
+                thread_config["mcp_servers"] = {
+                    name: {"enabled": False}
+                    for name in inherited_mcp
+                }
+            except Exception as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex network-isolated profile could not audit inherited "
+                    "MCP servers"
+                ) from exc
         if tools_disabled:
             try:
                 effective = await self._request(
@@ -2692,7 +2910,7 @@ class CodexAppServer:
             # layer above defines and selects the profile atomically.
             common["baseInstructions"] = ""
             common["developerInstructions"] = ""
-        else:
+        elif not network_isolated:
             common["sandbox"] = sandbox_mode
         if model and model != "default":
             common["model"] = model
@@ -2812,6 +3030,18 @@ class CodexAppServer:
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex tool-free profile was not proven by the "
+                    f"{thread_method} response"
+                ) from exc
+        if network_isolated:
+            try:
+                _audit_network_isolated_thread_response(
+                    response,
+                    cwd=cwd,
+                    permission_profile_id=str(network_permission_profile),
+                )
+            except (TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex network-isolated profile was not proven by the "
                     f"{thread_method} response"
                 ) from exc
         self._known_threads.add(thread_id)
@@ -3038,7 +3268,7 @@ class CodexAppServer:
                 "type": "readOnly",
                 "networkAccess": False,
             }
-        elif sandbox_mode == "workspace-write":
+        elif sandbox_mode == "workspace-write" and not network_isolated:
             turn_params["sandboxPolicy"] = {
                 "type": "workspaceWrite",
                 "writableRoots": [os.path.abspath(cwd)],

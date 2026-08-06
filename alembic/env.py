@@ -45,6 +45,15 @@ from backend.models.user_group import UserGroup, UserGroupMember  # noqa: F401
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep  # noqa: F401
 from backend.models.plan import Plan, PlanVersion, PlanInputRequest, PlanApplication, PlanLegacyTaskLink  # noqa: F401
 from backend.models.capability import CapabilityInvocation, CapabilityExecution  # noqa: F401
+from backend.models.code_review import CodeReviewRun, CodeReviewResult  # noqa: F401
+from backend.models.delivery import (  # noqa: F401
+    DeliveryAction,
+    DeliveryCycle,
+    DeliveryEvent,
+    DeliveryRun,
+    DeliveryTransition,
+    DeliveryTurn,
+)
 from backend.database import Base, _async_url_to_sync, _is_sqlite
 
 target_metadata = Base.metadata

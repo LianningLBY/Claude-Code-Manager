@@ -8,6 +8,7 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.task import Task
 from backend.schemas.instance import (
     InstanceCreate,
     InstanceResponse,
@@ -19,6 +20,7 @@ from backend.services.instance_capacity import (
     occupied_slot_predicate,
 )
 from backend.services.task_queue import persisted_pid_is_definitively_dead
+from backend.services.pr_review_runtime import is_pr_sandbox_task
 
 router = APIRouter(
     prefix="/api/instances",
@@ -344,6 +346,25 @@ async def stop_instance(
             409,
             "Instance process generation changed; refresh before stopping",
         )
+    if instance.current_task_id is not None:
+        task = await db.get(Task, instance.current_task_id)
+        if task is None:
+            raise HTTPException(
+                409,
+                "Instance Task ownership cannot be verified; process was not stopped",
+            )
+        if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+            raise HTTPException(
+                409,
+                "Delivery Developer instances are controlled by DeliveryRun; "
+                "the process was not stopped",
+            )
+        if is_pr_sandbox_task(task):
+            raise HTTPException(
+                409,
+                "Automated PR and Delivery Capability reviewer instances are "
+                "workflow-controlled; the process was not stopped",
+            )
 
     # Stop the producer first so it cannot claim another task immediately after
     # InstanceManager has reaped the current process.

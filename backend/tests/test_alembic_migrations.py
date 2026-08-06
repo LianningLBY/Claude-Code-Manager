@@ -16,8 +16,17 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 import pytest
-from sqlalchemy import BigInteger, create_engine, inspect, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKeyConstraint,
+    UniqueConstraint,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateTable
 
 # All ORM models must be imported so Base.metadata is complete.
@@ -33,6 +42,8 @@ import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
 import backend.models.plan  # noqa: F401
 import backend.models.capability  # noqa: F401
+import backend.models.code_review  # noqa: F401
+import backend.models.delivery  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -44,7 +55,9 @@ PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
 PLAN_V2_REVISION = "3f2a9c8e7b10"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
-CURRENT_HEAD_REVISION = CAPABILITY_CORE_REVISION
+CODE_REVIEW_REVISION = "8d4e1f7a9c20"
+DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
+CURRENT_HEAD_REVISION = DELIVERY_LOOP_REVISION
 PUBLISHED_PLAN_CLEANUP_SHA256 = (
     "dd8cce93f05599ebc580cb95cad5d7d8875f03415775312718d3e42ef4369d16"
 )
@@ -246,6 +259,8 @@ class TestLegacyMigration:
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
         assert "attention_tag" in task_cols
+        assert "delivery_run_id" in task_cols
+        assert "delivery_role" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
@@ -255,6 +270,14 @@ class TestLegacyMigration:
         assert "last_delta_at" in plan_step_cols
         assert "streamed_output_chars" in plan_step_cols
         assert "last_event_type" in plan_step_cols
+        assert "capability_execution_id" in _get_table_columns(
+            engine, "plan_agent_runs"
+        )
+
+        worktree_cols = _get_table_columns(engine, "worktrees")
+        assert "delivery_run_id" in worktree_cols
+        assert "cleanup_status" in worktree_cols
+        assert "delivery_runs" in _get_all_tables(engine)
 
         project_cols = _get_table_columns(engine, "projects")
         assert "sort_order" in project_cols
@@ -439,6 +462,374 @@ class TestCodexServiceTierMigration:
         engine.dispose()
 
 
+class TestDeliveryLoopMigration:
+    def test_upgrade_closes_task_id_reuse_and_purges_stale_acl(self, tmp_path):
+        db_path = str(tmp_path / "delivery-task-id-aba.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CODE_REVIEW_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(id, title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, shared_from_id, "
+                "created_at) "
+                "VALUES (10, 'current task', 'd', 'pending', 0, 'main', "
+                "'pending', 0, 2, 'auto', 55, '2026-08-05 00:00:00')"
+            ))
+            conn.execute(text(
+                "INSERT INTO task_shares "
+                "(task_id, shared_to_open_id, shared_to_ccm_url, share_token, "
+                "status, created_at) VALUES "
+                "(10, 'stale', 'https://old.example', 'stale-token', 'active', "
+                "'2026-08-04 00:00:00'), "
+                "(10, 'current', 'https://new.example', 'current-token', "
+                "'active', '2026-08-06 00:00:00'), "
+                "(25, 'orphan', 'https://old.example', 'orphan-token', "
+                "'active', '2026-08-01 00:00:00')"
+            ))
+            conn.execute(text(
+                "INSERT INTO team_task_shares "
+                "(task_id, target_type, target_id, permission, shared_by, "
+                "created_at) VALUES "
+                "(10, 'user', 1, 'chat', 1, '2026-08-04 00:00:00'), "
+                "(30, 'user', 2, 'chat', 1, '2026-08-01 00:00:00')"
+            ))
+            conn.execute(text(
+                "INSERT INTO shared_tasks_received "
+                "(owner_ccm_url, remote_task_id, share_token, local_task_id, "
+                "status, received_at) VALUES "
+                "('https://owner.example', 9, 'relay-token', 40, 'active', "
+                "'2026-08-01 00:00:00')"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            task_share_tokens = conn.execute(text(
+                "SELECT share_token FROM task_shares ORDER BY share_token"
+            )).scalars().all()
+            assert task_share_tokens == ["current-token"]
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM team_task_shares"
+            )).scalar_one() == 0
+            task_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'tasks'"
+            )).scalar_one()
+            assert "AUTOINCREMENT" in task_ddl.upper()
+            shared_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'shared_tasks_received'"
+            )).scalar_one()
+            assert "AUTOINCREMENT" in shared_ddl.upper()
+            assert conn.execute(text(
+                "SELECT incarnation_id FROM tasks WHERE id = 10"
+            )).scalar_one() is None
+            unique_names = {
+                item["name"]
+                for item in inspect(conn).get_unique_constraints("tasks")
+            }
+            assert "uq_tasks_incarnation_id" in unique_names
+
+            conn.execute(text(
+                "INSERT INTO shared_tasks_received "
+                "(owner_ccm_url, remote_task_id, share_token, status, received_at) "
+                "VALUES ('https://new-owner.example', 10, 'new-relay-token', "
+                "'active', '2026-08-07 00:00:00')"
+            ))
+            new_shared_id = conn.execute(text(
+                "SELECT id FROM shared_tasks_received "
+                "WHERE share_token = 'new-relay-token'"
+            )).scalar_one()
+            assert new_shared_id > 55
+
+            conn.execute(text("DELETE FROM tasks WHERE id = 10"))
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('new task', 'd', 'pending', 0, 'main', 'pending', "
+                "0, 2, 'auto', '2026-08-07 00:00:00')"
+            ))
+            new_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'new task'"
+            )).scalar_one()
+            assert new_id > 40
+        engine.dispose()
+
+    def test_upgrade_from_code_review_head_preserves_existing_rows(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "delivery-existing.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CODE_REVIEW_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('existing auto task', 'd', 'pending', 0, 'main', "
+                "'pending', 0, 2, 'auto', '2026-08-05 00:00:00')"
+            ))
+            conn.execute(text(
+                "INSERT INTO worktrees "
+                "(repo_path, worktree_path, branch_name, base_branch, status, "
+                "created_at) VALUES ('/repo', '/repo-wt', 'feature', 'main', "
+                "'active', '2026-08-05 00:00:00')"
+            ))
+            conn.execute(text(
+                "INSERT INTO plan_agent_runs "
+                "(run_type, current_stage, generation, interaction_count, "
+                "max_interactions, execution_seconds, status, round, "
+                "review_exhausted, created_at, updated_at) VALUES "
+                "('legacy', 'planner', 0, 0, 3, 0, 'completed', 1, 0, "
+                "'2026-08-05 00:00:00', '2026-08-05 00:00:00')"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            task_owner = conn.execute(text(
+                "SELECT delivery_run_id, delivery_role FROM tasks "
+                "WHERE title = 'existing auto task'"
+            )).one()
+            assert task_owner == (None, None)
+
+            worktree_owner = conn.execute(text(
+                "SELECT task_id, delivery_run_id, last_verified_head, "
+                "cleanup_status FROM worktrees WHERE worktree_path = '/repo-wt'"
+            )).one()
+            assert worktree_owner == (None, None, None, "retained")
+
+            capability_execution_id = conn.execute(text(
+                "SELECT capability_execution_id FROM plan_agent_runs"
+            )).scalar_one()
+            assert capability_execution_id is None
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE tasks SET delivery_run_id = 99 "
+                    "WHERE title = 'existing auto task'"
+                ))
+
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE tasks SET mode = 'delivery_loop', delivery_run_id = 99, "
+                "delivery_role = 'developer' "
+                "WHERE title = 'existing auto task'"
+            ))
+        engine.dispose()
+
+    def test_delivery_revision_downgrades_and_reupgrades(self, tmp_path):
+        db_path = str(tmp_path / "delivery-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+        _run_alembic(cfg, command.downgrade, CODE_REVIEW_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert not {
+            "delivery_runs",
+            "delivery_cycles",
+            "delivery_turns",
+            "delivery_events",
+            "delivery_actions",
+            "delivery_transitions",
+        }.intersection(_get_all_tables(engine))
+        assert "delivery_run_id" not in _get_table_columns(engine, "tasks")
+        assert "delivery_run_id" not in _get_table_columns(engine, "worktrees")
+        assert "capability_execution_id" not in _get_table_columns(
+            engine, "plan_agent_runs"
+        )
+        assert "incarnation_id" not in _get_table_columns(engine, "tasks")
+        with engine.begin() as conn:
+            task_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'tasks'"
+            )).scalar_one()
+            shared_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'shared_tasks_received'"
+            )).scalar_one()
+            assert "AUTOINCREMENT" in task_ddl.upper()
+            assert "AUTOINCREMENT" in shared_ddl.upper()
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('downgrade highest', 'd', 'pending', 0, 'main', "
+                "'pending', 0, 2, 'auto', '2026-08-06 00:00:00')"
+            ))
+            old_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'downgrade highest'"
+            )).scalar_one()
+            conn.execute(text("DELETE FROM tasks WHERE id = :id"), {"id": old_id})
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('downgrade next', 'd', 'pending', 0, 'main', "
+                "'pending', 0, 2, 'auto', '2026-08-06 00:00:01')"
+            ))
+            new_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'downgrade next'"
+            )).scalar_one()
+            assert new_id > old_id
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "delivery_runs" in _get_all_tables(engine)
+        assert "delivery_run_id" in _get_table_columns(engine, "tasks")
+        assert "delivery_run_id" in _get_table_columns(engine, "worktrees")
+        assert "capability_execution_id" in _get_table_columns(
+            engine, "plan_agent_runs"
+        )
+        assert "incarnation_id" in _get_table_columns(engine, "tasks")
+        engine.dispose()
+
+    def test_delivery_revision_refuses_downgrade_with_run_history(self, tmp_path):
+        db_path = str(tmp_path / "delivery-downgrade-history.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO delivery_runs "
+                "(admission_scope, idempotency_key, request_hash, project_id, "
+                "title, requirements, requirements_hash, "
+                "policy_snapshot, policy_hash, base_branch, delivery_branch, "
+                "created_at, updated_at) VALUES "
+                "('system', 'downgrade-test', :digest, 1, "
+                "'retained delivery', 'requirements', :digest, '{}', "
+                ":digest, 'main', 'ccm/delivery/1-retained', "
+                "'2026-08-05 00:00:00', '2026-08-05 00:00:00')"
+            ), {"digest": "a" * 64})
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="delivery_runs contains history"):
+            _run_alembic(cfg, command.downgrade, CODE_REVIEW_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "delivery_runs" in _get_all_tables(engine)
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM delivery_runs"
+            )).scalar_one() == 1
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == DELIVERY_LOOP_REVISION
+        engine.dispose()
+
+    def test_delivery_revision_refuses_residual_owner_downgrade(self, tmp_path):
+        db_path = str(tmp_path / "delivery-downgrade-owners.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+
+        residues = (
+            (
+                "tasks",
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, "
+                "delivery_run_id, delivery_role, created_at) VALUES "
+                "('orphan delivery', 'd', 'cancelled', 0, 'main', "
+                "'pending', 0, 2, 'delivery_loop', 91, 'developer', "
+                "'2026-08-05 00:00:00')",
+                "DELETE FROM tasks WHERE title = 'orphan delivery'",
+            ),
+            (
+                "worktrees",
+                "INSERT INTO worktrees "
+                "(repo_path, worktree_path, branch_name, base_branch, "
+                "delivery_run_id, cleanup_status, status, created_at) VALUES "
+                "('/repo', '/repo/delivery-92', 'delivery-92', 'main', 92, "
+                "'retained', 'active', '2026-08-05 00:00:00')",
+                "DELETE FROM worktrees WHERE delivery_run_id = 92",
+            ),
+            (
+                "plan_agent_runs",
+                "INSERT INTO plan_agent_runs "
+                "(run_type, current_stage, generation, interaction_count, "
+                "max_interactions, execution_seconds, status, round, "
+                "review_exhausted, capability_execution_id, created_at, "
+                "updated_at) VALUES ('capability', 'planner', 0, 0, 3, 0, "
+                "'cancelled', 1, 0, 93, '2026-08-05 00:00:00', "
+                "'2026-08-05 00:00:00')",
+                "DELETE FROM plan_agent_runs WHERE capability_execution_id = 93",
+            ),
+        )
+        for table_name, insert_sql, delete_sql in residues:
+            with engine.begin() as conn:
+                conn.execute(text(insert_sql))
+            with pytest.raises(RuntimeError, match=table_name):
+                _run_alembic(cfg, command.downgrade, CODE_REVIEW_REVISION)
+            with engine.begin() as conn:
+                conn.execute(text(delete_sql))
+
+        engine.dispose()
+        _run_alembic(cfg, command.downgrade, CODE_REVIEW_REVISION)
+
+
+class TestCodeReviewMigration:
+    def test_refuses_review_history_or_reviewer_task_downgrade(self, tmp_path):
+        db_path = str(tmp_path / "code-review-downgrade-guard.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CODE_REVIEW_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        digest = "b" * 64
+        sha = "c" * 40
+
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO code_review_runs "
+                "(capability_invocation_id, capability_execution_id, attempt, "
+                "developer_task_id, reviewer_task_id, reviewer_task_retry_count, "
+                "repo_path, base_sha, head_sha, head_tree_sha, patch_sha256, "
+                "subject_ref, subject_hash, prompt_hash, created_at, updated_at) "
+                "VALUES (1, 1, 1, 1, 2, 0, '/repo', :sha, :sha, :sha, "
+                ":digest, '{}', :digest, :digest, "
+                "'2026-08-05 00:00:00', '2026-08-05 00:00:00')"
+            ), {"sha": sha, "digest": digest})
+        with pytest.raises(RuntimeError, match="code_review_runs contains history"):
+            _run_alembic(cfg, command.downgrade, CAPABILITY_CORE_REVISION)
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM code_review_runs"))
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, tags, metadata, "
+                "created_at) VALUES ('orphan reviewer', 'd', 'pending', 0, "
+                "'main', 'pending', 0, 0, 'auto', "
+                ":tags, :metadata, '2026-08-05 00:00:00')"
+            ), {
+                "tags": '["pre-pr-code-review"]',
+                "metadata": (
+                    '{"code_review_run_id":1,"capability_invocation_id":1,'
+                    '"capability_execution_id":1}'
+                ),
+            })
+        with pytest.raises(RuntimeError, match="retains reviewer ownership"):
+            _run_alembic(cfg, command.downgrade, CAPABILITY_CORE_REVISION)
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM tasks WHERE title = 'orphan reviewer'"))
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, CAPABILITY_CORE_REVISION)
+
+
 class TestFreshMigration:
     """A fresh database (no tables) can be fully created via Alembic upgrade."""
 
@@ -451,7 +842,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -464,6 +855,45 @@ class TestFreshMigration:
         assert "plan_context_snapshot" in task_cols
         assert "plan_applied_log_id" in task_cols
         assert "attention_tag" in task_cols
+        assert "delivery_run_id" in task_cols
+        assert "delivery_role" in task_cols
+
+        worktree_cols = _get_table_columns(engine, "worktrees")
+        assert {
+            "task_id",
+            "delivery_run_id",
+            "last_verified_head",
+            "cleanup_status",
+        }.issubset(worktree_cols)
+
+        plan_run_cols = _get_table_columns(engine, "plan_agent_runs")
+        assert "capability_execution_id" in plan_run_cols
+
+        delivery_run_cols = set(_get_table_columns(engine, "delivery_runs"))
+        assert {
+            "admission_scope",
+            "idempotency_key",
+            "request_hash",
+            "developer_task_id",
+            "worktree_id",
+            "current_cycle_id",
+            "controller_generation",
+            "lease_owner",
+            "lease_expires_at",
+            "next_reconcile_at",
+        }.issubset(delivery_run_cols)
+        delivery_run_unique_columns = {
+            tuple(constraint["column_names"])
+            for constraint in inspect(engine).get_unique_constraints(
+                "delivery_runs"
+            )
+        }
+        assert (
+            "admission_scope",
+            "project_id",
+            "idempotency_key",
+        ) in delivery_run_unique_columns
+        assert ("source_todo_id",) in delivery_run_unique_columns
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
@@ -1283,6 +1713,172 @@ class TestSchemaConsistency:
                 assert "active_slot" in ddl
                 assert "UNIQUE" in ddl
 
+    def test_code_review_integrity_constraints_compile_on_all_dialects(self):
+        for table_name in ("code_review_runs", "code_review_results"):
+            table = Base.metadata.tables[table_name]
+            for dialect in (
+                sqlite.dialect(),
+                postgresql.dialect(),
+                mysql.dialect(),
+            ):
+                ddl = str(CreateTable(table).compile(dialect=dialect))
+                assert "code_review" in ddl
+                assert "UNIQUE" in ddl
+
+    @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
+    def test_delivery_migration_compiles_offline(self, dialect_name):
+        migration_path = (
+            PROJECT_ROOT
+            / "alembic"
+            / "versions"
+            / "9e5b2a7c4d10_add_delivery_loop_state.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            f"delivery_migration_for_{dialect_name}", migration_path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        upgrade_output = io.StringIO()
+        upgrade_context = MigrationContext.configure(
+            dialect_name=dialect_name,
+            opts={"as_sql": True, "output_buffer": upgrade_output},
+        )
+        with patch.object(module, "op", Operations(upgrade_context)):
+            module.upgrade()
+        upgrade_ddl = upgrade_output.getvalue().lower()
+        assert "create table delivery_runs" in upgrade_ddl
+        assert "create table delivery_transitions" in upgrade_ddl
+        assert "ck_tasks_delivery_owner_shape" in upgrade_ddl
+        assert "uq_plan_agent_runs_capability_execution" in upgrade_ddl
+        assert "uq_worktrees_delivery_run" in upgrade_ddl
+        assert "idempotency_key varchar(191)" in upgrade_ddl
+
+        downgrade_output = io.StringIO()
+        downgrade_context = MigrationContext.configure(
+            dialect_name=dialect_name,
+            opts={"as_sql": True, "output_buffer": downgrade_output},
+        )
+        with patch.object(module, "op", Operations(downgrade_context)):
+            with pytest.raises(RuntimeError, match="Offline downgrade"):
+                module.downgrade()
+            # Compile the destructive statements separately only to prove the
+            # dialect syntax. Production offline downgrade remains refused.
+            with patch.object(
+                module,
+                "_assert_delivery_history_empty",
+                return_value=None,
+            ):
+                module.downgrade()
+        downgrade_ddl = downgrade_output.getvalue().lower()
+        assert "drop table delivery_runs" in downgrade_ddl
+        assert "drop column delivery_run_id" in downgrade_ddl
+        assert "uq_plan_agent_runs_capability_execution" in downgrade_ddl
+
+    def test_delivery_schema_constraints_and_indexes_match_orm(self, tmp_path):
+        db_path = str(tmp_path / "delivery-schema.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+
+        for table_name in (
+            "delivery_runs",
+            "delivery_cycles",
+            "delivery_turns",
+            "delivery_events",
+            "delivery_actions",
+            "delivery_transitions",
+        ):
+            table = Base.metadata.tables[table_name]
+
+            expected_indexes = {
+                (index.name, tuple(column.name for column in index.columns))
+                for index in table.indexes
+            }
+            actual_indexes = {
+                (index["name"], tuple(index["column_names"]))
+                for index in inspector.get_indexes(table_name)
+            }
+            assert actual_indexes == expected_indexes
+
+            expected_uniques = {
+                (
+                    constraint.name,
+                    tuple(column.name for column in constraint.columns),
+                )
+                for constraint in table.constraints
+                if isinstance(constraint, UniqueConstraint)
+            }
+            actual_uniques = {
+                (constraint["name"], tuple(constraint["column_names"]))
+                for constraint in inspector.get_unique_constraints(table_name)
+            }
+            assert actual_uniques == expected_uniques
+
+            expected_checks = {
+                constraint.name
+                for constraint in table.constraints
+                if isinstance(constraint, CheckConstraint)
+            }
+            actual_checks = {
+                constraint["name"]
+                for constraint in inspector.get_check_constraints(table_name)
+            }
+            assert actual_checks == expected_checks
+
+            expected_foreign_keys = {
+                (
+                    tuple(element.parent.name for element in constraint.elements),
+                    constraint.elements[0].column.table.name,
+                    tuple(element.column.name for element in constraint.elements),
+                    constraint.ondelete,
+                )
+                for constraint in table.constraints
+                if isinstance(constraint, ForeignKeyConstraint)
+            }
+            actual_foreign_keys = {
+                (
+                    tuple(constraint["constrained_columns"]),
+                    constraint["referred_table"],
+                    tuple(constraint["referred_columns"]),
+                    (constraint.get("options") or {}).get("ondelete"),
+                )
+                for constraint in inspector.get_foreign_keys(table_name)
+            }
+            assert actual_foreign_keys == expected_foreign_keys
+
+        task_checks = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("tasks")
+        }
+        assert "ck_tasks_delivery_owner_shape" in task_checks
+        worktree_checks = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("worktrees")
+        }
+        assert "ck_worktrees_cleanup_status" in worktree_checks
+        worktree_uniques = {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("worktrees")
+        }
+        assert "uq_worktrees_delivery_run" in worktree_uniques
+        plan_run_uniques = {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("plan_agent_runs")
+        }
+        assert "uq_plan_agent_runs_capability_execution" in plan_run_uniques
+        delivery_action_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("delivery_actions")
+        }
+        assert delivery_action_columns["idempotency_key"]["type"].length == 191
+        engine.dispose()
+
     @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
     def test_capability_migration_compiles_offline(self, dialect_name):
         migration_path = (
@@ -1427,6 +2023,14 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(DELIVERY_LOOP_REVISION).down_revision
+            == CODE_REVIEW_REVISION
+        )
+        assert (
+            script.get_revision(CODE_REVIEW_REVISION).down_revision
+            == CAPABILITY_CORE_REVISION
+        )
         assert (
             script.get_revision(CAPABILITY_CORE_REVISION).down_revision
             == PLAN_V2_REVISION

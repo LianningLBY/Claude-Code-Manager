@@ -35,6 +35,9 @@ vi.mock('../../api/client', () => ({
       },
     }),
     createTask: vi.fn().mockResolvedValue({ id: 1 }),
+    createDeliveryRun: vi.fn().mockResolvedValue({ id: 11, developer_task_id: 12 }),
+    uploadImages: vi.fn().mockResolvedValue([]),
+    getMonitoredRepos: vi.fn().mockResolvedValue([]),
     createProject: vi.fn().mockResolvedValue({ id: 2 }),
     listWorkers: vi.fn().mockResolvedValue([]),
     listSkillsCached: vi.fn().mockResolvedValue([
@@ -524,6 +527,7 @@ describe('Codex Fast speed configuration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    sessionStorage.clear();
     vi.mocked(api.config).mockResolvedValue({
       default_provider: 'claude',
       provider_options: ['claude', 'codex'],
@@ -687,5 +691,216 @@ describe('TaskForm persisted defaults', () => {
       expect(screen.getByDisplayValue('Goal')).toBeInTheDocument();
       expect(screen.getByDisplayValue('2 hours')).toBeInTheDocument();
     });
+  });
+});
+
+describe('TaskForm Delivery Loop mode', () => {
+  const config = {
+    default_provider: 'codex',
+    provider_options: ['claude', 'codex'],
+    default_model: 'claude-opus-4-6',
+    model_options: ['claude-opus-4-6'],
+    default_codex_model: 'gpt-5.6-sol',
+    codex_model_options: ['gpt-5.6-sol'],
+    default_effort: 'medium',
+    effort_options: ['low', 'medium', 'high'],
+    claude_model_efforts: {},
+    claude_model_context_windows: {},
+    codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
+    codex_model_efforts: {},
+    codex_model_service_tiers: { 'gpt-5.6-sol': ['default', 'priority'] },
+    capability_core_enabled: true,
+    delivery_loop_enabled: true,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.config).mockResolvedValue(config as never);
+    vi.mocked(api.listProjects).mockResolvedValue([{
+      id: 1,
+      name: 'test-project',
+      git_url: 'git@github.com:owner/repo.git',
+      has_remote: true,
+      local_path: '/srv/repo',
+      default_branch: 'main',
+      worker_id: null,
+      status: 'ready',
+      error_message: null,
+      show_in_selector: true,
+      sort_order: 0,
+      tags: [],
+      env_files: [],
+      git_author_name: null,
+      git_author_email: null,
+      git_credential_type: null,
+      git_ssh_key_path: null,
+      git_https_username: null,
+      git_https_token: null,
+      badge_color: null,
+      created_at: '2026-08-05T00:00:00Z',
+    }]);
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([{
+      id: 9,
+      repo_full_name: 'owner/repo',
+      project_id: 1,
+      worker_id: null,
+      enabled: true,
+      auto_merge: false,
+      auto_repair: true,
+      max_repair_attempts: 3,
+      provider: 'codex',
+      review_model: null,
+      review_effort: null,
+      review_mode: 'panel',
+      wait_for_ci: true,
+      required_checks: [{ kind: 'check_run', name: 'test', app_slug: 'github-actions' }],
+      merge_queue_mode: 'manual',
+      default_branch: 'main',
+      allowed_authors: [],
+      status: 'active',
+      error_message: null,
+      created_at: '2026-08-05T00:00:00Z',
+      updated_at: '2026-08-05T00:00:00Z',
+    }]);
+  });
+
+  async function fillDeliveryForm(requirements: string) {
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    fireEvent.change(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      { target: { value: requirements } },
+    );
+  }
+
+  it('keeps the mode hidden when the server feature gate is off', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...config,
+      delivery_loop_enabled: false,
+    } as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+
+    expect(screen.queryByRole('option', { name: 'Delivery Loop' })).not.toBeInTheDocument();
+  });
+
+  it('creates an atomic DeliveryRun instead of an ordinary Task', async () => {
+    const onCreated = vi.fn();
+    render(<TaskForm onCreated={onCreated} />);
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    expect(screen.getByDisplayValue('Codex')).toBeDisabled();
+
+    expect(screen.queryByRole('button', { name: 'Attach files' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Priority')).not.toBeInTheDocument();
+    expect(screen.queryByText('System Prompt')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Plugins/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Skills/)).not.toBeInTheDocument();
+
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    await userEvent.type(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      'Fix exact-head loop\nwith complete regression tests',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledWith({
+      idempotency_key: expect.any(String),
+      project_id: 1,
+      monitored_repo_id: 9,
+      title: 'Fix exact-head loop',
+      requirements: 'Fix exact-head loop\nwith complete regression tests',
+      base_branch: 'main',
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+      codex_service_tier: 'default',
+    }));
+    expect(api.createTask).not.toHaveBeenCalled();
+    expect(onCreated).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a failed admission key across remount and acknowledges it only after success', async () => {
+    vi.mocked(api.createDeliveryRun)
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValue({ id: 11, developer_task_id: 12 } as never);
+    const firstRender = render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('Retry the exact same admission');
+
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+    await screen.findByText('response lost');
+    const firstKey = vi.mocked(api.createDeliveryRun).mock.calls[0][0].idempotency_key;
+    firstRender.unmount();
+
+    const replayRender = render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('Retry the exact same admission');
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledTimes(2));
+    const secondKey = vi.mocked(api.createDeliveryRun).mock.calls[1][0].idempotency_key;
+    expect(firstKey).toBeTruthy();
+    expect(secondKey).toBe(firstKey);
+    replayRender.unmount();
+
+    render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('Retry the exact same admission');
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(api.createDeliveryRun).mock.calls[2][0].idempotency_key).not.toBe(firstKey);
+  });
+
+  it('trims Delivery requirements and derives a capped title from the first non-empty line', async () => {
+    const longTitle = 'T'.repeat(205);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm(`\n  \n${longTitle}\nRegression details\n`);
+
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'T'.repeat(200),
+        requirements: `${longTitle}\nRegression details`,
+      }),
+    ));
+  });
+
+  it('rejects whitespace-only Delivery requirements', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('  \n\t  ');
+
+    expect(screen.getByRole('button', { name: /create/i })).toBeDisabled();
+    expect(api.createDeliveryRun).not.toHaveBeenCalled();
+  });
+
+  it('ignores dropped and pasted files while Delivery Loop mode is active', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+
+    const prompt = screen.getByPlaceholderText(
+      'Delivery requirements (Plan → Code → Review → PR Monitor)',
+    );
+    const form = prompt.closest('form');
+    expect(form).not.toBeNull();
+
+    const dropped = new File(['drop'], 'dropped.txt', { type: 'text/plain' });
+    fireEvent.drop(form!, {
+      dataTransfer: { files: [dropped] },
+    });
+
+    const pasted = new File(['paste'], 'pasted.txt', { type: 'text/plain' });
+    fireEvent.paste(form!, {
+      clipboardData: {
+        items: [{ kind: 'file', getAsFile: () => pasted }],
+      },
+    });
+
+    expect(api.uploadImages).not.toHaveBeenCalled();
   });
 });

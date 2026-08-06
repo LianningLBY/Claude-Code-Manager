@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import shutil
 import signal
 import tomllib
 from pathlib import Path
@@ -96,6 +97,35 @@ def _tool_free_thread_response(
         "sandbox": {
             "type": "readOnly",
             "networkAccess": False,
+        },
+    }
+
+
+def _network_isolated_thread_response(
+    cwd: str,
+    *,
+    thread_id: str = "thread-delivery-test",
+    permission_profile: str = "ccm_delivery_workspace_v1_test",
+    network_access: bool = False,
+    writable_roots: list[str] | None = None,
+) -> dict:
+    return {
+        "thread": {
+            "id": thread_id,
+            "status": {"type": "idle"},
+        },
+        "serviceTier": "default",
+        "cwd": cwd,
+        "activePermissionProfile": {
+            "id": permission_profile,
+            "extends": None,
+        },
+        "sandbox": {
+            "type": "workspaceWrite",
+            "writableRoots": writable_roots or [],
+            "networkAccess": network_access,
+            "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True,
         },
     }
 
@@ -780,6 +810,491 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
         ("thread", "thread-read-only-monitor"),
         ("turn", process, "thread-read-only-monitor"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
+    tmp_path,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "config/read":
+            return {"config": {"mcp_servers": {}}}
+        if method == "thread/start":
+            return _network_isolated_thread_response(
+                workspace,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-delivery-isolated"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.start_turn(
+        prompt="implement only inside the managed worktree",
+        cwd=workspace,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=909,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        disable_autonomous_features=True,
+        network_isolated=True,
+    )
+
+    config_call, thread_call, turn_call = server._request.await_args_list
+    assert config_call.args == (
+        "config/read",
+        {"cwd": workspace, "includeLayers": False},
+    )
+    assert thread_call.args[0] == "thread/start"
+    thread_params = thread_call.args[1]
+    # A legacy workspace-write override would replace the restricted-read
+    # profile with full host read access.
+    assert "sandbox" not in thread_params
+    config = thread_params["config"]
+    assert config["mcp_servers"] == {}
+    assert config["web_search"] == "disabled"
+    assert config["allow_login_shell"] is False
+    permission_profile = config["default_permissions"]
+    assert permission_profile.startswith("ccm_delivery_workspace_v1_")
+    assert len(permission_profile) == len("ccm_delivery_workspace_v1_") + 32
+    assert config["permissions"] == {
+        permission_profile: {
+            "filesystem": {
+                ":root": "deny",
+                ":minimal": "read",
+                workspace: "write",
+            },
+            "network": {
+                "enabled": False,
+                "allow_local_binding": False,
+            },
+        },
+    }
+    for feature in (
+        "apps",
+        "browser_use",
+        "computer_use",
+        "enable_fanout",
+        "enable_mcp_apps",
+        "goals",
+        "hooks",
+        "image_generation",
+        "memories",
+        "multi_agent",
+        "plugins",
+        "realtime_conversation",
+        "remote_compaction_v2",
+        "remote_plugin",
+        "shell_snapshot",
+        "standalone_web_search",
+        "tool_call_mcp_elicitation",
+        "workspace_dependencies",
+    ):
+        assert config["features"][feature] is False
+    # The Developer still has the ordinary local coding tools; they must not
+    # accidentally be disabled by the remote-capability deny-list.
+    assert "shell_tool" not in config["features"]
+    assert "unified_exec" not in config["features"]
+    assert config["orchestrator"] == {
+        "skills": {"enabled": False},
+        "mcp": {"enabled": False},
+    }
+    assert config["skills"] == {
+        "include_instructions": False,
+        "bundled": {"enabled": False},
+        "config": [],
+    }
+    assert config["tools"]["experimental_request_user_input"] == {
+        "enabled": False,
+    }
+    shell_policy = config["shell_environment_policy"]
+    assert shell_policy["inherit"] == "core"
+    assert shell_policy["ignore_default_excludes"] is False
+    assert shell_policy["exclude"] == [
+        "GIT_*",
+        "GH_*",
+        "GITHUB_*",
+        "SSH_*",
+    ]
+    assert shell_policy["set"] == {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GH_PROMPT_DISABLED": "1",
+    }
+    assert not any(
+        "TOKEN" in name or "SECRET" in name or name.endswith("_KEY")
+        for name in shell_policy["set"]
+    )
+    assert turn_call.args[0] == "turn/start"
+    # TurnStartParams in Codex 0.144.6 has no permission-profile selector.
+    # Omitting the legacy sandboxPolicy preserves the exact audited thread
+    # profile rather than widening reads for this turn.
+    assert "sandboxPolicy" not in turn_call.args[1]
+
+
+@pytest.mark.asyncio
+async def test_network_isolated_delivery_profile_id_is_unique_per_turn(
+    tmp_path,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    profile_ids: list[str] = []
+
+    async def request(method, params):
+        if method == "config/read":
+            return {"config": {"mcp_servers": {}}}
+        if method == "thread/start":
+            profile_id = params["config"]["default_permissions"]
+            profile_ids.append(profile_id)
+            assert set(params["config"]["permissions"]) == {profile_id}
+            return _network_isolated_thread_response(
+                workspace,
+                thread_id=f"thread-delivery-{len(profile_ids)}",
+                permission_profile=profile_id,
+            )
+        if method == "turn/start":
+            return {"turn": {"id": f"turn-delivery-{len(profile_ids)}"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    random_suffixes = ["a" * 32, "b" * 32]
+    # start_turn also generates a client message ID after selecting the
+    # permission profile, so provide one unrelated UUID between profile IDs.
+    generated = [
+        SimpleNamespace(hex=random_suffixes[0]),
+        SimpleNamespace(hex="1" * 32),
+        SimpleNamespace(hex=random_suffixes[1]),
+        SimpleNamespace(hex="2" * 32),
+    ]
+
+    with patch(
+        "backend.services.codex_app_server.uuid.uuid4",
+        side_effect=generated,
+    ):
+        for task_id in (912, 913):
+            await server.start_turn(
+                prompt="implement only inside the managed worktree",
+                cwd=workspace,
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=task_id,
+                disable_project_config=True,
+                disable_user_mcp=True,
+                sandbox_mode="workspace-write",
+                disable_autonomous_features=True,
+                network_isolated=True,
+            )
+
+    assert profile_ids == [
+        f"ccm_delivery_workspace_v1_{suffix}"
+        for suffix in random_suffixes
+    ]
+    assert len(set(profile_ids)) == 2
+    assert "ccm_delivery_workspace_v1" not in profile_ids
+
+
+@pytest.mark.asyncio
+async def test_network_isolated_delivery_disables_inherited_mcp_by_name(
+    tmp_path,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "config/read":
+            return {
+                "config": {
+                    "mcp_servers": {
+                        "github": {"command": "/usr/bin/credential-helper"},
+                        "user-app": {"url": "https://example.invalid/mcp"},
+                    },
+                },
+            }
+        if method == "thread/start":
+            return _network_isolated_thread_response(
+                workspace,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-delivery-no-mcp"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.start_turn(
+        prompt="implement locally",
+        cwd=workspace,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=910,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        disable_autonomous_features=True,
+        network_isolated=True,
+    )
+
+    thread_config = server._request.await_args_list[1].args[1]["config"]
+    profile_id = thread_config["default_permissions"]
+    assert set(thread_config["permissions"]) == {profile_id}
+    assert thread_config["mcp_servers"] == {
+        "github": {"enabled": False},
+        "user-app": {"enabled": False},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_overrides", "message"),
+    [
+        ({"network_access": True}, "network-isolated profile"),
+        (
+            {"writable_roots": ["/outside-delivery-worktree"]},
+            "network-isolated profile",
+        ),
+        (
+            {"permission_profile": "attacker-controlled-profile"},
+            "network-isolated profile",
+        ),
+    ],
+)
+async def test_network_isolated_delivery_fails_before_turn_without_sandbox_proof(
+    tmp_path,
+    response_overrides,
+    message,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "config/read":
+            return {"config": {"mcp_servers": {}}}
+        if method == "thread/start":
+            response_kwargs = dict(response_overrides)
+            response_kwargs.setdefault(
+                "permission_profile",
+                params["config"]["default_permissions"],
+            )
+            return _network_isolated_thread_response(
+                workspace,
+                **response_kwargs,
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    with pytest.raises(CodexRequiredMcpPreTurnError, match=message):
+        await server.start_turn(
+            prompt="must not reach the model",
+            cwd=workspace,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=911,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            sandbox_mode="workspace-write",
+            disable_autonomous_features=True,
+            network_isolated=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "thread/start",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("CCM_RUN_REAL_CODEX_SANDBOX_TESTS") != "1"
+    or shutil.which("codex") is None,
+    reason="opt-in real Codex app-server sandbox probe",
+)
+async def test_real_codex_delivery_permission_profile_blocks_host_reads(
+    tmp_path,
+    monkeypatch,
+):
+    """Exercise the pinned app-server without sending a model request."""
+
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside-secret.txt"
+    codex_home.mkdir()
+    workspace.mkdir()
+    outside.write_text("host-secret", encoding="utf-8")
+    (workspace / "inside.txt").write_text("inside-ok", encoding="utf-8")
+    (workspace / ".git").write_text(
+        f"gitdir: {tmp_path / 'git-metadata'}\n",
+        encoding="utf-8",
+    )
+    profile = "ccm_delivery_workspace_v1"
+    monkeypatch.setenv("GH_TOKEN", "must-not-enter-delivery-shell")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-enter-delivery-shell")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/must-not-enter-delivery-shell")
+    profile_config = {
+        "allow_login_shell": False,
+        "default_permissions": profile,
+        "permissions": {
+            profile: {
+                "filesystem": {
+                    ":root": "deny",
+                    ":minimal": "read",
+                    str(workspace.resolve()): "write",
+                },
+                "network": {
+                    "enabled": False,
+                    "allow_local_binding": False,
+                },
+            },
+        },
+        "shell_environment_policy": {
+            "inherit": "core",
+            "ignore_default_excludes": False,
+            "exclude": ["GIT_*", "GH_*", "GITHUB_*", "SSH_*"],
+        },
+    }
+    # command/exec resolves named profiles from the account config. The
+    # thread/start request below independently proves that the same shape is
+    # accepted as the request-local profile used by production.
+    (codex_home / "config.toml").write_text(
+        "\n".join([
+            f'default_permissions = "{profile}"',
+            "allow_login_shell = false",
+            "",
+            f"[permissions.{profile}.filesystem]",
+            '":root" = "deny"',
+            '":minimal" = "read"',
+            f'{json.dumps(str(workspace.resolve()))} = "write"',
+            "",
+            f"[permissions.{profile}.network]",
+            "enabled = false",
+            "allow_local_binding = false",
+            "",
+            "[shell_environment_policy]",
+            'inherit = "core"',
+            "ignore_default_excludes = false",
+            'exclude = ["GIT_*", "GH_*", "GITHUB_*", "SSH_*"]',
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    server = CodexAppServer(
+        shutil.which("codex") or "codex",
+        codex_home=codex_home,
+    )
+    try:
+        await server.ensure_started()
+        thread_response = await server._request(
+            "thread/start",
+            {
+                "cwd": str(workspace.resolve()),
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "config": profile_config,
+            },
+        )
+        assert thread_response["activePermissionProfile"] == {
+            "id": profile,
+            "extends": None,
+        }
+        assert thread_response["sandbox"] == {
+            "type": "workspaceWrite",
+            "writableRoots": [],
+            "networkAccess": False,
+            "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True,
+        }
+
+        outside_result = await server._request(
+            "command/exec",
+            {
+                "command": ["/bin/cat", str(outside.resolve())],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert outside_result["exitCode"] != 0
+        assert "host-secret" not in outside_result["stdout"]
+
+        env_result = await server._request(
+            "command/exec",
+            {
+                "command": ["/usr/bin/env"],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert env_result["exitCode"] == 0
+        assert "GH_TOKEN=" not in env_result["stdout"]
+        assert "GITHUB_TOKEN=" not in env_result["stdout"]
+        assert "SSH_AUTH_SOCK=" not in env_result["stdout"]
+
+        inside_result = await server._request(
+            "command/exec",
+            {
+                "command": [
+                    "/bin/sh",
+                    "-c",
+                    "cat inside.txt && printf written > created.txt",
+                ],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert inside_result == {
+            "exitCode": 0,
+            "stdout": "inside-ok",
+            "stderr": "",
+        }
+        assert (workspace / "created.txt").read_text(encoding="utf-8") == (
+            "written"
+        )
+
+        git_result = await server._request(
+            "command/exec",
+            {
+                "command": [
+                    "/bin/sh",
+                    "-c",
+                    "printf overwritten > .git",
+                ],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert git_result["exitCode"] != 0
+        assert (workspace / ".git").read_text(encoding="utf-8").startswith(
+            "gitdir: "
+        )
+    finally:
+        await server.shutdown(reason="real Delivery sandbox probe complete")
 
 
 @pytest.mark.asyncio

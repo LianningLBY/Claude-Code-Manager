@@ -11,7 +11,7 @@ import json
 from typing import Iterable
 
 from fastapi import HTTPException
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +46,57 @@ ACTIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_user"})
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _plan_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 _target_plan_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+CAPABILITY_OWNED_PLAN_MUTATION_DETAIL = {
+    "code": "capability_owned_plan_read_only",
+    "message": "Capability-owned Plans can only be mutated by Capability Core",
+}
+
+
+async def reject_capability_owned_plan_mutation(
+    db: AsyncSession,
+    *,
+    plan_ids: Iterable[int],
+) -> None:
+    """Keep generic Plan writers away from Capability-owned aggregates.
+
+    Ownership is durable once *any* Run carries a Capability marker.  Querying
+    it with one correlated ``EXISTS`` keeps historical Runs authoritative and
+    cannot be bypassed by list pagination.  The active-Run branch is a
+    fail-closed integrity fence for a malformed reverse association whose Run
+    no longer points back at the Plan.
+    """
+
+    normalized_ids = tuple(sorted({int(plan_id) for plan_id in plan_ids}))
+    if not normalized_ids:
+        return
+    capability_marker = or_(
+        PlanAgentRun.run_type == "capability",
+        PlanAgentRun.capability_execution_id.is_not(None),
+    )
+    capability_owner = exists(
+        select(PlanAgentRun.id).where(
+            capability_marker,
+            or_(
+                PlanAgentRun.plan_id == Plan.id,
+                and_(
+                    Plan.active_run_id.is_not(None),
+                    PlanAgentRun.id == Plan.active_run_id,
+                ),
+            ),
+        )
+    )
+    owned_plan_id = await db.scalar(
+        select(Plan.id)
+        .where(Plan.id.in_(normalized_ids), capability_owner)
+        .limit(1)
+    )
+    if owned_plan_id is not None:
+        raise HTTPException(
+            409,
+            dict(CAPABILITY_OWNED_PLAN_MUTATION_DETAIL),
+        )
 
 
 @dataclass(frozen=True)
@@ -331,6 +382,29 @@ async def resolve_uncertain_plan_application(
     ).scalar_one_or_none()
     if receipt is None:
         raise HTTPException(404, "Plan application receipt not found")
+    receipt_plan_ids = list(
+        dict.fromkeys(
+            (
+                await db.execute(
+                    select(PlanVersion.plan_id).where(
+                        or_(
+                            PlanVersion.id.in_(receipt.plan_version_ids or []),
+                            PlanVersion.id.in_(
+                                select(PlanApplication.plan_version_id).where(
+                                    PlanApplication.application_receipt_key
+                                    == receipt.receipt_key
+                                )
+                            ),
+                        )
+                    )
+                )
+            ).scalars()
+        )
+    )
+    await reject_capability_owned_plan_mutation(
+        db,
+        plan_ids=receipt_plan_ids,
+    )
     prior_resolution = receipt.delivery_resolution
     if isinstance(prior_resolution, dict) and prior_resolution.get("action") == action:
         if actor_id is not None and prior_resolution.get("resolved_by") is None:
@@ -340,18 +414,7 @@ async def resolve_uncertain_plan_application(
             enriched_resolution["manager_confirmed_at"] = datetime.utcnow().isoformat()
             receipt.delivery_resolution = enriched_resolution
             receipt.updated_at = datetime.utcnow()
-        plan_ids = list(
-            dict.fromkeys(
-                (
-                    await db.execute(
-                        select(PlanVersion.plan_id).where(
-                            PlanVersion.id.in_(receipt.plan_version_ids or [])
-                        )
-                    )
-                ).scalars()
-            )
-        )
-        return plan_ids, receipt.target_task_id
+        return receipt_plan_ids, receipt.target_task_id
     if receipt.delivery_status != "uncertain":
         raise HTTPException(
             409,
@@ -367,17 +430,7 @@ async def resolve_uncertain_plan_application(
         "previous_status": "uncertain",
     }
     if action == "confirm_launched":
-        plan_ids = list(
-            dict.fromkeys(
-                (
-                    await db.execute(
-                        select(PlanVersion.plan_id).where(
-                            PlanVersion.id.in_(receipt.plan_version_ids or [])
-                        )
-                    )
-                ).scalars()
-            )
-        )
+        plan_ids = receipt_plan_ids
         receipt.delivery_status = "launched"
         receipt.delivery_error = None
     else:
@@ -391,17 +444,7 @@ async def resolve_uncertain_plan_application(
             ),
         )
         if not plan_ids:
-            plan_ids = list(
-                dict.fromkeys(
-                    (
-                        await db.execute(
-                            select(PlanVersion.plan_id).where(
-                                PlanVersion.id.in_(receipt.plan_version_ids or [])
-                            )
-                        )
-                    ).scalars()
-                )
-            )
+            plan_ids = receipt_plan_ids
         receipt.delivery_status = "cancelled"
         receipt.delivery_error = (
             "Administrator confirmed that the ambiguous delivery did not launch"
@@ -474,8 +517,7 @@ def input_request_resource(
     )
 
 
-@_serialize_related_plan_creation
-async def create_plan_with_run(
+async def stage_plan_with_run(
     db: AsyncSession,
     *,
     title: str,
@@ -497,7 +539,17 @@ async def create_plan_with_run(
     forked_from_version_id: int | None = None,
     base_version_id: int | None = None,
     run_type: str = "initial",
+    capability_execution_id: int | None = None,
 ) -> tuple[Plan, PlanAgentRun]:
+    """Stage a new Plan and its first Run without ending the transaction.
+
+    This is the composable counterpart to :func:`create_plan_with_run`.  A
+    caller may add its own durable ownership record after this function
+    returns and commit all three records atomically.  The caller owns the
+    eventual commit or rollback; this helper only flushes so the generated
+    Plan and Run ids are available.
+    """
+
     now = datetime.utcnow()
     await _fence_target_task(
         db,
@@ -546,6 +598,7 @@ async def create_plan_with_run(
     run = PlanAgentRun(
         plan_id=plan.id,
         plan_task_id=None,
+        capability_execution_id=capability_execution_id,
         run_type=run_type,
         status="queued",
         current_stage="planner",
@@ -566,6 +619,58 @@ async def create_plan_with_run(
     db.add(run)
     await db.flush()
     plan.active_run_id = run.id
+    await db.flush()
+    return plan, run
+
+
+@_serialize_related_plan_creation
+async def create_plan_with_run(
+    db: AsyncSession,
+    *,
+    title: str,
+    initial_request: str,
+    attachments: list[dict] | None,
+    target_task_id: int | None,
+    project_id: int | None,
+    target_repo: str | None,
+    target_branch: str | None,
+    worker_id: int | None,
+    priority: int,
+    timeout_hours: float | None,
+    created_by: int | None,
+    pipeline_config: dict,
+    context_session_id: str | None,
+    context_log_id: int | None,
+    context_snapshot: str | None,
+    repo_revision: dict | None,
+    forked_from_version_id: int | None = None,
+    base_version_id: int | None = None,
+    run_type: str = "initial",
+) -> tuple[Plan, PlanAgentRun]:
+    """Create and commit a Plan/Run pair for existing API callers."""
+
+    plan, run = await stage_plan_with_run(
+        db,
+        title=title,
+        initial_request=initial_request,
+        attachments=attachments,
+        target_task_id=target_task_id,
+        project_id=project_id,
+        target_repo=target_repo,
+        target_branch=target_branch,
+        worker_id=worker_id,
+        priority=priority,
+        timeout_hours=timeout_hours,
+        created_by=created_by,
+        pipeline_config=pipeline_config,
+        context_session_id=context_session_id,
+        context_log_id=context_log_id,
+        context_snapshot=context_snapshot,
+        repo_revision=repo_revision,
+        forked_from_version_id=forked_from_version_id,
+        base_version_id=base_version_id,
+        run_type=run_type,
+    )
     await db.commit()
     await db.refresh(plan)
     await db.refresh(run)
@@ -824,6 +929,62 @@ async def answer_input_request(
         and input_request.status == "answered"
     ):
         return input_request
+
+    if run.capability_execution_id is not None:
+        # The API already holds plan_operation_lock.  Locking the Capability
+        # Invocation then its Execution here makes an input answer serialize
+        # with Capability cancellation's fence without inverting the
+        # process-local capability_task_lock -> plan_operation_lock order.
+        # A cancellation that wins first publishes ``cancelling``; an answer
+        # that wins first commits before cancellation can proceed.
+        from backend.models.capability import (
+            CapabilityExecution,
+            CapabilityInvocation,
+        )
+
+        execution_ref = await db.get(
+            CapabilityExecution,
+            run.capability_execution_id,
+            populate_existing=True,
+        )
+        if execution_ref is None:
+            raise HTTPException(
+                409,
+                "Plan Capability execution disappeared before input answer",
+            )
+        invocation = (
+            await db.execute(
+                select(CapabilityInvocation)
+                .where(CapabilityInvocation.id == execution_ref.invocation_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        execution = (
+            await db.execute(
+                select(CapabilityExecution)
+                .where(CapabilityExecution.id == run.capability_execution_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            invocation is None
+            or execution is None
+            or execution.invocation_id != invocation.id
+            or invocation.task_id != plan.target_task_id
+            or invocation.capability_key != "plan"
+            or invocation.executor_kind != "plan_agent"
+            or run.run_type != "capability"
+            or execution.handle_kind != "plan_agent_run"
+            or execution.handle_id != str(run.id)
+            or invocation.status not in {"running", "waiting_user"}
+            or execution.status not in {"running", "waiting_user"}
+        ):
+            raise HTTPException(
+                409,
+                "Plan Capability is no longer accepting input",
+            )
     if plan.active_run_id != run.id or run.status != "waiting_user":
         raise HTTPException(409, "Plan Run is no longer waiting for input")
     if run.generation != expected_generation:
@@ -958,6 +1119,10 @@ async def materialize_execution_task(
             raise HTTPException(404, "Plan not found")
         if version is None or version.plan_id != plan.id:
             raise HTTPException(404, "Plan Version not found")
+        await reject_capability_owned_plan_mutation(
+            db,
+            plan_ids=(plan.id,),
+        )
         if plan.target_task_id is not None:
             raise HTTPException(400, "Only standalone Plans create execution Tasks")
         if (
@@ -1187,6 +1352,126 @@ async def cancel_run(
     if changed.rowcount != 1 or released.rowcount != 1:
         await db.rollback()
         raise HTTPException(409, "Plan Run changed while cancelling")
+    await db.commit()
+    await db.refresh(run)
+    return run
+
+
+async def fence_capability_run_cancellation(
+    db: AsyncSession,
+    *,
+    plan: Plan,
+    run: PlanAgentRun,
+) -> PlanAgentRun:
+    """Durably stop a Capability Plan Run from accepting new work.
+
+    The intermediate ``cancelling`` state intentionally keeps both the Plan's
+    active-run slot and the last Instance id.  A failed process stop can then
+    be retried without losing ownership evidence, while the Plan dispatcher
+    no longer sees a claimable queued/running/waiting Run.
+    """
+
+    if run.status == "cancelling":
+        await db.commit()
+        await db.refresh(run)
+        return run
+    if run.status not in ACTIVE_RUN_STATUSES:
+        if run.status in TERMINAL_RUN_STATUSES:
+            await db.commit()
+            await db.refresh(run)
+            return run
+        raise HTTPException(409, "Plan Run cannot enter cancellation")
+    if plan.active_run_id != run.id:
+        raise HTTPException(409, "Plan Run is no longer active")
+    now = datetime.utcnow()
+    if run.open_input_request_id is not None:
+        await db.execute(
+            update(PlanInputRequest)
+            .where(
+                PlanInputRequest.id == run.open_input_request_id,
+                PlanInputRequest.status.in_(["prepared", "open"]),
+            )
+            .values(status="cancelled", cancelled_at=now)
+        )
+    changed = await db.execute(
+        update(PlanAgentRun)
+        .where(
+            PlanAgentRun.id == run.id,
+            PlanAgentRun.plan_id == plan.id,
+            PlanAgentRun.status.in_(ACTIVE_RUN_STATUSES),
+        )
+        .values(
+            status="cancelling",
+            open_input_request_id=None,
+            generation=PlanAgentRun.generation + 1,
+            error="Cancellation requested",
+            updated_at=now,
+        )
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(409, "Plan Run changed while fencing cancellation")
+    plan.lock_version += 1
+    plan.updated_at = now
+    await db.commit()
+    await db.refresh(run)
+    return run
+
+
+async def finalize_capability_run_cancellation(
+    db: AsyncSession,
+    *,
+    plan: Plan,
+    run: PlanAgentRun,
+) -> PlanAgentRun:
+    """Publish cancelled only after the adapter proves runtime cleanup."""
+
+    if run.status == "cancelled":
+        await db.commit()
+        await db.refresh(run)
+        return run
+    if run.status != "cancelling" or plan.active_run_id != run.id:
+        if run.status in {"completed", "failed"}:
+            await db.commit()
+            await db.refresh(run)
+            return run
+        raise HTTPException(409, "Plan Run cancellation is not pending")
+    now = datetime.utcnow()
+    execution_seconds = float(run.execution_seconds or 0)
+    if run.last_execution_started_at is not None:
+        execution_seconds += max(
+            0.0,
+            (now - run.last_execution_started_at).total_seconds(),
+        )
+    changed = await db.execute(
+        update(PlanAgentRun)
+        .where(
+            PlanAgentRun.id == run.id,
+            PlanAgentRun.plan_id == plan.id,
+            PlanAgentRun.status == "cancelling",
+        )
+        .values(
+            status="cancelled",
+            instance_id=None,
+            execution_seconds=execution_seconds,
+            last_execution_started_at=None,
+            error="Cancelled by user",
+            updated_at=now,
+            finished_at=now,
+        )
+    )
+    released = await db.execute(
+        update(Plan)
+        .where(Plan.id == plan.id, Plan.active_run_id == run.id)
+        .values(
+            active_run_id=None,
+            lock_version=Plan.lock_version + 1,
+            updated_at=now,
+        )
+    )
+    if changed.rowcount != 1 or released.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(409, "Plan Run changed while finalizing cancellation")
     await db.commit()
     await db.refresh(run)
     return run

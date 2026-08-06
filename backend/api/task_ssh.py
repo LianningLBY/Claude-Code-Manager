@@ -1,3 +1,9 @@
+import asyncio
+import errno
+import posixpath
+import socket
+import stat as stat_mod
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,12 +15,23 @@ from backend.api.deps import (
     require_task_control,
 )
 from backend.database import get_db
+from backend.models.ssh_profile import SSHProfile
 from backend.models.task import Task
 from backend.schemas.task_ssh_grant import (
     TaskSSHExecuteRequest,
     TaskSSHExecuteResponse,
+    TaskSSHDirectoryResponse,
     TaskSSHGrantReplace,
     TaskSSHGrantResponse,
+    TaskSSHPathRequest,
+    TaskSSHReadRequest,
+    TaskSSHReadResponse,
+    TaskSSHWriteRequest,
+    TaskSSHWriteResponse,
+)
+from backend.services.ssh_executor import (
+    SSHHostKeyMismatchError,
+    SSHKeyPreflightError,
 )
 from backend.services.ssh_profiles import executor_for_profile
 from backend.services.task_ssh_access import (
@@ -26,10 +43,114 @@ from backend.services.task_ssh_access import (
 
 
 router = APIRouter(prefix="/api/tasks/{task_id}", tags=["task-ssh"])
+MAX_TASK_SSH_DIRECTORY_ENTRIES = 2000
+MAX_TASK_SSH_WRITE_BYTES = 1024 * 1024
 
 
 def _access_error(exc: TaskSSHAccessError) -> HTTPException:
     return HTTPException(exc.status_code, exc.detail)
+
+
+def _operation_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, SSHHostKeyMismatchError):
+        return HTTPException(409, "SSH host key does not match the pinned identity")
+    if isinstance(exc, SSHKeyPreflightError):
+        return HTTPException(409, "SSH private key is no longer usable")
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(404, "Remote path not found")
+    if isinstance(exc, PermissionError):
+        return HTTPException(403, "Remote permission denied")
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return HTTPException(504, "SSH operation timed out")
+    if isinstance(exc, OSError) and exc.errno == errno.EEXIST:
+        return HTTPException(409, "Remote file already exists")
+    return HTTPException(400, "SSH operation failed")
+
+
+def _list_directory_sync(
+    profile: SSHProfile,
+    path: str,
+) -> tuple[list[dict], bool]:
+    client = executor_for_profile(profile).connect(timeout=10)
+    try:
+        sftp = client.open_sftp()
+        try:
+            attrs = []
+            for attr in sftp.listdir_iter(path, read_aheads=10):
+                attrs.append(attr)
+                if len(attrs) > MAX_TASK_SSH_DIRECTORY_ENTRIES:
+                    break
+            truncated = len(attrs) > MAX_TASK_SSH_DIRECTORY_ENTRIES
+            attrs = sorted(
+                attrs[:MAX_TASK_SSH_DIRECTORY_ENTRIES],
+                key=lambda item: (
+                    not stat_mod.S_ISDIR(item.st_mode or 0),
+                    (item.filename or "").lower(),
+                ),
+            )
+            entries = []
+            for attr in attrs:
+                is_dir = stat_mod.S_ISDIR(attr.st_mode or 0)
+                entries.append({
+                    "name": attr.filename,
+                    "path": posixpath.join(path, attr.filename),
+                    "is_dir": is_dir,
+                    "size": attr.st_size if not is_dir else None,
+                })
+            return entries, truncated
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+
+def _read_file_sync(
+    profile: SSHProfile,
+    path: str,
+    max_bytes: int,
+) -> tuple[str, int, bool]:
+    client = executor_for_profile(profile).connect(timeout=10)
+    try:
+        sftp = client.open_sftp()
+        try:
+            size = sftp.stat(path).st_size or 0
+            with sftp.open(path, "rb") as remote_file:
+                raw = remote_file.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes or size > max_bytes
+            return (
+                raw[:max_bytes].decode("utf-8", errors="replace"),
+                size,
+                truncated,
+            )
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+
+def _write_file_sync(
+    profile: SSHProfile,
+    path: str,
+    content: str,
+    overwrite: bool,
+) -> int:
+    payload = content.encode("utf-8")
+    if len(payload) > MAX_TASK_SSH_WRITE_BYTES:
+        raise HTTPException(413, "Remote write exceeds the 1 MB limit")
+    client = executor_for_profile(profile).connect(timeout=10)
+    try:
+        sftp = client.open_sftp()
+        try:
+            mode = "wb" if overwrite else "wx"
+            with sftp.open(path, mode) as remote_file:
+                remote_file.write(payload)
+            return len(payload)
+        finally:
+            sftp.close()
+    finally:
+        client.close()
 
 
 async def _task_or_404(db: AsyncSession, task_id: int) -> Task:
@@ -109,12 +230,10 @@ async def internal_task_ssh_execute(
         )
     except TaskSSHAccessError as exc:
         raise _access_error(exc) from exc
-    except TimeoutError as exc:
-        raise HTTPException(504, "SSH command timed out") from exc
     except Exception as exc:
         # Managed profile endpoints intentionally never reflect credential
         # paths, Paramiko messages, or command contents to Task callers.
-        raise HTTPException(400, "SSH command failed to start") from exc
+        raise _operation_error(exc) from exc
     return TaskSSHExecuteResponse(
         exit_code=result.exit_code,
         stdout=result.stdout,
@@ -122,3 +241,104 @@ async def internal_task_ssh_execute(
         truncated=result.truncated,
         duration_ms=result.duration_ms,
     )
+
+
+@router.post(
+    "/ssh-access/{profile_id}/list",
+    response_model=TaskSSHDirectoryResponse,
+)
+async def internal_task_ssh_list_directory(
+    task_id: int,
+    profile_id: int,
+    body: TaskSSHPathRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    require_internal_service(request)
+    try:
+        profile = await resolve_task_ssh_profile(
+            db,
+            task_id=task_id,
+            profile_id=profile_id,
+            required_capability="read",
+        )
+        entries, truncated = await asyncio.to_thread(
+            _list_directory_sync,
+            profile,
+            body.path,
+        )
+    except TaskSSHAccessError as exc:
+        raise _access_error(exc) from exc
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+    return {"path": body.path, "entries": entries, "truncated": truncated}
+
+
+@router.post(
+    "/ssh-access/{profile_id}/read",
+    response_model=TaskSSHReadResponse,
+)
+async def internal_task_ssh_read_file(
+    task_id: int,
+    profile_id: int,
+    body: TaskSSHReadRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    require_internal_service(request)
+    try:
+        profile = await resolve_task_ssh_profile(
+            db,
+            task_id=task_id,
+            profile_id=profile_id,
+            required_capability="read",
+        )
+        content, size, truncated = await asyncio.to_thread(
+            _read_file_sync,
+            profile,
+            body.path,
+            body.max_bytes,
+        )
+    except TaskSSHAccessError as exc:
+        raise _access_error(exc) from exc
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+    return {
+        "path": body.path,
+        "content": content,
+        "size": size,
+        "truncated": truncated,
+    }
+
+
+@router.post(
+    "/ssh-access/{profile_id}/write",
+    response_model=TaskSSHWriteResponse,
+)
+async def internal_task_ssh_write_file(
+    task_id: int,
+    profile_id: int,
+    body: TaskSSHWriteRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    require_internal_service(request)
+    try:
+        profile = await resolve_task_ssh_profile(
+            db,
+            task_id=task_id,
+            profile_id=profile_id,
+            required_capability="write",
+        )
+        bytes_written = await asyncio.to_thread(
+            _write_file_sync,
+            profile,
+            body.path,
+            body.content,
+            body.overwrite,
+        )
+    except TaskSSHAccessError as exc:
+        raise _access_error(exc) from exc
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+    return {"path": body.path, "bytes_written": bytes_written}

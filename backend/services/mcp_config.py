@@ -60,6 +60,18 @@ CCM_SUB_AGENT_CONTROLLER_TOOLS = (
     "check_sub_agents",
     "stop_sub_agent",
 )
+CCM_SSH_TOOLS = (
+    "list_connections",
+    "run_command",
+    "list_directory",
+    "read_file",
+    "write_file",
+)
+CCM_SSH_CAPABILITY_TOOLS = {
+    "exec": ("run_command",),
+    "read": ("list_directory", "read_file"),
+    "write": ("write_file",),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +175,30 @@ def build_mcp_server_specs(
             module="backend.mcp.ccm_skills_server",
             context_args=("--task-id", str(task_id)),
             enabled_tools=enabled_tools,
+            api_base=api_base,
+        ),
+    )
+
+
+def build_task_ssh_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+    *,
+    capabilities: Sequence[str] = ("exec", "read", "write"),
+) -> tuple[McpServerSpec, ...]:
+    """Build the required, Task-scoped SSH capability server."""
+
+    enabled_tools = ["list_connections"]
+    selected = set(capabilities)
+    for capability in ("exec", "read", "write"):
+        if capability in selected:
+            enabled_tools.extend(CCM_SSH_CAPABILITY_TOOLS[capability])
+    return (
+        _ccm_server_spec(
+            name="ccm_ssh",
+            module="backend.mcp.ccm_ssh_server",
+            context_args=("--task-id", str(task_id)),
+            enabled_tools=tuple(enabled_tools),
             api_base=api_base,
         ),
     )
@@ -395,6 +431,8 @@ def generate_mcp_config(
     task_id: int,
     enabled_skills: dict | None = None,
     api_base: str | None = None,
+    *,
+    task_ssh_capabilities: Sequence[str] = (),
 ) -> Path:
     """为指定 task 生成 MCP config JSON 文件。
 
@@ -403,6 +441,12 @@ def generate_mcp_config(
     """
     config_path = Path(tempfile.gettempdir()) / f"ccm_mcp_{task_id}.json"
     specs = build_mcp_server_specs(task_id, enabled_skills, api_base)
+    if task_ssh_capabilities:
+        specs += build_task_ssh_mcp_server_specs(
+            task_id,
+            api_base,
+            capabilities=task_ssh_capabilities,
+        )
     return _write_claude_mcp_config(specs, config_path)
 
 

@@ -11,6 +11,7 @@ from backend.mcp import (
     ccm_monitor_agent_server,
     ccm_skills_server,
     ccm_sub_agent_server,
+    ccm_ssh_server,
 )
 from backend.services import mcp_config
 from backend.services.mcp_config import (
@@ -23,6 +24,7 @@ from backend.services.mcp_config import (
     build_monitor_agent_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
     build_sub_agent_mcp_server_specs,
+    build_task_ssh_mcp_server_specs,
     cleanup_mcp_config,
     cleanup_monitor_agent_mcp_config,
     cleanup_sub_agent_mcp_config,
@@ -378,6 +380,51 @@ def test_default_api_base_and_empty_auth_token(monkeypatch):
 
     assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8321")
     assert "--auth-token" not in spec.args
+
+
+def test_task_ssh_spec_exposes_only_tools_for_granted_capabilities():
+    (spec,) = build_task_ssh_mcp_server_specs(
+        42,
+        capabilities=("read",),
+    )
+
+    assert spec.name == "ccm_ssh"
+    assert spec.required is True
+    assert spec.enabled_tools == (
+        "list_connections",
+        "list_directory",
+        "read_file",
+    )
+    assert spec.args[spec.args.index("--task-id") + 1] == "42"
+    assert spec.args[spec.args.index("-m") + 1] == (
+        "backend.mcp.ccm_ssh_server"
+    )
+
+
+def test_claude_task_ssh_config_is_added_without_replacing_skills_server():
+    path = generate_mcp_config(
+        42,
+        {},
+        api_base="http://localhost:8000",
+        task_ssh_capabilities=("exec", "write"),
+    )
+    try:
+        config = json.loads(path.read_text())
+        assert set(config["mcpServers"]) == {"ccm_skills", "ccm_ssh"}
+        assert "backend.mcp.ccm_ssh_server" in config["mcpServers"]["ccm_ssh"]["args"]
+    finally:
+        cleanup_mcp_config(42)
+
+
+def test_ccm_ssh_module_registers_expected_tools():
+    registered = set(ccm_ssh_server.mcp._tool_manager._tools)
+    assert {
+        "list_connections",
+        "run_command",
+        "list_directory",
+        "read_file",
+        "write_file",
+    } <= registered
 
 
 def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():

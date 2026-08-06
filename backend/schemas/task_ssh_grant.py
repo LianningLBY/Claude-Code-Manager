@@ -66,3 +66,41 @@ class TaskSSHExecuteResponse(BaseModel):
     stderr: str
     truncated: bool
     duration_ms: int
+
+
+class TaskSSHPathRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("path")
+    @classmethod
+    def absolute_posix_path(cls, value: str) -> str:
+        if not value.startswith("/") or "\x00" in value:
+            raise ValueError("path must be an absolute POSIX path")
+        return value
+
+
+class TaskSSHReadRequest(TaskSSHPathRequest):
+    max_bytes: int = Field(default=256 * 1024, ge=1024, le=1024 * 1024)
+
+
+class TaskSSHWriteRequest(TaskSSHPathRequest):
+    content: str = Field(max_length=1024 * 1024)
+    overwrite: bool = False
+
+
+class TaskSSHDirectoryResponse(BaseModel):
+    path: str
+    entries: list[dict]
+    truncated: bool
+
+
+class TaskSSHReadResponse(BaseModel):
+    path: str
+    content: str
+    size: int
+    truncated: bool
+
+
+class TaskSSHWriteResponse(BaseModel):
+    path: str
+    bytes_written: int

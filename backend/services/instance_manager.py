@@ -891,6 +891,7 @@ class InstanceManager:
         task_skill_context = ""
         codex_monitor_enabled = False
         pr_review_task = False
+        task_ssh_capabilities: set[str] = set()
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -921,6 +922,15 @@ class InstanceManager:
                 )
 
                 pr_review_task = is_pr_sandbox_task(task)
+                if not pr_review_task:
+                    from backend.services.task_ssh_access import (
+                        valid_task_ssh_capabilities,
+                    )
+
+                    task_ssh_capabilities = await valid_task_ssh_capabilities(
+                        db,
+                        task,
+                    )
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -1004,7 +1014,11 @@ class InstanceManager:
         mcp_config_path = None
         if provider == "claude" and task_id and not pr_review_task:
             from backend.services.mcp_config import generate_mcp_config
-            mcp_config_path = generate_mcp_config(task_id, enabled_skills or {})
+            mcp_config_path = generate_mcp_config(
+                task_id,
+                enabled_skills or {},
+                task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
+            )
 
         # ask_user：把 AskUserQuestion 拦截 hook 注入本次使用的 config_dir（-p 与 PTY 统一）。
         # config_dir 为空时落到默认 ~/.claude。失败不阻断 launch。
@@ -1077,8 +1091,16 @@ class InstanceManager:
             and enabled_skills.get("sub-agent")
             and not pr_review_task
         )
+        codex_ssh_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and bool(task_ssh_capabilities)
+            and not pr_review_task
+        )
         codex_mcp_required = (
-            codex_main_mcp_required or codex_sub_agent_mcp_required
+            codex_main_mcp_required
+            or codex_sub_agent_mcp_required
+            or codex_ssh_mcp_required
         )
         codex_mcp_specs: tuple["McpServerSpec", ...] = ()
         codex_exec_route = "direct-exec"
@@ -1097,6 +1119,15 @@ class InstanceManager:
             )
 
             codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
+        if codex_ssh_mcp_required:
+            from backend.services.mcp_config import (
+                build_task_ssh_mcp_server_specs,
+            )
+
+            codex_mcp_specs += build_task_ssh_mcp_server_specs(
+                task_id,
+                capabilities=tuple(sorted(task_ssh_capabilities)),
+            )
 
         if (
             provider == "codex"
@@ -1193,7 +1224,10 @@ class InstanceManager:
                             "turn/start; exec fallback is disabled for Fast"
                         ) from exc
                     if (
-                        codex_main_mcp_required
+                        (
+                            codex_main_mcp_required
+                            or codex_ssh_mcp_required
+                        )
                         and not codex_sub_agent_mcp_required
                     ):
                         codex_exec_route = "safe-fallback"
@@ -1271,9 +1305,17 @@ class InstanceManager:
                             instance_id,
                             config_dir,
                         )
+                        required_server = (
+                            "ccm_skills"
+                            if (
+                                codex_main_mcp_required
+                                or codex_sub_agent_mcp_required
+                            )
+                            else "ccm_ssh"
+                        )
                         raise CodexRequiredMcpError(
                             "Codex app-server failed before required "
-                            "ccm_skills could be guaranteed"
+                            f"{required_server} could be guaranteed"
                         ) from exc
                     # App-server is an experimental Codex surface.  A CLI upgrade
                     # must not take all Codex tasks down; retain the proven exec
@@ -1337,9 +1379,7 @@ class InstanceManager:
             cwd=cwd,
             task_id=task_id,
             skill_context=task_skill_context,
-            codex_mcp_specs=(
-                codex_mcp_specs if codex_main_mcp_required else ()
-            ),
+            codex_mcp_specs=(codex_mcp_specs if codex_mcp_required else ()),
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
             tools_disabled=pr_review_task,

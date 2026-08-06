@@ -297,3 +297,114 @@ async def test_task_ssh_fails_closed_when_profile_key_file_is_replaced(
     assert "private key is no longer usable" in executed.text
     assert str(key_path) not in executed.text
 
+@pytest.mark.asyncio
+async def test_task_ssh_read_and_write_operations_enforce_capabilities(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Update a remote configuration file",
+        "ssh_grants": [{
+            "profile_id": profile_id,
+            "capabilities": ["read", "write"],
+        }],
+    })
+    task_id = created.json()["id"]
+    monkeypatch.setattr(
+        "backend.api.task_ssh._list_directory_sync",
+        lambda _profile, path: ([{
+            "name": "app.conf",
+            "path": f"{path}/app.conf",
+            "is_dir": False,
+            "size": 18,
+        }], False),
+    )
+    monkeypatch.setattr(
+        "backend.api.task_ssh._read_file_sync",
+        lambda _profile, _path, max_bytes: ("PORT=8000\n", 10, max_bytes < 10),
+    )
+    observed_write = []
+    monkeypatch.setattr(
+        "backend.api.task_ssh._write_file_sync",
+        lambda _profile, path, content, overwrite: observed_write.append(
+            (path, content, overwrite)
+        ) or len(content.encode()),
+    )
+
+    listed = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/list",
+        json={"path": "/etc/app"},
+    )
+    read = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/read",
+        json={"path": "/etc/app/app.conf", "max_bytes": 1024},
+    )
+    written = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/write",
+        json={
+            "path": "/etc/app/app.conf",
+            "content": "PORT=9000\n",
+            "overwrite": True,
+        },
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()["entries"][0]["name"] == "app.conf"
+    assert read.status_code == 200
+    assert read.json()["content"] == "PORT=8000\n"
+    assert written.status_code == 200
+    assert written.json()["bytes_written"] == 10
+    assert observed_write == [("/etc/app/app.conf", "PORT=9000\n", True)]
+
+    exec_denied = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+        json={"command": "hostname"},
+    )
+    assert exec_denied.status_code == 403
+
+
+def test_task_ssh_non_overwrite_write_uses_remote_exclusive_create(monkeypatch):
+    observed = {}
+
+    class RemoteFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def write(self, payload):
+            observed["payload"] = payload
+
+    class SFTP:
+        def open(self, path, mode):
+            observed["open"] = (path, mode)
+            return RemoteFile()
+
+        def close(self):
+            return None
+
+    class Client:
+        def open_sftp(self):
+            return SFTP()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "backend.api.task_ssh.executor_for_profile",
+        lambda _profile: type("Executor", (), {
+            "connect": lambda self, timeout: Client(),
+        })(),
+    )
+    from backend.api.task_ssh import _write_file_sync
+
+    count = _write_file_sync(object(), "/tmp/new.txt", "hello", False)
+
+    assert count == 5
+    assert observed == {
+        "open": ("/tmp/new.txt", "wx"),
+        "payload": b"hello",
+    }

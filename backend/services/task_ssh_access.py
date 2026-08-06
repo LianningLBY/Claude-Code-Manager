@@ -230,3 +230,38 @@ async def resolve_task_ssh_profile(
             f"Task SSH grant is no longer valid: {invalid_reason}",
         )
     return profile
+
+
+async def valid_task_ssh_capabilities(
+    db: AsyncSession,
+    task: Task,
+) -> set[str]:
+    if task_ssh_scope_invalid_reason(
+        worker_id=task.worker_id,
+        shared_from_id=task.shared_from_id,
+        metadata=task.metadata_,
+    ) is not None:
+        return set()
+    rows = (await db.execute(
+        select(TaskSSHGrant.capabilities)
+        .join(SSHProfile, SSHProfile.id == TaskSSHGrant.ssh_profile_id)
+        .where(
+            TaskSSHGrant.task_id == task.id,
+            TaskSSHGrant.profile_revision == SSHProfile.revision,
+            SSHProfile.enabled.is_(True),
+            SSHProfile.deleted_at.is_(None),
+        )
+    )).scalars().all()
+    return {
+        capability
+        for capabilities in rows
+        for capability in (capabilities or [])
+        if capability in {"exec", "read", "write"}
+    }
+
+
+async def task_has_valid_ssh_grants(
+    db: AsyncSession,
+    task: Task,
+) -> bool:
+    return bool(await valid_task_ssh_capabilities(db, task))

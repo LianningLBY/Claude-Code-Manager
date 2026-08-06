@@ -99,6 +99,13 @@ function App() {
   }, []);
 
   const handleNavigate = (p: string) => {
+    const nextHash = `#/${p}`;
+    if (window.location.hash !== nextHash) {
+      // Page navigation must create a history entry so the browser Back button
+      // returns to the exact page URL that preceded it. The state-sync effect
+      // continues to use replaceState for modal/chat URL updates.
+      window.history.pushState(null, '', nextHash);
+    }
     setPage(p);
     if (p !== 'tasks') setChatTaskId(null);
     if (p !== 'plans') setPlanId(null);

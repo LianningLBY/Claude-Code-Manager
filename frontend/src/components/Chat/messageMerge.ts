@@ -41,6 +41,8 @@ function messageFingerprint(message: ChatMessage): string {
   const nativeId = message.item_id || message.stream_item_id || null;
   return JSON.stringify([
     nativeId,
+    message.task_retry_count ?? null,
+    message.task_turn_generation ?? null,
     message.request_id || null,
     message.event_type,
     message.role,
@@ -56,7 +58,14 @@ function messageFingerprint(message: ChatMessage): string {
 
 function stableLiveKey(message: ChatMessage): string | null {
   const nativeId = message.item_id || message.stream_item_id;
-  if (nativeId) return `item:${nativeId}`;
+  if (nativeId) {
+    return JSON.stringify([
+      'item',
+      message.task_retry_count ?? null,
+      message.task_turn_generation ?? null,
+      nativeId,
+    ]);
+  }
   if (message.request_id) return `request:${message.request_id}`;
   return null;
 }

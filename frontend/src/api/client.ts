@@ -271,6 +271,7 @@ export interface Task {
   merge_status: string;
   instance_id: number | null;
   retry_count: number;
+  turn_generation: number;
   max_retries: number;
   mode: string;
   delivery_run_id?: number | null;
@@ -367,6 +368,8 @@ export interface Instance {
   pid: number | null;
   status: string;
   current_task_id: number | null;
+  current_task_retry_count: number | null;
+  current_task_turn_generation: number | null;
   current_plan_run_id: number | null;
   worktree_path: string | null;
   provider: string;
@@ -408,6 +411,10 @@ export interface ChatMessage {
   loop_iteration: number | null;
   /** Exact Task retry generation that persisted this history row. */
   task_retry_count?: number | null;
+  /** Exact logical Task turn that produced this row/live stream item. */
+  task_turn_generation?: number | null;
+  /** Provider-native turn id, when the transport exposes one. */
+  native_turn_id?: string | null;
   timestamp: string | null;
   image_urls: string[] | null;
   attachments: FileAttachment[] | null;
@@ -683,6 +690,9 @@ export interface LogEntry {
   id: number;
   instance_id: number;
   task_id: number | null;
+  task_retry_count: number | null;
+  task_turn_generation: number | null;
+  native_turn_id: string | null;
   event_type: string;
   role: string | null;
   content: string | null;
@@ -1930,6 +1940,7 @@ export const api = {
   stopInstance: (
     id: number,
     expectedTaskId: number,
+    expectedTaskTurnGeneration: number,
     expectedPid: number | null,
     expectedStartedAt: string | null,
   ) =>
@@ -1937,6 +1948,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({
         expected_task_id: expectedTaskId,
+        expected_task_turn_generation: expectedTaskTurnGeneration,
         expected_pid: expectedPid,
         expected_started_at: expectedStartedAt,
       }),

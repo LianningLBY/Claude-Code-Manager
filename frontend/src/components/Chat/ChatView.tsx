@@ -64,7 +64,13 @@ interface QueuedMessage {
   planVersionIds?: number[];
 }
 
-interface LiveStreamCacheEntry {
+interface TaskTurnIdentity {
+  taskId: number;
+  retryCount: number;
+  turnGeneration: number;
+}
+
+interface LiveStreamCacheEntry extends TaskTurnIdentity {
   messages: ChatMessage[];
   updatedAt: number;
 }
@@ -75,6 +81,96 @@ const LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM = 200_000;
 const LIVE_STREAM_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const liveStreamCache = new Map<number, LiveStreamCacheEntry>();
 
+function taskTurnIdentity(task: Pick<Task, 'id' | 'retry_count' | 'turn_generation'>): TaskTurnIdentity {
+  return {
+    taskId: task.id,
+    retryCount: task.retry_count,
+    turnGeneration: task.turn_generation,
+  };
+}
+
+function eventTaskTurnIdentity(
+  data: Record<string, unknown>,
+  taskId: number,
+): TaskTurnIdentity | null {
+  const retryCount = data.task_retry_count;
+  const turnGeneration = data.task_turn_generation;
+  const payloadTaskId = data.task_id;
+  if (
+    !Number.isInteger(retryCount)
+    || (retryCount as number) < 0
+    || !Number.isInteger(turnGeneration)
+    || (turnGeneration as number) < 0
+    || (
+      payloadTaskId !== undefined
+      && payloadTaskId !== null
+      && payloadTaskId !== taskId
+    )
+  ) {
+    return null;
+  }
+  return {
+    taskId,
+    retryCount: retryCount as number,
+    turnGeneration: turnGeneration as number,
+  };
+}
+
+function eventDeclaresTaskTurn(data: Record<string, unknown>): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(data, 'task_retry_count')
+    || Object.prototype.hasOwnProperty.call(data, 'task_turn_generation')
+  );
+}
+
+function sameTaskTurn(left: TaskTurnIdentity, right: TaskTurnIdentity): boolean {
+  return (
+    left.taskId === right.taskId
+    && left.retryCount === right.retryCount
+    && left.turnGeneration === right.turnGeneration
+  );
+}
+
+function compareTaskTurn(left: TaskTurnIdentity, right: TaskTurnIdentity): number {
+  if (left.taskId !== right.taskId) return 0;
+  if (left.turnGeneration !== right.turnGeneration) {
+    return left.turnGeneration - right.turnGeneration;
+  }
+  return left.retryCount - right.retryCount;
+}
+
+function messageMatchesTaskTurn(
+  message: ChatMessage,
+  identity: TaskTurnIdentity,
+): boolean {
+  return (
+    message.task_retry_count === identity.retryCount
+    && message.task_turn_generation === identity.turnGeneration
+  );
+}
+
+function messageMatchesStreamItem(
+  message: ChatMessage,
+  identity: TaskTurnIdentity,
+  itemId: string,
+): boolean {
+  return (
+    message.stream_item_id === itemId
+    && messageMatchesTaskTurn(message, identity)
+  );
+}
+
+function removeOtherTurnProvisionals(
+  messages: ChatMessage[],
+  identity: TaskTurnIdentity,
+): ChatMessage[] {
+  return messages.filter((message) => (
+    message.persisted
+    || !message.stream_item_id
+    || messageMatchesTaskTurn(message, identity)
+  ));
+}
+
 function taskHasActiveStream(task: Task): boolean {
   return (
     task.background_active === true
@@ -83,8 +179,11 @@ function taskHasActiveStream(task: Task): boolean {
   );
 }
 
-function clearLiveStreamCache(taskId: number): void {
-  liveStreamCache.delete(taskId);
+function clearLiveStreamCache(taskId: number, identity?: TaskTurnIdentity): void {
+  const cached = liveStreamCache.get(taskId);
+  if (!identity || (cached && sameTaskTurn(cached, identity))) {
+    liveStreamCache.delete(taskId);
+  }
 }
 
 function pruneLiveStreamCache(now: number): void {
@@ -100,12 +199,13 @@ function pruneLiveStreamCache(now: number): void {
   }
 }
 
-function syncLiveStreamCache(taskId: number, messages: ChatMessage[]): void {
+function syncLiveStreamCache(identity: TaskTurnIdentity, messages: ChatMessage[]): void {
   const liveMessages = messages
     .filter((message) => (
       !message.persisted
       && Boolean(message.stream_item_id)
       && (message.event_type === 'message' || message.event_type === 'thinking')
+      && messageMatchesTaskTurn(message, identity)
     ))
     .slice(-LIVE_STREAM_CACHE_MAX_ITEMS)
     .map((message) => ({
@@ -113,13 +213,19 @@ function syncLiveStreamCache(taskId: number, messages: ChatMessage[]): void {
       content: message.content?.slice(-LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM) ?? null,
     }));
   if (liveMessages.length === 0) {
-    clearLiveStreamCache(taskId);
+    clearLiveStreamCache(identity.taskId, identity);
     return;
   }
 
   const now = Date.now();
-  liveStreamCache.delete(taskId);
-  liveStreamCache.set(taskId, { messages: liveMessages, updatedAt: now });
+  const cached = liveStreamCache.get(identity.taskId);
+  if (cached && compareTaskTurn(identity, cached) < 0) return;
+  liveStreamCache.delete(identity.taskId);
+  liveStreamCache.set(identity.taskId, {
+    ...identity,
+    messages: liveMessages,
+    updatedAt: now,
+  });
   pruneLiveStreamCache(now);
 }
 
@@ -129,7 +235,13 @@ function restoreLiveStreamCache(task: Task): ChatMessage[] {
     return [];
   }
   pruneLiveStreamCache(Date.now());
-  return (liveStreamCache.get(task.id)?.messages || []).map((message) => ({ ...message }));
+  const cached = liveStreamCache.get(task.id);
+  const identity = taskTurnIdentity(task);
+  if (!cached || !sameTaskTurn(cached, identity)) {
+    clearLiveStreamCache(task.id);
+    return [];
+  }
+  return cached.messages.map((message) => ({ ...message }));
 }
 
 function loadStoredUploadResults(key: string): UploadResult[] {
@@ -265,6 +377,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
   const deliveryReadOnly = task.mode === 'delivery_loop' || task.delivery_run_id != null;
   const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
+  const activeTaskTurnRef = useRef<TaskTurnIdentity>(taskTurnIdentity(task));
   const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
   const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
   const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
@@ -363,6 +476,28 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [starred, setStarred] = useState(task.starred);
+
+  useEffect(() => {
+    const incoming = taskTurnIdentity(task);
+    const current = activeTaskTurnRef.current;
+    if (incoming.taskId !== current.taskId) {
+      clearLiveStreamCache(current.taskId, current);
+      activeTaskTurnRef.current = incoming;
+      setMessages(restoreLiveStreamCache(task));
+      return;
+    }
+    if (sameTaskTurn(incoming, current) || compareTaskTurn(incoming, current) < 0) {
+      return;
+    }
+
+    clearLiveStreamCache(task.id, current);
+    activeTaskTurnRef.current = incoming;
+    setMessages((previous) => {
+      const next = removeOtherTurnProvisionals(previous, incoming);
+      syncLiveStreamCache(incoming, next);
+      return next;
+    });
+  }, [task.id, task.retry_count, task.turn_generation]);
 
   useVisualViewportBounds(chatRootRef, !inline);
 
@@ -887,6 +1022,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   // Handle real-time WebSocket messages via callback (not state) to avoid
   // losing messages when React batches rapid state updates.
+  const observeTaskTurn = useCallback((incoming: TaskTurnIdentity): number => {
+    const current = activeTaskTurnRef.current;
+    if (incoming.taskId !== current.taskId) return -1;
+    const comparison = compareTaskTurn(incoming, current);
+    if (comparison > 0) {
+      clearLiveStreamCache(current.taskId, current);
+      activeTaskTurnRef.current = incoming;
+    }
+    return comparison;
+  }, []);
+
   const handleWsMessage = useCallback((raw: Record<string, unknown>) => {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
     if (
@@ -924,6 +1070,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       (msg.channel === `task:${task.id}` && (msg.data?.event === 'status_change' || msg.data?.event_type === 'status_change'))
     );
     if (isStatusChange) {
+      const statusIdentity = eventTaskTurnIdentity(msg.data!, task.id);
+      if (
+        (statusIdentity && observeTaskTurn(statusIdentity) < 0)
+        || (!statusIdentity && eventDeclaresTaskTurn(msg.data!))
+      ) {
+        return;
+      }
       const newStatus = (msg.data!.new_status as string) || '';
       const nextBackground = msg.data!.background_active;
       if (typeof msg.data!.background_active === 'boolean') {
@@ -961,6 +1114,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )
     );
     if (isBackgroundActivity) {
+      const backgroundIdentity = eventTaskTurnIdentity(msg.data!, task.id);
+      if (
+        (backgroundIdentity && observeTaskTurn(backgroundIdentity) < 0)
+        || (!backgroundIdentity && eventDeclaresTaskTurn(msg.data!))
+      ) {
+        return;
+      }
       if (typeof msg.data!.background_active === 'boolean') {
         lastWsBackgroundAt.current = Date.now();
         setLocalBackgroundActive(msg.data!.background_active);
@@ -1149,10 +1309,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
 
     if (eventType === 'process_exit') {
-      clearLiveStreamCache(task.id);
+      const exitIdentity = eventTaskTurnIdentity(msg.data, task.id);
+      if (!exitIdentity || observeTaskTurn(exitIdentity) < 0) return;
+      clearLiveStreamCache(task.id, exitIdentity);
       // Small delay so any final output messages queued just before
       // process_exit are rendered before the "thinking" indicator hides.
       setTimeout(() => {
+        // A newer logical turn may start during this deliberate delay. The
+        // old exit may refresh history, but it must not stop the new spinner
+        // or dequeue another prompt into that active native session.
+        if (!sameTaskTurn(exitIdentity, activeTaskTurnRef.current)) return;
         // A foreground process_exit is not terminal while an exact native
         // background epoch is still active. Its false marker will drive the
         // normal terminal effect after the final autonomous output arrives.
@@ -1173,6 +1339,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     // Track context window usage
     if (eventType === 'context_usage' && msg.data) {
+      const usageIdentity = eventTaskTurnIdentity(msg.data, task.id);
+      if (
+        (usageIdentity && observeTaskTurn(usageIdentity) < 0)
+        || (!usageIdentity && eventDeclaresTaskTurn(msg.data))
+      ) {
+        return;
+      }
       setContextUsage((prev) => ({
         input_tokens: (msg.data!.input_tokens as number) || 0,
         cache_read_input_tokens: (msg.data!.cache_read_input_tokens as number) || 0,
@@ -1270,23 +1443,38 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (eventType === 'message_delta' || eventType === 'thinking_delta') {
       const delta = (msg.data.content as string) || '';
       const itemId = (msg.data.item_id as string) || null;
-      if (!delta || !itemId) return;
+      const identity = eventTaskTurnIdentity(msg.data, task.id);
+      if (!delta || !itemId || !identity) return;
+      const turnComparison = observeTaskTurn(identity);
+      if (turnComparison < 0) return;
       const renderedType = eventType === 'message_delta' ? 'message' : 'thinking';
+      const nativeTurnId = typeof msg.data.native_turn_id === 'string'
+        ? msg.data.native_turn_id
+        : null;
       setMessages((prev) => {
-        const index = prev.findIndex((entry) => entry.stream_item_id === itemId);
+        const current = turnComparison > 0
+          ? removeOtherTurnProvisionals(prev, identity)
+          : prev;
+        const index = current.findIndex((entry) => (
+          messageMatchesStreamItem(entry, identity, itemId)
+        ));
         if (index >= 0) {
-          const next = [...prev];
+          const next = [...current];
           next[index] = { ...next[index], content: `${next[index].content || ''}${delta}` };
-          syncLiveStreamCache(task.id, next);
+          syncLiveStreamCache(identity, next);
           return next;
         }
-        const next = [...prev, {
+        const next = [...current, {
           id: Date.now() + Math.random(), role: 'assistant', event_type: renderedType,
           content: delta, tool_name: null, tool_input: null, tool_output: null,
           is_error: false, loop_iteration: null, timestamp: new Date().toISOString(),
           image_urls: null, attachments: null, stream_item_id: itemId,
+          task_retry_count: identity.retryCount,
+          task_turn_generation: identity.turnGeneration,
+          native_turn_id: nativeTurnId,
+          turn_id: nativeTurnId,
         }];
-        syncLiveStreamCache(task.id, next);
+        syncLiveStreamCache(identity, next);
         return next;
       });
       return;
@@ -1314,6 +1502,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const persistedId = Number(msg.data.id);
     const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
     const itemId = (msg.data.item_id as string) || null;
+    const identity = eventTaskTurnIdentity(msg.data, task.id);
+    let turnComparison = 0;
+    if (itemId) {
+      if (!identity && !isPersisted) return;
+      if (identity) {
+        turnComparison = observeTaskTurn(identity);
+        if (turnComparison < 0 && !isPersisted) return;
+      }
+    }
+    const nativeTurnId = typeof msg.data.native_turn_id === 'string'
+      ? msg.data.native_turn_id
+      : typeof msg.data.turn_id === 'string'
+        ? msg.data.turn_id
+        : null;
     const entry: ChatMessage = {
       id: isPersisted ? persistedId : Date.now() + Math.random(),
       role: (msg.data.role as string) || 'assistant',
@@ -1328,36 +1530,45 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       image_urls: (msg.data.image_urls as string[]) || null,
       attachments: (msg.data.attachments as FileAttachment[]) || null,
       source: (msg.data.source as string) || null,
+      task_retry_count: identity?.retryCount ?? null,
+      task_turn_generation: identity?.turnGeneration ?? null,
+      native_turn_id: nativeTurnId,
       item_id: itemId,
       stream_item_id: itemId,
+      turn_id: nativeTurnId,
       native_item_type: (msg.data.native_item_type as string) || null,
       native_item_status: (msg.data.native_item_status as string) || null,
       pty_cold_start: Boolean(msg.data.pty_cold_start),
       persisted: isPersisted,
     };
     setMessages((prev) => {
-      const current = isPersisted
-        ? prev.filter((candidate) => !candidate.pty_cold_start)
+      const generationCurrent = turnComparison > 0 && identity
+        ? removeOtherTurnProvisionals(prev, identity)
         : prev;
+      const current = isPersisted
+        ? generationCurrent.filter((candidate) => !candidate.pty_cold_start)
+        : generationCurrent;
       if (isPersisted) {
         const next = mergeChatHistory([entry], current);
-        syncLiveStreamCache(task.id, next);
+        syncLiveStreamCache(activeTaskTurnRef.current, next);
         return next;
       }
-      if (itemId) {
-        const index = current.findIndex((candidate) => candidate.stream_item_id === itemId);
+      if (itemId && identity) {
+        const index = current.findIndex((candidate) => (
+          messageMatchesStreamItem(candidate, identity, itemId)
+        ));
         if (index >= 0) {
           const next = [...current];
           next[index] = entry;
-          syncLiveStreamCache(task.id, next);
+          syncLiveStreamCache(identity, next);
           return next;
         }
       }
       const next = [...current, entry];
-      syncLiveStreamCache(task.id, next);
+      syncLiveStreamCache(activeTaskTurnRef.current, next);
       return next;
     });
-  }, [markAskUserResolved, refreshVersionedPlans, task.id, task.worker_id]);
+  }, [markAskUserResolved, observeTaskTurn, refreshVersionedPlans, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -1416,7 +1627,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const snapshot = cards.length ? [...filtered, ...cards] : filtered;
       setMessages((current) => {
         const next = mergeChatHistory(snapshot, current);
-        syncLiveStreamCache(task.id, next);
+        syncLiveStreamCache(activeTaskTurnRef.current, next);
         return next;
       });
     }).catch(() => {}).finally(() => setHistoryLoading(false));

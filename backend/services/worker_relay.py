@@ -16,6 +16,7 @@ worker 的 MonitorSession.id 与本地自增会碰撞（用 remote_id 列翻译�
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from collections import Counter
@@ -30,8 +31,11 @@ from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.pr_review_runtime import (
+    PR_REVIEW_TERMINAL_CHAT_HEADER,
+    PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
     is_pr_review_fix_task,
     is_pr_review_task,
 )
@@ -58,6 +62,31 @@ _WORKER_BACKGROUND_MIRROR_SENTINEL = "worker-relay:background-active:v1"
 _FP_PREFIX = 1000  # chars; compare only a prefix so the chat/history endpoint's
                    # 20k truncation of tool_input/tool_output can't cause a false
                    # "missing" (which would re-insert an already-present entry).
+WORKER_HANDOFF_RECOVERY_BASE_DELAY = 1.0
+WORKER_HANDOFF_RECOVERY_MAX_DELAY = 60.0
+
+# Worker receipt states are deliberately split by replay safety, not merely by
+# whether G+1 has been assigned.  ``claimed`` still precedes every provider
+# side effect and may replay the exact G+1 envelope.  ``launching`` is written
+# immediately before the first possible provider side effect, so it is exact
+# generation evidence but must never be replayed automatically.
+_WORKER_HANDOFF_REPLAYABLE_STATUSES = frozenset({"accepted", "claimed"})
+_WORKER_HANDOFF_POST_BOUNDARY_STATUSES = frozenset({"launching", "launched"})
+_WORKER_HANDOFF_BOUND_GENERATION_STATUSES = frozenset(
+    {"claimed", "launching", "launched"}
+)
+
+
+def _handoff_payload_digest(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -73,10 +102,17 @@ class WorkerTaskGeneration:
     worker_id: int
     status: str
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
     pty_background_generation: str | None
+    worker_turn_handoff_id: str | None
+    worker_turn_handoff_worker_id: int | None
+    worker_turn_handoff_retry_count: int | None
+    worker_turn_handoff_from_generation: int | None
+    worker_turn_handoff_source_log_id: int | None
+    worker_turn_handoff_acknowledged: bool | None
 
 
 def worker_task_generation(
@@ -99,10 +135,23 @@ def worker_task_generation(
         worker_id=worker_id,
         status=task.status,
         retry_count=task.retry_count,
+        turn_generation=task.turn_generation,
         instance_id=task.instance_id,
         started_at=task.started_at,
         completed_at=task.completed_at,
         pty_background_generation=task.pty_background_generation,
+        worker_turn_handoff_id=task.worker_turn_handoff_id,
+        worker_turn_handoff_worker_id=task.worker_turn_handoff_worker_id,
+        worker_turn_handoff_retry_count=task.worker_turn_handoff_retry_count,
+        worker_turn_handoff_from_generation=(
+            task.worker_turn_handoff_from_generation
+        ),
+        worker_turn_handoff_source_log_id=(
+            task.worker_turn_handoff_source_log_id
+        ),
+        worker_turn_handoff_acknowledged=(
+            task.worker_turn_handoff_acknowledged
+        ),
     )
 
 
@@ -119,12 +168,37 @@ def worker_task_generation_predicates(
         Task.shared_from_id.is_(None),
         Task.status == generation.status,
         Task.retry_count == generation.retry_count,
+        Task.turn_generation == generation.turn_generation,
         _nullable_eq(Task.instance_id, generation.instance_id),
         _nullable_eq(Task.started_at, generation.started_at),
         _nullable_eq(Task.completed_at, generation.completed_at),
         _nullable_eq(
             Task.pty_background_generation,
             generation.pty_background_generation,
+        ),
+        _nullable_eq(
+            Task.worker_turn_handoff_id,
+            generation.worker_turn_handoff_id,
+        ),
+        _nullable_eq(
+            Task.worker_turn_handoff_worker_id,
+            generation.worker_turn_handoff_worker_id,
+        ),
+        _nullable_eq(
+            Task.worker_turn_handoff_retry_count,
+            generation.worker_turn_handoff_retry_count,
+        ),
+        _nullable_eq(
+            Task.worker_turn_handoff_from_generation,
+            generation.worker_turn_handoff_from_generation,
+        ),
+        _nullable_eq(
+            Task.worker_turn_handoff_source_log_id,
+            generation.worker_turn_handoff_source_log_id,
+        ),
+        _nullable_eq(
+            Task.worker_turn_handoff_acknowledged,
+            generation.worker_turn_handoff_acknowledged,
         ),
     )
 
@@ -143,10 +217,17 @@ async def read_worker_task_generation(
                 Task.worker_id,
                 Task.status,
                 Task.retry_count,
+                Task.turn_generation,
                 Task.instance_id,
                 Task.started_at,
                 Task.completed_at,
                 Task.pty_background_generation,
+                Task.worker_turn_handoff_id,
+                Task.worker_turn_handoff_worker_id,
+                Task.worker_turn_handoff_retry_count,
+                Task.worker_turn_handoff_from_generation,
+                Task.worker_turn_handoff_source_log_id,
+                Task.worker_turn_handoff_acknowledged,
             ).where(
                 Task.id == task_id,
                 Task.worker_id == worker_id,
@@ -161,11 +242,289 @@ async def read_worker_task_generation(
         worker_id=row.worker_id,
         status=row.status,
         retry_count=row.retry_count,
+        turn_generation=row.turn_generation,
         instance_id=row.instance_id,
         started_at=row.started_at,
         completed_at=row.completed_at,
         pty_background_generation=row.pty_background_generation,
+        worker_turn_handoff_id=row.worker_turn_handoff_id,
+        worker_turn_handoff_worker_id=row.worker_turn_handoff_worker_id,
+        worker_turn_handoff_retry_count=row.worker_turn_handoff_retry_count,
+        worker_turn_handoff_from_generation=(
+            row.worker_turn_handoff_from_generation
+        ),
+        worker_turn_handoff_source_log_id=(
+            row.worker_turn_handoff_source_log_id
+        ),
+        worker_turn_handoff_acknowledged=(
+            row.worker_turn_handoff_acknowledged
+        ),
     )
+
+
+_WORKER_TURN_HANDOFF_CLEAR_VALUES = {
+    "worker_turn_handoff_id": None,
+    "worker_turn_handoff_worker_id": None,
+    "worker_turn_handoff_retry_count": None,
+    "worker_turn_handoff_from_generation": None,
+    "worker_turn_handoff_source_log_id": None,
+    "worker_turn_handoff_acknowledged": None,
+}
+
+
+async def _settle_manager_handoff_receipt(
+    db,
+    observed: WorkerTaskGeneration,
+    *,
+    status: str,
+    reason: str | None = None,
+) -> bool:
+    """Advance the Manager receipt in the caller's Task-marker transaction."""
+
+    if status not in {"completed", "cancelled"}:
+        raise ValueError("invalid Manager handoff settlement status")
+    if not _valid_worker_turn_handoff(observed) or not _has_worker_turn_handoff(
+        observed
+    ):
+        return False
+    changed = await db.execute(
+        update(WorkerTurnHandoffReceipt)
+        .where(
+            WorkerTurnHandoffReceipt.handoff_id
+            == observed.worker_turn_handoff_id,
+            WorkerTurnHandoffReceipt.task_id == observed.task_id,
+            WorkerTurnHandoffReceipt.source_log_id
+            == observed.worker_turn_handoff_source_log_id,
+            WorkerTurnHandoffReceipt.side == "manager",
+            WorkerTurnHandoffReceipt.worker_id == observed.worker_id,
+            WorkerTurnHandoffReceipt.retry_count
+            == observed.worker_turn_handoff_retry_count,
+            WorkerTurnHandoffReceipt.from_generation
+            == observed.worker_turn_handoff_from_generation,
+            WorkerTurnHandoffReceipt.status.in_(
+                ("prepared", "acknowledged")
+            ),
+        )
+        .values(
+            status=status,
+            cancel_reason=(reason[:2000] if reason else None),
+            updated_at=datetime.utcnow(),
+        )
+    )
+    return changed.rowcount == 1
+
+
+def _has_worker_turn_handoff(generation: WorkerTaskGeneration) -> bool:
+    return generation.worker_turn_handoff_id is not None
+
+
+def _valid_worker_turn_handoff(generation: WorkerTaskGeneration) -> bool:
+    """Validate the complete durable reservation shape and baseline."""
+
+    if not _has_worker_turn_handoff(generation):
+        return all(
+            value is None
+            for value in (
+                generation.worker_turn_handoff_worker_id,
+                generation.worker_turn_handoff_retry_count,
+                generation.worker_turn_handoff_from_generation,
+                generation.worker_turn_handoff_source_log_id,
+                generation.worker_turn_handoff_acknowledged,
+            )
+        )
+    return (
+        isinstance(generation.worker_turn_handoff_id, str)
+        and bool(generation.worker_turn_handoff_id)
+        and len(generation.worker_turn_handoff_id) <= 32
+        and type(generation.worker_turn_handoff_worker_id) is int
+        and generation.worker_turn_handoff_worker_id == generation.worker_id
+        and type(generation.worker_turn_handoff_retry_count) is int
+        and generation.worker_turn_handoff_retry_count >= 0
+        and type(generation.worker_turn_handoff_from_generation) is int
+        and generation.worker_turn_handoff_from_generation >= 0
+        and type(generation.worker_turn_handoff_source_log_id) is int
+        and generation.worker_turn_handoff_source_log_id > 0
+        and type(generation.worker_turn_handoff_acknowledged) is bool
+    )
+
+
+def _handoff_authorizes_next_turn(
+    generation: WorkerTaskGeneration,
+    *,
+    retry_count: int,
+    turn_generation: int,
+) -> bool:
+    return (
+        _valid_worker_turn_handoff(generation)
+        and _has_worker_turn_handoff(generation)
+        and generation.retry_count
+        == generation.worker_turn_handoff_retry_count
+        and generation.turn_generation
+        == generation.worker_turn_handoff_from_generation
+        and retry_count == generation.worker_turn_handoff_retry_count
+        and turn_generation
+        == generation.worker_turn_handoff_from_generation + 1
+    )
+
+
+async def reserve_worker_turn_handoff(
+    db,
+    observed: WorkerTaskGeneration,
+    *,
+    handoff_id: str,
+    source_log_id: int,
+    request_payload: dict,
+    request_digest: str,
+    terminal_pr_review_chat: bool = False,
+) -> WorkerTaskGeneration | None:
+    """Reserve exactly one Worker G -> G+1 follow-up before network I/O."""
+
+    if (
+        not _valid_worker_turn_handoff(observed)
+        or _has_worker_turn_handoff(observed)
+        or not handoff_id
+        or len(handoff_id) > 32
+        or type(source_log_id) is not int
+        or source_log_id <= 0
+        or not isinstance(request_payload, dict)
+        or not isinstance(request_digest, str)
+        or len(request_digest) != 64
+        or type(terminal_pr_review_chat) is not bool
+    ):
+        return None
+    try:
+        if _handoff_payload_digest(request_payload) != request_digest:
+            return None
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    changed = await db.execute(
+        update(Task)
+        .where(*worker_task_generation_predicates(observed))
+        .values(
+            worker_turn_handoff_id=handoff_id,
+            worker_turn_handoff_worker_id=observed.worker_id,
+            worker_turn_handoff_retry_count=observed.retry_count,
+            worker_turn_handoff_from_generation=observed.turn_generation,
+            worker_turn_handoff_source_log_id=source_log_id,
+            worker_turn_handoff_acknowledged=False,
+        )
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        return None
+    db.add(
+        WorkerTurnHandoffReceipt(
+            handoff_id=handoff_id,
+            task_id=observed.task_id,
+            source_log_id=source_log_id,
+            side="manager",
+            worker_id=observed.worker_id,
+            retry_count=observed.retry_count,
+            from_generation=observed.turn_generation,
+            status="prepared",
+            request_payload=request_payload,
+            request_digest=request_digest,
+            terminal_pr_review_chat=terminal_pr_review_chat,
+        )
+    )
+    try:
+        await db.flush()
+    except Exception:
+        await db.rollback()
+        return None
+    resulting = await read_worker_task_generation(
+        db,
+        observed.task_id,
+        observed.worker_id,
+    )
+    if resulting is None or not _valid_worker_turn_handoff(resulting):
+        await db.rollback()
+        return None
+    return resulting
+
+
+async def acknowledge_worker_turn_handoff(
+    db,
+    reserved: WorkerTaskGeneration,
+    *,
+    session_id: str | None = None,
+) -> WorkerTaskGeneration | None:
+    """Record the proxy ACK without guessing whether Worker claimed G+1 yet.
+
+    If relay evidence already advanced the exact reservation, this ACK clears
+    it. Otherwise the acknowledged marker remains until the Worker emits G+1.
+    """
+
+    if not _valid_worker_turn_handoff(reserved) or not _has_worker_turn_handoff(
+        reserved
+    ):
+        return None
+    task = (
+        await db.execute(
+            select(Task)
+            .where(
+                Task.id == reserved.task_id,
+                Task.worker_id == reserved.worker_id,
+                Task.shared_from_id.is_(None),
+                Task.retry_count == reserved.retry_count,
+                Task.worker_turn_handoff_id
+                == reserved.worker_turn_handoff_id,
+                Task.worker_turn_handoff_worker_id
+                == reserved.worker_turn_handoff_worker_id,
+                Task.worker_turn_handoff_retry_count
+                == reserved.worker_turn_handoff_retry_count,
+                Task.worker_turn_handoff_from_generation
+                == reserved.worker_turn_handoff_from_generation,
+                Task.worker_turn_handoff_source_log_id
+                == reserved.worker_turn_handoff_source_log_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        return None
+    current = worker_task_generation(task, expected_worker_id=reserved.worker_id)
+    if current is None or not _valid_worker_turn_handoff(current):
+        return None
+    from_generation = reserved.worker_turn_handoff_from_generation
+    if task.turn_generation not in {from_generation, from_generation + 1}:
+        return None
+    receipt = (
+        await db.execute(
+            select(WorkerTurnHandoffReceipt)
+            .where(
+                WorkerTurnHandoffReceipt.handoff_id
+                == reserved.worker_turn_handoff_id,
+                WorkerTurnHandoffReceipt.task_id == reserved.task_id,
+                WorkerTurnHandoffReceipt.source_log_id
+                == reserved.worker_turn_handoff_source_log_id,
+                WorkerTurnHandoffReceipt.side == "manager",
+                WorkerTurnHandoffReceipt.worker_id == reserved.worker_id,
+                WorkerTurnHandoffReceipt.retry_count
+                == reserved.worker_turn_handoff_retry_count,
+                WorkerTurnHandoffReceipt.from_generation
+                == reserved.worker_turn_handoff_from_generation,
+                WorkerTurnHandoffReceipt.status.in_(
+                    ("prepared", "acknowledged")
+                ),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if receipt is None:
+        return None
+    # HTTP acceptance is useful recovery state, but is not exact evidence that
+    # this queue receipt owns G+1.  Keep the marker until a launched Worker
+    # receipt and a Manager-durable event/history/snapshot are committed
+    # together.
+    task.worker_turn_handoff_acknowledged = True
+    receipt.status = "acknowledged"
+    receipt.updated_at = datetime.utcnow()
+    if session_id:
+        task.session_id = session_id
+    await db.flush()
+    return worker_task_generation(task, expected_worker_id=reserved.worker_id)
 
 
 def _remote_datetime(value) -> datetime | None:
@@ -205,6 +564,8 @@ def authoritative_worker_task_values(
         or remote_task.get("status") not in _TASK_STATUSES
         or type(remote_task.get("retry_count")) is not int
         or remote_task["retry_count"] < 0
+        or type(remote_task.get("turn_generation")) is not int
+        or remote_task["turn_generation"] < 0
     ):
         return None
 
@@ -212,6 +573,7 @@ def authoritative_worker_task_values(
     values: dict = {
         "status": status,
         "retry_count": remote_task["retry_count"],
+        "turn_generation": remote_task["turn_generation"],
     }
     remote_background_active = remote_task.get(
         "background_active",
@@ -285,6 +647,7 @@ async def apply_authoritative_worker_task(
     remote_task: dict,
     *,
     metadata_updates: dict | None = None,
+    worker_turn_handoff_id: str | None = None,
 ) -> WorkerTaskGeneration | None:
     """CAS an authoritative Worker snapshot onto its exact observed mirror."""
 
@@ -292,11 +655,34 @@ async def apply_authoritative_worker_task(
         remote_task,
         task_id=observed.task_id,
     )
-    if (
-        values is None
-        or values["retry_count"] < observed.retry_count
-    ):
+    if values is None or not _valid_worker_turn_handoff(observed):
         return None
+    remote_retry_count = values["retry_count"]
+    remote_turn_generation = values["turn_generation"]
+    adopting_handoff = _handoff_authorizes_next_turn(
+        observed,
+        retry_count=remote_retry_count,
+        turn_generation=remote_turn_generation,
+    )
+    same_turn = remote_turn_generation == observed.turn_generation
+    if adopting_handoff:
+        if worker_turn_handoff_id != observed.worker_turn_handoff_id:
+            return None
+    elif not same_turn or remote_retry_count < observed.retry_count:
+        return None
+    elif _has_worker_turn_handoff(observed):
+        # A reservation may only carry its exact retry into G+1.  Do not let a
+        # concurrent/replayed Worker retry borrow the reservation.  Likewise,
+        # once terminal G reserved a follow-up, a fresh snapshot of G is old
+        # lifecycle evidence rather than authority for the next request.
+        if remote_retry_count != observed.retry_count:
+            return None
+        if (
+            observed.turn_generation
+            == observed.worker_turn_handoff_from_generation
+            and observed.status in _TERMINAL_TASK_STATUSES
+        ):
+            return None
     merged_metadata_updates = dict(metadata_updates or {})
     remote_metadata = remote_task.get("metadata_") or {}
     if (
@@ -370,6 +756,10 @@ def _entry_fingerprint(e: dict) -> tuple:
         p(e.get("tool_input")),
         p(e.get("tool_output")),
         e.get("loop_iteration"),
+        # Native turns can retry/rebind within one logical task generation.
+        # Identical text from two such turns is two pieces of evidence, not a
+        # reconnect duplicate.
+        e.get("native_turn_id"),
     )
 
 
@@ -399,6 +789,36 @@ CHAT_EVENT_TYPES = {
     "system_init", "system_event", "thinking", "process_exit",
 }
 
+# Unlike status/background/plan notifications, these events apply payload
+# fields directly to the Manager mirror.  They therefore cannot use the
+# Manager's current generation at receive time as their identity: every
+# producer must freeze both counters when the event is created, and the relay
+# must drop missing, malformed, or stale identities before any DB mutation or
+# frontend forwarding.
+EXACT_GENERATION_RELAY_EVENT_TYPES = frozenset({
+    "context_usage",
+    "loop_iteration_end",
+    "goal_evaluation",
+    "message_delta",
+    "thinking_delta",
+    "monitor_session_created",
+    "monitor_check",
+    "monitor_session_status",
+})
+
+_INVALID_NATIVE_TURN_ID = object()
+
+
+def _validated_native_turn_id(payload: dict):
+    """Return a bounded native id, ``None``, or an invalid sentinel."""
+
+    value = payload.get("native_turn_id")
+    if value is None:
+        return None
+    if isinstance(value, str) and len(value) <= 200:
+        return value
+    return _INVALID_NATIVE_TURN_ID
+
 
 class WorkerRelay:
     def __init__(self, db_factory, broadcaster):
@@ -409,6 +829,12 @@ class WorkerRelay:
         self._loops: dict[int, asyncio.Task] = {}    # worker_id -> relay loop（强引用）
         self._closing: set[int] = set()
         self._connection_locks: dict[int, asyncio.Lock] = {}
+        self._reconnect_tasks: dict[int, set[asyncio.Task]] = {}
+        self._handoff_recovery_tasks: dict[
+            tuple[int, int, str], asyncio.Task
+        ] = {}
+        self._shutting_down = False
+        self._shutdown_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -428,7 +854,73 @@ class WorkerRelay:
     def _connection_lock(self, worker_id: int) -> asyncio.Lock:
         return self._connection_locks.setdefault(worker_id, asyncio.Lock())
 
+    def _assert_open(self) -> None:
+        if self._shutting_down:
+            raise RuntimeError("Worker relay is shutting down")
+
+    async def start(self) -> None:
+        """Open a fresh runtime generation after a fully completed shutdown."""
+
+        if not self._shutting_down and self._shutdown_task is None:
+            return
+        shutdown_task = self._shutdown_task
+        if shutdown_task is None or not shutdown_task.done():
+            raise RuntimeError("Worker relay shutdown is still in progress")
+        # Propagate a failed/cancelled shutdown instead of reopening on an
+        # uncertain resource snapshot.
+        shutdown_task.result()
+        owned_registries = (
+            self._ws,
+            self._tasks,
+            self._loops,
+            self._reconnect_tasks,
+            self._handoff_recovery_tasks,
+        )
+        if any(owned_registries):
+            raise RuntimeError(
+                "Worker relay shutdown left owned resources behind"
+            )
+        self._closing.clear()
+        self._shutdown_task = None
+        self._shutting_down = False
+
+    def _schedule_reconnect(
+        self,
+        worker: Worker,
+        task_ids: set[int],
+    ) -> None:
+        """Start and strongly own one reconnect attempt for ``worker``."""
+
+        worker_id = worker.id
+        if self._shutting_down or worker_id in self._closing:
+            return
+        task = asyncio.create_task(self._reconnect(worker, task_ids))
+        worker_tasks = self._reconnect_tasks.setdefault(worker_id, set())
+        worker_tasks.add(task)
+
+        def cleanup(done: asyncio.Task) -> None:
+            registered = self._reconnect_tasks.get(worker_id)
+            if registered is not None:
+                registered.discard(done)
+                if not registered:
+                    self._reconnect_tasks.pop(worker_id, None)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "worker %s relay reconnect task failed",
+                    worker_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(cleanup)
+
     async def _ensure_connection_locked(self, worker: Worker):
+        self._assert_open()
         if worker.id in self._ws:
             # A replacement connection may have been installed while an older
             # relay is backing off.  Keep the subscription owner present even
@@ -442,6 +934,9 @@ class WorkerRelay:
             open_timeout=15,
         )
         try:
+            # Global shutdown may win while connect() is awaiting the network.
+            # Never publish that late socket into the relay maps.
+            self._assert_open()
             await ws.send(
                 json.dumps({"action": "subscribe", "channels": ["tasks"]})
             )
@@ -466,6 +961,7 @@ class WorkerRelay:
         否则初始事件会丢。"""
         async with self._connection_lock(worker.id):
             await self._ensure_connection_locked(worker)
+            self._assert_open()
             if task_id in self._tasks.get(worker.id, set()):
                 return
             ws = self._ws[worker.id]
@@ -481,23 +977,146 @@ class WorkerRelay:
         """迁移后停止中继该 task（_handle 按 self._tasks 过滤，移除即生效）。"""
         self._tasks.get(worker_id, set()).discard(task_id)
 
-    async def stop_worker(self, worker_id: int):
-        """断开并停止重连（worker 关机/销毁前必须调，否则重连风暴）。"""
+    async def _stop_worker_impl(self, worker_id: int) -> None:
+        """Close one Worker's socket and await every owned background task."""
+
+        owned_tasks: set[asyncio.Task] = set()
         async with self._connection_lock(worker_id):
             self._closing.add(worker_id)
             ws = self._ws.pop(worker_id, None)
             self._tasks.pop(worker_id, None)
             loop_task = self._loops.pop(worker_id, None)
+            reconnect_tasks = list(self._reconnect_tasks.pop(worker_id, set()))
+            recovery_items = [
+                (key, task)
+                for key, task in list(self._handoff_recovery_tasks.items())
+                if key[0] == worker_id
+            ]
+            if loop_task is not None:
+                owned_tasks.add(loop_task)
+            owned_tasks.update(reconnect_tasks)
+            owned_tasks.update(task for _key, task in recovery_items)
+            current = asyncio.current_task()
+            for task in owned_tasks:
+                if task is not current and not task.done():
+                    task.cancel()
             if ws is not None:
                 try:
                     await ws.close()
                 except Exception:
-                    pass
-            if loop_task is not None:
-                loop_task.cancel()
+                    logger.debug(
+                        "worker relay socket close failed for worker %s",
+                        worker_id,
+                        exc_info=True,
+                    )
+
+        awaitable_tasks = [
+            task for task in owned_tasks if task is not asyncio.current_task()
+        ]
+        if awaitable_tasks:
+            await asyncio.gather(*awaitable_tasks, return_exceptions=True)
+        for key, task in recovery_items:
+            if self._handoff_recovery_tasks.get(key) is task:
+                self._handoff_recovery_tasks.pop(key, None)
+
+    async def stop_worker(self, worker_id: int):
+        """断开并停止重连（worker 关机/销毁前必须调，否则重连风暴）。"""
+
+        operation = asyncio.create_task(self._stop_worker_impl(worker_id))
+        cancellation: asyncio.CancelledError | None = None
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as exc:
+                # A cancelled API/lifespan caller must not abandon a half-closed
+                # socket with reconnect or handoff producers still running.
+                if cancellation is None:
+                    cancellation = exc
+        operation.result()
+        if cancellation is not None:
+            raise cancellation
+
+    async def _shutdown_impl(self) -> None:
+        worker_ids = (
+            set(self._connection_locks)
+            | set(self._ws)
+            | set(self._tasks)
+            | set(self._loops)
+            | set(self._reconnect_tasks)
+            | {key[0] for key in self._handoff_recovery_tasks}
+        )
+        results = await asyncio.gather(
+            *(self._stop_worker_impl(worker_id) for worker_id in worker_ids),
+            return_exceptions=True,
+        )
+
+        # The shutdown flag prevents new registrations, but take one final
+        # snapshot so a task which was between creation and map insertion when
+        # shutdown began cannot escape the first worker-id snapshot.
+        leftovers = {
+            *self._loops.values(),
+            *(
+                task
+                for tasks in self._reconnect_tasks.values()
+                for task in tasks
+            ),
+            *self._handoff_recovery_tasks.values(),
+        }
+        current = asyncio.current_task()
+        for task in leftovers:
+            if task is not current and not task.done():
+                task.cancel()
+        awaitable_leftovers = [
+            task for task in leftovers if task is not current
+        ]
+        if awaitable_leftovers:
+            await asyncio.gather(*awaitable_leftovers, return_exceptions=True)
+
+        # A connect already in flight when the admission fence closed will
+        # close its own late socket before publishing it.  Still drain the map
+        # defensively so shutdown's postcondition never depends on that path.
+        leftover_sockets = list(self._ws.values())
+        self._ws.clear()
+        if leftover_sockets:
+            await asyncio.gather(
+                *(socket.close() for socket in leftover_sockets),
+                return_exceptions=True,
+            )
+        self._loops.clear()
+        self._reconnect_tasks.clear()
+        self._handoff_recovery_tasks.clear()
+        self._tasks.clear()
+
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise RuntimeError(
+                f"Worker relay shutdown failed for {len(failures)} worker(s)"
+            ) from failures[0]
+
+    async def shutdown(self) -> None:
+        """Idempotently quiesce every Manager-side Worker relay producer."""
+
+        if self._shutdown_task is None:
+            # This synchronous transition is the global admission fence. Every
+            # connection/recovery path checks it before its next side effect.
+            self._shutting_down = True
+            self._shutdown_task = asyncio.create_task(self._shutdown_impl())
+        operation = self._shutdown_task
+        cancellation: asyncio.CancelledError | None = None
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+        operation.result()
+        if cancellation is not None:
+            raise cancellation
 
     async def recover(self, worker: Worker):
         """worker 恢复（开机/健康自动恢复/Manager 重启）后重建中继 + 补日志。"""
+        if self._shutting_down:
+            return
         async with self.db_factory() as db:
             result = await db.execute(
                 select(Task).where(
@@ -510,17 +1129,33 @@ class WorkerRelay:
                             (Task.status == "completed")
                             & Task.pty_background_generation.isnot(None)
                         ),
+                        # A completed Manager mirror may already have ACKed a
+                        # follow-up while the Worker has not emitted the first
+                        # exact G+1 event yet.  The durable reservation is an
+                        # active relay obligation in its own right: after a
+                        # Manager restart we must re-subscribe and backfill it,
+                        # otherwise the first G+1 event can be lost forever and
+                        # the handoff marker can never collect its second piece
+                        # of evidence.
+                        Task.worker_turn_handoff_id.isnot(None),
                     ),
                 )
             )
             active = result.scalars().all()
         for t in active:
+            if self._shutting_down:
+                return
             try:
                 await self.subscribe_task(worker, t.id)
             except Exception:
                 logger.exception("recover: subscribe task %s on worker %s failed", t.id, worker.id)
                 return
-        if active:
+        if active and not self._shutting_down:
+            # Backfill performs one bounded reconciliation pass for every
+            # durable handoff and arms the long-lived retry loop when it does
+            # not settle.  Do not perform another synchronous replay here:
+            # one unreachable Worker would otherwise block recovery of every
+            # other Task for the full HTTP retry budget.
             await self._backfill_missing_logs(worker, {t.id for t in active})
 
     async def _observe_task_generation(
@@ -530,6 +1165,100 @@ class WorkerRelay:
     ) -> WorkerTaskGeneration | None:
         async with self.db_factory() as db:
             return await read_worker_task_generation(db, task_id, worker_id)
+
+    async def _observe_or_adopt_event_generation(
+        self,
+        worker_id: int,
+        task_id: int,
+        *,
+        retry_count: int,
+        turn_generation: int,
+        worker_turn_handoff_id: str | None = None,
+    ) -> WorkerTaskGeneration | None:
+        """Resolve an exact event against current or one reserved next turn.
+
+        A bare Worker ``G+1`` is never accepted.  The only widening is the
+        durable reservation written before the matching proxy request.  The
+        Task row is locked while it is consumed, so relay may safely beat the
+        proxy HTTP ACK without opening a global ``+1`` allowance.
+        """
+
+        async with self.db_factory() as db:
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.worker_id == worker_id,
+                        Task.shared_from_id.is_(None),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if task is None:
+                await db.rollback()
+                return None
+            observed = worker_task_generation(
+                task,
+                expected_worker_id=worker_id,
+            )
+            if observed is None or not _valid_worker_turn_handoff(observed):
+                await db.rollback()
+                return None
+            if (
+                retry_count == observed.retry_count
+                and turn_generation == observed.turn_generation
+            ):
+                if (
+                    _has_worker_turn_handoff(observed)
+                    and turn_generation
+                    == observed.worker_turn_handoff_from_generation + 1
+                    and worker_turn_handoff_id
+                    != observed.worker_turn_handoff_id
+                ):
+                    await db.rollback()
+                    return None
+                # Once a follow-up is reserved from an already-terminal G,
+                # delayed payload events from G cannot be terminal evidence
+                # for the new request.  An active G may still finish normally
+                # while one queued follow-up is waiting behind it.
+                if (
+                    _has_worker_turn_handoff(observed)
+                    and observed.turn_generation
+                    == observed.worker_turn_handoff_from_generation
+                    and observed.status in _TERMINAL_TASK_STATUSES
+                ):
+                    await db.rollback()
+                    return None
+                await db.rollback()
+                return observed
+            if not _handoff_authorizes_next_turn(
+                observed,
+                retry_count=retry_count,
+                turn_generation=turn_generation,
+            ) or worker_turn_handoff_id != observed.worker_turn_handoff_id:
+                await db.rollback()
+                return None
+
+            task.turn_generation = turn_generation
+            # Do not clear the marker here.  This transaction only adopts the
+            # generation fence.  A live chat event clears it in the same
+            # transaction that persists the Manager LogEntry; status recovery
+            # keeps it until exact history is backfilled.  Marking the task
+            # active guarantees restart recovery remains subscribed between
+            # those two commits.
+            task.status = "executing"
+            task.completed_at = None
+            await db.flush()
+            resulting = worker_task_generation(
+                task,
+                expected_worker_id=worker_id,
+            )
+            if resulting is None:
+                await db.rollback()
+                return None
+            await db.commit()
+            return resulting
 
     async def _fetch_task_snapshot(
         self,
@@ -561,10 +1290,608 @@ class WorkerRelay:
             )
             return None
 
+    async def _fetch_worker_turn_handoff_receipt(
+        self,
+        worker: Worker,
+        task_id: int,
+        handoff_id: str,
+        *,
+        client=None,
+    ) -> dict | None:
+        async def fetch(http_client):
+            response = await http_client.get(
+                self._api(
+                    worker,
+                    f"/api/tasks/{task_id}/worker-turn-handoffs/{handoff_id}",
+                ),
+                headers=self._headers(worker),
+            )
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            return payload if isinstance(payload, dict) else None
+
+        try:
+            if client is not None:
+                return await fetch(client)
+            async with httpx.AsyncClient(timeout=15) as http_client:
+                return await fetch(http_client)
+        except Exception:
+            logger.warning(
+                "fetch Worker turn handoff %s for task %s from worker %s failed",
+                handoff_id,
+                task_id,
+                worker.id,
+            )
+            return None
+
+    async def _manager_worker_turn_handoff_request(
+        self,
+        observed: WorkerTaskGeneration,
+    ) -> dict | None:
+        """Load and verify the Manager's exact replay envelope."""
+
+        if not _valid_worker_turn_handoff(observed) or not _has_worker_turn_handoff(
+            observed
+        ):
+            return None
+        async with self.db_factory() as db:
+            receipt = await db.get(
+                WorkerTurnHandoffReceipt,
+                observed.worker_turn_handoff_id,
+            )
+            source_log = await db.get(
+                LogEntry,
+                observed.worker_turn_handoff_source_log_id,
+            )
+            if (
+                receipt is None
+                or receipt.side != "manager"
+                or receipt.task_id != observed.task_id
+                or receipt.source_log_id
+                != observed.worker_turn_handoff_source_log_id
+                or receipt.worker_id != observed.worker_id
+                or receipt.retry_count
+                != observed.worker_turn_handoff_retry_count
+                or receipt.from_generation
+                != observed.worker_turn_handoff_from_generation
+                or receipt.status not in {"prepared", "acknowledged"}
+                or source_log is None
+                or source_log.task_id != observed.task_id
+                or source_log.event_type != "user_message"
+                or not isinstance(receipt.request_payload, dict)
+            ):
+                return None
+            try:
+                actual_digest = _handoff_payload_digest(receipt.request_payload)
+            except (TypeError, ValueError, UnicodeError):
+                return None
+            payload = receipt.request_payload
+            if (
+                actual_digest != receipt.request_digest
+                or payload.get("worker_turn_handoff_id")
+                != observed.worker_turn_handoff_id
+                or payload.get("worker_turn_handoff_retry_count")
+                != observed.worker_turn_handoff_retry_count
+                or payload.get("worker_turn_handoff_from_generation")
+                != observed.worker_turn_handoff_from_generation
+            ):
+                return None
+            return {
+                "payload": dict(payload),
+                "terminal_pr_review_chat": receipt.terminal_pr_review_chat,
+            }
+
+    async def _post_worker_turn_handoff_request(
+        self,
+        worker: Worker,
+        observed: WorkerTaskGeneration,
+        replay: dict,
+        *,
+        client=None,
+    ) -> bool:
+        headers = self._headers(worker)
+        if replay["terminal_pr_review_chat"]:
+            headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
+                PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
+            )
+
+        async def send(http_client):
+            response = await http_client.post(
+                self._api(worker, f"/api/tasks/{observed.task_id}/chat"),
+                headers=headers,
+                json=replay["payload"],
+            )
+            return 200 <= response.status_code < 300
+
+        try:
+            if client is not None:
+                return await send(client)
+            async with httpx.AsyncClient(timeout=60) as http_client:
+                return await send(http_client)
+        except Exception:
+            logger.warning(
+                "replay Worker turn handoff %s for task %s on worker %s failed",
+                observed.worker_turn_handoff_id,
+                observed.task_id,
+                worker.id,
+            )
+            return False
+
+    @staticmethod
+    def _remote_handoff_matches(
+        observed: WorkerTaskGeneration,
+        receipt: dict,
+    ) -> bool:
+        status = receipt.get("status")
+        remote_task_id = receipt.get("task_id")
+        remote_retry_count = receipt.get("retry_count")
+        remote_from_generation = receipt.get("from_generation")
+        turn_generation = receipt.get("turn_generation")
+        if status in _WORKER_HANDOFF_BOUND_GENERATION_STATUSES:
+            valid_turn = (
+                type(turn_generation) is int
+                and type(observed.worker_turn_handoff_from_generation) is int
+                and turn_generation
+                == observed.worker_turn_handoff_from_generation + 1
+            )
+        elif status in {"accepted", "cancelled"}:
+            valid_turn = turn_generation is None
+        else:
+            valid_turn = False
+        return bool(
+            receipt.get("handoff_id") == observed.worker_turn_handoff_id
+            and type(remote_task_id) is int
+            and remote_task_id == observed.task_id
+            and type(remote_retry_count) is int
+            and remote_retry_count == observed.worker_turn_handoff_retry_count
+            and type(remote_from_generation) is int
+            and remote_from_generation
+            == observed.worker_turn_handoff_from_generation
+            and valid_turn
+            and isinstance(receipt.get("response"), dict)
+        )
+
+    async def _acknowledge_recovered_worker_turn_handoff(
+        self,
+        observed: WorkerTaskGeneration,
+        receipt: dict,
+    ) -> bool:
+        async with self.db_factory() as db:
+            acknowledged = await acknowledge_worker_turn_handoff(
+                db,
+                observed,
+                session_id=receipt["response"].get("session_id"),
+            )
+            if acknowledged is None:
+                await db.rollback()
+                return False
+            await db.commit()
+            return True
+
+    async def _cancel_recovered_worker_turn_handoff(
+        self,
+        observed: WorkerTaskGeneration,
+        receipt: dict,
+    ) -> bool:
+        """Consume exact remote cancellation and clear the Manager marker."""
+
+        async with self.db_factory() as db:
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(*worker_task_generation_predicates(observed))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if task is None:
+                await db.rollback()
+                return False
+            current = worker_task_generation(
+                task,
+                expected_worker_id=observed.worker_id,
+            )
+            if current is None or not (
+                await _settle_manager_handoff_receipt(
+                    db,
+                    current,
+                    status="cancelled",
+                    reason=str(
+                        receipt.get("cancel_reason")
+                        or "Worker cancelled the queued follow-up before launch"
+                    ),
+                )
+            ):
+                await db.rollback()
+                return False
+            for field, value in _WORKER_TURN_HANDOFF_CLEAR_VALUES.items():
+                setattr(task, field, value)
+            await db.commit()
+            return True
+
+    async def _resume_worker_turn_handoff(
+        self,
+        worker: Worker,
+        observed: WorkerTaskGeneration,
+    ) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    self._api(
+                        worker,
+                        f"/api/tasks/{observed.task_id}/worker-turn-handoffs/"
+                        f"{observed.worker_turn_handoff_id}/resume",
+                    ),
+                    headers=self._headers(worker),
+                )
+            if response.status_code != 200:
+                return False
+            payload = response.json()
+            return bool(
+                isinstance(payload, dict)
+                and self._remote_handoff_matches(observed, payload)
+                # Only accepted/claimed callers invoke this endpoint.  The
+                # response may already be post-boundary because the queue can
+                # advance while the resume request is in flight.
+                and payload.get("status")
+                in (
+                    _WORKER_HANDOFF_REPLAYABLE_STATUSES
+                    | _WORKER_HANDOFF_POST_BOUNDARY_STATUSES
+                )
+            )
+        except Exception:
+            logger.warning(
+                "resume Worker turn handoff %s for task %s on worker %s failed",
+                observed.worker_turn_handoff_id,
+                observed.task_id,
+                worker.id,
+            )
+            return False
+
+    async def _resume_accepted_worker_turn_handoff(
+        self,
+        worker: Worker,
+        observed: WorkerTaskGeneration,
+        *,
+        attempts: int = 3,
+        client=None,
+        operation_lock_held: bool = False,
+    ) -> bool:
+        """Recover a missing/accepted receipt using the exact durable POST."""
+
+        if not _has_worker_turn_handoff(observed):
+            return False
+        if not operation_lock_held:
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            async with get_task_operation_lock(observed.task_id):
+                current = await self._observe_task_generation(
+                    observed.worker_id,
+                    observed.task_id,
+                )
+                if (
+                    current is None
+                    or current.worker_turn_handoff_id
+                    != observed.worker_turn_handoff_id
+                ):
+                    return False
+                return await self._resume_accepted_worker_turn_handoff(
+                    worker,
+                    current,
+                    attempts=attempts,
+                    client=client,
+                    operation_lock_held=True,
+                )
+
+        replay = await self._manager_worker_turn_handoff_request(observed)
+        if replay is None:
+            return False
+        for attempt in range(max(1, attempts)):
+            receipt = await self._fetch_worker_turn_handoff_receipt(
+                worker,
+                observed.task_id,
+                observed.worker_turn_handoff_id,
+                client=client,
+            )
+            if receipt is None:
+                if not await self._post_worker_turn_handoff_request(
+                    worker,
+                    observed,
+                    replay,
+                    client=client,
+                ):
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(0)
+                    continue
+                receipt = await self._fetch_worker_turn_handoff_receipt(
+                    worker,
+                    observed.task_id,
+                    observed.worker_turn_handoff_id,
+                    client=client,
+                )
+            if not isinstance(receipt, dict) or not self._remote_handoff_matches(
+                observed,
+                receipt,
+            ):
+                return False
+            if receipt.get("status") == "cancelled":
+                return await self._cancel_recovered_worker_turn_handoff(
+                    observed,
+                    receipt,
+                )
+            if (
+                receipt.get("status")
+                in _WORKER_HANDOFF_POST_BOUNDARY_STATUSES
+            ):
+                # The exact G+1 crossed the provider boundary.  It is safe to
+                # acknowledge and reconcile its events/history/snapshot, but it
+                # must never be sent through /resume again.
+                return await self._acknowledge_recovered_worker_turn_handoff(
+                    observed,
+                    receipt,
+                )
+            if not await self._acknowledge_recovered_worker_turn_handoff(
+                observed,
+                receipt,
+            ):
+                return False
+            if await self._resume_worker_turn_handoff(
+                worker,
+                observed,
+            ):
+                return True
+            if attempt + 1 < attempts:
+                current = await self._observe_task_generation(
+                    observed.worker_id,
+                    observed.task_id,
+                )
+                if (
+                    current is None
+                    or current.worker_turn_handoff_id
+                    != observed.worker_turn_handoff_id
+                ):
+                    return False
+                observed = current
+                await asyncio.sleep(0)
+        return False
+
+    def ensure_worker_turn_handoff_recovery(
+        self,
+        worker: Worker,
+        observed: WorkerTaskGeneration,
+    ) -> None:
+        """Keep retrying a durable handoff until its Manager marker settles."""
+
+        if (
+            self._shutting_down
+            or worker.id in self._closing
+            or not _has_worker_turn_handoff(observed)
+        ):
+            return
+        key = (
+            worker.id,
+            observed.task_id,
+            observed.worker_turn_handoff_id,
+        )
+        existing = self._handoff_recovery_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._worker_turn_handoff_recovery_loop(*key)
+        )
+        self._handoff_recovery_tasks[key] = task
+
+        def cleanup(done: asyncio.Task) -> None:
+            if self._handoff_recovery_tasks.get(key) is done:
+                self._handoff_recovery_tasks.pop(key, None)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "Worker turn handoff recovery task failed for task %s",
+                    observed.task_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(cleanup)
+
+    async def _worker_turn_handoff_recovery_loop(
+        self,
+        worker_id: int,
+        task_id: int,
+        handoff_id: str,
+    ) -> None:
+        from backend.services.worker_proxy import get_task_operation_lock
+
+        delay = WORKER_HANDOFF_RECOVERY_BASE_DELAY
+        try:
+            while (
+                not self._shutting_down
+                and worker_id not in self._closing
+            ):
+                try:
+                    deferred_completions: list[
+                        WorkerTaskGeneration
+                    ] = []
+                    settled = False
+                    async with get_task_operation_lock(task_id):
+                        if (
+                            self._shutting_down
+                            or worker_id in self._closing
+                        ):
+                            return
+                        observed = await self._observe_task_generation(
+                            worker_id,
+                            task_id,
+                        )
+                        if (
+                            observed is None
+                            or observed.worker_turn_handoff_id != handoff_id
+                        ):
+                            return
+                        async with self.db_factory() as db:
+                            worker = await db.get(Worker, worker_id)
+                        if worker is not None and worker.status == "ready":
+                            recovered = await (
+                                self._resume_accepted_worker_turn_handoff(
+                                    worker,
+                                    observed,
+                                    attempts=1,
+                                    operation_lock_held=True,
+                                )
+                            )
+                            if recovered:
+                                await (
+                                    self._backfill_missing_logs_with_operation_lock(
+                                        worker,
+                                        {task_id},
+                                        deferred_completions=(
+                                            deferred_completions
+                                        ),
+                                    )
+                                )
+                                current = await self._observe_task_generation(
+                                    worker_id,
+                                    task_id,
+                                )
+                                if (
+                                    current is None
+                                    or current.worker_turn_handoff_id
+                                    != handoff_id
+                                ):
+                                    settled = True
+                    # Completion itself takes the same Task operation lock in
+                    # Dispatcher.  Mirror normal backfill and notify only
+                    # after releasing the recovery iteration's fence.
+                    for generation in deferred_completions:
+                        await self._notify_completed_pr_review(generation)
+                    if settled:
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Worker turn handoff recovery iteration failed for "
+                        "task %s",
+                        task_id,
+                    )
+                await asyncio.sleep(delay)
+                delay = min(
+                    max(delay * 2, WORKER_HANDOFF_RECOVERY_BASE_DELAY),
+                    WORKER_HANDOFF_RECOVERY_MAX_DELAY,
+                )
+        except asyncio.CancelledError:
+            raise
+
+    @staticmethod
+    def _launched_handoff_proves_generation(
+        observed: WorkerTaskGeneration,
+        receipt: dict | None,
+        *,
+        retry_count: int,
+        turn_generation: int,
+    ) -> bool:
+        return bool(
+            _valid_worker_turn_handoff(observed)
+            and _has_worker_turn_handoff(observed)
+            and isinstance(receipt, dict)
+            and receipt.get("handoff_id")
+            == observed.worker_turn_handoff_id
+            and receipt.get("task_id") == observed.task_id
+            # ``launching`` already crossed the durable provider-side-effect
+            # boundary.  It therefore proves the same exact G+1 identity as
+            # ``launched`` for relay adoption, even though only the latter says
+            # InstanceManager returned successfully.
+            and receipt.get("status")
+            in _WORKER_HANDOFF_POST_BOUNDARY_STATUSES
+            and receipt.get("retry_count")
+            == observed.worker_turn_handoff_retry_count
+            and receipt.get("from_generation")
+            == observed.worker_turn_handoff_from_generation
+            and receipt.get("turn_generation") == turn_generation
+            and retry_count
+            == observed.worker_turn_handoff_retry_count
+            and turn_generation
+            == observed.worker_turn_handoff_from_generation + 1
+        )
+
+    async def _launched_handoff_id_for_generation(
+        self,
+        worker: Worker,
+        observed: WorkerTaskGeneration,
+        *,
+        retry_count: int,
+        turn_generation: int,
+        client=None,
+    ) -> str | None:
+        if not _handoff_authorizes_next_turn(
+            observed,
+            retry_count=retry_count,
+            turn_generation=turn_generation,
+        ) and not (
+            _valid_worker_turn_handoff(observed)
+            and _has_worker_turn_handoff(observed)
+            and retry_count == observed.worker_turn_handoff_retry_count
+            and turn_generation
+            == observed.worker_turn_handoff_from_generation + 1
+            and observed.turn_generation == turn_generation
+        ):
+            return None
+        receipt = await self._fetch_worker_turn_handoff_receipt(
+            worker,
+            observed.task_id,
+            observed.worker_turn_handoff_id,
+            client=client,
+        )
+        if self._launched_handoff_proves_generation(
+            observed,
+            receipt,
+            retry_count=retry_count,
+            turn_generation=turn_generation,
+        ):
+            return observed.worker_turn_handoff_id
+        return None
+
+    async def _launched_handoff_id_for_snapshot(
+        self,
+        worker: Worker,
+        observed: WorkerTaskGeneration,
+        remote_task: dict,
+        *,
+        client=None,
+    ) -> str | None:
+        values = authoritative_worker_task_values(
+            remote_task,
+            task_id=observed.task_id,
+        )
+        if values is None:
+            return None
+        if not _handoff_authorizes_next_turn(
+            observed,
+            retry_count=values["retry_count"],
+            turn_generation=values["turn_generation"],
+        ):
+            return None
+        return await self._launched_handoff_id_for_generation(
+            worker,
+            observed,
+            retry_count=values["retry_count"],
+            turn_generation=values["turn_generation"],
+            client=client,
+        )
+
     async def _publish_status_generation(
         self,
         generation: WorkerTaskGeneration,
         payload: dict | None = None,
+        *,
+        notify_completion: bool = True,
     ) -> bool:
         """Publish while holding a no-op write lock on the exact result row."""
 
@@ -610,7 +1937,8 @@ class WorkerRelay:
                     generation.task_id,
                 )
             await db.commit()
-        await self._notify_completed_pr_review(generation)
+        if notify_completion:
+            await self._notify_completed_pr_review(generation)
         return True
 
     async def _notify_completed_pr_review(
@@ -728,6 +2056,7 @@ class WorkerRelay:
         generation: WorkerTaskGeneration,
         *,
         channels: tuple[str, ...],
+        notify_completion: bool = True,
     ) -> bool:
         """Publish a controlled background marker for one exact mirror.
 
@@ -782,7 +2111,8 @@ class WorkerRelay:
                     generation.task_id,
                 )
             await db.commit()
-        await self._notify_completed_pr_review(generation)
+        if notify_completion:
+            await self._notify_completed_pr_review(generation)
         return True
 
     # ------------------------------------------------------------------
@@ -802,7 +2132,8 @@ class WorkerRelay:
             return
         async with self._connection_lock(worker.id):
             if (
-                worker.id not in self._closing
+                not self._shutting_down
+                and worker.id not in self._closing
                 and self._ws.get(worker.id) is ws
             ):
                 logger.warning(
@@ -817,19 +2148,23 @@ class WorkerRelay:
                 # _reconnect raced subscribe_task(), which could install a new
                 # socket/set before this task first ran.
                 task_ids = self._tasks.pop(worker.id, set())
-                asyncio.create_task(self._reconnect(worker, task_ids))
+                self._schedule_reconnect(worker, task_ids)
 
     async def _reconnect(
         self,
         worker: Worker,
         task_ids: set[int] | None = None,
     ):
+        worker_id = worker.id
+        if self._shutting_down or worker_id in self._closing:
+            return
         if task_ids is None:
             # Compatibility for direct recovery callers/tests.  The relay-loop
             # path always supplies its lock-protected snapshot.
             async with self._connection_lock(worker.id):
+                if self._shutting_down or worker_id in self._closing:
+                    return
                 task_ids = self._tasks.pop(worker.id, set())
-        worker_id = worker.id
         # Capture the generations owned by this disconnected relay before any
         # backoff/network await.  Reconnect exhaustion belongs only to these
         # generations; a retry on the same Worker is a distinct generation.
@@ -854,9 +2189,11 @@ class WorkerRelay:
                 ):
                     disconnected_generations[task_id] = generation
         for attempt in range(10):
-            if worker_id in self._closing:
+            if self._shutting_down or worker_id in self._closing:
                 return
             await asyncio.sleep(min(2 ** attempt, 60))
+            if self._shutting_down or worker_id in self._closing:
+                return
             try:
                 # Re-fetch worker from DB to get latest IP/token after stop/start
                 async with self.db_factory() as db:
@@ -877,8 +2214,12 @@ class WorkerRelay:
                 logger.info("worker %s relay reconnected", worker_id)
                 return
             except Exception:
+                if self._shutting_down or worker_id in self._closing:
+                    return
                 continue
         # 重连失败 → 活跃 task 标 failed（worker 状态交给健康检查处理）
+        if self._shutting_down or worker_id in self._closing:
+            return
         logger.error("worker %s relay reconnect exhausted", worker.id)
         failed_generations: list[WorkerTaskGeneration] = []
         for tid, observed in disconnected_generations.items():
@@ -912,6 +2253,46 @@ class WorkerRelay:
             await self._publish_status_generation(generation)
 
     async def _handle(self, msg: dict, worker: Worker):
+        """Handle one relay event under the shared Task operation fence.
+
+        Consuming the first reserved G+1 event may durably advance the mirror
+        and clear its handoff marker before the event's own log/write/broadcast
+        finishes.  Holding the same fence used by chat, retry, and migration
+        keeps that multi-transaction relay step indivisible to Manager-side
+        Task operations.
+        """
+
+        channel = msg.get("channel", "")
+        data = msg.get("data", msg)
+        if not isinstance(data, dict):
+            return
+        task_id = data.get("task_id")
+        if not task_id and channel.startswith("task:"):
+            try:
+                task_id = int(channel.split(":", 1)[1])
+            except (ValueError, IndexError):
+                return
+        if not task_id or task_id not in self._tasks.get(worker.id, set()):
+            return
+
+        # Import lazily: worker_proxy imports this module for the generation
+        # helpers, while the lock registry lives there for all Manager→Worker
+        # mutation paths.
+        from backend.services.worker_proxy import get_task_operation_lock
+
+        async with get_task_operation_lock(task_id):
+            completion = await self._handle_with_operation_lock(msg, worker)
+        # PR completion itself takes the same operation lock in Dispatcher.
+        # Run it only after the relay event's fence is released; asyncio.Lock
+        # is deliberately non-reentrant.
+        if completion is not None:
+            await self._notify_completed_pr_review(completion)
+
+    async def _handle_with_operation_lock(
+        self,
+        msg: dict,
+        worker: Worker,
+    ):
         channel = msg.get("channel", "")
         data = msg.get("data", msg)
         if not isinstance(data, dict):
@@ -933,7 +2314,58 @@ class WorkerRelay:
         if event_type == "user_message":
             return
 
-        observed = await self._observe_task_generation(worker.id, task_id)
+        event_retry_count: int | None = None
+        event_turn_generation: int | None = None
+        native_turn_id = None
+        worker_turn_handoff_id: str | None = None
+        generation_scoped_event = (
+            event_type in EXACT_GENERATION_RELAY_EVENT_TYPES
+            or event_type in CHAT_EVENT_TYPES
+        )
+        if event_type in CHAT_EVENT_TYPES:
+            native_turn_id = _validated_native_turn_id(data)
+            if native_turn_id is _INVALID_NATIVE_TURN_ID:
+                return
+        if generation_scoped_event:
+            event_retry_count = data.get("task_retry_count")
+            event_turn_generation = data.get("task_turn_generation")
+            if (
+                type(event_retry_count) is not int
+                or type(event_turn_generation) is not int
+            ):
+                return
+            pre_observed = await self._observe_task_generation(
+                worker.id,
+                task_id,
+            )
+            if pre_observed is None:
+                return
+            if (
+                _has_worker_turn_handoff(pre_observed)
+                and event_retry_count
+                == pre_observed.worker_turn_handoff_retry_count
+                and event_turn_generation
+                == pre_observed.worker_turn_handoff_from_generation + 1
+            ):
+                worker_turn_handoff_id = (
+                    await self._launched_handoff_id_for_generation(
+                        worker,
+                        pre_observed,
+                        retry_count=event_retry_count,
+                        turn_generation=event_turn_generation,
+                    )
+                )
+                if worker_turn_handoff_id is None:
+                    return
+            observed = await self._observe_or_adopt_event_generation(
+                worker.id,
+                task_id,
+                retry_count=event_retry_count,
+                turn_generation=event_turn_generation,
+                worker_turn_handoff_id=worker_turn_handoff_id,
+            )
+        else:
+            observed = await self._observe_task_generation(worker.id, task_id)
         if observed is None:
             # Subscription state is only a routing hint.  The durable worker_id
             # assignment is the authority after migrations.
@@ -1084,12 +2516,10 @@ class WorkerRelay:
             )
             return
 
-        event_retry_count: int | None = None
         if event_type in CHAT_EVENT_TYPES:
-            event_retry_count = data.get("task_retry_count")
             if (
-                type(event_retry_count) is not int
-                or event_retry_count != observed.retry_count
+                event_retry_count != observed.retry_count
+                or event_turn_generation != observed.turn_generation
             ):
                 # Chat/result events are terminal evidence for generation-
                 # sensitive consumers such as PR Monitor.  A delayed event from
@@ -1103,6 +2533,17 @@ class WorkerRelay:
             async with self.db_factory() as db:
                 guard_values = {"status": observed.status}
                 if (
+                    worker_turn_handoff_id is not None
+                    and observed.worker_turn_handoff_id
+                    == worker_turn_handoff_id
+                    and observed.turn_generation
+                    == observed.worker_turn_handoff_from_generation + 1
+                ):
+                    # Clearing and persisting the exact G+1 event share this
+                    # transaction.  A crash before it commits leaves the
+                    # marker/recovery subscription intact.
+                    guard_values.update(_WORKER_TURN_HANDOFF_CLEAR_VALUES)
+                if (
                     data.get("role") == "assistant"
                     and event_type in ("message", "result")
                 ):
@@ -1115,10 +2556,21 @@ class WorkerRelay:
                 if guarded.rowcount != 1:
                     await db.rollback()
                     return
+                if worker_turn_handoff_id is not None and not (
+                    await _settle_manager_handoff_receipt(
+                        db,
+                        observed,
+                        status="completed",
+                    )
+                ):
+                    await db.rollback()
+                    return
                 entry = LogEntry(
                     instance_id=None,
                     task_id=task_id,
                     task_retry_count=event_retry_count,
+                    task_turn_generation=event_turn_generation,
+                    native_turn_id=native_turn_id,
                     event_type=event_type,
                     role=data.get("role"),
                     content=data.get("content"),
@@ -1140,10 +2592,15 @@ class WorkerRelay:
                             "instance_id",
                             "raw_json",
                             "task_retry_count",
+                            "task_turn_generation",
+                            "native_turn_id",
                         )
                     },
                 )
                 persisted_forward["task_retry_count"] = event_retry_count
+                persisted_forward["task_turn_generation"] = event_turn_generation
+                if native_turn_id is not None:
+                    persisted_forward["native_turn_id"] = native_turn_id
             # session_id 同步：worker 广播前 pop 了 session_id，首条事件到达时从 Worker 拉取
             if event_type == "system_init":
                 session_observed = await self._observe_task_generation(
@@ -1164,6 +2621,8 @@ class WorkerRelay:
                         remote_values is not None
                         and remote_values["retry_count"]
                         == session_observed.retry_count
+                        and remote_values["turn_generation"]
+                        == session_observed.turn_generation
                         and remote_values.get("session_id")
                     ):
                         async with self.db_factory() as db:
@@ -1219,11 +2678,19 @@ class WorkerRelay:
                 is not event_background_active
             ):
                 return
+            snapshot_handoff_id = (
+                await self._launched_handoff_id_for_snapshot(
+                    worker,
+                    observed,
+                    remote_task,
+                )
+            )
             async with self.db_factory() as db:
                 resulting = await apply_authoritative_worker_task(
                     db,
                     observed,
                     remote_task,
+                    worker_turn_handoff_id=snapshot_handoff_id,
                 )
             if (
                 resulting is None
@@ -1232,11 +2699,12 @@ class WorkerRelay:
                 ) != event_background_active
             ):
                 return
-            await self._publish_background_generation(
+            published = await self._publish_background_generation(
                 resulting,
                 channels=(channel,),
+                notify_completion=False,
             )
-            return
+            return resulting if published else None
 
         if event_type == "status_change":
             new_status = data.get("new_status")
@@ -1252,15 +2720,28 @@ class WorkerRelay:
                 or remote_task.get("status") != new_status
             ):
                 return
+            snapshot_handoff_id = (
+                await self._launched_handoff_id_for_snapshot(
+                    worker,
+                    observed,
+                    remote_task,
+                )
+            )
             async with self.db_factory() as db:
                 resulting = await apply_authoritative_worker_task(
                     db,
                     observed,
                     remote_task,
+                    worker_turn_handoff_id=snapshot_handoff_id,
                 )
             if resulting is not None:
-                await self._publish_status_generation(resulting, data)
-            return
+                published = await self._publish_status_generation(
+                    resulting,
+                    data,
+                    notify_completion=False,
+                )
+                return resulting if published else None
+            return None
 
         elif event_type == "context_usage":
             async with self.db_factory() as db:
@@ -1270,7 +2751,12 @@ class WorkerRelay:
                     .values(
                         context_window_usage={
                         k: v for k, v in data.items()
-                        if k not in ("event_type", "task_id")
+                        if k not in (
+                            "event_type",
+                            "task_id",
+                            "task_retry_count",
+                            "task_turn_generation",
+                        )
                         }
                     )
                 )
@@ -1289,11 +2775,19 @@ class WorkerRelay:
                 or remote_task.get("status") != "plan_review"
             ):
                 return
+            snapshot_handoff_id = (
+                await self._launched_handoff_id_for_snapshot(
+                    worker,
+                    observed,
+                    remote_task,
+                )
+            )
             async with self.db_factory() as db:
                 resulting = await apply_authoritative_worker_task(
                     db,
                     observed,
                     remote_task,
+                    worker_turn_handoff_id=snapshot_handoff_id,
                 )
             if resulting is None:
                 return
@@ -1429,6 +2923,36 @@ class WorkerRelay:
         *,
         sync_status: bool = True,
     ) -> set[int]:
+        """Backfill each Task while excluding chat/retry/migration mutations."""
+
+        from backend.services.worker_proxy import get_task_operation_lock
+
+        synced: set[int] = set()
+        for task_id in sorted(task_ids):
+            deferred_completions: list[WorkerTaskGeneration] = []
+            async with get_task_operation_lock(task_id):
+                synced.update(
+                    await self._backfill_missing_logs_with_operation_lock(
+                        worker,
+                        {task_id},
+                        sync_status=sync_status,
+                        deferred_completions=deferred_completions,
+                    )
+                )
+            # Dispatcher completion also takes this lock. Keep it outside the
+            # backfill fence for the same non-reentrant reason as live relay.
+            for generation in deferred_completions:
+                await self._notify_completed_pr_review(generation)
+        return synced
+
+    async def _backfill_missing_logs_with_operation_lock(
+        self,
+        worker: Worker,
+        task_ids: set[int],
+        *,
+        sync_status: bool = True,
+        deferred_completions: list[WorkerTaskGeneration] | None = None,
+    ) -> set[int]:
         """断连/重启后补日志。用「非 user_message 条数」对比（user_message 由
         chat 代理直接入 Manager DB，不经 relay，按总条数比会错位重复）。
 
@@ -1447,6 +2971,44 @@ class WorkerRelay:
                     )
                     if history_observed is None:
                         continue
+                    if (
+                        _has_worker_turn_handoff(history_observed)
+                        and history_observed.turn_generation
+                        == history_observed.worker_turn_handoff_from_generation
+                    ):
+                        await self._resume_accepted_worker_turn_handoff(
+                            worker,
+                            history_observed,
+                            attempts=1,
+                            client=client,
+                            operation_lock_held=True,
+                        )
+                        history_observed = await self._observe_task_generation(
+                            worker.id,
+                            tid,
+                        )
+                        if history_observed is None:
+                            continue
+                        if _has_worker_turn_handoff(history_observed):
+                            self.ensure_worker_turn_handoff_recovery(
+                                worker,
+                                history_observed,
+                            )
+                    history_handoff_id = None
+                    if (
+                        _has_worker_turn_handoff(history_observed)
+                        and history_observed.turn_generation
+                        == history_observed.worker_turn_handoff_from_generation + 1
+                    ):
+                        history_handoff_id = (
+                            await self._launched_handoff_id_for_generation(
+                                worker,
+                                history_observed,
+                                retry_count=history_observed.retry_count,
+                                turn_generation=history_observed.turn_generation,
+                                client=client,
+                            )
+                        )
                     history_response = await client.get(
                         self._api(
                             worker,
@@ -1464,103 +3026,213 @@ class WorkerRelay:
                             if not sync_status:
                                 continue
                         else:
-                            remote_non_user = [
+                            non_user_messages = [
                                 message
                                 for message in remote
                                 if isinstance(message, dict)
                                 and message.get("event_type") != "user_message"
-                                and type(message.get("task_retry_count")) is int
-                                and message["task_retry_count"]
-                                == history_observed.retry_count
                             ]
-                            async with self.db_factory() as db:
-                                guarded = await db.execute(
-                                    update(Task)
-                                    .where(
-                                        *worker_task_generation_predicates(
-                                            history_observed
-                                        )
-                                    )
-                                    .values(status=history_observed.status)
+                            scoped_messages = [
+                                message
+                                for message in non_user_messages
+                                if type(message.get("task_retry_count")) is int
+                                and type(
+                                    message.get("task_turn_generation")
+                                ) is int
+                                and _validated_native_turn_id(message)
+                                is not _INVALID_NATIVE_TURN_ID
+                            ]
+                            # Rows persisted by a pre-turn-generation Worker
+                            # legitimately serialize ``turn_generation=NULL``.
+                            # They are neither evidence nor import candidates,
+                            # but must not poison an otherwise exact current
+                            # terminal history after a rolling upgrade.
+                            legacy_unscoped_messages = [
+                                message
+                                for message in non_user_messages
+                                if message.get("task_turn_generation") is None
+                                and (
+                                    message.get("task_retry_count") is None
+                                    or type(message.get("task_retry_count")) is int
                                 )
-                                if guarded.rowcount != 1:
-                                    await db.rollback()
-                                else:
-                                    # Re-read after acquiring the Task
-                                    # generation lock so a live relay insert
-                                    # which won the race is included in
-                                    # fingerprint deduplication.
-                                    local_rows = (
-                                        await db.execute(
-                                            select(
-                                                LogEntry.event_type,
-                                                LogEntry.role,
-                                                LogEntry.content,
-                                                LogEntry.tool_name,
-                                                LogEntry.tool_input,
-                                                LogEntry.tool_output,
-                                                LogEntry.loop_iteration,
-                                            ).where(
-                                                LogEntry.task_id == tid,
-                                                LogEntry.task_retry_count
-                                                == history_observed.retry_count,
-                                                LogEntry.event_type
-                                                != "user_message",
-                                            )
+                                and _validated_native_turn_id(message)
+                                is not _INVALID_NATIVE_TURN_ID
+                            ]
+                            history_protocol_valid = (
+                                all(isinstance(message, dict) for message in remote)
+                                and len(scoped_messages)
+                                + len(legacy_unscoped_messages)
+                                == len(non_user_messages)
+                            )
+                            remote_non_user = [
+                                message
+                                for message in scoped_messages
+                                if message["task_retry_count"]
+                                == history_observed.retry_count
+                                and message["task_turn_generation"]
+                                == history_observed.turn_generation
+                            ] if history_protocol_valid else []
+                            # A non-empty history whose non-user records all
+                            # belong to another generation normally cannot
+                            # prove that the current generation's tail was
+                            # returned.  One exact exception is a terminal G+1
+                            # already proven by its launched handoff receipt:
+                            # a successful full-history response may
+                            # legitimately contain only G's old assistant tail
+                            # plus G+1's user row.  In that case the empty
+                            # current-generation non-user slice is itself the
+                            # complete terminal tail and may settle the marker.
+                            terminal_empty_handoff_history = bool(
+                                history_handoff_id is not None
+                                and history_observed.status
+                                in _TERMINAL_TASK_STATUSES
+                                and not remote_non_user
+                            )
+                            history_protocol_valid = (
+                                history_protocol_valid
+                                and (
+                                    not non_user_messages
+                                    or bool(remote_non_user)
+                                    or terminal_empty_handoff_history
+                                )
+                            )
+                            if not history_protocol_valid:
+                                logger.warning(
+                                    "worker %s returned unscoped or non-current "
+                                    "history for task %s generation %s/%s",
+                                    worker.id,
+                                    tid,
+                                    history_observed.retry_count,
+                                    history_observed.turn_generation,
+                                )
+                            else:
+                                async with self.db_factory() as db:
+                                    guard_values = {
+                                        "status": history_observed.status
+                                    }
+                                    clearing_history_handoff = bool(
+                                        history_handoff_id is not None
+                                        and (
+                                            remote_non_user
+                                            or history_observed.status
+                                            in _TERMINAL_TASK_STATUSES
                                         )
-                                    ).all()
-                                    local_entries = [
-                                        dict(row._mapping)
-                                        for row in local_rows
-                                    ]
-                                    missing = _missing_by_fingerprint(
-                                        local_entries,
-                                        remote_non_user,
                                     )
-                                    for message in missing:
-                                        db.add(
-                                            LogEntry(
-                                                instance_id=None,
-                                                task_id=tid,
-                                                task_retry_count=(
-                                                    history_observed.retry_count
-                                                ),
-                                                event_type=(
-                                                    message.get("event_type")
-                                                    or "message"
-                                                ),
-                                                role=message.get("role"),
-                                                content=message.get("content"),
-                                                tool_name=message.get(
-                                                    "tool_name"
-                                                ),
-                                                tool_input=message.get(
-                                                    "tool_input"
-                                                ),
-                                                tool_output=message.get(
-                                                    "tool_output"
-                                                ),
-                                                raw_json=message.get(
-                                                    "raw_json"
-                                                ),
-                                                is_error=message.get(
-                                                    "is_error",
-                                                    False,
-                                                ),
-                                                loop_iteration=message.get(
-                                                    "loop_iteration"
-                                                ),
+                                    if clearing_history_handoff:
+                                        # The exact remote history and its
+                                        # local copies commit together with
+                                        # marker cleanup.  A crash on either
+                                        # side leaves recover() subscribed.
+                                        guard_values.update(
+                                            _WORKER_TURN_HANDOFF_CLEAR_VALUES
+                                        )
+                                    guarded = await db.execute(
+                                        update(Task)
+                                        .where(
+                                            *worker_task_generation_predicates(
+                                                history_observed
                                             )
                                         )
-                                    await db.commit()
-                                    history_synced.add(tid)
-                                    if missing:
-                                        logger.info(
-                                            "backfilled %d log entries for "
-                                            "task %s",
-                                            len(missing),
-                                            tid,
+                                        .values(**guard_values)
+                                    )
+                                    if guarded.rowcount != 1:
+                                        await db.rollback()
+                                    else:
+                                        if clearing_history_handoff and not (
+                                            await _settle_manager_handoff_receipt(
+                                                db,
+                                                history_observed,
+                                                status="completed",
+                                            )
+                                        ):
+                                            await db.rollback()
+                                            continue
+                                        # Re-read after acquiring the Task
+                                        # generation lock so a live relay
+                                        # insert which won the race is included
+                                        # in fingerprint deduplication.
+                                        local_rows = (
+                                            await db.execute(
+                                                select(
+                                                    LogEntry.event_type,
+                                                    LogEntry.role,
+                                                    LogEntry.content,
+                                                    LogEntry.tool_name,
+                                                    LogEntry.tool_input,
+                                                    LogEntry.tool_output,
+                                                    LogEntry.loop_iteration,
+                                                    LogEntry.native_turn_id,
+                                                ).where(
+                                                    LogEntry.task_id == tid,
+                                                    LogEntry.task_retry_count
+                                                    == history_observed.retry_count,
+                                                    LogEntry.task_turn_generation
+                                                    == history_observed.turn_generation,
+                                                    LogEntry.event_type
+                                                    != "user_message",
+                                                )
+                                            )
+                                        ).all()
+                                        local_entries = [
+                                            dict(row._mapping)
+                                            for row in local_rows
+                                        ]
+                                        missing = _missing_by_fingerprint(
+                                            local_entries,
+                                            remote_non_user,
                                         )
+                                        for message in missing:
+                                            db.add(
+                                                LogEntry(
+                                                    instance_id=None,
+                                                    task_id=tid,
+                                                    task_retry_count=(
+                                                        history_observed.retry_count
+                                                    ),
+                                                    task_turn_generation=(
+                                                        history_observed.turn_generation
+                                                    ),
+                                                    native_turn_id=(
+                                                        _validated_native_turn_id(
+                                                            message
+                                                        )
+                                                    ),
+                                                    event_type=(
+                                                        message.get("event_type")
+                                                        or "message"
+                                                    ),
+                                                    role=message.get("role"),
+                                                    content=message.get("content"),
+                                                    tool_name=message.get(
+                                                        "tool_name"
+                                                    ),
+                                                    tool_input=message.get(
+                                                        "tool_input"
+                                                    ),
+                                                    tool_output=message.get(
+                                                        "tool_output"
+                                                    ),
+                                                    raw_json=message.get(
+                                                        "raw_json"
+                                                    ),
+                                                    is_error=message.get(
+                                                        "is_error",
+                                                        False,
+                                                    ),
+                                                    loop_iteration=message.get(
+                                                        "loop_iteration"
+                                                    ),
+                                                )
+                                            )
+                                        await db.commit()
+                                        history_synced.add(tid)
+                                        if missing:
+                                            logger.info(
+                                                "backfilled %d log entries for "
+                                                "task %s",
+                                                len(missing),
+                                                tid,
+                                            )
 
                     if not sync_status:
                         continue
@@ -1582,26 +3254,91 @@ class WorkerRelay:
                     )
                     if remote_task is None:
                         continue
+                    snapshot_handoff_id = (
+                        await self._launched_handoff_id_for_snapshot(
+                            worker,
+                            status_observed,
+                            remote_task,
+                            client=client,
+                        )
+                    )
                     async with self.db_factory() as db:
                         resulting = await apply_authoritative_worker_task(
                             db,
                             status_observed,
                             remote_task,
+                            worker_turn_handoff_id=snapshot_handoff_id,
                         )
+                    generation_advanced = bool(
+                        resulting is not None
+                        and (
+                            resulting.retry_count
+                            != status_observed.retry_count
+                            or resulting.turn_generation
+                            != status_observed.turn_generation
+                        )
+                    )
+                    if generation_advanced:
+                        # A recovery snapshot can be the first exact evidence
+                        # for a reserved G+1.  The history request above was
+                        # deliberately fenced to G, so immediately re-read the
+                        # same Worker history under the adopted identity before
+                        # releasing the operation lock.  Otherwise a completed
+                        # G+1 could clear the marker and never be selected by a
+                        # later recovery pass, permanently losing its tail.
+                        exact_synced = await (
+                            self._backfill_missing_logs_with_operation_lock(
+                                worker,
+                                {tid},
+                                sync_status=False,
+                                deferred_completions=deferred_completions,
+                            )
+                        )
+                        if tid in exact_synced:
+                            history_synced.add(tid)
+                            # Exact history may have cleared the durable
+                            # handoff marker.  Completion publication must use
+                            # that post-commit generation, otherwise its CAS
+                            # still expects the now-removed marker and silently
+                            # loses the terminal notification.
+                            resulting = await self._observe_task_generation(
+                                worker.id,
+                                tid,
+                            )
+                        else:
+                            history_synced.discard(tid)
                     if (
                         resulting is not None
                         and resulting.status != status_observed.status
                     ):
-                        await self._publish_status_generation(resulting)
+                        published = await self._publish_status_generation(
+                            resulting,
+                            notify_completion=False,
+                        )
+                        if published and deferred_completions is not None:
+                            deferred_completions.append(resulting)
                     elif (
                         resulting is not None
                         and resulting.pty_background_generation
                         != status_observed.pty_background_generation
                     ):
-                        await self._publish_background_generation(
+                        published = await self._publish_background_generation(
                             resulting,
                             channels=("tasks", f"task:{tid}"),
+                            notify_completion=False,
                         )
+                        if published and deferred_completions is not None:
+                            deferred_completions.append(resulting)
+                    elif (
+                        generation_advanced
+                        and tid in history_synced
+                        and deferred_completions is not None
+                    ):
+                        # A same-status completed G -> G+1 recovery has no
+                        # status/background publication to trigger the Manager
+                        # PR finalizer. Exact history synchronization is still
+                        # a complete terminal notification boundary.
+                        deferred_completions.append(resulting)
                 except Exception:
                     logger.exception("backfill task %s from worker %s failed", tid, worker.id)
         return history_synced

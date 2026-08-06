@@ -24,6 +24,7 @@ def _install_settling_failed_stop(instance_manager, db_factory):
         instance_id,
         *,
         expected_task_id,
+        expected_task_turn_generation,
         expected_pid,
         expected_started_at,
         task_status,
@@ -39,6 +40,7 @@ def _install_settling_failed_stop(instance_manager, db_factory):
             task = await db.get(Task, expected_task_id)
             instance = await db.get(Instance, instance_id)
             assert task.status == "failed"
+            assert task.turn_generation == expected_task_turn_generation
             assert instance.current_task_id == expected_task_id
             assert instance.pid == expected_pid
             assert instance.started_at == expected_started_at
@@ -316,6 +318,7 @@ async def test_cancel_adopts_marker_only_handoff_and_awaits_exact_stop(
     instance_manager.stop.assert_awaited_once_with(
         instance_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=0,
         expected_pid=6060,
         expected_started_at=started_at,
         terminal_consumer_timeout=30.0,
@@ -708,7 +711,7 @@ async def test_ralph_completion_adopts_marker_only_pty_handoff(db_factory):
     )
 
     assert resulting is not None
-    assert resulting[-1] == "native-tail-epoch"
+    assert resulting[-2] == "native-tail-epoch"
     async with db_factory() as db:
         current = await db.get(Task, task_id)
         assert current.status == "completed"
@@ -766,7 +769,7 @@ async def test_ralph_completion_retries_when_marker_clears_quickly(db_factory):
 
     assert attempts == 2
     assert resulting is not None
-    assert resulting[-1] is None
+    assert resulting[-2] is None
     async with db_factory() as db:
         current = await db.get(Task, task_id)
         assert current.status == "completed"
@@ -873,6 +876,7 @@ async def test_unexpected_error_fails_claim_before_reaping_exact_process(
     instance_manager.stop.assert_awaited_once_with(
         instance_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=0,
         expected_pid=process.pid,
         expected_started_at=datetime(2026, 2, 3, 4, 5, 6),
         task_status="failed",
@@ -937,6 +941,7 @@ async def test_unexpected_failure_clears_settled_marker_and_owner(
     instance_manager.stop.assert_awaited_once_with(
         instance_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=0,
         expected_pid=process.pid,
         expected_started_at=datetime(2026, 4, 5, 7, 8, 9),
         task_status="failed",
@@ -1195,6 +1200,7 @@ async def test_unexpected_error_suppresses_failed_event_after_rapid_retry(
         stopped_instance_id,
         *,
         expected_task_id,
+        expected_task_turn_generation,
         expected_pid,
         expected_started_at,
         task_status,
@@ -1204,6 +1210,7 @@ async def test_unexpected_error_suppresses_failed_event_after_rapid_retry(
     ):
         assert stopped_instance_id == instance_id
         assert expected_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert expected_pid == process.pid
         assert expected_started_at == datetime(2026, 3, 4, 5, 6, 7)
         assert task_status == "failed"
@@ -1426,6 +1433,7 @@ async def test_successful_stop_does_not_touch_immediate_same_instance_reclaim(
         stopped_instance_id,
         *,
         expected_task_id,
+        expected_task_turn_generation,
         expected_pid,
         expected_started_at,
         terminal_consumer_timeout,
@@ -1433,6 +1441,7 @@ async def test_successful_stop_does_not_touch_immediate_same_instance_reclaim(
     ):
         assert stopped_instance_id == instance_id
         assert expected_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert expected_pid == 1001
         assert expected_started_at is None
         assert terminal_consumer_timeout == 30.0
@@ -1511,6 +1520,7 @@ async def test_failed_stop_does_not_overwrite_new_same_task_instance_generation(
         stopped_instance_id,
         *,
         expected_task_id,
+        expected_task_turn_generation,
         expected_pid,
         expected_started_at,
         terminal_consumer_timeout,
@@ -1518,6 +1528,7 @@ async def test_failed_stop_does_not_overwrite_new_same_task_instance_generation(
     ):
         assert stopped_instance_id == instance_id
         assert expected_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert expected_pid == 3456
         assert expected_started_at == old_started_at
         assert terminal_consumer_timeout == 30.0
@@ -1599,6 +1610,7 @@ async def test_cancel_cleanup_failure_never_requeues_possibly_live_process(
     instance_manager.stop.assert_awaited_once_with(
         instance_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=0,
         expected_pid=43210,
         expected_started_at=None,
         terminal_consumer_timeout=30.0,

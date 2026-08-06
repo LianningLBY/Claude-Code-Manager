@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from sqlalchemy import Integer, String, Text, DateTime, Boolean, Index
+from sqlalchemy import BigInteger, Integer, String, Text, DateTime, Boolean, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -23,6 +23,16 @@ class LogEntry(Base):
     # evidence for generation-sensitive workflows such as PR Monitor.
     task_retry_count: Mapped[int | None] = mapped_column(
         Integer,
+        nullable=True,
+    )
+    # Immutable logical/native turn identity captured by the producer. These
+    # remain NULL only for legacy and genuinely non-turn-scoped events.
+    task_turn_generation: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
+    native_turn_id: Mapped[str | None] = mapped_column(
+        String(200),
         nullable=True,
     )
     event_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)

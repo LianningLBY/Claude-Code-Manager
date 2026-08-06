@@ -1425,6 +1425,7 @@ async def test_safety_reset_handles_db_error(db_factory):
             worker_id=None,
             shared_from_id=None,
             retry_count=0,
+            turn_generation=0,
             instance_id=99999,
             started_at=None,
             completed_at=None,

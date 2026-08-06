@@ -217,6 +217,8 @@ async def test_public_create_freezes_server_owned_contract(
     assert invocation["purpose"] == "advisory"
     assert invocation["resume_policy"] == "attach_only"
     assert invocation["executor_kind"] == "fake_plan"
+    assert invocation["request_output_log_id"] is None
+    assert invocation["request_native_turn_id"] is None
     assert "executor_config" not in invocation
     assert "policy_snapshot" not in invocation
     assert invocation["active_execution"]["status"] == "queued"

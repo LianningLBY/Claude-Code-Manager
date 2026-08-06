@@ -90,6 +90,16 @@ async def test_create_monitor_session(client, session_factory):
     assert data["max_checks"] == 10
     assert data["task_id"] == task_id
     mock_dispatcher.start_monitor_session.assert_called_once()
+    mock_dispatcher.broadcaster.broadcast.assert_awaited_once_with(
+        f"task:{task_id}",
+        {
+            "event": "monitor_session_created",
+            "monitor_session_id": data["id"],
+            "description": "watch build",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -741,6 +751,16 @@ async def test_delete_monitor_session(client, session_factory):
     mock_dispatcher.stop_monitor_session_process.assert_awaited_once_with(
         ms_id,
         terminal=True,
+    )
+    mock_dispatcher.broadcaster.broadcast.assert_awaited_once_with(
+        f"task:{task_id}",
+        {
+            "event": "monitor_session_status",
+            "monitor_session_id": ms_id,
+            "status": "cancelled",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
     )
 
     async with session_factory() as db:

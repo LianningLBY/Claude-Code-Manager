@@ -642,6 +642,7 @@ class CodexTurnProcess:
     ) -> None:
         self.pid = pid
         self.thread_id = thread_id
+        self.native_turn_id: str | None = None
         self.unsubscribe_on_terminal = False
         self.returncode: int | None = None
         self.termination_kind: str | None = None
@@ -959,6 +960,7 @@ class CodexAppServer:
         ):
             self._contexts_by_turn.pop(old_turn_id, None)
         context.turn_id = turn_id
+        context.process.native_turn_id = turn_id
         if observed:
             context.observed_turn_id = turn_id
         self._contexts_by_turn[turn_id] = context
@@ -3211,20 +3213,6 @@ class CodexAppServer:
                 self._attach_descendant(context, child_id, active=None)
         # Persist the native thread id through the same event path as exec.
         turn_process.feed({"type": "thread.started", "thread_id": thread_id})
-        if on_turn_prepared is not None:
-            try:
-                # Publish the adapter before turn/start goes on the wire. This
-                # closes the last shutdown/maintenance window in which model
-                # work could exist without an exact in-memory owner.
-                await on_turn_prepared(turn_process, thread_id)
-            except BaseException:
-                self._detach_turn_context(context)
-                turn_process.finish(
-                    1,
-                    "Codex turn ownership preparation failed",
-                )
-                raise
-
         if (
             tools_disabled
             and (
@@ -3232,9 +3220,8 @@ class CodexAppServer:
                 or self._skills_revision != tool_free_skills_revision
             )
         ):
-            # The ownership hook above may await durable state. Recheck the
-            # inventory generation at the final boundary before model input
-            # goes on the wire.
+            # Recheck the inventory generation at the final pure-preflight
+            # boundary before publishing durable launch ownership.
             reason = (
                 "Codex tool-free skills inventory changed before turn/start"
             )
@@ -3293,6 +3280,37 @@ class CodexAppServer:
                 "excludeTmpdirEnvVar": False,
                 "excludeSlashTmp": False,
             }
+        if on_turn_prepared is not None:
+            try:
+                # All fallible pure preflight is complete. Publish the exact
+                # adapter immediately before either Goal steering or
+                # turn/start can send model input.
+                await on_turn_prepared(turn_process, thread_id)
+            except BaseException:
+                self._detach_turn_context(context)
+                turn_process.finish(
+                    1,
+                    "Codex turn ownership preparation failed",
+                )
+                raise
+        if (
+            tools_disabled
+            and (
+                tool_free_skills_revision is None
+                or self._skills_revision != tool_free_skills_revision
+            )
+        ):
+            # This is not retryable preflight: the ownership callback has
+            # already crossed the durable ``launching`` boundary. It is a
+            # final TOCTOU safety invariant so a skills change during that
+            # awaited commit cannot widen a tool-free turn.
+            reason = (
+                "Codex tool-free skills inventory changed while publishing "
+                "launch ownership"
+            )
+            self._detach_turn_context(context)
+            turn_process.finish(1, reason)
+            raise CodexRequiredMcpPreTurnError(reason)
         if adopt_active_goal:
             self._mark_following_native_goal(context)
             adoption = asyncio.create_task(

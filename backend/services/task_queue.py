@@ -179,6 +179,7 @@ TaskGenerationFence = tuple[
     datetime | None,
     datetime | None,
     str | None,
+    int,
 ]
 
 TaskDeleteFence = tuple[
@@ -189,6 +190,7 @@ TaskDeleteFence = tuple[
     datetime | None,
     datetime | None,
     str | None,
+    int,
 ]
 
 
@@ -201,6 +203,7 @@ def task_generation_fence(task: Task) -> TaskGenerationFence:
         task.started_at,
         task.completed_at,
         task.pty_background_generation,
+        task.turn_generation,
     )
 
 
@@ -215,6 +218,7 @@ def task_delete_fence(task: Task) -> TaskDeleteFence:
         task.started_at,
         task.completed_at,
         task.pty_background_generation,
+        task.turn_generation,
     )
 
 
@@ -230,6 +234,7 @@ def append_task_generation_predicates(
         expected_started_at,
         expected_completed_at,
         expected_background_generation,
+        expected_turn_generation,
     ) = generation_fence
     predicates.extend(
         [
@@ -255,6 +260,7 @@ def append_task_generation_predicates(
                 else Task.pty_background_generation
                 == expected_background_generation
             ),
+            Task.turn_generation == expected_turn_generation,
         ]
     )
 
@@ -465,6 +471,7 @@ class TaskQueue:
             observed_started_at,
             observed_completed_at,
             observed_background_generation,
+            observed_turn_generation,
         ) = expected_fence or task_delete_fence(task)
         if (
             not remote_worker_deleted
@@ -510,6 +517,7 @@ class TaskQueue:
                 else Task.worker_id == observed_worker_id
             ),
             Task.retry_count == observed_retry_count,
+            Task.turn_generation == observed_turn_generation,
             (
                 Task.instance_id.is_(None)
                 if observed_instance_id is None
@@ -1002,6 +1010,7 @@ class TaskQueue:
                 "status": "in_progress",
                 "started_at": datetime.utcnow(),
                 "error_message": None,
+                "turn_generation": Task.turn_generation + 1,
             }
             if instance_id is not None:
                 values["instance_id"] = instance_id

@@ -199,6 +199,7 @@ class RalphLoop:
             instance_id=instance_id,
             prompt=_prepend_task_artifact_policy(task, prompt),
             task_id=task.id,
+            task_turn_generation=task.turn_generation,
             cwd=cwd,
             model=task.model,
             codex_service_tier=task.codex_service_tier,
@@ -308,6 +309,8 @@ class RalphLoop:
                     or current.status not in ("in_progress", "executing")
                     or task_generation_fence(current)[:4]
                     != foreground_generation[:4]
+                    or task_generation_fence(current)[-1]
+                    != foreground_generation[-1]
                 ):
                     await db.rollback()
                     return None
@@ -334,6 +337,7 @@ class RalphLoop:
                 or current.retry_count != foreground_generation[0]
                 or current.instance_id != foreground_generation[1]
                 or current.started_at != foreground_generation[2]
+                or current.turn_generation != foreground_generation[-1]
                 or current.completed_at is None
             ):
                 await db.rollback()
@@ -366,6 +370,7 @@ class RalphLoop:
             original_started_at,
             original_completed_at,
             original_background_generation,
+            original_turn_generation,
         ) = original_generation
         expected_retry_count = original_retry_count + retry_count_delta
         expected_instance_id = None if released else original_instance_id
@@ -379,6 +384,7 @@ class RalphLoop:
                 or current.retry_count != expected_retry_count
                 or current.instance_id != expected_instance_id
                 or current.started_at != expected_started_at
+                or current.turn_generation != original_turn_generation
                 or current.pty_background_generation
                 != original_background_generation
                 or (
@@ -650,6 +656,8 @@ class RalphLoop:
                 or task.status != "failed"
                 or task_generation_fence(task)[:4]
                 != task_generation[:4]
+                or task_generation_fence(task)[-1]
+                != task_generation[-1]
                 or task.pty_background_generation is not None
             ):
                 await db.rollback()
@@ -716,6 +724,8 @@ class RalphLoop:
                     or current.status not in ("in_progress", "executing")
                     or task_generation_fence(current)[:4]
                     != observed_generation[:4]
+                    or task_generation_fence(current)[-1]
+                    != observed_generation[-1]
                 ):
                     return
                 # A PTY idle callback can arm or settle the detached marker
@@ -745,6 +755,7 @@ class RalphLoop:
                 stopped = await self.instance_manager.stop(
                     instance_id,
                     expected_task_id=task_id,
+                    expected_task_turn_generation=current_generation[-1],
                     expected_pid=instance_snapshot[1],
                     expected_started_at=instance_snapshot[3],
                     terminal_consumer_timeout=30.0,
@@ -868,6 +879,8 @@ class RalphLoop:
                 or current.instance_id != instance_id
                 or task_generation_fence(current)[:4]
                 != observed_generation[:4]
+                or task_generation_fence(current)[-1]
+                != observed_generation[-1]
             ):
                 return
             (
@@ -876,6 +889,7 @@ class RalphLoop:
                 expected_started_at,
                 expected_completed_at,
                 expected_background_generation,
+                expected_turn_generation,
             ) = task_generation_fence(current)
             if instance is not None:
                 instance_snapshot = (
@@ -893,6 +907,7 @@ class RalphLoop:
                 Task.status.in_(("in_progress", "executing")),
                 Task.instance_id == instance_id,
                 Task.retry_count == expected_retry_count,
+                Task.turn_generation == expected_turn_generation,
                 (
                     Task.started_at.is_(None)
                     if expected_started_at is None
@@ -940,6 +955,7 @@ class RalphLoop:
             expected_started_at,
             persisted_failed_at,
             expected_background_generation,
+            expected_turn_generation,
         )
         publication_generation = failed_generation
         cleanup_error: Exception | None = None
@@ -953,6 +969,9 @@ class RalphLoop:
                     stopped = await self.instance_manager.stop(
                         instance_id,
                         expected_task_id=task_id,
+                        expected_task_turn_generation=(
+                            expected_turn_generation
+                        ),
                         expected_pid=instance_snapshot[1],
                         expected_started_at=instance_snapshot[3],
                         task_status="failed",

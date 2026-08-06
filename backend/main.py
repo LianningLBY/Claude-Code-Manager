@@ -478,6 +478,7 @@ async def _shutdown_runtime_services(
     upload_cleanup_task,
     tmp_cleanup_task,
     backup_svc,
+    worker_relay_recovery_task=None,
     pr_review_recovery_task=None,
 ) -> None:
     """Run every shutdown stage and re-raise the first teardown failure."""
@@ -491,6 +492,7 @@ async def _shutdown_runtime_services(
     background_tasks = [
         task
         for task in (
+            worker_relay_recovery_task,
             heartbeat_task,
             worker_health_task,
             upload_cleanup_task,
@@ -587,6 +589,16 @@ async def _shutdown_runtime_services(
         failures.append(exc)
         logger.exception("Capability coordinator shutdown failed")
 
+    # Relay recovery and health producers are already quiescent above. Close
+    # relay-owned sockets/tasks before Dispatcher starts dismantling the local
+    # execution paths that accepted Worker handoffs depend on.
+    if worker_relay is not None:
+        try:
+            await worker_relay.shutdown()
+        except BaseException as exc:
+            failures.append(exc)
+            logger.exception("Worker relay shutdown failed")
+
     # Close every Dispatcher admission path before taking down transports.
     # A failure is retained, but later cleanup must still run: those transports
     # may be the only remaining handles capable of reaping child processes.
@@ -654,6 +666,8 @@ async def _start_execution_runtimes() -> None:
 
     if settings.auto_start_dispatcher:
         await dispatcher.start()
+    if worker_relay is not None:
+        await worker_relay.start()
     # This remains active when capability admission is disabled: it must still
     # recover/cancel work that was already running before a feature rollback.
     await capability_coordinator.start()
@@ -807,13 +821,16 @@ async def _runtime_lifespan(app: FastAPI):
     await _ensure_claude_warmup()
     await _start_execution_runtimes()
     pr_review_recovery_task = None
+    worker_relay_recovery_task = None
 
     # Worker 健康监控循环 + Manager 重启后恢复所有 relay 连接
     worker_health_task = None
     if worker_provisioner is not None:
         import asyncio as _asyncio
         worker_health_task = _asyncio.create_task(worker_provisioner.health_check_loop())
-        _asyncio.create_task(_recover_worker_relays())
+        worker_relay_recovery_task = _asyncio.create_task(
+            _recover_worker_relays()
+        )
 
     # Recover shared task relays
 
@@ -861,6 +878,7 @@ async def _runtime_lifespan(app: FastAPI):
         await _shutdown_runtime_services(
             heartbeat_task=heartbeat_task,
             worker_health_task=worker_health_task,
+            worker_relay_recovery_task=worker_relay_recovery_task,
             upload_cleanup_task=upload_cleanup_task,
             tmp_cleanup_task=tmp_cleanup_task,
             backup_svc=backup_svc,

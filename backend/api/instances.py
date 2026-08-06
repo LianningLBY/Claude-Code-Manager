@@ -131,10 +131,45 @@ async def _reconcile_dead_terminal_pid(
     return bool(reconciled.rowcount)
 
 
+def _instance_response(
+    instance: Instance,
+    *,
+    task_retry_count: int | None,
+    task_turn_generation: int | None,
+) -> InstanceResponse:
+    """Expose the exact Task generation currently owned by an Instance."""
+
+    return InstanceResponse.model_validate(instance).model_copy(
+        update={
+            "current_task_retry_count": task_retry_count,
+            "current_task_turn_generation": task_turn_generation,
+        }
+    )
+
+
+def _instance_with_task_generation_query():
+    return select(
+        Instance,
+        Task.retry_count,
+        Task.turn_generation,
+    ).outerjoin(Task, Task.id == Instance.current_task_id)
+
+
 @router.get("", response_model=list[InstanceResponse])
 async def list_instances(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Instance).order_by(Instance.id))
-    return list(result.scalars().all())
+    rows = (
+        await db.execute(
+            _instance_with_task_generation_query().order_by(Instance.id)
+        )
+    ).all()
+    return [
+        _instance_response(
+            instance,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+        )
+        for instance, task_retry_count, task_turn_generation in rows
+    ]
 
 
 @router.post("", response_model=InstanceResponse, status_code=201)
@@ -241,10 +276,21 @@ async def cleanup_instances(request: Request, db: AsyncSession = Depends(get_db)
 
 @router.get("/{instance_id}", response_model=InstanceResponse)
 async def get_instance(instance_id: int, db: AsyncSession = Depends(get_db)):
-    instance = await db.get(Instance, instance_id)
-    if not instance:
+    row = (
+        await db.execute(
+            _instance_with_task_generation_query().where(
+                Instance.id == instance_id
+            )
+        )
+    ).one_or_none()
+    if row is None:
         raise HTTPException(404, "Instance not found")
-    return instance
+    instance, task_retry_count, task_turn_generation = row
+    return _instance_response(
+        instance,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+    )
 
 
 @router.delete("/{instance_id}")
@@ -335,36 +381,55 @@ async def stop_instance(
     instance = await db.get(Instance, instance_id)
     if instance is None:
         raise HTTPException(404, "Instance not found")
-    if (
-        instance.current_plan_run_id is not None
-        or
-        instance.current_task_id != body.expected_task_id
-        or instance.pid != body.expected_pid
-        or instance.started_at != body.expected_started_at
-    ):
+    exact_owner = (
+        await db.execute(
+            select(Instance, Task)
+            .join(Task, Task.id == Instance.current_task_id)
+            .where(
+                Instance.id == instance_id,
+                Instance.current_plan_run_id.is_(None),
+                Instance.current_task_id == body.expected_task_id,
+                (
+                    Instance.pid.is_(None)
+                    if body.expected_pid is None
+                    else Instance.pid == body.expected_pid
+                ),
+                (
+                    Instance.started_at.is_(None)
+                    if body.expected_started_at is None
+                    else Instance.started_at == body.expected_started_at
+                ),
+                Task.id == body.expected_task_id,
+                Task.instance_id == instance_id,
+                Task.turn_generation
+                == body.expected_task_turn_generation,
+            )
+        )
+    ).one_or_none()
+    if exact_owner is None:
         raise HTTPException(
             409,
-            "Instance process generation changed; refresh before stopping",
+            "Instance Task or process generation changed; refresh before stopping",
         )
-    if instance.current_task_id is not None:
-        task = await db.get(Task, instance.current_task_id)
-        if task is None:
-            raise HTTPException(
-                409,
-                "Instance Task ownership cannot be verified; process was not stopped",
-            )
-        if task.mode == "delivery_loop" or task.delivery_run_id is not None:
-            raise HTTPException(
-                409,
-                "Delivery Developer instances are controlled by DeliveryRun; "
-                "the process was not stopped",
-            )
-        if is_pr_sandbox_task(task):
-            raise HTTPException(
-                409,
-                "Automated PR and Delivery Capability reviewer instances are "
-                "workflow-controlled; the process was not stopped",
-            )
+    instance, task = exact_owner
+    if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+        raise HTTPException(
+            409,
+            "Delivery Developer instances are controlled by DeliveryRun; "
+            "the process was not stopped",
+        )
+    if is_pr_sandbox_task(task):
+        raise HTTPException(
+            409,
+            "Automated PR and Delivery Capability reviewer instances are "
+            "workflow-controlled; the process was not stopped",
+        )
+
+    # Do not retain the admission snapshot while Ralph/InstanceManager acquire
+    # their own lifecycle locks and may commit a newer Task turn. The stop call
+    # independently revalidates this exact generation under that lock, and a
+    # failed stop below must start a fresh read on MySQL REPEATABLE READ.
+    await db.rollback()
 
     # Stop the producer first so it cannot claim another task immediately after
     # InstanceManager has reaped the current process.
@@ -377,6 +442,9 @@ async def stop_instance(
     ok = await instance_manager.stop(
         instance_id,
         expected_task_id=body.expected_task_id,
+        expected_task_turn_generation=(
+            body.expected_task_turn_generation
+        ),
         expected_pid=body.expected_pid,
         expected_started_at=body.expected_started_at,
         terminal_consumer_timeout=30.0,
@@ -386,9 +454,14 @@ async def stop_instance(
         db.expire_all()
         remaining_exact_owner = await db.scalar(
             select(Instance.id)
+            .join(Task, Task.id == Instance.current_task_id)
             .where(
                 Instance.id == instance_id,
                 Instance.current_task_id == body.expected_task_id,
+                Task.id == body.expected_task_id,
+                Task.instance_id == instance_id,
+                Task.turn_generation
+                == body.expected_task_turn_generation,
                 (
                     Instance.pid.is_(None)
                     if body.expected_pid is None

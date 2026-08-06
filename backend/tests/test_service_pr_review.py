@@ -2505,6 +2505,7 @@ async def test_recover_superseding_intent_creates_replacement_after_cleanup(
             stopped=False,
             cleared_messages=0,
             retry_count=current.retry_count,
+            turn_generation=current.turn_generation,
             instance_id=current.instance_id,
             started_at=current.started_at,
             completed_at=current.completed_at,

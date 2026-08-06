@@ -2,6 +2,7 @@ import asyncio
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.models.user_skill import UserSkill
 from backend.api.uploads import (
     UploadAttachmentValidationError,
@@ -40,6 +42,8 @@ from backend.services.pr_review_runtime import (
 )
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import (
+    acknowledge_worker_turn_handoff,
+    reserve_worker_turn_handoff,
     worker_task_generation,
     worker_task_generation_predicates,
 )
@@ -56,6 +60,7 @@ def _plan_delivery_digest(payload: dict) -> str:
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
+            allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
 
@@ -123,12 +128,140 @@ class ChatMessage(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
+    # Manager -> Worker only.  This is the durable identity of one ordinary
+    # follow-up while the two databases move from logical turn G to G+1.  The
+    # Worker stores it with the exact user row/queue envelope and does not
+    # report it as launched until that row is bound to G+1.
+    worker_turn_handoff_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+    )
+    worker_turn_handoff_retry_count: int | None = Field(default=None, ge=0)
+    worker_turn_handoff_from_generation: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_plan_attachment_generation(self):
         if self.plan_task_ids and self.plan_version_ids:
             raise ValueError("Use plan_version_ids or legacy plan_task_ids, not both")
+        handoff = (
+            self.worker_turn_handoff_id,
+            self.worker_turn_handoff_retry_count,
+            self.worker_turn_handoff_from_generation,
+        )
+        if any(value is not None for value in handoff) and not all(
+            value is not None for value in handoff
+        ):
+            raise ValueError("Worker turn handoff fields must be provided together")
         return self
+
+
+def _worker_turn_handoff_request_identity(
+    body: ChatMessage,
+    admitted_routing: tuple[str, str | None, str],
+) -> dict:
+    """Canonical immutable Manager -> Worker request, excluding its receipt."""
+
+    payload = body.model_dump(
+        mode="json",
+        exclude={
+            "worker_turn_handoff_id",
+            "worker_turn_handoff_retry_count",
+            "worker_turn_handoff_from_generation",
+        },
+    )
+    payload["admitted_routing"] = list(admitted_routing)
+    return payload
+
+
+def _worker_turn_handoff_request_digest(
+    body: ChatMessage,
+    admitted_routing: tuple[str, str | None, str],
+) -> str:
+    return _plan_delivery_digest(
+        _worker_turn_handoff_request_identity(body, admitted_routing)
+    )
+
+
+def _remote_worker_turn_handoff_matches(
+    receipt: object,
+    *,
+    handoff_id: str,
+    task_id: int,
+    retry_count: int,
+    from_generation: int,
+) -> bool:
+    """Validate one Worker's durable ACK without trusting its HTTP outcome."""
+
+    if not isinstance(receipt, dict):
+        return False
+    status = receipt.get("status")
+    remote_task_id = receipt.get("task_id")
+    remote_retry_count = receipt.get("retry_count")
+    remote_from_generation = receipt.get("from_generation")
+    remote_turn_generation = receipt.get("turn_generation")
+    if status in {"claimed", "launching", "launched"}:
+        valid_generation = bool(
+            type(remote_turn_generation) is int
+            and remote_turn_generation == from_generation + 1
+        )
+    else:
+        valid_generation = remote_turn_generation is None
+    return bool(
+        receipt.get("handoff_id") == handoff_id
+        and type(remote_task_id) is int
+        and remote_task_id == task_id
+        and type(remote_retry_count) is int
+        and remote_retry_count == retry_count
+        and type(remote_from_generation) is int
+        and remote_from_generation == from_generation
+        and status
+        in {"accepted", "claimed", "launching", "launched", "cancelled"}
+        and valid_generation
+        and isinstance(receipt.get("response"), dict)
+    )
+
+
+async def _find_worker_turn_handoff_receipt(
+    db: AsyncSession,
+    *,
+    task_id: int,
+    handoff_id: str,
+) -> tuple[WorkerTurnHandoffReceipt, LogEntry] | None:
+    """Resolve one Worker-local receipt through its unique structured key."""
+
+    receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    if (
+        receipt is None
+        or receipt.side != "worker"
+        or receipt.task_id != task_id
+    ):
+        return None
+    try:
+        request_digest = (
+            _plan_delivery_digest(receipt.request_payload)
+            if isinstance(receipt.request_payload, dict)
+            else None
+        )
+        queue_digest = (
+            _plan_delivery_digest(receipt.queue_payload)
+            if isinstance(receipt.queue_payload, dict)
+            else None
+        )
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if (
+        request_digest != receipt.request_digest
+        or queue_digest != receipt.queue_payload_digest
+    ):
+        return None
+    row = await db.get(LogEntry, receipt.source_log_id)
+    if (
+        row is None
+        or row.task_id != task_id
+        or row.event_type != "user_message"
+    ):
+        return None
+    return receipt, row
 
 
 class ForkAnchor(BaseModel):
@@ -511,9 +644,7 @@ async def send_chat_message(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a follow-up message on a task, resuming its previous session."""
-    if body.plan_application_receipt_key:
-        from backend.api.deps import require_internal_service
-
+    if body.plan_application_receipt_key or body.worker_turn_handoff_id:
         require_internal_service(request)
     task = await db.get(Task, task_id)
     if not task:
@@ -589,7 +720,7 @@ async def send_chat_message(
         )
 
         _require_no_pending_worker_routing(task)
-        await _require_pr_review_chat_allowed(
+        terminal_pr_review_chat = await _require_pr_review_chat_allowed(
             db,
             task_id,
             trusted_unlinked_terminal=_trusted_terminal_pr_review_chat(
@@ -602,6 +733,102 @@ async def send_chat_message(
             effective_model=body.model or task.model,
         )
         _validate_chat_service_tier(task, body.model)
+        handoff_log = None
+        handoff_receipt = None
+        handoff_request_identity = None
+        handoff_digest = None
+        if body.worker_turn_handoff_id is not None:
+            handoff_request_identity = _worker_turn_handoff_request_identity(
+                body,
+                admitted_routing,
+            )
+            handoff_digest = _plan_delivery_digest(handoff_request_identity)
+            existing_handoff = await _find_worker_turn_handoff_receipt(
+                db,
+                task_id=task_id,
+                handoff_id=body.worker_turn_handoff_id,
+            )
+            if (
+                existing_handoff is None
+                and await db.get(
+                    WorkerTurnHandoffReceipt,
+                    body.worker_turn_handoff_id,
+                )
+                is not None
+            ):
+                raise HTTPException(
+                    409,
+                    "Worker turn handoff durable receipt is invalid",
+                )
+            if existing_handoff is not None:
+                handoff_receipt, handoff_log = existing_handoff
+                if (
+                    handoff_receipt.retry_count
+                    != body.worker_turn_handoff_retry_count
+                    or handoff_receipt.from_generation
+                    != body.worker_turn_handoff_from_generation
+                    or handoff_receipt.request_digest != handoff_digest
+                    or handoff_receipt.request_payload
+                    != handoff_request_identity
+                ):
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff identity or request changed",
+                    )
+                if handoff_receipt.status in {"launching", "launched"}:
+                    return handoff_receipt.response
+                if handoff_receipt.status == "cancelled":
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff was cancelled before launch",
+                    )
+                accepted_replay = bool(
+                    handoff_receipt.status == "accepted"
+                    and handoff_receipt.claimed_turn_generation is None
+                    and handoff_log.task_retry_count is None
+                    and handoff_log.task_turn_generation is None
+                    and task.retry_count == handoff_receipt.retry_count
+                    and task.turn_generation == handoff_receipt.from_generation
+                )
+                claimed_replay = bool(
+                    handoff_receipt.status == "claimed"
+                    and handoff_receipt.claimed_turn_generation
+                    == handoff_receipt.from_generation + 1
+                    and handoff_log.task_retry_count
+                    == handoff_receipt.retry_count
+                    and handoff_log.task_turn_generation
+                    == handoff_receipt.claimed_turn_generation
+                    and task.retry_count == handoff_receipt.retry_count
+                    and task.turn_generation
+                    == handoff_receipt.claimed_turn_generation
+                )
+                if not (accepted_replay or claimed_replay):
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff launch outcome is uncertain",
+                    )
+                from backend.main import dispatcher
+
+                admitted = await dispatcher.enqueue_worker_turn_handoff(
+                    task_id=task_id,
+                    source_log_id=handoff_log.id,
+                    handoff_id=body.worker_turn_handoff_id,
+                )
+                if not admitted:
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff is no longer admissible",
+                    )
+                return handoff_receipt.response
+            if (
+                task.retry_count != body.worker_turn_handoff_retry_count
+                or task.turn_generation
+                != body.worker_turn_handoff_from_generation
+            ):
+                raise HTTPException(
+                    409,
+                    "Worker turn handoff baseline changed before admission",
+                )
         application_receipt = None
         if body.plan_application_receipt_key:
             from backend.models.plan import PlanApplicationReceipt
@@ -792,6 +1019,26 @@ async def send_chat_message(
 
         applied_plan_data = versioned_plan_snapshots(approved_versions)
 
+    # Snapshot queue admission before this transaction performs its first
+    # write.  Queue launch holds the admission lock while committing its Task
+    # claim; taking that lock after flushing the user row would invert
+    # lock-order on SQLite (DB writer -> admission vs admission -> DB writer).
+    plan_queue_admission_fence = None
+    if approved_versions:
+        from backend.main import dispatcher
+        from backend.services.dispatcher import TaskStartPausedError
+
+        try:
+            plan_queue_admission_fence = (
+                await dispatcher.snapshot_plan_queue_admission(task_id)
+            )
+        except (TaskStartPausedError, RuntimeError) as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Task queue is stopping; the Plan Version was not applied",
+            ) from exc
+
     # Store user message as a log entry (use instance_id=1 as placeholder)
     log_metadata: dict = {"raw_content": model_message}
     if attachments:
@@ -821,21 +1068,6 @@ async def send_chat_message(
     # process clock, this remains comparable with messages admitted after a
     # process or host restart.
     queue_timestamp = time.time()
-    plan_queue_admission_fence = None
-    if approved_versions:
-        from backend.main import dispatcher
-        from backend.services.dispatcher import TaskStartPausedError
-
-        try:
-            plan_queue_admission_fence = (
-                await dispatcher.snapshot_plan_queue_admission(task_id)
-            )
-        except (TaskStartPausedError, RuntimeError) as exc:
-            await db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail="Task queue is stopping; the Plan Version was not applied",
-            ) from exc
     application_receipt_key = (
         body.plan_application_receipt_key or str(uuid.uuid4())
         if approved_versions
@@ -852,26 +1084,66 @@ async def send_chat_message(
     }
     if application_receipt_key is not None:
         response["plan_application_receipt_key"] = application_receipt_key
+    worker_queue_payload = {
+        "prompt": prompt,
+        "priority": 0,
+        "source": "user",
+        "command_skills": command_skills,
+        "model_override": body.model,
+        "expected_task_routing": list(admitted_routing),
+        "source_log_id": user_log.id,
+        "user_message_text": model_message,
+        "current_message": prompt,
+        "attachment_paths": all_paths,
+        "queue_timestamp": queue_timestamp,
+        "allow_new_session": False,
+        "delivery_key": application_receipt_key,
+    }
+    if body.worker_turn_handoff_id is not None:
+        worker_queue_payload.update({
+            "worker_turn_handoff_id": body.worker_turn_handoff_id,
+            "worker_turn_handoff_retry_count": (
+                body.worker_turn_handoff_retry_count
+            ),
+            "worker_turn_handoff_from_generation": (
+                body.worker_turn_handoff_from_generation
+            ),
+        })
+        log_metadata["worker_turn_handoff"] = {
+            "id": body.worker_turn_handoff_id,
+            "retry_count": body.worker_turn_handoff_retry_count,
+            "from_generation": body.worker_turn_handoff_from_generation,
+            "request_digest": handoff_digest,
+            "queue_payload": worker_queue_payload,
+            "response": response,
+        }
+        user_log.raw_json = json.dumps(log_metadata, ensure_ascii=False)
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=body.worker_turn_handoff_id,
+                task_id=task_id,
+                source_log_id=user_log.id,
+                side="worker",
+                worker_id=None,
+                retry_count=body.worker_turn_handoff_retry_count,
+                from_generation=body.worker_turn_handoff_from_generation,
+                status="accepted",
+                request_payload=handoff_request_identity,
+                request_digest=handoff_digest,
+                queue_payload=worker_queue_payload,
+                queue_payload_digest=_plan_delivery_digest(worker_queue_payload),
+                response=response,
+                terminal_pr_review_chat=terminal_pr_review_chat,
+            )
+        )
     if application_receipt_key and approved_versions:
         from backend.models.plan import PlanApplicationReceipt
 
-        outbox_payload = {
-            "prompt": prompt,
-            "priority": 0,
-            "source": "user",
-            "command_skills": command_skills,
-            "model_override": body.model,
-            "expected_task_routing": list(admitted_routing),
-            "source_log_id": user_log.id,
-            "user_message_text": model_message,
-            # Keep the full immutable model request (including the approved
-            # Plan) for compaction/session-recovery rebuilds. The raw user
-            # text above is the separate HTTP replay identity.
-            "current_message": prompt,
-            "attachment_paths": all_paths,
-            "queue_timestamp": queue_timestamp,
-            "queue_admission_fence": plan_queue_admission_fence,
-        }
+        outbox_payload = dict(worker_queue_payload)
+        # Keep the full immutable model request (including the approved Plan)
+        # for compaction/session-recovery rebuilds.  The raw user text above is
+        # the separate HTTP replay identity.
+        outbox_payload["queue_admission_fence"] = plan_queue_admission_fence
         application_receipt = PlanApplicationReceipt(
             receipt_key=application_receipt_key,
             target_task_id=task_id,
@@ -936,7 +1208,16 @@ async def send_chat_message(
                 409,
                 "A selected Plan Version was applied concurrently",
             ) from exc
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if body.worker_turn_handoff_id is not None:
+            raise HTTPException(
+                409,
+                "Worker turn handoff was admitted concurrently",
+            ) from exc
+        raise
 
     # Broadcast user message to task channel
     from backend.main import broadcaster
@@ -966,6 +1247,17 @@ async def send_chat_message(
                 raise HTTPException(
                     409,
                     "Plan application was cancelled before queue admission",
+                )
+        elif body.worker_turn_handoff_id is not None:
+            admitted = await dispatcher.enqueue_worker_turn_handoff(
+                task_id=task_id,
+                source_log_id=user_log.id,
+                handoff_id=body.worker_turn_handoff_id,
+            )
+            if not admitted:
+                raise HTTPException(
+                    409,
+                    "Worker turn handoff was cancelled before queue admission",
                 )
         else:
             await dispatcher.enqueue_message(
@@ -1059,6 +1351,112 @@ async def send_chat_message(
                 user_log_id=user_log.id,
             )
     return response
+
+
+@router.get("/{task_id}/worker-turn-handoffs/{handoff_id}")
+async def get_worker_turn_handoff_receipt(
+    task_id: int,
+    handoff_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return Worker-local durable proof for one Manager follow-up.
+
+    ``accepted`` and ``claimed`` are replayable; claimed already owns G+1.
+    ``launching`` crossed the first possible provider side effect and, like
+    ``launched``, is never replayed automatically.
+    """
+
+    require_internal_service(request)
+    if (
+        len(handoff_id) != 32
+        or any(char not in "0123456789abcdef" for char in handoff_id)
+    ):
+        raise HTTPException(404, "Worker turn handoff not found")
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
+    found = await _find_worker_turn_handoff_receipt(
+        db,
+        task_id=task_id,
+        handoff_id=handoff_id,
+    )
+    if found is None:
+        if await db.get(WorkerTurnHandoffReceipt, handoff_id) is not None:
+            raise HTTPException(
+                409,
+                "Worker turn handoff durable receipt is invalid",
+            )
+        raise HTTPException(404, "Worker turn handoff not found")
+    receipt, row = found
+    return {
+        "handoff_id": handoff_id,
+        "task_id": task_id,
+        "status": receipt.status,
+        "retry_count": receipt.retry_count,
+        "from_generation": receipt.from_generation,
+        "turn_generation": receipt.claimed_turn_generation,
+        "source_log_id": row.id,
+        "cancel_reason": receipt.cancel_reason,
+        # The acknowledgement contains no model prompt or attachment content;
+        # it is safe for the Manager to reconstruct the lost POST response.
+        "response": receipt.response,
+    }
+
+
+@router.post("/{task_id}/worker-turn-handoffs/{handoff_id}/resume")
+async def resume_worker_turn_handoff(
+    task_id: int,
+    handoff_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-admit a pre-boundary receipt after the memory queue was lost."""
+
+    receipt = await get_worker_turn_handoff_receipt(
+        task_id,
+        handoff_id,
+        request,
+        db,
+    )
+    if receipt["status"] in {"launching", "launched"}:
+        return {**receipt, "resumed": False}
+    if receipt["status"] == "cancelled":
+        raise HTTPException(
+            409,
+            "Worker turn handoff was cancelled before launch",
+        )
+    if receipt["status"] not in {"accepted", "claimed"}:
+        raise HTTPException(
+            409,
+            "Worker turn handoff launch outcome is uncertain",
+        )
+    task = await db.get(Task, task_id, populate_existing=True)
+    expected_generation = (
+        receipt["from_generation"]
+        if receipt["status"] == "accepted"
+        else receipt["turn_generation"]
+    )
+    if (
+        task is None
+        or task.retry_count != receipt["retry_count"]
+        or task.turn_generation != expected_generation
+    ):
+        raise HTTPException(
+            409,
+            "Worker turn handoff baseline changed before resume",
+        )
+    from backend.main import dispatcher
+
+    admitted = await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=receipt["source_log_id"],
+        handoff_id=handoff_id,
+    )
+    if not admitted:
+        raise HTTPException(409, "Worker turn handoff is no longer admissible")
+    return {**receipt, "resumed": True}
 
 
 @router.get("/{task_id}/fork-anchors")
@@ -1548,6 +1946,12 @@ async def _send_worker_chat(
                 409,
                 "Task moved away from its Worker before chat could be sent",
             )
+        if observed.worker_turn_handoff_id is not None:
+            raise HTTPException(
+                409,
+                "A previous Worker follow-up is still waiting for its exact "
+                "remote turn generation",
+            )
         if task_is_pr_review_superseded(current):
             raise HTTPException(
                 409,
@@ -1808,8 +2212,54 @@ async def _send_worker_chat(
             for p in all_paths
         ]
 
-        # 1. Persist the display copy only if the exact pre-network Worker
-        # generation is still current.
+        # Finish every fallible remote preflight before publishing a user
+        # message.  The user Log, Task handoff marker, Manager receipt, and
+        # optional Plan receipt are the durable outbox and must become visible
+        # in one local transaction; otherwise a crash here would leave a
+        # visible message that no recovery path can ever deliver.
+        if all_paths:
+            try:
+                await worker_proxy.push_files(worker, all_paths)
+            except Exception as e:
+                raise HTTPException(503, f"附件同步到 Worker 失败: {e}")
+
+        await worker_proxy.relay.subscribe_task(worker, current.id)
+        if not terminal_pr_review_chat:
+            await worker_proxy.sync_task_skill_selection(worker, current)
+        # PR review mirrors stay permanently tool-free. Their Worker-side
+        # configuration is immutable and needs no Skill synchronization.
+
+        application_receipt_key = (
+            str(uuid.uuid4()) if approved_versions else None
+        )
+        handoff_id = uuid.uuid4().hex
+        worker_request_body = {
+            "message": model_message,
+            "image_paths": body.image_paths,
+            "file_paths": body.file_paths,
+            "model": body.model,
+            "plan_task_ids": body.plan_task_ids,
+            "plan_version_ids": remote_version_ids or None,
+            "confirmed_stale_plan_version_ids": (
+                remote_confirmed_version_ids or None
+            ),
+            "confirmed_stale_plan_task_ids": (
+                body.confirmed_stale_plan_task_ids
+            ),
+            "expected_routing": (
+                body.expected_routing.model_dump(mode="json")
+                if body.expected_routing is not None
+                else None
+            ),
+            "plan_application_receipt_key": application_receipt_key,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": observed.retry_count,
+            "worker_turn_handoff_from_generation": observed.turn_generation,
+        }
+        worker_request_digest = _plan_delivery_digest(worker_request_body)
+
+        # Revalidate the exact Worker generation after all network preflight,
+        # then publish the complete durable outbox atomically.
         guarded = await db.execute(
             sa_update(Task)
             .where(*worker_task_generation_predicates(observed))
@@ -1837,40 +2287,9 @@ async def _send_worker_chat(
             is_error=False,
         )
         db.add(manager_user_log)
-        application_receipt_key = str(uuid.uuid4()) if approved_versions else None
+        await db.flush()
+
         manager_receipt = None
-        await db.commit()
-
-        # 2. Broadcast to the Manager frontend.
-        broadcast_data = persisted_chat_event(manager_user_log, {
-            "event_type": "user_message",
-            "role": "user",
-            "content": display_content,
-            "raw_content": model_message,
-            "image_paths": body.image_paths or [],
-        })
-        if sender_display_name:
-            broadcast_data["sender_name"] = sender_display_name
-        await broadcaster.broadcast(f"task:{current.id}", broadcast_data)
-
-        # 3. Push attachments to the same Worker path.
-        if all_paths:
-            try:
-                await worker_proxy.push_files(worker, all_paths)
-            except Exception as e:
-                raise HTTPException(503, f"附件同步到 Worker 失败: {e}")
-
-        # 4. Ensure relay subscription before the remote turn can emit events.
-        await worker_proxy.relay.subscribe_task(worker, current.id)
-        if not terminal_pr_review_chat:
-            await worker_proxy.sync_task_skill_selection(worker, current)
-        # PR review mirrors stay permanently tool-free.  Their Worker-side
-        # configuration is intentionally immutable and therefore needs no
-        # Skill synchronization before a terminal discussion turn.
-
-        # Persist the handoff receipt only after every preflight step succeeds.
-        # From this commit onward the next network action is the idempotent
-        # Worker request carrying this exact key.
         if approved_versions:
             from backend.models.plan import PlanApplicationReceipt
 
@@ -1883,89 +2302,245 @@ async def _send_worker_chat(
                 status="prepared",
             )
             db.add(manager_receipt)
-            await db.commit()
 
-        # 5. The common operation lock is already held; asking WorkerProxy to
+        # The marker is the sole authority for this exact G -> G+1. Reserve it
+        # in the same transaction as the user Log and both receipts.
+        reserved = await reserve_worker_turn_handoff(
+            db,
+            observed,
+            handoff_id=handoff_id,
+            source_log_id=manager_user_log.id,
+            request_payload=worker_request_body,
+            request_digest=worker_request_digest,
+            terminal_pr_review_chat=terminal_pr_review_chat,
+        )
+        if reserved is None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task Worker generation changed before follow-up handoff",
+            )
+        manager_user_log.task_retry_count = observed.retry_count
+        manager_user_log.task_turn_generation = observed.turn_generation + 1
+        manager_log_metadata = _raw_log_metadata(manager_user_log)
+        manager_log_metadata["worker_turn_handoff"] = {
+            "id": handoff_id,
+            "retry_count": observed.retry_count,
+            "from_generation": observed.turn_generation,
+            # Needed only to replay the exact internal request after a Manager
+            # restart.  Worker tasks reject Secrets, so no secret material can
+            # enter this durable envelope.
+            "request_body": worker_request_body,
+            "request_digest": worker_request_digest,
+            "terminal_pr_review_chat": terminal_pr_review_chat,
+        }
+        manager_user_log.raw_json = json.dumps(
+            manager_log_metadata,
+            ensure_ascii=False,
+        )
+        # COMMIT and recovery ownership are one cancellation-safe handoff.  A
+        # database driver may finish COMMIT just as the HTTP task is cancelled;
+        # never re-raise that cancellation until the durable marker has a live
+        # recovery owner in this process.
+        commit_task = asyncio.create_task(db.commit())
+        handoff_cancellation: asyncio.CancelledError | None = None
+        while not commit_task.done():
+            try:
+                await asyncio.shield(commit_task)
+            except asyncio.CancelledError as exc:
+                if handoff_cancellation is None:
+                    handoff_cancellation = exc
+        commit_task.result()
+
+        # Arm durable recovery immediately after the outbox/marker commit,
+        # before broadcasting or attempting the first HTTP POST.  If this
+        # request is cancelled or the process loses the initial ACK, the
+        # Manager must already have a live owner for the prepared handoff.
+        recovery_scheduler = getattr(
+            worker_proxy.relay,
+            "ensure_worker_turn_handoff_recovery",
+            None,
+        )
+        if callable(recovery_scheduler):
+            scheduled = recovery_scheduler(worker, reserved)
+            if inspect.isawaitable(scheduled):
+                recovery_task = asyncio.ensure_future(scheduled)
+                while not recovery_task.done():
+                    try:
+                        await asyncio.shield(recovery_task)
+                    except asyncio.CancelledError as exc:
+                        if handoff_cancellation is None:
+                            handoff_cancellation = exc
+                recovery_task.result()
+        if handoff_cancellation is not None:
+            raise handoff_cancellation
+
+        broadcast_data = persisted_chat_event(manager_user_log, {
+            "event_type": "user_message",
+            "role": "user",
+            "content": display_content,
+            "raw_content": model_message,
+            "image_paths": body.image_paths or [],
+        })
+        if sender_display_name:
+            broadcast_data["sender_name"] = sender_display_name
+        await broadcaster.broadcast(f"task:{current.id}", broadcast_data)
+
+        # The common operation lock is already held; asking WorkerProxy to
         # acquire it again would deadlock.
         try:
             result = await worker_proxy.proxy_to_worker(
                 current,
                 "POST",
                 f"/api/tasks/{current.id}/chat",
-                body={
-                    "message": model_message,
-                    "image_paths": body.image_paths,
-                    "file_paths": body.file_paths,
-                    "model": body.model,
-                    "plan_task_ids": body.plan_task_ids,
-                    "plan_version_ids": remote_version_ids or None,
-                    "confirmed_stale_plan_version_ids": (
-                        remote_confirmed_version_ids or None
-                    ),
-                    "confirmed_stale_plan_task_ids": (
-                        body.confirmed_stale_plan_task_ids
-                    ),
-                    "expected_routing": (
-                        body.expected_routing.model_dump(mode="json")
-                        if body.expected_routing is not None
-                        else None
-                    ),
-                    "plan_application_receipt_key": application_receipt_key,
-                },
+                body=worker_request_body,
                 operation_lock_held=True,
                 pr_review_terminal_chat=terminal_pr_review_chat,
             )
-        except Exception:
-            remote_receipt = (
-                await worker_proxy.get_plan_application_receipt(
-                    worker, application_receipt_key
+        except Exception as proxy_error:
+            remote_handoff = None
+            try:
+                remote_handoff = (
+                    await worker_proxy.get_worker_turn_handoff_receipt(
+                        worker,
+                        current.id,
+                        handoff_id,
+                    )
                 )
-                if application_receipt_key is not None
-                else None
-            )
+                if (
+                    remote_handoff is not None
+                    and not _remote_worker_turn_handoff_matches(
+                        remote_handoff,
+                        handoff_id=handoff_id,
+                        task_id=current.id,
+                        retry_count=reserved.worker_turn_handoff_retry_count,
+                        from_generation=(
+                            reserved.worker_turn_handoff_from_generation
+                        ),
+                    )
+                ):
+                    # An existing but mismatched receipt is durable conflict,
+                    # not evidence that the first POST never committed.  Keep
+                    # it non-None so the resend branch stays fail-closed.
+                    remote_handoff = {}
+                if (
+                    remote_handoff
+                    and remote_handoff.get("status") in {"accepted", "claimed"}
+                ):
+                    resumed_handoff = (
+                        await worker_proxy.resume_worker_turn_handoff(
+                            worker,
+                            current.id,
+                            handoff_id,
+                        )
+                    )
+                    remote_handoff = (
+                        resumed_handoff
+                        if _remote_worker_turn_handoff_matches(
+                            resumed_handoff,
+                            handoff_id=handoff_id,
+                            task_id=current.id,
+                            retry_count=(
+                                reserved.worker_turn_handoff_retry_count
+                            ),
+                            from_generation=(
+                                reserved.worker_turn_handoff_from_generation
+                            ),
+                        )
+                        else {}
+                    )
+            except Exception:
+                logger.warning(
+                    "Worker turn handoff %s reconciliation failed",
+                    handoff_id,
+                    exc_info=True,
+                )
             if (
-                manager_receipt is not None
-                and isinstance(remote_receipt, dict)
-                and remote_receipt.get("delivery_status") == "uncertain"
+                remote_handoff is not None
+                and remote_handoff.get("status")
+                in {"accepted", "claimed", "launching", "launched"}
+                and isinstance(remote_handoff.get("response"), dict)
             ):
-                await _preserve_remote_uncertain_plan_receipt(
-                    db,
-                    receipt=manager_receipt,
-                    remote_receipt=remote_receipt,
-                    request=request,
+                result = dict(remote_handoff["response"])
+            elif remote_handoff is None and manager_receipt is None:
+                # The first request may have failed before its durable commit,
+                # or its response may still be crossing the network.  Re-send
+                # the exact idempotency key once; the Worker's operation lock
+                # serializes this with an in-flight first attempt.
+                try:
+                    result = await worker_proxy.proxy_to_worker(
+                        current,
+                        "POST",
+                        f"/api/tasks/{current.id}/chat",
+                        body=worker_request_body,
+                        operation_lock_held=True,
+                        pr_review_terminal_chat=terminal_pr_review_chat,
+                    )
+                except Exception:
+                    raise proxy_error
+            elif remote_handoff is not None:
+                raise proxy_error
+            if manager_receipt is not None:
+                remote_receipt = (
+                    await worker_proxy.get_plan_application_receipt(
+                        worker, application_receipt_key
+                    )
+                    if application_receipt_key is not None
+                    else None
                 )
-                raise HTTPException(
-                    409,
-                    "Worker Plan application launch outcome is uncertain; "
-                    "administrator reconciliation is required",
-                )
-            if (
-                remote_receipt is None
-                or remote_receipt.get("status") != "committed"
-                or not isinstance(remote_receipt.get("response"), dict)
-                or remote_receipt.get("delivery_status")
-                in {"failed", "cancelled", "uncertain"}
-            ):
-                raise
-            result = remote_receipt["response"]
+                if (
+                    isinstance(remote_receipt, dict)
+                    and remote_receipt.get("delivery_status") == "uncertain"
+                ):
+                    await _preserve_remote_uncertain_plan_receipt(
+                        db,
+                        receipt=manager_receipt,
+                        remote_receipt=remote_receipt,
+                        request=request,
+                    )
+                    raise HTTPException(
+                        409,
+                        "Worker Plan application launch outcome is uncertain; "
+                        "administrator reconciliation is required",
+                    )
+                if (
+                    remote_receipt is None
+                    or remote_receipt.get("status") != "committed"
+                    or not isinstance(remote_receipt.get("response"), dict)
+                    or remote_receipt.get("delivery_status")
+                    in {"failed", "cancelled", "uncertain"}
+                ):
+                    raise proxy_error
+                result = remote_receipt["response"]
 
-        # 6. A delayed response can only update the generation that issued the
-        # request.  Even responses without a session id perform a no-op CAS so
-        # reassignment/retry during the network await is reported as conflict.
-        values = {"status": observed.status}
-        if isinstance(result, dict) and result.get("session_id"):
-            values["session_id"] = result["session_id"]
-        changed = await db.execute(
-            sa_update(Task)
-            .where(*worker_task_generation_predicates(observed))
-            .values(**values)
+        # 6. ACK the exact durable handoff.  If relay already proved G+1 this
+        # clears the marker; otherwise it stays acknowledged until the first
+        # exact G+1 event/snapshot consumes it.  Retry, migration, another
+        # Worker, or any generation beyond that one transition all conflict.
+        acknowledged = await acknowledge_worker_turn_handoff(
+            db,
+            reserved,
+            session_id=(
+                result.get("session_id")
+                if isinstance(result, dict)
+                else None
+            ),
         )
-        if changed.rowcount != 1:
+        if acknowledged is None:
             await db.rollback()
             raise HTTPException(
                 409,
                 "Task Worker assignment or generation changed while chat was in flight",
             )
+        # The remote acceptance is independent evidence from the Manager's
+        # subsequent Plan/application bookkeeping.  Persist it now so a later
+        # validation or local DB failure cannot roll the ACK back and strand a
+        # relay-proven G+1 behind an eternally unacknowledged handoff marker.
+        await db.commit()
+        if callable(recovery_scheduler):
+            scheduled = recovery_scheduler(worker, acknowledged)
+            if inspect.isawaitable(scheduled):
+                await scheduled
         applied_plan_ids = (
             result.get("applied_plan_task_ids")
             if isinstance(result, dict)
@@ -2176,6 +2751,7 @@ async def get_chat_history(
         LogEntry.tool_name, LogEntry.tool_input, LogEntry.tool_output,
         LogEntry.is_error, LogEntry.loop_iteration, LogEntry.timestamp,
         LogEntry.raw_json, LogEntry.task_retry_count,
+        LogEntry.task_turn_generation, LogEntry.native_turn_id,
     ]
     conditions = [
         LogEntry.task_id == task_id,
@@ -2290,7 +2866,7 @@ async def get_chat_history(
         raw_content = None
         applied_plans = None
         item_id = None
-        turn_id = None
+        turn_id = row.native_turn_id
         native_item_type = None
         native_item_status = None
         if row.raw_json:
@@ -2310,7 +2886,8 @@ async def get_chat_history(
                         or (turn.get("id") if isinstance(turn, dict) else None)
                     )
                     item_id = str(native_item) if native_item else None
-                    turn_id = str(native_turn) if native_turn else None
+                    if turn_id is None:
+                        turn_id = str(native_turn) if native_turn else None
                     if isinstance(item, dict):
                         item_type = item.get("type")
                         item_status = item.get("status")
@@ -2362,6 +2939,8 @@ async def get_chat_history(
             "is_error": row.is_error,
             "loop_iteration": row.loop_iteration,
             "task_retry_count": row.task_retry_count,
+            "task_turn_generation": row.task_turn_generation,
+            "native_turn_id": row.native_turn_id,
             "timestamp": (row.timestamp.isoformat() + "Z") if row.timestamp else None,
             "image_urls": image_urls or None,
             "attachments": attachments,

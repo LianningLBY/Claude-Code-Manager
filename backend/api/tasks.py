@@ -119,6 +119,17 @@ def _require_not_delivery_owned_task(task: Task, *, action: str) -> None:
         )
 
 
+def _require_no_pending_worker_turn_handoff(task: Task) -> None:
+    """Freeze execution-affecting edits across one Manager->Worker G+1."""
+
+    if task.worker_turn_handoff_id is not None:
+        raise HTTPException(
+            409,
+            "Task configuration cannot change while a Worker follow-up is "
+            "waiting for its exact remote turn generation",
+        )
+
+
 async def _require_no_pr_review_publication(
     db: AsyncSession,
     task_id: int,
@@ -2052,6 +2063,7 @@ async def _update_worker_task_with_routing_config(
                 409,
                 "Task Worker assignment changed before config synchronization",
             )
+        _require_no_pending_worker_turn_handoff(current)
         if current.status not in WORKER_ROUTING_SAFE_STATUSES:
             raise HTTPException(
                 409,
@@ -2214,6 +2226,7 @@ async def _update_worker_task_with_skill_configuration(
                 "Task Worker assignment changed before Skill configuration "
                 "could be saved",
             )
+        _require_no_pending_worker_turn_handoff(current)
         if current.status not in _WORKER_SKILL_EDITABLE_STATUSES:
             raise HTTPException(
                 409,
@@ -2221,6 +2234,35 @@ async def _update_worker_task_with_skill_configuration(
                 "execution claim became active; wait for the current Worker "
                 "turn to finish",
             )
+        updated = await queue.update_task(task_id, **updates)
+        if updated is None:
+            raise HTTPException(404, "Task not found")
+        return updated
+
+
+async def _update_worker_task_with_handoff_fence(
+    task_id: int,
+    updates: dict,
+    request: Request,
+    queue: TaskQueue,
+    *,
+    expected_worker_id: int,
+) -> Task:
+    """Serialize ordinary Worker Task edits with exact chat handoffs."""
+
+    await queue.db.rollback()
+    async with get_task_operation_lock(task_id):
+        queue.db.expire_all()
+        current = await queue.db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, queue.db)
+        if current.worker_id != expected_worker_id:
+            raise HTTPException(
+                409,
+                "Task Worker assignment changed before configuration could be saved",
+            )
+        _require_no_pending_worker_turn_handoff(current)
         updated = await queue.update_task(task_id, **updates)
         if updated is None:
             raise HTTPException(404, "Task not found")
@@ -2449,6 +2491,16 @@ async def update_task(
         if not task:
             raise HTTPException(404, "Task not found")
         return task
+    if task.worker_id is not None:
+        return await _finish_task_operation(
+            _update_worker_task_with_handoff_fence(
+                task_id,
+                updates,
+                request,
+                queue,
+                expected_worker_id=task.worker_id,
+            )
+        )
     task = await queue.update_task(task_id, **updates)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -2505,6 +2557,7 @@ async def _retry_local_task_safely(
         task.started_at,
         task.completed_at,
         task.pty_background_generation,
+        task.turn_generation,
     )
     reverse_owner_ids = set(
         (
@@ -2544,6 +2597,7 @@ async def _retry_local_task_safely(
             current_task.started_at,
             current_task.completed_at,
             current_task.pty_background_generation,
+            current_task.turn_generation,
         )
         if (
             current_task.status != observed_status
@@ -3062,6 +3116,7 @@ async def terminate_task_generation(
             expected_generation=LocalTaskGeneration(
                 status=body.expected_status,
                 retry_count=body.expected_retry_count,
+                turn_generation=body.expected_turn_generation,
                 instance_id=body.expected_instance_id,
                 started_at=body.expected_started_at,
                 completed_at=body.expected_completed_at,
@@ -3081,6 +3136,7 @@ async def terminate_task_generation(
         db,
         expected_status=terminated.terminal_status,
         expected_retry_count=terminated.retry_count,
+        expected_turn_generation=terminated.turn_generation,
         expected_instance_id=terminated.instance_id,
         expected_started_at=terminated.started_at,
         expected_completed_at=terminated.completed_at,
@@ -3295,6 +3351,7 @@ async def _stop_task_session_local_under_cancellation_lease(
 
     observed_status = active_task.status
     observed_retry_count = active_task.retry_count
+    observed_turn_generation = active_task.turn_generation
     observed_instance_id = active_task.instance_id
     observed_started_at = active_task.started_at
     observed_session_id = active_task.session_id
@@ -3321,6 +3378,7 @@ async def _stop_task_session_local_under_cancellation_lease(
             task_id,
             db,
             expected_generations=expected_generations,
+            expected_task_turn_generation=observed_turn_generation,
             task_status="completed",
         )
         remaining_generations = await _remaining_task_process_generations(
@@ -3350,6 +3408,7 @@ async def _stop_task_session_local_under_cancellation_lease(
             or current.worker_id is not None
             or current.shared_from_id is not None
             or current.retry_count != observed_retry_count
+            or current.turn_generation != observed_turn_generation
             or current.instance_id != observed_instance_id
             or current.started_at != observed_started_at
         ):
@@ -3392,6 +3451,7 @@ async def _stop_task_session_local_under_cancellation_lease(
             current.pty_background_generation = None
             background_cleared_by_api = True
         publication_retry_count = current.retry_count
+        publication_turn_generation = current.turn_generation
         publication_instance_id = current.instance_id
         publication_started_at = current.started_at
         publication_completed_at = await _read_persisted_task_completed_at(task_id, db)
@@ -3403,6 +3463,7 @@ async def _stop_task_session_local_under_cancellation_lease(
                 db,
                 expected_status=expected_status,
                 expected_retry_count=publication_retry_count,
+                expected_turn_generation=publication_turn_generation,
                 expected_instance_id=publication_instance_id,
                 expected_started_at=publication_started_at,
                 expected_completed_at=publication_completed_at,
@@ -3460,6 +3521,7 @@ async def _stop_task_session_local_under_cancellation_lease(
                 observed_background_generation,
                 expected_status=observed_status,
                 expected_retry_count=observed_retry_count,
+                expected_turn_generation=observed_turn_generation,
                 expected_instance_id=observed_instance_id,
                 expected_started_at=observed_started_at,
                 expected_completed_at=observed_completed_at,
@@ -3475,6 +3537,7 @@ async def _stop_task_session_local_under_cancellation_lease(
             db,
             expected_status=observed_status,
             expected_retry_count=observed_retry_count,
+            expected_turn_generation=observed_turn_generation,
             expected_instance_id=observed_instance_id,
             expected_started_at=observed_started_at,
             expected_completed_at=observed_completed_at,
@@ -3528,6 +3591,7 @@ async def _stop_task_session_local_under_cancellation_lease(
             db,
             expected_status="completed",
             expected_retry_count=observed_retry_count,
+            expected_turn_generation=observed_turn_generation,
             expected_instance_id=observed_instance_id,
             expected_started_at=observed_started_at,
             expected_completed_at=publication_completed_at,
@@ -3705,6 +3769,7 @@ async def _cancel_local_task_under_cancellation_lease(
         raise HTTPException(400, "Cannot cancel task")
 
     observed_retry_count = active_task.retry_count
+    observed_turn_generation = active_task.turn_generation
     observed_instance_id = active_task.instance_id
     observed_started_at = active_task.started_at
     observed_background_generation = active_task.pty_background_generation
@@ -3729,6 +3794,7 @@ async def _cancel_local_task_under_cancellation_lease(
             task_id,
             db,
             expected_generations=expected_generations,
+            expected_task_turn_generation=observed_turn_generation,
             task_status="cancelled",
         )
         remaining_generations = await _remaining_task_process_generations(
@@ -3753,6 +3819,7 @@ async def _cancel_local_task_under_cancellation_lease(
             or active_task.worker_id is not None
             or active_task.shared_from_id is not None
             or active_task.retry_count != observed_retry_count
+            or active_task.turn_generation != observed_turn_generation
             or active_task.instance_id != observed_instance_id
             or active_task.started_at != observed_started_at
         ):
@@ -3854,6 +3921,7 @@ async def _cancel_local_task_under_cancellation_lease(
         )
     )
     committed_retry_count = active_task.retry_count
+    committed_turn_generation = active_task.turn_generation
     committed_instance_id = active_task.instance_id
     committed_started_at = active_task.started_at
     committed_completed_at = await _read_persisted_task_completed_at(task_id, db)
@@ -3886,6 +3954,7 @@ async def _cancel_local_task_under_cancellation_lease(
         db,
         expected_status="cancelled",
         expected_retry_count=committed_retry_count,
+        expected_turn_generation=committed_turn_generation,
         expected_instance_id=committed_instance_id,
         expected_started_at=committed_started_at,
         expected_completed_at=committed_completed_at,
@@ -3980,6 +4049,11 @@ async def retry_task(
                 409,
                 "Task still has active Claude PTY background output",
             )
+        if current.worker_turn_handoff_id is not None:
+            raise HTTPException(
+                409,
+                "Task has a pending Worker follow-up turn handoff",
+            )
 
         if current.worker_id is not None:
             await _ensure_worker_routing_ready(
@@ -4029,6 +4103,7 @@ async def retry_task(
             db,
             expected_status=retried.status,
             expected_retry_count=retried.retry_count,
+            expected_turn_generation=retried.turn_generation,
             expected_instance_id=retried.instance_id,
             expected_started_at=retried.started_at,
             expected_completed_at=retried.completed_at,

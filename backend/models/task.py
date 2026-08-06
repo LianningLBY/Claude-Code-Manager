@@ -2,6 +2,7 @@ from datetime import datetime
 import secrets
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Float,
     Integer,
@@ -31,6 +32,23 @@ class Task(Base):
             "(mode <> 'delivery_loop' AND delivery_run_id IS NULL "
             "AND delivery_role IS NULL)",
             name="ck_tasks_delivery_owner_shape",
+        ),
+        CheckConstraint(
+            "(worker_turn_handoff_id IS NULL "
+            "AND worker_turn_handoff_worker_id IS NULL "
+            "AND worker_turn_handoff_retry_count IS NULL "
+            "AND worker_turn_handoff_from_generation IS NULL "
+            "AND worker_turn_handoff_source_log_id IS NULL "
+            "AND worker_turn_handoff_acknowledged IS NULL) OR "
+            "(worker_turn_handoff_id IS NOT NULL "
+            "AND worker_turn_handoff_worker_id IS NOT NULL "
+            "AND worker_turn_handoff_retry_count IS NOT NULL "
+            "AND worker_turn_handoff_retry_count >= 0 "
+            "AND worker_turn_handoff_from_generation IS NOT NULL "
+            "AND worker_turn_handoff_from_generation >= 0 "
+            "AND worker_turn_handoff_source_log_id IS NOT NULL "
+            "AND worker_turn_handoff_acknowledged IS NOT NULL)",
+            name="ck_tasks_worker_turn_handoff_shape",
         ),
         UniqueConstraint(
             "incarnation_id",
@@ -71,6 +89,42 @@ class Task(Base):
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
     mode: Mapped[str] = mapped_column(String(20), default="auto")  # auto/plan/loop/goal/delivery_loop
+    # Monotonic identity of a logical model turn. Retry/account failover within
+    # one turn keeps the same generation; a newly admitted turn increments it.
+    turn_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    # Manager-side durable reservation for exactly one Worker follow-up turn.
+    # The remote Worker increments ``turn_generation`` only when its queued
+    # message is dequeued, which can happen before the proxy HTTP response.
+    # These fields authorize only the recorded G -> G+1 transition; they are
+    # cleared after both the HTTP ACK and exact Worker generation evidence are
+    # observed.  They are intentionally Manager-only and absent from public
+    # Task schemas / Worker migration payloads.
+    worker_turn_handoff_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    worker_turn_handoff_worker_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    worker_turn_handoff_retry_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    worker_turn_handoff_from_generation: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    worker_turn_handoff_source_log_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    worker_turn_handoff_acknowledged: Mapped[bool | None] = mapped_column(
+        nullable=True
+    )
+    # Frozen per-Task allow/budget policy for model-requested capabilities.
+    # NULL means the capability surface is unavailable for this Task.
+    capability_policy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # DeliveryRun is Manager authority and is not mirrored as a foreign key on
     # remote Workers.  The controller is the only writer of these routing
     # fields; ordinary Task APIs must not synthesize a delivery-owned Task.

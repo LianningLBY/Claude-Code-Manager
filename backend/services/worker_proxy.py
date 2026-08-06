@@ -188,6 +188,61 @@ class WorkerProxy:
             raise RuntimeError("Worker returned an invalid Plan application receipt")
         return payload
 
+    async def get_worker_turn_handoff_receipt(
+        self,
+        worker: Worker,
+        task_id: int,
+        handoff_id: str,
+    ) -> dict | None:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(
+                    worker,
+                    f"/api/tasks/{task_id}/worker-turn-handoffs/{handoff_id}",
+                ),
+                headers=self._headers(worker),
+            )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("handoff_id") != handoff_id
+            or payload.get("task_id") != task_id
+        ):
+            raise RuntimeError(
+                "Worker returned an invalid turn handoff receipt"
+            )
+        return payload
+
+    async def resume_worker_turn_handoff(
+        self,
+        worker: Worker,
+        task_id: int,
+        handoff_id: str,
+    ) -> dict:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self._api(
+                    worker,
+                    f"/api/tasks/{task_id}/worker-turn-handoffs/"
+                    f"{handoff_id}/resume",
+                ),
+                headers=self._headers(worker),
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("handoff_id") != handoff_id
+            or payload.get("task_id") != task_id
+        ):
+            raise RuntimeError(
+                "Worker returned an invalid turn handoff resume receipt"
+            )
+        return payload
+
     async def resolve_plan_application_receipt(
         self,
         worker: Worker,

@@ -2718,6 +2718,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                             db,
                             expected_status=terminated.terminal_status,
                             expected_retry_count=terminated.retry_count,
+                            expected_turn_generation=terminated.turn_generation,
                             expected_instance_id=terminated.instance_id,
                             expected_started_at=terminated.started_at,
                             expected_completed_at=terminated.completed_at,

@@ -172,6 +172,11 @@ def _task_generation_matches(
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "session_id": task.session_id,
     }
+    if invocation.source == "agent_request":
+        expected.update(
+            incarnation_id=task.incarnation_id,
+            turn_generation=task.turn_generation,
+        )
     return (
         invocation.subject_kind == "task_generation"
         and all(subject.get(key) == value for key, value in expected.items())
@@ -180,6 +185,10 @@ def _task_generation_matches(
         and invocation.request_task_instance_id == task.instance_id
         and invocation.request_task_started_at == task.started_at
         and invocation.request_task_session_id == task.session_id
+        and (
+            invocation.source != "agent_request"
+            or invocation.request_task_turn_generation == task.turn_generation
+        )
     )
 
 

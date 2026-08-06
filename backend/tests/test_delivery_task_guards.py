@@ -514,6 +514,7 @@ async def test_instance_stop_api_rejects_workflow_owned_effect_task(
             f"/api/instances/{instance_id}/stop",
             json={
                 "expected_task_id": task_id,
+                "expected_task_turn_generation": 0,
                 "expected_pid": 81234,
                 "expected_started_at": started_at.isoformat(),
             },

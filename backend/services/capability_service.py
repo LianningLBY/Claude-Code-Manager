@@ -166,7 +166,9 @@ def _validate_hash(value: str, *, field: str) -> str:
 def _task_subject(task: Task) -> tuple[dict, str]:
     subject = {
         "task_id": task.id,
+        "incarnation_id": task.incarnation_id,
         "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
         "instance_id": task.instance_id,
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "session_id": task.session_id,

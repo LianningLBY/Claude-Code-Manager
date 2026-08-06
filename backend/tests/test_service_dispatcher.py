@@ -18,6 +18,8 @@ from backend.services.dispatcher import (
     GlobalDispatcher,
     QueuedMessage,
     QueuedMessagePrelaunchError,
+    QueuedMessageRoutingMismatchError,
+    WorkerTurnLaunchOutcomeUncertainError,
     _prepend_task_artifact_policy,
 )
 from backend.services.deployment_start_guard import (
@@ -39,6 +41,7 @@ from backend.models.plan import (
 )
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 
 
 def _make_dispatcher(db_factory):
@@ -275,6 +278,8 @@ async def test_recover_orphaned_plan_run_without_disturbing_reused_instance(
 async def test_pause_dispatching_does_not_stop_dispatcher(db_factory):
     d = _make_dispatcher(db_factory)
     d._running = True
+    d._recover_plan_application_outbox = AsyncMock()
+    d._recover_worker_turn_handoff_outbox = AsyncMock()
 
     await d.pause_dispatching()
 
@@ -282,7 +287,12 @@ async def test_pause_dispatching_does_not_stop_dispatcher(db_factory):
     assert d.status()["paused"] is True
 
     d.resume_dispatching()
+    await asyncio.sleep(0)
     assert d.status()["paused"] is False
+    d._recover_plan_application_outbox.assert_awaited_once_with(
+        after_restart=False
+    )
+    d._recover_worker_turn_handoff_outbox.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -1237,6 +1247,17 @@ async def test_loop_done_after_one_iteration(db_factory, tmp_path):
         t = await db.get(Task, task_obj.id)
         assert t.status == "completed"
         assert t.loop_progress == "1/1"
+    iteration_events = [
+        call.args[1]
+        for call in d.broadcaster.broadcast.await_args_list
+        if call.args[1].get("event") == "loop_iteration_end"
+    ]
+    assert len(iteration_events) == 1
+    assert iteration_events[0]["task_retry_count"] == task_obj.retry_count
+    assert (
+        iteration_events[0]["task_turn_generation"]
+        == task_obj.turn_generation
+    )
 
 
 @pytest.mark.asyncio
@@ -3676,6 +3697,11 @@ async def test_goal_broadcasts_evaluation_events(db_factory):
     assert len(goal_eval_events) >= 1
     assert goal_eval_events[0][0][1]["achieved"] is True
     assert goal_eval_events[0][0][1]["turn"] == 1
+    assert goal_eval_events[0][0][1]["task_retry_count"] == task_obj.retry_count
+    assert (
+        goal_eval_events[0][0][1]["task_turn_generation"]
+        == task_obj.turn_generation
+    )
 
 
 @pytest.mark.asyncio
@@ -4637,9 +4663,10 @@ async def test_codex_fast_admission_failure_is_visible_and_not_requeued(
         seen.append(msg)
         raise CodexServiceTierUnavailableError("priority was not admitted")
 
-    async def publish(task_id, exc):
+    async def publish(task_id, exc, **kwargs):
         assert task_id == 1
         assert isinstance(exc, CodexServiceTierUnavailableError)
+        assert kwargs["queued_message"].prompt == "must not run as Standard"
         published.set()
 
     d._process_queued_message = fake_process
@@ -4678,9 +4705,10 @@ async def test_codex_terminal_thread_failure_is_visible_and_not_requeued(
             recovery_attempted=True,
         )
 
-    async def publish(task_id, exc):
+    async def publish(task_id, exc, **kwargs):
         assert task_id == 1
         assert isinstance(exc, CodexThreadTerminalStateError)
+        assert kwargs["queued_message"].prompt == "must stop retrying visibly"
         published.set()
 
     d._process_queued_message = fake_process
@@ -4718,9 +4746,10 @@ async def test_codex_thread_identity_mismatch_is_visible_and_not_requeued(
             operation="thread/resume",
         )
 
-    async def publish(task_id, exc):
+    async def publish(task_id, exc, **kwargs):
         assert task_id == 1
         assert isinstance(exc, CodexThreadIdentityMismatchError)
+        assert kwargs["queued_message"].prompt == "must not cross native threads"
         published.set()
 
     d._process_queued_message = fake_process
@@ -5011,6 +5040,7 @@ async def test_duck_lifecycle_fence_can_persist_codex_binding(db_factory):
             shared_from_id=task.shared_from_id,
             status=None,
             retry_count=task.retry_count,
+            turn_generation=task.turn_generation,
             instance_id=task.instance_id,
             started_at=task.started_at,
             completed_at=task.completed_at,
@@ -5207,6 +5237,78 @@ def _plan_delivery_digest(payload: dict) -> str:
     ).hexdigest()
 
 
+async def _seed_worker_handoff_delivery(
+    db_factory,
+    *,
+    handoff_id: str,
+    prompt: str = "continue exactly once",
+):
+    retry_count = 2
+    from_generation = 8
+    async with db_factory() as db:
+        task = Task(
+            title="worker handoff",
+            description="delivery",
+            status="completed",
+            retry_count=retry_count,
+            turn_generation=from_generation,
+            session_id="worker-handoff-session",
+        )
+        db.add(task)
+        await db.flush()
+        log = LogEntry(
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content=prompt,
+            raw_json=json.dumps({"raw_content": prompt}),
+        )
+        db.add(log)
+        await db.flush()
+        request_payload = {
+            "message": prompt,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        }
+        queue_payload = {
+            "prompt": prompt,
+            "priority": 0,
+            "source": "user",
+            "user_message_text": None,
+            "command_skills": None,
+            "model_override": None,
+            "expected_task_routing": ["claude", None, "default"],
+            "source_log_id": log.id,
+            "current_message": prompt,
+            "queue_timestamp": 1234.5,
+            "allow_new_session": False,
+            "delivery_key": None,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        }
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task.id,
+                source_log_id=log.id,
+                side="worker",
+                worker_id=None,
+                retry_count=retry_count,
+                from_generation=from_generation,
+                status="accepted",
+                request_payload=request_payload,
+                request_digest=_plan_delivery_digest(request_payload),
+                queue_payload=queue_payload,
+                queue_payload_digest=_plan_delivery_digest(queue_payload),
+                response={"ok": True, "queued": True},
+            )
+        )
+        await db.commit()
+        return task.id, log.id
+
+
 async def _seed_plan_delivery(
     db_factory,
     *,
@@ -5275,6 +5377,117 @@ async def _seed_plan_delivery(
         )
         await db.commit()
         return task.id, plan.id, version.id, log.id
+
+
+async def _seed_plan_worker_handoff_delivery(
+    db_factory,
+    *,
+    receipt_key: str,
+    delivery_status: str = "pending",
+):
+    """Create one Worker-local queue item jointly owned by both receipts."""
+
+    retry_count = 2
+    from_generation = 8
+    handoff_id = hashlib.sha256(receipt_key.encode("utf-8")).hexdigest()[:32]
+    async with db_factory() as db:
+        task = Task(
+            title="worker plan delivery",
+            description="delivery",
+            status="completed",
+            retry_count=retry_count,
+            turn_generation=from_generation,
+            session_id="worker-plan-session",
+        )
+        plan = Plan(
+            title="worker plan",
+            initial_request="plan",
+            pipeline_config={},
+        )
+        db.add_all([task, plan])
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            version_number=1,
+            content="# Worker plan",
+            human_decision="approved",
+        )
+        log = LogEntry(
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement exactly",
+            raw_json=json.dumps({
+                "raw_content": "Implement exactly",
+                "applied_plans": [{"plan_id": plan.id}],
+            }),
+        )
+        db.add_all([version, log])
+        await db.flush()
+        queue_payload = _plan_delivery_payload(queue_timestamp=1234.5)
+        queue_payload.update({
+            "source_log_id": log.id,
+            "delivery_key": receipt_key,
+            "allow_new_session": False,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        })
+        request_payload = {
+            "message": "Implement exactly",
+            "plan_version_ids": [version.id],
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        }
+        db.add_all([
+            PlanApplicationReceipt(
+                receipt_key=receipt_key,
+                target_task_id=task.id,
+                manager_user_log_id=log.id,
+                plan_version_ids=[version.id],
+                status="committed",
+                response={"ok": True, "queued": True},
+                delivery_status=delivery_status,
+                delivery_error=(
+                    "legacy uncertain launch"
+                    if delivery_status == "uncertain"
+                    else None
+                ),
+                launch_evidence=(
+                    {"task_id": task.id, "instance_id": 7}
+                    if delivery_status == "uncertain"
+                    else None
+                ),
+                outbox_payload=queue_payload,
+                payload_digest=_plan_delivery_digest(queue_payload),
+            ),
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task.id,
+                source_log_id=log.id,
+                side="worker",
+                worker_id=None,
+                retry_count=retry_count,
+                from_generation=from_generation,
+                status="accepted",
+                request_payload=request_payload,
+                request_digest=_plan_delivery_digest(request_payload),
+                queue_payload=queue_payload,
+                queue_payload_digest=_plan_delivery_digest(queue_payload),
+                response={"ok": True, "queued": True},
+            ),
+            PlanApplication(
+                plan_id=plan.id,
+                plan_version_id=version.id,
+                application_type="chat_message",
+                target_task_id=task.id,
+                user_log_id=log.id,
+                application_receipt_key=receipt_key,
+            ),
+        ])
+        await db.commit()
+        return task.id, version.id, log.id, handoff_id
 
 
 @pytest.mark.asyncio
@@ -5372,6 +5585,208 @@ async def test_same_process_outbox_recovery_does_not_reclassify_launch(db_factor
             )
         )
         assert receipt.delivery_status == "launching"
+
+
+@pytest.mark.asyncio
+async def test_plan_recovery_defers_linked_accepted_handoff_to_worker_outbox(
+    db_factory,
+):
+    receipt_key = "accepted-worker-owned-plan-recovery"
+    task_id, _version_id, log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+        )
+    )
+    # Match the production API shape: only the Plan outbox owns the admission
+    # fence; the Worker's immutable replay envelope does not.
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        payload = dict(plan_receipt.outbox_payload)
+        payload["queue_admission_fence"] = {
+            "epoch": "startup-test",
+            "generation": 0,
+        }
+        plan_receipt.outbox_payload = payload
+        plan_receipt.payload_digest = _plan_delivery_digest(payload)
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+
+    await dispatcher._recover_plan_application_outbox()
+    assert dispatcher._get_task_queue(task_id).empty()
+
+    await dispatcher._recover_worker_turn_handoff_outbox()
+    recovered = dispatcher._get_task_queue(task_id).get_nowait()
+    assert recovered.delivery_key == receipt_key
+    assert recovered.worker_turn_handoff_id == handoff_id
+    assert recovered.worker_turn_handoff_claimed_generation is None
+    assert recovered.source_log_id == log_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan_status", ["queued", "launching"])
+async def test_plan_recovery_replays_exact_linked_claimed_generation(
+    db_factory,
+    plan_status,
+):
+    receipt_key = f"claimed-worker-owned-plan-{plan_status}"
+    task_id, _version_id, log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+            delivery_status=plan_status,
+        )
+    )
+    claimed_generation = 9
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        row = await db.get(LogEntry, log_id)
+        handoff = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        task.turn_generation = claimed_generation
+        row.task_retry_count = handoff.retry_count
+        row.task_turn_generation = claimed_generation
+        handoff.status = "claimed"
+        handoff.claimed_turn_generation = claimed_generation
+        if plan_status == "launching":
+            plan_receipt.launch_evidence = {
+                "task_id": task_id,
+                "instance_id": 7,
+                "retry_count": handoff.retry_count,
+                "turn_generation": claimed_generation,
+                "source_log_id": log_id,
+            }
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+
+    # Plan recovery must not create a fresh accepted envelope.  Worker
+    # recovery reopens an interrupted launching claim (if needed) and carries
+    # the already-bound G+1 into memory exactly once.
+    await dispatcher._recover_plan_application_outbox()
+    assert dispatcher._get_task_queue(task_id).empty()
+    await dispatcher._recover_worker_turn_handoff_outbox()
+
+    recovered = dispatcher._get_task_queue(task_id).get_nowait()
+    assert recovered.delivery_key == receipt_key
+    assert recovered.worker_turn_handoff_id == handoff_id
+    assert (
+        recovered.worker_turn_handoff_claimed_generation
+        == claimed_generation
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+    assert task.turn_generation == claimed_generation
+    assert plan_receipt.delivery_status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_plan_recovery_quarantines_missing_worker_handoff_proof(
+    db_factory,
+):
+    receipt_key = "missing-worker-proof-plan-recovery"
+    task_id, _version_id, _log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+        )
+    )
+    async with db_factory() as db:
+        handoff = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        await db.delete(handoff)
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    await dispatcher._recover_plan_application_outbox()
+
+    assert dispatcher._get_task_queue(task_id).empty()
+    async with db_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+    assert receipt.delivery_status == "uncertain"
+    assert "proof is missing or invalid" in receipt.delivery_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_status", ["launching", "launched"])
+async def test_plan_recovery_quarantines_linked_post_boundary_worker_handoff(
+    db_factory,
+    worker_status,
+):
+    receipt_key = f"post-boundary-worker-{worker_status}"
+    task_id, _version_id, log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+            delivery_status="launching",
+        )
+    )
+    claimed_generation = 9
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        row = await db.get(LogEntry, log_id)
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        task.status = "executing"
+        task.turn_generation = claimed_generation
+        row.task_retry_count = worker_receipt.retry_count
+        row.task_turn_generation = claimed_generation
+        worker_receipt.status = worker_status
+        worker_receipt.claimed_turn_generation = claimed_generation
+        plan_receipt.launch_evidence = {
+            "task_id": task_id,
+            "instance_id": 7,
+            "retry_count": worker_receipt.retry_count,
+            "turn_generation": claimed_generation,
+            "source_log_id": log_id,
+        }
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher.enqueue_plan_application_receipt = AsyncMock()
+    dispatcher.enqueue_worker_turn_handoff = AsyncMock()
+
+    await dispatcher._recover_plan_application_outbox()
+    await dispatcher._recover_worker_turn_handoff_outbox()
+
+    dispatcher.enqueue_plan_application_receipt.assert_not_awaited()
+    dispatcher.enqueue_worker_turn_handoff.assert_not_awaited()
+    assert dispatcher._get_task_queue(task_id).empty()
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert plan_receipt.delivery_status == "uncertain"
+    assert "duplicate execution" in plan_receipt.delivery_error
+    assert worker_receipt.status == worker_status
+    assert worker_receipt.claimed_turn_generation == claimed_generation
 
 
 @pytest.mark.asyncio
@@ -5520,6 +5935,166 @@ async def test_receipt_staged_before_abort_cannot_admit_after_abort_returns(
             is None
         )
     assert dispatcher._get_task_queue(task_id).empty()
+
+
+@pytest.mark.asyncio
+async def test_stale_plan_admission_jointly_cancels_worker_handoff(db_factory):
+    receipt_key = "stale-plan-worker-handoff"
+    task_id, version_id, log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+        )
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    fence = await dispatcher.snapshot_plan_queue_admission(task_id)
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        payload = dict(plan_receipt.outbox_payload)
+        payload["queue_admission_fence"] = fence
+        plan_receipt.outbox_payload = payload
+        plan_receipt.payload_digest = _plan_delivery_digest(payload)
+        worker_receipt.queue_payload = payload
+        worker_receipt.queue_payload_digest = _plan_delivery_digest(payload)
+        await db.commit()
+
+    # Advancing the in-process queue generation makes the captured fence
+    # stale without pre-cancelling either durable receipt.
+    assert await dispatcher.clear_task_queue(task_id) == 0
+    assert not await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=log_id,
+        handoff_id=handoff_id,
+    )
+
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+    assert plan_receipt.delivery_status == "cancelled"
+    assert worker_receipt.status == "cancelled"
+    assert application is None
+
+
+@pytest.mark.asyncio
+async def test_uncertain_plan_cancels_only_unlaunched_accepted_handoff(
+    db_factory,
+):
+    receipt_key = "uncertain-plan-accepted-handoff"
+    task_id, version_id, log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+            delivery_status="uncertain",
+        )
+    )
+    dispatcher = _make_dispatcher(db_factory)
+
+    assert not await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=log_id,
+        handoff_id=handoff_id,
+    )
+
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+    assert plan_receipt.delivery_status == "uncertain"
+    assert worker_receipt.status == "cancelled"
+    assert "uncertain" in worker_receipt.cancel_reason.lower()
+    assert application is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tampered_payload",
+    ["plan", "worker_queue", "worker_request"],
+)
+async def test_plan_linked_handoff_cancellation_rejects_tampered_payload_digest(
+    db_factory,
+    tampered_payload,
+):
+    receipt_key = f"tampered-cancellation-{tampered_payload}"
+    task_id, version_id, _log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+        )
+    )
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        if tampered_payload == "plan":
+            payload = dict(plan_receipt.outbox_payload)
+            payload["prompt"] = "tampered Plan prompt"
+            plan_receipt.outbox_payload = payload
+        elif tampered_payload == "worker_queue":
+            payload = dict(worker_receipt.queue_payload)
+            payload["prompt"] = "tampered Worker queue prompt"
+            worker_receipt.queue_payload = payload
+        else:
+            payload = dict(worker_receipt.request_payload)
+            payload["message"] = "tampered Worker request"
+            worker_receipt.request_payload = payload
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        assert not await dispatcher._cancel_plan_linked_worker_handoff(
+            db,
+            receipt=plan_receipt,
+            reason="must not cancel from corrupted proof",
+        )
+        await db.rollback()
+
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+    assert plan_receipt.delivery_status == "pending"
+    assert worker_receipt.status == "accepted"
+    assert worker_receipt.cancel_reason is None
+    assert application is not None
 
 
 @pytest.mark.asyncio
@@ -5896,6 +6471,131 @@ async def test_proven_prelaunch_failure_releases_version_application(db_factory)
 
 
 @pytest.mark.asyncio
+async def test_permanent_routing_failure_jointly_ends_plan_and_worker_handoff(
+    db_factory,
+):
+    receipt_key = "permanent-route-plan-worker-handoff"
+    task_id, version_id, log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+        )
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    queued_message = QueuedMessage(
+        priority=0,
+        timestamp=1234.5,
+        prompt="[Approved Plan]\nImplement exactly",
+        source="user",
+        source_log_id=log_id,
+        delivery_key=receipt_key,
+        worker_turn_handoff_id=handoff_id,
+        worker_turn_handoff_retry_count=2,
+        worker_turn_handoff_from_generation=8,
+    )
+
+    await dispatcher._publish_permanent_account_routing_failure(
+        task_id,
+        QueuedMessageRoutingMismatchError("permanent route mismatch"),
+        queued_message=queued_message,
+    )
+
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id,
+                PlanApplication.target_task_id == task_id,
+            )
+        )
+        system_logs = list(
+            (
+                await db.execute(
+                    select(LogEntry).where(
+                        LogEntry.task_id == task_id,
+                        LogEntry.event_type == "system_event",
+                        LogEntry.is_error.is_(True),
+                    )
+                )
+            ).scalars()
+        )
+    assert plan_receipt.delivery_status == "failed"
+    assert worker_receipt.status == "cancelled"
+    assert "permanent route mismatch" in worker_receipt.cancel_reason
+    assert application is None
+    assert len(system_logs) == 1
+    assert "本条消息未执行" in system_logs[0].content
+
+
+@pytest.mark.asyncio
+async def test_permanent_routing_failure_rolls_back_all_settlement_on_commit_error(
+    db_factory,
+    monkeypatch,
+):
+    receipt_key = "permanent-route-rollback"
+    task_id, version_id, log_id, handoff_id = (
+        await _seed_plan_worker_handoff_delivery(
+            db_factory,
+            receipt_key=receipt_key,
+        )
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    queued_message = QueuedMessage(
+        priority=0,
+        timestamp=1234.5,
+        prompt="[Approved Plan]\nImplement exactly",
+        source="user",
+        source_log_id=log_id,
+        delivery_key=receipt_key,
+        worker_turn_handoff_id=handoff_id,
+        worker_turn_handoff_retry_count=2,
+        worker_turn_handoff_from_generation=8,
+    )
+
+    async def fail_commit(_session):
+        raise RuntimeError("routing settlement commit failed")
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_commit)
+    with pytest.raises(RuntimeError, match="routing settlement commit failed"):
+        await dispatcher._publish_permanent_account_routing_failure(
+            task_id,
+            QueuedMessageRoutingMismatchError("permanent route mismatch"),
+            queued_message=queued_message,
+        )
+
+    async with db_factory() as db:
+        plan_receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        worker_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id,
+                PlanApplication.target_task_id == task_id,
+            )
+        )
+        system_log = await db.scalar(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "system_event",
+                LogEntry.is_error.is_(True),
+            )
+        )
+    assert plan_receipt.delivery_status == "pending"
+    assert worker_receipt.status == "accepted"
+    assert application is not None
+    assert system_log is None
+    dispatcher.broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_retry_queue_timestamp_preserves_original_message_order(
     db_factory,
 ):
@@ -5955,6 +6655,509 @@ async def _setup_queued_msg_two_idle(db_factory, monkeypatch):
         source="user",
     )
     return d, id1, id2, task_id, msg
+
+
+async def _attach_accepted_worker_handoff(
+    db_factory,
+    *,
+    task_id: int,
+    msg: QueuedMessage,
+    handoff_id: str,
+) -> int:
+    """Attach one production-shaped accepted receipt to a queued test item."""
+
+    retry_count = 2
+    from_generation = 8
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        task.retry_count = retry_count
+        task.turn_generation = from_generation
+        task.instance_id = None
+        log = LogEntry(
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="exact Worker follow-up",
+            raw_json=json.dumps({"raw_content": "exact Worker follow-up"}),
+        )
+        db.add(log)
+        await db.flush()
+        msg.source_log_id = log.id
+        msg.current_message = msg.prompt
+        msg.worker_turn_handoff_id = handoff_id
+        msg.worker_turn_handoff_retry_count = retry_count
+        msg.worker_turn_handoff_from_generation = from_generation
+        msg.expected_task_routing = ("claude", None, "default")
+        request_payload = {
+            "message": "exact Worker follow-up",
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        }
+        queue_payload = {
+            "prompt": msg.prompt,
+            "priority": msg.priority,
+            "source": msg.source,
+            "user_message_text": msg.user_message_text,
+            "command_skills": msg.command_skills,
+            "model_override": msg.model_override,
+            "expected_task_routing": ["claude", None, "default"],
+            "source_log_id": log.id,
+            "current_message": msg.current_message,
+            "queue_timestamp": msg.timestamp,
+            "allow_new_session": msg.allow_new_session,
+            "delivery_key": msg.delivery_key,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        }
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task_id,
+                source_log_id=log.id,
+                side="worker",
+                worker_id=None,
+                retry_count=retry_count,
+                from_generation=from_generation,
+                status="accepted",
+                request_payload=request_payload,
+                request_digest=_plan_delivery_digest(request_payload),
+                queue_payload=queue_payload,
+                queue_payload_digest=_plan_delivery_digest(queue_payload),
+                response={"ok": True, "queued": True},
+            )
+        )
+        await db.commit()
+        return log.id
+
+
+@pytest.mark.asyncio
+async def test_worker_handoff_claim_binds_user_log_to_exact_next_turn(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    handoff_id = "b" * 32
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        task.retry_count = 2
+        task.turn_generation = 8
+        task.instance_id = None
+        log = LogEntry(
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="exact Worker follow-up",
+            raw_json=json.dumps({
+                "raw_content": "exact Worker follow-up",
+                "worker_turn_handoff": {
+                    "id": handoff_id,
+                    "retry_count": 2,
+                    "from_generation": 8,
+                },
+            }),
+        )
+        db.add(log)
+        await db.flush()
+        log_id = log.id
+        msg.source_log_id = log_id
+        msg.current_message = msg.prompt
+        msg.worker_turn_handoff_id = handoff_id
+        msg.worker_turn_handoff_retry_count = 2
+        msg.worker_turn_handoff_from_generation = 8
+        request_payload = {
+            "message": "exact Worker follow-up",
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": 2,
+            "worker_turn_handoff_from_generation": 8,
+        }
+        queue_payload = {
+            "prompt": msg.prompt,
+            "priority": msg.priority,
+            "source": msg.source,
+            "user_message_text": msg.user_message_text,
+            "command_skills": msg.command_skills,
+            "model_override": msg.model_override,
+            "expected_task_routing": None,
+            "source_log_id": log_id,
+            "current_message": msg.current_message,
+            "queue_timestamp": msg.timestamp,
+            "allow_new_session": msg.allow_new_session,
+            "delivery_key": msg.delivery_key,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": 2,
+            "worker_turn_handoff_from_generation": 8,
+        }
+        canonical = lambda payload: hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task_id,
+                source_log_id=log_id,
+                side="worker",
+                worker_id=None,
+                retry_count=2,
+                from_generation=8,
+                status="accepted",
+                request_payload=request_payload,
+                request_digest=canonical(request_payload),
+                queue_payload=queue_payload,
+                queue_payload_digest=canonical(queue_payload),
+                response={"ok": True, "queued": True},
+            )
+        )
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        log = await db.get(LogEntry, log_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert task.turn_generation == 9
+    assert log.task_retry_count == 2
+    assert log.task_turn_generation == 9
+    assert receipt.status == "launched"
+    assert receipt.claimed_turn_generation == 9
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["task_turn_generation"] == 9
+
+
+@pytest.mark.asyncio
+async def test_worker_handoff_boundary_failure_retries_only_exact_claimed_g1(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    handoff_id = "1" * 32
+    await _attach_accepted_worker_handoff(
+        db_factory,
+        task_id=task_id,
+        msg=msg,
+        handoff_id=handoff_id,
+    )
+
+    persist_transition = d._persist_worker_handoff_transition
+    d._persist_worker_handoff_transition = AsyncMock(
+        side_effect=RuntimeError("boundary database rejected write")
+    )
+
+    async def reject_at_boundary(**kwargs):
+        await kwargs["on_launch_admitted"]()
+
+    d.instance_manager.launch.side_effect = reject_at_boundary
+
+    with pytest.raises(QueuedMessagePrelaunchError):
+        await d._process_queued_message(task_id, msg)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert task.status == "completed"
+    assert task.turn_generation == 9
+    assert receipt.status == "claimed"
+    assert receipt.claimed_turn_generation == 9
+
+    # Simulate process restart: durable recovery must rebuild this same G+1,
+    # then cross the provider boundary exactly once.  It must not create G+2.
+    provider_side_effects = 0
+
+    async def launch_recovered_generation(**kwargs):
+        nonlocal provider_side_effects
+        await kwargs["on_launch_admitted"]()
+        provider_side_effects += 1
+        return 4321
+
+    d._persist_worker_handoff_transition = persist_transition
+    d.instance_manager.launch.side_effect = launch_recovered_generation
+    d._ensure_queue_worker = MagicMock()
+    await d._recover_worker_turn_handoff_outbox()
+    recovered = d._get_task_queue(task_id).get_nowait()
+    assert recovered.worker_turn_handoff_claimed_generation == 9
+
+    await d._process_queued_message(task_id, recovered)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert task.turn_generation == 9
+    assert receipt.status == "launched"
+    assert receipt.claimed_turn_generation == 9
+    assert provider_side_effects == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_handoff_boundary_commit_unknown_is_not_replayed(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    handoff_id = "2" * 32
+    await _attach_accepted_worker_handoff(
+        db_factory,
+        task_id=task_id,
+        msg=msg,
+        handoff_id=handoff_id,
+    )
+    persist_transition = d._persist_worker_handoff_transition
+
+    async def commit_then_lose_ack(**kwargs):
+        await persist_transition(**kwargs)
+        raise RuntimeError("database lost commit acknowledgement")
+
+    d._persist_worker_handoff_transition = commit_then_lose_ack
+    # A third-party/AsyncMock stand-in may return success without invoking the
+    # callback. Dispatcher must run the fallback hook and treat an ambiguous
+    # commit as post-boundary instead of replaying G+1.
+    d.instance_manager.launch.return_value = 4321
+
+    with pytest.raises(WorkerTurnLaunchOutcomeUncertainError):
+        await d._process_queued_message(task_id, msg)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert task.status == "failed"
+    assert task.turn_generation == 9
+    assert receipt.status == "launching"
+    assert receipt.claimed_turn_generation == 9
+
+
+@pytest.mark.asyncio
+async def test_worker_handoff_cancel_after_boundary_is_not_recovered(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    handoff_id = "3" * 32
+    await _attach_accepted_worker_handoff(
+        db_factory,
+        task_id=task_id,
+        msg=msg,
+        handoff_id=handoff_id,
+    )
+
+    async def cancel_after_boundary(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        raise asyncio.CancelledError()
+
+    d.instance_manager.launch.side_effect = cancel_after_boundary
+    with pytest.raises(asyncio.CancelledError):
+        await d._process_queued_message(task_id, msg)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert task.turn_generation == 9
+    assert receipt.status == "launching"
+    assert receipt.claimed_turn_generation == 9
+
+    d._ensure_queue_worker = MagicMock()
+    await d._recover_worker_turn_handoff_outbox()
+    assert d._get_task_queue(task_id).empty()
+
+
+@pytest.mark.asyncio
+async def test_queue_abort_durably_cancels_accepted_worker_handoff_after_restart(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    handoff_id = "c" * 32
+    async with db_factory() as db:
+        task = Task(
+            title="worker handoff",
+            description="d",
+            status="completed",
+            retry_count=2,
+            turn_generation=8,
+            session_id="sess",
+        )
+        db.add(task)
+        await db.flush()
+        log = LogEntry(
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="must not resurrect",
+        )
+        db.add(log)
+        await db.flush()
+        request_payload = {
+            "message": "must not resurrect",
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": 2,
+            "worker_turn_handoff_from_generation": 8,
+        }
+        queue_payload = {
+            "prompt": "must not resurrect",
+            "priority": 0,
+            "source": "user",
+            "expected_task_routing": ["claude", None, "default"],
+            "source_log_id": log.id,
+            "current_message": "must not resurrect",
+            "queue_timestamp": 1.0,
+            "allow_new_session": False,
+            "delivery_key": None,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": 2,
+            "worker_turn_handoff_from_generation": 8,
+        }
+
+        def digest(payload):
+            return hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task.id,
+                source_log_id=log.id,
+                side="worker",
+                worker_id=None,
+                retry_count=2,
+                from_generation=8,
+                status="accepted",
+                request_payload=request_payload,
+                request_digest=digest(request_payload),
+                queue_payload=queue_payload,
+                queue_payload_digest=digest(queue_payload),
+                response={"ok": True, "queued": True},
+            )
+        )
+        await db.commit()
+        task_id = task.id
+        log_id = log.id
+
+    # Simulate a Worker restart: the durable receipt exists but its memory
+    # queue/set is empty when stop/cancel closes task admission.
+    async with d.task_queue_cancellation_lease(task_id):
+        await d.abort_task_queue(task_id, cancel_durable=False)
+
+    async with db_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        assert receipt.status == "cancelled"
+        assert receipt.claimed_turn_generation is None
+    assert not await d.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=log_id,
+        handoff_id=handoff_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_graceful_queue_abort_preserves_inflight_worker_handoff_for_restart(
+    db_factory,
+):
+    handoff_id = "d" * 32
+    task_id, log_id = await _seed_worker_handoff_delivery(
+        db_factory,
+        handoff_id=handoff_id,
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    processing = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def block_before_launch(_task_id, _msg):
+        processing.set()
+        await never_finish.wait()
+
+    dispatcher._process_queued_message = block_before_launch
+    assert await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=log_id,
+        handoff_id=handoff_id,
+    )
+    await asyncio.wait_for(processing.wait(), timeout=1)
+
+    dispatcher._shutting_down = True
+    await dispatcher.abort_task_queue(task_id, cancel_durable=False)
+
+    async with db_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        assert receipt.status == "accepted"
+        assert receipt.claimed_turn_generation is None
+
+    assert handoff_id not in dispatcher._queued_worker_turn_handoffs
+    dispatcher._shutting_down = False
+    dispatcher._ensure_queue_worker = MagicMock()
+    await dispatcher._recover_worker_turn_handoff_outbox()
+
+    recovered = dispatcher._get_task_queue(task_id).get_nowait()
+    assert recovered.worker_turn_handoff_id == handoff_id
+    assert recovered.source_log_id == log_id
+    async with db_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        assert receipt.status == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_queue_worker_replacement_releases_dequeued_handoff_dedup_key(
+    db_factory,
+):
+    handoff_id = "e" * 32
+    task_id, log_id = await _seed_worker_handoff_delivery(
+        db_factory,
+        handoff_id=handoff_id,
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    claiming = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def block_claim(_task_id, _msg):
+        claiming.set()
+        await never_finish.wait()
+
+    dispatcher._claim_dequeued_message = block_claim
+    assert await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=log_id,
+        handoff_id=handoff_id,
+    )
+    await asyncio.wait_for(claiming.wait(), timeout=1)
+
+    worker = dispatcher._task_queue_workers[task_id]
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+    assert handoff_id not in dispatcher._queued_worker_turn_handoffs
+    async with db_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        assert receipt.status == "accepted"
+
+    dispatcher._ensure_queue_worker = MagicMock()
+    await dispatcher._recover_worker_turn_handoff_outbox()
+    recovered = dispatcher._get_task_queue(task_id).get_nowait()
+    assert recovered.worker_turn_handoff_id == handoff_id
 
 
 @pytest.mark.asyncio
@@ -8796,6 +9999,8 @@ async def _seed_detached_shutdown_generation(
         await db.commit()
         await db.refresh(task)
         task_id = task.id
+        task_retry_count = task.retry_count
+        task_turn_generation = task.turn_generation
 
     instance_manager = InstanceManager(db_factory, dispatcher.broadcaster)
     session = SimpleNamespace(
@@ -8823,6 +10028,8 @@ async def _seed_detached_shutdown_generation(
         session_id,
         generation,
         session,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
     )
     dispatcher.instance_manager = instance_manager
     return task_id, session_id, generation, session, state

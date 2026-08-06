@@ -10,6 +10,7 @@ from sqlalchemy import select
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorSession
 from backend.models.task import Task
+from backend.models.worker import Worker
 
 
 @pytest.mark.asyncio
@@ -1089,6 +1090,94 @@ async def test_local_termination_rejects_new_background_marker_aba(
 
 
 @pytest.mark.asyncio
+async def test_local_termination_rejects_turn_generation_only_aba(
+    db_factory,
+):
+    """A stopped old owner cannot terminalize a newly admitted logical turn."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    started_at = datetime.utcnow()
+    async with db_factory() as db:
+        task = Task(
+            title="turn generation ABA",
+            description="test",
+            status="executing",
+            turn_generation=7,
+            started_at=started_at,
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="turn-generation-owner",
+            status="running",
+            pid=54302,
+            current_task_id=task.id,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+
+    async def stop_old_turn(_instance_id, **_kwargs):
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            owner = await db.get(Instance, instance_id)
+            owner.status = "idle"
+            owner.pid = None
+            owner.current_task_id = None
+            task.turn_generation += 1
+            await db.commit()
+        return True
+
+    async with db_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "wait_for_task_launch_barrier",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "stop",
+                new_callable=AsyncMock,
+                side_effect=stop_old_turn,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new_callable=AsyncMock,
+            ) as publish,
+        ):
+            with pytest.raises(
+                termination.TaskGenerationTerminationConflict,
+                match="newer generation",
+            ):
+                await termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+
+    publish.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 8
+    assert (current.metadata_ or {}).get("pr_review_superseded") is True
+
+
+@pytest.mark.asyncio
 async def test_local_termination_revalidates_authority_after_queue_abort(
     db_factory,
 ):
@@ -1187,6 +1276,246 @@ async def test_local_termination_reconciles_conflict_as_terminal(db_factory):
     publish.assert_not_awaited()
 
 
+def _worker_termination_snapshot(task: Task, **overrides) -> dict:
+    snapshot = {
+        "id": task.id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "instance_id": task.instance_id,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+        "pty_background_generation": task.pty_background_generation,
+        "background_active": task.pty_background_generation is not None,
+        "metadata_": dict(task.metadata_ or {}),
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "remote_turn_generation",
+    [None, 6],
+    ids=["missing", "different"],
+)
+async def test_worker_termination_rejects_invalid_get_turn_generation(
+    db_factory,
+    remote_turn_generation,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="termination-worker",
+            status="ready",
+            private_ip="10.0.0.8",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="remote termination fence",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+            turn_generation=5,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        remote = _worker_termination_snapshot(task)
+    if remote_turn_generation is None:
+        remote.pop("turn_generation")
+    else:
+        remote["turn_generation"] = remote_turn_generation
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.return_value = remote
+
+    with patch.object(backend.main, "worker_proxy", proxy):
+        async with db_factory() as db:
+            with pytest.raises(termination.WorkerTaskTerminationConflict):
+                await termination.terminate_worker_task_generation(
+                    task_id,
+                    db,
+                    operation_locks_held=True,
+                )
+
+    assert proxy.proxy_to_worker.await_count == 1
+    assert proxy.proxy_to_worker.await_args.args[1] == "GET"
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [None, [], "not-an-object"])
+async def test_worker_termination_rejects_non_object_snapshot(
+    db_factory,
+    remote,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="malformed-termination-worker",
+            status="ready",
+            private_ip="10.0.0.18",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="malformed remote termination snapshot",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.return_value = remote
+    with patch.object(backend.main, "worker_proxy", proxy):
+        async with db_factory() as db:
+            with pytest.raises(
+                termination.WorkerTaskTerminationConflict,
+                match="invalid termination snapshot",
+            ):
+                await termination.terminate_worker_task_generation(
+                    task_id,
+                    db,
+                    operation_locks_held=True,
+                )
+
+    assert proxy.proxy_to_worker.await_count == 1
+    assert proxy.proxy_to_worker.await_args.args[1] == "GET"
+
+
+@pytest.mark.asyncio
+async def test_worker_termination_sends_and_confirms_exact_turn_generation(
+    db_factory,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="successful-termination-worker",
+            status="ready",
+            private_ip="10.0.0.9",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="remote exact termination",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+            retry_count=2,
+            turn_generation=9,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        before = _worker_termination_snapshot(task)
+        result = _worker_termination_snapshot(
+            task,
+            status="completed",
+            metadata_={"pr_review_superseded": True},
+        )
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = [before, result]
+
+    with (
+        patch.object(backend.main, "worker_proxy", proxy),
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new_callable=AsyncMock,
+        ) as publish,
+    ):
+        async with db_factory() as db:
+            terminated = await termination.terminate_worker_task_generation(
+                task_id,
+                db,
+                operation_locks_held=True,
+            )
+
+    assert terminated.observed.turn_generation == 9
+    assert terminated.resulting.turn_generation == 9
+    post = proxy.proxy_to_worker.await_args_list[1]
+    assert post.args[1] == "POST"
+    assert post.kwargs["body"]["expected_turn_generation"] == 9
+    publish.assert_awaited_once_with(task_id, "completed")
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "completed"
+    assert current.retry_count == 2
+    assert current.turn_generation == 9
+
+
+@pytest.mark.asyncio
+async def test_worker_termination_rejects_result_from_different_turn(
+    db_factory,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="stale-result-worker",
+            status="ready",
+            private_ip="10.0.0.10",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="stale remote result",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+            turn_generation=14,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        before = _worker_termination_snapshot(task)
+        stale_result = _worker_termination_snapshot(
+            task,
+            status="completed",
+            turn_generation=15,
+            metadata_={"pr_review_superseded": True},
+        )
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = [before, stale_result]
+
+    with patch.object(backend.main, "worker_proxy", proxy):
+        async with db_factory() as db:
+            with pytest.raises(termination.WorkerTaskTerminationConflict):
+                await termination.terminate_worker_task_generation(
+                    task_id,
+                    db,
+                    operation_locks_held=True,
+                )
+
+    assert proxy.proxy_to_worker.await_count == 2
+    post = proxy.proxy_to_worker.await_args_list[1]
+    assert post.kwargs["body"]["expected_turn_generation"] == 14
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 14
+
+
 @pytest.mark.asyncio
 async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
     client,
@@ -1219,13 +1548,15 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
         f"/api/tasks/{task_id}/terminate-generation"
     )
     assert termination_snapshot.status_code == 200, termination_snapshot.text
-    assert termination_snapshot.json()["pty_background_generation"] is None
+    snapshot = termination_snapshot.json()
+    assert snapshot["pty_background_generation"] is None
 
     missing_marker = await client.post(
         f"/api/tasks/{task_id}/terminate-generation",
         json={
             "expected_status": "executing",
             "expected_retry_count": 0,
+            "expected_turn_generation": snapshot["turn_generation"],
             "expected_instance_id": None,
             "expected_started_at": None,
             "expected_completed_at": None,
@@ -1244,6 +1575,7 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
             json={
                 "expected_status": "executing",
                 "expected_retry_count": 0,
+                "expected_turn_generation": snapshot["turn_generation"],
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
@@ -1316,6 +1648,7 @@ async def test_internal_termination_accepts_pr_fix_task_generations(
             json={
                 "expected_status": snapshot["status"],
                 "expected_retry_count": snapshot["retry_count"],
+                "expected_turn_generation": snapshot["turn_generation"],
                 "expected_instance_id": snapshot["instance_id"],
                 "expected_started_at": snapshot["started_at"],
                 "expected_completed_at": snapshot["completed_at"],
@@ -1369,6 +1702,7 @@ async def test_internal_termination_rejects_plain_tasks_before_cleanup(
             json={
                 "expected_status": "pending",
                 "expected_retry_count": 0,
+                "expected_turn_generation": 0,
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
@@ -1594,6 +1928,7 @@ async def test_hidden_termination_rejects_stale_remote_generation_before_abort(
             json={
                 "expected_status": "executing",
                 "expected_retry_count": 0,
+                "expected_turn_generation": 0,
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
@@ -1667,6 +2002,7 @@ async def test_hidden_termination_rejects_background_generation_aba(
             json={
                 "expected_status": snapshot["status"],
                 "expected_retry_count": snapshot["retry_count"],
+                "expected_turn_generation": snapshot["turn_generation"],
                 "expected_instance_id": snapshot["instance_id"],
                 "expected_started_at": snapshot["started_at"],
                 "expected_completed_at": snapshot["completed_at"],

@@ -17,6 +17,9 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
     async def start_dispatcher() -> None:
         await record("dispatcher")
 
+    async def start_worker_relay() -> None:
+        await record("worker_relay")
+
     async def start_capability() -> None:
         await record("capability")
 
@@ -29,6 +32,10 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
         "start",
         AsyncMock(side_effect=start_dispatcher),
     )
+    worker_relay = MagicMock(
+        start=AsyncMock(side_effect=start_worker_relay)
+    )
+    monkeypatch.setattr(main, "worker_relay", worker_relay)
     monkeypatch.setattr(
         main.capability_coordinator,
         "start",
@@ -42,7 +49,12 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
 
     await main._start_execution_runtimes()
 
-    assert calls == ["dispatcher", "capability", "delivery"]
+    assert calls == [
+        "dispatcher",
+        "worker_relay",
+        "capability",
+        "delivery",
+    ]
 
 
 @pytest.mark.asyncio
@@ -63,6 +75,9 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
     async def stop_capability() -> None:
         await record("capability")
 
+    async def stop_worker_relay() -> None:
+        await record("worker_relay")
+
     async def stop_dispatcher() -> None:
         await record("dispatcher")
 
@@ -77,6 +92,10 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
         "shutdown",
         AsyncMock(side_effect=stop_capability),
     )
+    worker_relay = MagicMock(
+        shutdown=AsyncMock(side_effect=stop_worker_relay)
+    )
+    monkeypatch.setattr(main, "worker_relay", worker_relay)
     monkeypatch.setattr(
         main.dispatcher,
         "shutdown",
@@ -99,7 +118,12 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
             backup_svc=None,
         )
 
-    assert calls == ["delivery", "capability", "dispatcher"]
+    assert calls == [
+        "delivery",
+        "capability",
+        "worker_relay",
+        "dispatcher",
+    ]
 
 
 @pytest.mark.asyncio
@@ -200,7 +224,15 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
     monkeypatch.setattr(main, "instance_manager", instance_manager)
     monkeypatch.setattr(main, "sub_agent_watcher", watcher)
 
-    finalized = [asyncio.Event() for _ in range(4)]
+    finalized = [asyncio.Event() for _ in range(5)]
+
+    async def shutdown_worker_relay() -> None:
+        assert finalized[0].is_set()
+
+    worker_relay = MagicMock(
+        shutdown=AsyncMock(side_effect=shutdown_worker_relay)
+    )
+    monkeypatch.setattr(main, "worker_relay", worker_relay)
 
     async def background(done):
         try:
@@ -215,15 +247,17 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
     await asyncio.sleep(0)
 
     await main._shutdown_runtime_services(
-        heartbeat_task=tasks[0],
-        worker_health_task=tasks[1],
-        upload_cleanup_task=tasks[2],
-        tmp_cleanup_task=tasks[3],
+        worker_relay_recovery_task=tasks[0],
+        heartbeat_task=tasks[1],
+        worker_health_task=tasks[2],
+        upload_cleanup_task=tasks[3],
+        tmp_cleanup_task=tasks[4],
         backup_svc=None,
     )
 
     assert all(task.done() for task in tasks)
     assert all(done.is_set() for done in finalized)
+    worker_relay.shutdown.assert_awaited_once_with()
     watcher.shutdown.assert_awaited_once_with()
 
 

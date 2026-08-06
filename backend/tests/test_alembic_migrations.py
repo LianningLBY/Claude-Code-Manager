@@ -57,7 +57,8 @@ PLAN_V2_REVISION = "3f2a9c8e7b10"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
-CURRENT_HEAD_REVISION = DELIVERY_LOOP_REVISION
+AUTO_CAPABILITY_TURN_REVISION = "c3a7e9f1b2d4"
+CURRENT_HEAD_REVISION = AUTO_CAPABILITY_TURN_REVISION
 PUBLISHED_PLAN_CLEANUP_SHA256 = (
     "dd8cce93f05599ebc580cb95cad5d7d8875f03415775312718d3e42ef4369d16"
 )
@@ -261,10 +262,14 @@ class TestLegacyMigration:
         assert "attention_tag" in task_cols
         assert "delivery_run_id" in task_cols
         assert "delivery_role" in task_cols
+        assert "turn_generation" in task_cols
+        assert "capability_policy" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
         assert "task_retry_count" in log_cols
+        assert "task_turn_generation" in log_cols
+        assert "native_turn_id" in log_cols
 
         plan_step_cols = _get_table_columns(engine, "plan_agent_steps")
         assert "last_delta_at" in plan_step_cols
@@ -783,6 +788,276 @@ class TestDeliveryLoopMigration:
         _run_alembic(cfg, command.downgrade, CODE_REVIEW_REVISION)
 
 
+class TestAutoCapabilityTurnMigration:
+    def test_upgrade_downgrade_preserves_rows_and_task_identity(self, tmp_path):
+        db_path = str(tmp_path / "auto-capability-turn.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+
+        digest = "a" * 64
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('existing exact turn', 'd', 'pending', 0, 'main', "
+                "'pending', 0, 2, 'auto', '2026-08-06 00:00:00')"
+            ))
+            task_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'existing exact turn'"
+            )).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO log_entries "
+                    "(task_id, event_type, content, is_error, timestamp) "
+                    "VALUES (:task_id, 'result', 'existing output', 0, "
+                    "'2026-08-06 00:00:01')"
+                ),
+                {"task_id": task_id},
+            )
+            log_id = conn.execute(text(
+                "SELECT id FROM log_entries WHERE task_id = :task_id"
+            ), {"task_id": task_id}).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO capability_invocations "
+                    "(task_id, capability_key, source, purpose, status, "
+                    "state_version, idempotency_key, input_payload, input_hash, "
+                    "subject_kind, subject_ref, subject_hash, executor_kind, "
+                    "executor_config, executor_config_hash, policy_snapshot, "
+                    "policy_hash, resume_policy, max_attempts, active_task_id, "
+                    "created_at, updated_at) VALUES "
+                    "(:task_id, 'plan', 'human_request', 'advisory', 'failed', "
+                    "1, 'existing-exact-turn', '{}', :digest, "
+                    "'task_generation', '{}', :digest, 'plan_agent', '{}', "
+                    ":digest, '{}', :digest, 'attach_only', 1, NULL, "
+                    "'2026-08-06 00:00:02', '2026-08-06 00:00:02')"
+                ),
+                {"task_id": task_id, "digest": digest},
+            )
+            invocation_id = conn.execute(text(
+                "SELECT id FROM capability_invocations "
+                "WHERE idempotency_key = 'existing-exact-turn'"
+            )).scalar_one()
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(id, title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES (80, 'deleted high-water task', 'd', 'completed', 0, "
+                "'main', 'pending', 0, 2, 'auto', '2026-08-06 00:00:03')"
+            ))
+            conn.execute(text("DELETE FROM tasks WHERE id = 80"))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = {
+            table: {
+                column["name"]: column
+                for column in inspect(engine).get_columns(table)
+            }
+            for table in ("tasks", "log_entries", "capability_invocations")
+        }
+        assert "BIGINT" in str(columns["tasks"]["turn_generation"]["type"]).upper()
+        assert columns["tasks"]["turn_generation"]["nullable"] is False
+        assert columns["tasks"]["turn_generation"]["default"] is not None
+        assert columns["tasks"]["capability_policy"]["nullable"] is True
+        assert "BIGINT" in str(
+            columns["log_entries"]["task_turn_generation"]["type"]
+        ).upper()
+        assert columns["log_entries"]["native_turn_id"]["type"].length == 200
+        assert columns["capability_invocations"]["request_output_log_id"][
+            "nullable"
+        ] is True
+        assert columns["capability_invocations"]["request_native_turn_id"][
+            "type"
+        ].length == 200
+        capability_checks = {
+            item["name"]
+            for item in inspect(engine).get_check_constraints(
+                "capability_invocations"
+            )
+        }
+        assert "ck_cap_inv_agent_request_identity" in capability_checks
+        handoff_columns = _get_table_columns(
+            engine,
+            "worker_turn_handoff_receipts",
+        )
+        assert {
+            "handoff_id",
+            "task_id",
+            "source_log_id",
+            "side",
+            "worker_id",
+            "retry_count",
+            "from_generation",
+            "status",
+            "request_payload",
+            "request_digest",
+            "queue_payload",
+            "queue_payload_digest",
+            "response",
+            "claimed_turn_generation",
+            "terminal_pr_review_chat",
+            "cancel_reason",
+            "created_at",
+            "updated_at",
+        } == set(handoff_columns)
+        handoff_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspect(engine).get_check_constraints(
+                "worker_turn_handoff_receipts"
+            )
+        }
+        assert "CLAIMED_TURN_GENERATION IS NOT NULL" in handoff_checks[
+            "ck_worker_turn_handoff_claim"
+        ].upper()
+        with engine.begin() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT turn_generation, capability_policy FROM tasks "
+                    "WHERE id = :task_id"
+                ),
+                {"task_id": task_id},
+            ).one() == (0, None)
+            assert conn.execute(
+                text(
+                    "SELECT task_turn_generation, native_turn_id "
+                    "FROM log_entries WHERE id = :log_id"
+                ),
+                {"log_id": log_id},
+            ).one() == (None, None)
+            assert conn.execute(
+                text(
+                    "SELECT request_output_log_id, request_native_turn_id "
+                    "FROM capability_invocations WHERE id = :invocation_id"
+                ),
+                {"invocation_id": invocation_id},
+            ).one() == (None, None)
+            task_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'tasks'"
+            )).scalar_one()
+            assert "AUTOINCREMENT" in task_ddl.upper()
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('post-upgrade sequence task', 'd', 'completed', 0, "
+                "'main', 'pending', 0, 2, 'auto', '2026-08-06 00:00:04')"
+            ))
+            post_upgrade_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'post-upgrade sequence task'"
+            )).scalar_one()
+            assert post_upgrade_id > 80
+            conn.execute(text(
+                "DELETE FROM tasks WHERE id = :task_id"
+            ), {"task_id": post_upgrade_id})
+        handoff_insert = text(
+            "INSERT INTO worker_turn_handoff_receipts "
+            "(handoff_id, task_id, source_log_id, side, worker_id, "
+            "retry_count, from_generation, status, request_payload, "
+            "request_digest, queue_payload, queue_payload_digest, response, "
+            "claimed_turn_generation, terminal_pr_review_chat, created_at, "
+            "updated_at) VALUES (:handoff_id, :task_id, :log_id, 'worker', "
+            "NULL, 0, 4, :status, '{}', :digest, '{}', :digest, '{}', "
+            ":claimed_turn_generation, 0, '2026-08-06 00:00:05', "
+            "'2026-08-06 00:00:05')"
+        )
+        for handoff_id, status, claimed_generation in (
+            ("1" * 32, "claimed", None),
+            ("2" * 32, "accepted", 5),
+        ):
+            with pytest.raises(IntegrityError):
+                with engine.begin() as conn:
+                    conn.execute(
+                        handoff_insert,
+                        {
+                            "handoff_id": handoff_id,
+                            "task_id": task_id,
+                            "log_id": log_id,
+                            "status": status,
+                            "digest": digest,
+                            "claimed_turn_generation": claimed_generation,
+                        },
+                    )
+        with engine.begin() as conn:
+            conn.execute(
+                handoff_insert,
+                {
+                    "handoff_id": "3" * 32,
+                    "task_id": task_id,
+                    "log_id": log_id,
+                    "status": "launching",
+                    "digest": digest,
+                    "claimed_turn_generation": 5,
+                },
+            )
+            conn.execute(text(
+                "DELETE FROM worker_turn_handoff_receipts "
+                "WHERE handoff_id = :handoff_id"
+            ), {"handoff_id": "3" * 32})
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE capability_invocations "
+                        "SET source = 'agent_request', "
+                        "resume_policy = 'resume_task' "
+                        "WHERE id = :invocation_id"
+                    ),
+                    {"invocation_id": invocation_id},
+                )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, DELIVERY_LOOP_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_generation" not in _get_table_columns(engine, "tasks")
+        assert "capability_policy" not in _get_table_columns(engine, "tasks")
+        assert "task_turn_generation" not in _get_table_columns(
+            engine, "log_entries"
+        )
+        assert "request_output_log_id" not in _get_table_columns(
+            engine, "capability_invocations"
+        )
+        assert "worker_turn_handoff_receipts" not in _get_all_tables(engine)
+        with engine.begin() as conn:
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM tasks WHERE id = :task_id"
+            ), {"task_id": task_id}).scalar_one() == 1
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM log_entries WHERE id = :log_id"
+            ), {"log_id": log_id}).scalar_one() == 1
+            task_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'tasks'"
+            )).scalar_one()
+            assert "AUTOINCREMENT" in task_ddl.upper()
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('post-downgrade sequence task', 'd', 'completed', 0, "
+                "'main', 'pending', 0, 2, 'auto', '2026-08-06 00:00:05')"
+            ))
+            post_downgrade_id = conn.execute(text(
+                "SELECT id FROM tasks "
+                "WHERE title = 'post-downgrade sequence task'"
+            )).scalar_one()
+            assert post_downgrade_id > post_upgrade_id
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_generation" in _get_table_columns(engine, "tasks")
+        assert "request_native_turn_id" in _get_table_columns(
+            engine, "capability_invocations"
+        )
+        engine.dispose()
+
+
 class TestCodeReviewMigration:
     def test_refuses_review_history_or_reviewer_task_downgrade(self, tmp_path):
         db_path = str(tmp_path / "code-review-downgrade-guard.db")
@@ -842,7 +1117,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -940,6 +1215,8 @@ class TestFreshMigration:
             "active_task_id",
             "idempotency_key",
             "request_task_turn_generation",
+            "request_output_log_id",
+            "request_native_turn_id",
             "result_hash",
         }.issubset(capability_invocation_columns)
         capability_execution_columns = set(
@@ -1726,6 +2003,55 @@ class TestSchemaConsistency:
                 assert "UNIQUE" in ddl
 
     @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
+    def test_auto_capability_turn_migration_compiles_offline(self, dialect_name):
+        migration_path = (
+            PROJECT_ROOT
+            / "alembic"
+            / "versions"
+            / "c3a7e9f1b2d4_add_auto_capability_turn_identity.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            f"auto_capability_turn_migration_for_{dialect_name}",
+            migration_path,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        upgrade_output = io.StringIO()
+        upgrade_context = MigrationContext.configure(
+            dialect_name=dialect_name,
+            opts={"as_sql": True, "output_buffer": upgrade_output},
+        )
+        with patch.object(module, "op", Operations(upgrade_context)):
+            module.upgrade()
+        upgrade_ddl = upgrade_output.getvalue().lower()
+        assert "turn_generation" in upgrade_ddl
+        assert "capability_policy" in upgrade_ddl
+        assert "task_turn_generation" in upgrade_ddl
+        assert "native_turn_id" in upgrade_ddl
+        assert "request_output_log_id" in upgrade_ddl
+        assert "request_native_turn_id" in upgrade_ddl
+
+        downgrade_output = io.StringIO()
+        downgrade_context = MigrationContext.configure(
+            dialect_name=dialect_name,
+            opts={"as_sql": True, "output_buffer": downgrade_output},
+        )
+        with patch.object(module, "op", Operations(downgrade_context)):
+            module.downgrade()
+        downgrade_ddl = downgrade_output.getvalue().lower()
+        assert "drop column turn_generation" in downgrade_ddl
+        assert "drop column capability_policy" in downgrade_ddl
+        assert "drop column task_turn_generation" in downgrade_ddl
+        assert "drop column native_turn_id" in downgrade_ddl
+        assert "drop column request_output_log_id" in downgrade_ddl
+        assert "drop column request_native_turn_id" in downgrade_ddl
+
+    @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
     def test_delivery_migration_compiles_offline(self, dialect_name):
         migration_path = (
             PROJECT_ROOT
@@ -2023,6 +2349,10 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(AUTO_CAPABILITY_TURN_REVISION).down_revision
+            == DELIVERY_LOOP_REVISION
+        )
         assert (
             script.get_revision(DELIVERY_LOOP_REVISION).down_revision
             == CODE_REVIEW_REVISION

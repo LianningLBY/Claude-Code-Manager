@@ -88,6 +88,7 @@ class TaskTerminationResult:
     stopped: bool
     cleared_messages: int
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
@@ -107,6 +108,7 @@ class LocalTaskGeneration:
 
     status: str
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
@@ -144,6 +146,7 @@ def local_task_generation(task: Task) -> LocalTaskGeneration:
     return LocalTaskGeneration(
         status=task.status,
         retry_count=task.retry_count,
+        turn_generation=task.turn_generation,
         instance_id=task.instance_id,
         started_at=_utc_naive(task.started_at),
         completed_at=_utc_naive(task.completed_at),
@@ -157,6 +160,7 @@ def normalize_local_task_generation(
     return LocalTaskGeneration(
         status=generation.status,
         retry_count=generation.retry_count,
+        turn_generation=generation.turn_generation,
         instance_id=generation.instance_id,
         started_at=_utc_naive(generation.started_at),
         completed_at=_utc_naive(generation.completed_at),
@@ -175,6 +179,7 @@ def local_task_generation_predicates(
         Task.shared_from_id.is_(None),
         Task.status == generation.status,
         Task.retry_count == generation.retry_count,
+        Task.turn_generation == generation.turn_generation,
         (
             Task.instance_id.is_(None)
             if generation.instance_id is None
@@ -212,6 +217,7 @@ async def stop_task_process(
     db: AsyncSession,
     *,
     expected_generations: list[tuple[int, int | None, datetime | None]],
+    expected_task_turn_generation: int,
     task_status: str = "completed",
     allow_delivery_effect_stop: bool = False,
 ) -> bool:
@@ -236,6 +242,7 @@ async def stop_task_process(
         generation_stopped = await instance_manager.stop(
             instance_id,
             expected_task_id=task_id,
+            expected_task_turn_generation=expected_task_turn_generation,
             expected_pid=expected_pid,
             expected_started_at=expected_started_at,
             task_status=task_status,
@@ -346,6 +353,7 @@ async def lock_task_generation(
     *,
     expected_status: str,
     expected_retry_count: int,
+    expected_turn_generation: int,
     expected_instance_id: int | None,
     expected_started_at: datetime | None,
     expected_completed_at: datetime | None,
@@ -359,6 +367,7 @@ async def lock_task_generation(
         Task.shared_from_id.is_(None),
         Task.status == expected_status,
         Task.retry_count == expected_retry_count,
+        Task.turn_generation == expected_turn_generation,
         (
             Task.instance_id.is_(None)
             if expected_instance_id is None
@@ -547,6 +556,7 @@ def _same_local_identity(
         task.worker_id is None
         and task.shared_from_id is None
         and task.retry_count == generation.retry_count
+        and task.turn_generation == generation.turn_generation
         and task.instance_id == generation.instance_id
         and _utc_naive(task.started_at) == generation.started_at
     )
@@ -762,6 +772,9 @@ async def _terminate_local_task_generation_impl(
                 task_id,
                 db,
                 expected_generations=expected_generations,
+                expected_task_turn_generation=(
+                    observed_generation.turn_generation
+                ),
                 task_status=(
                     terminal_status
                     if terminal_status in {"completed", "cancelled"}
@@ -803,6 +816,7 @@ async def _terminate_local_task_generation_impl(
                 observed_generation.pty_background_generation,
                 expected_status=observed_generation.status,
                 expected_retry_count=observed_generation.retry_count,
+                expected_turn_generation=observed_generation.turn_generation,
                 expected_instance_id=observed_generation.instance_id,
                 expected_started_at=observed_generation.started_at,
                 expected_completed_at=observed_generation.completed_at,
@@ -972,6 +986,7 @@ async def _terminate_local_task_generation_impl(
                 )
             )
         expected_retry_count = observed_generation.retry_count
+        expected_turn_generation = observed_generation.turn_generation
         expected_instance_id = observed_generation.instance_id
         expected_started_at = observed_generation.started_at
         expected_completed_at = await read_persisted_task_completed_at(
@@ -1033,6 +1048,7 @@ async def _terminate_local_task_generation_impl(
             db,
             expected_status=terminal_status,
             expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
             expected_instance_id=expected_instance_id,
             expected_started_at=expected_started_at,
             expected_completed_at=expected_completed_at,
@@ -1063,6 +1079,7 @@ async def _terminate_local_task_generation_impl(
         stopped=stopped,
         cleared_messages=cleared,
         retry_count=expected_retry_count,
+        turn_generation=expected_turn_generation,
         instance_id=expected_instance_id,
         started_at=expected_started_at,
         completed_at=expected_completed_at,
@@ -1257,6 +1274,10 @@ async def _terminate_worker_task_generation_impl(
                 f"Could not read Worker task {task_id} before stop"
             ) from exc
 
+        if not isinstance(remote_before, dict):
+            raise WorkerTaskTerminationConflict(
+                f"Worker task {task_id} returned an invalid termination snapshot"
+            )
         remote_background_generation = remote_before.get("pty_background_generation")
         if "pty_background_generation" not in remote_before or (
             remote_background_generation is not None
@@ -1273,6 +1294,7 @@ async def _terminate_worker_task_generation_impl(
         if (
             remote_values is None
             or remote_before.get("retry_count") != observed.retry_count
+            or remote_before.get("turn_generation") != observed.turn_generation
         ):
             raise WorkerTaskTerminationConflict(
                 f"Worker task {task_id} generation does not match its Manager mirror"
@@ -1293,6 +1315,7 @@ async def _terminate_worker_task_generation_impl(
                 body={
                     "expected_status": remote_before["status"],
                     "expected_retry_count": remote_before["retry_count"],
+                    "expected_turn_generation": remote_before["turn_generation"],
                     "expected_instance_id": remote_before.get("instance_id"),
                     "expected_started_at": remote_before.get("started_at"),
                     "expected_completed_at": remote_before.get("completed_at"),
@@ -1320,6 +1343,7 @@ async def _terminate_worker_task_generation_impl(
         if (
             result_values is None
             or remote_result.get("retry_count") != observed.retry_count
+            or remote_result.get("turn_generation") != observed.turn_generation
             or remote_result.get("status") not in terminal_statuses
             or (remote_result.get("metadata_") or {}).get(
                 PR_REVIEW_SUPERSEDED_METADATA_KEY
@@ -1344,7 +1368,11 @@ async def _terminate_worker_task_generation_impl(
             # Worker retry generation or CAS the current mirror once more.
             await db.rollback()
             current = await read_worker_task_generation(db, task_id, worker_id)
-            if current is None or current.retry_count != remote_result["retry_count"]:
+            if (
+                current is None
+                or current.retry_count != remote_result["retry_count"]
+                or current.turn_generation != remote_result["turn_generation"]
+            ):
                 raise WorkerTaskTerminationConflict(
                     f"Task {task_id} mirror changed before Worker stop applied"
                 )

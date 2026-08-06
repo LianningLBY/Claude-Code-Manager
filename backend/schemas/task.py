@@ -150,6 +150,7 @@ class TaskMigrationImport(TaskCreate):
     # Keep Manager and destination Worker retry generations monotonic. This is
     # intentionally internal-only; public task creation always starts at zero.
     retry_count: int = Field(default=0, ge=0)
+    turn_generation: int = Field(default=0, ge=0)
     # Migration may preserve an already-inert source state without ever
     # exposing a dispatchable ``pending`` row on the destination Worker.
     source_status: Literal[
@@ -166,6 +167,7 @@ class TaskTerminationRequest(BaseModel):
 
     expected_status: str
     expected_retry_count: int = Field(ge=0)
+    expected_turn_generation: int = Field(ge=0)
     expected_instance_id: int | None = None
     expected_started_at: datetime | None = None
     expected_completed_at: datetime | None = None
@@ -310,6 +312,7 @@ class TaskResponse(BaseModel):
     merge_status: str
     instance_id: int | None
     retry_count: int
+    turn_generation: int
     max_retries: int
     mode: str
     delivery_run_id: int | None = None

@@ -373,6 +373,164 @@ async def test_stop_start_destroy_flow(client, session_factory, fake_provisioner
     fake_provisioner.destroy_worker.assert_called_once_with(wid)
 
 
+async def test_destroy_fails_closed_for_pending_worker_turn_handoff(
+    client,
+    session_factory,
+    fake_provisioner,
+    monkeypatch,
+):
+    """Recovery stays live, then a second destroy succeeds after settlement."""
+    import backend.api.workers as workers_api
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
+    from backend.services.task_migrator import MigrationError
+
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-handoff",
+    )
+    handoff_id = "a" * 32
+    async with session_factory() as db:
+        task = Task(
+            title="pending Worker follow-up",
+            description="keep its exact route",
+            status="completed",
+            worker_id=worker_id,
+            retry_count=2,
+            turn_generation=7,
+        )
+        db.add(task)
+        await db.flush()
+        source_log = LogEntry(
+            task_id=task.id,
+            task_retry_count=2,
+            task_turn_generation=7,
+            event_type="user_message",
+            role="user",
+            content="continue",
+        )
+        db.add(source_log)
+        await db.flush()
+        request_payload = {
+            "message": "continue",
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": 2,
+            "worker_turn_handoff_from_generation": 7,
+        }
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task.id,
+                source_log_id=source_log.id,
+                side="manager",
+                worker_id=worker_id,
+                retry_count=2,
+                from_generation=7,
+                status="prepared",
+                request_payload=request_payload,
+                request_digest="b" * 64,
+            )
+        )
+        task.worker_turn_handoff_id = handoff_id
+        task.worker_turn_handoff_worker_id = worker_id
+        task.worker_turn_handoff_retry_count = 2
+        task.worker_turn_handoff_from_generation = 7
+        task.worker_turn_handoff_source_log_id = source_log.id
+        task.worker_turn_handoff_acknowledged = False
+        await db.commit()
+        task_id = task.id
+        source_log_id = source_log.id
+
+    migrator = AsyncMock()
+
+    async def migrate_after_exact_settlement(migrating_task_id, target):
+        assert target is None
+        async with session_factory() as db:
+            current = await db.get(Task, migrating_task_id)
+            if current.worker_turn_handoff_id is not None:
+                raise MigrationError(
+                    "Worker follow-up turn handoff is still pending"
+                )
+            current.worker_id = None
+            await db.commit()
+
+    migrator.migrate.side_effect = migrate_after_exact_settlement
+    relay = AsyncMock()
+    monkeypatch.setattr(main_module, "task_migrator", migrator)
+    monkeypatch.setattr(main_module, "worker_relay", relay)
+    original_destroy = workers_api._migrate_back_then_destroy
+
+    async def destroy_with_test_db(provisioner, destroying_worker_id, _db=None):
+        await original_destroy(
+            provisioner,
+            destroying_worker_id,
+            db_factory=session_factory,
+        )
+
+    monkeypatch.setattr(
+        workers_api,
+        "_migrate_back_then_destroy",
+        destroy_with_test_db,
+    )
+
+    first = await client.post(f"/api/workers/{worker_id}/destroy")
+    assert first.status_code == 200
+    pending = list(workers_api._background_tasks)
+    if pending:
+        await asyncio.gather(*pending)
+
+    async with session_factory() as db:
+        current_task = await db.get(Task, task_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        worker = await db.get(Worker, worker_id)
+    assert current_task.worker_id == worker_id
+    assert current_task.worker_turn_handoff_id == handoff_id
+    assert current_task.worker_turn_handoff_source_log_id == source_log_id
+    assert receipt.status == "prepared"
+    assert receipt.worker_id == worker_id
+    # WorkerRelay's durable handoff recovery loop only runs in ready state.
+    assert worker.status == "ready"
+    assert worker.bootstrap_step is None
+    assert handoff_id in worker.bootstrap_error
+    assert "Task" in worker.bootstrap_error
+    migrator.migrate.assert_awaited_once_with(task_id, None)
+    relay.stop_worker.assert_not_awaited()
+    fake_provisioner.destroy_worker.assert_not_awaited()
+
+    # Simulate WorkerRelay's exact cancellation transaction: settle the
+    # matching Manager receipt and clear the matching Task marker together.
+    async with session_factory() as db:
+        current_task = await db.get(Task, task_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        receipt.status = "cancelled"
+        receipt.cancel_reason = "exact Worker receipt cancelled before launch"
+        current_task.worker_turn_handoff_id = None
+        current_task.worker_turn_handoff_worker_id = None
+        current_task.worker_turn_handoff_retry_count = None
+        current_task.worker_turn_handoff_from_generation = None
+        current_task.worker_turn_handoff_source_log_id = None
+        current_task.worker_turn_handoff_acknowledged = None
+        await db.commit()
+
+    second = await client.post(f"/api/workers/{worker_id}/destroy")
+    assert second.status_code == 200
+    pending = list(workers_api._background_tasks)
+    if pending:
+        await asyncio.gather(*pending)
+
+    async with session_factory() as db:
+        migrated = await db.get(Task, task_id)
+        settled = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert migrated.worker_id is None
+    assert migrated.worker_turn_handoff_id is None
+    assert settled.status == "cancelled"
+    assert migrator.migrate.await_count == 2
+    relay.stop_worker.assert_awaited_once_with(worker_id)
+    fake_provisioner.destroy_worker.assert_awaited_once_with(worker_id)
+
+
 @pytest.mark.parametrize(
     "status",
     ["creating", "bootstrapping", "starting", "stopping", "destroying"],

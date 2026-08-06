@@ -565,6 +565,7 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
             "session_id": "session-1",
             "last_cwd": "/workspace/repo",
             "retry_count": 2,
+            "turn_generation": 7,
             "source_status": "plan_review",
             "mode": "plan",
             "selected_user_skills": [81],
@@ -578,12 +579,14 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["status"] == "plan_review"
+    assert resp.json()["turn_generation"] == 7
     wake.assert_not_called()
     async with session_factory() as db:
         task = await db.get(Task, 7001)
     assert task.status == "plan_review"
     assert task.session_id == "session-1"
     assert task.retry_count == 2
+    assert task.turn_generation == 7
     assert task.selected_user_skills == [81]
     assert task.metadata_["ccm_user_skill_snapshots"] == [{
         "id": 81,
@@ -699,6 +702,59 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
     assert current.title == "Current generation"
     assert current.status == "cancelled"
     assert current.retry_count == 4
+
+
+@pytest.mark.asyncio
+async def test_migration_import_rejects_turn_generation_only_aba(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """An import snapshot cannot overwrite a newer logical turn."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7009,
+            title="Current logical turn",
+            description="d",
+            status="cancelled",
+            retry_count=4,
+            turn_generation=9,
+        )
+        db.add(task)
+        await db.commit()
+
+    real_fence = task_api._task_generation_fence
+
+    def replace_turn_after_snapshot(task_id, observed):
+        predicates = real_fence(task_id, observed)
+        observed.turn_generation += 1
+        return predicates
+
+    monkeypatch.setattr(
+        task_api,
+        "_task_generation_fence",
+        replace_turn_after_snapshot,
+    )
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7009,
+        "title": "Stale imported turn",
+        "description": "d",
+        "retry_count": 4,
+        "turn_generation": 9,
+    })
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        current = await db.get(Task, 7009)
+    assert current.title == "Current logical turn"
+    assert current.status == "cancelled"
+    assert current.retry_count == 4
+    assert current.turn_generation == 9
 
 
 @pytest.mark.asyncio
@@ -1123,6 +1179,261 @@ async def test_update_task(client):
     resp = await client.put(f"/api/tasks/{task_id}", json={"title": "Updated"})
     assert resp.status_code == 200
     assert resp.json()["title"] == "Updated"
+
+
+async def _create_worker_task_for_handoff_edit_test(
+    session_factory,
+    *,
+    reserve_handoff: bool,
+) -> int:
+    """Create a Worker Task, optionally with a valid durable G -> G+1 marker."""
+
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    from backend.models.worker import Worker
+    from backend.services.worker_relay import (
+        _handoff_payload_digest,
+        reserve_worker_turn_handoff,
+        worker_task_generation,
+    )
+
+    async with session_factory() as db:
+        worker = Worker(
+            name="handoff-edit-worker",
+            status="ready",
+            private_ip="10.0.0.77",
+            auth_token="worker-token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="Worker handoff edit fence",
+            description="original description",
+            status="completed",
+            worker_id=worker.id,
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="medium",
+            system_prompt_mode=None,
+            enabled_skills={},
+        )
+        db.add(task)
+        await db.flush()
+        await db.refresh(task)
+
+        if reserve_handoff:
+            source = LogEntry(
+                task_id=task.id,
+                event_type="user_message",
+                role="user",
+                content="reserved follow-up",
+            )
+            db.add(source)
+            await db.flush()
+            observed = worker_task_generation(
+                task,
+                expected_worker_id=worker.id,
+            )
+            assert observed is not None
+            request_payload = {
+                "message": "reserved follow-up",
+                "worker_turn_handoff_id": "a" * 32,
+                "worker_turn_handoff_retry_count": task.retry_count,
+                "worker_turn_handoff_from_generation": task.turn_generation,
+            }
+            reserved = await reserve_worker_turn_handoff(
+                db,
+                observed,
+                handoff_id=request_payload["worker_turn_handoff_id"],
+                source_log_id=source.id,
+                request_payload=request_payload,
+                request_digest=_handoff_payload_digest(request_payload),
+            )
+            assert reserved is not None
+
+        await db.commit()
+        return task.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"model": "gpt-5.6-terra"}, id="routing-model"),
+        pytest.param({"codex_service_tier": "priority"}, id="routing-tier"),
+        pytest.param(
+            {"enabled_skills": {"sub-agent": True}},
+            id="skills",
+        ),
+        pytest.param({"effort_level": "high"}, id="generic-effort"),
+        pytest.param(
+            {"system_prompt_mode": "append"},
+            id="generic-system-prompt",
+        ),
+        pytest.param(
+            {"description": "changed description"},
+            id="generic-description",
+        ),
+    ],
+)
+async def test_pending_worker_turn_handoff_blocks_task_configuration_edits(
+    client,
+    session_factory,
+    payload,
+):
+    """No execution-affecting PUT may cross an exact Worker turn handoff."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+
+    task_id = await _create_worker_task_for_handoff_edit_test(
+        session_factory,
+        reserve_handoff=True,
+    )
+    with patch.object(task_api, "_proxy", new_callable=AsyncMock) as proxy:
+        response = await client.put(f"/api/tasks/{task_id}", json=payload)
+
+    assert response.status_code == 409
+    assert "Worker follow-up" in response.json()["detail"]
+    proxy.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.model == "gpt-5.6-sol"
+        assert task.codex_service_tier == "default"
+        assert task.enabled_skills == {}
+        assert task.effort_level == "medium"
+        assert task.system_prompt_mode is None
+        assert task.description == "original description"
+        assert task.worker_turn_handoff_id == "a" * 32
+        assert task.worker_turn_handoff_acknowledged is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "field", "expected"),
+    [
+        pytest.param(
+            {"enabled_skills": {"sub-agent": True}},
+            "enabled_skills",
+            {"sub-agent": True},
+            id="skills",
+        ),
+        pytest.param(
+            {"effort_level": "high"},
+            "effort_level",
+            "high",
+            id="generic-effort",
+        ),
+        pytest.param(
+            {"system_prompt_mode": "append"},
+            "system_prompt_mode",
+            "append",
+            id="generic-system-prompt",
+        ),
+        pytest.param(
+            {"description": "changed description"},
+            "description",
+            "changed description",
+            id="generic-description",
+        ),
+    ],
+)
+async def test_worker_task_configuration_edits_still_work_without_handoff(
+    client,
+    session_factory,
+    payload,
+    field,
+    expected,
+):
+    """The handoff fence must not freeze an ordinary quiescent Worker Task."""
+
+    from backend.models.task import Task
+
+    task_id = await _create_worker_task_for_handoff_edit_test(
+        session_factory,
+        reserve_handoff=False,
+    )
+
+    response = await client.put(f"/api/tasks/{task_id}", json=payload)
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert getattr(task, field) == expected
+        assert task.worker_turn_handoff_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_model", "expected_tier"),
+    [
+        pytest.param(
+            {"model": "gpt-5.6-terra"},
+            "gpt-5.6-terra",
+            "default",
+            id="model",
+        ),
+        pytest.param(
+            {"codex_service_tier": "priority"},
+            "gpt-5.6-sol",
+            "priority",
+            id="tier",
+        ),
+    ],
+)
+async def test_worker_routing_edits_still_sync_without_handoff(
+    client,
+    session_factory,
+    monkeypatch,
+    payload,
+    expected_model,
+    expected_tier,
+):
+    """A marker-free routing PUT retains the existing Worker sync protocol."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+
+    task_id = await _create_worker_task_for_handoff_edit_test(
+        session_factory,
+        reserve_handoff=False,
+    )
+    calls = []
+
+    async def proxy(_task, method, path, body=None, **_kwargs):
+        calls.append((method, path))
+        base = {
+            "id": task_id,
+            "status": "completed",
+            "worker_id": None,
+            "shared_from_id": None,
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "default",
+            "pending": None,
+        }
+        if path.endswith("/routing-config/stage"):
+            return {**base, "pending": body}
+        if path.endswith("/routing-config/ack"):
+            return {
+                **base,
+                "model": expected_model,
+                "codex_service_tier": expected_tier,
+            }
+        return base
+
+    monkeypatch.setattr(task_api, "_proxy", proxy)
+
+    response = await client.put(f"/api/tasks/{task_id}", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert [method for method, _path in calls] == ["GET", "POST", "POST"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.model == expected_model
+        assert task.codex_service_tier == expected_tier
+        assert task.worker_turn_handoff_id is None
 
 
 @pytest.mark.asyncio
@@ -2396,9 +2707,11 @@ async def test_tracked_pty_background_terminal_request_clears_marker(
         _db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
     ):
         assert stopped_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == terminal_status
         assert expected_generations == [
             (instance_id, 41001, started_at)
@@ -2516,9 +2829,11 @@ async def test_owner_stop_preserves_new_background_generation(
         _db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
     ):
         assert _task_id == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == terminal_status
         assert expected_generations == [
             (instance_id, 42001, started_at)
@@ -2606,6 +2921,7 @@ async def test_stop_session_stops_ownerless_pty_background_generation(
             settled_generation,
         ) == (task_id, session_id, generation)
         assert expected["expected_status"] == "completed"
+        assert expected["expected_turn_generation"] == 0
         async with session_factory() as db:
             await db.execute(
                 update(Task)
@@ -3050,9 +3366,11 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
         _db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
     ):
         assert stopped_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == terminal_status
         assert [
             (owner_id, pid, owner_started_at)
@@ -3417,6 +3735,7 @@ async def test_stop_helper_never_uses_historical_recycled_instance(
                 old_task.id,
                 db,
                 expected_generations=[],
+                expected_task_turn_generation=old_task.turn_generation,
             ) is False
             stop.assert_not_awaited()
 
@@ -3452,10 +3771,12 @@ async def test_stop_helper_rechecks_live_owner_inside_manager_lock(
                 task.id,
                 db,
                 expected_generations=[(inst.id, None, None)],
+                expected_task_turn_generation=task.turn_generation,
             ) is True
             stop.assert_awaited_once_with(
                 inst.id,
                 expected_task_id=task.id,
+                expected_task_turn_generation=task.turn_generation,
                 expected_pid=None,
                 expected_started_at=None,
                 task_status="completed",
@@ -3489,6 +3810,7 @@ async def test_stop_helper_reconciles_an_exact_dead_reverse_owner(
         db.add(instance)
         await db.commit()
         task_id, instance_id = task.id, instance.id
+        task_turn_generation = task.turn_generation
 
         with (
             patch.object(
@@ -3512,11 +3834,13 @@ async def test_stop_helper_reconciles_an_exact_dead_reverse_owner(
                     145_0775,
                     started_at,
                 )],
+                expected_task_turn_generation=task_turn_generation,
             ) is True
 
     stop.assert_awaited_once_with(
         instance_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=task_turn_generation,
         expected_pid=145_0775,
         expected_started_at=started_at,
         task_status="completed",
@@ -3569,6 +3893,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
         stopped_instance_id,
         *,
         expected_task_id,
+        expected_task_turn_generation,
         expected_pid,
         expected_started_at,
         task_status,
@@ -3577,6 +3902,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
     ):
         assert stopped_instance_id == instance_id
         assert expected_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert expected_pid == 1111
         assert expected_started_at == old_started_at
         assert task_status == "completed"
@@ -3610,6 +3936,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
                 expected_generations=[
                     (instance_id, 1111, old_started_at)
                 ],
+                expected_task_turn_generation=0,
             ) is False
             reconcile.assert_not_awaited()
 
@@ -3654,9 +3981,11 @@ async def test_cancel_stops_exact_owner_before_publishing_status(
         db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
     ):
         assert tid == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == "cancelled"
         assert expected_generations == [(instance_id, 9911, None)]
         async with session_factory() as verify_db:

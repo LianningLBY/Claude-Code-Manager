@@ -329,11 +329,20 @@ def _developer_generation_matches(
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "session_id": task.session_id,
     }
+    if invocation.source == "agent_request":
+        expected_core.update(
+            incarnation_id=task.incarnation_id,
+            turn_generation=task.turn_generation,
+        )
     return (
         invocation.subject_kind == "task_generation"
         and isinstance(subject, dict)
         and all(subject.get(key) == value for key, value in expected_core.items())
         and invocation.subject_hash == capability_value_hash(subject)
+        and (
+            invocation.source != "agent_request"
+            or invocation.request_task_turn_generation == task.turn_generation
+        )
     )
 
 

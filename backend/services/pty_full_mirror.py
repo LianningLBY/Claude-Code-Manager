@@ -544,6 +544,8 @@ class FullMirrorCCMBackend(CCMBackend):
                             session_id,
                             background_generation,
                             session,
+                            task_retry_count=record.task_retry_count,
+                            task_turn_generation=record.task_turn_generation,
                         )
                     )
                 else:
@@ -895,6 +897,13 @@ class FullMirrorCCMBackend(CCMBackend):
                         if generation is None:
                             return
                         autonomous_generation = generation
+                    state = im.pty_background_state_for(
+                        task_id,
+                        expected_session_id,
+                        generation,
+                    )
+                    if state is None:
+                        return
                     await im._process_event(
                         key,
                         task_id,
@@ -903,6 +912,10 @@ class FullMirrorCCMBackend(CCMBackend):
                         detached_autonomous=True,
                         expected_session_id=expected_session_id,
                         expected_background_generation=generation,
+                        expected_task_retry_count=state.task_retry_count,
+                        expected_task_turn_generation=(
+                            state.task_turn_generation
+                        ),
                     )
                     await im._finish_pty_autonomous_activity_locked(
                         task_id,

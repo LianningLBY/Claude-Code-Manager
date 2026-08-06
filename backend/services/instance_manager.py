@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -367,6 +367,7 @@ class _OutputConsumerRecord:
     provider: str
     task_id: int | None = None
     task_retry_count: int | None = None
+    task_turn_generation: int | None = None
     # Durable per-turn token. PTY hot reuse keeps the same native Session and
     # PID across many turns, so neither process identity nor PID alone can
     # distinguish a late exit callback from a newer turn on the same slot.
@@ -415,6 +416,7 @@ class _LaunchReservation:
 
     token: object
     task_id: int | None
+    task_turn_generation: int | None
     previous_process: asyncio.subprocess.Process | None
 
 
@@ -426,6 +428,7 @@ class _ConsumerRecoveryEvidence:
     tracked_generation: bool
     task_id: int | None
     task_retry_count: int | None
+    task_turn_generation: int | None
     instance_started_at: datetime | None
 
 
@@ -436,6 +439,8 @@ class _PtyBackgroundState:
     task_id: int
     session_id: str
     generation: str
+    task_retry_count: int
+    task_turn_generation: int
     session: Any
     started_monotonic: float
     last_event_monotonic: float
@@ -456,6 +461,7 @@ class _TaskLifecycleFence:
     worker_id: int | None
     shared_from_id: int | None
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
@@ -918,6 +924,7 @@ class InstanceManager:
         instance_id: int,
         prompt: str,
         task_id: int | None = None,
+        task_turn_generation: int | None = None,
         cwd: str | None = None,
         model: str | None = None,
         resume_session_id: str | None = None,
@@ -935,6 +942,7 @@ class InstanceManager:
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
+        on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
@@ -953,6 +961,16 @@ class InstanceManager:
         lifecycle_lock = self._instance_lifecycle_lock(instance_id)
         current = asyncio.current_task()
         observed_generation: int | None = None
+        async def settle_launch_admitted_callback() -> None:
+            assert on_launch_admitted is not None
+            await _settle_instance_cleanup(on_launch_admitted())
+
+        settled_on_launch_admitted = (
+            settle_launch_admitted_callback
+            if on_launch_admitted is not None
+            else None
+        )
+
         while True:
             async with lifecycle_lock:
                 # This check is inside the same admission lock used by stop().
@@ -990,7 +1008,7 @@ class InstanceManager:
                 if consumer is None or consumer is current:
                     self._instance_launch_generations[instance_id] = generation + 1
                     reservation = _LaunchReservation(
-                        object(), task_id, process
+                        object(), task_id, task_turn_generation, process
                     )
                     self._launch_reservations[instance_id] = reservation
                     try:
@@ -1004,6 +1022,7 @@ class InstanceManager:
                                 instance_id=instance_id,
                                 prompt=prompt,
                                 task_id=task_id,
+                                task_turn_generation=task_turn_generation,
                                 cwd=cwd,
                                 model=model,
                                 resume_session_id=resume_session_id,
@@ -1021,6 +1040,7 @@ class InstanceManager:
                                 current_message=current_message,
                                 queue_timestamp=queue_timestamp,
                                 codex_service_tier=codex_service_tier,
+                                on_launch_admitted=settled_on_launch_admitted,
                             )
                     except BaseException:
                         current_process = (
@@ -1081,6 +1101,7 @@ class InstanceManager:
         instance_id: int,
         prompt: str,
         task_id: int | None = None,
+        task_turn_generation: int | None = None,
         cwd: str | None = None,
         model: str | None = None,
         resume_session_id: str | None = None,
@@ -1098,6 +1119,7 @@ class InstanceManager:
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
+        on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -1106,6 +1128,21 @@ class InstanceManager:
         that loop-task chat history can be grouped by iteration in the frontend.
         """
         provider = (provider or "claude").lower()
+        launch_boundary_attempted = False
+        launch_boundary_completed = False
+
+        async def admit_external_launch() -> None:
+            """Cross the durable boundary once, immediately before execution."""
+
+            nonlocal launch_boundary_attempted, launch_boundary_completed
+            if on_launch_admitted is None or launch_boundary_completed:
+                return
+            if launch_boundary_attempted:
+                raise RuntimeError("Launch admission callback is already running")
+            launch_boundary_attempted = True
+            await on_launch_admitted()
+            launch_boundary_completed = True
+
         cloudrouter_account = self._cloudrouter_account_for_runtime_home(
             provider, config_dir
         )
@@ -1124,13 +1161,21 @@ class InstanceManager:
                     f"Instance {instance_id} no longer exists"
                 )
             if task_id is not None:
+                generation_predicates = [
+                    Task.id == task_id,
+                    Task.instance_id == instance_id,
+                    Task.status.in_(["in_progress", "executing"]),
+                ]
+                if task_turn_generation is not None:
+                    generation_predicates.append(
+                        Task.turn_generation == task_turn_generation
+                    )
                 generation_row = (
                     await db.execute(
-                        select(Task.retry_count).where(
-                            Task.id == task_id,
-                            Task.instance_id == instance_id,
-                            Task.status.in_(["in_progress", "executing"]),
-                        )
+                        select(
+                            Task.retry_count,
+                            Task.turn_generation,
+                        ).where(*generation_predicates)
                     )
                 ).first()
                 if generation_row is None:
@@ -1138,6 +1183,7 @@ class InstanceManager:
                         f"Task {task_id} no longer owns instance {instance_id}"
                     )
                 task_retry_count = generation_row[0]
+                task_turn_generation = generation_row[1]
                 task = await db.get(Task, task_id)
                 if task is None:
                     raise LaunchSupersededError(
@@ -1412,6 +1458,7 @@ class InstanceManager:
                         enable_workflows=enable_workflows,
                         enabled_skills=enabled_skills,
                         task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
                         mcp_specs=codex_mcp_specs,
                         skill_context=task_skill_context,
                         source_log_id=source_log_id,
@@ -1434,6 +1481,11 @@ class InstanceManager:
                         disable_autonomous_features=(pr_review_task or delivery_task),
                         network_isolated=delivery_task,
                         tools_disabled=pr_review_task,
+                        on_launch_admitted=(
+                            admit_external_launch
+                            if on_launch_admitted is not None
+                            else None
+                        ),
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -1445,6 +1497,8 @@ class InstanceManager:
                     )
                     return pid
                 except CodexRequiredMcpPreTurnError as exc:
+                    if launch_boundary_attempted:
+                        raise
                     if delivery_task:
                         raise CodexRequiredMcpError(
                             "Codex Delivery workspace/network isolation could "
@@ -1508,6 +1562,11 @@ class InstanceManager:
                     )
                     raise
                 except Exception as exc:
+                    if launch_boundary_attempted:
+                        # The durable owner has already entered ``launching``.
+                        # Replaying through exec could duplicate a turn even
+                        # when app-server failed before returning its adapter.
+                        raise
                     if delivery_task:
                         logger.exception(
                             "Codex Delivery app-server failed; refusing exec "
@@ -1589,11 +1648,17 @@ class InstanceManager:
                 claude_binary_override=_container_wrapper,
                 container_exec_spec=_container_exec_spec,
                 task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
                 skill_context=task_skill_context,
                 cloudrouter_api=cloudrouter_account is not None,
                 source_log_id=source_log_id,
                 current_message=current_message,
                 queue_timestamp=queue_timestamp,
+                on_launch_admitted=(
+                    admit_external_launch
+                    if on_launch_admitted is not None
+                    else None
+                ),
             )
 
         if provider == "codex" and (pr_review_task or delivery_task):
@@ -1721,6 +1786,8 @@ class InstanceManager:
                 if provider == "claude" and config_dir:
                     container_env = dict(env)
                     container_env["CLAUDE_CONFIG_DIR"] = "/home/sandbox/.claude"
+                if on_launch_admitted is not None:
+                    await admit_external_launch()
                 process = await self._container_mgr.exec_command(
                     container_project_id,
                     cmd,
@@ -1798,6 +1865,8 @@ class InstanceManager:
                     }
                     if os.name == "posix":
                         spawn_kwargs["start_new_session"] = True
+                    if on_launch_admitted is not None:
+                        await admit_external_launch()
                     process = await self._spawn_managed_direct_process(
                         instance_id,
                         task_id,
@@ -1815,6 +1884,8 @@ class InstanceManager:
                 }
                 if os.name == "posix":
                     spawn_kwargs["start_new_session"] = True
+                if on_launch_admitted is not None:
+                    await admit_external_launch()
                 process = await self._spawn_managed_direct_process(
                     instance_id,
                     task_id,
@@ -1830,6 +1901,7 @@ class InstanceManager:
             self._launch_params[instance_id] = {
                 "prompt": prompt,
                 "task_id": task_id,
+                "task_turn_generation": task_turn_generation,
                 "cwd": cwd,
                 "model": model,
                 "git_env": git_env,
@@ -1854,6 +1926,7 @@ class InstanceManager:
             chat_initiated=chat_initiated,
             provider=provider,
             task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
         )
 
     def _ensure_codex_app_server_registry(self):
@@ -2319,6 +2392,7 @@ class InstanceManager:
         enable_workflows: bool,
         enabled_skills: dict | None,
         task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
         mcp_specs: Sequence["McpServerSpec"] = (),
         skill_context: str = "",
         source_log_id: int | None = None,
@@ -2331,12 +2405,18 @@ class InstanceManager:
         disable_autonomous_features: bool = False,
         network_isolated: bool = False,
         tools_disabled: bool = False,
+        on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
 
         actual_cwd = cwd or os.getcwd()
         codex_effort = clamp_codex_effort(model, effort_level)
+
+        async def publish_launch_admission(_process, _thread_id) -> None:
+            if on_launch_admitted is not None:
+                await on_launch_admitted()
+
         process, _thread_id = await registry.start_turn(
             codex_home=config_dir,
             prompt=prompt,
@@ -2355,6 +2435,11 @@ class InstanceManager:
             disable_autonomous_features=disable_autonomous_features,
             network_isolated=network_isolated,
             tools_disabled=tools_disabled,
+            on_turn_prepared=(
+                publish_launch_admission
+                if on_launch_admitted is not None
+                else None
+            ),
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -2372,6 +2457,7 @@ class InstanceManager:
             self._launch_params[instance_id] = {
                 "prompt": prompt,
                 "task_id": task_id,
+                "task_turn_generation": task_turn_generation,
                 "cwd": cwd,
                 "model": model,
                 "git_env": git_env,
@@ -2397,6 +2483,7 @@ class InstanceManager:
                 chat_initiated=chat_initiated,
                 provider="codex",
                 task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
             )
         except (InstanceNotFoundError, LaunchSupersededError):
             raise
@@ -2419,6 +2506,7 @@ class InstanceManager:
         chat_initiated: bool,
         provider: str,
         task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
     ) -> int:
         """Commit launch metadata and install the consumer as one guarded step."""
 
@@ -2439,6 +2527,12 @@ class InstanceManager:
                                 Task.id == task_id
                                 if task_retry_count is None
                                 else Task.retry_count == task_retry_count
+                            ),
+                            (
+                                Task.id == task_id
+                                if task_turn_generation is None
+                                else Task.turn_generation
+                                == task_turn_generation
                             ),
                         )
                         .values(last_cwd=actual_cwd)
@@ -2493,6 +2587,7 @@ class InstanceManager:
                 provider=provider,
                 task_id=task_id,
                 task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
                 instance_started_at=persisted_started_at,
             )
             return process.pid
@@ -2618,6 +2713,7 @@ class InstanceManager:
         provider: str = "claude",
         task_id: int | None = None,
         task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
         instance_started_at: datetime | None = None,
     ) -> _OutputConsumerRecord:
         """Register a consumer with identity-safe terminal cleanup.
@@ -2637,13 +2733,14 @@ class InstanceManager:
             invalidate_handoffs=True,
         )
         record = _OutputConsumerRecord(
-            process,
-            consumer,
-            chat_initiated,
-            (provider or "claude").lower(),
-            task_id,
-            task_retry_count,
-            instance_started_at,
+            process=process,
+            task=consumer,
+            chat_initiated=chat_initiated,
+            provider=(provider or "claude").lower(),
+            task_id=task_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            instance_started_at=instance_started_at,
         )
         self._tasks[instance_id] = consumer
         self._consumer_records[instance_id] = record
@@ -2712,6 +2809,7 @@ class InstanceManager:
         tracked_generation: bool,
         task_id: int | None,
         task_retry_count: int | None,
+        task_turn_generation: int | None,
         instance_started_at: datetime | None,
     ) -> _ConsumerRecoveryEvidence:
         """Retain one exact terminal generation whose DB recovery is unknown."""
@@ -2721,6 +2819,7 @@ class InstanceManager:
             tracked_generation=tracked_generation,
             task_id=task_id,
             task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
             instance_started_at=instance_started_at,
         )
         key = (instance_id, process)
@@ -3123,11 +3222,13 @@ class InstanceManager:
         claude_binary_override: str | None = None,
         container_exec_spec=None,
         task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
         skill_context: str = "",
         cloudrouter_api: bool = False,
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """PTY-mode launch: delegate to claude_pty, mirror -p bookkeeping.
 
@@ -3164,6 +3265,7 @@ class InstanceManager:
             pty_launch_params = {
                 "prompt": prompt,
                 "task_id": task_id,
+                "task_turn_generation": task_turn_generation,
                 "cwd": cwd,
                 "model": model,
                 "git_env": git_env,
@@ -3220,9 +3322,12 @@ class InstanceManager:
                         wrap_skill_context,
                     )
 
+                    wrapped_prompt = wrap_skill_context(prompt, skill_context)
+                    if on_launch_admitted is not None:
+                        await on_launch_admitted()
                     session_id = await self._pty_backend.launch_for_ccm(
                         instance_id=instance_id,
-                        prompt=wrap_skill_context(prompt, skill_context),
+                        prompt=wrapped_prompt,
                         task_id=task_id,
                         cwd=cwd,
                         model=model if model and model != "default" else None,
@@ -3279,6 +3384,7 @@ class InstanceManager:
                     provider="claude",
                     task_id=task_id,
                     task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
                     instance_started_at=turn_started_at,
                 )
             pid = getattr(process, "pid", 0) or 0
@@ -3303,6 +3409,12 @@ class InstanceManager:
                                 Task.id == task_id
                                 if task_retry_count is None
                                 else Task.retry_count == task_retry_count
+                            ),
+                            (
+                                Task.id == task_id
+                                if task_turn_generation is None
+                                else Task.turn_generation
+                                == task_turn_generation
                             ),
                         )
                         .values(**task_values)
@@ -3607,6 +3719,7 @@ class InstanceManager:
             or record.provider != "claude"
             or record.task_id != task_id
             or record.task_retry_count is None
+            or record.task_turn_generation is None
             or record.instance_started_at is None
             or record.pty_terminal_owner != "consumer"
             or record.task.done()
@@ -3755,6 +3868,8 @@ class InstanceManager:
                             and task.session_id == proof.session_id
                             and task.retry_count
                             == proof.record.task_retry_count
+                            and task.turn_generation
+                            == proof.record.task_turn_generation
                             and owner.current_task_id == proof.task_id
                             and owner.pid
                             == getattr(proof.process, "pid", None)
@@ -4042,6 +4157,7 @@ class InstanceManager:
         if (
             record.task_id != task_id
             or record.task_retry_count is None
+            or record.task_turn_generation is None
             or record.instance_started_at is None
         ):
             return False
@@ -4076,6 +4192,7 @@ class InstanceManager:
                     Task.instance_id == instance_id,
                     Task.session_id == session_id,
                     Task.retry_count == record.task_retry_count,
+                    Task.turn_generation == record.task_turn_generation,
                     Task.status.in_(("in_progress", "executing")),
                     marker_predicate,
                     task_retry_not_superseded_predicate(),
@@ -4117,6 +4234,8 @@ class InstanceManager:
             "event": "background_activity",
             "event_type": "background_activity",
             "task_id": task_id,
+            "task_retry_count": record.task_retry_count,
+            "task_turn_generation": record.task_turn_generation,
             "background_active": True,
         }
         await self.broadcaster.broadcast("tasks", payload)
@@ -4129,12 +4248,22 @@ class InstanceManager:
         session_id: str,
         generation: str,
         session: Any,
+        *,
+        task_retry_count: int,
+        task_turn_generation: int,
     ) -> _PtyBackgroundState:
         """Track an already-persisted foreground→background transition."""
 
         key = (task_id, session_id)
         current = self._pty_background_states.get(key)
         if current is not None and current.generation == generation:
+            if (
+                current.task_retry_count != task_retry_count
+                or current.task_turn_generation != task_turn_generation
+            ):
+                raise RuntimeError(
+                    "PTY background generation turn identity changed"
+                )
             current.session = session
             current.last_event_monotonic = time.monotonic()
             return current
@@ -4146,6 +4275,8 @@ class InstanceManager:
             task_id=task_id,
             session_id=session_id,
             generation=generation,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
             session=session,
             started_monotonic=now,
             last_event_monotonic=now,
@@ -4311,6 +4442,7 @@ class InstanceManager:
         *,
         expected_status: str,
         expected_retry_count: int,
+        expected_turn_generation: int,
         expected_instance_id: int | None,
         expected_started_at: datetime | None,
         expected_completed_at: datetime | None,
@@ -4340,6 +4472,7 @@ class InstanceManager:
                 Task.shared_from_id.is_(None),
                 Task.status == expected_status,
                 Task.retry_count == expected_retry_count,
+                Task.turn_generation == expected_turn_generation,
                 Task.session_id == session_id,
                 (
                     Task.instance_id.is_(None)
@@ -4392,7 +4525,12 @@ class InstanceManager:
                     return False
                 await db.commit()
 
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.generation != generation
+                or state.task_retry_count != expected_retry_count
+                or state.task_turn_generation != expected_turn_generation
+            ):
                 return False
             handoff = self._pty_autonomous_activity_handoffs.get(key)
             exact_session = state.session
@@ -4522,6 +4660,12 @@ class InstanceManager:
 
         key = (task_id, session_id)
         state = self._pty_background_states.get(key)
+        resolved_task_retry_count = (
+            state.task_retry_count if state is not None else None
+        )
+        resolved_task_turn_generation = (
+            state.task_turn_generation if state is not None else None
+        )
         owned_handoff = self._owned_pty_autonomous_activity_handoff(key)
         owned_post_exit_proof = self._owned_pty_post_exit_generation(key)
         if (
@@ -4601,6 +4745,8 @@ class InstanceManager:
                         session_id,
                         candidate,
                         session,
+                        task_retry_count=record.task_retry_count,
+                        task_turn_generation=record.task_turn_generation,
                     )
                     state = self._pty_background_states.get(key)
                     generation = candidate
@@ -4617,6 +4763,7 @@ class InstanceManager:
             and owned_post_exit_proof.session is session
             and owned_post_exit_proof.record.task_id == task_id
             and owned_post_exit_proof.record.task_retry_count is not None
+            and owned_post_exit_proof.record.task_turn_generation is not None
             and getattr(owned_post_exit_proof.process, "session", None)
             is session
             and instance_id not in self._stopping
@@ -4635,6 +4782,12 @@ class InstanceManager:
                     session_id,
                     candidate,
                     session,
+                    task_retry_count=(
+                        owned_post_exit_proof.record.task_retry_count
+                    ),
+                    task_turn_generation=(
+                        owned_post_exit_proof.record.task_turn_generation
+                    ),
                 )
                 state = self._pty_background_states.get(key)
                 generation = candidate
@@ -4655,6 +4808,8 @@ class InstanceManager:
                         Task.status.in_(
                             ("in_progress", "executing", "completed")
                         ),
+                        Task.retry_count == state.task_retry_count,
+                        Task.turn_generation == state.task_turn_generation,
                         Task.pty_background_generation == state.generation,
                         task_retry_not_superseded_predicate(),
                     )
@@ -4666,6 +4821,8 @@ class InstanceManager:
                     )
                     if task is not None and not has_pending_worker_routing(task):
                         generation = state.generation
+                        resolved_task_retry_count = task.retry_count
+                        resolved_task_turn_generation = task.turn_generation
                         await db.commit()
                     else:
                         await db.rollback()
@@ -4691,6 +4848,8 @@ class InstanceManager:
                 if task is None or has_pending_worker_routing(task):
                     await db.rollback()
                     return None
+                resolved_task_turn_generation = task.turn_generation
+                resolved_task_retry_count = task.retry_count
                 generation = task.pty_background_generation
                 if not generation:
                     generation = secrets.token_urlsafe(24)
@@ -4699,6 +4858,11 @@ class InstanceManager:
                 await db.commit()
 
         if generation is None:
+            return None
+        if (
+            resolved_task_retry_count is None
+            or resolved_task_turn_generation is None
+        ):
             return None
         if owned_post_exit_proof is not None:
             self._discard_pty_post_exit_generation(
@@ -4709,6 +4873,8 @@ class InstanceManager:
             session_id,
             generation,
             session,
+            task_retry_count=resolved_task_retry_count,
+            task_turn_generation=resolved_task_turn_generation,
         )
         state = self._pty_background_states.get(key)
         if state is not None and state.generation == generation:
@@ -4728,6 +4894,8 @@ class InstanceManager:
                 "event": "background_activity",
                 "event_type": "background_activity",
                 "task_id": task_id,
+                "task_retry_count": state.task_retry_count,
+                "task_turn_generation": state.task_turn_generation,
                 "background_active": True,
             }
             await self.broadcaster.broadcast("tasks", payload)
@@ -4808,6 +4976,8 @@ class InstanceManager:
                     Task.status.in_(
                         ("in_progress", "executing", "completed")
                     ),
+                    Task.retry_count == state.task_retry_count,
+                    Task.turn_generation == state.task_turn_generation,
                     Task.pty_background_generation == state.generation,
                     task_retry_not_superseded_predicate(),
                 )
@@ -4834,6 +5004,8 @@ class InstanceManager:
                     Task.id == state.task_id,
                     Task.session_id == state.session_id,
                     Task.status == original_status,
+                    Task.retry_count == state.task_retry_count,
+                    Task.turn_generation == state.task_turn_generation,
                     Task.pty_background_generation == state.generation,
                     task_retry_not_superseded_predicate(),
                 )
@@ -4862,6 +5034,8 @@ class InstanceManager:
                 Task.id == state.task_id,
                 Task.session_id == state.session_id,
                 Task.status == original_status,
+                Task.retry_count == state.task_retry_count,
+                Task.turn_generation == state.task_turn_generation,
                 Task.pty_background_generation.is_(None),
                 task_retry_not_superseded_predicate(),
             ]
@@ -4879,6 +5053,8 @@ class InstanceManager:
                     "event": "background_activity",
                     "event_type": "background_activity",
                     "task_id": state.task_id,
+                    "task_retry_count": state.task_retry_count,
+                    "task_turn_generation": state.task_turn_generation,
                     "background_active": False,
                 }
                 await self.broadcaster.broadcast("tasks", payload)
@@ -4894,6 +5070,8 @@ class InstanceManager:
                         {
                             "event": "status_change",
                             "task_id": state.task_id,
+                            "task_retry_count": state.task_retry_count,
+                            "task_turn_generation": state.task_turn_generation,
                             "new_status": "completed",
                             "background_active": False,
                         },
@@ -4902,6 +5080,8 @@ class InstanceManager:
                         f"task:{state.task_id}",
                         {
                             "event_type": "process_exit",
+                            "task_retry_count": state.task_retry_count,
+                            "task_turn_generation": state.task_turn_generation,
                             "exit_code": 0,
                             "stderr": None,
                             "background": True,
@@ -4966,6 +5146,7 @@ class InstanceManager:
                         select(
                             Task.status,
                             Task.retry_count,
+                            Task.turn_generation,
                             Task.instance_id,
                             Task.started_at,
                             Task.completed_at,
@@ -4975,6 +5156,8 @@ class InstanceManager:
                             Task.status.in_(
                                 ("in_progress", "executing", "completed")
                             ),
+                            Task.retry_count == state.task_retry_count,
+                            Task.turn_generation == state.task_turn_generation,
                             Task.pty_background_generation
                             == state.generation,
                             task_retry_not_superseded_predicate(),
@@ -5025,6 +5208,7 @@ class InstanceManager:
                 succeeded = await self.stop(
                     owner.id,
                     expected_task_id=state.task_id,
+                    expected_task_turn_generation=state.task_turn_generation,
                     expected_pid=owner.pid,
                     expected_started_at=owner.started_at,
                     task_status="failed",
@@ -5039,6 +5223,9 @@ class InstanceManager:
                         state.generation,
                         expected_status=task_row.status,
                         expected_retry_count=task_row.retry_count,
+                        expected_turn_generation=(
+                            task_row.turn_generation
+                        ),
                         expected_instance_id=task_row.instance_id,
                         expected_started_at=task_row.started_at,
                         expected_completed_at=task_row.completed_at,
@@ -5058,6 +5245,8 @@ class InstanceManager:
                 {
                     "event": "status_change",
                     "task_id": state.task_id,
+                    "task_retry_count": state.task_retry_count,
+                    "task_turn_generation": state.task_turn_generation,
                     "new_status": "failed",
                     "background_active": False,
                 },
@@ -5066,6 +5255,8 @@ class InstanceManager:
                 "event": "background_activity",
                 "event_type": "background_activity",
                 "task_id": state.task_id,
+                "task_retry_count": state.task_retry_count,
+                "task_turn_generation": state.task_turn_generation,
                 "background_active": False,
             }
             await self.broadcaster.broadcast("tasks", payload)
@@ -5076,6 +5267,8 @@ class InstanceManager:
                 f"task:{state.task_id}",
                 {
                     "event_type": "process_exit",
+                    "task_retry_count": state.task_retry_count,
+                    "task_turn_generation": state.task_turn_generation,
                     "exit_code": 1,
                     "stderr": error,
                     "background": True,
@@ -5148,11 +5341,13 @@ class InstanceManager:
         process = record.process
         expected_started_at = record.instance_started_at
         expected_retry_count = record.task_retry_count
+        expected_turn_generation = record.task_turn_generation
         if (
             record.task is not consumer
             or record.task_id != task_id
             or expected_started_at is None
             or expected_retry_count is None
+            or expected_turn_generation is None
         ):
             return None
 
@@ -5194,6 +5389,7 @@ class InstanceManager:
                     Task.status == "completed",
                     Task.instance_id == instance_id,
                     Task.retry_count == expected_retry_count,
+                    Task.turn_generation == expected_turn_generation,
                     Task.completed_at == completed_at,
                     Task.pty_background_generation.is_(None),
                     task_retry_not_superseded_predicate(),
@@ -5233,12 +5429,16 @@ class InstanceManager:
                 background_session_id,
                 generation,
                 getattr(process, "session", None),
+                task_retry_count=expected_retry_count,
+                task_turn_generation=expected_turn_generation,
             )
             state.last_event_monotonic = time.monotonic()
             payload = {
                 "event": "background_activity",
                 "event_type": "background_activity",
                 "task_id": task_id,
+                "task_retry_count": expected_retry_count,
+                "task_turn_generation": expected_turn_generation,
                 "background_active": True,
             }
             await self.broadcaster.broadcast("tasks", payload)
@@ -5264,6 +5464,7 @@ class InstanceManager:
                             Task.status == "failed",
                             Task.instance_id == instance_id,
                             Task.retry_count == expected_retry_count,
+                            Task.turn_generation == expected_turn_generation,
                             Task.pty_background_generation.is_(None),
                         )
                         .values(status=Task.status)
@@ -5305,6 +5506,7 @@ class InstanceManager:
                             ),
                             Task.instance_id == instance_id,
                             Task.retry_count == expected_retry_count,
+                            Task.turn_generation == expected_turn_generation,
                         )
                         .values(**task_values)
                     )
@@ -5347,6 +5549,7 @@ class InstanceManager:
                         instance_id=instance_id,
                         task_id=task_id,
                         task_retry_count=expected_retry_count,
+                        task_turn_generation=expected_turn_generation,
                         event_type="system_event",
                         role="system",
                         content=(
@@ -5361,6 +5564,8 @@ class InstanceManager:
                         "id": failure_notice.id,
                         "instance_id": instance_id,
                         "task_id": task_id,
+                        "task_retry_count": expected_retry_count,
+                        "task_turn_generation": expected_turn_generation,
                         "event_type": "system_event",
                         "role": "system",
                         "content": failure_notice.content,
@@ -5405,6 +5610,7 @@ class InstanceManager:
                         Task.status == final_status,
                         Task.instance_id == instance_id,
                         Task.retry_count == expected_retry_count,
+                        Task.turn_generation == expected_turn_generation,
                         Task.completed_at == completed_at,
                         (
                             Task.pty_background_generation
@@ -5435,6 +5641,8 @@ class InstanceManager:
                             "event": "background_activity",
                             "event_type": "background_activity",
                             "task_id": task_id,
+                            "task_retry_count": expected_retry_count,
+                            "task_turn_generation": expected_turn_generation,
                             "background_active": True,
                         }
                         await self.broadcaster.broadcast(
@@ -5448,6 +5656,8 @@ class InstanceManager:
                         {
                             "event": "status_change",
                             "task_id": task_id,
+                            "task_retry_count": expected_retry_count,
+                            "task_turn_generation": expected_turn_generation,
                             "new_status": final_status,
                             "instance_id": instance_id,
                             "background_active": bool(
@@ -5460,6 +5670,9 @@ class InstanceManager:
                         f"task:{task_id}",
                         {
                             "event_type": "process_exit",
+                            "task_id": task_id,
+                            "task_retry_count": expected_retry_count,
+                            "task_turn_generation": expected_turn_generation,
                             "exit_code": ec,
                             "stderr": None,
                             "background_active": bool(
@@ -5691,6 +5904,11 @@ class InstanceManager:
                 if tracked_generation
                 else None
             )
+            expected_turn_generation = (
+                record.task_turn_generation
+                if tracked_generation
+                else None
+            )
             expected_started_at = (
                 record.instance_started_at
                 if tracked_generation
@@ -5760,6 +5978,7 @@ class InstanceManager:
                     tracked_generation=False,
                     task_id=task_id,
                     task_retry_count=None,
+                    task_turn_generation=None,
                     instance_started_at=None,
                 )
                 raise unsettled from exc
@@ -5794,6 +6013,12 @@ class InstanceManager:
                                     if expected_retry_count is None
                                     else Task.retry_count
                                     == expected_retry_count
+                                ),
+                                (
+                                    Task.id == task_id
+                                    if expected_turn_generation is None
+                                    else Task.turn_generation
+                                    == expected_turn_generation
                                 ),
                             )
                             .values(
@@ -5897,6 +6122,7 @@ class InstanceManager:
                                     select(
                                         Task.status,
                                         Task.retry_count,
+                                        Task.turn_generation,
                                         Task.instance_id,
                                         Task.started_at,
                                         Task.completed_at,
@@ -5907,6 +6133,9 @@ class InstanceManager:
                                 "status": resulting_task_generation.status,
                                 "retry_count": (
                                     resulting_task_generation.retry_count
+                                ),
+                                "turn_generation": (
+                                    resulting_task_generation.turn_generation
                                 ),
                                 "instance_id": (
                                     resulting_task_generation.instance_id
@@ -5935,6 +6164,7 @@ class InstanceManager:
                     tracked_generation=True,
                     task_id=task_id,
                     task_retry_count=expected_retry_count,
+                    task_turn_generation=expected_turn_generation,
                     instance_started_at=expected_started_at,
                 )
             if task_publication_generation is not None:
@@ -5948,6 +6178,10 @@ class InstanceManager:
                                 == task_publication_generation["status"],
                                 Task.retry_count
                                 == task_publication_generation["retry_count"],
+                                Task.turn_generation
+                                == task_publication_generation[
+                                    "turn_generation"
+                                ],
                                 (
                                     Task.instance_id.is_(None)
                                     if task_publication_generation[
@@ -5988,6 +6222,16 @@ class InstanceManager:
                                 {
                                     "event": "status_change",
                                     "task_id": task_id,
+                                    "task_retry_count": (
+                                        task_publication_generation[
+                                            "retry_count"
+                                        ]
+                                    ),
+                                    "task_turn_generation": (
+                                        task_publication_generation[
+                                            "turn_generation"
+                                        ]
+                                    ),
                                     "new_status": "failed",
                                     "instance_id": instance_id,
                                 },
@@ -6091,6 +6335,11 @@ class InstanceManager:
         )
         expected_retry_count = (
             record.task_retry_count
+            if tracked_generation
+            else None
+        )
+        expected_turn_generation = (
+            record.task_turn_generation
             if tracked_generation
             else None
         )
@@ -6504,6 +6753,10 @@ class InstanceManager:
                         task_generation_predicates.append(
                             Task.retry_count == expected_retry_count
                         )
+                    if expected_turn_generation is not None:
+                        task_generation_predicates.append(
+                            Task.turn_generation == expected_turn_generation
+                        )
                 task_lock = await db.execute(
                     update(Task)
                     .where(*task_generation_predicates)
@@ -6524,6 +6777,7 @@ class InstanceManager:
                         select(
                             Task.status,
                             Task.retry_count,
+                            Task.turn_generation,
                             Task.instance_id,
                             Task.started_at,
                             Task.completed_at,
@@ -6575,6 +6829,9 @@ class InstanceManager:
                             task_retry_count=(
                                 current_task_generation.retry_count
                             ),
+                            task_turn_generation=(
+                                current_task_generation.turn_generation
+                            ),
                             event_type="system_event",
                             role="system",
                             content=(
@@ -6589,6 +6846,12 @@ class InstanceManager:
                             "id": failure_notice.id,
                             "instance_id": instance_id,
                             "task_id": task_id,
+                            "task_retry_count": (
+                                current_task_generation.retry_count
+                            ),
+                            "task_turn_generation": (
+                                current_task_generation.turn_generation
+                            ),
                             "event_type": "system_event",
                             "role": "system",
                             "content": failure_notice.content,
@@ -6605,6 +6868,7 @@ class InstanceManager:
                         select(
                             Task.status,
                             Task.retry_count,
+                            Task.turn_generation,
                             Task.instance_id,
                             Task.started_at,
                             Task.completed_at,
@@ -6614,6 +6878,9 @@ class InstanceManager:
                 task_publication_generation = {
                     "status": resulting_task_generation.status,
                     "retry_count": resulting_task_generation.retry_count,
+                    "turn_generation": (
+                        resulting_task_generation.turn_generation
+                    ),
                     "instance_id": resulting_task_generation.instance_id,
                     "started_at": resulting_task_generation.started_at,
                     "completed_at": resulting_task_generation.completed_at,
@@ -6679,6 +6946,8 @@ class InstanceManager:
                         == task_publication_generation["status"],
                         Task.retry_count
                         == task_publication_generation["retry_count"],
+                        Task.turn_generation
+                        == task_publication_generation["turn_generation"],
                         (
                             Task.instance_id.is_(None)
                             if task_publication_generation["instance_id"]
@@ -6741,12 +7010,31 @@ class InstanceManager:
                         {
                             "event": "status_change",
                             "task_id": task_id,
+                            "task_retry_count": (
+                                task_publication_generation["retry_count"]
+                            ),
+                            "task_turn_generation": (
+                                task_publication_generation[
+                                    "turn_generation"
+                                ]
+                            ),
                             "new_status": final_status,
                             "instance_id": instance_id,
                         },
                     )
                 exit_event = {
                     "event_type": "process_exit",
+                    "task_id": task_id,
+                    "task_retry_count": (
+                        task_publication_generation["retry_count"]
+                        if task_publication_generation is not None
+                        else expected_retry_count
+                    ),
+                    "task_turn_generation": (
+                        task_publication_generation["turn_generation"]
+                        if task_publication_generation is not None
+                        else expected_turn_generation
+                    ),
                     "exit_code": exit_code,
                     "stderr": (
                         stderr_text[:2000] if stderr_text else None
@@ -6941,6 +7229,7 @@ class InstanceManager:
                 instance_id=instance_id,
                 prompt=params.get("prompt", "请继续之前的工作。"),
                 task_id=task_id,
+                task_turn_generation=params.get("task_turn_generation"),
                 cwd=cwd,
                 model=params.get("model"),
                 resume_session_id=session_id,
@@ -7127,6 +7416,7 @@ class InstanceManager:
                     instance_id=instance_id,
                     prompt=params.get("prompt", "continue"),
                     task_id=task_id,
+                    task_turn_generation=params.get("task_turn_generation"),
                     cwd=cwd,
                     model=params.get("model"),
                     resume_session_id=session_id,
@@ -7265,6 +7555,7 @@ class InstanceManager:
                 instance_id=instance_id,
                 prompt=params.get("prompt", "continue"),
                 task_id=task_id,
+                task_turn_generation=params.get("task_turn_generation"),
                 cwd=cwd,
                 model=params.get("model"),
                 resume_session_id=session_id,
@@ -7347,6 +7638,7 @@ class InstanceManager:
                 predicates = [
                     Task.id == generation.task_id,
                     Task.retry_count == generation.retry_count,
+                    Task.turn_generation == generation.turn_generation,
                     (
                         Task.worker_id.is_(None)
                         if generation.worker_id is None
@@ -7418,6 +7710,7 @@ class InstanceManager:
                     worker_id=task.worker_id,
                     shared_from_id=task.shared_from_id,
                     retry_count=task.retry_count,
+                    turn_generation=task.turn_generation,
                     instance_id=task.instance_id,
                     started_at=task.started_at,
                     completed_at=task.completed_at,
@@ -8290,6 +8583,8 @@ class InstanceManager:
         detached_autonomous: bool = False,
         expected_session_id: str | None = None,
         expected_background_generation: str | None = None,
+        expected_task_retry_count: int | None = None,
+        expected_task_turn_generation: int | None = None,
     ):
         """Process a single parsed event: save to DB and broadcast."""
         provider = str(
@@ -8317,7 +8612,10 @@ class InstanceManager:
                 event_record.task_id == task_id
                 and (
                     task_id is None
-                    or event_record.task_retry_count is not None
+                    or (
+                        event_record.task_retry_count is not None
+                        and event_record.task_turn_generation is not None
+                    )
                 )
                 and event_record.instance_started_at is not None
                 and self._consumer_records.get(instance_id) is event_record
@@ -8334,6 +8632,9 @@ class InstanceManager:
                 predicates.extend(
                     [
                         Task.session_id == expected_session_id,
+                        Task.retry_count == expected_task_retry_count,
+                        Task.turn_generation
+                        == expected_task_turn_generation,
                         Task.pty_background_generation
                         == expected_background_generation,
                     ]
@@ -8343,6 +8644,8 @@ class InstanceManager:
                     [
                         Task.instance_id == instance_id,
                         Task.retry_count == event_record.task_retry_count,
+                        Task.turn_generation
+                        == event_record.task_turn_generation,
                     ]
                 )
             return predicates
@@ -8355,6 +8658,8 @@ class InstanceManager:
                     task_id is None
                     or expected_session_id is None
                     or expected_background_generation is None
+                    or expected_task_retry_count is None
+                    or expected_task_turn_generation is None
                 ):
                     return False
                 task_guard = await db.execute(
@@ -8454,27 +8759,65 @@ class InstanceManager:
         # would recreate the raw-json/DB amplification that this path is meant
         # to avoid.  The final item/completed event is still stored normally.
         if event.get("event_type") in ("message_delta", "thinking_delta"):
-            if detached_autonomous:
-                async with self.db_factory() as db:
-                    if not await guard_managed_event_generation(db):
-                        await db.rollback()
-                        logger.info(
-                            "Dropping stale autonomous delta for task %s "
-                            "session %s",
-                            task_id,
-                            expected_session_id,
-                        )
-                        return
-                    await db.commit()
+            # A live-only delta still needs the same durable generation fence
+            # as a persisted final item.  In-memory consumer identity alone is
+            # insufficient: a retry/new turn may already have committed while
+            # the old callback is still unwinding.  Keep the no-op Task→Instance
+            # row locks through publication so that a generation transition
+            # cannot commit between the check and the external WS side effect.
+            # Missing exact foreground identity is deliberately fail-closed.
+            if not detached_autonomous and event_record is None:
+                logger.info(
+                    "Dropping unscoped foreground delta for instance %s task %s",
+                    instance_id,
+                    task_id,
+                )
+                return
             broadcast_data = {k: v for k, v in event.items() if k != "raw_json"}
+            if detached_autonomous:
+                broadcast_data["task_retry_count"] = (
+                    expected_task_retry_count
+                )
+                broadcast_data["task_turn_generation"] = (
+                    expected_task_turn_generation
+                )
+            elif event_record is not None:
+                if not owns_event_generation():
+                    return
+                broadcast_data["task_retry_count"] = (
+                    event_record.task_retry_count
+                )
+                broadcast_data["task_turn_generation"] = (
+                    event_record.task_turn_generation
+                )
+                native_turn_id = getattr(
+                    event_record.process,
+                    "native_turn_id",
+                    None,
+                )
+                if native_turn_id:
+                    broadcast_data["native_turn_id"] = str(native_turn_id)
             if loop_iteration is not None:
                 broadcast_data["loop_iteration"] = loop_iteration
-            if not detached_autonomous:
-                await self.broadcaster.broadcast(
-                    f"instance:{instance_id}", broadcast_data
-                )
-            if task_id:
-                await self.broadcaster.broadcast(f"task:{task_id}", broadcast_data)
+            async with self.db_factory() as db:
+                if not await guard_managed_event_generation(db):
+                    await db.rollback()
+                    logger.info(
+                        "Dropping stale %s delta for task %s on instance %s",
+                        "autonomous" if detached_autonomous else "foreground",
+                        task_id,
+                        instance_id,
+                    )
+                    return
+                if not detached_autonomous:
+                    await self.broadcaster.broadcast(
+                        f"instance:{instance_id}", broadcast_data
+                    )
+                if task_id:
+                    await self.broadcaster.broadcast(
+                        f"task:{task_id}", broadcast_data
+                    )
+                await db.commit()
             return
 
         # A foreground turn can still produce output after another callback
@@ -8503,6 +8846,8 @@ class InstanceManager:
                         Task.status == "completed",
                         Task.instance_id == instance_id,
                         Task.retry_count == event_record.task_retry_count,
+                        Task.turn_generation
+                        == event_record.task_turn_generation,
                         task_retry_not_superseded_predicate(),
                     )
                     .values(status=Task.status)
@@ -8567,6 +8912,8 @@ class InstanceManager:
                             Task.status == "executing",
                             Task.instance_id == instance_id,
                             Task.retry_count == event_record.task_retry_count,
+                            Task.turn_generation
+                            == event_record.task_turn_generation,
                             (
                                 Task.completed_at.is_(None)
                                 if reactivated_completed_at is None
@@ -8604,6 +8951,10 @@ class InstanceManager:
                         await self.broadcaster.broadcast("tasks", {
                             "event": "status_change",
                             "task_id": task_id,
+                            "task_retry_count": event_record.task_retry_count,
+                            "task_turn_generation": (
+                                event_record.task_turn_generation
+                            ),
                             "new_status": "executing",
                         })
                     await db.commit()
@@ -8647,10 +8998,14 @@ class InstanceManager:
                 )
                 return
             persisted_task_retry_count = None
+            persisted_task_turn_generation = None
             if task_id is not None:
                 if event_record is not None:
                     persisted_task_retry_count = (
                         event_record.task_retry_count
+                    )
+                    persisted_task_turn_generation = (
+                        event_record.task_turn_generation
                     )
                 elif detached_autonomous:
                     persisted_task_retry_count = (
@@ -8668,10 +9023,52 @@ class InstanceManager:
                             task_id,
                         )
                         return
+                    persisted_task_turn_generation = (
+                        expected_task_turn_generation
+                    )
+                    if persisted_task_turn_generation is None:
+                        await db.rollback()
+                        logger.info(
+                            "Dropping autonomous event without an exact turn "
+                            "generation for task %s",
+                            task_id,
+                        )
+                        return
+            raw_payload = event.get("raw_json")
+            parsed_raw = None
+            if isinstance(raw_payload, dict):
+                parsed_raw = raw_payload
+            elif isinstance(raw_payload, str) and raw_payload:
+                try:
+                    parsed_raw = json.loads(raw_payload)
+                except (TypeError, ValueError):
+                    parsed_raw = None
+            native_turn_id = event.get("turn_id") or event.get("turnId")
+            if not native_turn_id and isinstance(parsed_raw, dict):
+                raw_turn = parsed_raw.get("turn")
+                native_turn_id = (
+                    parsed_raw.get("turn_id")
+                    or parsed_raw.get("turnId")
+                    or (
+                        raw_turn.get("id")
+                        if isinstance(raw_turn, dict)
+                        else None
+                    )
+                )
+            if not native_turn_id and event_record is not None:
+                native_turn_id = getattr(
+                    event_record.process,
+                    "native_turn_id",
+                    None,
+                )
             entry = LogEntry(
                 instance_id=instance_id,
                 task_id=task_id,
                 task_retry_count=persisted_task_retry_count,
+                task_turn_generation=persisted_task_turn_generation,
+                native_turn_id=(
+                    str(native_turn_id) if native_turn_id else None
+                ),
                 event_type=event["event_type"],
                 role=event.get("role"),
                 content=event.get("content"),
@@ -8729,7 +9126,11 @@ class InstanceManager:
         ):
             try:
                 await self._upsert_native_sub_agent(
-                    task_id, event["event_type"], event["subagent"]
+                    task_id,
+                    event["event_type"],
+                    event["subagent"],
+                    task_retry_count=entry.task_retry_count,
+                    task_turn_generation=entry.task_turn_generation,
                 )
             except Exception:
                 logger.exception(
@@ -8842,6 +9243,12 @@ class InstanceManager:
         )
         if entry.task_retry_count is not None:
             broadcast_data["task_retry_count"] = entry.task_retry_count
+        if entry.task_turn_generation is not None:
+            broadcast_data["task_turn_generation"] = (
+                entry.task_turn_generation
+            )
+        if entry.native_turn_id is not None:
+            broadcast_data["native_turn_id"] = entry.native_turn_id
         if loop_iteration is not None:
             broadcast_data["loop_iteration"] = loop_iteration
         if not detached_autonomous:
@@ -8966,13 +9373,26 @@ class InstanceManager:
                 else:
                     await db.commit()
             if context_updated is not None and context_updated.rowcount:
-                await self.broadcaster.broadcast(f"task:{task_id}", {
-                    "event_type": "context_usage",
-                    **context_usage,
-                })
+                await self.broadcaster.broadcast(
+                    f"task:{task_id}",
+                    {
+                        "event_type": "context_usage",
+                        "task_retry_count": entry.task_retry_count,
+                        "task_turn_generation": (
+                            entry.task_turn_generation
+                        ),
+                        **context_usage,
+                    },
+                )
 
     async def _upsert_native_sub_agent(
-        self, task_id: int, event_type: str, info: dict
+        self,
+        task_id: int,
+        event_type: str,
+        info: dict,
+        *,
+        task_retry_count: int | None,
+        task_turn_generation: int | None,
     ) -> None:
         """Mirror a native sub-agent lifecycle event into sub_agent_sessions.
 
@@ -8984,11 +9404,30 @@ class InstanceManager:
         from sqlalchemy import select as _select
         from backend.models.sub_agent import SubAgentSession
 
+        if (
+            type(task_retry_count) is not int
+            or type(task_turn_generation) is not int
+        ):
+            return
+
         tool_use_id = info.get("tool_use_id")
         if not tool_use_id:
             return
 
         async with self.db_factory() as db:
+            generation_guard = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.retry_count == task_retry_count,
+                    Task.turn_generation == task_turn_generation,
+                    task_retry_not_superseded_predicate(),
+                )
+                .values(status=Task.status)
+            )
+            if not generation_guard.rowcount:
+                await db.rollback()
+                return
             existing = (
                 await db.execute(
                     _select(SubAgentSession).where(
@@ -9019,6 +9458,8 @@ class InstanceManager:
                     "agent_type": sa.agent_type,
                     "source": "native",
                     "description": sa.description,
+                    "task_retry_count": task_retry_count,
+                    "task_turn_generation": task_turn_generation,
                 })
                 return
 
@@ -9036,6 +9477,8 @@ class InstanceManager:
                     "agent_type": existing.agent_type,
                     "check_number": existing.checks_done,
                     "summary": existing.last_summary,
+                    "task_retry_count": task_retry_count,
+                    "task_turn_generation": task_turn_generation,
                 })
                 # Write progress as system_event in chat (like monitor checks)
                 summary_text = (existing.last_summary or "working...")[:300]
@@ -9043,6 +9486,8 @@ class InstanceManager:
                 db.add(LogEntry(
                     instance_id=None,
                     task_id=task_id,
+                    task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
                     event_type="system_event",
                     content=log_content,
                     is_error=False,
@@ -9051,6 +9496,8 @@ class InstanceManager:
                 await self.broadcaster.broadcast(f"task:{task_id}", {
                     "event_type": "system_event",
                     "content": log_content,
+                    "task_retry_count": task_retry_count,
+                    "task_turn_generation": task_turn_generation,
                 })
             elif event_type == "subagent_done":
                 existing.status = "completed"
@@ -9065,6 +9512,8 @@ class InstanceManager:
                     "sub_agent_session_id": existing.id,
                     "agent_type": existing.agent_type,
                     "status": "completed",
+                    "task_retry_count": task_retry_count,
+                    "task_turn_generation": task_turn_generation,
                 })
                 # 绝不在这里 enqueue auto-resume：subagent_done 只来自 PTY 观测，
                 # 而 PTY 模式下 harness 自己的 task-notification 已在同一瞬间唤醒
@@ -9597,6 +10046,9 @@ class InstanceManager:
         instance_id: int,
         *,
         expected_task_id: int | None = None,
+        expected_task_turn_generation: int | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
         expected_pid: int | None | object = _EXPECTED_GENERATION_UNSET,
         expected_started_at: datetime | None | object = _EXPECTED_GENERATION_UNSET,
         task_status: str = "pending",
@@ -9610,7 +10062,9 @@ class InstanceManager:
         """Cancellation-safe stop of one reusable worker slot.
 
         ``expected_task_id`` turns a historical instance reference into an
-        owner-checked operation. ``expected_pid`` and
+        owner-checked operation. ``expected_task_turn_generation`` fences hot
+        PTY reuse where Task, Instance, PID, and start time remain unchanged.
+        ``expected_pid`` and
         ``expected_started_at`` additionally fence the exact process
         generation (explicit ``None`` is a real expected value; omission
         disables that one fence). All are verified under the launch lock and
@@ -9629,11 +10083,21 @@ class InstanceManager:
             "failed",
         }:
             raise ValueError(f"Unsupported terminal task status: {task_status}")
+        if (
+            expected_task_turn_generation is not _EXPECTED_GENERATION_UNSET
+            and expected_task_id is None
+        ):
+            raise ValueError(
+                "expected_task_turn_generation requires expected_task_id"
+            )
 
         operation = asyncio.create_task(
             self._stop_serialized(
                 instance_id,
                 expected_task_id=expected_task_id,
+                expected_task_turn_generation=(
+                    expected_task_turn_generation
+                ),
                 expected_pid=expected_pid,
                 expected_started_at=expected_started_at,
                 task_status=task_status,
@@ -9794,6 +10258,7 @@ class InstanceManager:
         instance_id: int,
         *,
         expected_task_id: int | None,
+        expected_task_turn_generation: int | object,
         expected_pid: int | None | object,
         expected_started_at: datetime | None | object,
         task_status: str,
@@ -9814,6 +10279,8 @@ class InstanceManager:
                 async with lifecycle_lock:
                     has_expected_owner = (
                         expected_task_id is not None
+                        or expected_task_turn_generation
+                        is not _EXPECTED_GENERATION_UNSET
                         or expected_pid is not _EXPECTED_GENERATION_UNSET
                         or expected_started_at is not _EXPECTED_GENERATION_UNSET
                     )
@@ -9822,9 +10289,25 @@ class InstanceManager:
                     )
                     if has_expected_owner:
                         async with self.db_factory() as db:
+                            task_turn_generation = (
+                                await db.scalar(
+                                    select(Task.turn_generation).where(
+                                        Task.id == expected_task_id
+                                    )
+                                )
+                                if expected_task_turn_generation
+                                is not _EXPECTED_GENERATION_UNSET
+                                else None
+                            )
                             owner = await db.get(Instance, instance_id)
                         if (
                             owner is None
+                            or (
+                                expected_task_turn_generation
+                                is not _EXPECTED_GENERATION_UNSET
+                                and task_turn_generation
+                                != expected_task_turn_generation
+                            )
                             or (
                                 expected_task_id is not None
                                 and owner.current_task_id != expected_task_id
@@ -10002,6 +10485,9 @@ class InstanceManager:
                         stopped = await self._stop_locked(
                             instance_id,
                             expected_task_id=expected_task_id,
+                            expected_task_turn_generation=(
+                                expected_task_turn_generation
+                            ),
                             expected_pid=expected_pid,
                             expected_started_at=expected_started_at,
                             task_status=task_status,
@@ -10088,6 +10574,9 @@ class InstanceManager:
         instance_id: int,
         *,
         expected_task_id: int | None,
+        expected_task_turn_generation: int | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
         task_status: str,
         task_error_message: str | None = None,
         expected_pid: int | None | object = _EXPECTED_GENERATION_UNSET,
@@ -10135,6 +10624,9 @@ class InstanceManager:
             return await self._stop_locked_inner(
                 instance_id,
                 expected_task_id=expected_task_id,
+                expected_task_turn_generation=(
+                    expected_task_turn_generation
+                ),
                 task_status=task_status,
                 task_error_message=task_error_message,
                 expected_pid=expected_pid,
@@ -10194,6 +10686,9 @@ class InstanceManager:
         instance_id: int,
         *,
         expected_task_id: int | None,
+        expected_task_turn_generation: int | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
         task_status: str,
         task_error_message: str | None = None,
         expected_pid: int | None | object = _EXPECTED_GENERATION_UNSET,
@@ -10257,6 +10752,21 @@ class InstanceManager:
             effective_expected_started_at = expected_started_at
 
         if (
+            expected_task_turn_generation is not _EXPECTED_GENERATION_UNSET
+        ):
+            async with self.db_factory() as db:
+                current_task_turn_generation = await db.scalar(
+                    select(Task.turn_generation).where(
+                        Task.id == expected_task_id
+                    )
+                )
+            if (
+                current_task_turn_generation
+                != expected_task_turn_generation
+            ):
+                return False
+
+        if (
             expected_task_id is not None
             or effective_expected_pid is not _EXPECTED_GENERATION_UNSET
             or effective_expected_started_at is not _EXPECTED_GENERATION_UNSET
@@ -10290,6 +10800,20 @@ class InstanceManager:
             process is not None
             and not self._generation_reap_confirmed(instance_id, process)
         )
+        if (
+            process_live
+            and expected_task_turn_generation
+            is not _EXPECTED_GENERATION_UNSET
+            and not (
+                record is not None
+                and record.task_id == expected_task_id
+                and record.task_turn_generation
+                == expected_task_turn_generation
+            )
+        ):
+            # PID/start time do not distinguish hot PTY turns. Never signal a
+            # live process unless its in-memory consumer proves the same turn.
+            return False
         consumer_live = task is not None and not task.done()
         stopping_background_state = (
             self._pty_background_state_for_task(expected_task_id)
@@ -10537,10 +11061,24 @@ class InstanceManager:
                         Task.instance_id == instance_id,
                         (
                             Task.id == task_id
+                            if expected_task_turn_generation
+                            is _EXPECTED_GENERATION_UNSET
+                            else Task.turn_generation
+                            == expected_task_turn_generation
+                        ),
+                        (
+                            Task.id == task_id
                             if recovery_evidence is None
                             or recovery_evidence.task_retry_count is None
                             else Task.retry_count
                             == recovery_evidence.task_retry_count
+                        ),
+                        (
+                            Task.id == task_id
+                            if recovery_evidence is None
+                            or recovery_evidence.task_turn_generation is None
+                            else Task.turn_generation
+                            == recovery_evidence.task_turn_generation
                         ),
                     )
                     .values(status=Task.status)
@@ -10554,6 +11092,7 @@ class InstanceManager:
                         select(
                             Task.status,
                             Task.retry_count,
+                            Task.turn_generation,
                             Task.instance_id,
                             Task.started_at,
                             Task.completed_at,
@@ -10589,6 +11128,8 @@ class InstanceManager:
                             Task.status == current_task_generation.status,
                             Task.retry_count
                             == current_task_generation.retry_count,
+                            Task.turn_generation
+                            == current_task_generation.turn_generation,
                             Task.instance_id == instance_id,
                         )
                         .values(**task_values)
@@ -10616,6 +11157,8 @@ class InstanceManager:
                             == current_task_generation.status,
                             Task.retry_count
                             == current_task_generation.retry_count,
+                            Task.turn_generation
+                            == current_task_generation.turn_generation,
                             Task.instance_id == instance_id,
                             Task.pty_background_generation
                             == current_task_generation
@@ -10657,6 +11200,7 @@ class InstanceManager:
                         select(
                             Task.status,
                             Task.retry_count,
+                            Task.turn_generation,
                             Task.instance_id,
                             Task.started_at,
                             Task.completed_at,
@@ -10667,6 +11211,9 @@ class InstanceManager:
                 published_generation = {
                     "status": resulting_task_generation.status,
                     "retry_count": resulting_task_generation.retry_count,
+                    "turn_generation": (
+                        resulting_task_generation.turn_generation
+                    ),
                     "instance_id": resulting_task_generation.instance_id,
                     "started_at": resulting_task_generation.started_at,
                     "completed_at": resulting_task_generation.completed_at,
@@ -10760,6 +11307,8 @@ class InstanceManager:
                     Task.id == task_id,
                     Task.status == published_generation["status"],
                     Task.retry_count == published_generation["retry_count"],
+                    Task.turn_generation
+                    == published_generation["turn_generation"],
                     (
                         Task.instance_id.is_(None)
                         if published_generation["instance_id"] is None
@@ -10806,6 +11355,12 @@ class InstanceManager:
                             {
                                 "event": "status_change",
                                 "task_id": task_id,
+                                "task_retry_count": published_generation[
+                                    "retry_count"
+                                ],
+                                "task_turn_generation": published_generation[
+                                    "turn_generation"
+                                ],
                                 "new_status": task_status,
                                 "instance_id": instance_id,
                                 "background_active": False,
@@ -10816,6 +11371,12 @@ class InstanceManager:
                             "event": "background_activity",
                             "event_type": "background_activity",
                             "task_id": task_id,
+                            "task_retry_count": published_generation[
+                                "retry_count"
+                            ],
+                            "task_turn_generation": published_generation[
+                                "turn_generation"
+                            ],
                             "background_active": False,
                         }
                         await self.broadcaster.broadcast(
@@ -10828,6 +11389,13 @@ class InstanceManager:
                         f"task:{task_id}",
                         {
                             "event_type": "process_exit",
+                            "task_id": task_id,
+                            "task_retry_count": published_generation[
+                                "retry_count"
+                            ],
+                            "task_turn_generation": published_generation[
+                                "turn_generation"
+                            ],
                             "exit_code": (
                                 process.returncode
                                 if process is not None

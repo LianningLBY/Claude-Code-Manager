@@ -628,6 +628,7 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
                 "id": task_id,
                 "status": "executing",
                 "retry_count": 0,
+                "turn_generation": 0,
                 "instance_id": None,
                 "started_at": None,
                 "completed_at": None,
@@ -637,6 +638,7 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
         assert body == {
             "expected_status": "executing",
             "expected_retry_count": 0,
+            "expected_turn_generation": 0,
             "expected_instance_id": None,
             "expected_started_at": None,
             "expected_completed_at": None,
@@ -646,6 +648,7 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
             "id": task_id,
             "status": "completed",
             "retry_count": 0,
+            "turn_generation": 0,
             "instance_id": None,
             "started_at": None,
             "completed_at": None,

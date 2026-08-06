@@ -2,6 +2,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -30,6 +31,7 @@ from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.schemas.task import TaskCreate
 from backend.services.worker_proxy import (
     WorkerEndpointNotFoundError,
@@ -112,12 +114,178 @@ async def test_concurrent_worker_connection_admission_creates_one_transport(
     await relay.stop_worker(worker.id)
 
 
+async def test_worker_relay_shutdown_closes_and_awaits_all_owned_tasks(relay):
+    worker_id = 301
+    socket = SimpleNamespace(close=AsyncMock())
+    started = [asyncio.Event() for _ in range(3)]
+    finalized = [asyncio.Event() for _ in range(3)]
+
+    async def tracked_background(index):
+        started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            finalized[index].set()
+
+    relay_task = asyncio.create_task(tracked_background(0))
+    reconnect_task = asyncio.create_task(tracked_background(1))
+    handoff_task = asyncio.create_task(tracked_background(2))
+    relay._ws[worker_id] = socket
+    relay._tasks[worker_id] = {11}
+    relay._loops[worker_id] = relay_task
+    relay._reconnect_tasks[worker_id] = {reconnect_task}
+    relay._handoff_recovery_tasks[(worker_id, 11, "handoff-11")] = (
+        handoff_task
+    )
+    await asyncio.gather(*(event.wait() for event in started))
+
+    await relay.shutdown()
+    await relay.shutdown()
+
+    socket.close.assert_awaited_once_with()
+    assert all(task.done() for task in (
+        relay_task,
+        reconnect_task,
+        handoff_task,
+    ))
+    assert all(task.cancelled() for task in (
+        relay_task,
+        reconnect_task,
+        handoff_task,
+    ))
+    assert all(event.is_set() for event in finalized)
+    assert relay._ws == {}
+    assert relay._tasks == {}
+    assert relay._loops == {}
+    assert relay._reconnect_tasks == {}
+    assert relay._handoff_recovery_tasks == {}
+
+
+async def test_worker_relay_shutdown_rejects_all_new_background_work(
+    relay,
+    monkeypatch,
+):
+    worker = SimpleNamespace(
+        id=302,
+        private_ip="10.0.0.10",
+        ccm_port=8002,
+        auth_token="worker-token",
+    )
+    observed = worker_relay_module.WorkerTaskGeneration(
+        task_id=12,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=0,
+        turn_generation=1,
+        instance_id=None,
+        started_at=None,
+        completed_at=None,
+        pty_background_generation=None,
+        worker_turn_handoff_id="a" * 32,
+        worker_turn_handoff_worker_id=worker.id,
+        worker_turn_handoff_retry_count=0,
+        worker_turn_handoff_from_generation=1,
+        worker_turn_handoff_source_log_id=99,
+        worker_turn_handoff_acknowledged=True,
+    )
+    connect = AsyncMock()
+    monkeypatch.setattr(worker_relay_module.websockets, "connect", connect)
+
+    await relay.shutdown()
+    forbidden_db_factory = Mock(
+        side_effect=AssertionError("shutdown path touched the database")
+    )
+    relay.db_factory = forbidden_db_factory
+    relay._worker_turn_handoff_recovery_loop = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await relay.ensure_connection(worker)
+    await relay.recover(worker)
+    await relay._reconnect(worker, {observed.task_id})
+    relay._reconnect = AsyncMock()
+    relay._schedule_reconnect(worker, {observed.task_id})
+    relay.ensure_worker_turn_handoff_recovery(worker, observed)
+
+    connect.assert_not_awaited()
+    forbidden_db_factory.assert_not_called()
+    relay._reconnect.assert_not_called()
+    relay._worker_turn_handoff_recovery_loop.assert_not_called()
+    assert relay._reconnect_tasks == {}
+    assert relay._handoff_recovery_tasks == {}
+
+
+async def test_worker_relay_shutdown_caller_cancellation_finishes_cleanup(
+    relay,
+):
+    worker_id = 303
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    async def close():
+        close_started.set()
+        await release_close.wait()
+        close_finished.set()
+
+    relay._ws[worker_id] = SimpleNamespace(close=AsyncMock(side_effect=close))
+    shutdown_call = asyncio.create_task(relay.shutdown())
+    await close_started.wait()
+
+    shutdown_call.cancel()
+    await asyncio.sleep(0)
+    assert not shutdown_call.done()
+    release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown_call
+    assert close_finished.is_set()
+    assert relay._shutdown_task is not None
+    assert relay._shutdown_task.done()
+    assert relay._ws == {}
+    await relay.shutdown()
+
+
+async def test_worker_relay_start_requires_completed_clean_shutdown(relay):
+    worker_id = 304
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def close():
+        close_started.set()
+        await release_close.wait()
+
+    await relay.start()
+    relay._ws[worker_id] = SimpleNamespace(
+        close=AsyncMock(side_effect=close)
+    )
+    shutdown_call = asyncio.create_task(relay.shutdown())
+    await close_started.wait()
+
+    with pytest.raises(RuntimeError, match="still in progress"):
+        await relay.start()
+
+    release_close.set()
+    await shutdown_call
+    relay._tasks[worker_id] = set()
+    with pytest.raises(RuntimeError, match="owned resources"):
+        await relay.start()
+
+    relay._tasks.clear()
+    await relay.start()
+    assert relay._shutting_down is False
+    assert relay._shutdown_task is None
+    assert relay._closing == set()
+    await relay.shutdown()
+
+
 async def _mk_worker(session_factory, **fields) -> Worker:
+    fields.setdefault("name", "w1")
     fields.setdefault("status", "ready")
     fields.setdefault("private_ip", "10.0.0.9")
     fields.setdefault("auth_token", "wtoken")
     async with session_factory() as db:
-        w = Worker(name="w1", **fields)
+        w = Worker(**fields)
         db.add(w)
         await db.commit()
         await db.refresh(w)
@@ -136,10 +304,14 @@ async def _mk_task(session_factory, **fields) -> Task:
 
 
 def _remote_task(task: Task, **overrides) -> dict:
+    task_turn_generation = getattr(task, "turn_generation", None)
+    if type(task_turn_generation) is not int:
+        task_turn_generation = 0
     payload = {
         "id": task.id,
         "status": task.status,
         "retry_count": task.retry_count,
+        "turn_generation": task_turn_generation,
         "session_id": task.session_id,
         "started_at": (
             task.started_at.isoformat() if task.started_at else None
@@ -151,6 +323,89 @@ def _remote_task(task: Task, **overrides) -> dict:
     }
     payload.update(overrides)
     return payload
+
+
+def _relay_generation(task: Task) -> dict[str, int]:
+    return {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
+
+
+async def _reserve_worker_handoff(session_factory, task: Task):
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        observed = worker_relay_module.worker_task_generation(current)
+        assert observed is not None
+        log = LogEntry(
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="reserved follow-up",
+        )
+        db.add(log)
+        await db.flush()
+        handoff_id = f"{task.id:032x}"
+        request_payload = {
+            "message": "reserved follow-up",
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": task.retry_count,
+            "worker_turn_handoff_from_generation": task.turn_generation,
+        }
+        reserved = await worker_relay_module.reserve_worker_turn_handoff(
+            db,
+            observed,
+            handoff_id=handoff_id,
+            source_log_id=log.id,
+            request_payload=request_payload,
+            request_digest=worker_relay_module._handoff_payload_digest(
+                request_payload
+            ),
+        )
+        assert reserved is not None
+        await db.commit()
+        return reserved
+
+
+def _launched_handoff_receipt(reserved) -> dict:
+    return {
+        "handoff_id": reserved.worker_turn_handoff_id,
+        "task_id": reserved.task_id,
+        "status": "launched",
+        "retry_count": reserved.worker_turn_handoff_retry_count,
+        "from_generation": reserved.worker_turn_handoff_from_generation,
+        "turn_generation": reserved.worker_turn_handoff_from_generation + 1,
+        "source_log_id": 9001,
+        "response": {"ok": True, "queued": True},
+    }
+
+
+def _handoff_receipt_with_status(reserved, status: str) -> dict:
+    receipt = _launched_handoff_receipt(reserved)
+    receipt["status"] = status
+    if status in {"accepted", "cancelled"}:
+        receipt["turn_generation"] = None
+    return receipt
+
+
+def _mock_launched_handoff_receipts(relay, session_factory) -> None:
+    async def fetch(_worker, task_id, handoff_id, **_kwargs):
+        async with session_factory() as db:
+            task = await db.get(Task, task_id)
+        if task is None or task.worker_turn_handoff_id != handoff_id:
+            return None
+        return {
+            "handoff_id": handoff_id,
+            "task_id": task_id,
+            "status": "launched",
+            "retry_count": task.worker_turn_handoff_retry_count,
+            "from_generation": task.worker_turn_handoff_from_generation,
+            "turn_generation": task.worker_turn_handoff_from_generation + 1,
+            "source_log_id": 9001,
+            "response": {"ok": True, "queued": True},
+        }
+
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(side_effect=fetch)
 
 
 def _routing_snapshot(
@@ -330,6 +585,86 @@ async def test_authoritative_worker_background_missing_field_preserves_marker(
 
     assert resulting is not None
     assert resulting.pty_background_generation == "manager-owned"
+
+
+@pytest.mark.parametrize(
+    "remote_turn_generation",
+    [None, True, -1],
+    ids=["missing", "boolean", "negative"],
+)
+async def test_authoritative_worker_snapshot_requires_valid_turn_generation(
+    session_factory,
+    remote_turn_generation,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        turn_generation=5,
+    )
+    observed = worker_relay_module.worker_task_generation(task)
+    assert observed is not None
+    remote = _remote_task(task)
+    if remote_turn_generation is None:
+        remote.pop("turn_generation")
+    else:
+        remote["turn_generation"] = remote_turn_generation
+
+    async with session_factory() as db:
+        resulting = await (
+            worker_relay_module.apply_authoritative_worker_task(
+                db,
+                observed,
+                remote,
+            )
+        )
+
+    assert resulting is None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == task.status
+    assert current.turn_generation == 5
+
+
+async def test_authoritative_worker_apply_rejects_turn_generation_only_aba(
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        turn_generation=8,
+    )
+    observed = worker_relay_module.worker_task_generation(task)
+    assert observed is not None
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(turn_generation=9)
+        )
+        await db.commit()
+    remote = _remote_task(
+        task,
+        status="completed",
+        turn_generation=8,
+    )
+
+    async with session_factory() as db:
+        resulting = await (
+            worker_relay_module.apply_authoritative_worker_task(
+                db,
+                observed,
+                remote,
+            )
+        )
+
+    assert resulting is None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "in_progress"
+    assert current.turn_generation == 9
 
 
 def test_worker_proxy_ssh_is_scoped_to_cloud_instance(monkeypatch):
@@ -933,6 +1268,8 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
             "content": "hi",
             "instance_id": 7,
             "task_retry_count": t.retry_count,
+            "task_turn_generation": t.turn_generation,
+            "native_turn_id": "native-turn-live-1",
         },
     }, w)
 
@@ -943,6 +1280,8 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
     assert logs[0].instance_id is None
     assert logs[0].content == "hi"
     assert logs[0].task_retry_count == t.retry_count
+    assert logs[0].task_turn_generation == t.turn_generation
+    assert logs[0].native_turn_id == "native-turn-live-1"
     assert task.has_unread is True
     # 镜像广播到同名 channel，剥掉 worker 的 instance_id，并以 Manager
     # 本地 LogEntry 身份覆盖远端数据库 id。
@@ -957,7 +1296,40 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
     assert event["id"] != 987654
     assert event["task_id"] == t.id
     assert event["task_retry_count"] == t.retry_count
+    assert event["task_turn_generation"] == t.turn_generation
+    assert event["native_turn_id"] == "native-turn-live-1"
     assert event["timestamp"].endswith("Z")
+
+
+async def test_relay_rejects_non_string_native_turn_identity(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "invalid identity",
+                "native_turn_id": 17,
+                **_relay_generation(task),
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        logs = list((await db.execute(
+            select(LogEntry).where(LogEntry.task_id == task.id)
+        )).scalars())
+    assert logs == []
+    assert broadcaster.sent == []
 
 
 @pytest.mark.parametrize(
@@ -1015,6 +1387,791 @@ async def test_relay_drops_pr_terminal_event_without_exact_retry_generation(
     assert current.has_unread is False
     assert logs == []
     assert broadcaster.sent == []
+
+
+async def test_relay_drops_chat_event_from_stale_turn_with_same_retry(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+        has_unread=False,
+    )
+    relay._tasks[worker.id] = {task.id}
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "result",
+                "role": "assistant",
+                "content": "stale logical turn",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation - 1,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        logs = (
+            await db.execute(
+                select(LogEntry).where(LogEntry.task_id == task.id)
+            )
+        ).scalars().all()
+    assert current.has_unread is False
+    assert logs == []
+    assert broadcaster.sent == []
+
+
+async def test_relay_rejects_unreserved_next_turn_generation(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+        has_unread=False,
+    )
+    relay._tasks[worker.id] = {task.id}
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "result",
+                "role": "assistant",
+                "content": "unreserved next turn",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        logs = list((await db.execute(
+            select(LogEntry).where(LogEntry.task_id == task.id)
+        )).scalars())
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id is None
+    assert current.has_unread is False
+    assert logs == []
+    assert broadcaster.sent == []
+
+
+async def test_reserved_next_turn_rejects_accepted_but_unlaunched_receipt(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+        has_unread=False,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    relay._tasks[worker.id] = {task.id}
+    receipt = _launched_handoff_receipt(reserved)
+    receipt["status"] = "accepted"
+    receipt["turn_generation"] = None
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=receipt
+    )
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "an unrelated remote plus one",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assistant = await db.scalar(
+            select(LogEntry.id).where(LogEntry.role == "assistant")
+        )
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    assert assistant is None
+    assert broadcaster.sent == []
+
+
+async def test_launching_handoff_live_terminal_event_adopts_exact_next_turn(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    """A provider can emit G+1 before launch() returns and marks launched."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+        has_unread=False,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_handoff_receipt_with_status(reserved, "launching")
+    )
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "result",
+                "role": "assistant",
+                "content": "terminal output raced launch settlement",
+                "native_turn_id": "native-launching-turn-11",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        manager_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+        terminal_log = await db.scalar(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.content == "terminal output raced launch settlement",
+            )
+        )
+    assert current.turn_generation == task.turn_generation + 1
+    assert current.worker_turn_handoff_id is None
+    assert manager_receipt.status == "completed"
+    assert terminal_log is not None
+    assert terminal_log.task_turn_generation == task.turn_generation + 1
+    assert terminal_log.native_turn_id == "native-launching-turn-11"
+    assert any(
+        payload.get("content") == "terminal output raced launch settlement"
+        for _channel, payload in broadcaster.sent
+    )
+
+
+async def test_claimed_handoff_recovery_resumes_exact_generation(
+    relay,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_handoff_receipt_with_status(reserved, "claimed")
+    )
+    relay._resume_worker_turn_handoff = AsyncMock(return_value=True)
+
+    recovered = await relay._resume_accepted_worker_turn_handoff(
+        worker,
+        reserved,
+        attempts=1,
+    )
+
+    assert recovered is True
+    relay._resume_worker_turn_handoff.assert_awaited_once_with(
+        worker,
+        reserved,
+    )
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        manager_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_acknowledged is True
+    assert manager_receipt.status == "acknowledged"
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        ("task_id", True),
+        ("retry_count", True),
+        ("from_generation", False),
+        ("turn_generation", True),
+    ],
+)
+async def test_remote_handoff_match_rejects_boolean_integer_fields(
+    relay,
+    session_factory,
+    field,
+    malformed,
+):
+    # Choose integer values that compare equal to their bool counterpart.  The
+    # protocol must still reject them instead of relying on Python's True == 1
+    # and False == 0 behavior.
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=1,
+        turn_generation=0,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    observed = replace(reserved, task_id=1)
+    receipt = _handoff_receipt_with_status(observed, "launching")
+    receipt[field] = malformed
+
+    assert not relay._remote_handoff_matches(observed, receipt)
+
+
+@pytest.mark.parametrize(
+    ("mismatched_field", "expected"),
+    [
+        (None, True),
+        ("task_id", False),
+        ("retry_count", False),
+        ("from_generation", False),
+        ("turn_generation", False),
+    ],
+)
+async def test_resume_worker_handoff_validates_complete_remote_identity(
+    relay,
+    session_factory,
+    monkeypatch,
+    mismatched_field,
+    expected,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    receipt = _handoff_receipt_with_status(reserved, "claimed")
+    if mismatched_field == "task_id":
+        receipt[mismatched_field] = task.id + 1
+    elif mismatched_field == "retry_count":
+        receipt[mismatched_field] = task.retry_count + 1
+    elif mismatched_field == "from_generation":
+        receipt[mismatched_field] = task.turn_generation + 1
+    elif mismatched_field == "turn_generation":
+        receipt[mismatched_field] = task.turn_generation + 2
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return receipt
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, **_kwargs):
+            assert url.endswith(
+                f"/api/tasks/{task.id}/worker-turn-handoffs/"
+                f"{reserved.worker_turn_handoff_id}/resume"
+            )
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+
+    resumed = await relay._resume_worker_turn_handoff(worker, reserved)
+
+    assert resumed is expected
+
+
+async def test_handoff_adoption_crash_state_keeps_marker_and_active_recovery(
+    relay,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=6,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+
+    adopted = await relay._observe_or_adopt_event_generation(
+        worker.id,
+        task.id,
+        retry_count=task.retry_count,
+        turn_generation=task.turn_generation + 1,
+        worker_turn_handoff_id=reserved.worker_turn_handoff_id,
+    )
+
+    assert adopted is not None
+    assert adopted.status == "executing"
+    assert adopted.turn_generation == task.turn_generation + 1
+    assert adopted.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assistant = await db.scalar(
+            select(LogEntry.id).where(LogEntry.role == "assistant")
+        )
+    assert current.status == "executing"
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    assert assistant is None
+
+
+async def test_worker_startup_recover_arms_background_loop_for_accepted_handoff(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=1,
+        turn_generation=4,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    accepted = _launched_handoff_receipt(reserved)
+    accepted["status"] = "accepted"
+    accepted["turn_generation"] = None
+    relay.subscribe_task = AsyncMock()
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=accepted
+    )
+    relay._resume_worker_turn_handoff = AsyncMock(return_value=False)
+    relay._fetch_task_snapshot = AsyncMock(return_value=_remote_task(task))
+    relay.ensure_worker_turn_handoff_recovery = Mock()
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return []
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+
+    await relay.recover(worker)
+
+    relay.subscribe_task.assert_awaited_once_with(worker, task.id)
+    relay.ensure_worker_turn_handoff_recovery.assert_called_once()
+    recovery_worker, recovery_generation = (
+        relay.ensure_worker_turn_handoff_recovery.call_args.args
+    )
+    assert recovery_worker.id == worker.id
+    assert recovery_generation.task_id == task.id
+    assert recovery_generation.worker_turn_handoff_id == (
+        reserved.worker_turn_handoff_id
+    )
+    assert recovery_generation.worker_turn_handoff_acknowledged is True
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        manager_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    assert current.worker_turn_handoff_acknowledged is True
+    assert manager_receipt.status == "acknowledged"
+
+
+async def test_worker_handoff_recovery_replays_missing_exact_post(
+    relay,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    accepted = _launched_handoff_receipt(reserved)
+    accepted["status"] = "accepted"
+    accepted["turn_generation"] = None
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        side_effect=[None, accepted]
+    )
+    relay._post_worker_turn_handoff_request = AsyncMock(return_value=True)
+    relay._resume_worker_turn_handoff = AsyncMock(return_value=True)
+
+    recovered = await relay._resume_accepted_worker_turn_handoff(
+        worker,
+        reserved,
+        attempts=1,
+    )
+
+    assert recovered is True
+    replay = relay._post_worker_turn_handoff_request.await_args.args[2]
+    assert replay["payload"]["worker_turn_handoff_id"] == (
+        reserved.worker_turn_handoff_id
+    )
+    assert replay["payload"]["message"] == "reserved follow-up"
+    relay._resume_worker_turn_handoff.assert_awaited_once_with(
+        worker,
+        reserved,
+    )
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        manager_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+    assert current.worker_turn_handoff_acknowledged is True
+    assert manager_receipt.status == "acknowledged"
+
+
+async def test_worker_handoff_recovery_consumes_remote_cancellation(
+    relay,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=9,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    cancelled = _launched_handoff_receipt(reserved)
+    cancelled.update({
+        "status": "cancelled",
+        "turn_generation": None,
+        "cancel_reason": "explicit stop",
+    })
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=cancelled
+    )
+
+    recovered = await relay._resume_accepted_worker_turn_handoff(
+        worker,
+        reserved,
+        attempts=1,
+    )
+
+    assert recovered is True
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        manager_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+    assert current.worker_turn_handoff_id is None
+    assert current.worker_turn_handoff_worker_id is None
+    assert manager_receipt.status == "cancelled"
+    assert manager_receipt.cancel_reason == "explicit stop"
+
+
+async def test_worker_handoff_recovery_timer_retries_without_reconnect(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=1,
+        turn_generation=5,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    monkeypatch.setattr(
+        worker_relay_module,
+        "WORKER_HANDOFF_RECOVERY_BASE_DELAY",
+        0.001,
+    )
+    monkeypatch.setattr(
+        worker_relay_module,
+        "WORKER_HANDOFF_RECOVERY_MAX_DELAY",
+        0.002,
+    )
+    relay._resume_accepted_worker_turn_handoff = AsyncMock(
+        side_effect=[False, True]
+    )
+
+    async def settle(_worker, task_ids, **_kwargs):
+        async with session_factory() as db:
+            current = await db.get(Task, task.id)
+            for field in (
+                "worker_turn_handoff_id",
+                "worker_turn_handoff_worker_id",
+                "worker_turn_handoff_retry_count",
+                "worker_turn_handoff_from_generation",
+                "worker_turn_handoff_source_log_id",
+                "worker_turn_handoff_acknowledged",
+            ):
+                setattr(current, field, None)
+            receipt = await db.get(
+                WorkerTurnHandoffReceipt,
+                reserved.worker_turn_handoff_id,
+            )
+            receipt.status = "completed"
+            await db.commit()
+        return set(task_ids)
+
+    relay._backfill_missing_logs_with_operation_lock = AsyncMock(
+        side_effect=settle
+    )
+    relay.ensure_worker_turn_handoff_recovery(worker, reserved)
+    recovery_task = next(iter(relay._handoff_recovery_tasks.values()))
+    await asyncio.wait_for(recovery_task, timeout=1)
+
+    assert relay._resume_accepted_worker_turn_handoff.await_count == 2
+    relay._backfill_missing_logs_with_operation_lock.assert_awaited_once()
+    backfill = relay._backfill_missing_logs_with_operation_lock.await_args
+    assert backfill.args[0].id == worker.id
+    assert backfill.args[1] == {task.id}
+
+
+@pytest.mark.parametrize("event_retry_offset", [0, 1])
+async def test_reserved_next_turn_rejects_retry_aba(
+    relay,
+    broadcaster,
+    session_factory,
+    event_retry_offset,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=4,
+        turn_generation=12,
+        has_unread=False,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_launched_handoff_receipt(reserved)
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(retry_count=Task.retry_count + 1)
+        )
+        await db.commit()
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "wrong retry cannot consume handoff",
+                "task_retry_count": reserved.retry_count + event_retry_offset,
+                "task_turn_generation": reserved.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        logs = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type != "user_message",
+            )
+        )).scalars())
+    assert current.retry_count == reserved.retry_count + 1
+    assert current.turn_generation == reserved.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    assert logs == []
+    assert broadcaster.sent == []
+
+
+async def test_reserved_next_turn_rejects_worker_migration_aba(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    source = await _mk_worker(session_factory)
+    destination = await _mk_worker(
+        session_factory,
+        name="w2",
+        private_ip="10.0.0.10",
+    )
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=5,
+        has_unread=False,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    relay._tasks[source.id] = {task.id}
+    relay._tasks[destination.id] = {task.id}
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(worker_id=destination.id)
+        )
+        await db.commit()
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_launched_handoff_receipt(reserved)
+    )
+
+    event = {
+        "channel": f"task:{task.id}",
+        "data": {
+            "event_type": "message_delta",
+            "content": "wrong assignment",
+            "task_retry_count": reserved.retry_count,
+            "task_turn_generation": reserved.turn_generation + 1,
+        },
+    }
+    await relay._handle(event, source)
+    await relay._handle(event, destination)
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id == destination.id
+    assert current.turn_generation == reserved.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    assert broadcaster.sent == []
+
+
+async def test_pending_worker_turn_handoff_blocks_migration_before_side_effects(
+    session_factory,
+):
+    from backend.services.task_migrator import MigrationError, TaskMigrator
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=1,
+        turn_generation=4,
+    )
+    await _reserve_worker_handoff(session_factory, task)
+    migrator = TaskMigrator(session_factory, relay=AsyncMock())
+    migrator._get_worker = AsyncMock()
+    migrator._sync_workspace = AsyncMock()
+    migrator._move_session = AsyncMock()
+
+    with pytest.raises(MigrationError, match="handoff"):
+        await migrator.migrate(task.id, None)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+
+
+async def test_reserved_terminal_generation_drops_old_turn_then_adopts_next(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=6,
+        has_unread=False,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_launched_handoff_receipt(reserved)
+    )
+
+    for turn, content in (
+        (reserved.turn_generation, "late old result"),
+        (reserved.turn_generation + 1, "reserved next result"),
+    ):
+        await relay._handle(
+            {
+                "channel": f"task:{task.id}",
+                "data": {
+                    "event_type": "result",
+                    "role": "assistant",
+                    "content": content,
+                    "task_retry_count": reserved.retry_count,
+                    "task_turn_generation": turn,
+                },
+            },
+            worker,
+        )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assistant_logs = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.role == "assistant",
+            )
+        )).scalars())
+    assert current.turn_generation == reserved.turn_generation + 1
+    assert current.worker_turn_handoff_id is None
+    assert [log.content for log in assistant_logs] == ["reserved next result"]
+    assert [event[1]["content"] for event in broadcaster.sent] == [
+        "reserved next result"
+    ]
 
 
 async def test_relay_skips_user_message_and_unsubscribed(relay, broadcaster, session_factory):
@@ -1179,6 +2336,60 @@ async def test_relay_completed_pr_fix_backfills_before_manager_finalizer(
     assert relay._backfill_missing_logs.await_args.kwargs == {
         "sync_status": False,
     }
+
+
+async def test_relay_releases_operation_fence_before_pr_finalizer_reacquires_it(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        tags=["pr-review"],
+    )
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_task_snapshot = AsyncMock(return_value=_remote_task(
+        task,
+        status="completed",
+        completed_at=None,
+        background_active=False,
+    ))
+    relay._backfill_missing_logs = AsyncMock(return_value={task.id})
+    finalizer_acquired = asyncio.Event()
+
+    async def completion(task_id):
+        async with get_task_operation_lock(task_id):
+            finalizer_acquired.set()
+
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
+
+    await asyncio.wait_for(
+        relay._handle(
+            {
+                "channel": "tasks",
+                "data": {
+                    "event": "status_change",
+                    "task_id": task.id,
+                    "new_status": "completed",
+                },
+            },
+            worker,
+        ),
+        timeout=2,
+    )
+
+    assert finalizer_acquired.is_set()
 
 
 @pytest.mark.parametrize("terminal_status", ["failed", "cancelled", "conflict"])
@@ -1678,7 +2889,12 @@ async def test_background_publication_fence_drops_superseded_result(
     )
     real_publish = relay._publish_background_generation
 
-    async def clear_before_publication(generation, *, channels):
+    async def clear_before_publication(
+        generation,
+        *,
+        channels,
+        notify_completion=True,
+    ):
         async with session_factory() as db:
             await db.execute(
                 update(Task)
@@ -1686,7 +2902,11 @@ async def test_background_publication_fence_drops_superseded_result(
                 .values(pty_background_generation=None)
             )
             await db.commit()
-        return await real_publish(generation, channels=channels)
+        return await real_publish(
+            generation,
+            channels=channels,
+            notify_completion=notify_completion,
+        )
 
     relay._publish_background_generation = AsyncMock(
         side_effect=clear_before_publication
@@ -1779,17 +2999,18 @@ async def test_relay_monitor_events_with_remote_id(relay, session_factory):
     await relay._handle({
         "channel": f"task:{t.id}",
         "data": {"event": "monitor_session_created", "monitor_session_id": 5,
-                 "description": "watch"},
+                 "description": "watch", **_relay_generation(t)},
     }, w)
     await relay._handle({
         "channel": f"task:{t.id}",
         "data": {"event": "monitor_check", "monitor_session_id": 5,
-                 "check_number": 1, "status": "ok", "summary": "fine"},
+                 "check_number": 1, "status": "ok", "summary": "fine",
+                 **_relay_generation(t)},
     }, w)
     await relay._handle({
         "channel": f"task:{t.id}",
         "data": {"event": "monitor_session_status", "monitor_session_id": 5,
-                 "status": "completed"},
+                 "status": "completed", **_relay_generation(t)},
     }, w)
 
     async with session_factory() as db:
@@ -1809,11 +3030,120 @@ async def test_relay_context_usage_syncs(relay, session_factory):
     relay._tasks[w.id] = {t.id}
     await relay._handle({
         "channel": f"task:{t.id}",
-        "data": {"event_type": "context_usage", "input_tokens": 100, "context_window": 200000},
+        "data": {
+            "event_type": "context_usage",
+            "input_tokens": 100,
+            "context_window": 200000,
+            **_relay_generation(t),
+        },
     }, w)
     async with session_factory() as db:
         task = await db.get(Task, t.id)
     assert task.context_window_usage == {"input_tokens": 100, "context_window": 200000}
+
+
+@pytest.mark.parametrize(
+    ("event_type", "event_key", "extra"),
+    [
+        ("context_usage", "event_type", {"input_tokens": 999}),
+        ("message_delta", "event_type", {"content": "stale"}),
+        ("thinking_delta", "event_type", {"content": "stale"}),
+        ("loop_iteration_end", "event", {"progress": "9/9"}),
+        ("goal_evaluation", "event_type", {"turn": 9, "reason": "stale"}),
+        (
+            "monitor_session_created",
+            "event",
+            {"monitor_session_id": 91, "description": "stale"},
+        ),
+    ],
+)
+async def test_relay_drops_direct_state_event_from_stale_turn(
+    relay,
+    broadcaster,
+    session_factory,
+    event_type,
+    event_key,
+    extra,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        retry_count=4,
+        turn_generation=12,
+        loop_progress="1/9",
+        goal_turns_used=2,
+        goal_last_reason="current",
+    )
+    relay._tasks[worker.id] = {task.id}
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                event_key: event_type,
+                **extra,
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation - 1,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        monitors = (
+            await db.execute(
+                select(MonitorSession).where(MonitorSession.task_id == task.id)
+            )
+        ).scalars().all()
+    assert current.context_window_usage is None
+    assert current.loop_progress == "1/9"
+    assert current.goal_turns_used == 2
+    assert current.goal_last_reason == "current"
+    assert monitors == []
+    assert broadcaster.sent == []
+
+
+@pytest.mark.parametrize(
+    "generation_fields",
+    [
+        {},
+        {"task_retry_count": 4, "task_turn_generation": True},
+        {"task_retry_count": True, "task_turn_generation": 12},
+        {"task_retry_count": 3, "task_turn_generation": 12},
+    ],
+    ids=["missing", "boolean-turn", "boolean-retry", "stale-retry"],
+)
+async def test_relay_drops_direct_state_event_without_valid_generation(
+    relay,
+    broadcaster,
+    session_factory,
+    generation_fields,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        retry_count=4,
+        turn_generation=12,
+    )
+    relay._tasks[worker.id] = {task.id}
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "context_usage",
+                "input_tokens": 999,
+                **generation_fields,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.context_window_usage is None
+    assert broadcaster.sent == []
 
 
 async def test_delayed_worker_message_cannot_mark_reassigned_local_task_unread(
@@ -2019,7 +3349,12 @@ async def test_worker_status_publication_fence_drops_superseded_result(
     )
     real_publish = relay._publish_status_generation
 
-    async def retry_before_publication(generation, payload=None):
+    async def retry_before_publication(
+        generation,
+        payload=None,
+        *,
+        notify_completion=True,
+    ):
         async with session_factory() as db:
             await db.execute(
                 update(Task)
@@ -2031,7 +3366,11 @@ async def test_worker_status_publication_fence_drops_superseded_result(
                 )
             )
             await db.commit()
-        return await real_publish(generation, payload)
+        return await real_publish(
+            generation,
+            payload,
+            notify_completion=notify_completion,
+        )
 
     relay._publish_status_generation = AsyncMock(
         side_effect=retry_before_publication
@@ -2160,6 +3499,7 @@ async def test_backfill_only_imports_exact_worker_retry_generation(
         db.add(LogEntry(
             task_id=task.id,
             task_retry_count=task.retry_count - 1,
+            task_turn_generation=task.turn_generation - 1,
             event_type="message",
             role="assistant",
             content="same content",
@@ -2177,18 +3517,21 @@ async def test_backfill_only_imports_exact_worker_retry_generation(
                     "role": "assistant",
                     "content": "same content",
                     "task_retry_count": task.retry_count,
+                    "task_turn_generation": task.turn_generation,
                 },
                 {
                     "event_type": "message",
                     "role": "assistant",
                     "content": "stale",
                     "task_retry_count": task.retry_count - 1,
+                    "task_turn_generation": task.turn_generation - 1,
                 },
                 {
                     "event_type": "message",
                     "role": "assistant",
-                    "content": "unscoped",
-                    "task_retry_count": None,
+                    "content": "stale turn, same retry",
+                    "task_retry_count": task.retry_count,
+                    "task_turn_generation": task.turn_generation - 1,
                 },
             ]
 
@@ -2221,12 +3564,424 @@ async def test_backfill_only_imports_exact_worker_retry_generation(
             )
         ).scalars().all()
     assert [
-        (row.content, row.task_retry_count)
+        (row.content, row.task_retry_count, row.task_turn_generation)
         for row in logs
     ] == [
-        ("same content", task.retry_count - 1),
-        ("same content", task.retry_count),
+        (
+            "same content",
+            task.retry_count - 1,
+            task.turn_generation - 1,
+        ),
+        ("same content", task.retry_count, task.turn_generation),
     ]
+
+
+@pytest.mark.parametrize(
+    "history_kind",
+    ["missing-turn", "non-current-only"],
+)
+async def test_completion_backfill_does_not_confirm_unscoped_history(
+    relay,
+    session_factory,
+    monkeypatch,
+    history_kind,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=7,
+        tags=["pr-review"],
+    )
+    message = {
+        "event_type": "result",
+        "role": "assistant",
+        "content": "cannot prove this terminal turn",
+        "task_retry_count": task.retry_count,
+    }
+    if history_kind == "non-current-only":
+        message["task_turn_generation"] = task.turn_generation - 1
+    messages = [message]
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return messages
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+
+    synced = await relay._backfill_missing_logs(
+        worker,
+        {task.id},
+        sync_status=False,
+    )
+
+    assert synced == set()
+    async with session_factory() as db:
+        logs = (
+            await db.execute(
+                select(LogEntry).where(LogEntry.task_id == task.id)
+            )
+        ).scalars().all()
+    assert logs == []
+
+
+async def test_completion_backfill_ignores_legacy_unscoped_with_exact_terminal(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=7,
+        tags=["pr-review"],
+    )
+    messages = [
+        {
+            "event_type": "message",
+            "role": "assistant",
+            "content": "legacy row must not be imported",
+            "task_retry_count": task.retry_count,
+            "task_turn_generation": None,
+            "native_turn_id": None,
+        },
+        {
+            "event_type": "result",
+            "role": "assistant",
+            "content": "exact terminal evidence",
+            "task_retry_count": task.retry_count,
+            "task_turn_generation": task.turn_generation,
+            "native_turn_id": "native-turn-backfill-7",
+        },
+    ]
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return messages
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+
+    synced = await relay._backfill_missing_logs(
+        worker,
+        {task.id},
+        sync_status=False,
+    )
+
+    assert synced == {task.id}
+    async with session_factory() as db:
+        logs = list((await db.execute(
+            select(LogEntry).where(LogEntry.task_id == task.id)
+        )).scalars())
+    assert len(logs) == 1
+    assert logs[0].content == "exact terminal evidence"
+    assert logs[0].native_turn_id == "native-turn-backfill-7"
+
+
+@pytest.mark.parametrize("with_terminal_log", [True, False])
+async def test_recovery_backfill_replays_history_after_handoff_adopts_next_turn(
+    relay,
+    session_factory,
+    monkeypatch,
+    with_terminal_log,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=7,
+        tags=["pr-review"],
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    async with session_factory() as db:
+        acknowledged = await (
+            worker_relay_module.acknowledge_worker_turn_handoff(
+                db,
+                reserved,
+                session_id="worker-session-next",
+            )
+        )
+        assert acknowledged is not None
+        await db.commit()
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_launched_handoff_receipt(reserved)
+    )
+
+    messages = [{
+        "event_type": "result",
+        "role": "assistant",
+        "content": "recovered exact G+1 terminal",
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation + 1,
+        "native_turn_id": "native-recovered-turn-8",
+    }] if with_terminal_log else []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return messages
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+    completion = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
+    relay._fetch_task_snapshot = AsyncMock(return_value=_remote_task(
+        task,
+        status="completed",
+        turn_generation=task.turn_generation + 1,
+        session_id="worker-session-next",
+    ))
+
+    synced = await relay._backfill_missing_logs(worker, {task.id})
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        logs = list((await db.execute(
+            select(LogEntry).where(LogEntry.task_id == task.id)
+        )).scalars())
+    assert synced == {task.id}
+    assert current.turn_generation == task.turn_generation + 1
+    assert current.worker_turn_handoff_id is None
+    assistant_logs = [log for log in logs if log.role == "assistant"]
+    if with_terminal_log:
+        assert [log.content for log in assistant_logs] == [
+            "recovered exact G+1 terminal"
+        ]
+        assert assistant_logs[-1].native_turn_id == "native-recovered-turn-8"
+    else:
+        assert assistant_logs == []
+    completion.assert_awaited_once_with(task.id)
+
+
+async def test_terminal_launched_handoff_settles_with_only_old_turn_history(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=7,
+        tags=["pr-review"],
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    async with session_factory() as db:
+        acknowledged = await (
+            worker_relay_module.acknowledge_worker_turn_handoff(
+                db,
+                reserved,
+                session_id="worker-session-next",
+            )
+        )
+        assert acknowledged is not None
+        await db.commit()
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_launched_handoff_receipt(reserved)
+    )
+
+    # The Worker has durably launched and terminally completed G+1, but its
+    # compact history contains only a non-user row from G.  That old row must
+    # not keep the exact G -> G+1 marker and Manager receipt alive forever.
+    messages = [{
+        "event_type": "result",
+        "role": "assistant",
+        "content": "old G terminal row",
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+        "native_turn_id": "native-old-turn-7",
+    }]
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return messages
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+    completion = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(
+            _handle_pty_background_completion=completion,
+        ),
+    )
+    relay._fetch_task_snapshot = AsyncMock(return_value=_remote_task(
+        task,
+        status="completed",
+        turn_generation=task.turn_generation + 1,
+        session_id="worker-session-next",
+    ))
+
+    synced = await relay._backfill_missing_logs(worker, {task.id})
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+        non_user_logs = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type != "user_message",
+            )
+        )).scalars())
+    assert synced == {task.id}
+    assert current.status == "completed"
+    assert current.turn_generation == task.turn_generation + 1
+    assert current.worker_turn_handoff_id is None
+    assert receipt.status == "completed"
+    assert [
+        (log.content, log.task_turn_generation)
+        for log in non_user_logs
+    ] == [("old G terminal row", task.turn_generation)]
+
+
+async def test_launching_handoff_startup_failure_snapshot_converges_manager(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    """A Worker restart fail-closes G+1 without making it replayable."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=4,
+        turn_generation=12,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_handoff_receipt_with_status(reserved, "launching")
+    )
+    relay._resume_worker_turn_handoff = AsyncMock(return_value=True)
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            # Startup fail-close may have no provider output at all.  The exact
+            # terminal snapshot plus a complete empty G+1 history still settles
+            # the Manager marker without replaying the prompt.
+            return []
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
+    relay._fetch_task_snapshot = AsyncMock(return_value=_remote_task(
+        task,
+        status="failed",
+        turn_generation=task.turn_generation + 1,
+        error_message=(
+            "CCM restarted after the Worker handoff crossed its launch boundary"
+        ),
+    ))
+
+    synced = await relay._backfill_missing_logs(worker, {task.id})
+
+    assert synced == {task.id}
+    # ``launching`` is post-boundary evidence: reconcile it, never resume it.
+    relay._resume_worker_turn_handoff.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        manager_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+    assert current.status == "failed"
+    assert current.turn_generation == task.turn_generation + 1
+    assert current.worker_turn_handoff_id is None
+    assert "crossed its launch boundary" in current.error_message
+    assert manager_receipt.status == "completed"
 
 
 async def test_completion_backfill_syncs_logs_without_recursive_status(
@@ -2252,6 +4007,8 @@ async def test_completion_backfill_syncs_logs_without_recursive_status(
                 "role": "assistant",
                 "content": "terminal",
                 "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation,
+                "native_turn_id": "native-terminal-turn",
             }]
 
     class Client:
@@ -2290,6 +4047,8 @@ async def test_completion_backfill_syncs_logs_without_recursive_status(
         ).scalar_one()
     assert stored.content == "terminal"
     assert stored.task_retry_count == task.retry_count
+    assert stored.task_turn_generation == task.turn_generation
+    assert stored.native_turn_id == "native-terminal-turn"
 
 
 async def test_backfill_syncs_and_broadcasts_background_marker(
@@ -2529,6 +4288,13 @@ async def test_recover_includes_completed_task_with_background_marker(
         worker_id=worker.id,
         status="completed",
     )
+    completed_handoff = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        turn_generation=7,
+    )
+    await _reserve_worker_handoff(session_factory, completed_handoff)
     relay.subscribe_task = AsyncMock()
     relay._backfill_missing_logs = AsyncMock()
 
@@ -2538,11 +4304,15 @@ async def test_recover_includes_completed_task_with_background_marker(
         call.args[1]
         for call in relay.subscribe_task.await_args_list
     }
-    assert subscribed == {active.id, completed_background.id}
+    assert subscribed == {
+        active.id,
+        completed_background.id,
+        completed_handoff.id,
+    }
     assert completed_plain.id not in subscribed
     relay._backfill_missing_logs.assert_awaited_once_with(
         worker,
-        {active.id, completed_background.id},
+        {active.id, completed_background.id, completed_handoff.id},
     )
 
 
@@ -2598,8 +4368,26 @@ async def test_dispatch_worker_tasks_forwards(db_factory, session_factory, broad
     async with session_factory() as db:
         task = await db.get(Task, t.id)
     assert task.status == "in_progress"
+    assert task.turn_generation == t.turn_generation + 1
     proxy.forward_task_to_worker.assert_called_once()
+    forwarded = proxy.forward_task_to_worker.await_args.args[0]
+    assert forwarded.turn_generation == task.turn_generation
     assert any(c == "tasks" and d.get("new_status") == "in_progress" for c, d in broadcaster.sent)
+
+    # The Worker's pending row starts at N and its local dequeue advances it
+    # to the same N+1.  That exact first-turn snapshot is accepted; a later
+    # arbitrary remote value is still rejected by apply_authoritative_worker_task.
+    observed = worker_relay_module.worker_task_generation(task)
+    assert observed is not None
+    async with session_factory() as db:
+        resulting = await worker_relay_module.apply_authoritative_worker_task(
+            db,
+            observed,
+            _remote_task(task, status="executing"),
+        )
+    assert resulting is not None
+    assert resulting.turn_generation == task.turn_generation
+    assert resulting.status == "executing"
 
 
 async def test_dispatch_worker_tasks_skips_unready_worker(db_factory, session_factory, broadcaster, monkeypatch):
@@ -4722,6 +6510,7 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
                 "id": json["id"],
                 "status": json["source_status"],
                 "retry_count": json["retry_count"],
+                "turn_generation": json["turn_generation"],
                 "instance_id": None,
                 "enabled_skills": json["enabled_skills"],
                 "selected_user_skills": json["selected_user_skills"],
@@ -5661,6 +7450,809 @@ async def test_chat_proxy_for_worker_task(client, session_factory, monkeypatch):
     )
 
 
+async def test_worker_chat_commit_cancellation_arms_handoff_recovery_first(
+    session_factory,
+    monkeypatch,
+):
+    """A durable Manager outbox must gain a recovery owner before cancel."""
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-session",
+    )
+    commit_durable = asyncio.Event()
+    release_commit_return = asyncio.Event()
+    recovery_armed = asyncio.Event()
+    ordering: list[str] = []
+    armed_generations = []
+
+    def arm_recovery(observed_worker, reserved):
+        assert observed_worker.id == worker.id
+        ordering.append("recovery_armed")
+        armed_generations.append(reserved)
+        recovery_armed.set()
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = SimpleNamespace(
+        subscribe_task=AsyncMock(),
+        ensure_worker_turn_handoff_recovery=Mock(
+            side_effect=arm_recovery,
+        ),
+    )
+
+    async def routing_only(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        raise AssertionError("Cancellation must win before the initial POST")
+
+    proxy.proxy_to_worker.side_effect = routing_only
+    broadcaster = FakeBroadcaster()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", broadcaster)
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        original_commit = db.commit
+
+        async def durable_commit_then_pause():
+            await original_commit()
+            ordering.append("commit_durable")
+            commit_durable.set()
+            await release_commit_return.wait()
+
+        monkeypatch.setattr(db, "commit", durable_commit_then_pause)
+        send = asyncio.create_task(
+            _send_worker_chat(
+                current,
+                ChatMessage(message="recover after cancellation"),
+                db,
+                request,
+            )
+        )
+        await asyncio.wait_for(commit_durable.wait(), timeout=2)
+        send.cancel()
+        await asyncio.sleep(0)
+        assert not recovery_armed.is_set()
+
+        release_commit_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await send
+
+    assert recovery_armed.is_set()
+    assert ordering == ["commit_durable", "recovery_armed"]
+    assert len(armed_generations) == 1
+    reserved = armed_generations[0]
+    assert reserved.worker_turn_handoff_acknowledged is False
+    assert broadcaster.sent == []
+    assert not any(
+        call.args[1] == "POST"
+        for call in proxy.proxy_to_worker.await_args_list
+    )
+
+    async with session_factory() as db:
+        persisted_task = await db.get(Task, task.id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+        user_log = await db.get(
+            LogEntry,
+            reserved.worker_turn_handoff_source_log_id,
+        )
+    assert persisted_task.worker_turn_handoff_id == (
+        reserved.worker_turn_handoff_id
+    )
+    assert persisted_task.worker_turn_handoff_acknowledged is False
+    assert receipt is not None
+    assert receipt.side == "manager"
+    assert receipt.status == "prepared"
+    assert user_log is not None
+    assert user_log.task_retry_count == task.retry_count
+    assert user_log.task_turn_generation == task.turn_generation + 1
+
+
+async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-local-session",
+    )
+    dispatcher = SimpleNamespace(
+        enqueue_worker_turn_handoff=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(main_module, "dispatcher", dispatcher)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    handoff_id = "a" * 32
+    payload = {
+        "message": "run this exact follow-up",
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": task.retry_count,
+        "worker_turn_handoff_from_generation": task.turn_generation,
+    }
+
+    first = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    duplicate = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+
+    assert first.status_code == 200, first.text
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json() == first.json()
+    async with session_factory() as db:
+        logs = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars())
+    assert len(logs) == 1
+    metadata = json.loads(logs[0].raw_json)["worker_turn_handoff"]
+    assert metadata["id"] == handoff_id
+    assert metadata["queue_payload"]["prompt"] == payload["message"]
+    assert dispatcher.enqueue_worker_turn_handoff.await_count == 2
+
+    changed = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={**payload, "message": "different request"},
+    )
+    assert changed.status_code == 409
+
+    receipt = await client.get(
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}"
+    )
+    assert receipt.status_code == 200, receipt.text
+    assert receipt.json()["status"] == "accepted"
+    assert "queue_payload" not in receipt.json()
+    assert payload["message"] not in receipt.text
+    resumed = await client.post(
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume"
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["resumed"] is True
+    assert dispatcher.enqueue_worker_turn_handoff.await_count == 3
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        current.turn_generation = task.turn_generation + 1
+        logs[0].task_retry_count = task.retry_count
+        logs[0].task_turn_generation = task.turn_generation + 1
+        await db.merge(logs[0])
+        durable_receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        durable_receipt.status = "launched"
+        durable_receipt.claimed_turn_generation = task.turn_generation + 1
+        await db.commit()
+    launched = await client.get(
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}"
+    )
+    assert launched.status_code == 200
+    assert launched.json()["status"] == "launched"
+    assert launched.json()["turn_generation"] == task.turn_generation + 1
+
+
+@pytest.mark.parametrize(
+    ("handoff_status", "expected_status", "should_enqueue", "resumed"),
+    [
+        ("claimed", 200, True, True),
+        ("launching", 200, False, False),
+        ("launched", 200, False, False),
+        ("cancelled", 409, False, None),
+    ],
+)
+async def test_worker_internal_handoff_duplicate_and_resume_obey_boundary(
+    client,
+    session_factory,
+    monkeypatch,
+    handoff_status,
+    expected_status,
+    should_enqueue,
+    resumed,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-local-session",
+    )
+    dispatcher = SimpleNamespace(
+        enqueue_worker_turn_handoff=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(main_module, "dispatcher", dispatcher)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    handoff_id = "b" * 32
+    payload = {
+        "message": "resume only before the provider boundary",
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": task.retry_count,
+        "worker_turn_handoff_from_generation": task.turn_generation,
+    }
+
+    first = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    assert first.status_code == 200, first.text
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        source_log = await db.get(LogEntry, receipt.source_log_id)
+        receipt.status = handoff_status
+        if handoff_status in {"claimed", "launching", "launched"}:
+            next_generation = task.turn_generation + 1
+            receipt.claimed_turn_generation = next_generation
+            source_log.task_retry_count = task.retry_count
+            source_log.task_turn_generation = next_generation
+            current.turn_generation = next_generation
+        else:
+            receipt.cancel_reason = "cancelled before provider launch"
+        await db.commit()
+
+    dispatcher.enqueue_worker_turn_handoff.reset_mock()
+    duplicate = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+
+    assert duplicate.status_code == expected_status, duplicate.text
+    if expected_status == 200:
+        assert duplicate.json() == first.json()
+    if should_enqueue:
+        dispatcher.enqueue_worker_turn_handoff.assert_awaited_once()
+    else:
+        dispatcher.enqueue_worker_turn_handoff.assert_not_awaited()
+
+    dispatcher.enqueue_worker_turn_handoff.reset_mock()
+    resume_response = await client.post(
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume"
+    )
+
+    assert resume_response.status_code == expected_status, resume_response.text
+    if resumed is not None:
+        assert resume_response.json()["resumed"] is resumed
+    if should_enqueue:
+        dispatcher.enqueue_worker_turn_handoff.assert_awaited_once()
+    else:
+        dispatcher.enqueue_worker_turn_handoff.assert_not_awaited()
+
+    async with session_factory() as db:
+        user_logs = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars())
+    assert len(user_logs) == 1
+
+
+async def test_worker_handoff_rejects_tampered_structured_queue_payload(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        retry_count=1,
+        turn_generation=4,
+        session_id="worker-local-session",
+    )
+    dispatcher = SimpleNamespace(
+        enqueue_worker_turn_handoff=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(main_module, "dispatcher", dispatcher)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    handoff_id = "d" * 32
+    payload = {
+        "message": "original exact prompt",
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": task.retry_count,
+        "worker_turn_handoff_from_generation": task.turn_generation,
+    }
+    first = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    assert first.status_code == 200
+
+    async with session_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        changed = dict(receipt.queue_payload)
+        changed["prompt"] = "tampered prompt"
+        receipt.queue_payload = changed
+        await db.commit()
+
+    duplicate = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    stored = await client.get(
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}"
+    )
+    resumed = await client.post(
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume"
+    )
+    assert duplicate.status_code == 409
+    assert stored.status_code == 409
+    assert resumed.status_code == 409
+    assert dispatcher.enqueue_worker_turn_handoff.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("handoff_status", "should_resume"),
+    [
+        ("accepted", True),
+        ("claimed", True),
+        ("launching", False),
+        ("launched", False),
+    ],
+)
+async def test_worker_chat_lost_http_ack_reconciles_exact_handoff_receipt(
+    client,
+    session_factory,
+    monkeypatch,
+    handoff_status,
+    should_resume,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-session",
+    )
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = AsyncMock()
+    captured_handoff = None
+
+    async def route_then_lose_ack(_task, method, _path, *_args, **kwargs):
+        nonlocal captured_handoff
+        if method == "GET":
+            return _routing_snapshot(task)
+        captured_handoff = kwargs["body"]["worker_turn_handoff_id"]
+        raise HTTPException(503, "lost Worker response")
+
+    proxy.proxy_to_worker.side_effect = route_then_lose_ack
+
+    async def get_receipt(_worker, task_id, handoff_id):
+        assert task_id == task.id
+        assert handoff_id == captured_handoff
+        return {
+            "handoff_id": handoff_id,
+            "task_id": task_id,
+            "status": handoff_status,
+            "retry_count": task.retry_count,
+            "from_generation": task.turn_generation,
+            "turn_generation": (
+                None
+                if handoff_status == "accepted"
+                else task.turn_generation + 1
+            ),
+            "source_log_id": 91,
+            "response": {
+                "ok": True,
+                "queued": True,
+                "session_id": task.session_id,
+            },
+        }
+
+    proxy.get_worker_turn_handoff_receipt.side_effect = get_receipt
+    async def resume_receipt(_worker, task_id, handoff_id):
+        return await get_receipt(
+            _worker,
+            task_id,
+            handoff_id,
+        )
+
+    proxy.resume_worker_turn_handoff.side_effect = resume_receipt
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": "recover this exact request"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured_handoff is not None
+    proxy.get_worker_turn_handoff_receipt.assert_awaited_once()
+    if should_resume:
+        proxy.resume_worker_turn_handoff.assert_awaited_once()
+    else:
+        proxy.resume_worker_turn_handoff.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        logs = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars())
+    assert current.worker_turn_handoff_id == captured_handoff
+    assert current.worker_turn_handoff_acknowledged is True
+    assert len(logs) == 1
+
+
+async def test_worker_chat_lost_ack_mismatched_turn_fails_closed(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-session",
+    )
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = AsyncMock()
+    captured_handoff = None
+
+    async def route_then_lose_ack(_task, method, _path, *_args, **kwargs):
+        nonlocal captured_handoff
+        if method == "GET":
+            return _routing_snapshot(task)
+        captured_handoff = kwargs["body"]["worker_turn_handoff_id"]
+        raise HTTPException(503, "lost Worker response")
+
+    proxy.proxy_to_worker.side_effect = route_then_lose_ack
+
+    async def get_receipt(_worker, task_id, handoff_id):
+        return {
+            "handoff_id": handoff_id,
+            "task_id": task_id,
+            "status": "launching",
+            "retry_count": task.retry_count,
+            "from_generation": task.turn_generation,
+            # Same handoff id cannot lend authority to a different turn.
+            "turn_generation": task.turn_generation + 2,
+            "response": {"ok": True, "queued": True},
+        }
+
+    proxy.get_worker_turn_handoff_receipt.side_effect = get_receipt
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": "reject mismatched remote turn"},
+    )
+
+    assert response.status_code == 503
+    assert captured_handoff is not None
+    proxy.resume_worker_turn_handoff.assert_not_awaited()
+    assert sum(
+        call.args[1] == "POST"
+        for call in proxy.proxy_to_worker.await_args_list
+    ) == 1
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        manager_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            captured_handoff,
+        )
+    assert current.worker_turn_handoff_id == captured_handoff
+    assert current.worker_turn_handoff_acknowledged is False
+    assert manager_receipt.status == "prepared"
+
+
+async def test_worker_chat_ack_then_relay_consumes_exact_handoff(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-session",
+    )
+    broadcaster = FakeBroadcaster()
+    actual_relay = WorkerRelay(session_factory, broadcaster)
+    actual_relay._tasks[worker.id] = {task.id}
+    _mock_launched_handoff_receipts(actual_relay, session_factory)
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = AsyncMock()
+
+    async def route_then_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        return {"ok": True, "queued": True, "session_id": task.session_id}
+
+    proxy.proxy_to_worker.side_effect = route_then_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": "next turn"},
+    )
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        acknowledged = await db.get(Task, task.id)
+    assert acknowledged.turn_generation == task.turn_generation
+    assert acknowledged.worker_turn_handoff_id is not None
+    assert acknowledged.worker_turn_handoff_acknowledged is True
+
+    await actual_relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "first delta",
+                "item_id": "item-ack-first",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.turn_generation == task.turn_generation + 1
+    assert current.worker_turn_handoff_id is None
+    assert any(
+        payload.get("content") == "first delta"
+        for _channel, payload in broadcaster.sent
+    )
+
+
+async def test_first_next_turn_relay_holds_migration_fence_through_broadcast(
+    session_factory,
+):
+    from backend.services.task_migrator import TaskMigrator
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    async with session_factory() as db:
+        acknowledged = await (
+            worker_relay_module.acknowledge_worker_turn_handoff(db, reserved)
+        )
+        assert acknowledged is not None
+        await db.commit()
+
+    broadcast_entered = asyncio.Event()
+    release_broadcast = asyncio.Event()
+
+    class BlockingBroadcaster:
+        async def broadcast(self, _channel, _data):
+            broadcast_entered.set()
+            await release_broadcast.wait()
+
+    relay = WorkerRelay(session_factory, BlockingBroadcaster())
+    relay._tasks[worker.id] = {task.id}
+    relay._fetch_worker_turn_handoff_receipt = AsyncMock(
+        return_value=_launched_handoff_receipt(reserved)
+    )
+    event_task = asyncio.create_task(relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "first exact G+1 delta",
+                "item_id": "first-exact-g-plus-one",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    ))
+    await asyncio.wait_for(broadcast_entered.wait(), timeout=2)
+
+    # Adoption has already committed and cleared the marker, but migration
+    # must still be unable to cross the event's persistence/publication fence.
+    async with session_factory() as db:
+        adopted = await db.get(Task, task.id)
+    assert adopted.turn_generation == task.turn_generation + 1
+    assert adopted.worker_turn_handoff_id is None
+
+    migrator = TaskMigrator(session_factory, relay=AsyncMock())
+    migrator._migrate_locked = AsyncMock()
+    migration = asyncio.create_task(migrator.migrate(task.id, None))
+    await asyncio.sleep(0)
+    migrator._migrate_locked.assert_not_awaited()
+
+    release_broadcast.set()
+    await event_task
+    await migration
+    migrator._migrate_locked.assert_awaited_once_with(
+        task.id,
+        None,
+        coordinated_updates={},
+    )
+
+
+async def test_worker_chat_relay_before_http_ack_accepts_exact_next_turn(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=11,
+        session_id="old-worker-session",
+        has_unread=False,
+    )
+    broadcaster = FakeBroadcaster()
+    actual_relay = WorkerRelay(session_factory, broadcaster)
+    actual_relay._tasks[worker.id] = {task.id}
+    _mock_launched_handoff_receipts(actual_relay, session_factory)
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = AsyncMock()
+    pending_relay_events: list[asyncio.Task] = []
+
+    async def relay_before_ack(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        async with session_factory() as db:
+            pending = await db.get(Task, task.id)
+        assert pending.turn_generation == task.turn_generation
+        assert pending.worker_turn_handoff_id is not None
+        assert pending.worker_turn_handoff_acknowledged is False
+
+        # Terminal G is stale once this completed task reserved its follow-up.
+        pending_relay_events.append(
+            asyncio.create_task(actual_relay._handle(
+                {
+                    "channel": f"task:{task.id}",
+                    "data": {
+                        "event_type": "result",
+                        "role": "assistant",
+                        "content": "late terminal G",
+                        "task_retry_count": task.retry_count,
+                        "task_turn_generation": task.turn_generation,
+                    },
+                },
+                worker,
+            ))
+        )
+        # The exact reserved G+1 may arrive before this HTTP call returns.
+        pending_relay_events.append(
+            asyncio.create_task(actual_relay._handle(
+                {
+                    "channel": f"task:{task.id}",
+                    "data": {
+                        "event_type": "message_delta",
+                        "content": "early G+1 delta",
+                        "item_id": "item-relay-first",
+                        "task_retry_count": task.retry_count,
+                        "task_turn_generation": task.turn_generation + 1,
+                    },
+                },
+                worker,
+            ))
+        )
+        pending_relay_events.append(
+            asyncio.create_task(actual_relay._handle(
+                {
+                    "channel": f"task:{task.id}",
+                    "data": {
+                        "event_type": "message",
+                        "role": "assistant",
+                        "content": "early G+1 message",
+                        "native_turn_id": "native-worker-turn-12",
+                        "task_retry_count": task.retry_count,
+                        "task_turn_generation": task.turn_generation + 1,
+                    },
+                },
+                worker,
+            ))
+        )
+        await asyncio.sleep(0)
+        assert all(not event.done() for event in pending_relay_events)
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": "new-worker-session",
+        }
+
+    proxy.proxy_to_worker.side_effect = relay_before_ack
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", broadcaster)
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json={"message": "run exact next turn"},
+    )
+    assert response.status_code == 200, response.text
+    await asyncio.gather(*pending_relay_events)
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        logs = list((await db.execute(
+            select(LogEntry)
+            .where(LogEntry.task_id == task.id)
+            .order_by(LogEntry.id)
+        )).scalars())
+    assert current.turn_generation == task.turn_generation + 1
+    assert current.session_id == "new-worker-session"
+    assert current.worker_turn_handoff_id is None
+    assert [row.content for row in logs if row.role == "assistant"] == [
+        "early G+1 message"
+    ]
+    assert logs[0].role == "user"
+    assert logs[0].task_retry_count == task.retry_count
+    assert logs[0].task_turn_generation == task.turn_generation + 1
+    assert logs[1].native_turn_id == "native-worker-turn-12"
+
+    actual_relay._fetch_task_snapshot = AsyncMock(
+        return_value=_remote_task(
+            task,
+            status="executing",
+            turn_generation=task.turn_generation + 1,
+            session_id="new-worker-session",
+        )
+    )
+    await actual_relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "status_change",
+                "task_id": task.id,
+                "new_status": "executing",
+            },
+        },
+        worker,
+    )
+    await actual_relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "result",
+                "role": "assistant",
+                "content": "G+1 result",
+                "native_turn_id": "native-worker-turn-12",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        result_log = await db.scalar(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.content == "G+1 result",
+            )
+        )
+    assert current.status == "executing"
+    assert result_log is not None
+    assert result_log.task_turn_generation == task.turn_generation + 1
+
+
 async def test_worker_chat_response_cannot_overwrite_retry_aba(
     client,
     session_factory,
@@ -5933,6 +8525,92 @@ async def _approved_worker_plan_version(session_factory):
         plan.current_version_id = version.id
         await db.commit()
         return worker, task, version.id
+
+
+async def test_worker_chat_ack_survives_later_plan_confirmation_rollback(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(
+        session_factory
+    )
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            # The remote request was accepted, but this malformed confirmation
+            # must fail Manager Plan bookkeeping after the transport ACK.
+            "applied_plan_version_ids": [999],
+        }
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        with pytest.raises(HTTPException) as caught:
+            await _send_worker_chat(
+                current,
+                ChatMessage(
+                    message="Implement once",
+                    plan_version_ids=[version_id],
+                ),
+                db,
+                request,
+            )
+    assert caught.value.status_code == 502
+
+    async with session_factory() as db:
+        acknowledged = await db.get(Task, task.id)
+    assert acknowledged.turn_generation == task.turn_generation
+    assert acknowledged.worker_turn_handoff_id is not None
+    assert acknowledged.worker_turn_handoff_acknowledged is True
+
+    relay = WorkerRelay(session_factory, FakeBroadcaster())
+    relay._tasks[worker.id] = {task.id}
+    _mock_launched_handoff_receipts(relay, session_factory)
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "accepted turn started",
+                "item_id": "accepted-after-plan-rollback",
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+    async with session_factory() as db:
+        converged = await db.get(Task, task.id)
+    assert converged.turn_generation == task.turn_generation + 1
+    assert converged.worker_turn_handoff_id is None
 
 
 async def test_worker_delivery_failure_releases_manager_plan_application(
@@ -6257,6 +8935,7 @@ async def test_worker_plan_application_recovers_lost_http_ack(
     }
     proxy.materialize_plan_version.return_value = 912
     proxy.relay = AsyncMock()
+    proxy.get_worker_turn_handoff_receipt.return_value = None
 
     async def route_chat(_task, method, _path, *_args, **_kwargs):
         if method == "GET":
@@ -6333,6 +9012,7 @@ async def test_worker_uncertain_http_reconciliation_consumes_manager_version(
     }
     proxy.materialize_plan_version.return_value = 912
     proxy.relay = AsyncMock()
+    proxy.get_worker_turn_handoff_receipt.return_value = None
 
     async def route_chat(_task, method, _path, *_args, **_kwargs):
         if method == "GET":
@@ -6899,11 +9579,13 @@ async def test_ws_token_check():
 # ---------------------------------------------------------------------------
 
 def _entry(et="message", role="assistant", content=None, tool_name=None,
-           tool_input=None, tool_output=None, loop_iteration=None):
+           tool_input=None, tool_output=None, loop_iteration=None,
+           native_turn_id=None):
     return {
         "event_type": et, "role": role, "content": content,
         "tool_name": tool_name, "tool_input": tool_input,
         "tool_output": tool_output, "loop_iteration": loop_iteration,
+        "native_turn_id": native_turn_id,
     }
 
 
@@ -6949,3 +9631,14 @@ class TestBackfillDedup:
         local = [_entry(content="same")]  # only one present
         missing = _missing_by_fingerprint(local, remote)
         assert len(missing) == 2  # insert the two still-missing copies
+
+    def test_identical_content_from_distinct_native_turns_is_preserved(self):
+        from backend.services.worker_relay import _missing_by_fingerprint
+
+        local = [_entry(content="same", native_turn_id="turn-a")]
+        remote = [
+            _entry(content="same", native_turn_id="turn-a"),
+            _entry(content="same", native_turn_id="turn-b"),
+        ]
+
+        assert _missing_by_fingerprint(local, remote) == [remote[1]]

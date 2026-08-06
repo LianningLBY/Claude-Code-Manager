@@ -19,6 +19,8 @@ async def test_task_defaults(db_session):
     assert task.retry_count == 0
     assert task.max_retries == 2
     assert task.mode == "auto"
+    assert task.turn_generation == 0
+    assert task.capability_policy is None
     assert task.merge_status == "pending"
     assert task.project_id is None
     assert task.target_repo is not None  # defaults to ""
@@ -108,6 +110,46 @@ async def test_log_entry_defaults(db_session):
     assert entry.tool_input is None
     assert entry.tool_output is None
     assert entry.task_id is None
+    assert entry.task_turn_generation is None
+    assert entry.native_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_task_and_log_exact_turn_identity_round_trip(db_session):
+    from backend.models.log_entry import LogEntry
+
+    generation = 2**40 + 7
+    task = Task(
+        title="exact turn",
+        description="d",
+        turn_generation=generation,
+        capability_policy={
+            "version": 1,
+            "allowed": ["plan", "code_review"],
+            "max_invocations": 2,
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+    entry = LogEntry(
+        task_id=task.id,
+        event_type="result",
+        task_turn_generation=generation,
+        native_turn_id="turn_native_123",
+    )
+    db_session.add(entry)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(entry)
+
+    assert task.turn_generation == generation
+    assert task.capability_policy == {
+        "version": 1,
+        "allowed": ["plan", "code_review"],
+        "max_invocations": 2,
+    }
+    assert entry.task_turn_generation == generation
+    assert entry.native_turn_id == "turn_native_123"
 
 
 @pytest.mark.asyncio

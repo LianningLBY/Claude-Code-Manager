@@ -125,6 +125,7 @@ async def test_create_task(queue):
     )
     assert task.effort_level == settings.default_effort
     assert task.codex_service_tier == "default"
+    assert task.turn_generation == 0
 
 
 @pytest.mark.asyncio
@@ -139,6 +140,7 @@ async def test_dequeue_priority_order(queue):
     assert first.title == "High priority"
     assert first.priority == 0
     assert first.status == "in_progress"
+    assert first.turn_generation == 1
 
     second = await queue.dequeue()
     assert second is not None
@@ -193,6 +195,46 @@ async def test_concurrent_dequeue_claims_each_task_once(tmp_path):
             second_id,
         }
         assert len([task for task in claimed if task is not None]) == 2
+        assert all(
+            task.turn_generation == 1 for task in claimed if task is not None
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dequeue_same_task_increments_turn_generation_once(tmp_path):
+    """A lost claim CAS cannot consume a second logical turn generation."""
+
+    db_path = tmp_path / "single-atomic-dequeue.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        async with factory() as db:
+            task = Task(title="single", description="d", priority=0)
+            db.add(task)
+            await db.commit()
+            task_id = task.id
+
+        async with factory() as db1, factory() as db2:
+            claimed = await asyncio.gather(
+                TaskQueue(db1).dequeue(),
+                TaskQueue(db2).dequeue(),
+            )
+
+        winners = [task for task in claimed if task is not None]
+        assert len(winners) == 1
+        assert winners[0].id == task_id
+        assert winners[0].turn_generation == 1
+        async with factory() as db:
+            persisted = await db.get(Task, task_id)
+            assert persisted is not None
+            assert persisted.status == "in_progress"
+            assert persisted.turn_generation == 1
     finally:
         await engine.dispose()
 
@@ -273,7 +315,10 @@ async def test_dequeue_rechecks_delivery_admission_during_claim_cas(
 
     assert invalidated is True
     assert selected is not None and selected.id == runnable.id
-    assert (await queue.get(delivery_id)).status == "pending"
+    assert selected.turn_generation == 1
+    stale_delivery = await queue.get(delivery_id)
+    assert stale_delivery.status == "pending"
+    assert stale_delivery.turn_generation == 0
 
 
 @pytest.mark.asyncio
@@ -413,6 +458,41 @@ async def test_owned_retry_is_cas_and_releases_instance_claim(queue):
 
 
 @pytest.mark.asyncio
+async def test_retry_does_not_increment_turn_generation_until_next_claim(queue):
+    task = await queue.create(title="turn retry", description="d")
+    task_id = task.id
+    first = await queue.dequeue(instance_id=4)
+    assert first is not None
+    assert first.turn_generation == 1
+
+    assert await queue.retry(
+        task_id,
+        expected_statuses=("in_progress", "executing"),
+        instance_id=99,
+        generation_fence=task_generation_fence(first),
+    ) is None
+    queue.db.expire_all()
+    unchanged = await queue.get(task_id)
+    assert unchanged is not None
+    assert unchanged.turn_generation == 1
+
+    first_generation = task_generation_fence(unchanged)
+    retried = await queue.retry(
+        task_id,
+        expected_statuses=("in_progress", "executing"),
+        instance_id=4,
+        generation_fence=first_generation,
+    )
+    assert retried is not None
+    assert retried.status == "pending"
+    assert retried.turn_generation == 1
+
+    second = await queue.dequeue(instance_id=4)
+    assert second is not None
+    assert second.turn_generation == 2
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_transitions_reject_same_slot_retry_aba(queue):
     """Every Ralph result transition must fence retry_count/start generation."""
 
@@ -468,6 +548,49 @@ async def test_lifecycle_transitions_reject_same_slot_retry_aba(queue):
     assert current.status == "in_progress"
     assert current.retry_count == 1
     assert current.instance_id == instance_id
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_fence_rejects_turn_generation_only_aba(queue):
+    """Legacy owner fields matching cannot authorize a newer logical turn."""
+
+    task = await queue.create(title="turn-only ABA", description="d")
+    claimed = await queue.dequeue(instance_id=12)
+    assert claimed is not None
+    task_id = claimed.id
+    old_generation = task_generation_fence(claimed)
+
+    claimed.turn_generation += 1
+    await queue.db.commit()
+
+    assert not await queue.mark_completed(
+        task_id,
+        instance_id=12,
+        generation_fence=old_generation,
+    )
+    assert not await queue.mark_failed(
+        task_id,
+        "late old failure",
+        instance_id=12,
+        generation_fence=old_generation,
+    )
+    assert not await queue.defer(
+        task_id,
+        "late old defer",
+        instance_id=12,
+        generation_fence=old_generation,
+    )
+    assert await queue.retry(
+        task_id,
+        expected_statuses=("in_progress", "executing"),
+        instance_id=12,
+        generation_fence=old_generation,
+    ) is None
+
+    queue.db.expire_all()
+    current = await queue.get(task_id)
+    assert current.status == "in_progress"
+    assert current.turn_generation == old_generation[-1] + 1
 
 
 @pytest.mark.asyncio
@@ -1650,6 +1773,27 @@ async def test_delete_task_rejects_retry_then_same_terminal_status_aba(
         assert task.status == "completed"
         assert task.retry_count == 1
         assert log is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_rejects_turn_generation_only_aba(queue):
+    """A stale delete fence cannot erase a newer turn with legacy fields equal."""
+
+    task = await queue.create(title="delete turn ABA", description="work")
+    task.status = "completed"
+    await queue.db.commit()
+    task_id = task.id
+    stale_fence = task_delete_fence(task)
+
+    task.turn_generation += 1
+    await queue.db.commit()
+
+    assert not await queue.delete(task_id, expected_fence=stale_fence)
+    queue.db.expire_all()
+    current = await queue.get(task_id)
+    assert current is not None
+    assert current.status == "completed"
+    assert current.turn_generation == stale_fence[-1] + 1
 
 
 @pytest.mark.asyncio

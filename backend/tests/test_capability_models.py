@@ -4,10 +4,48 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from backend.models.capability import CapabilityExecution, CapabilityInvocation
+from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 
 
 _HASH = "0" * 64
+
+
+async def _worker_handoff_receipt(
+    db_session,
+    *,
+    handoff_id: str,
+    status: str,
+    claimed_turn_generation: int | None,
+) -> WorkerTurnHandoffReceipt:
+    task = Task(title=f"handoff {handoff_id}")
+    db_session.add(task)
+    await db_session.flush()
+    log = LogEntry(
+        task_id=task.id,
+        event_type="user_message",
+        role="user",
+        content="exact follow-up",
+    )
+    db_session.add(log)
+    await db_session.flush()
+    return WorkerTurnHandoffReceipt(
+        handoff_id=handoff_id,
+        task_id=task.id,
+        source_log_id=log.id,
+        side="worker",
+        worker_id=None,
+        retry_count=2,
+        from_generation=4,
+        status=status,
+        request_payload={},
+        request_digest=_HASH,
+        queue_payload={},
+        queue_payload_digest=_HASH,
+        response={},
+        claimed_turn_generation=claimed_turn_generation,
+    )
 
 
 def _invocation(
@@ -159,3 +197,112 @@ async def test_only_one_active_execution_per_invocation(db_session):
     )
     with pytest.raises(IntegrityError):
         await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_invocation_exact_turn_evidence_round_trip(db_session):
+    task = Task(title="exact capability turn")
+    db_session.add(task)
+    await db_session.flush()
+    invocation = _invocation(task.id, "exact-turn-evidence")
+    invocation.request_task_turn_generation = 2**40 + 9
+    invocation.request_output_log_id = 314
+    invocation.request_native_turn_id = "native_turn_314"
+    db_session.add(invocation)
+    await db_session.commit()
+    await db_session.refresh(invocation)
+
+    assert invocation.request_task_turn_generation == 2**40 + 9
+    assert invocation.request_output_log_id == 314
+    assert invocation.request_native_turn_id == "native_turn_314"
+
+
+@pytest.mark.asyncio
+async def test_agent_invocation_requires_exact_turn_evidence(db_session):
+    task = Task(title="agent exact capability turn")
+    db_session.add(task)
+    await db_session.flush()
+    invocation = _invocation(task.id, "missing-agent-evidence")
+    invocation.source = "agent_request"
+    invocation.resume_policy = "resume_task"
+    db_session.add(invocation)
+
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_agent_invocation_exact_turn_shape_is_accepted(db_session):
+    task = Task(title="valid agent exact capability turn")
+    db_session.add(task)
+    await db_session.flush()
+    invocation = _invocation(task.id, "valid-agent-evidence")
+    invocation.source = "agent_request"
+    invocation.resume_policy = "resume_task"
+    invocation.request_task_retry_count = 0
+    invocation.request_task_turn_generation = 1
+    invocation.request_source_log_id = 41
+    invocation.request_output_log_id = 42
+    db_session.add(invocation)
+
+    await db_session.commit()
+    await db_session.refresh(invocation)
+    assert invocation.id is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "claimed_turn_generation"),
+    [
+        ("claimed", None),
+        ("launching", None),
+        ("launched", None),
+        ("claimed", 4),
+        ("accepted", 5),
+        ("cancelled", 5),
+    ],
+)
+async def test_worker_handoff_claim_generation_shape_is_enforced(
+    db_session,
+    status,
+    claimed_turn_generation,
+):
+    receipt = await _worker_handoff_receipt(
+        db_session,
+        handoff_id=(status[0] * 31 + str(claimed_turn_generation))[-32:],
+        status=status,
+        claimed_turn_generation=claimed_turn_generation,
+    )
+    db_session.add(receipt)
+
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "claimed_turn_generation"),
+    [
+        ("claimed", 5),
+        ("launching", 5),
+        ("launched", 5),
+        ("accepted", None),
+        ("cancelled", None),
+    ],
+)
+async def test_worker_handoff_claim_generation_valid_shapes_are_accepted(
+    db_session,
+    status,
+    claimed_turn_generation,
+):
+    receipt = await _worker_handoff_receipt(
+        db_session,
+        handoff_id=(status[0] * 31 + str(claimed_turn_generation))[-32:],
+        status=status,
+        claimed_turn_generation=claimed_turn_generation,
+    )
+    db_session.add(receipt)
+
+    await db_session.commit()
+    await db_session.refresh(receipt)
+    assert receipt.claimed_turn_generation == claimed_turn_generation

@@ -87,6 +87,16 @@ class CapabilityInvocation(Base):
             "resume_policy IN ('attach_only', 'resume_task', 'controller')",
             name="ck_cap_inv_resume_policy",
         ),
+        CheckConstraint(
+            "source <> 'agent_request' OR ("
+            "purpose = 'advisory' AND resume_policy = 'resume_task' "
+            "AND requested_by_user_id IS NULL "
+            "AND request_task_retry_count IS NOT NULL "
+            "AND request_task_turn_generation IS NOT NULL "
+            "AND request_source_log_id IS NOT NULL "
+            "AND request_output_log_id IS NOT NULL)",
+            name="ck_cap_inv_agent_request_identity",
+        ),
         CheckConstraint("state_version >= 1", name="ck_cap_inv_state_version"),
         CheckConstraint("max_attempts >= 1", name="ck_cap_inv_max_attempts"),
         CheckConstraint(
@@ -157,6 +167,10 @@ class CapabilityInvocation(Base):
         BigInteger, nullable=True
     )
     request_source_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_output_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_native_turn_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
     result_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     result_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     result_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

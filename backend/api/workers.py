@@ -558,7 +558,10 @@ async def _migrate_back_then_destroy(prov, worker_id: int, db_factory=None):
     """销毁 = 批量 migrate(task, 本机) + terminate（设计 §10.3）。
 
     单个 task 迁移失败不阻塞销毁（日志/状态在 Manager 本就完整，丢的只是
-    session 续聊能力），但要记到 task.error_message 让用户知情。"""
+    session 续聊能力），但要记到 task.error_message 让用户知情。
+    例外是已持久化的 Worker turn handoff：在 exact remote outcome 尚未
+    reconcile 前既不能丢掉 Worker 路由，也不能销毁唯一可证明该 turn
+    的 Worker。这种情况将整次销毁置为可重试的 fail-closed 错误。"""
     from backend.main import task_migrator, worker_relay
     from backend.models.task import Task
     from sqlalchemy import select
@@ -591,12 +594,27 @@ async def _migrate_back_then_destroy(prov, worker_id: int, db_factory=None):
                 await task_migrator.migrate(task.id, None)
         except Exception as e:
             logger.warning("destroy: migrate task %s back failed: %s", task.id, e)
-            async with db_factory() as db:
-                t = await db.get(Task, task.id)
-                if t:
-                    t.worker_id = None  # 指针总要切回，否则 task 永远指向死 worker
-                    t.error_message = (t.error_message or "") + f"\n[销毁迁移失败: {e}]"
-                    await db.commit()
+            detached, pending_handoff_id = (
+                await _fallback_detach_after_destroy_migration_failure(
+                    db_factory,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    error=e,
+                )
+            )
+            if not detached:
+                detail = (
+                    f"Worker 销毁已拒绝：Task {task.id} 仍有未收敛的 "
+                    f"turn handoff {pending_handoff_id}；请等待 exact remote "
+                    "outcome 同步后重试"
+                )
+                logger.error("destroy: worker %s blocked: %s", worker_id, detail)
+                await _mark_worker_destroy_blocked(
+                    db_factory,
+                    worker_id=worker_id,
+                    detail=detail,
+                )
+                return
     if worker_relay is not None:
         try:
             await worker_relay.stop_worker(worker_id)
@@ -605,6 +623,82 @@ async def _migrate_back_then_destroy(prov, worker_id: int, db_factory=None):
             # the cloud termination attempt or strand the row in destroying.
             logger.warning("destroy: stop worker relay %s failed: %s", worker_id, e)
     await prov.destroy_worker(worker_id)
+
+
+async def _fallback_detach_after_destroy_migration_failure(
+    db_factory,
+    *,
+    task_id: int,
+    worker_id: int,
+    error: Exception,
+) -> tuple[bool, str | None]:
+    """Apply the legacy lossy fallback only when no handoff remains.
+
+    ``TaskMigrator`` and Manager→Worker mutations share this operation lock.
+    Re-reading the row under that lock lets an exact relay reconciliation which
+    already cleared the marker win, while preventing a new handoff from being
+    installed between this decision and the detach write.
+    """
+    from backend.models.task import Task
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    async with get_task_operation_lock(task_id):
+        async with db_factory() as db:
+            current = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None or current.worker_id != worker_id:
+                await db.rollback()
+                return True, None
+            if current.worker_turn_handoff_id is not None:
+                handoff_id = current.worker_turn_handoff_id
+                await db.rollback()
+                return False, handoff_id
+
+            current.worker_id = None
+            current.error_message = (
+                (current.error_message or "")
+                + f"\n[销毁迁移失败: {error}]"
+            )
+            await db.commit()
+            return True, None
+
+
+async def _mark_worker_destroy_blocked(
+    db_factory,
+    *,
+    worker_id: int,
+    detail: str,
+) -> None:
+    """Restore relay eligibility without overwriting a newer lifecycle state.
+
+    Handoff recovery deliberately runs only for ``ready`` Workers.  Leaving a
+    blocked destroy in ``error`` (especially with ``bootstrap_step=destroy``)
+    would therefore make the marker impossible to settle and every retry would
+    fail on the same marker.  Keep the visible error text, but return the live
+    Worker to the normal recovery state so a later destroy can succeed.
+    """
+    async with db_factory() as db:
+        result = await db.execute(
+            update(Worker)
+            .where(
+                Worker.id == worker_id,
+                Worker.status == "destroying",
+            )
+            .values(
+                status="ready",
+                bootstrap_step=None,
+                bootstrap_error=detail[:2000],
+            )
+        )
+        if result.rowcount == 1:
+            await db.commit()
+        else:
+            await db.rollback()
 
 
 @router.post("/{worker_id}/retry", response_model=WorkerResponse)

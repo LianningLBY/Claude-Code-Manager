@@ -98,6 +98,8 @@ async def _run_pre_noted_background_event(
                     detached_autonomous=True,
                     expected_session_id=session_id,
                     expected_background_generation=generation,
+                    expected_task_retry_count=0,
+                    expected_task_turn_generation=0,
                 )
         return generation
     finally:
@@ -152,6 +154,43 @@ class TestAutonomousUserSanitization:
         })
 
         assert await _entries(db_factory, task_id) == []
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_native_sub_agent_upsert_rejects_retry_aba(
+        self,
+        db_factory,
+    ):
+        """A post-commit lifecycle callback cannot cross a retry boundary."""
+
+        _inst_id, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.retry_count = 2
+            task.turn_generation = 7
+            await db.commit()
+
+        im, broadcaster = _make_im(db_factory)
+        await im._upsert_native_sub_agent(
+            task_id,
+            "subagent_spawn",
+            {
+                "tool_use_id": "stale-native-agent",
+                "kind": "native-agent",
+                "description": "must not be created",
+            },
+            task_retry_count=1,
+            task_turn_generation=7,
+        )
+
+        async with db_factory() as db:
+            sessions = (
+                await db.execute(
+                    select(SubAgentSession).where(
+                        SubAgentSession.task_id == task_id
+                    )
+                )
+            ).scalars().all()
+        assert sessions == []
         broadcaster.broadcast.assert_not_awaited()
 
     async def test_non_autonomous_user_event_unchanged(self, db_factory):
@@ -243,6 +282,8 @@ class TestAutonomousUserSanitization:
             detached_autonomous=True,
             expected_session_id="session-old",
             expected_background_generation="old-background-generation",
+            expected_task_retry_count=0,
+            expected_task_turn_generation=0,
         )
 
         async with db_factory() as db:
@@ -284,6 +325,44 @@ class TestAutonomousUserSanitization:
             detached_autonomous=True,
             expected_session_id="closed-session",
             expected_background_generation="cleared-generation",
+            expected_task_retry_count=0,
+            expected_task_turn_generation=0,
+        )
+
+        assert await _entries(db_factory, task_id) == []
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_detached_autonomous_event_rejects_retry_aba_with_same_turn(
+        self,
+        db_factory,
+    ):
+        """A logical-turn retry cannot adopt output from its prior attempt."""
+
+        inst_id, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "retried-background-session"
+            task.pty_background_generation = "retried-background-generation"
+            task.retry_count = 2
+            task.turn_generation = 7
+            await db.commit()
+
+        im, broadcaster = _make_im(db_factory)
+        await im._process_event(
+            inst_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "late output from retry one",
+                "autonomous": True,
+            },
+            detached_autonomous=True,
+            expected_session_id="retried-background-session",
+            expected_background_generation="retried-background-generation",
+            expected_task_retry_count=1,
+            expected_task_turn_generation=7,
         )
 
         assert await _entries(db_factory, task_id) == []
@@ -750,6 +829,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=4,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -844,6 +924,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=4,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -995,6 +1076,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=3,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_event(
@@ -1260,6 +1342,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=5,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1323,6 +1406,8 @@ class TestFullMirrorBackend:
             {
                 "event": "status_change",
                 "task_id": task_id,
+                "task_retry_count": 5,
+                "task_turn_generation": 0,
                 "new_status": "failed",
                 "instance_id": instance_id,
                 "background_active": False,
@@ -1400,6 +1485,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=2,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1560,6 +1646,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=1,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1685,6 +1772,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=4,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1778,6 +1866,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.processes[instance_id] = old_proxy
@@ -1830,6 +1919,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=started_at + timedelta(seconds=1),
         )
         im.processes[instance_id] = new_proxy
@@ -1893,6 +1983,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=1,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im._claim_pty_terminal_owner(record, "consumer")
@@ -1962,6 +2053,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=3,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im._claim_pty_terminal_owner(record, "consumer")
@@ -2078,6 +2170,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=5,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im._claim_pty_terminal_owner(record, "consumer")
@@ -2182,6 +2275,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=6,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         won_a, won_b = await asyncio.gather(
@@ -2251,6 +2345,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=3,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.register_pty_background_generation(
@@ -2258,6 +2353,8 @@ class TestFullMirrorBackend:
             proxy.session.session_id,
             generation,
             proxy.session,
+            task_retry_count=3,
+            task_turn_generation=0,
         )
         state = im._pty_background_states[
             (task_id, proxy.session.session_id)
@@ -2402,6 +2499,8 @@ class TestFullMirrorBackend:
             Session.session_id,
             "early-complete-generation",
             Session(),
+            task_retry_count=0,
+            task_turn_generation=0,
         )
         state.outcome = "completed"
         im._discard_pty_background_state(
@@ -2594,6 +2693,8 @@ class TestFullMirrorBackend:
             session.session_id,
             "watchdog-generation",
             session,
+            task_retry_count=0,
+            task_turn_generation=0,
         )
         state = im._pty_background_states[
             (task_id, session.session_id)
@@ -2653,6 +2754,8 @@ class TestFullMirrorBackend:
             session.session_id,
             new_generation,
             session,
+            task_retry_count=0,
+            task_turn_generation=0,
         )
 
         await im.finish_pty_autonomous_activity(
@@ -2736,6 +2839,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=3,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
 
@@ -2851,6 +2955,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=9,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.processes[instance_id] = proxy
@@ -2859,7 +2964,12 @@ class TestFullMirrorBackend:
         backend._consumers[instance_id] = consumer
         backend._proxies[instance_id] = proxy
         im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=9,
+            task_turn_generation=0,
         )
 
         async def stop_backend(key):
@@ -2942,13 +3052,19 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=10,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         backend._sessions[instance_id] = session
         backend._consumers[instance_id] = consumer
         backend._proxies[instance_id] = proxy
         im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=10,
+            task_turn_generation=0,
         )
 
         noted = asyncio.Event()
@@ -3060,13 +3176,19 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=14,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         backend._sessions[instance_id] = session
         backend._consumers[instance_id] = consumer
         backend._proxies[instance_id] = proxy
         state = im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=14,
+            task_turn_generation=0,
         )
         handoff = im.note_pty_autonomous_activity(
             task_id, session.session_id
@@ -3192,7 +3314,12 @@ class TestFullMirrorBackend:
             task.pty_background_generation = generation
             await db.commit()
         im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=11,
+            task_turn_generation=0,
         )
 
         noted = asyncio.Event()
@@ -3216,6 +3343,7 @@ class TestFullMirrorBackend:
                 generation,
                 expected_status="completed",
                 expected_retry_count=11,
+                expected_turn_generation=0,
                 expected_instance_id=None,
                 expected_started_at=None,
                 expected_completed_at=completed_at,
@@ -3277,7 +3405,12 @@ class TestFullMirrorBackend:
             task.pty_background_generation = generation
             await db.commit()
         state = im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=12,
+            task_turn_generation=0,
         )
 
         noted = asyncio.Event()
@@ -3305,6 +3438,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=12,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=completed_at,
@@ -3336,6 +3470,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=12,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=completed_at,
@@ -3394,7 +3529,12 @@ class TestFullMirrorBackend:
             task.pty_background_generation = generation
             await db.commit()
         state = im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=13,
+            task_turn_generation=0,
         )
         handoff = im.note_pty_autonomous_activity(
             task_id, session.session_id
@@ -3406,6 +3546,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=13,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=completed_at,
@@ -3447,6 +3588,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=13,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=replacement_completed_at,
@@ -3489,6 +3631,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=old_started_at,
         )
         object.__setattr__(record, "pty_terminal_owner", "consumer")
@@ -3527,6 +3670,8 @@ class TestFullMirrorBackend:
             proxy.session.session_id,
             "old-background",
             proxy.session,
+            task_retry_count=2,
+            task_turn_generation=0,
         )
         assert not await im.stop(
             instance_id,
@@ -3619,6 +3764,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=5,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         backend.stop = AsyncMock(
@@ -3626,6 +3772,16 @@ class TestFullMirrorBackend:
                 "consumer-owned terminal path must not call backend.stop"
             )
         )
+        consumer_wait_entered = asyncio.Event()
+        release_consumer_wait = asyncio.Event()
+        original_wait_for_output_consumer = im.wait_for_output_consumer
+
+        async def gated_wait_for_output_consumer(*args, **kwargs):
+            consumer_wait_entered.set()
+            await release_consumer_wait.wait()
+            return await original_wait_for_output_consumer(*args, **kwargs)
+
+        im.wait_for_output_consumer = gated_wait_for_output_consumer
 
         begin_exit.set()
         await container_finalize_entered.wait()
@@ -3642,10 +3798,7 @@ class TestFullMirrorBackend:
                 consumer_cancel_timeout=0.2,
             )
         )
-        for _ in range(100):
-            if instance_id in im._stopping:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(consumer_wait_entered.wait(), timeout=1)
         assert instance_id in im._stopping
         assert not im._instance_lifecycle_lock(instance_id).locked()
         with pytest.raises(
@@ -3654,6 +3807,7 @@ class TestFullMirrorBackend:
             await im.launch(instance_id, "must not race stop")
 
         release_container_finalize.set()
+        release_consumer_wait.set()
         assert await asyncio.wait_for(stopping, timeout=1) is True
         backend.stop.assert_not_awaited()
 
@@ -3728,6 +3882,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=6,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.finalize_pty_container_exec = AsyncMock(
@@ -3837,6 +3992,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=7,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
 
@@ -4027,6 +4183,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         status = await im.finalize_pty_chat_generation(
@@ -4111,6 +4268,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=4,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
 
@@ -4190,6 +4348,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=3,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await im._process_event(
@@ -4291,6 +4450,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=2,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -4365,6 +4525,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=7,
+                task_turn_generation=0,
                 instance_started_at=old_started_at,
             )
             await backend.on_exit(
@@ -4416,13 +4577,14 @@ class TestFullMirrorBackend:
             from backend.services.instance_manager import _OutputConsumerRecord
 
             old_record = _OutputConsumerRecord(
-                old_proxy,
-                consumer,
-                True,
-                "claude",
-                task_id,
-                0,
-                datetime.utcnow(),
+                process=old_proxy,
+                task=consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=0,
+                instance_started_at=datetime.utcnow(),
             )
             setattr(
                 consumer, "_ccm_output_consumer_record", old_record
@@ -4444,13 +4606,14 @@ class TestFullMirrorBackend:
             from backend.services.instance_manager import _OutputConsumerRecord
 
             new_record = _OutputConsumerRecord(
-                new_proxy,
-                new_consumer,
-                True,
-                "claude",
-                task_id,
-                0,
-                datetime.utcnow(),
+                process=new_proxy,
+                task=new_consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=1,
+                instance_started_at=datetime.utcnow(),
             )
             backend._consumers[instance_id] = new_consumer
             im._tasks[instance_id] = new_consumer
@@ -4479,6 +4642,10 @@ class TestFullMirrorBackend:
         im._finish_pty_autonomous_activity_locked = AsyncMock()
         im._is_pty_autonomous_terminal.return_value = False
         im._is_pty_autonomous_activity.return_value = True
+        im.pty_background_state_for.return_value = SimpleNamespace(
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
         backend = self._bare_backend(im)
         session = MagicMock()
 
@@ -4503,6 +4670,8 @@ class TestFullMirrorBackend:
             detached_autonomous=True,
             expected_session_id="session-27",
             expected_background_generation="background-generation",
+            expected_task_retry_count=0,
+            expected_task_turn_generation=0,
         )
 
     async def test_mirror_drops_event_when_background_admission_fails(self):

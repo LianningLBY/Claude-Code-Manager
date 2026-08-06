@@ -438,6 +438,270 @@ async def test_task_launch_barrier_waits_for_cancelled_spawn_cleanup():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_launch_admission_callback_runs_inside_shared_launch_boundary(
+    provider,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+    instance_id = 911
+    events = []
+
+    @asynccontextmanager
+    async def runtime_admission(*_args, **_kwargs):
+        events.append("runtime-admitted")
+        yield None
+        events.append("runtime-released")
+
+    async def on_launch_admitted():
+        assert im._instance_lifecycle_lock(instance_id).locked()
+        events.append("callback")
+
+    async def launch_locked(**kwargs):
+        assert im._instance_lifecycle_lock(instance_id).locked()
+        events.append("preflight")
+        await kwargs["on_launch_admitted"]()
+        events.append("launch")
+        return 4321
+
+    im._cloudrouter_runtime_admission = runtime_admission
+    im._launch_locked = launch_locked
+
+    assert await im.launch(
+        instance_id,
+        "prompt",
+        provider=provider,
+        on_launch_admitted=on_launch_admitted,
+    ) == 4321
+    assert events == [
+        "runtime-admitted",
+        "preflight",
+        "callback",
+        "launch",
+        "runtime-released",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_launch_admission_callback_cancellation_settles_before_propagating():
+    im = InstanceManager(MagicMock(), MagicMock())
+    instance_id = 912
+    callback_entered = asyncio.Event()
+    callback_release = asyncio.Event()
+    callback_settled = asyncio.Event()
+    external_launch_started = asyncio.Event()
+
+    async def launch_locked(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        external_launch_started.set()
+        return 4321
+
+    im._launch_locked = launch_locked
+
+    async def on_launch_admitted():
+        callback_entered.set()
+        await callback_release.wait()
+        callback_settled.set()
+
+    launching = asyncio.create_task(
+        im.launch(
+            instance_id,
+            "prompt",
+            on_launch_admitted=on_launch_admitted,
+        )
+    )
+    await callback_entered.wait()
+    launching.cancel()
+    await asyncio.sleep(0)
+
+    assert not launching.done()
+    assert im._instance_lifecycle_lock(instance_id).locked()
+    assert not external_launch_started.is_set()
+
+    callback_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await launching
+
+    assert callback_settled.is_set()
+    assert not im._instance_lifecycle_lock(instance_id).locked()
+    assert instance_id not in im._launch_reservations
+    assert not external_launch_started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_launch_admission_callback_failure_prevents_launch():
+    im = InstanceManager(MagicMock(), MagicMock())
+    instance_id = 913
+    external_launch_started = asyncio.Event()
+
+    async def launch_locked(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        external_launch_started.set()
+        return 4321
+
+    im._launch_locked = launch_locked
+
+    async def on_launch_admitted():
+        raise RuntimeError("durable admission failed")
+
+    with pytest.raises(RuntimeError, match="durable admission failed"):
+        await im.launch(
+            instance_id,
+            "prompt",
+            on_launch_admitted=on_launch_admitted,
+        )
+
+    assert not external_launch_started.is_set()
+    assert instance_id not in im._launch_reservations
+    assert not im._instance_lifecycle_lock(instance_id).locked()
+
+
+@pytest.mark.asyncio
+async def test_launch_preflight_failure_does_not_publish_launch_admission(
+    db_factory,
+):
+    im = InstanceManager(db_factory, MagicMock())
+    on_launch_admitted = AsyncMock()
+
+    with pytest.raises(InstanceNotFoundError):
+        await im.launch(
+            999_999,
+            "prompt",
+            on_launch_admitted=on_launch_admitted,
+        )
+
+    on_launch_admitted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_launch_callback_runs_immediately_before_spawn(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="direct-launch-boundary")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+
+    im = InstanceManager(db_factory, MagicMock())
+    process = _make_mock_process(pid=1914)
+    events = []
+    im._build_command = MagicMock(
+        side_effect=lambda **_kwargs: events.append("command") or ["agent"]
+    )
+
+    async def spawn(*_args, **_kwargs):
+        assert events[-1] == "callback"
+        assert im._instance_lifecycle_lock(instance_id).locked()
+        events.append("spawn")
+        return process
+
+    im._spawn_managed_direct_process = spawn
+    im._persist_and_track_launch = AsyncMock(return_value=process.pid)
+
+    async def on_launch_admitted():
+        assert im._instance_lifecycle_lock(instance_id).locked()
+        events.append("callback")
+
+    with patch(
+        "backend.services.ask_user_settings.ensure_ask_user_hook"
+    ):
+        assert await im.launch(
+            instance_id,
+            "prompt",
+            on_launch_admitted=on_launch_admitted,
+        ) == process.pid
+
+    assert events == ["command", "callback", "spawn"]
+
+
+@pytest.mark.asyncio
+async def test_container_launch_callback_runs_immediately_before_exec(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        project = Project(
+            name="container-launch-boundary-project",
+            local_path=str(tmp_path),
+            status="ready",
+        )
+        instance = Instance(name="container-launch-boundary")
+        db.add_all([project, instance])
+        await db.flush()
+        task = Task(
+            title="container launch boundary",
+            status="executing",
+            provider="claude",
+            project_id=project.id,
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    from backend.services.container_manager import ContainerManager
+
+    im = InstanceManager(db_factory, MagicMock())
+    process = _make_mock_process(pid=1915)
+    events = []
+    container_manager = MagicMock()
+
+    async def ensure_container(*_args, **_kwargs):
+        events.append("container-preflight")
+        return "ccm-project-boundary"
+
+    async def exec_command(*_args, **_kwargs):
+        assert events[-1] == "callback"
+        assert im._instance_lifecycle_lock(instance_id).locked()
+        events.append("container-exec")
+        return process
+
+    container_manager.ensure_container = ensure_container
+    container_manager.create_pty_wrapper.return_value = (None, None)
+    container_manager.exec_command = exec_command
+    im._container_mgr = container_manager
+    im._build_command = MagicMock(return_value=["agent"])
+    im._persist_and_track_launch = AsyncMock(return_value=process.pid)
+
+    async def on_launch_admitted():
+        assert events.count("container-preflight") == 2
+        assert im._instance_lifecycle_lock(instance_id).locked()
+        events.append("callback")
+
+    with (
+        patch(
+            "backend.services.container_manager.is_shared_project",
+            new=AsyncMock(return_value=True),
+        ),
+        patch.object(
+            ContainerManager,
+            "is_docker_available",
+            return_value=True,
+        ),
+        patch(
+            "backend.services.ask_user_settings.ensure_ask_user_hook"
+        ),
+    ):
+        assert await im.launch(
+            instance_id,
+            "prompt",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            on_launch_admitted=on_launch_admitted,
+        ) == process.pid
+
+    assert events == [
+        "container-preflight",
+        "container-preflight",
+        "callback",
+        "container-exec",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_failed_spawn_reap_retains_task_launch_reservation():
     im = InstanceManager(MagicMock(), MagicMock())
     instance_id = 903
@@ -537,10 +801,20 @@ async def test_pty_quota_event_retains_reset_metadata_for_post_turn_switch(
 @pytest.mark.asyncio
 async def test_codex_app_server_delta_is_broadcast_but_not_persisted(db_factory):
     """Streaming improves TTFT without turning every token into a DB row."""
+    started_at = datetime.utcnow()
+    pid = 73101
     async with db_factory() as db:
-        inst = Instance(name="delta-inst")
+        inst = Instance(
+            name="delta-inst",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
         task = Task(title="delta-task", status="executing", provider="codex")
         db.add_all([inst, task])
+        await db.flush()
+        task.instance_id = inst.id
+        inst.current_task_id = task.id
         await db.commit()
         await db.refresh(inst)
         await db.refresh(task)
@@ -548,14 +822,30 @@ async def test_codex_app_server_delta_is_broadcast_but_not_persisted(db_factory)
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
-    await im._process_event(inst.id, task.id, {
-        "event_type": "message_delta",
-        "role": "assistant",
-        "content": "Hel",
-        "item_id": "msg-1",
-        "raw_json": '{"large":"payload"}',
-        "is_error": False,
-    })
+    process = MagicMock(pid=pid, returncode=None, native_turn_id=None)
+    consumer = asyncio.create_task(asyncio.Event().wait())
+    im.processes[inst.id] = process
+    im._track_output_consumer(
+        inst.id,
+        process,
+        consumer,
+        task_id=task.id,
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
+        instance_started_at=started_at,
+    )
+    try:
+        await im._process_event(inst.id, task.id, {
+            "event_type": "message_delta",
+            "role": "assistant",
+            "content": "Hel",
+            "item_id": "msg-1",
+            "raw_json": '{"large":"payload"}',
+            "is_error": False,
+        })
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
 
     async with db_factory() as db:
         rows = (await db.execute(
@@ -566,12 +856,82 @@ async def test_codex_app_server_delta_is_broadcast_but_not_persisted(db_factory)
         ((f"instance:{inst.id}", {
             "event_type": "message_delta", "role": "assistant",
             "content": "Hel", "item_id": "msg-1", "is_error": False,
+            "task_retry_count": task.retry_count,
+            "task_turn_generation": task.turn_generation,
         }),),
         ((f"task:{task.id}", {
             "event_type": "message_delta", "role": "assistant",
             "content": "Hel", "item_id": "msg-1", "is_error": False,
+            "task_retry_count": task.retry_count,
+            "task_turn_generation": task.turn_generation,
         }),),
     ]
+
+
+@pytest.mark.asyncio
+async def test_foreground_delta_rejects_durable_turn_aba(db_factory):
+    """A stale in-memory consumer cannot publish after turn N+1 commits."""
+
+    started_at = datetime.utcnow()
+    pid = 73102
+    async with db_factory() as db:
+        inst = Instance(
+            name="delta-turn-aba",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        task = Task(
+            title="delta-turn-aba",
+            status="executing",
+            provider="codex",
+            retry_count=4,
+            turn_generation=9,
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        task.instance_id = inst.id
+        inst.current_task_id = task.id
+        await db.commit()
+        inst_id = inst.id
+        task_id = task.id
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    im = InstanceManager(db_factory, broadcaster)
+    process = MagicMock(pid=pid, returncode=None, native_turn_id="native-9")
+    consumer = asyncio.create_task(asyncio.Event().wait())
+    im.processes[inst_id] = process
+    old_record = im._track_output_consumer(
+        inst_id,
+        process,
+        consumer,
+        task_id=task_id,
+        task_retry_count=4,
+        task_turn_generation=9,
+        instance_started_at=started_at,
+    )
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current.turn_generation = 10
+        await db.commit()
+
+    try:
+        await im._process_event(
+            inst_id,
+            task_id,
+            {
+                "event_type": "message_delta",
+                "role": "assistant",
+                "content": "late turn nine",
+                "item_id": "msg-old",
+            },
+            consumer_record=old_record,
+        )
+        broadcaster.broadcast.assert_not_awaited()
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
 
 
 def test_parse_codex_command_started():
@@ -3396,6 +3756,86 @@ async def test_codex_started_turn_wraps_generic_persistence_failure(
 
 
 @pytest.mark.asyncio
+async def test_codex_launch_callback_uses_final_pre_turn_hook(db_factory):
+    process = _make_mock_process(pid=7657)
+    events = []
+    registry = MagicMock()
+
+    async def start_turn(**kwargs):
+        events.append("preflight")
+        await kwargs["on_turn_prepared"](process, "thread-boundary")
+        events.append("turn-start")
+        return process, "thread-boundary"
+
+    registry.start_turn = start_turn
+    im = InstanceManager(db_factory, MagicMock())
+    im._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    im._persist_and_track_launch = AsyncMock(return_value=process.pid)
+
+    async def on_launch_admitted():
+        events.append("callback")
+
+    assert await im._launch_codex_app_server(
+        instance_id=1,
+        prompt="work",
+        task_id=None,
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        resume_session_id=None,
+        loop_iteration=None,
+        git_env=None,
+        effort_level="high",
+        chat_initiated=False,
+        config_dir="/tmp/codex-boundary",
+        enable_workflows=False,
+        enabled_skills=None,
+        on_launch_admitted=on_launch_admitted,
+    ) == process.pid
+
+    assert events == ["preflight", "callback", "turn-start"]
+
+
+@pytest.mark.asyncio
+async def test_codex_post_boundary_failure_never_falls_back_to_exec(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    async with db_factory() as db:
+        instance = Instance(name="codex-post-boundary-failure")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+
+    im = InstanceManager(db_factory, MagicMock())
+    callback_called = asyncio.Event()
+
+    async def fail_after_boundary(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        raise RuntimeError("failed after durable launch boundary")
+
+    im._launch_codex_app_server = fail_after_boundary
+    im._spawn_managed_direct_process = AsyncMock()
+
+    async def on_launch_admitted():
+        callback_called.set()
+
+    with pytest.raises(
+        RuntimeError,
+        match="failed after durable launch boundary",
+    ):
+        await im.launch(
+            instance.id,
+            "prompt",
+            provider="codex",
+            config_dir=str(tmp_path / "codex-boundary-home"),
+            on_launch_admitted=on_launch_admitted,
+        )
+
+    assert callback_called.is_set()
+    im._spawn_managed_direct_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     db_factory, monkeypatch, tmp_path,
 ):
@@ -5338,6 +5778,7 @@ async def test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy(
         provider="codex",
         task_id=first_task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=first_started_at,
     )
     manager._track_output_consumer(
@@ -5347,6 +5788,7 @@ async def test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy(
         provider="codex",
         task_id=peer_task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=peer_started_at,
     )
 
@@ -5738,6 +6180,7 @@ async def test_overlapping_stop_tokens_survive_stale_stop_and_block_retry(
         provider="codex",
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
     )
 
     with patch.object(im, "_generation_reap_confirmed", return_value=True):
@@ -6025,6 +6468,8 @@ async def test_instance_stop_releases_active_claim_back_to_pending(db_factory):
         {
             "event": "status_change",
             "task_id": task_id,
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
             "new_status": "pending",
             "instance_id": instance_id,
             "background_active": False,
@@ -6750,6 +7195,93 @@ async def test_stop_generation_fence_rejects_same_task_slot_aba(db_factory):
         assert instance.pid == process.pid
         assert instance.current_task_id == task_id
         assert task.status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_stop_turn_fence_rejects_reused_hot_pty_before_signal(
+    db_factory,
+):
+    """A stale stop cannot interrupt a newer turn on one hot PTY process."""
+
+    started_at = datetime(2026, 7, 23, 13, 30, 0)
+    async with db_factory() as db:
+        instance = Instance(
+            name="stop-hot-pty-turn-aba",
+            status="running",
+            pid=54_351,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="stop-hot-pty-turn-aba",
+            description="same PTY process, newer logical turn",
+            status="executing",
+            instance_id=instance.id,
+            turn_generation=2,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    process = _make_mock_process(pid=54_351, returncode=None)
+    process.session = MagicMock(session_id="hot-pty-session")
+    release_consumer = asyncio.Event()
+    consumer = asyncio.create_task(release_consumer.wait())
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    pty_backend = MagicMock()
+    pty_backend._sessions = {instance_id: process.session}
+    pty_backend.stop = AsyncMock()
+    im._pty_backend = pty_backend
+    im.processes[instance_id] = process
+    im._track_output_consumer(
+        instance_id,
+        process,
+        consumer,
+        provider="claude",
+        task_id=task_id,
+        task_retry_count=0,
+        task_turn_generation=2,
+        instance_started_at=started_at,
+    )
+
+    try:
+        with patch.object(
+            im,
+            "_signal_managed_process_tree",
+            new_callable=AsyncMock,
+        ) as signal_tree:
+            assert not await im.stop(
+                instance_id,
+                expected_task_id=task_id,
+                expected_task_turn_generation=1,
+                expected_pid=process.pid,
+                expected_started_at=started_at,
+                task_status="cancelled",
+            )
+
+        signal_tree.assert_not_awaited()
+        pty_backend.stop.assert_not_awaited()
+        process.send_signal.assert_not_called()
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+        assert im.processes[instance_id] is process
+        assert im._tasks[instance_id] is consumer
+        assert instance_id not in im._stopping
+        async with db_factory() as db:
+            instance = await db.get(Instance, instance_id)
+            task = await db.get(Task, task_id)
+            assert instance.status == "running"
+            assert instance.pid == process.pid
+            assert instance.current_task_id == task_id
+            assert task.status == "executing"
+            assert task.turn_generation == 2
+    finally:
+        release_consumer.set()
+        await asyncio.gather(consumer, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -8225,6 +8757,7 @@ async def _run_crashed_chat_consumer(
         chat_initiated=True,
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=started_at,
     )
     with pytest.raises(RuntimeError, match=message):
@@ -8350,6 +8883,8 @@ async def test_consumer_exception_recovery_completes_and_publishes_failed(
         {
             "event": "status_change",
             "task_id": task_id,
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
             "new_status": "failed",
             "instance_id": instance_id,
         },
@@ -8545,6 +9080,7 @@ async def test_consumer_exception_recovery_retains_ambiguous_cas_miss(
         chat_initiated=True,
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=started_at,
     )
 
@@ -8709,6 +9245,7 @@ async def test_consumer_recovery_db_failure_retains_evidence_until_stop_retry(
         chat_initiated=True,
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=started_at,
     )
 
@@ -8862,6 +9399,7 @@ async def test_non_chat_consumer_recovery_leaves_task_for_dispatcher(
         chat_initiated=False,
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=started_at,
     )
     with pytest.raises(RuntimeError, match="dispatcher bookkeeping"):
@@ -8923,6 +9461,7 @@ async def test_old_consumer_cannot_finalize_new_task_retry_generation(db_factory
         chat_initiated=True,
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
     )
     await consumer
 
@@ -8997,6 +9536,7 @@ async def test_direct_chat_terminal_transaction_locks_task_before_instance(
         chat_initiated=True,
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=started_at,
     )
     await consumer
@@ -9088,6 +9628,7 @@ async def test_direct_chat_consumer_suppresses_events_after_retry_claim(
         chat_initiated=True,
         task_id=task_id,
         task_retry_count=0,
+        task_turn_generation=0,
         instance_started_at=started_at,
     )
     await consumer
@@ -9179,6 +9720,7 @@ async def test_prompt_too_long_compaction_rejects_changed_task_generation(
             chat_initiated=True,
             task_id=task_id,
             task_retry_count=0,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         await consumer
@@ -9475,6 +10017,38 @@ async def test_launch_delegates_to_pty_backend_for_claude():
     assert calls["prompt"] == "do it"
     assert calls["model"] is None  # "default" normalized away
     assert calls["cwd"] == "/w"
+
+
+@pytest.mark.asyncio
+async def test_pty_launch_callback_runs_immediately_before_backend_launch():
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    instance_id = 17
+    events = []
+
+    class FakeBackend:
+        async def launch_for_ccm(self, **kwargs):
+            assert events == ["callback"]
+            assert im._instance_lifecycle_lock(instance_id).locked()
+            events.append("launch_for_ccm")
+            im.processes[kwargs["instance_id"]] = MagicMock(pid=4252)
+            return "sess-boundary"
+
+    im._pty_backend = FakeBackend()
+    im._pty_enabled = True
+
+    async def on_launch_admitted():
+        assert im._instance_lifecycle_lock(instance_id).locked()
+        events.append("callback")
+
+    assert await im.launch(
+        instance_id=instance_id,
+        prompt="do it",
+        task_id=3,
+        cwd="/w",
+        provider="claude",
+        on_launch_admitted=on_launch_admitted,
+    ) == 4252
+    assert events == ["callback", "launch_for_ccm"]
 
 
 @pytest.mark.asyncio
@@ -10394,6 +10968,7 @@ def _arm_reactivation_generation(
         consumer,
         task_id=task_id,
         task_retry_count=retry_count,
+        task_turn_generation=0,
         instance_started_at=started_at,
     )
     return process, consumer, record
@@ -10603,6 +11178,7 @@ async def test_process_event_cannot_borrow_replacement_consumer_generation(
         new_consumer,
         task_id=task_id,
         task_retry_count=retry_count + 1,
+        task_turn_generation=0,
         instance_started_at=started_at + timedelta(seconds=1),
     )
 
@@ -11053,6 +11629,7 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
             provider="codex",
             task_id=task_id,
             task_retry_count=0,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         await consumer

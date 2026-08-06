@@ -1831,6 +1831,111 @@ async def test_turn_owner_hook_failure_prevents_model_admission():
 
 
 @pytest.mark.asyncio
+async def test_turn_owner_hook_runs_after_final_tool_free_preflight():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "config": {"mcp_servers": {}},
+            "origins": {},
+        },
+        {
+            "data": [{
+                "cwd": "/tmp",
+                "skills": [],
+                "errors": [],
+            }],
+        },
+        _tool_free_thread_response("thread-final-preflight"),
+    ])
+    prepared = AsyncMock()
+
+    async def invalidate_inventory(_thread_id):
+        server._handle_notification("skills/changed", {})
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="skills inventory changed before turn/start",
+    ):
+        await server.start_turn(
+            prompt="must not start after stale preflight",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=905,
+            sandbox_mode="read-only",
+            disable_autonomous_features=True,
+            tools_disabled=True,
+            on_thread_started=invalidate_inventory,
+            on_turn_prepared=prepared,
+        )
+
+    prepared.assert_not_awaited()
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+    assert not server.has_active_thread("thread-final-preflight")
+
+
+@pytest.mark.asyncio
+async def test_turn_owner_hook_skills_change_fails_closed_before_model_input():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "config": {"mcp_servers": {}},
+            "origins": {},
+        },
+        {
+            "data": [{
+                "cwd": "/tmp",
+                "skills": [],
+                "errors": [],
+            }],
+        },
+        _tool_free_thread_response("thread-owner-toctou"),
+    ])
+    prepared = AsyncMock(
+        side_effect=lambda *_args: server._handle_notification(
+            "skills/changed",
+            {},
+        )
+    )
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="changed while publishing launch ownership",
+    ):
+        await server.start_turn(
+            prompt="must remain tool-free",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=906,
+            sandbox_mode="read-only",
+            disable_autonomous_features=True,
+            tools_disabled=True,
+            on_turn_prepared=prepared,
+        )
+
+    prepared.assert_awaited_once()
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+    assert not server.has_active_thread("thread-owner-toctou")
+
+
+@pytest.mark.asyncio
 async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
     server = CodexAppServer(
         "codex",

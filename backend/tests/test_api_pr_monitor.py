@@ -2717,6 +2717,7 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
         assert stopped_instance_id == instance_id
         assert kwargs == {
             "expected_task_id": old_task_id,
+            "expected_task_turn_generation": 0,
             "expected_pid": 51001,
             "expected_started_at": old_started_at,
             "task_status": "completed",
@@ -2849,6 +2850,7 @@ async def test_webhook_synchronize_same_task_slot_aba_does_not_stop_new_generati
     async def slot_reused_before_exact_stop(stopped_instance_id, **kwargs):
         assert stopped_instance_id == instance_id
         assert kwargs["expected_task_id"] == old_task_id
+        assert kwargs["expected_task_turn_generation"] == 0
         assert kwargs["expected_pid"] == 52001
         assert kwargs["expected_started_at"] == old_started_at
         async with session_factory() as db:
@@ -3239,6 +3241,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
                 "id": old_task_id,
                 "status": remote_initial_status,
                 "retry_count": 0,
+                "turn_generation": 0,
                 "pty_background_generation": remote_background_generation,
             }
         assert method == "POST"
@@ -3246,6 +3249,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
         assert body == {
             "expected_status": remote_initial_status,
             "expected_retry_count": 0,
+            "expected_turn_generation": 0,
             "expected_instance_id": None,
             "expected_started_at": None,
             "expected_completed_at": None,
@@ -3255,6 +3259,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
             "id": old_task_id,
             "status": "completed",
             "retry_count": 0,
+            "turn_generation": 0,
             "error_message": "Superseded by new PR push",
             "metadata_": {"pr_review_superseded": True},
         }
@@ -3365,6 +3370,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
                     else "completed"
                 ),
                 "retry_count": 0,
+                "turn_generation": 0,
                 "pty_background_generation": None,
                 "metadata_": (
                     {"pr_review_superseded": True}
@@ -3377,6 +3383,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
                 "executing" if post_attempts == 0 else "completed"
             ),
             "expected_retry_count": 0,
+            "expected_turn_generation": 0,
             "expected_instance_id": None,
             "expected_started_at": None,
             "expected_completed_at": None,
@@ -3389,6 +3396,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
             "id": old_task_id,
             "status": "completed",
             "retry_count": 0,
+            "turn_generation": 0,
             "error_message": "Superseded by new PR push",
             "metadata_": {"pr_review_superseded": True},
         }

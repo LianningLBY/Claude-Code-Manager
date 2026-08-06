@@ -3577,6 +3577,9 @@ async def recover_superseding_pr_reviews(
                                     expected_retry_count=(
                                         terminated.retry_count
                                     ),
+                                    expected_turn_generation=(
+                                        terminated.turn_generation
+                                    ),
                                     expected_instance_id=(
                                         terminated.instance_id
                                     ),

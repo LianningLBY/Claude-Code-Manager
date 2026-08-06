@@ -76,6 +76,7 @@ import backend.models.discussion  # noqa: F401
 import backend.models.monitor_session  # noqa: F401
 import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker  # noqa: F401
+import backend.models.worker_turn_handoff  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
 import backend.models.plan  # noqa: F401
 import backend.models.capability  # noqa: F401

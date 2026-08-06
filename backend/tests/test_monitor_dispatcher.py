@@ -1770,6 +1770,8 @@ async def test_codex_monitor_recycle_failure_fails_closed_and_cleans_thread(
             "event": "monitor_session_status",
             "monitor_session_id": session_id,
             "status": "failed",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
         },
     )
 
@@ -2755,6 +2757,8 @@ async def test_report_check_writes_record_and_broadcasts(client, session_factory
     assert len(events) == 1
     assert events[0][0][0] == f"task:{task_id}"
     assert events[0][0][1]["summary"] == "Process running at 45% CPU"
+    assert events[0][0][1]["task_retry_count"] == 0
+    assert events[0][0][1]["task_turn_generation"] == 0
     # Non-important routine check does not interrupt the main agent
     mock_d.enqueue_message.assert_not_awaited()
 
@@ -2802,6 +2806,8 @@ async def test_report_check_max_checks_auto_completes(client, session_factory):
     ]
     assert len(status_events) == 1
     assert status_events[0][0][1]["status"] == "completed"
+    assert status_events[0][0][1]["task_retry_count"] == 0
+    assert status_events[0][0][1]["task_turn_generation"] == 0
 
     mock_d.enqueue_message.assert_awaited_once()
     assert mock_d.enqueue_message.call_args.kwargs["source"] == "monitor:complete"
@@ -2833,9 +2839,17 @@ async def test_mark_complete_endpoint(client, session_factory):
         assert check.status == "completed"
         assert check.summary == "Build finished successfully"
 
-    events = {c[0][1].get("event") for c in mock_d.broadcaster.broadcast.call_args_list}
+    event_payloads = [
+        c[0][1] for c in mock_d.broadcaster.broadcast.call_args_list
+    ]
+    events = {payload.get("event") for payload in event_payloads}
     assert "monitor_check" in events
     assert "monitor_session_status" in events
+    assert all(payload["task_retry_count"] == 0 for payload in event_payloads)
+    assert all(
+        payload["task_turn_generation"] == 0
+        for payload in event_payloads
+    )
 
     # Completion is relayed to the main agent
     mock_d.enqueue_message.assert_awaited_once()

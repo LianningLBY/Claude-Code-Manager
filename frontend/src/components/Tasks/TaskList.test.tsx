@@ -54,6 +54,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     merge_status: 'pending',
     instance_id: null,
     retry_count: 0,
+    turn_generation: 0,
     max_retries: 3,
     mode: 'auto',
     todo_file_path: null,

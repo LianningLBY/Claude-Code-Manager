@@ -5342,6 +5342,76 @@ async def test_completion_publication_fence_rejects_late_background_arm(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "fail", "retry_exhausted"])
+async def test_temporary_frontend_review_goal_terminal_paths_restore_chat_mode(
+    db_factory,
+    operation,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name=f"frontend-review-terminal-{operation}")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="temporary frontend review goal",
+            status="executing",
+            instance_id=instance.id,
+            mode="goal",
+            goal_condition="temporary review condition",
+            goal_max_turns=5,
+            goal_turns_used=2,
+            goal_last_reason="browser passed",
+            retry_count=0,
+            max_retries=0,
+            metadata_={
+                "keep": "account-binding",
+                "frontend_review": {
+                    "mode": "goal",
+                    "profile": "standard",
+                    "max_iterations": 5,
+                },
+                "frontend_review_activation": {
+                    "message": "review and fix the frontend",
+                    "file_paths": [],
+                    "secret_ids": [],
+                    "restore": {
+                        "mode": "auto",
+                        "goal_condition": None,
+                        "goal_max_turns": 30,
+                        "goal_turns_used": 0,
+                        "goal_last_reason": None,
+                    },
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id = task.id
+
+    if operation == "complete":
+        assert await d._complete_owned_task(generation)
+        expected_status = "completed"
+    elif operation == "fail":
+        assert await d._fail_owned_task(generation, "failed")
+        expected_status = "failed"
+    else:
+        assert await d._retry_or_fail_mode_task(generation, "exhausted") == "failed"
+        expected_status = "failed"
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == expected_status
+        assert current.mode == "auto"
+        assert current.goal_condition is None
+        assert current.goal_max_turns == 30
+        assert current.goal_turns_used == 0
+        assert current.goal_last_reason is None
+        assert current.metadata_ == {"keep": "account-binding"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["retry", "complete", "fail"])
 async def test_owned_mode_publication_cannot_cross_new_generation(
     db_factory,

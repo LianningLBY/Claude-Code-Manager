@@ -172,6 +172,7 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.listTestRuns).mockResolvedValue([]);
   localStorage.clear();
+  delete document.documentElement.dataset.theme;
 });
 
 describe('BrowserReviewPanel', () => {
@@ -241,7 +242,9 @@ describe('BrowserReviewPanel', () => {
       />,
     );
 
-    expect(await screen.findByText('当前分支黑盒测试')).toBeInTheDocument();
+    expect(await screen.findByText('Test Harness · current_workspace')).toBeInTheDocument();
+    expect(screen.getAllByText('验证当前分支的设置页')).toHaveLength(1);
+    expect(screen.getByText(/工作区指纹 abcdef1234/)).toBeInTheDocument();
     expect(screen.getAllByText('正在启动隔离预览').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/HEAD 1234567890/).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole('button', { name: 'Stop test run' }));
@@ -275,6 +278,9 @@ describe('BrowserReviewPanel', () => {
     expect(screen.getByText('审查结论')).toBeInTheDocument();
     expect(screen.getByText('Goal 循环审查 · 模型自动判断')).toBeInTheDocument();
     expect(screen.getByText(/还需要复查窄屏页面/)).toBeInTheDocument();
+    const harnessSummary = screen.getByTestId('test-harness-progress');
+    const goalSummary = screen.getByTestId('frontend-review-goal-progress');
+    expect(harnessSummary.compareDocumentPosition(goalSummary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     await waitFor(() => expect(onAvailableChange).toHaveBeenCalledWith(true));
   });
 
@@ -620,5 +626,140 @@ describe('BrowserReviewPanel', () => {
     expect((await screen.findAllByText('本轮 PR99 前端验收')).length).toBeGreaterThan(0);
     expect(onExpectedWorkspaceReviewFound).toHaveBeenCalledTimes(1);
     expect(onNewReview).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces the previous run with a dedicated page for every Goal browser review request', async () => {
+    const firstWorkspaceRun = makeWorkspaceRun({
+      id: 'workspace-goal-first',
+      goal: '第一轮基线审查',
+    });
+    const firstHarnessRun = makeHarnessRun({
+      id: 'harness-goal-first',
+      root_run_id: 'harness-goal-first',
+      workspace_review: firstWorkspaceRun,
+    });
+    const secondWorkspaceRun = makeWorkspaceRun({
+      id: 'workspace-goal-second',
+      goal: '修改后的第一次复查',
+      status: 'preparing',
+      stage: 'starting_preview',
+      report: null,
+      cleanup_status: 'pending',
+      created_at: '2026-08-06T01:00:00Z',
+      completed_at: null,
+    });
+    const secondHarnessRun = makeHarnessRun({
+      id: 'harness-goal-second',
+      root_run_id: 'harness-goal-second',
+      status: 'preparing_environment',
+      stage: 'starting_preview',
+      workspace_review: secondWorkspaceRun,
+    });
+    const thirdWorkspaceRun = makeWorkspaceRun({
+      id: 'workspace-goal-third',
+      goal: '修改后的第二次复查',
+      status: 'preparing',
+      stage: 'starting_preview',
+      report: null,
+      cleanup_status: 'pending',
+      created_at: '2026-08-06T02:00:00Z',
+      completed_at: null,
+    });
+    const thirdHarnessRun = makeHarnessRun({
+      id: 'harness-goal-third',
+      root_run_id: 'harness-goal-third',
+      status: 'preparing_environment',
+      stage: 'starting_preview',
+      workspace_review: thirdWorkspaceRun,
+    });
+    let listedRuns = [firstHarnessRun];
+    vi.mocked(api.listTestRuns).mockImplementation(async () => listedRuns);
+    const onGoalReviewFound = vi.fn();
+    const commonProps = {
+      taskId: 73,
+      taskActive: true,
+      open: true,
+      displayMode: 'docked' as const,
+      onAvailableChange: vi.fn(),
+      onClose: vi.fn(),
+      onDisplayModeChange: vi.fn(),
+      onNewReview: vi.fn(),
+      onGoalReviewFound,
+      goalProgress: { turn: 0, maxTurns: 5, lastReason: null, active: true },
+    };
+    const { rerender } = render(<BrowserReviewPanel {...commonProps} />);
+
+    expect((await screen.findAllByText('第一轮基线审查')).length).toBeGreaterThan(0);
+    rerender(
+      <BrowserReviewPanel
+        {...commonProps}
+        goalStart={{
+          requestId: 1,
+          prompt: '修改后重新检查弹窗',
+          maxTurns: 5,
+          phase: 'starting_review',
+        }}
+      />,
+    );
+
+    expect(await screen.findByText('正在创建本轮浏览器复查')).toBeInTheDocument();
+    expect(screen.getByText('修改后重新检查弹窗')).toBeInTheDocument();
+    expect(screen.queryByText('第一轮基线审查')).not.toBeInTheDocument();
+
+    listedRuns = [secondHarnessRun, firstHarnessRun];
+    fireEvent.click(screen.getByTitle('刷新审查进度'));
+    await waitFor(() => expect(onGoalReviewFound).toHaveBeenCalledTimes(1));
+    rerender(<BrowserReviewPanel {...commonProps} />);
+    expect((await screen.findAllByText('修改后的第一次复查')).length).toBeGreaterThan(0);
+
+    rerender(
+      <BrowserReviewPanel
+        {...commonProps}
+        goalStart={{
+          requestId: 2,
+          prompt: '再次复查键盘焦点',
+          maxTurns: 5,
+          phase: 'starting_review',
+        }}
+      />,
+    );
+    expect(await screen.findByText('正在创建本轮浏览器复查')).toBeInTheDocument();
+    expect(screen.getByText('再次复查键盘焦点')).toBeInTheDocument();
+    expect(screen.queryByText('修改后的第一次复查')).not.toBeInTheDocument();
+
+    listedRuns = [thirdHarnessRun, secondHarnessRun, firstHarnessRun];
+    fireEvent.click(screen.getByTitle('刷新审查进度'));
+    await waitFor(() => expect(onGoalReviewFound).toHaveBeenCalledTimes(2));
+    rerender(<BrowserReviewPanel {...commonProps} />);
+    expect((await screen.findAllByText('修改后的第二次复查')).length).toBeGreaterThan(0);
+  });
+
+  it('uses high-contrast theme tokens for the light review panel', async () => {
+    document.documentElement.dataset.theme = 'light';
+    vi.mocked(api.listTestRuns).mockResolvedValue([
+      makeHarnessRun({
+        id: 'harness-light-theme',
+        root_run_id: 'harness-light-theme',
+        browser_review: completedJob,
+      }),
+    ]);
+    const { container } = render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    const panel = await screen.findByLabelText('Frontend Review progress');
+    expect(panel).toHaveClass('border-gray-600/60');
+    expect(screen.getByText(/Test Harness/)).toHaveClass('text-indigo-300');
+    expect(container.querySelectorAll('[class~="border-gray-800"]')).toHaveLength(0);
+    expect(screen.getByText('审查结论').closest('.prose')).toHaveClass('prose-p:text-gray-300');
   });
 });

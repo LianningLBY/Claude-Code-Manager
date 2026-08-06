@@ -69,6 +69,8 @@ interface BrowserReviewPanelProps {
   startedWorkspaceRun?: TestHarnessRun | null;
   expectedWorkspaceReviewBaseline?: string | null;
   onExpectedWorkspaceReviewFound?: () => void;
+  goalStart?: BrowserReviewGoalStart | null;
+  onGoalReviewFound?: () => void;
   goalProgress?: BrowserReviewGoalProgress;
 }
 
@@ -79,6 +81,13 @@ export interface BrowserReviewGoalProgress {
   maxTurns: number;
   lastReason: string | null;
   active: boolean;
+}
+
+export interface BrowserReviewGoalStart {
+  requestId: number;
+  prompt: string;
+  maxTurns: number;
+  phase: 'starting_goal' | 'starting_review';
 }
 
 interface FloatingPosition {
@@ -135,6 +144,8 @@ export function BrowserReviewPanel({
   startedWorkspaceRun,
   expectedWorkspaceReviewBaseline,
   onExpectedWorkspaceReviewFound,
+  goalStart,
+  onGoalReviewFound,
   goalProgress,
 }: BrowserReviewPanelProps) {
   const [runs, setRuns] = useState<TestHarnessRun[]>([]);
@@ -155,6 +166,8 @@ export function BrowserReviewPanel({
   const latestReviewIdRef = useRef<string | null>(null);
   const startedWorkspaceRunRef = useRef<TestHarnessRun | null>(null);
   const expectedWorkspaceReviewBaselineRef = useRef<string | null | undefined>(undefined);
+  const expectedGoalReviewBaselineRef = useRef<string | null | undefined>(undefined);
+  const goalReviewRequestIdRef = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -170,6 +183,12 @@ export function BrowserReviewPanel({
         && visibleRuns[0].id !== expectedBaseline
         ? visibleRuns[0]
         : null;
+      const expectedGoalBaseline = expectedGoalReviewBaselineRef.current;
+      const expectedGoalRun = expectedGoalBaseline !== undefined
+        && visibleRuns[0]
+        && visibleRuns[0].id !== expectedGoalBaseline
+        ? visibleRuns[0]
+        : null;
       const previousLatestId = latestReviewIdRef.current;
       const hasNewReview = Boolean(
         previousLatestId
@@ -179,15 +198,20 @@ export function BrowserReviewPanel({
       latestReviewIdRef.current = nextLatestId;
       setRuns(visibleRuns);
       setSelectedId((current) => (
-        expectedWorkspaceRun
-          ? expectedWorkspaceRun.id
+        expectedGoalRun || expectedWorkspaceRun
+          ? (expectedGoalRun || expectedWorkspaceRun)!.id
           : !hasNewReview && current && (
           visibleRuns.some((run) => run.id === current)
         )
           ? current
           : nextLatestId
       ));
-      if (expectedWorkspaceRun) {
+      if (expectedGoalRun) {
+        expectedGoalReviewBaselineRef.current = undefined;
+        setMinimized(false);
+        onGoalReviewFound?.();
+        onNewReview();
+      } else if (expectedWorkspaceRun) {
         expectedWorkspaceReviewBaselineRef.current = undefined;
         setWaitingForWorkspaceReview(false);
         setMinimized(false);
@@ -204,11 +228,13 @@ export function BrowserReviewPanel({
     } finally {
       setLoading(false);
     }
-  }, [onAvailableChange, onExpectedWorkspaceReviewFound, onNewReview, taskId]);
+  }, [onAvailableChange, onExpectedWorkspaceReviewFound, onGoalReviewFound, onNewReview, taskId]);
 
   useEffect(() => {
     startedWorkspaceRunRef.current = null;
     expectedWorkspaceReviewBaselineRef.current = undefined;
+    expectedGoalReviewBaselineRef.current = undefined;
+    goalReviewRequestIdRef.current = null;
     setRuns([]);
     setSelectedId(null);
     setLoading(true);
@@ -243,17 +269,33 @@ export function BrowserReviewPanel({
     void refresh();
   }, [expectedWorkspaceReviewBaseline, refresh]);
 
-  const hasActiveReview = runs.some((run) => !TERMINAL.has(run.status));
   useEffect(() => {
-    if (!taskActive && !hasActiveReview && !waitingForWorkspaceReview) return;
+    if (!goalStart) {
+      expectedGoalReviewBaselineRef.current = undefined;
+      goalReviewRequestIdRef.current = null;
+      return;
+    }
+    if (goalReviewRequestIdRef.current === goalStart.requestId) return;
+    goalReviewRequestIdRef.current = goalStart.requestId;
+    expectedGoalReviewBaselineRef.current = latestReviewIdRef.current;
+    setLoading(true);
+    setError(null);
+    setMinimized(false);
+    void refresh();
+  }, [goalStart, refresh]);
+
+  const hasActiveReview = runs.some((run) => !TERMINAL.has(run.status));
+  const waitingForGoalReview = goalStart != null;
+  useEffect(() => {
+    if (!taskActive && !hasActiveReview && !waitingForWorkspaceReview && !waitingForGoalReview) return;
     const timer = window.setInterval(() => { void refresh(); }, 1000);
     return () => window.clearInterval(timer);
-  }, [hasActiveReview, refresh, taskActive, waitingForWorkspaceReview]);
+  }, [hasActiveReview, refresh, taskActive, waitingForGoalReview, waitingForWorkspaceReview]);
 
   const harnessRun = runs.find((item) => item.id === selectedId)
     ?? runs[0]
     ?? null;
-  const displayedRun = waitingForWorkspaceReview ? null : harnessRun;
+  const displayedRun = waitingForWorkspaceReview || waitingForGoalReview ? null : harnessRun;
   const selectedRunIndex = harnessRun
     ? runs.findIndex((item) => item.id === harnessRun.id)
     : -1;
@@ -264,6 +306,12 @@ export function BrowserReviewPanel({
   };
   const workspaceRun: WorkspaceReviewRun | null = displayedRun?.workspace_review ?? null;
   const job: BrowserReviewJob | null = displayedRun?.browser_review ?? null;
+  const displayedObjective = String(displayedRun?.test_plan.objective || '前端黑盒测试').trim();
+  const showBrowserGoal = Boolean(
+    job?.goal?.trim()
+    && job.goal.trim() !== displayedObjective
+    && job.goal.trim() !== workspaceRun?.goal?.trim(),
+  );
   const harnessRunId = displayedRun?.id ?? null;
   const latestScreenshot = job?.latest_screenshot ?? null;
 
@@ -418,7 +466,7 @@ export function BrowserReviewPanel({
 
   if (
     !open
-    || (!waitingForWorkspaceReview && !loading && runs.length === 0)
+    || (!waitingForWorkspaceReview && !waitingForGoalReview && !loading && runs.length === 0)
   ) return null;
 
   const panel = (
@@ -427,21 +475,25 @@ export function BrowserReviewPanel({
       aria-label="Frontend Review progress"
       data-display-mode={displayMode}
       className={displayMode === 'floating'
-        ? `fixed z-[70] flex w-[min(430px,calc(100vw-24px))] flex-col overflow-hidden rounded-xl border border-gray-700 bg-gray-950/98 shadow-2xl shadow-black/60 backdrop-blur ${minimized ? '' : 'max-h-[min(720px,calc(100vh-24px))]'}`
-        : 'flex max-h-[46vh] w-full shrink-0 flex-col border-t border-gray-800 bg-gray-950/95 lg:max-h-none lg:w-[430px] lg:border-l lg:border-t-0'}
+        ? `fixed z-[70] flex w-[min(430px,calc(100vw-24px))] flex-col overflow-hidden rounded-xl border border-gray-600/60 bg-gray-950/98 shadow-2xl shadow-black/60 backdrop-blur ${minimized ? '' : 'max-h-[min(720px,calc(100vh-24px))]'}`
+        : 'flex max-h-[46vh] w-full shrink-0 flex-col border-t border-gray-600/60 bg-gray-950/95 lg:max-h-none lg:w-[430px] lg:border-l lg:border-t-0'}
       style={displayMode === 'floating' ? { left: floatingPosition.x, top: floatingPosition.y } : undefined}
     >
       <div
         data-floating-drag-handle={displayMode === 'floating' ? 'true' : undefined}
         onPointerDown={startDragging}
-        className={`flex items-center gap-2 border-b border-gray-800 px-3 py-2.5 ${displayMode === 'floating' ? 'cursor-move touch-none' : ''}`}
+        className={`flex items-center gap-2 border-b border-gray-600/50 px-3 py-2.5 ${displayMode === 'floating' ? 'cursor-move touch-none' : ''}`}
       >
         {displayMode === 'floating' && <GripVertical size={14} className="shrink-0 text-gray-600" />}
         <Eye size={16} className="text-indigo-400" />
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium text-gray-100">前端运行审查</div>
           <div className="truncate text-[10px] text-gray-500">
-            Task #{taskId}{displayedGoalRound ? ` · Goal 第 ${displayedGoalRound} 轮` : ''} · {waitingForWorkspaceReview
+            Task #{taskId}{displayedGoalRound ? ` · Goal Agent 第 ${displayedGoalRound} 轮` : ''} · {waitingForGoalReview
+              ? goalStart?.phase === 'starting_review'
+                ? '正在创建新的浏览器复查'
+                : '正在启动循环审查'
+              : waitingForWorkspaceReview
               ? '等待 Agent 创建新的浏览器审查'
               : displayedRun
               ? STAGE_LABELS[displayedRun.stage] || displayedRun.stage
@@ -498,14 +550,14 @@ export function BrowserReviewPanel({
         </button>
       </div>
 
-      {!minimized && !waitingForWorkspaceReview && runs.length > 1 && (
-        <div className="border-b border-gray-800 px-3 py-2">
+      {!minimized && !waitingForWorkspaceReview && !waitingForGoalReview && runs.length > 1 && (
+        <div className="border-b border-gray-600/50 px-3 py-2">
           <div className="flex items-center gap-1.5">
             <select
               value={harnessRun?.id || ''}
               onChange={(event) => setSelectedId(event.target.value)}
               aria-label="Select test run"
-              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
+              className="min-w-0 flex-1 rounded border border-gray-600/60 bg-gray-900 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
             >
               {runs.map((item, index) => (
                 <option key={item.id} value={item.id}>
@@ -517,7 +569,7 @@ export function BrowserReviewPanel({
               type="button"
               onClick={() => selectAdjacentRun(1)}
               disabled={selectedRunIndex < 0 || selectedRunIndex >= runs.length - 1}
-              className="rounded border border-gray-700 bg-gray-900 p-1.5 text-gray-400 hover:border-indigo-500/60 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-35"
+              className="rounded border border-gray-600/60 bg-gray-900 p-1.5 text-gray-400 hover:border-indigo-500/60 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-35"
               title="切换到更早的测试"
               aria-label="Select older test run"
             >
@@ -527,7 +579,7 @@ export function BrowserReviewPanel({
               type="button"
               onClick={() => selectAdjacentRun(-1)}
               disabled={selectedRunIndex <= 0}
-              className="rounded border border-gray-700 bg-gray-900 p-1.5 text-gray-400 hover:border-indigo-500/60 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-35"
+              className="rounded border border-gray-600/60 bg-gray-900 p-1.5 text-gray-400 hover:border-indigo-500/60 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-35"
               title="切换到更新的测试"
               aria-label="Select newer test run"
             >
@@ -538,24 +590,53 @@ export function BrowserReviewPanel({
       )}
 
       {!minimized && <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
-        {waitingForWorkspaceReview && (
+        {waitingForGoalReview && goalStart && (
+          <section data-testid="frontend-review-goal-starting" className="flex min-h-72 flex-col items-center justify-center rounded-lg border border-indigo-500/35 bg-indigo-500/8 px-5 py-8 text-center">
+            <div className="flex h-11 w-11 items-center justify-center rounded-full border border-indigo-400/35 bg-indigo-400/10">
+              <Loader2 size={19} className="animate-spin text-indigo-300" />
+            </div>
+            <div className="mt-3 text-sm font-medium text-indigo-300">
+              {goalStart.phase === 'starting_review'
+                ? '正在创建本轮浏览器复查'
+                : 'Goal 循环审查正在启动'}
+            </div>
+            <div className="mt-1 max-w-80 text-[11px] leading-relaxed text-gray-400">
+              {goalStart.phase === 'starting_review'
+                ? 'Agent 已发起新的 Harness Run。本页已与上一轮证据分离，新 Run 建立后会自动切换到实时截图和操作轨迹。'
+                : '已接收 Goal，正在当前 Task/session 中启动“浏览器审查 → 必要修改 → 测试 → 重新审查”的执行链。'}
+            </div>
+            <div className="mt-4 w-full max-w-80 rounded-lg border border-gray-600/45 bg-gray-900/75 px-3 py-2 text-left">
+              <div className="text-[9px] font-medium uppercase tracking-wide text-gray-500">本次目标</div>
+              <div className="mt-1 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-gray-300">{goalStart.prompt}</div>
+            </div>
+            <div className="mt-3 grid w-full max-w-80 gap-1.5 text-left text-[10px] text-gray-400">
+              <div className="rounded border border-gray-600/35 bg-gray-900/60 px-2.5 py-1.5">1 · 创建独立 Harness Run 与代码指纹</div>
+              <div className="rounded border border-gray-600/35 bg-gray-900/60 px-2.5 py-1.5">2 · 启动隔离预览与黑盒 Browser Agent</div>
+              <div className="rounded border border-gray-600/35 bg-gray-900/60 px-2.5 py-1.5">3 · 回传截图、操作轨迹和审查报告</div>
+            </div>
+            <div className="mt-3 text-[10px] text-gray-500">
+              Goal Agent 最多 {goalStart.maxTurns} 轮；同一轮内可以执行多次浏览器审查与复查。
+            </div>
+          </section>
+        )}
+        {!waitingForGoalReview && waitingForWorkspaceReview && (
           <section data-testid="workspace-review-expected" className="flex min-h-64 flex-col items-center justify-center rounded-lg border border-cyan-500/25 bg-cyan-500/8 px-5 py-8 text-center">
             <div className="flex h-10 w-10 items-center justify-center rounded-full border border-cyan-400/25 bg-cyan-400/10">
               <Loader2 size={18} className="animate-spin text-cyan-300" />
             </div>
-            <div className="mt-3 text-sm font-medium text-cyan-100">正在创建新的前端测试</div>
+            <div className="mt-3 text-sm font-medium text-cyan-300">正在创建新的前端测试</div>
             <div className="mt-1 max-w-72 text-[11px] leading-relaxed text-gray-400">
               已收到本次测试请求，正在等待 Agent 创建独立的 Harness Run。新 Run 就绪后，右栏会自动切换到它的实时截图和操作轨迹。
             </div>
             <div className="mt-4 grid w-full max-w-72 gap-1.5 text-left text-[10px] text-gray-500">
-              <div className="rounded bg-gray-950/45 px-2.5 py-1.5">1 · 识别本次测试目标</div>
-              <div className="rounded bg-gray-950/45 px-2.5 py-1.5">2 · 创建独立 Harness Run</div>
-              <div className="rounded bg-gray-950/45 px-2.5 py-1.5">3 · 绑定浏览器 Agent</div>
+              <div className="rounded border border-gray-600/35 bg-gray-900/60 px-2.5 py-1.5">1 · 识别本次测试目标</div>
+              <div className="rounded border border-gray-600/35 bg-gray-900/60 px-2.5 py-1.5">2 · 创建独立 Harness Run</div>
+              <div className="rounded border border-gray-600/35 bg-gray-900/60 px-2.5 py-1.5">3 · 绑定浏览器 Agent</div>
             </div>
-            <div className="mt-3 text-[10px] text-gray-600">上一轮测试仍保留在历史记录中，本页不会继续展示其内容。</div>
+            <div className="mt-3 text-[10px] text-gray-500">上一轮测试仍保留在历史记录中，本页不会继续展示其内容。</div>
           </section>
         )}
-        {loading && !waitingForWorkspaceReview && !displayedRun && (
+        {loading && !waitingForWorkspaceReview && !waitingForGoalReview && !displayedRun && (
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500">
             <Loader2 size={15} className="animate-spin" />
             加载审查运行…
@@ -571,9 +652,9 @@ export function BrowserReviewPanel({
           <section data-testid="test-harness-progress" className="rounded-lg border border-indigo-500/25 bg-indigo-500/8 p-3">
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-xs font-medium text-indigo-200">Test Harness · {displayedRun.target_kind}</div>
+                <div className="text-xs font-medium text-indigo-300">Test Harness · {displayedRun.target_kind}</div>
                 <div className="mt-0.5 line-clamp-2 text-[10px] text-gray-500">
-                  {String(displayedRun.test_plan.objective || '前端黑盒测试')}
+                  {displayedObjective}
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
@@ -616,6 +697,24 @@ export function BrowserReviewPanel({
                 {displayedRun.stale ? '代码已变化 · 结果过期' : `结论 ${displayedRun.verdict || '待定'}`}
               </div>
             </div>
+            {workspaceRun && (
+              <div data-testid="workspace-review-progress" className="mt-2 border-t border-gray-600/40 pt-2 text-[10px] text-gray-500">
+                <div className="truncate" title={workspaceRun.workspace_fingerprint}>
+                  工作区指纹 {workspaceRun.workspace_fingerprint.slice(0, 10)}
+                </div>
+                {workspaceRun.preview_url && (
+                  <div className="mt-1 truncate" title={workspaceRun.preview_url}>
+                    隔离预览：{workspaceRun.preview_url}
+                  </div>
+                )}
+                {(workspaceRun.error || workspaceRun.cleanup_error)
+                  && (workspaceRun.error || workspaceRun.cleanup_error) !== (displayedRun.error || displayedRun.cleanup_error) && (
+                  <div className="mt-1 whitespace-pre-wrap break-words text-red-300">
+                    {workspaceRun.error || workspaceRun.cleanup_error}
+                  </div>
+                )}
+              </div>
+            )}
             {(displayedRun.error || displayedRun.cleanup_error) && (
               <div className="mt-2 whitespace-pre-wrap break-words text-[10px] text-red-300">
                 {displayedRun.error || displayedRun.cleanup_error}
@@ -623,70 +722,64 @@ export function BrowserReviewPanel({
             )}
           </section>
         )}
-        {workspaceRun && (
-          <section data-testid="workspace-review-progress" className="rounded-lg border border-blue-500/25 bg-blue-500/8 p-3">
-            <div className="flex items-start justify-between gap-2">
-              <div className="min-w-0">
-                <div className="text-xs font-medium text-blue-200">当前分支黑盒测试</div>
-                <div className="mt-0.5 line-clamp-2 text-[10px] text-gray-500">{workspaceRun.goal}</div>
+        {goalProgress && displayedRun && (
+          <section data-testid="frontend-review-goal-progress" className="rounded-lg border border-indigo-500/30 bg-indigo-500/8 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs font-medium text-indigo-300">Goal 循环审查 · 模型自动判断</div>
+                <div className="mt-0.5 text-[10px] text-gray-500">
+                  Agent 第 {displayedGoalRound ?? 1} 轮 · 安全上限 {goalProgress.maxTurns} 轮
+                </div>
               </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                <span className={`rounded-full border px-2 py-0.5 text-[10px] ${statusClass(workspaceRun.status)}`}>
-                  {STAGE_LABELS[workspaceRun.stage] || workspaceRun.stage}
-                </span>
-              </div>
+              <span className={`h-2 w-2 shrink-0 rounded-full ${goalProgress.active ? 'animate-pulse bg-blue-400' : 'bg-emerald-400'}`} />
             </div>
-            <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-gray-500">
-              <div className="truncate rounded bg-gray-950/60 px-2 py-1.5" title={workspaceRun.git_head}>
-                HEAD {workspaceRun.git_head.slice(0, 10)}
-              </div>
-              <div className={`rounded px-2 py-1.5 ${workspaceRun.stale ? 'bg-amber-500/10 text-amber-300' : 'bg-gray-950/60'}`}>
-                {workspaceRun.stale ? '工作区已变化 · 结果过期' : `指纹 ${workspaceRun.workspace_fingerprint.slice(0, 10)}`}
-              </div>
+            <div className="mt-2 h-1 overflow-hidden rounded-full bg-gray-600/35">
+              <div
+                className="h-full rounded-full bg-indigo-500 transition-all"
+                style={{ width: `${Math.min(100, ((displayedGoalRound ?? 1) / Math.max(1, goalProgress.maxTurns)) * 100)}%` }}
+              />
             </div>
-            {workspaceRun.preview_url && (
-              <div className="mt-2 truncate text-[10px] text-gray-600" title={workspaceRun.preview_url}>
-                隔离预览：{workspaceRun.preview_url}
-              </div>
-            )}
-            {(workspaceRun.error || workspaceRun.cleanup_error) && (
-              <div className="mt-2 whitespace-pre-wrap break-words text-[10px] text-red-300">
-                {workspaceRun.error || workspaceRun.cleanup_error}
+            <div className="mt-2 text-[10px] leading-relaxed text-gray-500">
+              本轮 Harness 报告只是 Goal 证据；Agent 仍会按需修改、测试并创建新的复查。
+            </div>
+            {goalProgress.lastReason && (
+              <div className="mt-2 line-clamp-3 text-[10px] leading-relaxed text-gray-400">
+                评估器：{goalProgress.lastReason}
               </div>
             )}
           </section>
         )}
         {job && (
-          <section className="overflow-hidden rounded-lg border border-gray-800 bg-black">
-            <div className="flex items-center gap-1.5 border-b border-gray-800 bg-gray-900 px-2.5 py-2 text-[11px] text-gray-400">
+          <section className="overflow-hidden rounded-lg border border-gray-600/60 bg-black">
+            <div className="flex items-center gap-1.5 border-b border-gray-600/50 bg-gray-900 px-2.5 py-2 text-[11px] text-gray-400">
               <Image size={13} />
               最新浏览器画面
             </div>
             {screenshotUrl ? (
               <img src={screenshotUrl} alt="Latest frontend review screenshot" className="block h-auto w-full" />
             ) : (
-              <div className="flex aspect-video items-center justify-center text-xs text-gray-600">
+              <div className="flex aspect-video items-center justify-center text-xs text-gray-500">
                 {TERMINAL.has(job.status) ? '没有可用截图' : '等待浏览器截图…'}
               </div>
             )}
           </section>
         )}
         {displayedRun && (
-          <section className="rounded-lg border border-gray-800 bg-gray-900/55">
-            <div className="flex items-center gap-1.5 border-b border-gray-800 px-3 py-2 text-xs font-medium text-gray-200">
+          <section className="rounded-lg border border-gray-600/60 bg-gray-900/55">
+            <div className="flex items-center gap-1.5 border-b border-gray-600/50 px-3 py-2 text-xs font-medium text-gray-200">
               <Activity size={13} className="text-indigo-400" />
               模型观察与操作轨迹
             </div>
             <div className="max-h-72 space-y-0 overflow-y-auto px-3 py-1">
               {displayedRun.events.length === 0 && (
-                <div className="py-5 text-center text-[11px] text-gray-600">等待测试 Harness 开始…</div>
+                <div className="py-5 text-center text-[11px] text-gray-500">等待测试 Harness 开始…</div>
               )}
               {displayedRun.events.map((event, index) => (
-                <div key={event.id} className="relative border-l border-gray-700 py-2 pl-4">
+                <div key={event.id} className="relative border-l border-gray-600/60 py-2 pl-4">
                   <span className={`absolute -left-1 top-3 h-2 w-2 rounded-full ${event.event_type === 'decision' ? 'bg-indigo-400' : 'bg-cyan-400'}`} />
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-medium text-gray-300">{event.title}</span>
-                    <span className="text-[9px] text-gray-600">{index + 1}</span>
+                    <span className="text-[9px] text-gray-500">{index + 1}</span>
                   </div>
                   {event.detail && <div className="mt-0.5 whitespace-pre-wrap break-words text-[10px] leading-relaxed text-gray-500">{event.detail}</div>}
                 </div>
@@ -696,35 +789,13 @@ export function BrowserReviewPanel({
         )}
         {job && (
           <>
-            {goalProgress && (
-              <section data-testid="frontend-review-goal-progress" className="rounded-lg border border-indigo-500/25 bg-indigo-500/8 p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-xs font-medium text-indigo-200">Goal 循环审查 · 模型自动判断</div>
-                    <div className="mt-0.5 text-[10px] text-gray-500">
-                      第 {displayedGoalRound ?? 1} 轮 · 安全上限 {goalProgress.maxTurns} 轮
-                    </div>
-                  </div>
-                  <span className={`h-2 w-2 shrink-0 rounded-full ${goalProgress.active ? 'animate-pulse bg-blue-400' : 'bg-emerald-400'}`} />
-                </div>
-                <div className="mt-2 h-1 overflow-hidden rounded-full bg-gray-800">
-                  <div
-                    className="h-full rounded-full bg-indigo-500 transition-all"
-                    style={{ width: `${Math.min(100, ((displayedGoalRound ?? 1) / Math.max(1, goalProgress.maxTurns)) * 100)}%` }}
-                  />
-                </div>
-                {goalProgress.lastReason && (
-                  <div className="mt-2 line-clamp-3 text-[10px] leading-relaxed text-gray-400">
-                    评估器：{goalProgress.lastReason}
-                  </div>
-                )}
-              </section>
-            )}
-            <section className="rounded-lg border border-gray-800 bg-gray-900/55 p-3">
+            <section className="rounded-lg border border-gray-600/60 bg-gray-900/55 p-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <div className="truncate text-xs font-medium text-gray-100" title={job.url}>{job.url}</div>
-                  <div className="mt-1 line-clamp-2 text-[11px] text-gray-500">{job.goal}</div>
+                  {showBrowserGoal && (
+                    <div className="mt-1 line-clamp-2 text-[11px] text-gray-500">{job.goal}</div>
+                  )}
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   <span className={`rounded-full border px-2 py-0.5 text-[10px] ${statusClass(job.status)}`}>
@@ -768,7 +839,7 @@ export function BrowserReviewPanel({
                 <div className="flex items-center gap-1.5 border-b border-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300">
                   <FileText size={13} />审查报告
                 </div>
-                <div className="prose prose-invert prose-sm max-w-none px-3 py-2 text-xs text-gray-300">
+                <div className="prose prose-invert prose-sm max-w-none px-3 py-2 text-xs text-gray-300 prose-headings:text-gray-100 prose-p:text-gray-300 prose-li:text-gray-300 prose-strong:text-gray-200 prose-a:text-indigo-300 prose-code:text-gray-200">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayedRun?.report || job.report}</ReactMarkdown>
                 </div>
               </section>
@@ -781,9 +852,9 @@ export function BrowserReviewPanel({
                 </div>
                 <div className="space-y-2">
                   {displayedRun!.findings.map((finding) => (
-                    <div key={finding.fingerprint || `${finding.scenario_id}-${finding.title}`} className="rounded border border-gray-800 bg-gray-950/55 p-2">
+                    <div key={finding.fingerprint || `${finding.scenario_id}-${finding.title}`} className="rounded border border-gray-600/55 bg-gray-950/55 p-2">
                       <div className="flex items-center gap-2">
-                        <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[9px] uppercase text-gray-300">{finding.severity}</span>
+                        <span className="rounded border border-gray-600/50 bg-gray-900 px-1.5 py-0.5 text-[9px] uppercase text-gray-300">{finding.severity}</span>
                         <span className="text-[11px] font-medium text-gray-200">{finding.title}</span>
                       </div>
                       {finding.actual && <div className="mt-1 text-[10px] leading-relaxed text-gray-500">{finding.actual}</div>}
@@ -800,7 +871,7 @@ export function BrowserReviewPanel({
                     key={item.id}
                     type="button"
                     onClick={() => void download(item.name)}
-                    className="inline-flex items-center gap-1 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-400 hover:border-gray-600 hover:text-gray-200"
+                    className="inline-flex items-center gap-1 rounded border border-gray-600/60 bg-gray-900 px-2 py-1 text-[10px] text-gray-400 hover:border-indigo-500/60 hover:text-gray-200"
                   >
                     <Download size={10} />{item.name}
                   </button>

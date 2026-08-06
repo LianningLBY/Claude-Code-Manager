@@ -18,6 +18,8 @@ FRONTEND_REVIEW_METADATA_KEY = "frontend_review"
 FRONTEND_REVIEW_ACTIVATION_METADATA_KEY = "frontend_review_activation"
 FRONTEND_REVIEW_GOAL_MODE = "goal"
 DEFAULT_FRONTEND_REVIEW_GOAL_MAX_ITERATIONS = 5
+DEFAULT_TASK_GOAL_MAX_TURNS = 30
+_RESTORABLE_TASK_MODES = {"auto", "plan", "loop", "goal"}
 
 
 async def inspect_frontend_review_local_repository(
@@ -227,6 +229,110 @@ def frontend_review_goal_activation(
             secret_id for secret_id in (secret_ids or [])
             if isinstance(secret_id, int) and not isinstance(secret_id, bool)
         ],
+    }
+
+
+def _normalize_frontend_review_restore_state(
+    raw: object,
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    mode = raw.get("mode")
+    if mode not in _RESTORABLE_TASK_MODES:
+        return None
+    goal_condition = raw.get("goal_condition")
+    if goal_condition is not None and not isinstance(goal_condition, str):
+        goal_condition = None
+    goal_max_turns = raw.get("goal_max_turns")
+    if (
+        not isinstance(goal_max_turns, int)
+        or isinstance(goal_max_turns, bool)
+        or goal_max_turns < 1
+    ):
+        goal_max_turns = DEFAULT_TASK_GOAL_MAX_TURNS
+    goal_turns_used = raw.get("goal_turns_used")
+    if (
+        not isinstance(goal_turns_used, int)
+        or isinstance(goal_turns_used, bool)
+        or goal_turns_used < 0
+    ):
+        goal_turns_used = 0
+    goal_last_reason = raw.get("goal_last_reason")
+    if goal_last_reason is not None and not isinstance(goal_last_reason, str):
+        goal_last_reason = None
+    return {
+        "mode": mode,
+        "goal_condition": goal_condition,
+        "goal_max_turns": goal_max_turns,
+        "goal_turns_used": goal_turns_used,
+        "goal_last_reason": goal_last_reason,
+    }
+
+
+def frontend_review_goal_restore_snapshot(task: Task) -> dict[str, Any]:
+    """Capture the mode state to restore after a follow-up review Goal.
+
+    A legacy temporary Goal may already have leaked into an idle Task.  When
+    that happens its activation has no restore snapshot, so normal chat mode is
+    the only safe backward-compatible fallback.
+    """
+
+    metadata = task.metadata_ or {}
+    activation = metadata.get(FRONTEND_REVIEW_ACTIVATION_METADATA_KEY)
+    if (
+        frontend_review_goal_config(metadata) is not None
+        and frontend_review_goal_activation(metadata) is not None
+        and isinstance(activation, dict)
+    ):
+        existing = _normalize_frontend_review_restore_state(
+            activation.get("restore")
+        )
+        if existing is not None:
+            return existing
+        return {
+            "mode": "auto",
+            "goal_condition": None,
+            "goal_max_turns": DEFAULT_TASK_GOAL_MAX_TURNS,
+            "goal_turns_used": 0,
+            "goal_last_reason": None,
+        }
+    return {
+        "mode": (
+            task.mode if task.mode in _RESTORABLE_TASK_MODES else "auto"
+        ),
+        "goal_condition": task.goal_condition,
+        "goal_max_turns": task.goal_max_turns or DEFAULT_TASK_GOAL_MAX_TURNS,
+        "goal_turns_used": max(0, int(task.goal_turns_used or 0)),
+        "goal_last_reason": task.goal_last_reason,
+    }
+
+
+def frontend_review_goal_terminal_updates(task: Task) -> dict[str, Any]:
+    """Return Task updates that close a temporary follow-up review Goal."""
+
+    metadata = task.metadata_ or {}
+    activation = metadata.get(FRONTEND_REVIEW_ACTIVATION_METADATA_KEY)
+    if (
+        frontend_review_goal_config(metadata) is None
+        or frontend_review_goal_activation(metadata) is None
+        or not isinstance(activation, dict)
+    ):
+        return {}
+    restore = _normalize_frontend_review_restore_state(
+        activation.get("restore")
+    ) or {
+        "mode": "auto",
+        "goal_condition": None,
+        "goal_max_turns": DEFAULT_TASK_GOAL_MAX_TURNS,
+        "goal_turns_used": 0,
+        "goal_last_reason": None,
+    }
+    restored_metadata = dict(metadata)
+    restored_metadata.pop(FRONTEND_REVIEW_METADATA_KEY, None)
+    restored_metadata.pop(FRONTEND_REVIEW_ACTIVATION_METADATA_KEY, None)
+    return {
+        **restore,
+        "metadata_": restored_metadata,
     }
 
 

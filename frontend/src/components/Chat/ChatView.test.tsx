@@ -930,7 +930,7 @@ describe('ChatView', () => {
       await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
 
       await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
-      expect(await screen.findByText('等待父 Agent 调用浏览器审查工具')).toBeInTheDocument();
+      expect(await screen.findByText('正在创建新的前端测试')).toBeInTheDocument();
       expect(screen.getByLabelText('Frontend Review progress')).toBeInTheDocument();
     });
 
@@ -1041,7 +1041,7 @@ describe('ChatView', () => {
       ));
       expect(api.sendTaskChat).not.toHaveBeenCalled();
       expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
-      expect(await screen.findByText('当前分支黑盒测试')).toBeInTheDocument();
+      expect(await screen.findByText('Test Harness · current_workspace')).toBeInTheDocument();
       expect(screen.getAllByText('正在校验本地仓库').length).toBeGreaterThan(0);
     });
 
@@ -1052,6 +1052,10 @@ describe('ChatView', () => {
         provider: 'codex',
         model: 'gpt-5.6-sol',
       });
+      let resolveGoalStart!: (task: Task) => void;
+      vi.mocked(api.startFrontendReviewGoal).mockReturnValueOnce(new Promise<Task>((resolve) => {
+        resolveGoalStart = resolve;
+      }));
       render(
         <ChatView
           task={task}
@@ -1071,6 +1075,9 @@ describe('ChatView', () => {
       await userEvent.type(input, '审查设置页桌面和窄屏，修复后重新验证');
       await userEvent.click(screen.getByTitle('启动循环审查 (Ctrl+Enter)'));
 
+      expect(await screen.findByText('Goal 循环审查正在启动')).toBeInTheDocument();
+      expect(screen.getAllByText('审查设置页桌面和窄屏，修复后重新验证').length).toBeGreaterThan(0);
+      expect(screen.getByText(/审查报告不会结束本轮/)).toBeInTheDocument();
       await waitFor(() => expect(api.startFrontendReviewGoal).toHaveBeenCalledWith(
         409,
         {
@@ -1087,11 +1094,124 @@ describe('ChatView', () => {
         },
       ));
       expect(api.sendTaskChat).not.toHaveBeenCalled();
-      expect(onTaskUpdated).toHaveBeenCalled();
+      await act(async () => {
+        resolveGoalStart(makeTask({
+          ...task,
+          status: 'pending',
+          mode: 'goal',
+          goal_max_turns: 5,
+          metadata_: {
+            frontend_review: {
+              mode: 'goal',
+              profile: 'standard',
+              max_iterations: 5,
+            },
+          },
+        }));
+      });
+      await waitFor(() => expect(onTaskUpdated).toHaveBeenCalled());
       await waitFor(() => {
         expect(screen.getByRole('button', { name: '循环审查' }))
           .toHaveAttribute('aria-pressed', 'false');
       });
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:409',
+          data: {
+            event_type: 'tool_use',
+            role: 'assistant',
+            tool_name: 'ccm_workspace_review.test_current_changes',
+            tool_input: JSON.stringify({ goal: '修改后重新检查设置页键盘流程' }),
+            item_id: 'workspace-review-start-1',
+            timestamp: '2026-08-06T02:00:00Z',
+          },
+        });
+      });
+      expect(await screen.findByText('正在创建本轮浏览器复查')).toBeInTheDocument();
+      expect(screen.getByText('修改后重新检查设置页键盘流程')).toBeInTheDocument();
+    });
+
+    it('Goal 已终态时不再显示运行提示，后续输入保持普通对话', async () => {
+      const task = makeTask({
+        id: 411,
+        status: 'completed',
+        mode: 'goal',
+        goal_turns_used: 2,
+        goal_max_turns: 5,
+        metadata_: {
+          frontend_review: {
+            mode: 'goal',
+            profile: 'standard',
+            max_iterations: 5,
+          },
+          frontend_review_activation: {
+            message: '旧版残留的循环审查',
+          },
+        },
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.queryByText(/Goal 审查 · 第/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
+      const input = screen.getByPlaceholderText(/follow-up message/i);
+      await userEvent.type(input, 'Goal 已结束后的普通问题');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+      expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
+    });
+
+    it('终态 status_change 不会被随后到达的 process_exit 恢复成 thinking', async () => {
+      render(
+        <ChatView
+          task={makeTask({
+            id: 412,
+            status: 'executing',
+            mode: 'goal',
+            metadata_: {
+              frontend_review: {
+                mode: 'goal',
+                profile: 'standard',
+                max_iterations: 5,
+              },
+            },
+          })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      expect(screen.getByText(/Goal Agent 第 1 轮正在执行/)).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: 412,
+            new_status: 'completed',
+            background_active: false,
+          },
+        });
+      });
+      expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:412',
+          data: { event_type: 'process_exit', exit_code: 0 },
+        });
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+      });
+      expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/is thinking/)).not.toBeInTheDocument();
     });
 
     it('Task 运行时显示但禁用循环审查按钮', () => {

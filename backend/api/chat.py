@@ -559,6 +559,7 @@ async def send_chat_message(
                 "Task routing changed while chat admission was in progress",
             )
         from backend.api.tasks import (
+            _MANUAL_RETRYABLE_STATUSES,
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
             _require_pr_review_chat_allowed,
@@ -572,6 +573,17 @@ async def send_chat_message(
                 request
             ),
         )
+        if task.status in _MANUAL_RETRYABLE_STATUSES:
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            restore_updates = frontend_review_goal_terminal_updates(task)
+            if restore_updates:
+                for field, value in restore_updates.items():
+                    setattr(task, field, value)
+                await db.commit()
+                await db.refresh(task)
         admitted_routing = _require_expected_task_routing(
             task,
             body.expected_routing,
@@ -862,6 +874,7 @@ async def start_frontend_review_goal(
             FRONTEND_REVIEW_METADATA_KEY,
             build_frontend_review_goal_condition,
             frontend_review_goal_config,
+            frontend_review_goal_restore_snapshot,
         )
 
         review_config = frontend_review_goal_config({
@@ -880,6 +893,7 @@ async def start_frontend_review_goal(
             "message": body.message,
             "file_paths": list(all_paths),
             "secret_ids": list(body.secret_ids or []),
+            "restore": frontend_review_goal_restore_snapshot(current),
         }
         task_updates = {
             "mode": "goal",

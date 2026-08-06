@@ -2,12 +2,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from backend.models.task import Task
 from backend.services.frontend_review_goal import (
+    FRONTEND_REVIEW_ACTIVATION_METADATA_KEY,
     FRONTEND_REVIEW_METADATA_KEY,
     build_frontend_review_goal_condition,
     build_frontend_review_goal_protocol,
     collect_frontend_review_goal_evidence,
     frontend_review_goal_config,
+    frontend_review_goal_restore_snapshot,
+    frontend_review_goal_terminal_updates,
 )
 
 
@@ -40,6 +44,46 @@ def test_frontend_review_goal_condition_and_protocol_require_browser_recheck():
     assert "check_current_changes_review" in protocol
     assert "cleanup_status=completed" in protocol
     assert "安全上限为 5 轮" in protocol
+
+
+def test_followup_frontend_review_goal_restores_prior_task_mode_state():
+    task = Task(
+        mode="plan",
+        goal_condition="prior condition",
+        goal_max_turns=17,
+        goal_turns_used=4,
+        goal_last_reason="prior reason",
+        metadata_={"keep": "binding"},
+    )
+    snapshot = frontend_review_goal_restore_snapshot(task)
+    task.mode = "goal"
+    task.goal_condition = "temporary review"
+    task.goal_max_turns = 5
+    task.goal_turns_used = 2
+    task.goal_last_reason = "review passed"
+    task.metadata_ = {
+        "keep": "binding",
+        FRONTEND_REVIEW_METADATA_KEY: {
+            "mode": "goal",
+            "profile": "standard",
+            "max_iterations": 5,
+        },
+        FRONTEND_REVIEW_ACTIVATION_METADATA_KEY: {
+            "message": "review this branch",
+            "file_paths": [],
+            "secret_ids": [],
+            "restore": snapshot,
+        },
+    }
+
+    assert frontend_review_goal_terminal_updates(task) == {
+        "mode": "plan",
+        "goal_condition": "prior condition",
+        "goal_max_turns": 17,
+        "goal_turns_used": 4,
+        "goal_last_reason": "prior reason",
+        "metadata_": {"keep": "binding"},
+    }
 
 
 @pytest.mark.asyncio

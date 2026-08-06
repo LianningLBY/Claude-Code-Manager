@@ -4833,6 +4833,16 @@ class GlobalDispatcher:
                 )
                 status = "pending"
             else:
+                from backend.services.frontend_review_goal import (
+                    frontend_review_goal_terminal_updates,
+                )
+
+                terminal_values = {
+                    "status": "failed",
+                    "error_message": reason,
+                    "completed_at": datetime.utcnow(),
+                    **frontend_review_goal_terminal_updates(task),
+                }
                 changed = await db.execute(
                     update(Task)
                     .where(
@@ -4841,11 +4851,7 @@ class GlobalDispatcher:
                         ),
                         task_retry_not_superseded_predicate(),
                     )
-                    .values(
-                        status="failed",
-                        error_message=reason,
-                        completed_at=datetime.utcnow(),
-                    )
+                    .values(**terminal_values)
                 )
                 status = "failed"
 
@@ -4906,6 +4912,16 @@ class GlobalDispatcher:
                 task.pty_background_generation is not None
             )
             observed_generation = self._task_status_generation(task)
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            terminal_values = {
+                "status": "completed",
+                "completed_at": datetime.utcnow(),
+                "error_message": None,
+                **frontend_review_goal_terminal_updates(task),
+            }
             changed = await db.execute(
                 update(Task)
                 .where(
@@ -4914,11 +4930,7 @@ class GlobalDispatcher:
                     ),
                     task_retry_not_superseded_predicate(),
                 )
-                .values(
-                    status="completed",
-                    completed_at=datetime.utcnow(),
-                    error_message=None,
-                )
+                .values(**terminal_values)
             )
             if not changed.rowcount:
                 await db.rollback()
@@ -4978,6 +4990,16 @@ class GlobalDispatcher:
             if task is None:
                 return False
             observed_generation = self._task_status_generation(task)
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            terminal_values = {
+                "status": "failed",
+                "error_message": reason,
+                "completed_at": datetime.utcnow(),
+                **frontend_review_goal_terminal_updates(task),
+            }
             changed = await db.execute(
                 update(Task)
                 .where(
@@ -4986,11 +5008,7 @@ class GlobalDispatcher:
                     ),
                     task_retry_not_superseded_predicate(),
                 )
-                .values(
-                    status="failed",
-                    error_message=reason,
-                    completed_at=datetime.utcnow(),
-                )
+                .values(**terminal_values)
             )
             if not changed.rowcount:
                 await db.rollback()

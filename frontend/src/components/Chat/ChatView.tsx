@@ -27,6 +27,7 @@ import {
   BrowserReviewPanel,
   type BrowserReviewDisplayMode,
   type BrowserReviewGoalProgress,
+  type BrowserReviewGoalStart,
 } from './BrowserReviewPanel';
 import {
   isLegacyCodexCollabCompleted,
@@ -48,6 +49,22 @@ interface ChatViewProps {
 interface QueuedMessage {
   text: string;
   uploadResults?: UploadResult[];
+}
+
+const WORKSPACE_REVIEW_START_TOOLS = new Set([
+  'ccm_workspace_review.test_current_changes',
+  'ccm_workspace_review.test_git_target',
+]);
+
+function workspaceReviewGoalFromToolInput(rawInput: unknown): string | null {
+  if (typeof rawInput !== 'string' || !rawInput.trim()) return null;
+  try {
+    const parsed = JSON.parse(rawInput) as Record<string, unknown>;
+    const goal = parsed.goal ?? parsed.objective;
+    return typeof goal === 'string' && goal.trim() ? goal.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 interface LiveStreamCacheEntry {
@@ -514,6 +531,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [workspaceReviewCapability, setWorkspaceReviewCapability] = useState<WorkspaceReviewCapabilities | null>(null);
   const [startedWorkspaceReview, setStartedWorkspaceReview] = useState<TestHarnessRun | null>(null);
   const [expectedWorkspaceReviewBaseline, setExpectedWorkspaceReviewBaseline] = useState<string | null | undefined>(undefined);
+  const [frontendReviewGoalStart, setFrontendReviewGoalStart] = useState<BrowserReviewGoalStart | null>(null);
+  const [frontendReviewGoalLocallyActive, setFrontendReviewGoalLocallyActive] = useState(
+    task.metadata_?.frontend_review?.mode === 'goal'
+      && ['pending', 'in_progress', 'executing'].includes(task.status),
+  );
+  const frontendReviewGoalRequestSequence = useRef(0);
+  const signalledWorkspaceReviewItemsRef = useRef(new Set<string>());
+  const frontendReviewGoalActiveRef = useRef(
+    task.metadata_?.frontend_review?.mode === 'goal'
+      && ['pending', 'in_progress', 'executing'].includes(task.status),
+  );
   const [frontendReviewGoalCapabilityLoading, setFrontendReviewGoalCapabilityLoading] = useState(false);
   const [browserReviewDisplayMode, setBrowserReviewDisplayMode] = useState<BrowserReviewDisplayMode>(() => (
     localStorage.getItem('ccm-browser-review-display-mode') === 'floating' ? 'floating' : 'docked'
@@ -537,6 +565,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const handleExpectedWorkspaceReviewFound = useCallback(() => {
     setExpectedWorkspaceReviewBaseline(undefined);
   }, []);
+  const handleFrontendReviewGoalFound = useCallback(() => {
+    setFrontendReviewGoalStart(null);
+  }, []);
 
   useEffect(() => {
     previousBrowserReviewAvailable.current = false;
@@ -546,6 +577,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setWorkspaceReviewComposerMode(false);
     setStartedWorkspaceReview(null);
     setExpectedWorkspaceReviewBaseline(undefined);
+    setFrontendReviewGoalStart(null);
+    setFrontendReviewGoalLocallyActive(false);
+    signalledWorkspaceReviewItemsRef.current.clear();
+    frontendReviewGoalActiveRef.current = false;
   }, [task.id]);
 
   useEffect(() => {
@@ -659,6 +694,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         ? '正在确认可修改的本地 Git 仓库…'
         : workspaceReviewCapability?.reason || frontendReviewGoalCapability?.reason || '尚未确认存在可修改的本地 Git 仓库';
   const isFrontendReviewGoal = task.metadata_?.frontend_review?.mode === 'goal';
+  const frontendReviewGoalTaskActive = ['pending', 'in_progress', 'executing'].includes(effectiveStatus);
+  const showFrontendReviewGoal = frontendReviewGoalStart !== null
+    || ((isFrontendReviewGoal || frontendReviewGoalLocallyActive) && frontendReviewGoalTaskActive);
+  useEffect(() => {
+    if (frontendReviewGoalStart !== null || (isFrontendReviewGoal && frontendReviewGoalTaskActive)) {
+      frontendReviewGoalActiveRef.current = true;
+      setFrontendReviewGoalLocallyActive(true);
+    } else if (!frontendReviewGoalTaskActive) {
+      frontendReviewGoalActiveRef.current = false;
+      setFrontendReviewGoalLocallyActive(false);
+    }
+  }, [frontendReviewGoalStart, frontendReviewGoalTaskActive, isFrontendReviewGoal]);
   const [frontendReviewGoalProgress, setFrontendReviewGoalProgress] = useState<BrowserReviewGoalProgress>({
     turn: task.goal_turns_used || 0,
     maxTurns: task.goal_max_turns || 5,
@@ -903,6 +950,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (newStatus) {
         lastWsStatusAt.current = Date.now();
         setLocalStatus(newStatus);
+        if (['completed', 'failed', 'cancelled', 'conflict'].includes(newStatus)) {
+          frontendReviewGoalActiveRef.current = false;
+          setFrontendReviewGoalLocallyActive(false);
+          setFrontendReviewGoalStart(null);
+        }
       }
       return;
     }
@@ -943,6 +995,30 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         active: !msg.data.achieved,
       });
       return;
+    }
+    const workspaceReviewToolName = typeof msg.data.tool_name === 'string'
+      ? msg.data.tool_name
+      : '';
+    if (
+      eventType === 'tool_use'
+      && frontendReviewGoalActiveRef.current
+      && WORKSPACE_REVIEW_START_TOOLS.has(workspaceReviewToolName)
+    ) {
+      const itemKey = typeof msg.data.item_id === 'string'
+        ? msg.data.item_id
+        : `${workspaceReviewToolName}:${String(msg.data.timestamp || '')}`;
+      if (!signalledWorkspaceReviewItemsRef.current.has(itemKey)) {
+        signalledWorkspaceReviewItemsRef.current.add(itemKey);
+        setFrontendReviewGoalStart((current) => ({
+          requestId: ++frontendReviewGoalRequestSequence.current,
+          prompt: workspaceReviewGoalFromToolInput(msg.data!.tool_input)
+            || current?.prompt
+            || '按当前 Goal 对最新代码创建新的浏览器审查',
+          maxTurns: current?.maxTurns || task.goal_max_turns || 5,
+          phase: 'starting_review',
+        }));
+        setShowBrowserReviewPanel(true);
+      }
     }
     if (eventType === 'monitor_session_created' || eventType === 'monitor_session_status'
         || eventType === 'sub_agent_session_created' || eventType === 'sub_agent_session_status') {
@@ -1134,7 +1210,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           return;
         }
         setSending(false);
-        setLocalStatus(null);  // Reset — status_change WS may have been missed
+        // Keep an already observed terminal status sticky. A late process_exit
+        // must not revive stale `task.status=executing` props and bring the
+        // Goal/thinking indicator back after completion.
+        setLocalStatus((current) => (
+          ['completed', 'failed', 'cancelled', 'conflict'].includes(current || '')
+            ? current
+            : null
+        ));
         setAutoDequeueFlag(f => f + 1);
         // Replace live-only bubbles with their persisted LogEntry ids so every
         // completed Codex turn immediately becomes a valid fork anchor.
@@ -1509,7 +1592,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   useEffect(() => {
     if (
       !backgroundActive
-      && ['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)
+      && ['completed', 'failed', 'cancelled', 'conflict', 'pending'].includes(effectiveStatus)
     ) {
       clearLiveStreamCache(task.id);
       setSending(false);
@@ -1832,6 +1915,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setError(null);
 
     let optimisticMessageId: number | null = null;
+    let frontendReviewGoalRequestId: number | null = null;
     try {
       let uploadedPaths: string[] | undefined;
       const uploadedResults = uploadedResultsForTurn;
@@ -1859,6 +1943,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
 
       if (frontendReviewComposerMode && !fromQueue) {
+        frontendReviewGoalRequestId = ++frontendReviewGoalRequestSequence.current;
+        frontendReviewGoalActiveRef.current = true;
+        setFrontendReviewGoalLocallyActive(true);
+        setFrontendReviewGoalStart({
+          requestId: frontendReviewGoalRequestId,
+          prompt: text,
+          maxTurns: 5,
+          phase: 'starting_goal',
+        });
+        setFrontendReviewGoalProgress({
+          turn: 0,
+          maxTurns: 5,
+          lastReason: null,
+          active: true,
+        });
+        setShowBrowserReviewPanel(true);
         const activatedTask = await api.startFrontendReviewGoal(task.id, {
           message: text,
           file_paths: uploadedPaths,
@@ -1879,6 +1979,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           lastReason: null,
           active: true,
         });
+        setFrontendReviewGoalStart((current) => (
+          current?.requestId === frontendReviewGoalRequestId
+            ? { ...current, maxTurns: activatedTask.goal_max_turns || 5 }
+            : current
+        ));
         onTaskUpdated?.();
       } else {
         const chatResponse = await api.sendTaskChat(
@@ -1906,6 +2011,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       setModelOverride(null);
     } catch (e) {
       setSending(false);
+      if (frontendReviewGoalRequestId !== null) {
+        setFrontendReviewGoalStart((current) => (
+          current?.requestId === frontendReviewGoalRequestId ? null : current
+        ));
+        setFrontendReviewGoalLocallyActive(false);
+        frontendReviewGoalActiveRef.current = false;
+      }
       if (optimisticMessageId !== null) {
         setMessages((current) =>
           current.filter((message) => message.id !== optimisticMessageId)
@@ -1969,7 +2081,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 后台运行中
               </span>
             )}
-            {isFrontendReviewGoal && (
+            {showFrontendReviewGoal && (
               <span
                 className="whitespace-nowrap rounded bg-indigo-500/20 px-1.5 text-xs font-medium text-indigo-300"
                 title={frontendReviewGoalProgress.lastReason || '模型将自动判断是否继续下一轮'}
@@ -2523,9 +2635,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           )
         )}
         {isProcessing && (
-          <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
+          <div className="flex gap-2 items-start text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
-            <span>{providerLabel} is thinking...</span>
+            {showFrontendReviewGoal ? (
+              <div>
+                <div>Goal Agent 第 {Math.max(1, frontendReviewGoalProgress.turn + 1)} 轮正在执行…</div>
+                <div className="mt-0.5 text-[11px] text-gray-500">
+                  审查报告不会结束本轮；Agent 会继续处理必要修改、构建测试和修改后复查。
+                </div>
+              </div>
+            ) : (
+              <span>{providerLabel} is thinking...</span>
+            )}
           </div>
         )}
         <div ref={bottomRef} className="h-4" />
@@ -2953,7 +3074,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           startedWorkspaceRun={startedWorkspaceReview}
           expectedWorkspaceReviewBaseline={expectedWorkspaceReviewBaseline}
           onExpectedWorkspaceReviewFound={handleExpectedWorkspaceReviewFound}
-          goalProgress={isFrontendReviewGoal ? frontendReviewGoalProgress : undefined}
+          goalStart={frontendReviewGoalStart}
+          onGoalReviewFound={handleFrontendReviewGoalFound}
+          goalProgress={showFrontendReviewGoal ? frontendReviewGoalProgress : undefined}
         />
       </div>
     </div>

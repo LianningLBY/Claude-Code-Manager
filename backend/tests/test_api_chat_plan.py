@@ -1047,6 +1047,13 @@ async def test_chat_can_start_frontend_review_goal_on_same_task(
         "message": "审查登录页桌面和移动端，修复后重新验证",
         "file_paths": ["/tmp/login-reference.png"],
         "secret_ids": [],
+        "restore": {
+            "mode": "auto",
+            "goal_condition": None,
+            "goal_max_turns": 30,
+            "goal_turns_used": 0,
+            "goal_last_reason": None,
+        },
     }
 
     async with session_factory() as db:
@@ -1178,6 +1185,61 @@ async def test_chat_send_enqueues_message(client, session_factory):
     ]
     assert len(task_broadcasts) == 1
     assert task_broadcasts[0][0][1]["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_chat_closes_legacy_terminal_frontend_review_goal_before_enqueue(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        status="completed",
+        mode="goal",
+        goal_condition="temporary browser review",
+        goal_max_turns=5,
+        goal_turns_used=2,
+        goal_last_reason="review passed",
+        metadata_={
+            "keep": "account-binding",
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 5,
+            },
+            # Legacy activations did not contain a restore snapshot.
+            "frontend_review_activation": {
+                "message": "审查并修复前端",
+                "file_paths": [],
+                "secret_ids": [],
+            },
+        },
+    )
+    mock_d = _mock_dispatcher()
+    mock_broadcaster = MagicMock()
+    mock_broadcaster.broadcast = AsyncMock()
+
+    with patch("backend.main.dispatcher", mock_d), patch(
+        "backend.main.broadcaster",
+        mock_broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "这是 Goal 结束后的普通后续问题"},
+        )
+
+    assert response.status_code == 200, response.text
+    mock_d.enqueue_message.assert_awaited_once()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.mode == "auto"
+        assert task.goal_condition is None
+        assert task.goal_max_turns == 30
+        assert task.goal_turns_used == 0
+        assert task.goal_last_reason is None
+        assert task.metadata_ == {"keep": "account-binding"}
 
 
 @pytest.mark.asyncio

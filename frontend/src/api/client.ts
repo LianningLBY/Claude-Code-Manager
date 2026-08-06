@@ -187,6 +187,49 @@ export interface Project {
   location?: string;  // "local" or worker name
 }
 
+export interface SSHProfile {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  key_path_hint: string;
+  public_key_fingerprint: string;
+  host_key_type: string;
+  host_key_fingerprint: string;
+  revision: number;
+  enabled: boolean;
+  created_by: number | null;
+  last_tested_at: string | null;
+  last_test_ok: boolean | null;
+  last_error_code: string | null;
+  last_error_detail: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SSHProfileInput {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  key_path: string;
+  host_key_value: string;
+  enabled: boolean;
+}
+
+export interface SSHHostKeyProbe {
+  key_type: string;
+  host_key_value: string;
+  fingerprint: string;
+}
+
+export interface SSHProfileTestResult {
+  ok: boolean;
+  error_code: string | null;
+  detail: string | null;
+}
+
 export type ProjectTodoStatus = 'open' | 'done' | 'archived';
 
 export interface ProjectTodo {
@@ -1989,6 +2032,44 @@ export const api = {
   },
 
   // Files (SSH)
+  listSSHProfiles: () =>
+    request<SSHProfile[]>('/api/ssh-profiles'),
+  createSSHProfile: (data: SSHProfileInput) =>
+    request<SSHProfile>('/api/ssh-profiles', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateSSHProfile: (id: number, data: Partial<SSHProfileInput>) =>
+    request<SSHProfile>(`/api/ssh-profiles/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteSSHProfile: (id: number) =>
+    request<{ ok: boolean }>(`/api/ssh-profiles/${id}`, { method: 'DELETE' }),
+  probeSSHHostKey: (data: { host: string; port: number; timeout_seconds?: number }) =>
+    request<SSHHostKeyProbe>('/api/ssh-profiles/probe-host-key', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  testSSHProfile: (id: number) =>
+    request<SSHProfileTestResult>(`/api/ssh-profiles/${id}/test`, { method: 'POST' }),
+  managedSSHListDir: (profileId: number, path: string) =>
+    request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[] }>(`/api/files/ssh/${profileId}/list`, { method: 'POST', body: JSON.stringify({ path }) }),
+  managedSSHReadFile: (profileId: number, path: string) =>
+    request<{ path: string; content: string; size: number }>(`/api/files/ssh/${profileId}/read`, { method: 'POST', body: JSON.stringify({ path }) }),
+  managedSSHDownloadFile: async (profileId: number, path: string) => {
+    const token = getToken();
+    const res = await fetch(`${getBase()}/api/files/ssh/${profileId}/download`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ path }),
+    });
+    await validateAuthenticatedDownloadResponse(res);
+    return res;
+  },
   sshListDir: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>
     request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[] }>('/api/files/ssh/list', { method: 'POST', body: JSON.stringify({ ...creds, path }) }),
   sshReadFile: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>

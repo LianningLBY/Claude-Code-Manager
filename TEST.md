@@ -1217,6 +1217,26 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 |----------|----------|------|
 | `frontend/src/components/Chat/ChatView.test.tsx` | `copies a user message without its sender prefix` | 用户消息保留 `[发送者]` 的界面显示，但复制时只写入消息正文 |
 
+## Auto Capability policy（dark rollout）
+
+```bash
+uv run pytest -q backend/tests/test_auto_capability_policy.py \
+  backend/tests/test_api_system.py -k 'auto_capability or policy'
+```
+
+| 测试 | 覆盖 |
+|------|------|
+| `test_policy_rejects_ambiguous_or_unbounded_shapes` | V1 静态 Plan/Review 白名单、严格整数、总预算/分类预算、未知字段与硬上限 |
+| `test_task_policy_is_create_only_and_local_auto_only` | policy 只在本机普通 Auto Task 创建时冻结；PUT、Worker 与非 Auto 明确拒绝 |
+| `test_default_policy_is_real_sql_null` | 默认关闭持久化为 SQL `NULL`，不落 JSON `null` |
+| `test_project_worker_resolution_rejects_policy_before_task_write` | Project 解析出远端 Worker 后仍在任何 Task 副作用前 fail closed |
+| `test_clone_requires_explicit_policy_opt_in` | clone 不继承源 Task 的自动能力授权 |
+| `test_auto_capability_switch_is_independent_and_fail_closed` | `AUTO_CAPABILITY_ENABLED` 独立默认关闭，且 Capability Core 关闭时有效值仍为 false |
+
+本阶段只部署 policy/API/类型边界；`create_agent_invocation` 必须继续拒绝，直到
+exact terminal output、原子预算消费、`waiting_capability` 与 durable resume outbox
+全部接通并通过崩溃恢复测试。
+
 ## 开发规范
 
 ### Claude Code 开发时必须遵守：
@@ -1253,6 +1273,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/container_manager.py`（容器 `/tmp`） | `backend/tests/test_container_manager.py` |
 | `backend/api/files.py`（SSH 下载临时文件） | `backend/tests/test_api_files.py` |
 | `backend/services/task_artifact_contract.py` + `backend/api/task_artifacts.py` + Task 产物提示/Worker capability | `backend/tests/test_api_task_artifacts.py` + `backend/tests/test_service_dispatcher.py` + `backend/tests/test_api_system.py`（跨 Task namespace、旧 Worker fail-closed、伪造 tag、非法项目根） |
+| `backend/services/auto_capability_policy.py` + Task policy schemas/API | `backend/tests/test_auto_capability_policy.py` + `backend/tests/test_api_system.py` |
 | `backend/services/token_manager_service.py` | `backend/tests/test_service_token_manager.py` |
 | `backend/schemas/task.py` (datetime serialization) | `backend/tests/test_task_schema.py` |
 | `backend/api/chat.py` (timestamp Z suffix) | `backend/tests/test_chat_timestamp.py` |

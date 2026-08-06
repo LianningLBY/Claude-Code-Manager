@@ -124,7 +124,10 @@ class Task(Base):
     )
     # Frozen per-Task allow/budget policy for model-requested capabilities.
     # NULL means the capability surface is unavailable for this Task.
-    capability_policy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    capability_policy: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True),
+        nullable=True,
+    )
     # DeliveryRun is Manager authority and is not mirrored as a foreign key on
     # remote Workers.  The controller is the only writer of these routing
     # fields; ordinary Task APIs must not synthesize a delivery-owned Task.

@@ -9,6 +9,9 @@ from backend.config import settings
 from backend.models.task import Task
 from backend.models.task_share import TaskShare
 from backend.models.team_share import TeamTaskShare
+from backend.services.auto_capability_policy import (
+    validate_auto_capability_task_scope,
+)
 from backend.services.codex_models import validate_codex_service_tier
 
 
@@ -56,6 +59,22 @@ def prepare_task_create_values(values: Mapping[str, object]) -> dict:
     """Return canonical persisted values shared by every creation adapter."""
 
     prepared = dict(values)
+    policy = validate_auto_capability_task_scope(
+        prepared.get("capability_policy"),
+        task_id=prepared.get("id"),
+        mode=prepared.get("mode") or "auto",
+        worker_id=prepared.get("worker_id"),
+        shared_from_id=prepared.get("shared_from_id"),
+        delivery_run_id=prepared.get("delivery_run_id"),
+        delivery_role=prepared.get("delivery_role"),
+        plan_target_task_id=prepared.get("plan_target_task_id"),
+    )
+    if policy is None:
+        # Generic JSON otherwise serializes Python None as a JSON ``null`` on
+        # some dialects. Omission preserves the SQL NULL disabled state.
+        prepared.pop("capability_policy", None)
+    else:
+        prepared["capability_policy"] = policy
     provider, model, effort_level = resolve_task_runtime_defaults(
         provider=prepared.get("provider"),
         model=prepared.get("model"),

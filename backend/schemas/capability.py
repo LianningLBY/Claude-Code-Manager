@@ -1,8 +1,75 @@
 """Public and internal schema contracts for generic task capabilities."""
 
 from datetime import datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+AUTO_CAPABILITY_KEYS = ("plan", "code_review")
+MAX_AUTO_CAPABILITY_INVOCATIONS = 8
+AutoCapabilityKey = Literal["plan", "code_review"]
+AutoCapabilityLimit = Annotated[
+    int,
+    Field(strict=True, ge=1, le=MAX_AUTO_CAPABILITY_INVOCATIONS),
+]
+
+
+class AutoCapabilityPolicy(BaseModel):
+    """Frozen allowlist and non-refundable budgets for Agent requests.
+
+    Mapping keys are the allowlist, so authorization and per-capability budgets
+    cannot drift into two contradictory representations.  SQL ``NULL`` on the
+    Task remains the only disabled state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    max_invocations: AutoCapabilityLimit
+    capabilities: dict[AutoCapabilityKey, AutoCapabilityLimit]
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def require_strict_version(cls, value: object) -> object:
+        if type(value) is not int or value != 1:
+            raise ValueError("version must be the integer 1")
+        return value
+
+    @field_validator("capabilities")
+    @classmethod
+    def normalize_capabilities(
+        cls,
+        value: dict[AutoCapabilityKey, int],
+    ) -> dict[AutoCapabilityKey, int]:
+        if not value:
+            raise ValueError("at least one capability budget is required")
+        return {
+            key: value[key]
+            for key in AUTO_CAPABILITY_KEYS
+            if key in value
+        }
+
+    @model_validator(mode="after")
+    def validate_budget_relationships(self):
+        if any(
+            limit > self.max_invocations
+            for limit in self.capabilities.values()
+        ):
+            raise ValueError(
+                "per-capability budgets cannot exceed max_invocations"
+            )
+        if self.max_invocations > sum(self.capabilities.values()):
+            raise ValueError(
+                "max_invocations cannot exceed the available capability budgets"
+            )
+        return self
 
 
 class CapabilityInvocationCreate(BaseModel):

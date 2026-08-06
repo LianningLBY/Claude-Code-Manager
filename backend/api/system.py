@@ -89,6 +89,10 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "versioned_plan_worker_protocol": 3,
         "plan_pipeline_defaults": plan_pipeline.model_dump(mode="json"),
         "capability_core_enabled": settings.capability_core_enabled,
+        "auto_capability_enabled": (
+            settings.auto_capability_enabled
+            and settings.capability_core_enabled
+        ),
         "delivery_loop_enabled": (
             settings.delivery_loop_enabled
             and settings.capability_core_enabled

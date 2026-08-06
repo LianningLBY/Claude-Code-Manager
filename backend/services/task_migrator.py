@@ -294,8 +294,8 @@ class TaskMigrator:
             # capability execution locality through truthiness.
             if task.capability_policy is not None:
                 raise MigrationError(
-                    "Auto capability requests are local-only; remove the "
-                    "Task capability policy before migrating"
+                    "Auto capability policy is immutable and local-only; "
+                    "create a new Task without it before migrating"
                 )
             if task.worker_turn_handoff_id is not None:
                 raise MigrationError(

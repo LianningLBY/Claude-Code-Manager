@@ -11,6 +11,7 @@ from pydantic import (
 )
 
 from backend.config import settings
+from backend.schemas.capability import AutoCapabilityPolicy
 from backend.schemas.plan import PlanPipelineConfig
 
 
@@ -62,6 +63,9 @@ class TaskCreate(BaseModel):
     priority: int = 0
     max_retries: int = 2
     mode: TaskMode = "auto"
+    # Explicit opt-in for model-requested Plan/Review. ``None`` is the only
+    # disabled state; a non-NULL policy is immutable for this Task incarnation.
+    capability_policy: AutoCapabilityPolicy | None = None
     # Reserved for the Delivery Controller.  They are declared explicitly so
     # a public caller cannot smuggle ownership hints through Pydantic's legacy
     # extra-field compatibility.  ``None`` remains harmless for clients that
@@ -126,6 +130,15 @@ class TaskCreate(BaseModel):
                 "delivery_run_id and delivery_role are reserved for the "
                 "Delivery Controller"
             )
+        if self.capability_policy is not None:
+            if self.mode != "auto":
+                raise ValueError("capability_policy requires mode=auto")
+            if self.worker_id is not None:
+                raise ValueError("capability_policy is local-task only")
+            if self.id is not None:
+                raise ValueError(
+                    "Manager-forwarded Worker Tasks cannot use capability_policy"
+                )
         if self.mode not in ('loop',) and not self.description:
             raise ValueError('description is required for non-loop tasks')
         if self.mode == 'loop' and not self.todo_file_path:
@@ -143,6 +156,9 @@ class TaskMigrationImport(TaskCreate):
     """
 
     id: int
+    # Auto capability history and resume state are Manager-local.  Inheriting
+    # TaskCreate must never make the migration transport accept this field.
+    capability_policy: None = None
     # Accept the reserved wire value so the internal endpoint can reject it
     # with a lifecycle conflict (409) instead of letting schema validation
     # disguise an attempted Delivery ownership migration as malformed input.
@@ -261,6 +277,12 @@ class TaskUpdate(BaseModel):
     max_iterations: int | None = None
     must_complete: bool | None = None
     mode: TaskMode | None = None
+    # Reserve the wire name so old Pydantic extra-field behavior cannot turn a
+    # policy mutation into a misleading 200 response. Policies are create-only.
+    capability_policy: AutoCapabilityPolicy | None = Field(
+        default=None,
+        exclude=True,
+    )
     goal_condition: str | None = None
     goal_max_turns: int | None = None
     goal_evaluator_model: str | None = None
@@ -296,6 +318,12 @@ class TaskUpdate(BaseModel):
     def normalize_attention_tag(cls, value: object) -> object:
         return _normalize_attention_tag(value)
 
+    @model_validator(mode="after")
+    def reject_capability_policy_mutation(self):
+        if "capability_policy" in self.model_fields_set:
+            raise ValueError("capability_policy is immutable after Task creation")
+        return self
+
 
 class TaskResponse(BaseModel):
     id: int
@@ -315,6 +343,7 @@ class TaskResponse(BaseModel):
     turn_generation: int
     max_retries: int
     mode: str
+    capability_policy: AutoCapabilityPolicy | None = None
     delivery_run_id: int | None = None
     delivery_role: str | None = None
     # Read-only DeliveryRun projection.  A Delivery-owned Task remains a

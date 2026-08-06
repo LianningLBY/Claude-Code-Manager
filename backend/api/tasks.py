@@ -77,6 +77,9 @@ from backend.services.worker_routing_config import (
     with_pending_worker_routing,
     without_pending_worker_routing,
 )
+from backend.services.auto_capability_policy import (
+    validate_auto_capability_task_scope,
+)
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
@@ -777,6 +780,24 @@ async def create_task(
     if project is None:
         await require_worker_target_access(request, target_worker_id, db)
 
+    try:
+        normalized_policy = validate_auto_capability_task_scope(
+            data.get("capability_policy"),
+            task_id=data.get("id"),
+            mode=data.get("mode"),
+            worker_id=target_worker_id,
+            shared_from_id=data.get("shared_from_id"),
+            delivery_run_id=data.get("delivery_run_id"),
+            delivery_role=data.get("delivery_role"),
+            plan_target_task_id=data.get("plan_target_task_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if normalized_policy is None:
+        data.pop("capability_policy", None)
+    else:
+        data["capability_policy"] = normalized_policy
+
     if data.get("id") is None:
         data.pop("id", None)  # 未指定 → 正常自增；指定 → 用 Manager 分配的全局 ID
     image_paths = data.pop("image_paths", None)
@@ -1055,6 +1076,17 @@ async def import_migrated_task(
     existing = await db.get(Task, body.id)
     if existing is not None:
         _require_not_delivery_owned_task(existing, action="migration-imported")
+        # Migration import may refresh an inert Worker copy, but it must never
+        # repurpose a same-id local Auto Task that carries immutable capability
+        # authority.  The wire schema deliberately omits the policy, so merely
+        # excluding that field from the UPDATE would retain it on the imported
+        # Worker mirror and bypass the local-only scope boundary.
+        if existing.capability_policy is not None:
+            raise HTTPException(
+                409,
+                "Destination Task has an immutable local Auto capability "
+                "policy and cannot be migration-imported",
+            )
 
     data = body.model_dump()
     source_status = data.pop("source_status")
@@ -2291,6 +2323,21 @@ async def update_task(
     if user_skill_snapshots is not None:
         require_admin(request)
     try:
+        effective_policy_worker_id = task.worker_id
+        if "worker_id" in updates:
+            requested_worker_id = updates["worker_id"]
+            effective_policy_worker_id = (
+                None if requested_worker_id == -1 else requested_worker_id
+            )
+        validate_auto_capability_task_scope(
+            task.capability_policy,
+            mode=updates.get("mode", task.mode),
+            worker_id=effective_policy_worker_id,
+            shared_from_id=task.shared_from_id,
+            delivery_run_id=task.delivery_run_id,
+            delivery_role=task.delivery_role,
+            plan_target_task_id=task.plan_target_task_id,
+        )
         validate_task_service_tier_configuration(
             provider=updates.get("provider", task.provider),
             model=updates.get("model", task.model),

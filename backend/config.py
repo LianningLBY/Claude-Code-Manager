@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     capability_coordinator_scan_limit: int = 64
     capability_coordinator_initial_backoff_seconds: float = 1.0
     capability_coordinator_max_backoff_seconds: float = 60.0
+    # Model-requested Plan/Review admission is a separate opt-in from Human
+    # advisory capabilities and the Delivery Controller.
+    auto_capability_enabled: bool = False
     # Autonomous Plan -> Code -> Review -> PR Monitor controller. Admission is
     # dark by default because enabling it can push a branch and create a PR;
     # V1 still stops before merge.

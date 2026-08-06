@@ -125,8 +125,8 @@ async def test_task_and_log_exact_turn_identity_round_trip(db_session):
         turn_generation=generation,
         capability_policy={
             "version": 1,
-            "allowed": ["plan", "code_review"],
             "max_invocations": 2,
+            "capabilities": {"plan": 1, "code_review": 1},
         },
     )
     db_session.add(task)
@@ -145,8 +145,8 @@ async def test_task_and_log_exact_turn_identity_round_trip(db_session):
     assert task.turn_generation == generation
     assert task.capability_policy == {
         "version": 1,
-        "allowed": ["plan", "code_review"],
         "max_invocations": 2,
+        "capabilities": {"plan": 1, "code_review": 1},
     }
     assert entry.task_turn_generation == generation
     assert entry.native_turn_id == "turn_native_123"

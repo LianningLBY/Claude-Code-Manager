@@ -526,6 +526,9 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `WORKSPACE_DIR` | `~/Projects` | 项目 clone 目标目录 |
 | `MAX_CONCURRENT_INSTANCES` | `5` | 最大并发 worker 数 |
 | `AUTO_START_DISPATCHER` | `true` | 启动时自动开始调度 |
+| `CAPABILITY_CORE_ENABLED` | `false` | 允许新建人工/Controller Capability invocation；已接纳工作不受关闭影响 |
+| `AUTO_CAPABILITY_ENABLED` | `false` | 独立允许模型请求 Plan/Code Review；同时要求 Capability Core，当前执行入口仍保持关闭 |
+| `DELIVERY_LOOP_ENABLED` | `false` | 允许新建 Delivery Loop；同时要求 Capability Core |
 | `TASK_TIMEOUT_SECONDS` | `1800` | 单个任务最长执行时间（秒） |
 | `SERVICE_NAME` | (自动检测) | systemd 服务名，一键更新重启时使用 |
 

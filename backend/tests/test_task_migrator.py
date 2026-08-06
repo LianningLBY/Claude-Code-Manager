@@ -146,13 +146,17 @@ async def test_auto_capability_policy_rejects_migration_before_side_effects(
     worker = await _mk_worker(session_factory)
     task = await _mk_task(
         session_factory,
-        capability_policy={"allowed": ["plan"]},
+        capability_policy={
+            "version": 1,
+            "max_invocations": 1,
+            "capabilities": {"plan": 1},
+        },
     )
     relay = FakeRelay()
     migrator = _migrator(db_factory, relay)
     migrator._get_worker = AsyncMock()
 
-    with pytest.raises(MigrationError, match="local-only"):
+    with pytest.raises(MigrationError, match="immutable and local-only"):
         await migrator.migrate(task.id, worker.id)
 
     migrator._get_worker.assert_not_awaited()

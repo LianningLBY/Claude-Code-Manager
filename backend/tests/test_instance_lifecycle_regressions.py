@@ -159,6 +159,8 @@ async def test_stale_reset_honors_consumer_or_recovery_only_running_evidence(
             title=f"{evidence_kind} evidence",
             description="must remain owned",
             status="executing",
+            retry_count=3,
+            turn_generation=11,
         )
         db.add(task)
         await db.flush()
@@ -175,6 +177,8 @@ async def test_stale_reset_honors_consumer_or_recovery_only_running_evidence(
         generation = dispatcher._task_lifecycle_generation(task)
         instance_id = instance.id
         task_id = task.id
+        task_retry_count = task.retry_count
+        task_turn_generation = task.turn_generation
 
     consumer = None
     recovery_process = None
@@ -189,9 +193,15 @@ async def test_stale_reset_honors_consumer_or_recovery_only_running_evidence(
             error=RuntimeError("durable recovery is unconfirmed"),
             tracked_generation=True,
             task_id=task_id,
-            task_retry_count=0,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
             instance_started_at=None,
         )
+        recovery_evidence = manager._consumer_recovery_pending[
+            (instance_id, recovery_process)
+        ]
+        assert recovery_evidence.task_retry_count == task_retry_count
+        assert recovery_evidence.task_turn_generation == task_turn_generation
 
     try:
         assert instance_id not in manager.processes

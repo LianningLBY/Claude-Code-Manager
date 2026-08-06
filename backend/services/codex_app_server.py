@@ -5637,14 +5637,16 @@ class CodexAppServerRegistry:
         *,
         reason: str,
     ) -> bool:
-        """Stop one durably-owned turn, recycling its transport if necessary.
+        """Stop one durably-owned turn and recycle its account transport.
 
-        Exact thread/turn interruption is always attempted first.  If Codex
-        cannot confirm that interrupt (notably while native descendants are
-        wedged), an explicit user stop must still have a terminal outcome.
-        Once admission is drained, recycle the account transport.  Non-target
-        adapters fail and use the ordinary task retry path; leaving the target
-        permanently uninterruptible is not an acceptable alternative.
+        Exact thread/turn interruption is always attempted first.  It is not,
+        however, sufficient proof that task-scoped native helpers are gone:
+        Codex keeps MCP servers and code-mode hosts below the persistent
+        app-server even after a turn reports ``interrupted``.  Once admission
+        is drained, therefore recycle the account transport for every explicit
+        stop.  Non-target adapters fail and use the ordinary task retry path;
+        returning success while target-owned native helpers remain alive is
+        not an acceptable outcome.
 
         Returns whether transport shutdown was required.
         """
@@ -5700,9 +5702,6 @@ class CodexAppServerRegistry:
                         "Failed to interrupt claimed Codex turn: %s",
                         home,
                     )
-                if interrupt_confirmed or process.returncode is not None:
-                    return False
-
                 async with self._lock:
                     server_is_current = self._servers.get(home) is server
                     target_is_current = server.owns_live_turn_process(process)
@@ -5713,7 +5712,13 @@ class CodexAppServerRegistry:
                     registry_shutdown = self._shutdown_requested
 
                 blockers: list[str] = []
-                if not server_is_current or not target_is_current:
+                if not server_is_current:
+                    blockers.append("the exact transport generation changed")
+                if (
+                    not interrupt_confirmed
+                    and process.returncode is None
+                    and not target_is_current
+                ):
                     blockers.append("the exact target generation changed")
                 if starting:
                     blockers.append(
@@ -5731,14 +5736,15 @@ class CodexAppServerRegistry:
                 if has_peer_turns:
                     logger.warning(
                         "Recycling shared Codex app-server transport after "
-                        "an unconfirmed explicit turn interrupt; peer turns "
+                        "an explicit turn interrupt; peer turns "
                         "will fail and retry: %s",
                         home,
                     )
 
-                # Admission is drained and the target is the only remaining
-                # live adapter.  A verified transport stop is now isolated to
-                # this claimed task generation.
+                # Admission is drained.  Transport recycle is the only
+                # available lifecycle boundary that also closes task-scoped
+                # MCP/code-mode helpers retained by Codex after a confirmed
+                # turn interrupt.
                 shutdown_attempted = True
                 await server.shutdown(
                     interrupted_process=process,

@@ -4934,6 +4934,56 @@ async def test_claimed_stop_recycles_shared_transport_when_interrupt_unconfirmed
 
 
 @pytest.mark.asyncio
+async def test_claimed_stop_recycles_transport_after_confirmed_interrupt(tmp_path):
+    """Turn terminality alone does not prove native MCP helpers are gone."""
+
+    home = normalize_codex_home(tmp_path / "confirmed-claimed-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-target", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-target"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="target with a retained MCP helper",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=160,
+    )
+    await process.stdout.readline()
+
+    async def confirm_interrupt(exact_process, reason):
+        assert exact_process is process
+        process.finish(130, reason, termination_kind="internal_abort")
+        server._detach_turn_context(server._contexts_by_thread["thread-target"])
+        return True
+
+    server.abandon_turn = AsyncMock(side_effect=confirm_interrupt)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners["thread-target"] = home
+
+    assert await registry.stop_claimed_turn(
+        home,
+        process,
+        reason="user requested stop",
+    ) is True
+
+    server.shutdown.assert_awaited_once_with(
+        interrupted_process=process,
+        reason="user requested stop",
+    )
+    assert home not in registry._servers
+    assert "thread-target" not in registry._thread_owners
+    assert home not in registry._draining
+
+
+@pytest.mark.asyncio
 async def test_claimed_stop_may_shutdown_transport_for_an_isolated_turn(tmp_path):
     """An isolated claimed turn retains fail-closed transport escalation."""
 

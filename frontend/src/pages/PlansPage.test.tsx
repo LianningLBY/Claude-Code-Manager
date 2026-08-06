@@ -107,7 +107,7 @@ const createdPlan = {
 
 function StatefulPlansPage() {
   const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
-  return <PlansPage selectedPlanId={selectedPlanId} onSelectedPlanChange={setSelectedPlanId} onNavigateTask={vi.fn()} />;
+  return <PlansPage selectedPlanId={selectedPlanId} onSelectedPlanChange={setSelectedPlanId} onNavigateTask={vi.fn()} onNavigateSettings={vi.fn()} />;
 }
 
 describe('PlansPage', () => {
@@ -121,7 +121,7 @@ describe('PlansPage', () => {
 
   it('owns the Plan catalog, hides an empty action heading, and supports deep-link selection', async () => {
     const onSelectedPlanChange = vi.fn();
-    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={vi.fn()} />);
+    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={vi.fn()} onNavigateSettings={vi.fn()} />);
 
     expect(await screen.findByRole('button', { name: plan.title })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Plans requiring action' })).not.toBeInTheDocument();
@@ -139,7 +139,7 @@ describe('PlansPage', () => {
 
   it('uses canonical Plan search/archive filters and keeps a newly created Plan in the catalog', async () => {
     const onSelectedPlanChange = vi.fn();
-    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={vi.fn()} />);
+    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={vi.fn()} onNavigateSettings={vi.fn()} />);
 
     await screen.findByRole('button', { name: plan.title });
     await userEvent.type(screen.getByPlaceholderText('Search Plans'), 'architecture');
@@ -205,10 +205,18 @@ describe('PlansPage', () => {
     const onSelectedPlanChange = vi.fn();
     const onNavigateTask = vi.fn();
 
-    render(<PlansPage selectedPlanId={relatedPlan.id} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={onNavigateTask} />);
+    render(<PlansPage selectedPlanId={relatedPlan.id} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={onNavigateTask} onNavigateSettings={vi.fn()} />);
     await userEvent.click(await screen.findByRole('button', { name: 'Open related Task #200' }));
 
     expect(onNavigateTask).toHaveBeenCalledWith(200);
     expect(onSelectedPlanChange).toHaveBeenCalledWith(null);
+  });
+
+  it('provides an in-app shortcut to the Plan settings page', async () => {
+    const onNavigateSettings = vi.fn();
+    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={vi.fn()} onNavigateTask={vi.fn()} onNavigateSettings={onNavigateSettings} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plan settings' }));
+    expect(onNavigateSettings).toHaveBeenCalledOnce();
   });
 });

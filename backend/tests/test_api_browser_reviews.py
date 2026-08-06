@@ -131,6 +131,22 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
                 "telemetry": {"page_errors": [{"message": "render exploded"}]},
                 "action_batch": [{"type": "scroll", "scroll_y": 500}],
                 "report": "# Browser result",
+                "verdict": "failed",
+                "findings": [
+                    {
+                        "scenario_id": "runtime-health",
+                        "severity": "high",
+                        "category": "runtime",
+                        "title": "The page crashed",
+                        "route": "/settings",
+                        "locator": "main",
+                        "expected": "The page remains usable",
+                        "actual": "A page error was reported",
+                        "reproduction": ["Open settings"],
+                        "evidence": ["final.png"],
+                        "confidence": 0.95,
+                    }
+                ],
             },
         )
         assert evidence.status_code == 200, evidence.text
@@ -143,6 +159,8 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
         assert polled.status_code == 200
         assert polled.json()["status"] == "completed"
         assert polled.json()["report"] == "# Browser result"
+        assert polled.json()["verdict"] == "failed"
+        assert polled.json()["findings"][0]["title"] == "The page crashed"
 
         artifact = await client.get(
             f"/api/browser-reviews/{job_id}/artifacts/final.png"

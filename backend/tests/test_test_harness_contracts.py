@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from backend.services.test_harness_contracts import (
+    BrowserReviewFindingInput,
     TestHarnessContractError as HarnessContractError,
     TestHarnessSpec as HarnessSpec,
     compile_test_plan,
@@ -35,6 +36,34 @@ def test_read_only_harness_rejects_an_action_budget():
             allow_actions=False,
             max_actions=1,
         ).normalized()
+
+
+def test_browser_finding_schema_exposes_only_canonical_fields():
+    finding = BrowserReviewFindingInput.model_validate(
+        {
+            "scenario_id": "runtime-health",
+            "severity": "medium",
+            "category": "network",
+            "title": "Status endpoint returned 404",
+            "route": "/#/tasks",
+            "locator": "GET /api/pool/status",
+            "expected": "The endpoint succeeds",
+            "actual": "The endpoint returned 404",
+            "reproduction": ["Open Tasks"],
+            "evidence": ["final.png"],
+        }
+    )
+    assert finding.model_dump()["reproduction"] == ["Open Tasks"]
+
+    with pytest.raises(ValueError, match="reproduction_steps"):
+        BrowserReviewFindingInput.model_validate(
+            {
+                "severity": "medium",
+                "category": "network",
+                "title": "Status endpoint returned 404",
+                "reproduction_steps": ["Open Tasks"],
+            }
+        )
 
 
 def test_explicit_plan_is_bounded_and_normalized():

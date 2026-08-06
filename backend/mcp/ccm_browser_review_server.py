@@ -12,7 +12,7 @@ import asyncio
 import base64
 import json
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -27,6 +27,7 @@ from backend.services.browser_review import (
     execute_computer_actions,
     validate_target_url,
 )
+from backend.services.test_harness_contracts import BrowserReviewFindingInput
 
 
 _JOB_ID = ""
@@ -157,7 +158,17 @@ async def _post_event(
             headers=_headers(),
             json=payload,
         )
-        response.raise_for_status()
+        if response.is_error:
+            try:
+                detail: Any = response.json().get("detail")
+            except (ValueError, AttributeError):
+                detail = response.text
+            if not isinstance(detail, str):
+                detail = json.dumps(detail, ensure_ascii=False, default=str)
+            detail = detail.strip()[:2000] or "unknown validation error"
+            raise BrowserReviewError(
+                f"Manager rejected Browser Review event (HTTP {response.status_code}): {detail}"
+            )
 
 
 async def _ensure_browser() -> Any:
@@ -549,11 +560,15 @@ async def browser_drag(path: list[dict[str, float]], button: str = "left") -> li
 @mcp.tool(structured_output=False)
 async def finish_review(
     report: str,
-    verdict: str = "inconclusive",
-    findings: list[dict[str, Any]] | None = None,
+    verdict: Literal["passed", "failed", "inconclusive"] = "inconclusive",
+    findings: list[BrowserReviewFindingInput] | None = None,
     coverage: dict[str, Any] | None = None,
 ) -> str:
-    """Persist a report plus structured verdict/findings and finish the review."""
+    """Persist the final report and canonical structured findings exactly once.
+
+    Finding fields are scenario_id, severity, category, title, route, locator,
+    expected, actual, reproduction, evidence, and optional confidence.
+    """
 
     global _finished
     if not report.strip():
@@ -574,7 +589,7 @@ async def finish_review(
             screenshot=screenshot,
             report=report.strip(),
             verdict=verdict,
-            findings=findings or [],
+            findings=[finding.model_dump() for finding in findings or []],
             coverage=coverage or {},
         )
         _finished = True

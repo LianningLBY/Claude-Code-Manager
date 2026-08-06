@@ -279,7 +279,7 @@ async def test_inline_task_tool_completes_and_allows_a_later_run(
     await manager.shutdown()
 
 
-def test_trace_tool_arguments_redact_typed_text_and_report():
+def test_trace_tool_arguments_redact_typed_text_and_hide_report_body():
     typed = _safe_tool_arguments(
         "browser_type_text",
         '{"text":"sensitive test value"}',
@@ -291,5 +291,4 @@ def test_trace_tool_arguments_redact_typed_text_and_report():
 
     assert typed == '{"text": "<20 chars redacted>"}'
     assert "sensitive" not in typed
-    assert report == "报告已保存到 Browser Review 结果"
-    assert "private report" not in report
+    assert report is None

@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from pydantic import BaseModel, ConfigDict, Field
+
 
 HarnessTargetKind = Literal["current_workspace", "fixed_url", "pull_request", "git_ref"]
 HarnessProfile = Literal["quick", "standard", "exhaustive"]
@@ -38,6 +40,37 @@ _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,119}$")
 
 class TestHarnessContractError(ValueError):
     """The caller supplied an invalid harness contract."""
+
+
+class BrowserReviewFindingInput(BaseModel):
+    """Canonical structured finding shared by API and Browser MCP schemas."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_id: str = Field(default="primary-flow", min_length=1, max_length=120)
+    severity: Literal["critical", "high", "medium", "low", "info"]
+    category: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=500)
+    route: str | None = Field(default=None, max_length=1000)
+    locator: str | None = Field(default=None, max_length=1000)
+    expected: str | None = Field(default=None, max_length=8000)
+    actual: str | None = Field(default=None, max_length=8000)
+    reproduction: list[str] = Field(
+        default_factory=list,
+        max_length=30,
+        description="JSON array of separate reproduction-step strings; never one string",
+    )
+    evidence: list[str] = Field(
+        default_factory=list,
+        max_length=30,
+        description="JSON array of evidence artifact names or concise evidence references",
+    )
+    confidence: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Numeric confidence from 0 to 1; omit instead of using words",
+    )
 
 
 @dataclass(frozen=True, slots=True)

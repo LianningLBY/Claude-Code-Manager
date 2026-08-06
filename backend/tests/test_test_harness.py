@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
 import uuid
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -130,6 +131,12 @@ async def test_fixed_url_run_is_idempotent_and_persists_structured_evidence(
     assert sequences == list(range(1, len(sequences) + 1))
     assert await service.resolve_evidence(run.id, "final.png") is not None
 
+    job.findings = []
+    await service.sync_browser_job(job)
+    cleared = await service.get_run(run.id)
+    assert cleared is not None
+    assert cleared["findings"] == []
+
 
 @pytest.mark.asyncio
 async def test_repeat_and_compare_use_stable_finding_fingerprints(db_factory, tmp_path):
@@ -163,3 +170,43 @@ async def test_repeat_and_compare_use_stable_finding_fingerprints(db_factory, tm
     assert comparison["new"] == []
     assert len(comparison["persisting"]) == 1
     assert comparison["resolved"] == []
+
+
+@pytest.mark.asyncio
+async def test_sync_terminal_workspace_run_records_cleanup_event(db_factory):
+    task_id = await _task(db_factory)
+    service = HarnessService(db_factory=db_factory, poll_interval=0.01)
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "http://127.0.0.1:5173"},
+            goal="Verify the finished workspace result",
+        ),
+    )
+    now = datetime.utcnow()
+    workspace_run = SimpleNamespace(
+        id=uuid.uuid4().hex,
+        status="completed",
+        stage="completed",
+        cleanup_status="completed",
+        cleanup_error=None,
+        browser_review_job_id=None,
+        agent_task_id=321,
+        git_head="a" * 40,
+        workspace_fingerprint="b" * 64,
+        stale=False,
+        report="# Result\n\nVerdict: pass",
+        error=None,
+        started_at=now,
+        completed_at=now,
+    )
+
+    await service._sync_workspace_run(run.id, workspace_run)
+
+    payload = await service.get_run(run.id)
+    assert payload is not None
+    assert payload["status"] == "completed"
+    assert payload["cleanup_status"] == "completed"
+    assert payload["events"][-1]["event_type"] == "cleanup"
+    assert payload["events"][-1]["title"] == "隔离预览已清理"

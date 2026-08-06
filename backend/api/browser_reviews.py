@@ -45,6 +45,7 @@ from backend.services.test_harness import (
     test_harness_service,
 )
 from backend.services.test_harness_contracts import (
+    BrowserReviewFindingInput,
     TestHarnessContractError,
     TestHarnessSpec,
 )
@@ -93,24 +94,8 @@ class BrowserReviewEvent(BaseModel):
     action_batch: list[dict[str, Any]] | None = Field(default=None, max_length=100)
     report: str | None = Field(default=None, max_length=100_000)
     verdict: Literal["passed", "failed", "inconclusive"] | None = None
-    findings: list["BrowserReviewFinding"] | None = Field(default=None, max_length=100)
+    findings: list[BrowserReviewFindingInput] | None = Field(default=None, max_length=100)
     coverage: dict[str, Any] | None = None
-
-
-class BrowserReviewFinding(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scenario_id: str = Field(default="primary-flow", min_length=1, max_length=120)
-    severity: Literal["critical", "high", "medium", "low", "info"]
-    category: str = Field(min_length=1, max_length=80)
-    title: str = Field(min_length=1, max_length=500)
-    route: str | None = Field(default=None, max_length=1000)
-    locator: str | None = Field(default=None, max_length=1000)
-    expected: str | None = Field(default=None, max_length=8000)
-    actual: str | None = Field(default=None, max_length=8000)
-    reproduction: list[str] = Field(default_factory=list, max_length=30)
-    evidence: list[str] = Field(default_factory=list, max_length=30)
-    confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class TaskBrowserReviewStart(BaseModel):

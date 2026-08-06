@@ -760,7 +760,7 @@ def _safe_tool_arguments(tool_name: str, raw: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
     if tool_name == "finish_review":
-        return "报告已保存到 Browser Review 结果"
+        return None
     if tool_name == "browser_type_text" and isinstance(payload.get("text"), str):
         payload["text"] = f"<{len(payload['text'])} chars redacted>"
     if not payload:

@@ -30,6 +30,36 @@ from backend.services.browser_review import (
 )
 
 
+@pytest.mark.asyncio
+async def test_finish_review_mcp_schema_is_canonical_and_constrained():
+    from backend.mcp.ccm_browser_review_server import mcp
+
+    tools = await mcp.list_tools()
+    schema = next(tool.inputSchema for tool in tools if tool.name == "finish_review")
+
+    assert schema["properties"]["verdict"]["enum"] == [
+        "passed",
+        "failed",
+        "inconclusive",
+    ]
+    finding = schema["$defs"]["BrowserReviewFindingInput"]
+    assert set(finding["properties"]) == {
+        "scenario_id",
+        "severity",
+        "category",
+        "title",
+        "route",
+        "locator",
+        "expected",
+        "actual",
+        "reproduction",
+        "evidence",
+        "confidence",
+    }
+    assert "JSON array" in finding["properties"]["reproduction"]["description"]
+    assert "Numeric confidence" in finding["properties"]["confidence"]["description"]
+
+
 @pytest.mark.parametrize(
     ("url", "origin"),
     [

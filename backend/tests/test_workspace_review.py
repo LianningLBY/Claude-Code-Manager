@@ -12,7 +12,9 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services import workspace_review as workspace_review_module
+from backend.services.browser_review import BrowserReviewOptions
 from backend.services.workspace_review import (
+    _browser_agent_prompt,
     PreviewConfigurationError,
     PreviewHandle,
     WorkspacePreviewManager,
@@ -70,6 +72,27 @@ def _http_preview_config() -> dict:
         "health_url": "http://127.0.0.1:{preview_port}/",
         "startup_timeout_seconds": 10,
     }
+
+
+def test_browser_agent_prompt_publishes_canonical_result_schema_and_zero_budget():
+    prompt = _browser_agent_prompt(
+        "job-1",
+        BrowserReviewOptions(
+            url="http://127.0.0.1:5173",
+            goal="Inspect the first screen",
+            allow_actions=False,
+            max_steps=8,
+            max_actions=0,
+        ),
+        profile="quick",
+    )
+
+    assert "browser_open, browser_inspect, and browser_observe only" in prompt
+    assert "scenario_id, severity, category, title, route" in prompt
+    assert "verdict must be exactly passed, failed, or inconclusive" in prompt
+    assert "reproduction_steps" in prompt
+    assert "reproduction and evidence must be JSON arrays" in prompt
+    assert "never use high/medium/low" in prompt
 
 
 def test_preview_config_is_shell_free_and_auto_detection_requires_confirmation(tmp_path):

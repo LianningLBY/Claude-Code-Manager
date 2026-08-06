@@ -248,6 +248,14 @@ export function BrowserReviewPanel({
   const harnessRun = runs.find((item) => item.id === selectedId)
     ?? runs[0]
     ?? null;
+  const selectedRunIndex = harnessRun
+    ? runs.findIndex((item) => item.id === harnessRun.id)
+    : -1;
+  const selectAdjacentRun = (offset: number) => {
+    if (selectedRunIndex < 0) return;
+    const nextRun = runs[selectedRunIndex + offset];
+    if (nextRun) setSelectedId(nextRun.id);
+  };
   const workspaceRun: WorkspaceReviewRun | null = harnessRun?.workspace_review ?? null;
   const job: BrowserReviewJob | null = harnessRun?.browser_review ?? null;
   const harnessRunId = harnessRun?.id ?? null;
@@ -486,17 +494,40 @@ export function BrowserReviewPanel({
 
       {!minimized && runs.length > 1 && (
         <div className="border-b border-gray-800 px-3 py-2">
-          <select
-            value={harnessRun?.id || ''}
-            onChange={(event) => setSelectedId(event.target.value)}
-            className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
-          >
-            {runs.map((item, index) => (
-              <option key={item.id} value={item.id}>
-                #{runs.length - index} · {item.target_kind} · {STAGE_LABELS[item.stage] || item.stage} · {String(item.test_plan.objective || '')}
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center gap-1.5">
+            <select
+              value={harnessRun?.id || ''}
+              onChange={(event) => setSelectedId(event.target.value)}
+              aria-label="Select test run"
+              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
+            >
+              {runs.map((item, index) => (
+                <option key={item.id} value={item.id}>
+                  #{runs.length - index} · {item.target_kind} · {STAGE_LABELS[item.stage] || item.stage} · {String(item.test_plan.objective || '')}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => selectAdjacentRun(1)}
+              disabled={selectedRunIndex < 0 || selectedRunIndex >= runs.length - 1}
+              className="rounded border border-gray-700 bg-gray-900 p-1.5 text-gray-400 hover:border-indigo-500/60 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-35"
+              title="切换到更早的测试"
+              aria-label="Select older test run"
+            >
+              <ChevronDown size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => selectAdjacentRun(-1)}
+              disabled={selectedRunIndex <= 0}
+              className="rounded border border-gray-700 bg-gray-900 p-1.5 text-gray-400 hover:border-indigo-500/60 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-35"
+              title="切换到更新的测试"
+              aria-label="Select newer test run"
+            >
+              <ChevronUp size={14} />
+            </button>
+          </div>
         </div>
       )}
 

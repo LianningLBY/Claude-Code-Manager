@@ -118,6 +118,20 @@ async def test_task_test_run_api_persists_lists_and_cancels_fixed_url(
         assert cancelled.status_code == 200, cancelled.text
         assert cancelled.json()["status"] == "cancelled"
 
+        repeated = await client.post(
+            f"/api/tasks/{task_id}/test-runs/{run_id}/repeat"
+        )
+        assert repeated.status_code == 202, repeated.text
+        repeated_payload = repeated.json()
+        assert repeated_payload["id"] != run_id
+        assert repeated_payload["parent_run_id"] == run_id
+        assert repeated_payload["browser_review_job_id"] == "b" * 32
+        assert start_browser.await_count == 2
+        assert start_browser.await_args.kwargs == {
+            "run_id": repeated_payload["id"],
+            "inline": False,
+        }
+
         foreign = await service.start_task_run(
             task_id=other_task_id,
             spec=HarnessSpec(

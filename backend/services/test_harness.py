@@ -502,6 +502,26 @@ class TestHarnessService:
             verdict = "error"
         else:
             verdict = None
+        event_type = "lifecycle"
+        title = _workspace_stage_title(workspace_run.stage)
+        detail = workspace_run.error
+        if workspace_run.cleanup_status == "failed":
+            event_type = "cleanup"
+            title = "隔离预览清理失败"
+            detail = workspace_run.cleanup_error or workspace_run.error
+        elif (
+            workspace_run.cleanup_status == "completed"
+            and status in HARNESS_TERMINAL_STATUSES
+        ):
+            event_type = "cleanup"
+            title = "隔离预览已清理"
+        elif (
+            workspace_run.status in _WORKSPACE_TERMINAL
+            and workspace_run.cleanup_status == "pending"
+        ):
+            title = "测试已结束，正在清理隔离环境"
+        elif workspace_run.status == "reviewing" and workspace_run.stage == "completed":
+            title = "浏览器报告已接收，正在收尾"
         await self._update_run(
             run_id,
             values={
@@ -521,9 +541,9 @@ class TestHarnessService:
                 "started_at": workspace_run.started_at,
                 "completed_at": workspace_run.completed_at,
             },
-            event_type="lifecycle",
-            title=_workspace_stage_title(workspace_run.stage),
-            detail=workspace_run.error,
+            event_type=event_type,
+            title=title,
+            detail=detail,
             source_key=(
                 f"workspace:{workspace_run.id}:{workspace_run.status}:"
                 f"{workspace_run.stage}:{workspace_run.cleanup_status}"
@@ -905,15 +925,15 @@ class TestHarnessService:
         run_id: str,
         findings: list[dict[str, Any]],
     ) -> None:
-        if not findings:
-            return
         fingerprints = {item["fingerprint"] for item in findings}
-        await db.execute(
-            delete(TestHarnessFinding).where(
-                TestHarnessFinding.run_id == run_id,
-                TestHarnessFinding.fingerprint.not_in(fingerprints),
-            )
+        stale_query = delete(TestHarnessFinding).where(
+            TestHarnessFinding.run_id == run_id
         )
+        if fingerprints:
+            stale_query = stale_query.where(
+                TestHarnessFinding.fingerprint.not_in(fingerprints)
+            )
+        await db.execute(stale_query)
         existing = {
             item.fingerprint: item
             for item in (
@@ -1450,12 +1470,16 @@ class TestHarnessService:
 
 def _workspace_stage_title(stage: str) -> str:
     return {
+        "queued": "测试已进入队列",
         "fingerprinted": "工作区指纹已记录",
         "starting_preview": "正在启动隔离预览",
         "preview_ready": "隔离预览已就绪",
         "browser_agent_queued": "黑盒浏览器 Agent 已排队",
+        "waiting_for_agent": "等待黑盒浏览器 Agent",
+        "agent_starting": "黑盒浏览器 Agent 正在启动",
         "browser_ready": "浏览器已打开页面",
         "executing_actions": "正在执行测试场景",
+        "agent_reported": "黑盒浏览器 Agent 已提交报告",
         "completed": "测试运行已完成",
         "stale": "测试结果已过期",
         "failed": "测试运行失败",

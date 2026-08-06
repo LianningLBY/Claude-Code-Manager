@@ -292,6 +292,11 @@ async def repeat_test_harness_run(
             run_id,
             owner_user_id=get_current_user_id(request),
         )
+        if repeated.target_kind == "fixed_url" and repeated.browser_review_job_id is None:
+            await test_harness_service.start_fixed_url_browser(
+                run_id=repeated.id,
+                inline=False,
+            )
     except TestHarnessError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     payload = await test_harness_service.get_run(repeated.id)

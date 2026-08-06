@@ -524,6 +524,43 @@ describe('BrowserReviewPanel', () => {
     expect(onNewReview).toHaveBeenCalledTimes(1);
   });
 
+  it('switches to an older run with an explicit control and preserves it on refresh', async () => {
+    const newerRun = makeHarnessRun({
+      id: 'harness-newer',
+      root_run_id: 'harness-newer',
+      test_plan: { version: 1, objective: '最新审查', scenarios: [] },
+    });
+    const olderRun = makeHarnessRun({
+      id: 'harness-older',
+      root_run_id: 'harness-older',
+      test_plan: { version: 1, objective: '历史终态审查', scenarios: [] },
+    });
+    vi.mocked(api.listTestRuns).mockResolvedValue([newerRun, olderRun]);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    const picker = await screen.findByRole('combobox', { name: 'Select test run' });
+    expect(picker).toHaveValue(newerRun.id);
+    fireEvent.click(screen.getByRole('button', { name: 'Select older test run' }));
+    expect(picker).toHaveValue(olderRun.id);
+    expect(screen.getAllByText('历史终态审查').length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByTitle('刷新审查进度'));
+    await waitFor(() => expect(api.listTestRuns).toHaveBeenCalledTimes(2));
+    expect(picker).toHaveValue(olderRun.id);
+  });
+
   it('shows ordinary-chat expectation and switches from its exact baseline to the new workspace run', async () => {
     const oldRun = makeWorkspaceRun({
       id: 'workspace-run-old',

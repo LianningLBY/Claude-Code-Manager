@@ -16,9 +16,10 @@ vi.mock('../api/client', () => ({
 }));
 
 vi.mock('../components/PlanReview/PlanCreateForm', () => ({
-  PlanCreateForm: ({ onCreated }: { onCreated: (plan: PlanResource) => void }) => (
+  PlanCreateForm: ({ onCreated, onNavigateSettings }: { onCreated: (plan: PlanResource) => void; onNavigateSettings: () => void }) => <div>
     <button type="button" onClick={() => onCreated(createdPlan)}>Create standalone Plan</button>
-  ),
+    <button type="button" onClick={onNavigateSettings}>Plan settings</button>
+  </div>,
 }));
 vi.mock('../components/PlanReview/PlanNeedsInputPanel', () => ({
   PlanNeedsInputPanel: ({ onVisibilityChange }: { onVisibilityChange?: (visible: boolean) => void }) => (

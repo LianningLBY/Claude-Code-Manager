@@ -1,0 +1,299 @@
+from pathlib import Path
+
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
+from backend.services.ssh_executor import (
+    SSHCommandResult,
+    derive_openssh_public_key,
+)
+from backend.services.task_ssh_access import (
+    TaskSSHAccessError,
+    prepare_task_ssh_grants,
+)
+from backend.models.task import Task
+
+
+def _private_key_file(tmp_path: Path) -> Path:
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    path = tmp_path / "task-ssh-key"
+    path.write_bytes(private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    path.chmod(0o600)
+    return path
+
+
+async def _create_profile(client, tmp_path: Path) -> tuple[int, Path]:
+    key_path = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(key_path)
+    response = await client.post("/api/ssh-profiles", json={
+        "name": "task-target",
+        "host": "ssh.task.internal",
+        "username": "deploy",
+        "key_path": str(key_path),
+        "host_key_value": host_key,
+    })
+    assert response.status_code == 201, response.text
+    return response.json()["id"], key_path
+
+
+@pytest.mark.asyncio
+async def test_task_create_atomically_snapshots_ssh_grant(client, tmp_path):
+    profile_id, _ = await _create_profile(client, tmp_path)
+
+    created = await client.post("/api/tasks", json={
+        "title": "remote check",
+        "description": "Inspect the remote service",
+        "ssh_grants": [{
+            "profile_id": profile_id,
+            "capabilities": ["exec", "read", "exec"],
+        }],
+    })
+
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    listed = await client.get(f"/api/tasks/{task_id}/ssh-grants")
+    assert listed.status_code == 200
+    grant = listed.json()[0]
+    assert {
+        "task_id": task_id,
+        "profile_id": profile_id,
+        "profile_name": "task-target",
+        "host": "ssh.task.internal",
+        "port": 22,
+        "username": "deploy",
+        "host_key_fingerprint": listed.json()[0]["host_key_fingerprint"],
+        "profile_revision": 1,
+        "current_profile_revision": 1,
+        "capabilities": ["exec", "read"],
+        "valid": True,
+        "invalid_reason": None,
+        "created_by": None,
+    }.items() <= grant.items()
+    serialized = listed.text
+    assert "key_path" not in serialized
+    assert "host_key_value" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_task_ssh_execute_fails_closed_after_profile_revision_change(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Run a remote health check",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["exec"]}],
+    })
+    task_id = created.json()["id"]
+    observed = []
+
+    class FakeExecutor:
+        async def run_result(self, command, **kwargs):
+            observed.append((command, kwargs))
+            return SSHCommandResult(
+                exit_code=0,
+                stdout="healthy\n",
+                stderr="",
+                truncated=False,
+                duration_ms=12,
+            )
+
+    monkeypatch.setattr(
+        "backend.api.task_ssh.executor_for_profile",
+        lambda _profile: FakeExecutor(),
+    )
+    first = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+        json={"command": "systemctl is-active app", "timeout_seconds": 20},
+    )
+    assert first.status_code == 200
+    assert first.json()["stdout"] == "healthy\n"
+    assert observed == [(
+        "systemctl is-active app",
+        {
+            "timeout": 20,
+            "max_output_bytes": 1024 * 1024,
+            "sensitive": True,
+        },
+    )]
+
+    changed = await client.put(
+        f"/api/ssh-profiles/{profile_id}",
+        json={"username": "release"},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["revision"] == 2
+
+    stale = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+        json={"command": "hostname"},
+    )
+    assert stale.status_code == 409
+    assert "profile_revision_changed" in stale.text
+    access = await client.get(f"/api/tasks/{task_id}/ssh-access")
+    assert access.json()[0]["valid"] is False
+    assert access.json()[0]["invalid_reason"] == "profile_revision_changed"
+
+    refreshed = await client.put(f"/api/tasks/{task_id}/ssh-grants", json={
+        "grants": [{"profile_id": profile_id, "capabilities": ["exec"]}],
+    })
+    assert refreshed.status_code == 200
+    assert refreshed.json()[0]["profile_revision"] == 2
+    assert refreshed.json()[0]["valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_task_ssh_execute_requires_explicit_exec_capability(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Read remote configuration",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["read"]}],
+    })
+    task_id = created.json()["id"]
+    monkeypatch.setattr(
+        "backend.api.task_ssh.executor_for_profile",
+        lambda _profile: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+        json={"command": "cat /etc/app.conf"},
+    )
+
+    assert response.status_code == 403
+    assert "does not allow exec" in response.text
+
+
+@pytest.mark.asyncio
+async def test_duplicate_task_ssh_grants_reject_before_task_creation(
+    client,
+    tmp_path,
+):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    before = (await client.get("/api/tasks/count")).json()["total"]
+
+    response = await client.post("/api/tasks", json={
+        "description": "Invalid duplicate authorization",
+        "ssh_grants": [
+            {"profile_id": profile_id, "capabilities": ["exec"]},
+            {"profile_id": profile_id, "capabilities": ["read"]},
+        ],
+    })
+
+    assert response.status_code == 422
+    after = (await client.get("/api/tasks/count")).json()["total"]
+    assert after == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_id", "shared_from_id", "metadata"),
+    [
+        (9, None, None),
+        (None, 73, None),
+        (None, None, {"ccm_worker_managed_task": True}),
+        (None, None, {"ccm_user_skill_snapshots": []}),
+    ],
+)
+async def test_nonlocal_task_scope_cannot_receive_manager_local_ssh_grant(
+    db_session,
+    worker_id,
+    shared_from_id,
+    metadata,
+):
+    with pytest.raises(TaskSSHAccessError, match="local, unshared Manager Tasks"):
+        await prepare_task_ssh_grants(
+            db_session,
+            [{"profile_id": 1, "capabilities": ["exec"]}],
+            worker_id=worker_id,
+            shared_from_id=shared_from_id,
+            metadata=metadata,
+        )
+
+
+@pytest.mark.parametrize(
+    ("scope_field", "scope_value", "invalid_reason"),
+    [
+        ("shared_from_id", 73, "task_shared"),
+        ("metadata_", {"ccm_worker_managed_task": True}, "task_worker_managed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_existing_grant_fails_closed_in_nonlocal_task_scope(
+    client,
+    db_session,
+    tmp_path,
+    monkeypatch,
+    scope_field,
+    scope_value,
+    invalid_reason,
+):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Inspect a remote service",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["exec"]}],
+    })
+    task_id = created.json()["id"]
+    task = await db_session.get(Task, task_id)
+    setattr(task, scope_field, scope_value)
+    await db_session.commit()
+    monkeypatch.setattr(
+        "backend.api.task_ssh.executor_for_profile",
+        lambda _profile: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+
+    snapshot = await client.get(f"/api/tasks/{task_id}/ssh-access")
+    executed = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+        json={"command": "hostname"},
+    )
+    replaced = await client.put(f"/api/tasks/{task_id}/ssh-grants", json={
+        "grants": [{"profile_id": profile_id, "capabilities": ["exec"]}],
+    })
+
+    assert snapshot.status_code == 200
+    assert snapshot.json()[0]["valid"] is False
+    assert snapshot.json()[0]["invalid_reason"] == invalid_reason
+    assert executed.status_code == 409
+    assert invalid_reason in executed.text
+    assert replaced.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_task_ssh_fails_closed_when_profile_key_file_is_replaced(
+    client,
+    tmp_path,
+):
+    profile_id, key_path = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Inspect a remote service",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["exec"]}],
+    })
+    task_id = created.json()["id"]
+    replacement = ed25519.Ed25519PrivateKey.generate()
+    key_path.write_bytes(replacement.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    key_path.chmod(0o600)
+
+    executed = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+        json={"command": "hostname"},
+    )
+
+    assert executed.status_code == 409
+    assert "private key is no longer usable" in executed.text
+    assert str(key_path) not in executed.text
+

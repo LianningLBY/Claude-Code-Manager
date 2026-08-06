@@ -32,6 +32,7 @@ import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
 import backend.models.plan  # noqa: F401
 import backend.models.ssh_profile  # noqa: F401
+import backend.models.task_ssh_grant  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -43,7 +44,8 @@ PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
 FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
 PLAN_MAIN_MERGE_REVISION = "e5b8d1c4a7f2"
-CURRENT_HEAD_REVISION = "73c4a9e1b2d0"
+SSH_PROFILES_REVISION = "73c4a9e1b2d0"
+CURRENT_HEAD_REVISION = "84d5b0f2c3e1"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -434,7 +436,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "ssh_profiles", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "ssh_profiles", "task_ssh_grants", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -1643,7 +1645,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_managed_ssh_profiles(self, tmp_path):
+    def test_migration_graph_has_one_head_after_task_ssh_grants(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -1651,6 +1653,10 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == SSH_PROFILES_REVISION
+        )
+        assert (
+            script.get_revision(SSH_PROFILES_REVISION).down_revision
             == PLAN_MAIN_MERGE_REVISION
         )
         assert (

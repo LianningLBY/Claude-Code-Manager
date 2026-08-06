@@ -1034,3 +1034,16 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **安全与生命周期**：Delivery 使用隔离 Git worktree，分支、base/head、dirty tree、commit subject/action 全部 fail closed；Task 删除、取消、暂停/恢复、Todo 创建、ACL、共享、重试、队列领取和高水位 ID 均纳入同一代次约束。公开 Capability API 只能创建人工 advisory 请求，不能伪造 Agent source、执行策略或远程 Worker；ready 结果通过带版本号的 consume 原子确认并释放活动槽。
 - **界面与兼容**：新增 Delivery Task 创建、运行进度、Cycle/Plan/Review/PR 状态和安全点控制；现有 `loop` 保留兼容并标为 Legacy Todo Loop。Todo → Delivery 保留原 Todo 溯源，重复请求幂等回放同一 Task。
 - **验证**：受影响后端矩阵 `1820 passed, 1 skipped`；前端全量 `653 passed`，Vite production build（4758 modules）和新增文件 ESLint 通过；合入最新 `origin/main` 的 Codex/Delivery 回归 `574 passed, 1 skipped`；Alembic 单 head `9e5b2a7c4d10`，`compileall`、`git diff --check` 通过。后端全量 `4192 passed, 1 skipped, 1 failed`，唯一失败是既有 `test_stale_owner_record_does_not_authorize_replaced_socket`：单项稳定得到 `Xvfb :199 did not become ready` 而非测试期望的 `socket no longer matches`；在独立 `origin/main@d822d02` worktree 复跑仍为同一失败，确认不是本分支回归，本轮未修改相关实现或测试。
+
+### 2026-08-06 — Exact logical turn 与 Xvfb stale artifact 恢复（commits 010dcd4 / 92d3c70 / 913b499）
+
+- **Logical turn**：新增跨 provider 的 `Task.turn_generation`，retry/账号轮换保持同代，只有新 admission 才推进；日志、原生 turn、Worker handoff receipt、Manager/Worker 对账和前端事件都携带 exact retry/turn identity。Manager 崩溃、Worker ACK 丢失、取消、Plan 联合投递和启动边界由结构化 receipt 状态机恢复，无法证明未启动时一律禁止盲重放。
+- **Xvfb 安全修复**：owner record 升级为 v2，artifact identity 增加 `ctime_ns`；stale v2 恢复使用 `O_PATH | O_NOFOLLOW` 固定 inode，再搬入同文件系统私有 quarantine 并在删除前复核。恢复失败只做无覆盖 hardlink 回放或保留 quarantine，绝不 unlink replacement；v1 有残留 artifact 时 fail closed，只在 artifact 已自然消失且旧 PID/start 已死时允许新实例覆盖 owner。
+- **验证**：exact-turn 补齐恢复与广播的非默认 generation 断言；Xvfb 覆盖 PID 检查竞态、inode 立即复用、v1/v2 升级、hardlink 恢复失败及 SIGKILL 残留。登录相关联跑 `120 passed`，最终后端全量 `4383 passed, 1 skipped`（10m50s），不再保留此前的 stale-socket 已知失败。
+
+### 2026-08-06 — Auto Capability policy dark rollout（commit 39a9f65）
+
+- **准入边界**：`Task.capability_policy` 仅允许本地普通 `mode=auto` Task 在创建时显式冻结，SQL `NULL` 是唯一关闭态；V1 只允许 `plan` / `code_review`，总预算与分类预算均为严格正整数且硬上限 8。PUT、Manager-forwarded ID、Worker、migration import、Shared shadow、Delivery、Plan、Loop、Goal 和 clone 继承全部 fail closed。
+- **开关与执行边界**：`AUTO_CAPABILITY_ENABLED=false` 独立默认关闭，并要求 Capability Core 同时开启；当前 `create_agent_invocation` 仍无条件拒绝，尚未写入 `waiting_capability`。预算消费、terminal output arbitration 和 durable resume outbox 未同时完成前不得开放模型自助入口。
+- **防绕过**：normalizer 对 mutated / `model_construct` 的 typed instance 也先深拷贝再 strict revalidate；migration import 遇到同 ID 且带 policy 的既有本地 Task，在任何写入前返回 409，避免把授权带入 Worker scope。
+- **验证**：policy 定向矩阵 `38 passed`，前端全量 `661 passed`、TypeScript 0 errors、production build 4758 modules，Python compile 与 `git diff --check` 通过；上述后端全量结果同时覆盖本提交。

@@ -1155,6 +1155,53 @@ async def test_list_tasks_filter_status(client):
 
 
 @pytest.mark.asyncio
+async def test_list_and_count_tasks_filter_by_task_kind(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        main = Task(title="Main", description="d", mode="auto")
+        standalone = Task(
+            title="Standalone Plan",
+            description="d",
+            mode="plan",
+        )
+        db.add_all([main, standalone])
+        await db.flush()
+        related = Task(
+            title="Related Plan",
+            description="d",
+            mode="plan",
+            plan_target_task_id=main.id,
+        )
+        db.add(related)
+        await db.commit()
+
+    expected = {
+        "main": "Main",
+        "standalone_plan": "Standalone Plan",
+        "related_plan": "Related Plan",
+    }
+    for task_kind, title in expected.items():
+        response = await client.get(
+            f"/api/tasks?task_kind={task_kind}"
+        )
+        assert response.status_code == 200
+        assert [task["title"] for task in response.json()] == [title]
+
+        count = await client.get(
+            f"/api/tasks/count?task_kind={task_kind}"
+        )
+        assert count.status_code == 200
+        assert count.json() == {"total": 1}
+
+    invalid = await client.get("/api/tasks?task_kind=unknown")
+    assert invalid.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_pagination(client):
     """GET /api/tasks?limit=1&offset=1 returns second task."""
     await client.post("/api/tasks", json={
@@ -1201,6 +1248,78 @@ async def test_delete_in_progress_rejected(client, session_factory):
 
     resp = await client.delete(f"/api/tasks/{task_id}")
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["plan_review", "superseded"])
+async def test_delete_stopped_plan_cleans_pipeline_history(
+    client,
+    session_factory,
+    status,
+):
+    from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        plan = Task(
+            title="Disposable Plan",
+            description="Plan this",
+            status=status,
+            mode="plan",
+            plan_content="A completed proposal",
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(plan_task_id=plan.id, status="completed")
+        db.add(run)
+        await db.flush()
+        db.add(
+            PlanAgentStep(
+                run_id=run.id,
+                step_type="planner",
+                provider="claude",
+                status="completed",
+            )
+        )
+        await db.commit()
+        plan_id = plan.id
+        run_id = run.id
+
+    response = await client.delete(f"/api/tasks/{plan_id}")
+
+    assert response.status_code == 200
+    async with session_factory() as db:
+        assert await db.get(Task, plan_id) is None
+        assert await db.get(PlanAgentRun, run_id) is None
+        steps = (
+            await db.execute(
+                select(PlanAgentStep).where(PlanAgentStep.run_id == run_id)
+            )
+        ).scalars().all()
+        assert steps == []
+
+
+@pytest.mark.asyncio
+async def test_delete_non_plan_in_plan_review_state_is_rejected(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="Not a Plan",
+            description="work",
+            status="plan_review",
+            mode="auto",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    response = await client.delete(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 400
 
 
 # === image_paths tests ===
@@ -3266,6 +3385,73 @@ async def test_stop_helper_rechecks_live_owner_inside_manager_lock(
 
 
 @pytest.mark.asyncio
+async def test_stop_helper_reconciles_an_exact_dead_reverse_owner(
+    session_factory,
+):
+    from backend.api.tasks import _stop_task_process
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+    import backend.main
+
+    started_at = datetime(2026, 8, 2, 7, 36, 23)
+    manager = backend.main.instance_manager
+    async with session_factory() as db:
+        task = Task(title="orphan owner", status="executing")
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="dead reverse owner",
+            status="running",
+            pid=145_0775,
+            current_task_id=task.id,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+
+        with (
+            patch.object(
+                manager,
+                "stop",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as stop,
+            patch.object(
+                manager,
+                "reconcile_dead_reverse_task_owner",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as reconcile,
+        ):
+            assert await _stop_task_process(
+                task_id,
+                db,
+                expected_generations=[(
+                    instance_id,
+                    145_0775,
+                    started_at,
+                )],
+            ) is True
+
+    stop.assert_awaited_once_with(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=145_0775,
+        expected_started_at=started_at,
+        task_status="completed",
+        terminal_consumer_timeout=30.0,
+        consumer_cancel_timeout=10.0,
+    )
+    reconcile.assert_awaited_once_with(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=145_0775,
+        expected_started_at=started_at,
+    )
+
+
+@pytest.mark.asyncio
 async def test_stop_helper_passes_exact_generation_for_same_task_aba(
     session_factory,
 ):
@@ -3325,10 +3511,18 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
         return False
 
     async with session_factory() as db:
-        with patch.object(
-            backend.main.instance_manager,
-            "stop",
-            side_effect=reject_old_generation,
+        with (
+            patch.object(
+                backend.main.instance_manager,
+                "stop",
+                side_effect=reject_old_generation,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "reconcile_dead_reverse_task_owner",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as reconcile,
         ):
             assert await _stop_task_process(
                 task_id,
@@ -3337,6 +3531,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
                     (instance_id, 1111, old_started_at)
                 ],
             ) is False
+            reconcile.assert_not_awaited()
 
     async with session_factory() as db:
         instance = await db.get(Instance, instance_id)
@@ -3798,7 +3993,9 @@ async def test_stop_session_clears_pending_queue(client):
     assert body["ok"] is True
     assert body["stopped"] is False
     assert body["cleared_messages"] == 2
-    mock_clear.assert_awaited_once_with(task_id)
+    mock_clear.assert_awaited_once()
+    assert mock_clear.await_args.args == (task_id,)
+    assert mock_clear.await_args.kwargs["durable_db"] is not None
     mock_stop.assert_not_awaited()
 
 

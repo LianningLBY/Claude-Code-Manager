@@ -6,9 +6,10 @@ import uuid
 from contextlib import AsyncExitStack
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import or_, select, update as sa_update
+from sqlalchemy import func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -17,6 +18,7 @@ from backend.models.task import Task
 from backend.models.instance import Instance
 from backend.schemas.task import (
     TaskActionRequest,
+    PlanApprovalRequest,
     TaskCreate,
     TaskMigrationImport,
     TaskResponse,
@@ -27,7 +29,16 @@ from backend.schemas.task import (
     WorkerRoutingConfigRequest,
     WorkerRoutingConfigSnapshot,
 )
-from backend.services.task_queue import TaskQueue, task_delete_fence
+from backend.services.task_queue import (
+    TaskQueue,
+    is_task_status_deletable,
+    task_delete_fence,
+)
+from backend.services.task_creation import (
+    prepare_task_create_values,
+    stage_task_record,
+    validate_task_service_tier_configuration,
+)
 from backend.services.pr_review_runtime import (
     is_pr_review_fix_task,
     is_pr_review_task,
@@ -36,7 +47,6 @@ from backend.services.pr_review_runtime import (
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
-from backend.services.codex_models import validate_codex_service_tier
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
     _finish_despite_cancellation as _finish_task_operation,
@@ -81,24 +91,16 @@ from backend.api.deps import (
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
-_MANUAL_RETRYABLE_STATUSES = frozenset(
-    {"failed", "cancelled", "conflict", "completed"}
-)
-_WORKER_ROUTING_CONFIG_FIELDS = frozenset(
-    {"provider", "model", "codex_service_tier"}
-)
+_MANUAL_RETRYABLE_STATUSES = frozenset({"failed", "cancelled", "conflict", "completed"})
+_WORKER_ROUTING_CONFIG_FIELDS = frozenset({"provider", "model", "codex_service_tier"})
 _WORKER_SKILL_CONFIG_FIELDS = frozenset(
     {"enabled_skills", "selected_user_skills", "metadata_"}
 )
 _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
     {"worker_id", "project_id", "target_repo"}
 )
-_LOCAL_ROUTING_EDITABLE_STATUSES = (
-    WORKER_ROUTING_SAFE_STATUSES | {"pending"}
-)
-_WORKER_SKILL_EDITABLE_STATUSES = (
-    WORKER_ROUTING_SAFE_STATUSES | {"pending"}
-)
+_LOCAL_ROUTING_EDITABLE_STATUSES = WORKER_ROUTING_SAFE_STATUSES | {"pending"}
+_WORKER_SKILL_EDITABLE_STATUSES = WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 _PR_REVIEW_CHAT_TERMINAL_STATUSES = frozenset(
     {"approved", "merged", "commented", "error"}
 )
@@ -142,7 +144,7 @@ async def _require_not_pr_review_task_mutation(
 ) -> None:
     """Keep automated review Tasks immutable outside their backend workflow."""
 
-    from backend.models.pr_monitor import PRReview, PRReviewerRun
+    from backend.models.pr_monitor import PRReview
 
     linked = await db.execute(
         select(PRReview.id)
@@ -346,45 +348,6 @@ def _require_expected_task_routing(
     return actual
 
 
-def _validate_task_service_tier_configuration(
-    *,
-    provider: str | None,
-    model: str | None,
-    codex_service_tier: str | None,
-    mode: str | None,
-    goal_evaluator_model: str | None,
-) -> None:
-    """Validate every model request hidden behind one Task configuration."""
-
-    validate_codex_service_tier(provider, model, codex_service_tier)
-    if not (
-        (provider or "claude").lower() == "codex"
-        and (codex_service_tier or "default") == "priority"
-        and mode == "goal"
-    ):
-        return
-
-    # A separate evaluator model may be statically Fast-capable yet absent
-    # from the account admitted for the main turn. Requiring the same model
-    # lets admission prove both requests before any Goal work starts.
-    task_model = model
-    if not task_model or task_model == "default":
-        task_model = settings.default_codex_model
-    evaluator_model = goal_evaluator_model
-    if not evaluator_model or evaluator_model == "default":
-        evaluator_model = task_model
-    if evaluator_model != task_model:
-        raise ValueError(
-            "Codex Fast Goal tasks must use the Task model for goal "
-            "evaluation; clear goal_evaluator_model or select the same model"
-        )
-    validate_codex_service_tier(
-        "codex",
-        evaluator_model,
-        "priority",
-    )
-
-
 def _explicit_command_skills(message: str | None) -> dict[str, bool]:
     """Return the temporary Skills requested by one leading $command."""
 
@@ -468,11 +431,9 @@ async def _validate_skill_configuration(
             found.add(snapshot.id)
     if user_skill_snapshots is None:
         found.update(
-            (
-                await db.execute(
-                    select(UserSkill.id).where(UserSkill.id.in_(normalized))
-                )
-            ).scalars().all()
+            (await db.execute(select(UserSkill.id).where(UserSkill.id.in_(normalized))))
+            .scalars()
+            .all()
         )
     missing = [skill_id for skill_id in normalized if skill_id not in found]
     if missing:
@@ -507,6 +468,7 @@ def _find_session_jsonl(session_id: str, provider: str = "claude") -> Path | Non
         # history remains valid even when the credentials cannot run a turn.
         try:
             from backend.main import codex_pool
+
             if codex_pool:
                 for account in codex_pool.list_accounts():
                     codex_home = account.get("codex_home")
@@ -555,6 +517,7 @@ def _find_session_jsonl(session_id: str, provider: str = "claude") -> Path | Non
     config_dir: str | None = None
     try:
         from backend.main import dispatcher
+
         if dispatcher and dispatcher.pool:
             config_dir = dispatcher.pool.locate_session_config_dir(session_id)
     except Exception:
@@ -630,15 +593,19 @@ async def count_tasks(
     project_id: int | None = None,
     starred: bool | None = None,
     has_unread: bool | None = None,
+    task_kind: Literal["standalone_plan", "related_plan", "main"] | None = None,
     queue: TaskQueue = Depends(_get_queue),
 ):
     user_id = get_current_user_id(request)
     user_role = get_current_user_role(request)
     total = await queue.count_tasks(
-        status=status, include_archived=include_archived,
+        status=status,
+        include_archived=include_archived,
         archived_only=archived_only,
-        project_id=project_id, starred=starred,
+        project_id=project_id,
+        starred=starred,
         has_unread=has_unread,
+        task_kind=task_kind,
         user_id=user_id if user_role not in ("admin", "super_admin") else None,
     )
     return {"total": total}
@@ -653,6 +620,7 @@ async def list_tasks(
     project_id: int | None = None,
     starred: bool | None = None,
     has_unread: bool | None = None,
+    task_kind: Literal["standalone_plan", "related_plan", "main"] | None = None,
     limit: int = 50,
     offset: int = 0,
     queue: TaskQueue = Depends(_get_queue),
@@ -660,22 +628,69 @@ async def list_tasks(
     user_id = get_current_user_id(request)
     user_role = get_current_user_role(request)
     return await queue.list_tasks(
-        status=status, include_archived=include_archived,
+        status=status,
+        include_archived=include_archived,
         archived_only=archived_only,
-        project_id=project_id, starred=starred,
+        project_id=project_id,
+        starred=starred,
         has_unread=has_unread,
-        limit=limit, offset=offset,
+        task_kind=task_kind,
+        limit=limit,
+        offset=offset,
         user_id=user_id if user_role not in ("admin", "super_admin") else None,
     )
 
 
 @router.post("", response_model=TaskResponse, status_code=201)
-async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def create_task(
+    request: Request,
+    body: TaskCreate,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     user_id = get_current_user_id(request)
+    if body.mode == "plan":
+        raise HTTPException(
+            410,
+            "Legacy mode=plan Task creation is closed; use POST /api/plans",
+        )
     if body.secret_ids:
         require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
+    supersedes: Task | None = None
+    if data.get("mode") == "plan":
+        from backend.schemas.plan import resolve_plan_pipeline_config
+        from backend.services.plan_pipeline_settings import (
+            effective_plan_pipeline_config,
+        )
+
+        base_pipeline = await effective_plan_pipeline_config(db)
+
+        pipeline = resolve_plan_pipeline_config(
+            data.get("plan_pipeline_config"),
+            base_config=base_pipeline,
+            legacy_provider=(
+                data.get("provider") if "provider" in body.model_fields_set else None
+            ),
+            legacy_model=(
+                data.get("model") if "model" in body.model_fields_set else None
+            ),
+            legacy_effort=(
+                data.get("effort_level")
+                if "effort_level" in body.model_fields_set
+                else None
+            ),
+        )
+        data["plan_pipeline_config"] = pipeline.model_dump(mode="json")
+        data["provider"] = pipeline.planner.primary.provider
+        data["model"] = pipeline.planner.primary.model
+        data["effort_level"] = pipeline.planner.primary.effort
+    elif data.get("plan_pipeline_config") is not None:
+        raise HTTPException(
+            422,
+            "plan_pipeline_config requires mode='plan'",
+        )
 
     # Resolve the exact execution target before persisting anything.  A member
     # owning Worker A must not be able to name Worker B (or the Manager) merely
@@ -688,10 +703,7 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         if project is None:
             raise HTTPException(404, "Project not found")
         await require_project_access(request, project.id, db)
-        if (
-            body.worker_id is not None
-            and body.worker_id != project.worker_id
-        ):
+        if body.worker_id is not None and body.worker_id != project.worker_id:
             raise HTTPException(
                 400,
                 "Task Worker must match the selected Project location",
@@ -731,6 +743,116 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     if meta:
         data["metadata_"] = meta
 
+    if data.get("plan_target_task_id") is not None:
+        if data.get("mode") != "plan":
+            raise HTTPException(422, "plan_target_task_id requires mode='plan'")
+        target = await db.get(Task, data["plan_target_task_id"])
+        if target is None:
+            raise HTTPException(404, "Plan target Task not found")
+        await require_task_control(request, target, db)
+        if not target.session_id:
+            raise HTTPException(
+                400,
+                "Run the target Task before creating a session Plan",
+            )
+        if target.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Shared shadow tasks cannot own Plan Tasks",
+            )
+        if (
+            data.get("worker_id") != target.worker_id
+            or data.get("project_id") != target.project_id
+        ):
+            raise HTTPException(
+                422,
+                "Related Plan must use the target Task's Project and Worker",
+            )
+        from backend.services.plan_tasks import (
+            ACTIVE_PLAN_STATUSES,
+            MAX_ACTIVE_PLANS_PER_TASK,
+        )
+
+        active_count = await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.plan_target_task_id == target.id,
+                Task.mode == "plan",
+                Task.status.in_(ACTIVE_PLAN_STATUSES),
+            )
+        )
+        if int(active_count or 0) >= MAX_ACTIVE_PLANS_PER_TASK:
+            raise HTTPException(
+                429,
+                f"Task already has {MAX_ACTIVE_PLANS_PER_TASK} active Plans",
+            )
+        supersedes_id = data.get("supersedes_plan_task_id")
+        if supersedes_id is not None:
+            supersedes = await db.get(Task, supersedes_id)
+            if (
+                supersedes is None
+                or supersedes.mode != "plan"
+                or supersedes.plan_target_task_id != target.id
+            ):
+                raise HTTPException(
+                    400,
+                    "Superseded Plan does not belong to this Task",
+                )
+            await require_task_control(request, supersedes, db)
+            if supersedes.status != "plan_review":
+                raise HTTPException(
+                    409,
+                    "Only a Plan awaiting review can be superseded",
+                )
+        # The execution node owns its LogEntry ids and repository. Re-capture
+        # the same target boundary locally instead of trusting a Manager-side
+        # watermark whose integer id has no cross-database meaning.
+        from backend.services.plan_tasks import capture_task_context, latest_task_log_id
+
+        local_context_log_id = await latest_task_log_id(db, target.id)
+        data["plan_context_session_id"] = target.session_id
+        data["plan_context_log_id"] = local_context_log_id
+        data["plan_context_snapshot"] = await capture_task_context(
+            db,
+            target.id,
+            through_log_id=local_context_log_id,
+            max_chars=settings.plan_transcript_max_chars,
+        )
+        from backend.services.plan_tasks import capture_repo_revision
+
+        data["plan_repo_revision"] = await capture_repo_revision(
+            target.last_cwd or target.target_repo
+        )
+    elif data.get("mode") != "plan":
+        for plan_only_field in (
+            "plan_context_session_id",
+            "plan_context_log_id",
+            "plan_context_snapshot",
+            "plan_repo_revision",
+            "supersedes_plan_task_id",
+        ):
+            if data.get(plan_only_field) is not None:
+                raise HTTPException(
+                    422,
+                    f"{plan_only_field} requires mode='plan'",
+                )
+    elif data.get("supersedes_plan_task_id") is not None:
+        supersedes = await db.get(Task, data["supersedes_plan_task_id"])
+        if (
+            supersedes is None
+            or supersedes.mode != "plan"
+            or supersedes.plan_target_task_id is not None
+        ):
+            raise HTTPException(
+                400,
+                "Standalone Plan can only supersede another standalone Plan",
+            )
+        await require_task_control(request, supersedes, db)
+        if supersedes.status != "plan_review":
+            raise HTTPException(
+                409,
+                "Only a Plan awaiting review can be superseded",
+            )
+
     if clone_from_task_id:
         source = await db.get(Task, clone_from_task_id)
         if source is None:
@@ -743,20 +865,15 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
             data["session_id"] = cloned["session_id"]
             data["last_cwd"] = cloned["last_cwd"]
 
-    # 设置归 Task：创建时填入全局默认值，后续不再依赖 instance fallback
-    from backend.config import settings as app_settings
-    if not data.get("model"):
-        data["model"] = (
-            app_settings.default_codex_model
-            if data.get("provider") == "codex"
-            else app_settings.default_model
-        )
-    if not data.get("effort_level"):
-        data["effort_level"] = app_settings.default_effort
+    if data.get("mode") == "plan" and data.get("plan_repo_revision") is None:
+        from backend.services.plan_tasks import capture_repo_revision
+
+        if data.get("worker_id") is None:
+            data["plan_repo_revision"] = await capture_repo_revision(
+                data.get("last_cwd") or data.get("target_repo")
+            )
     validation_skills = dict(data.get("enabled_skills") or {})
-    validation_skills.update(
-        _explicit_command_skills(data.get("description"))
-    )
+    validation_skills.update(_explicit_command_skills(data.get("description")))
     data["selected_user_skills"] = await _validate_skill_configuration(
         db,
         provider=data.get("provider"),
@@ -768,21 +885,63 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         metadata=data.get("metadata_"),
     )
     try:
-        _validate_task_service_tier_configuration(
+        validate_task_service_tier_configuration(
             provider=data.get("provider"),
             model=data.get("model"),
             codex_service_tier=data.get("codex_service_tier"),
             mode=data.get("mode"),
             goal_evaluator_model=data.get("goal_evaluator_model"),
         )
+        if data.get("mode") == "plan":
+            from backend.schemas.plan import PlanPipelineConfig
+
+            pipeline = PlanPipelineConfig.model_validate(data["plan_pipeline_config"])
+            for route in (
+                pipeline.planner.primary,
+                pipeline.planner.fallback,
+                pipeline.reviewer.primary,
+                pipeline.reviewer.fallback,
+            ):
+                validate_task_service_tier_configuration(
+                    provider=route.provider,
+                    model=route.model,
+                    codex_service_tier="default",
+                    mode="plan",
+                    goal_evaluator_model=None,
+                )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    task = await queue.create(**data)
+    if supersedes is None:
+        task = await queue.create(**data)
+    else:
+        superseded_id = supersedes.id
+        metadata = dict(data.get("metadata_") or {})
+        metadata["revised_from_plan_task_id"] = superseded_id
+        data["metadata_"] = metadata
+        task = await stage_task_record(db, **data)
+        from backend.services.plan_tasks import mark_plan_superseded
+
+        if not await mark_plan_superseded(
+            db,
+            supersedes,
+            successor_id=task.id,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Plan changed while its revision was being created",
+            )
+        await db.commit()
+        await db.refresh(task)
+        from backend.services.task_events import broadcast_status_change
+
+        await broadcast_status_change(superseded_id, "superseded")
     # Eliminate the dispatcher's historical 0-2s polling delay.  Importing
     # here avoids a module cycle during application construction.
     try:
         from backend.main import dispatcher
+
         if dispatcher:
             dispatcher.wake()
     except Exception:
@@ -792,6 +951,7 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     if task.project_id:
         try:
             from backend.services.task_sharing import auto_share_new_task
+
             await auto_share_new_task(db, task.id, task.project_id)
         except Exception:
             pass  # best-effort
@@ -841,9 +1001,7 @@ async def import_migrated_task(
         WORKER_MANAGED_TASK_METADATA_KEY: True,
     }
     if user_skill_snapshots is not None:
-        migration_metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = (
-            user_skill_snapshots
-        )
+        migration_metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
     data["metadata_"] = migration_metadata
     data.update(
         worker_id=None,
@@ -851,19 +1009,9 @@ async def import_migrated_task(
         created_by=get_current_user_id(request),
     )
 
-    from backend.config import settings as app_settings
-    if not data.get("model"):
-        data["model"] = (
-            app_settings.default_codex_model
-            if data.get("provider") == "codex"
-            else app_settings.default_model
-        )
-    if not data.get("effort_level"):
-        data["effort_level"] = app_settings.default_effort
+    data = prepare_task_create_values(data)
     validation_skills = dict(data.get("enabled_skills") or {})
-    validation_skills.update(
-        _explicit_command_skills(data.get("description"))
-    )
+    validation_skills.update(_explicit_command_skills(data.get("description")))
     data["selected_user_skills"] = await _validate_skill_configuration(
         db,
         provider=data.get("provider"),
@@ -875,7 +1023,7 @@ async def import_migrated_task(
         metadata=data.get("metadata_"),
     )
     try:
-        _validate_task_service_tier_configuration(
+        validate_task_service_tier_configuration(
             provider=data.get("provider"),
             model=data.get("model"),
             codex_service_tier=data.get("codex_service_tier"),
@@ -914,12 +1062,18 @@ async def import_migrated_task(
         raise HTTPException(409, "Destination task disappeared during migration import")
     if old_status != source_status:
         from backend.services.task_events import broadcast_status_change
+
         await broadcast_status_change(task.id, source_status)
     return task
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
-async def get_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def get_task(
+    task_id: int,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -1095,9 +1249,7 @@ async def _lock_worker_local_routing_task(
     elif safe_status_required:
         predicates.append(Task.status.in_(WORKER_ROUTING_SAFE_STATUSES))
     guarded = await db.execute(
-        sa_update(Task)
-        .where(*predicates)
-        .values(status=Task.status)
+        sa_update(Task).where(*predicates).values(status=Task.status)
     )
     if guarded.rowcount != 1:
         await db.rollback()
@@ -1118,8 +1270,7 @@ async def _lock_worker_local_routing_task(
             )
         else:
             detail = (
-                "Worker Task routing config cannot change while it is pending "
-                "or active"
+                "Worker Task routing config cannot change while it is pending or active"
             )
         raise HTTPException(409, detail)
     current = await db.get(Task, task_id, populate_existing=True)
@@ -1161,9 +1312,7 @@ async def _running_routing_sub_agent_id(
                 SubAgentSession.task_id == task_id,
                 SubAgentSession.status == "running",
                 (
-                    (
-                        SubAgentSession.agent_type == "sub_agent"
-                    )
+                    (SubAgentSession.agent_type == "sub_agent")
                     & (SubAgentSession.source == "ccm")
                 )
                 | (SubAgentSession.source == "native"),
@@ -1203,7 +1352,7 @@ async def stage_worker_routing_config(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, observed, db)
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=candidate.provider,
                 model=candidate.model,
                 codex_service_tier=candidate.codex_service_tier,
@@ -1212,14 +1361,10 @@ async def stage_worker_routing_config(
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        if (
-            observed.worker_id is not None
-            or observed.shared_from_id is not None
-        ):
+        if observed.worker_id is not None or observed.shared_from_id is not None:
             raise HTTPException(
                 409,
-                "Routing synchronization endpoints only accept Worker-local "
-                "Tasks",
+                "Routing synchronization endpoints only accept Worker-local Tasks",
             )
         if observed.status not in WORKER_ROUTING_SAFE_STATUSES:
             raise HTTPException(
@@ -1227,10 +1372,7 @@ async def stage_worker_routing_config(
                 "Worker Task routing config cannot change while it is pending "
                 "or active",
             )
-        if (
-            candidate.provider != observed.provider
-            and observed.session_id is not None
-        ):
+        if candidate.provider != observed.provider and observed.session_id is not None:
             raise HTTPException(
                 409,
                 "Task provider cannot change while an existing native session "
@@ -1436,7 +1578,7 @@ async def reconcile_worker_routing_config(
             safe_status_required=True,
         )
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=authoritative.provider,
                 model=authoritative.model,
                 codex_service_tier=authoritative.codex_service_tier,
@@ -1459,8 +1601,7 @@ async def reconcile_worker_routing_config(
                 await db.rollback()
                 raise HTTPException(
                     409,
-                    "Worker routing differs from Manager without a pending "
-                    "operation",
+                    "Worker routing differs from Manager without a pending operation",
                 )
             snapshot = _worker_routing_snapshot(current)
             await db.rollback()
@@ -1679,7 +1820,10 @@ async def _ensure_worker_routing_ready(
             expected=authoritative,
             operation_lock_held=operation_lock_held,
         )
-    if snapshot.pending is not None or _snapshot_routing_tuple(snapshot) != authoritative:
+    if (
+        snapshot.pending is not None
+        or _snapshot_routing_tuple(snapshot) != authoritative
+    ):
         raise HTTPException(
             409,
             "Worker routing config does not exactly match the Manager; execution "
@@ -1734,18 +1878,14 @@ async def _update_local_task_with_routing_config(
         normalized = _normalized_task_update_values(updates)
         candidate = WorkerRoutingTuple(
             provider=normalized.get("provider", observed.provider),
-            model=(
-                normalized["model"]
-                if "model" in normalized
-                else observed.model
-            ),
+            model=(normalized["model"] if "model" in normalized else observed.model),
             codex_service_tier=normalized.get(
                 "codex_service_tier",
                 observed.codex_service_tier,
             ),
         )
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=candidate.provider,
                 model=candidate.model,
                 codex_service_tier=candidate.codex_service_tier,
@@ -1754,10 +1894,7 @@ async def _update_local_task_with_routing_config(
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        if (
-            candidate.provider != observed.provider
-            and observed.session_id is not None
-        ):
+        if candidate.provider != observed.provider and observed.session_id is not None:
             raise HTTPException(
                 409,
                 "Task provider cannot change while an existing native session "
@@ -1790,15 +1927,11 @@ async def _update_local_task_with_routing_config(
                     "quiescence was being verified",
                 )
             _require_no_pending_worker_routing(current)
-            if (
-                await _running_routing_sub_agent_id(queue.db, task_id)
-                is not None
-            ):
+            if await _running_routing_sub_agent_id(queue.db, task_id) is not None:
                 await queue.db.rollback()
                 raise HTTPException(
                     409,
-                    "Task routing config cannot change while a sub-agent is "
-                    "running",
+                    "Task routing config cannot change while a sub-agent is running",
                 )
 
             current.provider = candidate.provider
@@ -1856,18 +1989,14 @@ async def _update_worker_task_with_routing_config(
         normalized = _normalized_task_update_values(updates)
         candidate = WorkerRoutingTuple(
             provider=normalized.get("provider", current.provider),
-            model=(
-                normalized["model"]
-                if "model" in normalized
-                else current.model
-            ),
+            model=(normalized["model"] if "model" in normalized else current.model),
             codex_service_tier=normalized.get(
                 "codex_service_tier",
                 current.codex_service_tier,
             ),
         )
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=candidate.provider,
                 model=candidate.model,
                 codex_service_tier=candidate.codex_service_tier,
@@ -1945,9 +2074,7 @@ async def _update_worker_task_with_routing_config(
             Task.codex_service_tier == previous.codex_service_tier,
         ]
         changed = await queue.db.execute(
-            sa_update(Task)
-            .where(*predicates)
-            .values(**normalized)
+            sa_update(Task).where(*predicates).values(**normalized)
         )
         if changed.rowcount != 1:
             await queue.db.rollback()
@@ -2029,7 +2156,10 @@ async def _update_worker_task_with_skill_configuration(
 
 @router.put("/{task_id}", response_model=TaskResponse)
 async def update_task(
-    task_id: int, body: TaskUpdate, request: Request, queue: TaskQueue = Depends(_get_queue)
+    task_id: int,
+    body: TaskUpdate,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
 ):
     task = await queue.get(task_id)
     if not task:
@@ -2045,7 +2175,7 @@ async def update_task(
     if user_skill_snapshots is not None:
         require_admin(request)
     try:
-        _validate_task_service_tier_configuration(
+        validate_task_service_tier_configuration(
             provider=updates.get("provider", task.provider),
             model=updates.get("model", task.model),
             codex_service_tier=updates.get(
@@ -2073,9 +2203,7 @@ async def update_task(
         )
 
         metadata = dict(updates.get("metadata_") or task.metadata_ or {})
-        metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = (
-            user_skill_snapshots
-        )
+        metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
         metadata[WORKER_MANAGED_TASK_METADATA_KEY] = True
         updates["metadata_"] = metadata
 
@@ -2091,31 +2219,34 @@ async def update_task(
     effective_worker_id = task.worker_id
     if "worker_id" in updates:
         requested_worker_id = updates["worker_id"]
-        effective_worker_id = (
-            None if requested_worker_id == -1 else requested_worker_id
-        )
+        effective_worker_id = None if requested_worker_id == -1 else requested_worker_id
     effective_metadata = updates.get("metadata_", task.metadata_)
     command_skills = _explicit_command_skills(effective_description)
-    skill_configuration_changed = bool(
-        {
-            "provider",
-            "enabled_skills",
-            "selected_user_skills",
-            "worker_id",
-        }
-        & updates.keys()
-    ) or user_skill_snapshots is not None or bool(
-        command_skills and "description" in updates
+    skill_configuration_changed = (
+        bool(
+            {
+                "provider",
+                "enabled_skills",
+                "selected_user_skills",
+                "worker_id",
+            }
+            & updates.keys()
+        )
+        or user_skill_snapshots is not None
+        or bool(command_skills and "description" in updates)
     )
     if skill_configuration_changed:
         from backend.services.skill_context import (
             USER_SKILL_SNAPSHOTS_METADATA_KEY,
         )
 
-        effective_skills = dict(updates.get(
-            "enabled_skills",
-            task.enabled_skills,
-        ) or {})
+        effective_skills = dict(
+            updates.get(
+                "enabled_skills",
+                task.enabled_skills,
+            )
+            or {}
+        )
         effective_skills.update(command_skills)
         effective_user_skills = updates.get(
             "selected_user_skills",
@@ -2129,9 +2260,7 @@ async def update_task(
             user_skill_snapshots=(
                 user_skill_snapshots
                 if user_skill_snapshots is not None
-                else (task.metadata_ or {}).get(
-                    USER_SKILL_SNAPSHOTS_METADATA_KEY
-                )
+                else (task.metadata_ or {}).get(USER_SKILL_SNAPSHOTS_METADATA_KEY)
             ),
             worker_id=effective_worker_id,
             shared_from_id=task.shared_from_id,
@@ -2177,9 +2306,11 @@ async def update_task(
             await require_worker_target_access(request, target, queue.db)
         if task.worker_id != target:
             from backend.main import task_migrator
+
             if task_migrator is None:
                 raise HTTPException(503, "Worker 功能未启用")
             from backend.services.task_migrator import MigrationError
+
             try:
                 # 同步执行：迁移结束后才返回，前端拿到的就是最终状态。
                 # 大工作目录会久——前端按钮置灰 + migrating 状态广播兜底
@@ -2203,9 +2334,8 @@ async def update_task(
 
     # An already-forwarded Worker owns the executable Task row. Synchronize
     # its complete routing tuple before making the Manager mirror visible.
-    if (
-        task.worker_id is not None
-        and _WORKER_ROUTING_CONFIG_FIELDS.intersection(updates)
+    if task.worker_id is not None and _WORKER_ROUTING_CONFIG_FIELDS.intersection(
+        updates
     ):
         return await _finish_task_operation(
             _update_worker_task_with_routing_config(
@@ -2216,10 +2346,7 @@ async def update_task(
                 expected_worker_id=task.worker_id,
             )
         )
-    if (
-        task.worker_id is None
-        and _WORKER_ROUTING_CONFIG_FIELDS.intersection(updates)
-    ):
+    if task.worker_id is None and _WORKER_ROUTING_CONFIG_FIELDS.intersection(updates):
         return await _finish_task_operation(
             _update_local_task_with_routing_config(
                 task_id,
@@ -2232,10 +2359,7 @@ async def update_task(
     # Skill-only edits remain Manager-authoritative until the next turn, but
     # they must commit under the same lock as retry/chat/plan approval.  This
     # gives every execution admission one unambiguous final tuple to sync.
-    if (
-        task.worker_id is not None
-        and _WORKER_SKILL_CONFIG_FIELDS.intersection(updates)
-    ):
+    if task.worker_id is not None and _WORKER_SKILL_CONFIG_FIELDS.intersection(updates):
         return await _finish_task_operation(
             _update_worker_task_with_skill_configuration(
                 task_id,
@@ -2311,9 +2435,7 @@ async def _retry_local_task_safely(
     reverse_owner_ids = set(
         (
             await db.execute(
-                select(Instance.id).where(
-                    Instance.current_task_id == task_id
-                )
+                select(Instance.id).where(Instance.current_task_id == task_id)
             )
         )
         .scalars()
@@ -2392,9 +2514,7 @@ async def _retry_local_task_safely(
         if not current_candidate_ids.issubset(candidate_ids):
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "Task ownership changed while retrying; refresh and try again"
-                ),
+                detail=("Task ownership changed while retrying; refresh and try again"),
             )
 
         # A task-side link without a reverse owner can still point at a
@@ -2468,11 +2588,7 @@ async def _retry_local_task_safely(
                 Instance.id == instance.id,
                 Instance.current_task_id == task_id,
                 Instance.status == instance.status,
-                (
-                    Instance.pid.is_(None)
-                    if pid is None
-                    else Instance.pid == pid
-                ),
+                (Instance.pid.is_(None) if pid is None else Instance.pid == pid),
                 (
                     Instance.started_at.is_(None)
                     if instance.started_at is None
@@ -2509,7 +2625,12 @@ async def _retry_local_task_safely(
 
 
 @router.delete("/{task_id}")
-async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def delete_task(
+    task_id: int,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
@@ -2568,12 +2689,9 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
                     409,
                     "Task moved back to this Manager; refresh before deleting",
                 )
-            if worker_task.status not in (
-                "pending",
-                "failed",
-                "cancelled",
-                "conflict",
-                "completed",
+            if not is_task_status_deletable(
+                mode=worker_task.mode,
+                status=worker_task.status,
             ):
                 raise HTTPException(
                     400,
@@ -2620,9 +2738,7 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
                 await db.rollback()
                 current_worker_task = (
                     await db.execute(
-                        select(Task)
-                        .where(Task.id == task_id)
-                        .with_for_update()
+                        select(Task).where(Task.id == task_id).with_for_update()
                     )
                 ).scalar_one_or_none()
                 if current_worker_task is None:
@@ -2654,9 +2770,7 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
     lifecycle_ids = set(
         (
             await db.execute(
-                select(Instance.id).where(
-                    Instance.current_task_id == task_id
-                )
+                select(Instance.id).where(Instance.current_task_id == task_id)
             )
         )
         .scalars()
@@ -2664,9 +2778,9 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
     )
     if task is not None and task.instance_id is not None:
         task_side_instance = await db.get(Instance, task.instance_id)
-        if (
-            task_side_instance is not None
-            and task_side_instance.current_task_id in (None, task_id)
+        if task_side_instance is not None and task_side_instance.current_task_id in (
+            None,
+            task_id,
         ):
             lifecycle_ids.add(task.instance_id)
     # Do not wait on a lifecycle lock while retaining a read transaction:
@@ -2684,9 +2798,10 @@ async def delete_task(task_id: int, request: Request, queue: TaskQueue = Depends
             )
         ok = await queue.delete(task_id)
     if not ok:
-        raise HTTPException(400, "Cannot delete task (not found or not in deletable state)")
+        raise HTTPException(
+            400, "Cannot delete task (not found or not in deletable state)"
+        )
     return {"ok": True}
-
 
 
 async def _worker_task_or_none(db: AsyncSession, task_id: int) -> Task | None:
@@ -2707,6 +2822,7 @@ async def _proxy(
     operation_lock_held: bool = False,
 ):
     from backend.main import worker_proxy
+
     if worker_proxy is None:
         raise HTTPException(503, "Worker 功能未启用")
     if (
@@ -2874,9 +2990,7 @@ async def terminate_task_generation(
                 instance_id=body.expected_instance_id,
                 started_at=body.expected_started_at,
                 completed_at=body.expected_completed_at,
-                pty_background_generation=(
-                    body.expected_pty_background_generation
-                ),
+                pty_background_generation=(body.expected_pty_background_generation),
             ),
         )
     except TaskTerminationConflict as exc:
@@ -2894,9 +3008,7 @@ async def terminate_task_generation(
         expected_instance_id=terminated.instance_id,
         expected_started_at=terminated.started_at,
         expected_completed_at=terminated.completed_at,
-        expected_pty_background_generation=(
-            terminated.pty_background_generation
-        ),
+        expected_pty_background_generation=(terminated.pty_background_generation),
     )
     if locked_task is None:
         raise HTTPException(
@@ -2910,13 +3022,32 @@ async def _stop_task_session_local_impl(
     task_id: int,
     db: AsyncSession,
 ) -> dict:
+    """Keep message admission closed until the stopped generation is final."""
+
+    from backend.main import dispatcher
+
+    async with dispatcher.task_queue_cancellation_lease(task_id):
+        return await _stop_task_session_local_under_cancellation_lease(
+            task_id,
+            db,
+        )
+
+
+async def _stop_task_session_local_under_cancellation_lease(
+    task_id: int,
+    db: AsyncSession,
+) -> dict:
     """Cancellation-safe local core for ``POST /stop-session``."""
 
-    from backend.main import dispatcher, instance_manager
+    from backend.main import dispatcher, instance_manager, ralph_loop
 
     await db.rollback()
     try:
-        cleared = await dispatcher.abort_task_queue(task_id)
+        cleared = await dispatcher.abort_task_queue(
+            task_id,
+            cancel_durable=False,
+            durable_db=db,
+        )
     except Exception as exc:
         from backend.services.dispatcher import TaskQueueAbortTimeoutError
 
@@ -3005,19 +3136,34 @@ async def _stop_task_session_local_impl(
     await db.rollback()
     db.expire_all()
     probe = await db.get(Task, task_id)
-    if (
-        probe is None
-        or probe.worker_id is not None
-        or probe.shared_from_id is not None
-    ):
+    if probe is None or probe.worker_id is not None or probe.shared_from_id is not None:
         await db.rollback()
         raise HTTPException(
             409,
             "Task execution location changed while stopping its session",
         )
     probe_instance_id = probe.instance_id
+    probe_is_active_plan = probe.mode == "plan" and probe.status in {
+        "in_progress",
+        "executing",
+    }
     await db.rollback()
     await _settle_task_launch_barrier(task_id, probe_instance_id)
+    if probe_is_active_plan:
+        try:
+            stopped = await dispatcher.stop_plan_agent_lifecycle(
+                task_id,
+                probe_instance_id,
+            )
+            if not stopped:
+                stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
+            if not stopped:
+                raise RuntimeError(f"No exact Plan lifecycle owns Task {task_id}")
+        except Exception as exc:
+            raise HTTPException(
+                409,
+                "Plan Agent process cleanup could not be confirmed",
+            ) from exc
 
     db.expire_all()
     active_task = (
@@ -3060,8 +3206,7 @@ async def _stop_task_session_local_impl(
                 await db.rollback()
                 raise HTTPException(
                     409,
-                    "Task generation changed while queued messages were "
-                    "being cleared",
+                    "Task generation changed while queued messages were being cleared",
                 )
             await db.commit()
             return {
@@ -3078,9 +3223,7 @@ async def _stop_task_session_local_impl(
     observed_started_at = active_task.started_at
     observed_session_id = active_task.session_id
     observed_completed_at = active_task.completed_at
-    observed_background_generation = (
-        active_task.pty_background_generation
-    )
+    observed_background_generation = active_task.pty_background_generation
     owner_rows = await db.execute(
         select(
             Instance.id,
@@ -3104,12 +3247,10 @@ async def _stop_task_session_local_impl(
             expected_generations=expected_generations,
             task_status="completed",
         )
-        remaining_generations = (
-            await _remaining_task_process_generations(
-                task_id,
-                db,
-                expected_generations=expected_generations,
-            )
+        remaining_generations = await _remaining_task_process_generations(
+            task_id,
+            db,
+            expected_generations=expected_generations,
         )
         if remaining_generations:
             await db.rollback()
@@ -3121,11 +3262,7 @@ async def _stop_task_session_local_impl(
         await db.rollback()
         db.expire_all()
         current = (
-            await db.execute(
-                select(Task)
-                .where(Task.id == task_id)
-                .with_for_update()
-            )
+            await db.execute(select(Task).where(Task.id == task_id).with_for_update())
         ).scalar_one_or_none()
         expected_status = (
             "completed"
@@ -3165,13 +3302,9 @@ async def _stop_task_session_local_impl(
             )
 
         background_cleared_by_api = False
-        if (
-            current.pty_background_generation is not None
-            and (
-                observed_background_generation is None
-                or current.pty_background_generation
-                != observed_background_generation
-            )
+        if current.pty_background_generation is not None and (
+            observed_background_generation is None
+            or current.pty_background_generation != observed_background_generation
         ):
             await db.rollback()
             raise HTTPException(
@@ -3185,9 +3318,7 @@ async def _stop_task_session_local_impl(
         publication_retry_count = current.retry_count
         publication_instance_id = current.instance_id
         publication_started_at = current.started_at
-        publication_completed_at = (
-            await _read_persisted_task_completed_at(task_id, db)
-        )
+        publication_completed_at = await _read_persisted_task_completed_at(task_id, db)
         await db.commit()
 
         if background_cleared_by_api:
@@ -3261,8 +3392,7 @@ async def _stop_task_session_local_impl(
         if not detached_stopped:
             raise HTTPException(
                 409,
-                "Detached Claude PTY background session could not be "
-                "proven stopped",
+                "Detached Claude PTY background session could not be proven stopped",
             )
         publication_task = await _lock_task_generation(
             task_id,
@@ -3315,9 +3445,7 @@ async def _stop_task_session_local_impl(
                 409,
                 "Task generation changed while stopping its session",
             )
-        publication_completed_at = (
-            await _read_persisted_task_completed_at(task_id, db)
-        )
+        publication_completed_at = await _read_persisted_task_completed_at(task_id, db)
         await db.commit()
         publication_task = await _lock_task_generation(
             task_id,
@@ -3402,22 +3530,36 @@ async def stop_task_session(
     if wt is not None:
         return await _proxy(wt, "POST", f"/api/tasks/{task_id}/stop-session")
 
-    return await _finish_task_operation(
-        _stop_task_session_local_impl(task_id, db)
-    )
+    return await _finish_task_operation(_stop_task_session_local_impl(task_id, db))
 
 
 async def _cancel_local_task_impl(
     task_id: int,
     db: AsyncSession,
 ) -> Task:
-    """Cancellation-safe local core for ``POST /cancel``."""
+    """Keep message admission closed until cancellation is authoritative."""
 
     from backend.main import dispatcher
 
+    async with dispatcher.task_queue_cancellation_lease(task_id):
+        return await _cancel_local_task_under_cancellation_lease(task_id, db)
+
+
+async def _cancel_local_task_under_cancellation_lease(
+    task_id: int,
+    db: AsyncSession,
+) -> Task:
+    """Cancellation-safe local core for ``POST /cancel``."""
+
+    from backend.main import dispatcher, ralph_loop
+
     await db.rollback()
     try:
-        await dispatcher.abort_task_queue(task_id)
+        await dispatcher.abort_task_queue(
+            task_id,
+            cancel_durable=False,
+            durable_db=db,
+        )
     except Exception as exc:
         from backend.services.dispatcher import TaskQueueAbortTimeoutError
 
@@ -3434,19 +3576,31 @@ async def _cancel_local_task_impl(
     await db.rollback()
     db.expire_all()
     probe = await db.get(Task, task_id)
-    if (
-        probe is None
-        or probe.worker_id is not None
-        or probe.shared_from_id is not None
-    ):
+    if probe is None or probe.worker_id is not None or probe.shared_from_id is not None:
         await db.rollback()
         raise HTTPException(
             409,
             "Task execution location changed while cancellation was starting",
         )
     probe_instance_id = probe.instance_id
+    probe_is_active_plan = probe.mode == "plan" and probe.status in {
+        "in_progress",
+        "executing",
+    }
     await db.rollback()
     await _settle_task_launch_barrier(task_id, probe_instance_id)
+    if probe_is_active_plan:
+        stopped = await dispatcher.stop_plan_agent_lifecycle(
+            task_id,
+            probe_instance_id,
+        )
+        if not stopped:
+            stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
+        if not stopped:
+            raise HTTPException(
+                409,
+                "Plan Agent process cleanup could not be confirmed",
+            )
 
     db.expire_all()
     active_task = (
@@ -3473,13 +3627,10 @@ async def _cancel_local_task_impl(
         await db.rollback()
         raise HTTPException(400, "Cannot cancel task")
 
-    observed_status = active_task.status
     observed_retry_count = active_task.retry_count
     observed_instance_id = active_task.instance_id
     observed_started_at = active_task.started_at
-    observed_background_generation = (
-        active_task.pty_background_generation
-    )
+    observed_background_generation = active_task.pty_background_generation
     owner_rows = await db.execute(
         select(
             Instance.id,
@@ -3503,12 +3654,10 @@ async def _cancel_local_task_impl(
             expected_generations=expected_generations,
             task_status="cancelled",
         )
-        remaining_generations = (
-            await _remaining_task_process_generations(
-                task_id,
-                db,
-                expected_generations=expected_generations,
-            )
+        remaining_generations = await _remaining_task_process_generations(
+            task_id,
+            db,
+            expected_generations=expected_generations,
         )
         if remaining_generations:
             await db.rollback()
@@ -3520,11 +3669,7 @@ async def _cancel_local_task_impl(
         await db.rollback()
         db.expire_all()
         active_task = (
-            await db.execute(
-                select(Task)
-                .where(Task.id == task_id)
-                .with_for_update()
-            )
+            await db.execute(select(Task).where(Task.id == task_id).with_for_update())
         ).scalar_one_or_none()
         if (
             active_task is None
@@ -3557,13 +3702,9 @@ async def _cancel_local_task_impl(
                 409,
                 "Task owner did not atomically publish its cancelled state",
             )
-        if (
-            active_task.pty_background_generation is not None
-            and (
-                observed_background_generation is None
-                or active_task.pty_background_generation
-                != observed_background_generation
-            )
+        if active_task.pty_background_generation is not None and (
+            observed_background_generation is None
+            or active_task.pty_background_generation != observed_background_generation
         ):
             await db.rollback()
             raise HTTPException(
@@ -3604,9 +3745,7 @@ async def _cancel_local_task_impl(
                 409,
                 "Task generation changed while cancellation was starting",
             )
-        active_task = await db.get(
-            Task, task_id, populate_existing=True
-        )
+        active_task = await db.get(Task, task_id, populate_existing=True)
 
     from backend.models.monitor_session import MonitorSession
 
@@ -3640,9 +3779,7 @@ async def _cancel_local_task_impl(
     committed_retry_count = active_task.retry_count
     committed_instance_id = active_task.instance_id
     committed_started_at = active_task.started_at
-    committed_completed_at = (
-        await _read_persisted_task_completed_at(task_id, db)
-    )
+    committed_completed_at = await _read_persisted_task_completed_at(task_id, db)
     await db.commit()
 
     for session_id, agent_type, source in auxiliary_sessions:
@@ -3723,9 +3860,7 @@ async def cancel_task(
             observed=observed,
         )
 
-    return await _finish_task_operation(
-        _cancel_local_task_impl(task_id, db)
-    )
+    return await _finish_task_operation(_cancel_local_task_impl(task_id, db))
 
 
 @router.post("/{task_id}/retry", response_model=TaskResponse)
@@ -3818,9 +3953,7 @@ async def retry_task(
             expected_instance_id=retried.instance_id,
             expected_started_at=retried.started_at,
             expected_completed_at=retried.completed_at,
-            expected_pty_background_generation=(
-                retried.pty_background_generation
-            ),
+            expected_pty_background_generation=(retried.pty_background_generation),
         )
         if locked_task is None:
             raise HTTPException(
@@ -3828,13 +3961,19 @@ async def retry_task(
                 "Task was claimed by a newer generation before retry publication",
             )
         from backend.services.task_events import broadcast_status_change
+
         await broadcast_status_change(task_id, retried.status)
         await db.commit()
         return locked_task
 
 
 @router.post("/{task_id}/star", response_model=TaskResponse)
-async def star_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def star_task(
+    task_id: int,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
@@ -3845,7 +3984,12 @@ async def star_task(task_id: int, request: Request, queue: TaskQueue = Depends(_
 
 
 @router.post("/{task_id}/read", response_model=TaskResponse)
-async def mark_task_read(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def mark_task_read(
+    task_id: int,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
@@ -3856,7 +4000,12 @@ async def mark_task_read(task_id: int, request: Request, queue: TaskQueue = Depe
 
 
 @router.post("/{task_id}/unread", response_model=TaskResponse)
-async def mark_task_unread(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def mark_task_unread(
+    task_id: int,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
@@ -3867,7 +4016,12 @@ async def mark_task_unread(task_id: int, request: Request, queue: TaskQueue = De
 
 
 @router.post("/{task_id}/archive", response_model=TaskResponse)
-async def archive_task(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def archive_task(
+    task_id: int,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
@@ -3889,15 +4043,31 @@ async def get_queue(
     )
 
 
+def _require_plan_review_operation(task: Task) -> None:
+    if task.canonical_plan_id is not None:
+        raise HTTPException(
+            409,
+            f"Legacy Plan Task has migrated to canonical Plan #{task.canonical_plan_id}",
+        )
+    if task.mode == "plan" and task.status == "superseded":
+        successor_id = (task.metadata_ or {}).get("plan_superseded_by_task_id")
+        detail = "Plan has been superseded"
+        if isinstance(successor_id, int):
+            detail += f" by Plan #{successor_id}"
+        raise HTTPException(409, detail)
+    if task.mode != "plan" or task.status != "plan_review":
+        raise HTTPException(400, "Task is not in plan review state")
+
+
 @router.post("/{task_id}/plan/approve", response_model=TaskResponse)
 async def approve_plan(
     task_id: int,
     request: Request,
-    body: TaskActionRequest | None = None,
+    body: PlanApprovalRequest | None = None,
     queue: TaskQueue = Depends(_get_queue),
     db: AsyncSession = Depends(get_db),
 ):
-    """Approve a plan-mode task's plan and queue it for execution."""
+    """Approve an independent Plan without starting an Agent turn."""
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -3914,10 +4084,17 @@ async def approve_plan(
             body.expected_routing if body is not None else None,
             effective_model=current.model,
         )
-        if current.mode != "plan" or current.status != "plan_review":
-            raise HTTPException(400, "Task is not in plan review state")
+        _require_plan_review_operation(current)
+
+        target = None
+        if current.plan_target_task_id is not None:
+            target = await db.get(Task, current.plan_target_task_id)
+            if target is None:
+                raise HTTPException(409, "Plan target no longer exists")
+            await require_task_control(request, target, db)
 
         if current.worker_id is not None:
+            approving_user_id = get_current_user_id(request)
             await _ensure_worker_routing_ready(
                 current,
                 operation_lock_held=True,
@@ -3925,23 +4102,6 @@ async def approve_plan(
             observed = worker_task_generation(current)
             if observed is None:
                 raise HTTPException(409, "Task Worker assignment changed")
-            await _sync_worker_skill_selection_before_execution(current)
-            await db.rollback()
-            db.expire_all()
-            current = await db.get(Task, task_id)
-            if (
-                current is None
-                or worker_task_generation(
-                    current,
-                    expected_worker_id=observed.worker_id,
-                )
-                != observed
-            ):
-                raise HTTPException(
-                    409,
-                    "Task Worker generation changed while Skill selection was "
-                    "being synchronized",
-                )
             result = await _proxy(
                 current,
                 "POST",
@@ -3949,19 +4109,43 @@ async def approve_plan(
                 body=body.model_dump(mode="json") if body is not None else None,
                 operation_lock_held=True,
             )
-            # worker 上回到 pending 由 worker 自己的 Dispatcher 接力执行
-            return await _sync_task_from_worker_response(
-                queue.db,
+            approved = await _sync_task_from_worker_response(
+                db,
                 current,
                 result,
                 observed=observed,
             )
+            # Worker authentication identifies the Manager service, not the
+            # human who made this decision. Keep this Manager-local audit field
+            # authoritative and never mirror a Worker-local user id.
+            approved.plan_approved_by = approving_user_id
+            await db.commit()
+            await db.refresh(approved)
+            return approved
 
         _require_no_pending_worker_routing(current)
+        from backend.services.plan_tasks import plan_staleness
+
+        stale = await plan_staleness(db, current, current_target=target)
+        if stale["stale"] and not (body and body.confirm_stale):
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "Plan context changed; confirm stale approval",
+                    "staleness": stale,
+                },
+            )
+        approved_at = datetime.utcnow()
         changed = await db.execute(
             sa_update(Task)
             .where(*_task_generation_fence(task_id, current))
-            .values(plan_approved=True, status="pending")
+            .values(
+                plan_approved=True,
+                plan_approved_at=approved_at,
+                plan_approved_by=get_current_user_id(request),
+                status="completed",
+                completed_at=approved_at,
+            )
         )
         if changed.rowcount != 1:
             await db.rollback()
@@ -3974,19 +4158,19 @@ async def approve_plan(
         approved = await db.get(Task, task_id)
         if approved is None:
             raise HTTPException(409, "Task disappeared while approving the plan")
-        try:
-            from backend.main import dispatcher
-            if dispatcher:
-                dispatcher.wake()
-        except Exception:
-            pass
         from backend.services.task_events import broadcast_status_change
-        await broadcast_status_change(task_id, "pending")
+
+        await broadcast_status_change(task_id, "completed")
         return approved
 
 
 @router.post("/{task_id}/plan/reject", response_model=TaskResponse)
-async def reject_plan(task_id: int, request: Request, queue: TaskQueue = Depends(_get_queue), db: AsyncSession = Depends(get_db)):
+async def reject_plan(
+    task_id: int,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+    db: AsyncSession = Depends(get_db),
+):
     """Reject a plan-mode task's plan."""
     task = await queue.get(task_id)
     if not task:
@@ -3999,8 +4183,7 @@ async def reject_plan(task_id: int, request: Request, queue: TaskQueue = Depends
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
-        if current.mode != "plan" or current.status != "plan_review":
-            raise HTTPException(400, "Task is not in plan review state")
+        _require_plan_review_operation(current)
 
         if current.worker_id is not None:
             observed = worker_task_generation(current)
@@ -4022,7 +4205,11 @@ async def reject_plan(task_id: int, request: Request, queue: TaskQueue = Depends
         changed = await db.execute(
             sa_update(Task)
             .where(*_task_generation_fence(task_id, current))
-            .values(plan_approved=False, status="cancelled")
+            .values(
+                plan_approved=False,
+                status="cancelled",
+                completed_at=datetime.utcnow(),
+            )
         )
         if changed.rowcount != 1:
             await db.rollback()
@@ -4036,5 +4223,6 @@ async def reject_plan(task_id: int, request: Request, queue: TaskQueue = Depends
         if rejected is None:
             raise HTTPException(409, "Task disappeared while rejecting the plan")
         from backend.services.task_events import broadcast_status_change
+
         await broadcast_status_change(task_id, "cancelled")
         return rejected

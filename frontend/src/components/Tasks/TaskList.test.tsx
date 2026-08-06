@@ -81,6 +81,140 @@ describe('TaskList', () => {
     expect(screen.getByText('The prompt')).toBeInTheDocument();
   });
 
+  it.each([
+    ['planning', 1, 'Planning'],
+    ['reviewing', 1, 'Reviewing'],
+    ['planning', 2, 'Planning · Round 2'],
+    ['reviewing', 2, 'Reviewing · Round 2'],
+  ])(
+    'shows the active Plan stage %s round %s',
+    (planStage, planStageRound, expected) => {
+      render(
+        <TaskList
+          tasks={[makeTask({
+            mode: 'plan',
+            status: 'executing',
+            plan_stage: planStage,
+            plan_stage_round: planStageRound,
+          })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      expect(screen.getByText(expected)).toBeInTheDocument();
+    },
+  );
+
+  it('shows the concrete running Plan route and fallback state without generic Config', () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          mode: 'plan',
+          status: 'executing',
+          provider: 'claude',
+          model: 'claude-fable-5',
+          plan_stage: 'reviewing',
+          plan_stage_round: 2,
+          plan_stage_provider: 'codex',
+          plan_stage_model: 'gpt-5.6-terra',
+          plan_stage_effort: 'xhigh',
+          plan_stage_route_slot: 'fallback',
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    const badge = screen.getByTestId('plan-pipeline-badge');
+    expect(badge).toHaveTextContent('Reviewer · gpt-5.6-terra');
+    expect(badge).toHaveTextContent('fallback');
+    expect(badge).toHaveAttribute(
+      'title',
+      'Reviewer, round 2: codex / gpt-5.6-terra / xhigh (fallback)',
+    );
+    expect(screen.queryByText('Config')).not.toBeInTheDocument();
+  });
+
+  it('shows the frozen Planner to Reviewer pipeline when a Plan is not running', () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          mode: 'plan',
+          status: 'plan_review',
+          provider: 'claude',
+          model: 'claude-fable-5',
+          plan_pipeline_config: {
+            version: 1,
+            planner: {
+              primary: { provider: 'claude', model: 'claude-fable-5', effort: 'high' },
+              fallback: { provider: 'codex', model: 'gpt-5.6-terra', effort: 'xhigh' },
+            },
+            reviewer: {
+              enabled: true,
+              primary: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh' },
+              fallback: { provider: 'claude', model: 'claude-sonnet-5', effort: 'high' },
+            },
+            max_revision_cycles: 2,
+          },
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    const badge = screen.getByTestId('plan-pipeline-badge');
+    expect(badge).toHaveTextContent('claude-fable-5 → gpt-5.6-sol');
+    expect(badge).toHaveAttribute(
+      'title',
+      expect.stringContaining('Planner fallback: codex / gpt-5.6-terra / xhigh'),
+    );
+  });
+
+  it('shows both sides of an immutable Plan revision chain', () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          id: 12,
+          mode: 'plan',
+          status: 'superseded',
+          supersedes_plan_task_id: 9,
+          metadata_: { plan_superseded_by_task_id: 15 },
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    expect(screen.getByText('Superseded')).toBeInTheDocument();
+    expect(screen.getByText('Revision of #9')).toBeInTheDocument();
+    expect(screen.getByText('Superseded by #15')).toBeInTheDocument();
+    expect(screen.queryByText('Config')).not.toBeInTheDocument();
+  });
+
+  it('keeps a migrated Plan Task visible and links it to the canonical Plan', async () => {
+    render(
+      <TaskList
+        tasks={[makeTask({
+          id: 12,
+          mode: 'plan',
+          status: 'completed',
+          canonical_plan_id: 44,
+        })]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plan #44' }));
+    expect(window.location.hash).toBe('#/plans/44');
+  });
+
   it('shows empty state when no tasks', () => {
     render(<TaskList tasks={[]} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('No tasks yet')).toBeInTheDocument();

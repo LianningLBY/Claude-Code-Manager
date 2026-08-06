@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Integer, String, Float, DateTime, JSON
+from sqlalchemy import CheckConstraint, Integer, String, Float, DateTime, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -8,12 +8,19 @@ from backend.database import Base
 
 class Instance(Base):
     __tablename__ = "instances"
+    __table_args__ = (
+        CheckConstraint(
+            "NOT (current_task_id IS NOT NULL AND current_plan_run_id IS NOT NULL)",
+            name="ck_instances_task_xor_plan_run_owner",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="idle")
     current_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_plan_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     worktree_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     worktree_branch: Mapped[str | None] = mapped_column(String(100), nullable=True)
     provider: Mapped[str] = mapped_column(String(20), default="claude", server_default="claude")

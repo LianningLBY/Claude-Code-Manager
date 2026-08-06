@@ -59,9 +59,6 @@ vi.mock('../hooks/useTaskReorder', () => ({
 vi.mock('../components/Tasks/TaskForm', () => ({
   TaskForm: () => null,
 }));
-vi.mock('../components/PlanReview/PlanPanel', () => ({
-  PlanPanel: () => null,
-}));
 vi.mock('../components/Tasks/TaskList', () => ({
   TaskList: ({
     tasks,
@@ -71,6 +68,11 @@ vi.mock('../components/Tasks/TaskList', () => ({
       id: number;
       status: string;
       background_active?: boolean;
+      plan_stage?: string | null;
+      plan_stage_round?: number | null;
+      plan_stage_provider?: string | null;
+      plan_stage_model?: string | null;
+      plan_stage_route_slot?: string | null;
       attention_tag?: string | null;
     }>;
     onTaskUpdated?: (task: {
@@ -85,6 +87,12 @@ vi.mock('../components/Tasks/TaskList', () => ({
         <div key={task.id}>
           <span>
             {task.id}:{task.status}:{String(task.background_active === true)}
+          </span>
+          <span data-testid={`plan-stage-${task.id}`}>
+            {task.plan_stage || 'none'}:{task.plan_stage_round ?? 'none'}
+          </span>
+          <span data-testid={`plan-route-${task.id}`}>
+            {task.plan_stage_provider || 'none'}:{task.plan_stage_model || 'none'}:{task.plan_stage_route_slot || 'none'}
           </span>
           <span data-testid={`attention-tag-${task.id}`}>
             {task.attention_tag ?? ''}
@@ -206,6 +214,86 @@ describe('TasksPage realtime reconciliation', () => {
       await Promise.resolve();
     });
     expect(api.countTasks).toHaveBeenCalledTimes(2);
+  });
+
+  it('applies Plan stage changes without waiting for polling', async () => {
+    vi.mocked(api.listTasks).mockResolvedValue([{
+      ...task,
+      mode: 'plan',
+      status: 'executing',
+      plan_stage: 'planning',
+      plan_stage_round: 1,
+    }] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByTestId('plan-stage-7')).toHaveTextContent(
+      'planning:1',
+    );
+    const countCalls = vi.mocked(api.countTasks).mock.calls.length;
+
+    act(() => {
+      capturedGlobalWs?.({
+        channel: 'tasks',
+        data: {
+          event: 'plan_stage_change',
+          task_id: 7,
+          plan_stage: 'reviewing',
+          plan_stage_round: 2,
+          plan_stage_provider: 'codex',
+          plan_stage_model: 'gpt-5.6-terra',
+          plan_stage_effort: 'xhigh',
+          plan_stage_route_slot: 'fallback',
+        },
+      });
+    });
+
+    expect(await screen.findByTestId('plan-stage-7')).toHaveTextContent(
+      'reviewing:2',
+    );
+    expect(await screen.findByTestId('plan-route-7')).toHaveTextContent(
+      'codex:gpt-5.6-terra:fallback',
+    );
+    expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
+
+    act(() => {
+      capturedGlobalWs?.({
+        channel: 'tasks',
+        data: {
+          event: 'plan_ready',
+          task_id: 7,
+        },
+      });
+    });
+
+    expect(await screen.findByText('7:plan_review:false')).toBeInTheDocument();
+    expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
+  });
+
+  it('queries the complete Task history without embedding Plan catalog panels', async () => {
+    vi.mocked(api.listTasks).mockResolvedValue([{ ...task, id: 1 }] as never);
+    vi.mocked(api.countTasks).mockResolvedValue({ total: 1 });
+
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('1:pending:false')).toBeInTheDocument();
+    await waitFor(() => expect(api.listTasks).toHaveBeenCalled());
+    expect(vi.mocked(api.listTasks).mock.calls.every((call) => call[8] === undefined)).toBe(true);
+    expect(vi.mocked(api.countTasks).mock.calls.every((call) => call[6] === undefined)).toBe(true);
+    expect(screen.queryByRole('region', { name: 'Plans requiring action' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Filter/ }));
+    expect(screen.queryByText('Standalone Plans')).not.toBeInTheDocument();
+    expect(screen.queryByText('Related Plans')).not.toBeInTheDocument();
   });
 
   it('shows the attention tag in the split-mode task sidebar', async () => {

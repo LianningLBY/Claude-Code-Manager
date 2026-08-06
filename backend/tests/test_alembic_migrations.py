@@ -8,15 +8,16 @@ Ensures:
 import importlib.util
 import io
 import json
-import re
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+import pytest
 from sqlalchemy import BigInteger, create_engine, inspect, text
+from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.schema import CreateTable
 
 # All ORM models must be imported so Base.metadata is complete.
 from backend.database import Base
@@ -29,6 +30,7 @@ import backend.models.worktree  # noqa: F401
 import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
+import backend.models.plan  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -37,7 +39,9 @@ PR_REVIEW_SNAPSHOT_REVISION = "5f7a9c2e4d61"
 PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
-CURRENT_HEAD_REVISION = "2f6c8a1d4e90"
+ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
+FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
+CURRENT_HEAD_REVISION = "e5b8d1c4a7f2"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -227,6 +231,11 @@ class TestLegacyMigration:
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
         assert "task_retry_count" in log_cols
+
+        plan_step_cols = _get_table_columns(engine, "plan_agent_steps")
+        assert "last_delta_at" in plan_step_cols
+        assert "streamed_output_chars" in plan_step_cols
+        assert "last_event_type" in plan_step_cols
 
         project_cols = _get_table_columns(engine, "projects")
         assert "sort_order" in project_cols
@@ -423,7 +432,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -432,6 +441,9 @@ class TestFreshMigration:
         assert "loop_progress" in task_cols
         assert "max_iterations" in task_cols
         assert "context_window_usage" in task_cols
+        assert "plan_target_task_id" in task_cols
+        assert "plan_context_snapshot" in task_cols
+        assert "plan_applied_log_id" in task_cols
         assert "attention_tag" in task_cols
 
         log_cols = _get_table_columns(engine, "log_entries")
@@ -613,10 +625,16 @@ class TestFreshMigration:
         engine = create_engine(f"sqlite:///{db_path}")
         assert "pr_finding_actions" not in _get_all_tables(engine)
         with engine.connect() as conn:
-            revision = conn.execute(
+            revisions = {
+                row[0]
+                for row in conn.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one()
-        assert revision == PR_REVIEW_PANEL_REVISION
+                ).fetchall()
+            }
+        assert revisions == {
+            PR_REVIEW_PANEL_REVISION,
+            FIRST_CLASS_PLAN_HEAD_REVISION,
+        }
         engine.dispose()
 
         _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
@@ -915,12 +933,606 @@ class TestAlreadyMigratedDb:
         engine.dispose()
 
 
+class TestVersionedPlanBackfill:
+    def test_feature_branch_revision_chain_is_not_migrated(self, tmp_path):
+        db_path = str(tmp_path / "legacy_plans.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            required = """
+                id, title, description, status, priority, target_branch,
+                merge_status, retry_count, max_retries, mode, created_at
+            """
+            conn.execute(text(f"""
+                INSERT INTO tasks ({required}) VALUES
+                (1, 'Target', 'Implement feature', 'completed', 0, 'main',
+                 'pending', 0, 2, 'auto', '2026-08-01 09:00:00')
+            """))
+            conn.execute(text(f"""
+                INSERT INTO tasks (
+                    {required}, plan_target_task_id, plan_context_session_id,
+                    plan_context_log_id, plan_context_snapshot,
+                    plan_repo_revision, supersedes_plan_task_id, plan_content,
+                    plan_approved, plan_approved_at, plan_approved_by,
+                    plan_applied_at, plan_applied_to_session_id,
+                    plan_applied_log_id, plan_pipeline_config, completed_at
+                ) VALUES
+                (2, 'Plan root', 'Design it', 'completed', 1, 'main',
+                 'pending', 0, 2, 'plan', '2026-08-01 10:00:00',
+                 1, 'session-1', 10, 'bounded context',
+                 '{{"commit": "abc"}}', NULL, '# Version 1', 1,
+                 '2026-08-01 10:30:00', 7, '2026-08-01 11:00:00',
+                 'session-1', 11, '{{"planner": {{"provider": "claude"}}}}',
+                 '2026-08-01 10:30:00'),
+                (3, 'Plan revision', 'Add rollback', 'completed', 1, 'main',
+                 'pending', 0, 2, 'plan', '2026-08-01 12:00:00',
+                 1, 'session-1', 12, 'new bounded context',
+                 '{{"commit": "def"}}', 2, '# Version 2', NULL,
+                 NULL, NULL, NULL, NULL, NULL,
+                 '{{"planner": {{"provider": "claude"}}}}',
+                 '2026-08-01 12:30:00')
+            """))
+            conn.execute(text("""
+                INSERT INTO log_entries (
+                    id, task_id, event_type, content, timestamp, is_error
+                ) VALUES (
+                    11, 1, 'user', 'Applied Plan', '2026-08-01 11:00:00', 0
+                )
+            """))
+            run_id = conn.execute(text("""
+                INSERT INTO plan_agent_runs (
+                    plan_task_id, status, round, review_exhausted,
+                    created_at, updated_at
+                ) VALUES (
+                    3, 'completed', 1, 0,
+                    '2026-08-01 12:00:00', '2026-08-01 12:30:00'
+                ) RETURNING id
+            """)).scalar_one()
+            conn.execute(text("""
+                INSERT INTO plan_agent_steps (
+                    run_id, step_type, round, provider, status, started_at
+                ) VALUES (
+                    :run_id, 'planner', 1, 'claude', 'completed',
+                    '2026-08-01 12:00:00'
+                )
+            """), {"run_id": run_id})
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            for table in (
+                "plans",
+                "plan_versions",
+                "plan_agent_runs",
+                "plan_agent_steps",
+                "plan_applications",
+                "plan_legacy_task_links",
+            ):
+                assert conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one() == 0
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM tasks WHERE id IN (1, 2, 3)"
+            )).scalar_one() == 3
+        engine.dispose()
+
+    def test_pending_failed_and_attachments_are_backfilled(self, tmp_path):
+        db_path = str(tmp_path / "legacy_plan_states.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, metadata,
+                    created_at
+                ) VALUES
+                (21, 'Pending legacy Plan', 'Wait to run', 'pending', 0,
+                 'main', 'pending', 0, 2, 'plan', :metadata,
+                 '2026-08-01 10:00:00')
+            """), {"metadata": json.dumps({
+                "file_paths": ["/uploads/requirements.txt"],
+                "attachments": [{
+                    "url": "/api/uploads/requirements.txt",
+                    "name": "requirements.txt",
+                    "is_image": False,
+                }],
+            })})
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, metadata,
+                    created_at
+                ) VALUES
+                (22, 'Failed legacy Plan', 'Failed before output', 'failed', 0,
+                 'main', 'pending', 0, 2, 'plan', NULL,
+                 '2026-08-01 11:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT l.legacy_task_id, l.plan_run_id, r.status,
+                       p.active_run_id, p.initial_attachments, t.status AS task_status,
+                       p.pipeline_config
+                FROM plan_legacy_task_links l
+                JOIN plan_agent_runs r ON r.id = l.plan_run_id
+                JOIN plans p ON p.id = l.plan_id
+                JOIN tasks t ON t.id = l.legacy_task_id
+                ORDER BY l.legacy_task_id
+            """)).mappings().all()
+            assert [row["status"] for row in rows] == ["queued", "failed"]
+            assert rows[0]["active_run_id"] == rows[0]["plan_run_id"]
+            assert rows[1]["active_run_id"] is None
+            assert [row["task_status"] for row in rows] == ["superseded", "failed"]
+            attachments = rows[0]["initial_attachments"]
+            if isinstance(attachments, str):
+                attachments = json.loads(attachments)
+            assert attachments == [{
+                "url": "/api/uploads/requirements.txt",
+                "name": "requirements.txt",
+                "is_image": False,
+                "path": "/uploads/requirements.txt",
+            }]
+            pipeline = rows[0]["pipeline_config"]
+            if isinstance(pipeline, str):
+                pipeline = json.loads(pipeline)
+            assert pipeline["planner"]["primary"]["provider"] == "claude"
+            assert pipeline["max_interactions"] == 3
+        engine.dispose()
+
+    def test_main_plan_task_states_preserve_review_and_execution_semantics(
+        self,
+        tmp_path,
+    ):
+        """Main approved by reusing the carrier Task; do not execute it twice."""
+        db_path = str(tmp_path / "main_plan_task_states.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, plan_content,
+                    plan_approved, plan_approved_at, created_at, completed_at
+                ) VALUES
+                (31, 'Needs decision', 'Review this', 'plan_review', 0,
+                 'main', 'pending', 0, 2, 'plan', '# Review', NULL, NULL,
+                 '2026-08-01 09:00:00', NULL),
+                (32, 'Approved and queued', 'Execute this', 'pending', 0,
+                 'main', 'pending', 0, 2, 'plan', '# Queued', 1, NULL,
+                 '2026-08-01 10:00:00', NULL),
+                (33, 'Already executed', 'Was executed', 'completed', 0,
+                 'main', 'pending', 0, 2, 'plan', '# Done', 1, NULL,
+                 '2026-08-01 11:00:00', '2026-08-01 12:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT l.legacy_task_id, t.status AS task_status,
+                       p.active_run_id, v.review_verdict, v.human_decision,
+                       a.application_type, a.execution_task_id
+                FROM plan_legacy_task_links l
+                JOIN tasks t ON t.id = l.legacy_task_id
+                JOIN plans p ON p.id = l.plan_id
+                JOIN plan_versions v ON v.id = l.plan_version_id
+                LEFT JOIN plan_applications a
+                  ON a.plan_version_id = l.plan_version_id
+                ORDER BY l.legacy_task_id
+            """)).mappings().all()
+
+            assert dict(rows[0]) == {
+                "legacy_task_id": 31,
+                "task_status": "plan_review",
+                "active_run_id": None,
+                "review_verdict": "disabled",
+                "human_decision": "pending",
+                "application_type": None,
+                "execution_task_id": None,
+            }
+            assert dict(rows[1]) == {
+                "legacy_task_id": 32,
+                "task_status": "pending",
+                "active_run_id": None,
+                "review_verdict": None,
+                "human_decision": "approved",
+                "application_type": "execution_task",
+                "execution_task_id": 32,
+            }
+            assert dict(rows[2]) == {
+                "legacy_task_id": 33,
+                "task_status": "completed",
+                "active_run_id": None,
+                "review_verdict": None,
+                "human_decision": "approved",
+                "application_type": "execution_task",
+                "execution_task_id": 33,
+            }
+        engine.dispose()
+
+    def test_active_legacy_plan_process_blocks_backfill(self, tmp_path):
+        db_path = str(tmp_path / "active_legacy_plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                ) VALUES (
+                    31, 'Active legacy Plan', 'Still running', 'executing', 0,
+                    'main', 'pending', 0, 2, 'plan', '2026-08-01 10:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO instances (
+                    id, name, pid, status, current_task_id, provider, model,
+                    total_tasks_completed, total_cost_usd
+                ) VALUES (
+                    41, 'legacy-owner', 12345, 'running', 31, 'claude',
+                    'default', 0, 0
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="active process evidence",
+        ):
+            _run_alembic(cfg, command.upgrade, "head")
+
+    def test_active_legacy_plan_task_state_blocks_without_instance(self, tmp_path):
+        db_path = str(tmp_path / "active_legacy_plan_without_instance.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                ) VALUES (
+                    32, 'Unowned active Plan', 'State is still authoritative',
+                    'in_progress', 0, 'main', 'pending', 0, 2, 'plan',
+                    '2026-08-01 10:00:00'
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="active state evidence",
+        ):
+            _run_alembic(cfg, command.upgrade, "head")
+
+    def test_feature_branch_application_fields_are_not_migrated(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "legacy_applied_pending_plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "d2b8f6a10c43")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, plan_content,
+                    plan_approved, plan_approved_at, plan_applied_at,
+                    plan_execution_task_id, created_at, completed_at
+                ) VALUES
+                (50, 'Applied legacy Plan', 'Historical application',
+                 'completed', 0, 'main', 'pending', 0, 2, 'plan', '# Applied',
+                 NULL, '2026-08-01 11:00:00', '2026-08-01 11:00:00', 51,
+                 '2026-08-01 09:00:00', '2026-08-01 11:00:00'),
+                (51, 'Execution Task', 'Implemented the Plan', 'completed', 0,
+                 'main', 'pending', 0, 2, 'auto', NULL, NULL, NULL, NULL, NULL,
+                 '2026-08-01 11:00:00', '2026-08-01 12:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM plans")).scalar_one() == 0
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM tasks WHERE id IN (50, 51)"
+            )).scalar_one() == 2
+        engine.dispose()
+
+    def test_reconcile_keeps_main_carrier_and_deletes_feature_branch_plans(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "reconcile_feature_branch_plans.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "f5b7c9d1e3a2")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, plan_content,
+                    plan_approved, created_at, completed_at
+                ) VALUES
+                (60, 'Main Plan Task', 'Main request', 'completed', 0, 'main',
+                 'pending', 0, 2, 'plan', '# Main content', 1,
+                 '2026-04-01 09:00:00', '2026-04-01 11:00:00')
+            """))
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, plan_content,
+                    plan_target_task_id, plan_approved_at, created_at,
+                    completed_at
+                ) VALUES
+                (61, 'Branch Plan Task', 'Branch request', 'superseded', 0,
+                 'main', 'pending', 0, 2, 'plan', '# Branch content', 60,
+                 '2026-08-01 10:30:00', '2026-08-01 10:00:00',
+                 '2026-08-01 11:00:00')
+            """))
+            conn.execute(text("""
+                INSERT INTO plans (
+                    id, title, initial_request, priority, pipeline_config,
+                    current_version_id, archived_at, lock_version,
+                    created_at, updated_at
+                ) VALUES
+                (100, 'Previously migrated Main', 'Old request', 0, '{}',
+                 1002, '2026-08-02 09:00:00', 3,
+                 '2026-04-01 09:00:00', '2026-08-02 09:00:00'),
+                (101, 'Branch standalone', 'Discard me', 0, '{}',
+                 1011, NULL, 0,
+                 '2026-08-01 09:00:00', '2026-08-01 11:00:00')
+            """))
+            conn.execute(text("""
+                INSERT INTO plan_versions (
+                    id, plan_id, version_number, parent_version_id, content,
+                    review_exhausted, human_decision,
+                    superseded_by_version_id, created_at
+                ) VALUES
+                (1001, 100, 1, NULL, '# Old migrated content', 0, 'pending',
+                 1002, '2026-04-01 11:00:00'),
+                (1002, 100, 2, 1001, '# Branch revision', 0, 'approved',
+                 NULL, '2026-08-02 09:00:00'),
+                (1011, 101, 1, NULL, '# Branch standalone', 0, 'pending',
+                 NULL, '2026-08-01 11:00:00')
+            """))
+            run_id = conn.execute(text("""
+                INSERT INTO plan_agent_runs (
+                    plan_task_id, plan_id, status, round, review_exhausted,
+                    created_at, updated_at
+                ) VALUES (
+                    61, 101, 'completed', 1, 0,
+                    '2026-08-01 10:00:00', '2026-08-01 11:00:00'
+                ) RETURNING id
+            """)).scalar_one()
+            step_id = conn.execute(text("""
+                INSERT INTO plan_agent_steps (
+                    run_id, plan_id, step_type, round, provider, status,
+                    started_at
+                ) VALUES (
+                    :run_id, 101, 'planner', 1, 'claude', 'completed',
+                    '2026-08-01 10:00:00'
+                ) RETURNING id
+            """), {"run_id": run_id}).scalar_one()
+            conn.execute(text("""
+                INSERT INTO plan_input_requests (
+                    plan_id, run_id, source_step_id, requested_by, questions,
+                    status, idempotency_key, created_at
+                ) VALUES (
+                    101, :run_id, :step_id, 'planner', '[]', 'open',
+                    'branch-input', '2026-08-01 10:30:00'
+                )
+            """), {"run_id": run_id, "step_id": step_id})
+            conn.execute(text("""
+                INSERT INTO plan_applications (
+                    plan_id, plan_version_id, application_type,
+                    execution_task_id, created_at
+                ) VALUES (
+                    100, 1002, 'execution_task', 61,
+                    '2026-08-02 10:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO plan_application_receipts (
+                    receipt_key, target_task_id, plan_version_ids, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'branch-receipt', 61, '[1002]', 'completed',
+                    '2026-08-02 10:00:00', '2026-08-02 10:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO plan_legacy_task_links (
+                    legacy_task_id, plan_id, plan_version_id, plan_run_id,
+                    created_at
+                ) VALUES
+                (60, 100, 1001, NULL, '2026-04-01 09:00:00'),
+                (61, 101, 1011, :run_id, '2026-08-01 09:00:00')
+            """), {"run_id": run_id})
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            plan = conn.execute(text("""
+                SELECT id, title, current_version_id, active_run_id,
+                       archived_at, lock_version
+                FROM plans
+            """)).mappings().one()
+            assert plan["id"] == 100
+            assert plan["title"] == "Main Plan Task"
+            assert plan["archived_at"] is None
+            assert plan["lock_version"] == 0
+
+            version = conn.execute(text("""
+                SELECT id, plan_id, version_number, parent_version_id, content,
+                       human_decision, superseded_by_version_id
+                FROM plan_versions
+            """)).mappings().one()
+            assert dict(version) == {
+                "id": 1001,
+                "plan_id": 100,
+                "version_number": 1,
+                "parent_version_id": None,
+                "content": "# Main content",
+                "human_decision": "approved",
+                "superseded_by_version_id": None,
+            }
+            assert plan["current_version_id"] == 1001
+            assert plan["active_run_id"] is None
+
+            application = conn.execute(text("""
+                SELECT plan_id, plan_version_id, application_type,
+                       execution_task_id
+                FROM plan_applications
+            """)).mappings().one()
+            assert dict(application) == {
+                "plan_id": 100,
+                "plan_version_id": 1001,
+                "application_type": "execution_task",
+                "execution_task_id": 60,
+            }
+            link = conn.execute(text("""
+                SELECT legacy_task_id, plan_id, plan_version_id, plan_run_id
+                FROM plan_legacy_task_links
+            """)).mappings().one()
+            assert link["legacy_task_id"] == 60
+            assert link["plan_id"] == 100
+            assert link["plan_version_id"] == 1001
+            assert link["plan_run_id"] is not None
+
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM plan_agent_runs"
+            )).scalar_one() == 1
+            for table in (
+                "plan_agent_steps",
+                "plan_input_requests",
+                "plan_application_receipts",
+            ):
+                assert conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one() == 0
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM tasks WHERE id=61"
+            )).scalar_one() == 1
+        engine.dispose()
+
+    def test_reconcile_blocks_while_canonical_run_waits_for_user(self, tmp_path):
+        db_path = str(tmp_path / "active_canonical_plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "f5b7c9d1e3a2")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO plan_agent_runs (
+                    plan_task_id, status, round, review_exhausted,
+                    created_at, updated_at
+                ) VALUES (
+                    NULL, 'waiting_user', 1, 0,
+                    '2026-08-01 10:00:00', '2026-08-01 11:00:00'
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="canonical Run has active state evidence",
+        ):
+            _run_alembic(cfg, command.upgrade, "head")
+
+    def test_repair_migration_only_approves_versions_with_applications(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "repair_applied_pending_plan.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "f1a8c4d72e90")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO plans (
+                    id, title, initial_request, priority, pipeline_config,
+                    current_version_id, lock_version, created_at, updated_at
+                ) VALUES (
+                    90, 'Migrated Plan', 'Repair it', 0, '{}', 902, 0,
+                    '2026-08-01 09:00:00', '2026-08-01 11:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO plan_versions (
+                    id, plan_id, version_number, content, review_exhausted,
+                    human_decision, superseded_by_version_id, created_at
+                ) VALUES
+                (901, 90, 1, '# Superseded', 0, 'pending', 902,
+                 '2026-08-01 10:00:00'),
+                (902, 90, 2, '# Applied', 0, 'pending', NULL,
+                 '2026-08-01 11:00:00')
+            """))
+            conn.execute(text("""
+                INSERT INTO plan_applications (
+                    plan_id, plan_version_id, application_type,
+                    execution_task_id, applied_by, created_at
+                ) VALUES (
+                    90, 902, 'execution_task', 999, 77,
+                    '2026-08-01 12:00:00'
+                )
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "f5b7c9d1e3a2")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, human_decision, decided_at, decided_by
+                FROM plan_versions ORDER BY id
+            """)).mappings().all()
+            assert dict(rows[0]) == {
+                "id": 901,
+                "human_decision": "pending",
+                "decided_at": None,
+                "decided_by": None,
+            }
+            assert rows[1]["human_decision"] == "approved"
+            assert rows[1]["decided_at"] is not None
+            assert rows[1]["decided_by"] == 77
+        engine.dispose()
+
+
 class TestSchemaConsistency:
     """The schema produced by Alembic migrations matches the ORM models.
 
     This is the critical test: if someone adds a column to an ORM model
     but forgets to create an Alembic migration, this test will catch it.
     """
+
+    def test_plan_application_integrity_constraint_compiles_on_all_dialects(self):
+        table = backend.models.plan.PlanApplication.__table__
+        for dialect in (sqlite.dialect(), postgresql.dialect(), mysql.dialect()):
+            ddl = str(CreateTable(table).compile(dialect=dialect))
+            assert "ck_plan_application_target" in ddl
+            assert "execution_task" in ddl
 
     def test_migrated_schema_matches_orm(self, tmp_path):
         """Compare columns from Alembic-migrated DB vs ORM metadata.create_all."""
@@ -987,7 +1599,7 @@ class TestSchemaConsistency:
             ]
 
             assert len(significant_diffs) == 0, (
-                f"Alembic autogenerate found pending changes (need a new migration!):\n"
+                "Alembic autogenerate found pending changes (need a new migration!):\n"
                 + "\n".join(str(d) for d in significant_diffs)
             )
 
@@ -1029,7 +1641,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_attention_tag(self, tmp_path):
+    def test_migration_graph_has_one_head_after_plan_main_merge(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -1037,7 +1649,7 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
-            == PR_FINDING_ACTIONS_REVISION
+            == (FIRST_CLASS_PLAN_HEAD_REVISION, ATTENTION_TAG_REVISION)
         )
         assert (
             script.get_revision(PR_FINDING_ACTIONS_REVISION).down_revision
@@ -1047,6 +1659,28 @@ class TestPublishedMigrationHistory:
             script.get_revision(PR_REVIEW_PANEL_REVISION).down_revision
             == PUBLISHED_BRANCH_MERGE_REVISION
         )
+
+    def test_deployed_main_head_upgrades_to_combined_plan_head(self, tmp_path):
+        db_path = str(tmp_path / "main-to-combined.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, ATTENTION_TAG_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plans" not in _get_all_tables(engine)
+        assert "attention_tag" in _get_table_columns(engine, "tasks")
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plans" in _get_all_tables(engine)
+        task_columns = _get_table_columns(engine, "tasks")
+        assert "attention_tag" in task_columns
+        assert "plan_target_task_id" in task_columns
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == CURRENT_HEAD_REVISION
+        engine.dispose()
 
     @pytest.mark.parametrize(
         ("start_revision", "plan_schema_present", "snapshot_schema_present"),

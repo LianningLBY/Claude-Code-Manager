@@ -236,15 +236,9 @@ async def test_live_auxiliary_generations_block_restart_without_active_task(
         dispatcher=dispatcher,
     )
 
-    try:
-        blockers = await service._get_blocking_tasks(
-            pending_task_ids=set()
-        )
-    finally:
-        monitor_lifecycle.cancel()
-        await asyncio.gather(
-            monitor_lifecycle, return_exceptions=True
-        )
+    blockers = await service._get_blocking_tasks(
+        pending_task_ids=set()
+    )
 
     assert blockers == [
         {

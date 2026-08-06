@@ -17,7 +17,42 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+_FIRST_CLASS_PLAN_REVISIONS = {
+    "c1a7e4d92f30",
+    "d2b8f6a10c43",
+    "e7c4a21d9b30",
+    "f1a8c4d72e90",
+    "f5b7c9d1e3a2",
+    "f6c8d0e2a4b1",
+    "a4d9e2c7b1f0",
+    "b5f7c9d1e3a4",
+    "c6e8a1f4d2b7",
+    "d4a7c9e2f1b6",
+}
+
+
+def _first_class_plan_history_started() -> bool:
+    bind = op.get_bind()
+    if "plans" in sa.inspect(bind).get_table_names():
+        return True
+    applied = {
+        row[0]
+        for row in bind.execute(
+            sa.text("SELECT version_num FROM alembic_version")
+        ).fetchall()
+    }
+    return bool(applied & _FIRST_CLASS_PLAN_REVISIONS)
+
+
 def upgrade() -> None:
+    # The feature history may already have installed the first-class Plan
+    # aggregate before this published main-branch cleanup is encountered.
+    # In that case the legacy carrier tables are still part of the supported
+    # compatibility/migration boundary and must not be deleted underneath the
+    # canonical Plan data.
+    if _first_class_plan_history_started():
+        return
+
     op.drop_index(
         "ix_plan_agent_steps_run_id",
         table_name="plan_agent_steps",
@@ -51,6 +86,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    if (
+        "plans" in inspector.get_table_names()
+        or "plan_agent_runs" in inspector.get_table_names()
+        or "plan_target_task_id"
+        in {column["name"] for column in inspector.get_columns("tasks")}
+    ):
+        return
+
     with op.batch_alter_table("tasks", schema=None) as batch_op:
         batch_op.add_column(
             sa.Column("plan_target_task_id", sa.Integer(), nullable=True)

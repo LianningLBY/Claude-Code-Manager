@@ -2,9 +2,7 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import update
 
-from backend.models.task import Task
 from backend.models.instance import Instance
 
 
@@ -210,6 +208,44 @@ async def test_config_ships_codex_sol_as_default(client):
     assert data["default_provider"] == "codex"
     assert data["default_codex_model"] == "gpt-5.6-sol"
     assert "gpt-5.6-sol" in data["codex_model_options"]
+
+
+@pytest.mark.asyncio
+async def test_config_returns_two_stage_plan_pipeline_defaults(client):
+    resp = await client.get("/api/system/config")
+    assert resp.status_code == 200
+    pipeline = resp.json()["plan_pipeline_defaults"]
+
+    assert pipeline == {
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 2,
+        "max_interactions": 3,
+    }
 
 
 @pytest.mark.asyncio

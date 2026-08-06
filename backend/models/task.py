@@ -10,7 +10,6 @@ from sqlalchemy import (
     JSON,
     select,
     func,
-    case,
 )
 from sqlalchemy.orm import Mapped, mapped_column, column_property
 
@@ -57,6 +56,49 @@ class Task(Base):
     goal_last_reason: Mapped[str | None] = mapped_column(Text, nullable=True)  # goal mode: evaluator's latest judgment reason
     plan_content: Mapped[str | None] = mapped_column(Text, nullable=True)  # Claude's proposed plan
     plan_approved: Mapped[bool | None] = mapped_column(default=None)  # None=pending, True=approved, False=rejected
+    # Independent Plan Task relationship and application audit.  Always relate
+    # through Task.id: the target's native session_id may change after
+    # compaction, recovery, account rotation, or Worker migration.
+    plan_target_task_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    plan_context_session_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+    plan_context_log_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # Bounded immutable transcript captured at Plan creation. This keeps a
+    # Worker-side Planner independent from node-local LogEntry ids.
+    plan_context_snapshot: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    plan_repo_revision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    supersedes_plan_task_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    plan_approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    plan_approved_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    plan_applied_to_session_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+    plan_applied_log_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    plan_execution_task_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # Versioned Planner/Reviewer primary+fallback routing snapshot. Generic
+    # provider/model/effort mirror the Planner primary route for compatibility
+    # with existing Task lists and Worker routing.
+    plan_pipeline_config: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True
+    )
     session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # Exact Claude PTY background epoch.  A persistent session can
     # finish foreground turn A, start turn B, and only then deliver A's late
@@ -115,7 +157,13 @@ class Task(Base):
 
 def _configure_task_properties():
     from backend.models.monitor_session import MonitorSession
+    from backend.models.plan import PlanLegacyTaskLink
+    from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+
     ms = MonitorSession.__table__
+    legacy_plan_links = PlanLegacyTaskLink.__table__
+    plan_runs = PlanAgentRun.__table__
+    plan_steps = PlanAgentStep.__table__
     # Always show real running sub-agent count — background agents can
     # outlive the main turn, so even completed tasks may have active sub-agents.
     Task.active_sub_agents = column_property(
@@ -123,6 +171,70 @@ def _configure_task_properties():
         .where(ms.c.task_id == Task.id, ms.c.status == "running")
         .correlate(Task.__table__)
         .scalar_subquery()
+    )
+    # A migrated Plan Task remains a real, visible Task history row. Expose its
+    # canonical Plan destination so clients can navigate to the new aggregate
+    # without treating the legacy Task as the writable Plan authority.
+    Task.canonical_plan_id = column_property(
+        select(legacy_plan_links.c.plan_id)
+        .where(legacy_plan_links.c.legacy_task_id == Task.id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    # PlanAgentRun is the durable authority for the currently executing
+    # Planner/Reviewer phase. Keep this as a read-only projection rather than
+    # duplicating mutable pipeline state on Task.
+    Task.plan_stage = column_property(
+        select(plan_runs.c.status)
+        .where(plan_runs.c.plan_task_id == Task.id)
+        .order_by(plan_runs.c.id.desc())
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    Task.plan_stage_round = column_property(
+        select(plan_runs.c.round)
+        .where(plan_runs.c.plan_task_id == Task.id)
+        .order_by(plan_runs.c.id.desc())
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+
+    latest_plan_run_id = (
+        select(plan_runs.c.id)
+        .where(plan_runs.c.plan_task_id == Task.id)
+        .order_by(plan_runs.c.id.desc())
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+
+    def latest_plan_step_value(column):
+        return (
+            select(column)
+            .where(plan_steps.c.run_id == latest_plan_run_id)
+            .order_by(plan_steps.c.id.desc())
+            .limit(1)
+            .correlate(Task.__table__)
+            .scalar_subquery()
+        )
+
+    # The latest step records the concrete route being attempted, including a
+    # fallback route. These projections let task lists show what is actually
+    # running without issuing one Plan-runs request per card.
+    Task.plan_stage_provider = column_property(
+        latest_plan_step_value(plan_steps.c.provider)
+    )
+    Task.plan_stage_model = column_property(
+        latest_plan_step_value(plan_steps.c.model)
+    )
+    Task.plan_stage_effort = column_property(
+        latest_plan_step_value(plan_steps.c.effort)
+    )
+    Task.plan_stage_route_slot = column_property(
+        latest_plan_step_value(plan_steps.c.route_slot)
     )
 
 _configure_task_properties()

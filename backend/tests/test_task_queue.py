@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.config import settings
 from backend.database import Base
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
@@ -36,6 +37,14 @@ async def test_create_task(queue):
     assert task.title == "Test task"
     assert task.status == "pending"
     assert task.priority == 0
+    assert task.provider == settings.default_provider
+    assert task.model == (
+        settings.default_codex_model
+        if settings.default_provider == "codex"
+        else settings.default_model
+    )
+    assert task.effort_level == settings.default_effort
+    assert task.codex_service_tier == "default"
 
 
 @pytest.mark.asyncio
@@ -240,7 +249,7 @@ async def test_lifecycle_transitions_reject_same_slot_retry_aba(queue):
     instance = Instance(name="same-slot-lifecycle")
     queue.db.add(instance)
     await queue.db.commit()
-    task = await queue.create(
+    await queue.create(
         title="old lifecycle",
         description="d",
         status="pending",
@@ -296,7 +305,7 @@ async def test_completion_rejects_background_marker_armed_after_fence(queue):
     instance = Instance(name="background-fence-worker")
     queue.db.add(instance)
     await queue.db.commit()
-    task = await queue.create(
+    await queue.create(
         title="foreground generation",
         description="native child tail",
         status="pending",

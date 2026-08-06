@@ -20,7 +20,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **多 Provider（Claude / Codex）** — Task 级选择执行引擎：OpenAI Codex CLI（默认，`gpt-5.6-sol`）或 Claude Code。Codex 任务支持完整生命周期、多轮对话、Goal 模式评估、Plan 审批、上下文自动压缩、瞬时错误退避重试、账号池与跨 Worker rollout 迁移；指令文件读 `AGENTS.md`（自动注入）。PTY 热会话、ask_user 和 Claude 原生子 Agent 仍为 Claude 专属（Codex 下显式隐藏/拒绝，不静默降级）
 - **PTY 持久会话模式** — 默认模式，Claude Code 以常驻交互会话运行，多轮免冷启动（热 session 复用），首次启动有 Cold Start 指示器
 - **Goal 模式** — `mode="goal"` 使用自然语言完成条件（`goal_condition`），每 turn 后由轻量评估器（默认 Haiku）自动判断是否达成目标
-- **Plan Mode** — 敏感任务先生成只读计划，人工审批后再执行
+- **交互式版本化 Plan** — Plan 是独立于 Task 的一等制品；Planner/Reviewer 可暂停同一个 Run 请求任意数量的必要输入，回答后继续并保留不可变 Version 历史。审批不自动执行，关联 Version 由用户显式附到下一条真实消息，standalone Version 可一键创建执行 Task
 - **Effort Level** — 支持 `low` / `medium` / `high` / `xhigh` / `max` 五档，优先级链：Task → Instance → 全局默认
 - **Model 配置** — 支持全称模型 ID（包括 `claude-opus-5`）；Opus 5 固定为 1M context 并支持 `low/medium/high/xhigh/max` effort，其他兼容模型可用 `[1m]` 后缀开启 1M context
 - **Codex Fast** — Codex Task 可选择 Standard 或 Fast；Fast 使用同一模型的 `priority` service tier，不会换模型或降低 effort。当前支持 GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；账号或模型无法确认 `priority` 时会在执行前明确失败，不会挂着 Fast 徽标偷偷按 Standard 运行
@@ -109,6 +109,8 @@ claude-manager/
 │   ├── database.py              # SQLAlchemy async engine + session
 │   ├── api/                     # REST + WebSocket 路由
 │   │   ├── tasks.py             # 任务 CRUD + plan 审批 + conflict 解决
+│   │   ├── plans.py             # 关联 Plan 历史、stale、revision、执行 Task
+│   │   ├── plan_resources.py    # 一等 Plan/Version/Run/Input/Application API
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop + Dispatcher 端点
 │   │   ├── projects.py          # Project CRUD + git clone
@@ -128,6 +130,8 @@ claude-manager/
 │   │   └── ask_user_hook.py     # AskUserQuestion PreToolUse hook 脚本
 │   ├── models/                  # SQLAlchemy ORM 模型
 │   │   ├── task.py              # Task (session_id, last_cwd, project_id, enabled_skills, effort_level...)
+│   │   ├── plan_agent.py        # Planner/Reviewer Run + Step 审计
+│   │   ├── plan.py              # Plan/Version/Input/Application 聚合模型
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── sub_agent.py         # SubAgentSession + SubAgentReport (通用子 agent)
@@ -144,6 +148,9 @@ claude-manager/
 │       ├── instance_manager.py  # 子进程生命周期 (launch/stop/consume, MCP 注入)
 │       ├── claude_pool.py       # 多账号池 (限速检测/自动切换/session 迁移/额度查询)
 │       ├── goal_evaluator.py    # Goal 条件评估器 (claude -p 子进程)
+│       ├── plan_agent_runner.py # 严格只读 Planner/Reviewer pipeline
+│       ├── plan_tasks.py        # Plan 上下文、repo 指纹、stale 与附件校验
+│       ├── plan_service.py      # 版本状态机、输入、审批、Worker outcome 导入
 │       ├── mcp_config.py        # MCP config 动态生成
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
 │       ├── cloud_provider.py    # AWS EC2 Provider (Worker 实例创建/启停/销毁)
@@ -169,7 +176,7 @@ claude-manager/
 │       ├── api/ws.ts            # WebSocket 客户端 (指数退避重连)
 │       ├── config/server.ts     # 远程服务器 URL 配置 (Capacitor/Android)
 │       ├── config/theme.ts      # 主题注册表 (现代深/浅 + Legacy 组, meta theme-color 同步)
-│       ├── pages/               # Dashboard, TasksPage, WorkersPage, PRMonitorPage, LoginPage...
+│       ├── pages/               # Dashboard, TasksPage, PlansPage, WorkersPage, PRMonitorPage, LoginPage...
 │       ├── components/
 │       │   ├── AskUserNotifications.tsx   # 全局 ask_user 弹窗通知
 │       │   ├── Chat/ChatView.tsx          # 多轮对话 UI
@@ -178,7 +185,7 @@ claude-manager/
 │       │   ├── Instances/                 # InstanceGrid, InstanceLog
 │       │   ├── Tasks/                     # TaskForm, TaskList, TaskConfigBadge
 │       │   ├── Layout/PoolDrawer.tsx      # Pool 额度抽屉
-│       │   ├── PlanReview/PlanPanel.tsx    # Plan 审批
+│       │   ├── PlanReview/                 # 一等 Plan action/history/detail/input UI
 │       │   ├── System/                    # UpdatePanel
 │       │   └── Voice/VoiceButton.tsx      # 语音录入
 │       └── hooks/useWebSocket.ts
@@ -370,12 +377,26 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 4. 启用 Monitor 的任务中，Agent 可自主创建持久监控子 Agent，Task 列表显示活跃子 Agent 数量
 5. 可在任务卡片菜单添加一个关注标签，或直接点击任务卡片/Chat 顶栏中的标签修改；清空并保存即可移除
 
-### Plan Mode
+### Interactive Plans
 
-创建任务时选择 Mode = `plan`：
-1. Claude Code 先以只读模式分析代码，生成执行计划
-2. 任务进入 `plan_review` 状态，在 Tasks 页面显示计划内容
-3. 点击 Approve 批准后，任务重新入队执行
+Plan 是独立于 Task 的一等、版本化制品：
+
+1. 在独立的 **Plans** 页面创建 standalone Plan，或在已有 Chat 的 **Plans** 面板创建多个互相独立的 related Plan。**Tasks** 页面只创建和展示真正的 Task。
+2. Planner/Reviewer 路由只在全局 Settings 配置；每个新 Plan 冻结当时的 primary/fallback provider、model、effort 和轮数设置。
+3. Planner 和 Reviewer 都可暂停同一个 Run 请求必要输入；单轮问题数量没有业务上限，每 Run 可暂停次数是独立的 `0–5` 全局设置。
+4. 每次完整方案写入不可变 Version。Revise 在同一 Plan 下创建新 Run/Version，只有 Fork 才创建新 Plan。
+5. Approve/Reject 绑定用户看到的 exact Version，不唤醒或改变原 Task/session。关联 Version 只有显式附到下一条真实消息时才应用一次；standalone Version 可显式创建普通 execution Task。
+
+**Plans** 页面用 **Plans requiring action** 汇总待输入、待审批和待执行动作；下方目录支持
+standalone/related、状态、Project、搜索和 Archived only 筛选。Archive 是可恢复的软归档，不会
+删除 Plan、Version、Run 或问答历史。Plans 详情保留 Version
+切换/比较、完整 Q&A/Run/route/repository 审计，以及旧 Version 已应用而新 Version 待审的双状态。
+若对话、仓库或目标发生变化，操作会要求 stale 确认或因 hard conflict 明确阻断。
+
+Planner/Reviewer 使用严格只读 transport。Codex 步骤复用账号的常驻 App Server，但使用终态即
+删除的一次性只读 thread。Plan 创建请求、标题、Revise/Fork 请求和回答都会持久化，因此
+API key、access token 和 private key 等高置信凭据必须存入 Settings → Secrets，Plan 文本中
+只写引用名称。
 
 ### Goal Mode
 

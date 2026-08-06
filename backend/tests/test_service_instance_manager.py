@@ -5641,6 +5641,121 @@ async def test_owner_checked_stop_cannot_interrupt_recycled_instance(db_factory)
 
 
 @pytest.mark.asyncio
+async def test_reconcile_dead_reverse_owner_preserves_current_task_generation(
+    db_factory,
+):
+    stale_started_at = datetime(2026, 8, 2, 7, 36, 23)
+    live_started_at = datetime(2026, 8, 2, 7, 39, 22)
+    async with db_factory() as db:
+        stale = Instance(
+            name="dead-retry-owner",
+            status="running",
+            pid=145_0775,
+            started_at=stale_started_at,
+        )
+        live = Instance(
+            name="current-retry-owner",
+            status="running",
+            pid=145_1525,
+            started_at=live_started_at,
+        )
+        db.add_all([stale, live])
+        await db.flush()
+        task = Task(
+            title="retry owner handoff",
+            status="executing",
+            instance_id=live.id,
+            started_at=live_started_at,
+        )
+        db.add(task)
+        await db.flush()
+        stale.current_task_id = task.id
+        live.current_task_id = task.id
+        await db.commit()
+        stale_id, live_id, task_id = stale.id, live.id, task.id
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    with patch(
+        "backend.services.instance_manager.os.kill",
+        side_effect=ProcessLookupError,
+    ):
+        reconciled = await manager.reconcile_dead_reverse_task_owner(
+            stale_id,
+            expected_task_id=task_id,
+            expected_pid=145_0775,
+            expected_started_at=stale_started_at,
+        )
+
+    assert reconciled is True
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        stale = await db.get(Instance, stale_id)
+        live = await db.get(Instance, live_id)
+        assert task.status == "executing"
+        assert task.instance_id == live_id
+        assert stale.status == "idle"
+        assert stale.pid is None
+        assert stale.current_task_id is None
+        assert live.status == "running"
+        assert live.current_task_id == task_id
+    broadcaster.broadcast.assert_awaited_once_with(
+        "system",
+        {
+            "event": "instance_status",
+            "instance_id": stale_id,
+            "status": "idle",
+            "exit_code": None,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reverse_owner_refuses_a_live_pid(db_factory):
+    started_at = datetime(2026, 8, 2, 7, 36, 23)
+    async with db_factory() as db:
+        stale = Instance(
+            name="ambiguous-live-owner",
+            status="running",
+            pid=145_0775,
+            started_at=started_at,
+        )
+        live = Instance(name="authoritative-owner", status="running")
+        db.add_all([stale, live])
+        await db.flush()
+        task = Task(
+            title="do not guess about live pid",
+            status="executing",
+            instance_id=live.id,
+        )
+        db.add(task)
+        await db.flush()
+        stale.current_task_id = task.id
+        await db.commit()
+        stale_id, task_id = stale.id, task.id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    with patch("backend.services.instance_manager.os.kill") as probe:
+        reconciled = await manager.reconcile_dead_reverse_task_owner(
+            stale_id,
+            expected_task_id=task_id,
+            expected_pid=145_0775,
+            expected_started_at=started_at,
+        )
+
+    assert reconciled is False
+    probe.assert_called_once_with(145_0775, 0)
+    async with db_factory() as db:
+        stale = await db.get(Instance, stale_id)
+        assert stale.status == "running"
+        assert stale.pid == 145_0775
+        assert stale.current_task_id == task_id
+
+
+@pytest.mark.asyncio
 async def test_instance_stop_releases_active_claim_back_to_pending(db_factory):
     async with db_factory() as db:
         task = Task(title="claimed", description="run", status="executing")

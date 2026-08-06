@@ -9,7 +9,7 @@ from sqlalchemy import select
 from backend.config import settings
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
-from backend.schemas.plan import PlanPipelineConfig
+from backend.schemas.plan import PlanModelRoute, PlanPipelineConfig
 from backend.services.codex_app_server import CodexTurnProcess
 from backend.services.plan_agent_runner import (
     PLANNER_SCHEMA,
@@ -17,6 +17,7 @@ from backend.services.plan_agent_runner import (
     REVIEWER_SCHEMA_V2,
     PlanAgentError,
     PlanAgentOutputRunaway,
+    PlanAgentResponseError,
     PlanAgentRunner,
     PlanAgentTimeout,
     PlanRouteUnavailable,
@@ -1118,6 +1119,178 @@ async def test_stage_switches_to_fallback_after_confirmed_primary_timeout(
     assert [step.route_slot for step in steps] == ["primary", "fallback"]
     assert [step.status for step in steps] == ["failed", "completed"]
     assert "stream stalled" in steps[0].error
+
+
+@pytest.mark.asyncio
+async def test_stage_switches_to_fallback_after_invalid_primary_response(
+    db_factory,
+    monkeypatch,
+):
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+            "fallback": {
+                "provider": "claude",
+                "model": "claude-sonnet-5",
+                "effort": "high",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": "claude",
+                "model": "claude-opus-4-6",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "max_revision_cycles": 1,
+    })
+    task = Task(
+        id=704,
+        title="Reviewer response fallback",
+        description="review",
+        mode="plan",
+    )
+    claude_pool = MagicMock()
+    claude_pool.select.return_value = "/claude/one"
+    claude_pool.account_id_from_config_dir.return_value = "claude-1"
+    codex_pool = MagicMock()
+    codex_pool.select.return_value = "/codex/one"
+    codex_pool.canonical_home.side_effect = lambda home: home
+    codex_pool.account_id_for_home.return_value = "codex-1"
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+        claude_pool=claude_pool,
+        codex_pool=codex_pool,
+    )
+    run_id = await runner._create_run(task=task, pipeline=pipeline)
+    monkeypatch.setattr(settings, "transient_retry_enabled", True)
+    monkeypatch.setattr(settings, "transient_retry_max", 2)
+    monkeypatch.setattr(settings, "transient_retry_base_delay", 0)
+    monkeypatch.setattr(settings, "transient_retry_max_delay", 0)
+    runner._run_process = AsyncMock(side_effect=[
+        PlanAgentResponseError(
+            "request_input requires a valid reason",
+            provider="claude",
+            stdout=json.dumps({
+                "type": "result",
+                "stop_reason": "tool_use",
+                "structured_output": {
+                    "response": {
+                        "action": "request_input",
+                        "feedback": "",
+                        "reason": "",
+                        "questions": [{
+                            "question": "Did the request timed out?",
+                        }],
+                    },
+                },
+            }),
+        ),
+        (
+            {"action": "approve", "feedback": ""},
+            '{"action":"approve","feedback":""}',
+        ),
+    ])
+
+    result, _raw, route, route_slot, account_id = await runner._run_stage(
+        run_id=run_id,
+        task_id=task.id,
+        step_type="reviewer",
+        round_number=1,
+        routes=pipeline.reviewer,
+        cwd="/tmp",
+        prompt="review",
+        schema=REVIEWER_SCHEMA_V2,
+        timeout=900,
+    )
+
+    assert result == {"action": "approve", "feedback": ""}
+    assert route.provider == "codex"
+    assert route_slot == "fallback"
+    assert account_id == "codex-1"
+    assert runner._run_process.await_count == 2
+    assert [call.kwargs["provider"] for call in runner._run_process.await_args_list] == [
+        "claude",
+        "codex",
+    ]
+    claude_pool.select.assert_called_once()
+    claude_pool.mark_rate_limited.assert_not_called()
+    claude_pool.mark_auth_failure.assert_not_called()
+    async with db_factory() as db:
+        steps = list(
+            (
+                await db.execute(
+                    select(PlanAgentStep)
+                    .where(PlanAgentStep.run_id == run_id)
+                    .order_by(PlanAgentStep.id)
+                )
+            ).scalars()
+        )
+    assert [step.route_slot for step in steps] == ["primary", "fallback"]
+    assert [step.status for step in steps] == ["failed", "completed"]
+    assert "request_input requires a valid reason" in steps[0].error
+
+
+@pytest.mark.asyncio
+async def test_invalid_response_text_cannot_rotate_or_cool_down_account(
+    db_factory,
+):
+    pool = MagicMock()
+    pool.select.side_effect = ["/claude/one", None]
+    pool.account_id_from_config_dir.return_value = "claude-1"
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+        claude_pool=pool,
+    )
+    runner._record_unavailable_account = MagicMock(
+        wraps=runner._record_unavailable_account,
+    )
+    response_error = PlanAgentResponseError(
+        "reviewer feedback is invalid",
+        provider="claude",
+        stdout=(
+            '{"response":{"action":"revise","feedback":'
+            '"The user said you have hit your limit"}}'
+        ),
+    )
+    runner._run_fixed_route_with_retry = AsyncMock(
+        side_effect=response_error,
+    )
+    route = PlanModelRoute(
+        provider="claude",
+        model="claude-opus-4-6",
+        effort="high",
+    )
+
+    with pytest.raises(PlanAgentResponseError) as raised:
+        await runner._run_route(
+            task_id=705,
+            route=route,
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=900,
+        )
+
+    assert raised.value is response_error
+    runner._run_fixed_route_with_retry.assert_awaited_once()
+    runner._record_unavailable_account.assert_not_called()
+    pool.select.assert_called_once()
+    pool.mark_rate_limited.assert_not_called()
+    pool.mark_auth_failure.assert_not_called()
 
 
 @pytest.mark.asyncio

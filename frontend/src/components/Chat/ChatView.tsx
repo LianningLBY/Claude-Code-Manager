@@ -1,16 +1,35 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import type { Components } from 'react-markdown';
 import { api, isApiRequestError } from '../../api/client';
-import type { ChatMessage, CodexForkAnchor, FileAttachment, FrontendReviewGoalCapabilities, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, WorkspaceReviewCapabilities, TestHarnessRun } from '../../api/client';
+import type {
+  AskUserAnswer,
+  AskUserQuestion,
+  AppliedPlanSnapshot,
+  ChatMessage,
+  CodexForkAnchor,
+  FileAttachment,
+  FrontendReviewGoalCapabilities,
+  InjectTaskAttachments,
+  MonitorSession,
+  PlanResource,
+  Project,
+  Task,
+  TestHarnessRun,
+  UploadResult,
+  WorkspaceReviewCapabilities,
+} from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
-import { FastModeBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import { VersionedPlansDialog } from '../PlanReview/VersionedPlansDialog';
+import { planStalenessConfirmationMessage } from '../PlanReview/planStaleness';
 import { AttentionTag } from '../Tasks/AttentionTag';
 import { ExpandableText } from '../ExpandableText';
+import { copyToClipboard } from '../clipboard';
 import { formatMessageTime } from '../../config/timezone';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useVisualViewportBounds } from '../../hooks/useVisualViewportBounds';
@@ -49,6 +68,8 @@ interface ChatViewProps {
 interface QueuedMessage {
   text: string;
   uploadResults?: UploadResult[];
+  planTaskIds?: number[];
+  planVersionIds?: number[];
 }
 
 const WORKSPACE_REVIEW_START_TOOLS = new Set([
@@ -339,6 +360,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     [draftUploadsKey],
   );
   const fileUpload = useFileUpload(initialDraftUploads);
+  const addChatFiles = fileUpload.addFiles;
   const consumeForkSeedUploads = useCallback(() => {
     if (forkSeedUploads.length === 0) return;
     try {
@@ -644,6 +666,53 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   }, [frontendReviewGoalCapability?.available, workspaceReviewCapability]);
 
+  // Canonical first-class Plans associated with this Task. Legacy carrier
+  // Task ids remain queue-readable only so drafts from an older release can
+  // still be delivered after migration.
+  const [plansOpen, setPlansOpen] = useState(false);
+  const [selectedPlanIds, setSelectedPlanIds] = useState<number[]>([]);
+  const [versionedPlans, setVersionedPlans] = useState<PlanResource[]>([]);
+  const [planRefreshGeneration, setPlanRefreshGeneration] = useState(0);
+  const [selectedPlanVersionIds, setSelectedPlanVersionIds] = useState<number[]>([]);
+  useEffect(() => {
+    setPlansOpen(false);
+    setSelectedPlanIds([]);
+    setVersionedPlans([]);
+    setSelectedPlanVersionIds([]);
+  }, [task.id]);
+
+  const refreshVersionedPlans = useCallback(async () => {
+    if (!task.session_id || task.shared_from_id != null) return;
+    try {
+      const rows = await api.listPlans({ target_task_id: task.id });
+      setVersionedPlans(rows);
+      const attachable = new Set(
+        rows
+          .filter((plan) => plan.current_version?.human_decision === 'approved' && !plan.current_version.applied)
+          .map((plan) => plan.current_version!.id),
+      );
+      setSelectedPlanVersionIds((current) => current.filter((id) => attachable.has(id)));
+    } catch { /* modal exposes actionable errors; passive polling is best-effort */ }
+  }, [task.id, task.session_id, task.shared_from_id]);
+
+  useEffect(() => {
+    void refreshVersionedPlans();
+    const timer = window.setInterval(() => void refreshVersionedPlans(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshVersionedPlans]);
+
+  const togglePlanVersionAttachment = useCallback((versionId: number) => {
+    setSelectedPlanVersionIds((current) => current.includes(versionId)
+      ? current.filter((id) => id !== versionId)
+      : [...current, versionId]);
+  }, []);
+
+  const attachPlanVersion = useCallback((versionId: number) => {
+    setSelectedPlanVersionIds((current) => current.includes(versionId)
+      ? current
+      : [...current, versionId]);
+  }, []);
+
   // Distill state
   const [distillOpen, setDistillOpen] = useState(false);
   const [distilling, setDistilling] = useState(false);
@@ -736,6 +805,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   useEffect(() => {
     setFrontendReviewGoalProgress((current) => ({ ...current, active: isProcessing }));
   }, [isProcessing]);
+  useEffect(() => {
+    if (!stillRunning) return;
+    const timer = window.setTimeout(() => {
+      setStillRunning(false);
+      onTaskUpdated?.();
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [onTaskUpdated, stillRunning]);
+  const planAttentionCount = versionedPlans.filter((plan) =>
+    ['waiting_user', 'awaiting_review', 'planner', 'reviewer', 'queued', 'running'].includes(plan.display_state)
+    || (plan.display_state === 'approved' && Boolean(plan.current_version && !plan.current_version.applied))
+  ).length;
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const historyCursorRef = useRef<{
@@ -817,12 +898,42 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     localStorage.setItem(`ccm-chat-queue-${task.id}`, JSON.stringify(messageQueue));
   }, [messageQueue, task.id]);
 
-  const addToQueue = useCallback((text: string, uploadResults?: UploadResult[]) => {
-    setMessageQueue(prev => [...prev, { text, uploadResults }]);
+  const addToQueue = useCallback((
+    text: string,
+    uploadResults?: UploadResult[],
+    planTaskIds?: number[],
+    planVersionIds?: number[],
+  ) => {
+    setMessageQueue(prev => [...prev, { text, uploadResults, planTaskIds, planVersionIds }]);
+    if (planTaskIds?.length) {
+      setSelectedPlanIds((current) =>
+        current.filter((id) => !planTaskIds.includes(id))
+      );
+    }
+    if (planVersionIds?.length) {
+      setSelectedPlanVersionIds((current) =>
+        current.filter((id) => !planVersionIds.includes(id))
+      );
+    }
   }, []);
 
   const removeFromQueue = useCallback((index: number) => {
-    setMessageQueue(prev => prev.filter((_, i) => i !== index));
+    setMessageQueue(prev => {
+      const removed = prev[index];
+      if (removed?.planTaskIds?.length) {
+        setSelectedPlanIds((current) => [
+          ...current,
+          ...removed.planTaskIds!.filter((id) => !current.includes(id)),
+        ]);
+      }
+      if (removed?.planVersionIds?.length) {
+        setSelectedPlanVersionIds((current) => [
+          ...current,
+          ...removed.planVersionIds!.filter((id) => !current.includes(id)),
+        ]);
+      }
+      return prev.filter((_, i) => i !== index);
+    });
   }, []);
 
   const restoreQueuedUploads = useCallback((items: QueuedMessage[]): boolean => {
@@ -865,6 +976,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (!item) return;
     if (!restoreQueuedUploads([item])) return;
     setInput(prev => prev.trim() ? `${prev.trim()}\n\n${item.text}` : item.text);
+    if (item.planTaskIds?.length) {
+      setSelectedPlanIds((current) => [
+        ...current,
+        ...item.planTaskIds!.filter((id) => !current.includes(id)),
+      ]);
+    }
+    if (item.planVersionIds?.length) {
+      setSelectedPlanVersionIds((current) => [
+        ...current,
+        ...item.planVersionIds!.filter((id) => !current.includes(id)),
+      ]);
+    }
     setMessageQueue(prev => prev.filter((_, i) => i !== index));
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, [restoreQueuedUploads]);
@@ -878,9 +1001,53 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const merged = queued.map(q => q.text).join('\n\n');
       return current ? `${current}\n\n${merged}` : merged;
     });
+    const queuedPlanIds = [
+      ...new Set(queued.flatMap((item) => item.planTaskIds || [])),
+    ];
+    if (queuedPlanIds.length > 0) {
+      setSelectedPlanIds((current) => [
+        ...current,
+        ...queuedPlanIds.filter((id) => !current.includes(id)),
+      ]);
+    }
+    const queuedVersionIds = [
+      ...new Set(queued.flatMap((item) => item.planVersionIds || [])),
+    ];
+    if (queuedVersionIds.length > 0) {
+      setSelectedPlanVersionIds((current) => [
+        ...current,
+        ...queuedVersionIds.filter((id) => !current.includes(id)),
+      ]);
+    }
     setMessageQueue([]);
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, [restoreQueuedUploads]);
+
+  const clearMessageQueue = useCallback(() => {
+    const queuedPlanIds = [
+      ...new Set(
+        messageQueueRef.current.flatMap((item) => item.planTaskIds || []),
+      ),
+    ];
+    if (queuedPlanIds.length > 0) {
+      setSelectedPlanIds((current) => [
+        ...current,
+        ...queuedPlanIds.filter((id) => !current.includes(id)),
+      ]);
+    }
+    const queuedVersionIds = [
+      ...new Set(
+        messageQueueRef.current.flatMap((item) => item.planVersionIds || []),
+      ),
+    ];
+    if (queuedVersionIds.length > 0) {
+      setSelectedPlanVersionIds((current) => [
+        ...current,
+        ...queuedVersionIds.filter((id) => !current.includes(id)),
+      ]);
+    }
+    setMessageQueue([]);
+  }, []);
 
   const moveQueueItem = useCallback((index: number, direction: 'up' | 'down') => {
     setMessageQueue(prev => {
@@ -898,7 +1065,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   sendingRef.current = sending;
   const backgroundActiveRef = useRef(false);
   backgroundActiveRef.current = backgroundActive;
-  const handleSendRef = useRef<(text: string, uploadResults?: UploadResult[]) => void>(() => {});
+  const handleSendRef = useRef<(
+    text: string,
+    uploadResults?: UploadResult[],
+    planTaskIds?: number[],
+    planVersionIds?: number[],
+  ) => void>(() => {});
 
   useEffect(() => {
     if (autoDequeueFlag === 0) return;
@@ -912,7 +1084,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (queue.length > 0) {
         const next = queue[0];
         setMessageQueue(prev => prev.slice(1));
-        setTimeout(() => handleSendRef.current(next.text, next.uploadResults), 300);
+        setTimeout(
+          () => handleSendRef.current(
+            next.text,
+            next.uploadResults,
+            next.planTaskIds,
+            next.planVersionIds,
+          ),
+          300,
+        );
       }
     }, 200);
     return () => clearTimeout(timer);
@@ -930,6 +1110,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // losing messages when React batches rapid state updates.
   const handleWsMessage = useCallback((raw: Record<string, unknown>) => {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
+    if (
+      msg.channel === 'plans'
+      && typeof msg.data?.event === 'string'
+      && msg.data.event.startsWith('plan_')
+      && Number(msg.data.plan_id) > 0
+    ) {
+      setPlanRefreshGeneration((generation) => generation + 1);
+      void refreshVersionedPlans();
+      return;
+    }
     // System channel: react to PTY mode toggling without a refresh
     if (msg.channel === 'system' && msg.data?.event === 'runtime_settings_changed') {
       // Manager broadcasts describe Manager capabilities only. Worker tasks
@@ -956,6 +1146,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     );
     if (isStatusChange) {
       const newStatus = (msg.data!.new_status as string) || '';
+      const nextBackground = msg.data!.background_active;
       if (typeof msg.data!.background_active === 'boolean') {
         lastWsBackgroundAt.current = Date.now();
         setLocalBackgroundActive(msg.data!.background_active);
@@ -968,6 +1159,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           setFrontendReviewGoalLocallyActive(false);
           setFrontendReviewGoalStart(null);
         }
+      }
+      if (
+        ['completed', 'failed', 'cancelled', 'conflict'].includes(newStatus)
+        && nextBackground !== true
+      ) {
+        setStillRunning(false);
       }
       return;
     }
@@ -1223,6 +1420,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           return;
         }
         setSending(false);
+        setStillRunning(false);
         // Keep an already observed terminal status sticky. A late process_exit
         // must not revive stale `task.status=executing` props and bring the
         // Goal/thinking indicator back after completion.
@@ -1260,6 +1458,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const rawContent = typeof msg.data.raw_content === 'string' ? msg.data.raw_content : null;
       const imageUrls = (msg.data.image_urls as string[]) || null;
       const attachments = (msg.data.attachments as { url: string; name: string; is_image: boolean }[]) || null;
+      const appliedPlans = (msg.data.applied_plans as AppliedPlanSnapshot[]) || null;
       const persistedId = Number(msg.data.id);
       const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
       const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
@@ -1278,18 +1477,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         attachments,
         source,
         raw_content: rawContent,
+        applied_plans: appliedPlans,
         persisted: isPersisted,
       };
       setSending(true);
       setMessages((prev) => {
-        if (isPersisted) {
-          return mergeChatHistory([entry], prev);
-        }
-
         // Reconcile the optimistic bubble with the authoritative broadcast.
         // The optimistic content can be raw text while the server content is
-        // prefixed with the sender name, so display content alone is not a
-        // stable identity. raw_content is the canonical user input.
+        // prefixed with the sender name. Worker Manager broadcasts also omit
+        // attachment and Plan snapshots from their first persisted event, so
+        // that event must participate in reconciliation before fingerprinting.
+        // raw_content is the canonical user input.
         let optimisticIndex = -1;
         for (let index = prev.length - 1; index >= 0; index -= 1) {
           const candidate = prev[index];
@@ -1311,17 +1509,33 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         }
         if (optimisticIndex >= 0) {
           const optimistic = prev[optimisticIndex];
-          const next = [...prev];
-          next[optimisticIndex] = {
-            ...optimistic,
+          const reconciled = {
+            ...entry,
+            // A live event without a durable LogEntry id is still the same
+            // optimistic send. Keep its local id so HTTP failure compensation
+            // can remove the bubble it originally created.
+            id: isPersisted ? entry.id : optimistic.id,
             content,
             source,
             raw_content: rawContent ?? optimistic.raw_content,
             timestamp: eventTimestamp,
             image_urls: imageUrls?.length ? imageUrls : optimistic.image_urls,
             attachments: attachments?.length ? attachments : optimistic.attachments,
+            applied_plans: appliedPlans?.length ? appliedPlans : optimistic.applied_plans,
+            persisted: isPersisted,
           };
+          if (isPersisted) {
+            return mergeChatHistory(
+              [reconciled],
+              prev.filter((_candidate, index) => index !== optimisticIndex),
+            );
+          }
+          const next = [...prev];
+          next[optimisticIndex] = reconciled;
           return next;
+        }
+        if (isPersisted) {
+          return mergeChatHistory([entry], prev);
         }
         return [...prev, entry];
       });
@@ -1421,7 +1635,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(task.id, next);
       return next;
     });
-  }, [markAskUserResolved, task.goal_max_turns, task.id, task.worker_id]);
+  }, [markAskUserResolved, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -1544,7 +1758,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [fetchHistory, task.id]);
 
   useWebSocket(
-    [`task:${task.id}`, 'system', 'tasks'],
+    [`task:${task.id}`, 'system', 'tasks', 'plans'],
     handleWsMessage,
     handleReconnect,
     handleSubscribed,
@@ -1693,7 +1907,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   useFileDrop({
     onDrop: (files) => {
       if (!injectingRef.current) {
-        fileUpload.addFiles(files, (msg) => setDropError(msg));
+        addChatFiles(files, (msg) => setDropError(msg));
       }
     },
     disabled: injecting || (!task.session_id && !task.shared_from_id),
@@ -1703,6 +1917,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (injecting || (!task.session_id && !task.shared_from_id)) return;
     const handlePaste = (e: ClipboardEvent) => {
       if (injectingRef.current) return;
+      const target = e.target;
+      if (target instanceof Element && target.closest('[data-attachment-paste-target]')) return;
       const items = e.clipboardData?.items;
       if (!items) return;
       const files: File[] = [];
@@ -1714,7 +1930,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       if (files.length > 0) {
         e.preventDefault();
-        fileUpload.addFiles(files, (msg) => setDropError(msg));
+        addChatFiles(files, (msg) => setDropError(msg));
       }
     };
     document.addEventListener('paste', handlePaste);
@@ -1722,7 +1938,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [
     task.session_id,
     task.shared_from_id,
-    fileUpload.addFiles,
+    addChatFiles,
     injecting,
   ]);
 
@@ -1740,7 +1956,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
-    fileUpload.addFiles(files, (msg) => setDropError(msg));
+    addChatFiles(files, (msg) => setDropError(msg));
     e.target.value = '';
   };
 
@@ -1829,8 +2045,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   };
 
-  const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
+  const handleSend = async (
+    overrideText?: string,
+    fromQueue?: boolean,
+    preUploadedResults?: UploadResult[],
+    preSelectedPlanIds?: number[],
+    preSelectedPlanVersionIds?: number[],
+  ) => {
     const text = (overrideText ?? input).trim();
+    const planIdsForTurn = fromQueue
+      ? (preSelectedPlanIds || [])
+      : selectedPlanIds;
+    const planVersionIdsForTurn = fromQueue
+      ? (preSelectedPlanVersionIds || [])
+      : selectedPlanVersionIds;
     const fileUploadResultsForTurn = dedupeUploadResults(
       fileUpload.uploadedResults,
     );
@@ -1913,6 +2141,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         addToQueue(
           text,
           uploadedResultsForTurn.length > 0 ? uploadedResultsForTurn : undefined,
+          planIdsForTurn.length > 0 ? [...planIdsForTurn] : undefined,
+          planVersionIdsForTurn.length > 0 ? [...planVersionIdsForTurn] : undefined,
         );
         setInput('');
         fileUpload.clear();
@@ -1944,6 +2174,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           : null;
         const ccU = JSON.parse(localStorage.getItem('cc_user') || '{}');
         const displayText = ccU.name ? `[${ccU.name}] ${text}` : text;
+        const optimisticAppliedPlans: AppliedPlanSnapshot[] = [];
+        const versionSnapshots: AppliedPlanSnapshot[] = [];
+        planVersionIdsForTurn.forEach((selectedVersionId) => {
+          const plan = versionedPlans.find((item) => item.current_version?.id === selectedVersionId);
+          const version = plan?.current_version;
+          if (plan && version) {
+            versionSnapshots.push({
+              id: plan.id,
+              plan_id: plan.id,
+              version_id: version.id,
+              version_number: version.version_number,
+              title: plan.title,
+              content: version.content,
+            });
+          }
+        });
+        optimisticAppliedPlans.push(...versionSnapshots);
         setMessages(prev => [...prev, {
           id: optimisticMessageId!, role: 'user', event_type: 'user_message',
           content: displayText, tool_name: null, tool_input: null, tool_output: null,
@@ -1951,6 +2198,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           image_urls: optimisticAttachments?.filter((a) => a.is_image).map((a) => a.url) || null,
           attachments: optimisticAttachments,
           raw_content: text,
+          applied_plans: optimisticAppliedPlans.length > 0
+            ? optimisticAppliedPlans
+            : null,
         }]);
         setSending(true);
       }
@@ -1999,23 +2249,115 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         ));
         onTaskUpdated?.();
       } else {
-        const chatResponse = await api.sendTaskChat(
-          task.id,
-          text || '(files attached)',
-          uploadedPaths,
-          selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
-          modelOverride,
-          {
-            provider: task.provider,
-            model: modelOverride || task.model,
-            codex_service_tier: task.codex_service_tier,
-          },
-        );
-        if (chatResponse.workspace_review_expected) {
+        const routing = {
+          provider: task.provider,
+          model: modelOverride || task.model,
+          codex_service_tier: task.codex_service_tier,
+        };
+        const confirmedStalePlanIds: number[] = [];
+        let chatResponse: Awaited<ReturnType<typeof api.sendTaskChat>> | null = null;
+        for (;;) {
+          try {
+            if (planVersionIdsForTurn.length > 0) {
+              chatResponse = await api.sendTaskChat(
+                task.id,
+                text || '(files attached)',
+                uploadedPaths,
+                selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+                modelOverride,
+                routing,
+                undefined,
+                undefined,
+                planVersionIdsForTurn,
+                confirmedStalePlanIds,
+              );
+            } else if (planIdsForTurn.length > 0) {
+              chatResponse = await api.sendTaskChat(
+                task.id,
+                text || '(files attached)',
+                uploadedPaths,
+                selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+                modelOverride,
+                routing,
+                planIdsForTurn,
+                confirmedStalePlanIds,
+              );
+            } else {
+              // Keep the legacy six-argument call for ordinary messages.
+              chatResponse = await api.sendTaskChat(
+                task.id,
+                text || '(files attached)',
+                uploadedPaths,
+                selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+                modelOverride,
+                routing,
+              );
+            }
+            break;
+          } catch (sendError) {
+            const detail = isApiRequestError(sendError)
+              ? sendError.detail
+              : null;
+            const stalePlanId = (
+              detail
+              && typeof detail === 'object'
+              && (
+                ('plan_version_id' in detail && typeof detail.plan_version_id === 'number')
+                || ('plan_task_id' in detail && typeof detail.plan_task_id === 'number')
+              )
+            ) ? (
+              'plan_version_id' in detail && typeof detail.plan_version_id === 'number'
+                ? detail.plan_version_id
+                : ('plan_task_id' in detail && typeof detail.plan_task_id === 'number' ? detail.plan_task_id : null)
+            ) : null;
+            const selectedIdsForStale = planVersionIdsForTurn.length > 0
+              ? planVersionIdsForTurn
+              : planIdsForTurn;
+            const staleState = (
+              detail
+              && typeof detail === 'object'
+              && 'staleness' in detail
+              && detail.staleness
+              && typeof detail.staleness === 'object'
+            ) ? detail.staleness as Record<string, unknown> : null;
+            if (
+              stalePlanId == null
+              || !selectedIdsForStale.includes(stalePlanId)
+              || confirmedStalePlanIds.includes(stalePlanId)
+              || staleState?.stale !== true
+              || staleState.hard_conflict === true
+              || staleState.can_confirm === false
+              || !window.confirm(planStalenessConfirmationMessage(staleState, 'apply'))
+            ) {
+              throw sendError;
+            }
+            confirmedStalePlanIds.push(stalePlanId);
+          }
+        }
+        if (chatResponse?.workspace_review_expected) {
           setExpectedWorkspaceReviewBaseline(
             chatResponse.workspace_review_baseline_run_id,
           );
           setShowBrowserReviewPanel(true);
+        }
+        if (planIdsForTurn.length > 0) {
+          setSelectedPlanIds((current) =>
+            current.filter((id) => !planIdsForTurn.includes(id))
+          );
+          // Replace the optimistic bubble with the durable user-message row,
+          // including the exact approved Plan snapshots used by the backend.
+          fetchHistory();
+        }
+        if (planVersionIdsForTurn.length > 0) {
+          setSelectedPlanVersionIds((current) =>
+            current.filter((id) => !planVersionIdsForTurn.includes(id))
+          );
+          setVersionedPlans((current) => current.map((plan) => (
+            plan.current_version && planVersionIdsForTurn.includes(plan.current_version.id)
+              ? { ...plan, display_state: 'applied', current_version: { ...plan.current_version, applied: true } }
+              : plan
+          )));
+          fetchHistory();
         }
       }
       if (!fromQueue) {
@@ -2059,13 +2401,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         fileUpload.addUploadedResults(fileUploadResultsForTurn);
       }
       if (fromQueue && (text || preUploadedResults?.length)) {
-        setMessageQueue(prev => [{ text, uploadResults: preUploadedResults }, ...prev]);
+        setMessageQueue(prev => [{
+          text,
+          uploadResults: preUploadedResults,
+          planTaskIds: preSelectedPlanIds,
+          planVersionIds: preSelectedPlanVersionIds,
+        }, ...prev]);
       }
     }
   };
 
   // Keep ref updated for auto-dequeue effect
-  handleSendRef.current = (text: string, uploadResults?: UploadResult[]) => handleSend(text, true, uploadResults);
+  handleSendRef.current = (
+    text: string,
+    uploadResults?: UploadResult[],
+    planTaskIds?: number[],
+    planVersionIds?: number[],
+  ) => handleSend(text, true, uploadResults, planTaskIds, planVersionIds);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) {
@@ -2085,10 +2437,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           </button>
           <div className="flex items-center gap-1.5 min-w-0 flex-1">
             <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
-            <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
-              {providerLabel}
-            </span>
-            <FastModeBadge task={task} />
+            {task.mode === 'plan' ? (
+              <PlanPipelineBadge task={task} />
+            ) : (
+              <>
+                <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
+                  {providerLabel}
+                </span>
+                <FastModeBadge task={task} />
+              </>
+            )}
             {backgroundActive && (
               <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
                 后台运行中
@@ -2102,7 +2460,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 Goal 审查 · 第 {Math.max(1, frontendReviewGoalProgress.turn + (frontendReviewGoalProgress.active ? 1 : 0))} 轮 · 自动
               </span>
             )}
-            {task.provider === 'codex' && codexMainMcpEnabled !== null && (
+            {task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
                 className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
@@ -2147,7 +2505,29 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 aria-hidden="true"
               />
             </button>
-            <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
+            {task.session_id && task.shared_from_id == null && (
+              <button
+                onClick={() => setPlansOpen((open) => !open)}
+                className={`flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors ${
+                  plansOpen
+                    ? 'bg-indigo-500/15 text-indigo-300'
+                    : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'
+                }`}
+                title="Independent Plans"
+                aria-label="Plans"
+              >
+                <ListTodo size={16} />
+                <span>Plans</span>
+                {planAttentionCount > 0 && (
+                  <span className="min-w-4 rounded-full bg-indigo-500 px-1 text-center text-[9px] font-bold leading-4 text-white">
+                    {planAttentionCount}
+                  </span>
+                )}
+              </button>
+            )}
+            {task.mode !== 'plan' && (
+              <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
+            )}
             <button
               onClick={() => {
                 setDistillOpen(true);
@@ -2204,14 +2584,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       setError(null);
                     }
                     onTaskUpdated?.();
-                  } catch (e) {
+                  } catch (interruptError) {
                     setSending(false);
-                    setStillRunning(false);
+                    const noRunningSession = isApiRequestError(interruptError)
+                      && interruptError.status === 400
+                      && String(interruptError.detail || '').toLowerCase().includes('no running session');
+                    setStillRunning(!noRunningSession);
                     setLocalStatus(null);
                     setError(
-                      `Interrupt failed; the Task may still be running: ${
-                        e instanceof Error ? e.message : String(e)
-                      }`,
+                      noRunningSession
+                        ? 'Interrupt: the session had already finished before the stop request arrived.'
+                        : `Interrupt failed: ${interruptError instanceof Error
+                          ? interruptError.message
+                          : String(interruptError)}`,
                     );
                     onTaskUpdated?.();
                   }
@@ -2403,6 +2788,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           />
         </div>
       )}
+
+      {plansOpen && <VersionedPlansDialog
+        open={plansOpen}
+        taskId={task.id}
+        refreshGeneration={planRefreshGeneration}
+        selectedVersionIds={selectedPlanVersionIds}
+        onToggleVersion={togglePlanVersionAttachment}
+        onAttachVersion={attachPlanVersion}
+        onPlansChange={setVersionedPlans}
+        onClose={() => setPlansOpen(false)}
+      />}
 
       {/* Distill modal */}
       {distillOpen && (
@@ -2697,7 +3093,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   Merge
                 </button>
                 <button
-                  onClick={() => setMessageQueue([])}
+                  onClick={clearMessageQueue}
                   className="text-xs text-gray-500 hover:text-red-400 transition-colors"
                 >
                   Clear all
@@ -2709,6 +3105,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <div key={idx} className="flex items-center gap-1.5 group/q">
                   <span className="text-[10px] text-gray-600 w-4 text-right shrink-0">{idx + 1}</span>
                   <div className="flex-1 min-w-0 bg-gray-800/60 rounded px-2.5 py-1 text-xs text-gray-300 truncate flex items-center gap-1.5">
+                    {item.planTaskIds && item.planTaskIds.length > 0 && (
+                      <span
+                        className="inline-flex shrink-0 items-center gap-0.5 text-indigo-300"
+                        title={`Plans: ${item.planTaskIds.map((id) => `#${id}`).join(', ')}`}
+                      >
+                        <ListTodo size={10} />
+                        <span className="text-[10px]">{item.planTaskIds.length}</span>
+                      </span>
+                    )}
                     {item.uploadResults && item.uploadResults.length > 0 && (
                       <span className="inline-flex items-center gap-0.5 text-amber-400 shrink-0" title={item.uploadResults.map(r => r.filename).join(', ')}>
                         <Paperclip size={10} />
@@ -2759,6 +3164,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       {/* Input */}
       <div className="border-t border-gray-800 bg-gray-900 p-3">
         <div className="flex flex-col gap-2 max-w-3xl mx-auto">
+          {selectedPlanVersionIds.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-indigo-300">
+                <ListTodo size={11} /> Next message
+              </span>
+              {selectedPlanVersionIds.map((versionId) => {
+                const plan = versionedPlans.find((item) => item.current_version?.id === versionId);
+                return (
+                  <span key={versionId} className="inline-flex max-w-[240px] items-center gap-1 rounded-full border border-indigo-500/40 bg-indigo-500/10 px-2 py-1 text-[11px] text-indigo-200" title={plan?.title || `Plan Version #${versionId}`}>
+                    <span className="truncate">Plan #{plan?.id || '?'} · v{plan?.current_version?.version_number || '?' }{plan?.title ? ` · ${plan.title}` : ''}</span>
+                    <button type="button" onClick={() => togglePlanVersionAttachment(versionId)} className="shrink-0 text-indigo-300 hover:text-white" aria-label={`Detach Plan Version #${versionId}`}><X size={10} /></button>
+                  </span>
+                );
+              })}
+              <span className="text-[10px] text-gray-500">applied only when this message is sent</span>
+            </div>
+          )}
           {/* File preview strip */}
           {(forkSeedUploads.length > 0 || fileUpload.uploads.length > 0) && (
             <div className="flex gap-2 flex-wrap">
@@ -3296,52 +3718,6 @@ function ToolItem({ message, taskId }: { message: ChatMessage; taskId: number })
   );
 }
 
-function copyToClipboard(text: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    return navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
-  }
-  return fallbackCopy(text);
-}
-
-function fallbackCopy(text: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    try {
-      document.execCommand('copy') ? resolve() : reject();
-    } catch {
-      reject();
-    } finally {
-      document.body.removeChild(ta);
-    }
-  });
-}
-
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const handleCopy = () => {
-    copyToClipboard(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
-  };
-  return (
-    <button
-      onClick={handleCopy}
-      className="copy-btn absolute top-2 right-2 p-1 rounded bg-gray-700/80 hover:bg-gray-600 text-gray-400 hover:text-gray-200 opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto transition-opacity"
-      title="Copy"
-    >
-      {copied ? <Check size={12} /> : <Copy size={12} />}
-    </button>
-  );
-}
-
 function MessageCopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   const handleCopy = () => {
@@ -3357,6 +3733,25 @@ function MessageCopyButton({ text }: { text: string }) {
       title="Copy message"
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    copyToClipboard(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+  return (
+    <button
+      onClick={handleCopy}
+      className="copy-btn pointer-events-none absolute right-2 top-2 rounded bg-gray-700/80 p-1 text-gray-400 opacity-0 transition-opacity hover:bg-gray-600 hover:text-gray-200 group-hover:pointer-events-auto group-hover:opacity-100"
+      title="Copy"
+    >
+      {copied ? <Check size={12} /> : <Copy size={12} />}
     </button>
   );
 }
@@ -3422,13 +3817,15 @@ const MarkdownContent = memo(function MarkdownContent({
   className,
 }: {
   content: string;
-  taskId: number;
+  taskId?: number;
   className?: string;
 }) {
   const taskComponents = useMemo<Components>(() => ({
     ...markdownComponents,
     a({ href, title, children }) {
-      return <TaskArtifactLink taskId={taskId} href={href} linkTitle={title}>{children}</TaskArtifactLink>;
+      return taskId == null
+        ? <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:text-indigo-300 underline">{children}</a>
+        : <TaskArtifactLink taskId={taskId} href={href} linkTitle={title}>{children}</TaskArtifactLink>;
     },
   }), [taskId]);
   return (
@@ -3441,13 +3838,35 @@ const MarkdownContent = memo(function MarkdownContent({
     </div>
   );
 });
-
 function MessageTimestamp({ timestamp, className }: { timestamp: string | null; className?: string }) {
   if (!timestamp) return null;
   return (
     <span className={`text-[10px] text-gray-600 select-none ${className || ''}`}>
       {formatMessageTime(timestamp)}
     </span>
+  );
+}
+
+function AppliedPlansInMessage({ plans }: { plans: AppliedPlanSnapshot[] }) {
+  return (
+    <div className="applied-plan-message mt-2 space-y-1.5 border-t border-white/25 pt-2">
+      {plans.map((plan) => (
+        <details
+          key={plan.id}
+          className="rounded-lg border border-white/25 bg-black/15 px-2.5 py-1.5"
+        >
+          <summary className="cursor-pointer select-none text-xs font-medium text-white marker:text-white/70">
+            Applied Plan #{plan.id}: {plan.title}
+          </summary>
+          <div className="applied-plan-content mt-2 max-h-80 overflow-y-auto rounded-md bg-transparent p-2.5">
+            <MarkdownContent
+              content={plan.content}
+              className="text-xs text-white"
+            />
+          </div>
+        </details>
+      ))}
+    </div>
   );
 }
 
@@ -3580,7 +3999,8 @@ function AskUserCard({
     setSelected((prev) => {
       const cur = new Set(prev[qi] || []);
       if (multi) {
-        cur.has(label) ? cur.delete(label) : cur.add(label);
+        if (cur.has(label)) cur.delete(label);
+        else cur.add(label);
       } else {
         cur.clear();
         cur.add(label);
@@ -3763,9 +4183,7 @@ const MessageBubble = memo(function MessageBubble({
       // (new messages arrive as user_message with source=monitor/sub-agent)
       return (
         <div className="border-l-2 border-gray-600 pl-2 py-1 my-0.5 opacity-50">
-          <div className="markdown-body text-xs text-gray-500">
-            <MarkdownRenderer content={content} components={markdownComponents} />
-          </div>
+          <MarkdownContent content={content} taskId={taskId} className="text-xs text-gray-500" />
           {message.timestamp && <MessageTimestamp timestamp={message.timestamp} className="mt-0.5" />}
         </div>
       );
@@ -3868,6 +4286,9 @@ const MessageBubble = memo(function MessageBubble({
                 </div>
               )}
               {message.content && message.content !== '(files attached)' && message.content !== '(images attached)' ? message.content : !message.attachments?.length && !message.image_urls?.length ? message.content || '' : null}
+              {message.applied_plans && message.applied_plans.length > 0 && (
+                <AppliedPlansInMessage plans={message.applied_plans} />
+              )}
             </>
           ) : (
             <MarkdownContent content={message.content || ''} taskId={taskId} />

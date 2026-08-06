@@ -582,6 +582,20 @@ describe('Codex Fast speed configuration', () => {
     ));
   });
 
+  it('removes Plan mode and normalizes a legacy saved Plan default', async () => {
+    localStorage.setItem('cc_default_task_config', JSON.stringify({
+      mode: 'plan',
+      provider: 'codex',
+      codexServiceTier: 'priority',
+    }));
+
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+
+    expect(screen.getByDisplayValue('Auto')).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Plan' })).not.toBeInTheDocument();
+  });
+
   it('atomically resets Fast when switching to an unsupported model', async () => {
     const speedSelect = await switchToCodexFastForm();
     await userEvent.selectOptions(speedSelect, 'priority');

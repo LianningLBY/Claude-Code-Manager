@@ -11,6 +11,7 @@ from pydantic import (
 )
 
 from backend.config import settings
+from backend.schemas.plan import PlanPipelineConfig
 
 
 class UserSkillSnapshotPayload(BaseModel):
@@ -96,6 +97,16 @@ class TaskCreate(BaseModel):
     attachments: list[dict] | None = None  # [{url, name, is_image}, ...]
     secret_ids: list[int] | None = None
     clone_from_task_id: int | None = None
+    # Internal/Plan endpoints use these fields to preserve independent Plan
+    # relationships across Manager→Worker copies. Public creation validates the
+    # referenced Task before accepting them.
+    plan_target_task_id: int | None = None
+    plan_context_session_id: str | None = None
+    plan_context_log_id: int | None = None
+    plan_context_snapshot: str | None = Field(default=None, max_length=60_000)
+    plan_repo_revision: dict | None = None
+    supersedes_plan_task_id: int | None = None
+    plan_pipeline_config: PlanPipelineConfig | None = None
     starred: bool = False
 
     @field_validator("provider", mode="before")
@@ -215,6 +226,10 @@ class TaskActionRequest(BaseModel):
     expected_routing: TaskRoutingExpectation | None = None
 
 
+class PlanApprovalRequest(TaskActionRequest):
+    confirm_stale: bool = False
+
+
 class TaskUpdate(BaseModel):
     # 执行位置切换：传 worker_id 触发 TaskMigrator（-1 表示切回本机，
     # 因为 None 在 exclude_unset 语义下无法与「未传」区分）
@@ -292,6 +307,23 @@ class TaskResponse(BaseModel):
     goal_last_reason: str | None
     plan_content: str | None
     plan_approved: bool | None
+    plan_target_task_id: int | None = None
+    supersedes_plan_task_id: int | None = None
+    plan_approved_at: datetime | None = None
+    plan_approved_by: int | None = None
+    plan_applied_at: datetime | None = None
+    plan_applied_to_session_id: str | None = None
+    plan_execution_task_id: int | None = None
+    canonical_plan_id: int | None = None
+    plan_pipeline_config: PlanPipelineConfig | None = None
+    # Read-only projection of the latest PlanAgentRun. Task.status remains the
+    # stable scheduler lifecycle (for example ``executing``).
+    plan_stage: str | None = None
+    plan_stage_round: int | None = None
+    plan_stage_provider: str | None = None
+    plan_stage_model: str | None = None
+    plan_stage_effort: str | None = None
+    plan_stage_route_slot: Literal["primary", "fallback"] | None = None
     session_id: str | None
     provider: str
     model: str | None

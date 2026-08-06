@@ -15,6 +15,32 @@ from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task_share import TaskShare
+from backend.schemas.plan import default_plan_pipeline_config
+from backend.services.plan_tasks import capture_repo_revision
+
+
+async def _legacy_plan_task(session_factory, **values) -> int:
+    """Create a historical Plan Task without using the closed write entry."""
+
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    fields = {
+        "title": "Legacy Plan",
+        "description": "Historical planning request",
+        "target_repo": "/tmp",
+        "mode": "plan",
+        "provider": pipeline["planner"]["primary"]["provider"],
+        "model": pipeline["planner"]["primary"]["model"],
+        "effort_level": pipeline["planner"]["primary"]["effort"],
+        "plan_pipeline_config": pipeline,
+        "plan_repo_revision": await capture_repo_revision("/tmp"),
+    }
+    fields.update(values)
+    async with session_factory() as db:
+        task = Task(**fields)
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        return task.id
 
 
 # === Chat tests ===
@@ -759,12 +785,48 @@ async def test_plan_reject_not_plan_review(client):
 
 
 @pytest.mark.asyncio
+async def test_migrated_plan_task_is_visible_but_legacy_decisions_are_blocked(
+    client,
+    session_factory,
+):
+    """The Task remains history; its canonical Plan owns future decisions."""
+    from backend.models.plan import PlanLegacyTaskLink
+
+    task_id = await _legacy_plan_task(
+        session_factory,
+        title="Migrated Plan Task",
+        description="d",
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task).where(Task.id == task_id).values(
+                status="plan_review",
+                plan_content="Historical plan",
+            )
+        )
+        db.add(PlanLegacyTaskLink(legacy_task_id=task_id, plan_id=456))
+        await db.commit()
+
+    task_response = await client.get(f"/api/tasks/{task_id}")
+    assert task_response.status_code == 200
+    assert task_response.json()["canonical_plan_id"] == 456
+
+    for action in ("approve", "reject"):
+        response = await client.post(f"/api/tasks/{task_id}/plan/{action}")
+        assert response.status_code == 409
+        assert response.json()["detail"] == (
+            "Legacy Plan Task has migrated to canonical Plan #456"
+        )
+
+
+@pytest.mark.asyncio
 async def test_plan_approve_success(client, session_factory):
-    """Approving a plan-mode task in plan_review state should succeed."""
-    create_resp = await client.post("/api/tasks", json={
-        "title": "Plan Task", "description": "d", "target_repo": "/tmp", "mode": "plan",
-    })
-    task_id = create_resp.json()["id"]
+    """Approval completes the Plan without scheduling an execution turn."""
+    task_id = await _legacy_plan_task(
+        session_factory,
+        title="Plan Task",
+        description="d",
+    )
 
     # Set task to plan_review state directly in DB
     async with session_factory() as db:
@@ -778,8 +840,9 @@ async def test_plan_approve_success(client, session_factory):
     resp = await client.post(f"/api/tasks/{task_id}/plan/approve")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "pending"
+    assert data["status"] == "completed"
     assert data["plan_approved"] is True
+    assert data["plan_approved_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -787,16 +850,14 @@ async def test_plan_approve_rejects_stale_fast_view_before_queueing(
     client,
     session_factory,
 ):
-    create_resp = await client.post("/api/tasks", json={
-        "title": "Plan Task",
-        "description": "d",
-        "target_repo": "/tmp",
-        "mode": "plan",
-        "provider": "codex",
-        "model": "gpt-5.6-sol",
-        "codex_service_tier": "default",
-    })
-    task_id = create_resp.json()["id"]
+    task_id = await _legacy_plan_task(
+        session_factory,
+        title="Plan Task",
+        description="d",
+        provider="codex",
+        model="gpt-5.6-sol",
+        codex_service_tier="default",
+    )
     async with session_factory() as db:
         await db.execute(
             update(Task)
@@ -826,10 +887,11 @@ async def test_plan_approve_rejects_stale_fast_view_before_queueing(
 @pytest.mark.asyncio
 async def test_plan_reject_success(client, session_factory):
     """Rejecting a plan-mode task in plan_review state should cancel it."""
-    create_resp = await client.post("/api/tasks", json={
-        "title": "Plan Task", "description": "d", "target_repo": "/tmp", "mode": "plan",
-    })
-    task_id = create_resp.json()["id"]
+    task_id = await _legacy_plan_task(
+        session_factory,
+        title="Plan Task",
+        description="d",
+    )
 
     async with session_factory() as db:
         await db.execute(
@@ -856,13 +918,11 @@ async def test_plan_transition_revalidates_after_operation_lock(
 ):
     """A stale plan_review read cannot overwrite a migration generation."""
 
-    create_resp = await client.post("/api/tasks", json={
-        "title": "Plan race",
-        "description": "d",
-        "target_repo": "/tmp",
-        "mode": "plan",
-    })
-    task_id = create_resp.json()["id"]
+    task_id = await _legacy_plan_task(
+        session_factory,
+        title="Plan race",
+        description="d",
+    )
     async with session_factory() as db:
         await db.execute(
             update(Task)

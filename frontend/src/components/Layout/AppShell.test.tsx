@@ -7,6 +7,7 @@ import { setTheme } from '../../config/theme';
 vi.mock('../../api/client', () => ({
   api: {
     listWorkers: vi.fn().mockResolvedValue([]),
+    countPlans: vi.fn().mockResolvedValue({ total: 0 }),
     getRuntimeSettings: vi.fn().mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -114,15 +115,27 @@ describe('AppShell layout and z-index architecture', () => {
 
     expect(screen.queryByRole('button', { name: 'Files' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Secrets' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
   });
 
   it('keeps the process-wide update control available to administrators', () => {
     renderShell();
 
     expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Browser Review' })).not.toBeInTheDocument();
+  });
+
+  it('marks Plans navigation when a Plan requires user action', async () => {
+    vi.mocked(api.countPlans).mockResolvedValue({ total: 2 });
+    renderShell();
+
+    const marker = await screen.findByLabelText('Plans requiring action');
+    expect(marker).toBeInTheDocument();
+    expect(marker.parentElement).toHaveAttribute('data-nav-icon');
+    expect(marker.className).toContain('absolute');
   });
 
   describe('header stacking context', () => {

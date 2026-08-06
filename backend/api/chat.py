@@ -1,9 +1,12 @@
 import asyncio
 from copy import deepcopy
 from datetime import datetime
+import hashlib
+import json
 import logging
 import os
-import json
+import time
+import uuid
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -14,7 +17,8 @@ from backend.api.deps import (
     require_task_control,
 )
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import and_, not_, select, func, update as sa_update  # still used by chat history
+from sqlalchemy import and_, not_, select, update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
@@ -27,6 +31,7 @@ from backend.api.uploads import (
     validate_upload_attachments,
 )
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
+from backend.services.task_creation import stage_task_record
 from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.task_queue import TaskQueue, task_is_pr_review_superseded
 from backend.services.pr_review_runtime import (
@@ -42,6 +47,17 @@ from backend.services.worker_relay import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
+
+
+def _plan_delivery_digest(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _trusted_terminal_pr_review_chat(request: Request) -> bool:
@@ -95,6 +111,24 @@ class ChatMessage(BaseModel):
     # The route rendered by the caller. A mismatch is rejected before the
     # user row is persisted, so a stale Fast tab cannot launch Standard.
     expected_routing: TaskRoutingExpectation | None = None
+    # Approved independent Plan Tasks explicitly attached to this real user
+    # turn. Approval alone never starts a model turn.
+    plan_task_ids: list[int] | None = None
+    confirmed_stale_plan_task_ids: list[int] | None = None
+    plan_version_ids: list[int] | None = None
+    confirmed_stale_plan_version_ids: list[int] | None = None
+    # Manager→Worker only. It makes a successful remote application replayable
+    # when the response or Manager commit is lost.
+    plan_application_receipt_key: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_plan_attachment_generation(self):
+        if self.plan_task_ids and self.plan_version_ids:
+            raise ValueError("Use plan_version_ids or legacy plan_task_ids, not both")
+        return self
 
 
 class FrontendReviewGoalMessage(BaseModel):
@@ -504,6 +538,10 @@ async def send_chat_message(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a follow-up message on a task, resuming its previous session."""
+    if body.plan_application_receipt_key:
+        from backend.api.deps import require_internal_service
+
+        require_internal_service(request)
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -523,6 +561,11 @@ async def send_chat_message(
         )
     command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
+        if body.plan_task_ids or body.plan_version_ids:
+            raise HTTPException(
+                400,
+                "Shared shadow tasks do not support Plan attachments",
+            )
         return await _send_shared_chat(
             task,
             body,
@@ -541,6 +584,9 @@ async def send_chat_message(
         from backend.api.deps import require_admin
 
         require_admin(request)
+
+    approved_plans: list[Task] = []
+    approved_versions = []
 
     # Worker-local stage/ack/reconcile and direct chat admission share this
     # process-wide lock.  A stage that wins first returns 409 here; a stage
@@ -590,12 +636,133 @@ async def send_chat_message(
             effective_model=body.model or task.model,
         )
         _validate_chat_service_tier(task, body.model)
+        application_receipt = None
+        if body.plan_application_receipt_key:
+            from backend.models.plan import PlanApplicationReceipt
+
+            application_receipt = (
+                await db.execute(
+                    select(PlanApplicationReceipt).where(
+                        PlanApplicationReceipt.receipt_key
+                        == body.plan_application_receipt_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if application_receipt is not None:
+                if (
+                    application_receipt.target_task_id != task_id
+                    or application_receipt.plan_version_ids
+                    != (body.plan_version_ids or [])
+                ):
+                    raise HTTPException(
+                        409, "Plan application receipt identity changed"
+                    )
+                if application_receipt.delivery_status in {
+                    "failed",
+                    "cancelled",
+                }:
+                    raise HTTPException(
+                        409,
+                        "Plan application delivery failed before launch; "
+                        "the Version may be applied again",
+                    )
+                if application_receipt.delivery_status == "uncertain":
+                    raise HTTPException(
+                        409,
+                        "Plan application launch outcome is uncertain; "
+                        "automatic replay was blocked",
+                    )
+                if (
+                    application_receipt.status == "committed"
+                    and application_receipt.response
+                ):
+                    payload = application_receipt.outbox_payload or {}
+                    if (
+                        payload.get("user_message_text") != body.message
+                        or payload.get("attachment_paths")
+                        != (body.file_paths or body.image_paths or [])
+                        or payload.get("model_override") != body.model
+                        or payload.get("expected_task_routing")
+                        != list(admitted_routing)
+                        or payload.get("source_log_id")
+                        != application_receipt.manager_user_log_id
+                    ):
+                        raise HTTPException(
+                            409, "Plan application receipt payload changed"
+                        )
+                    from backend.main import dispatcher
+
+                    admitted = await dispatcher.enqueue_plan_application_receipt(
+                        application_receipt.receipt_key
+                    )
+                    if not admitted:
+                        raise HTTPException(
+                            409,
+                            "Plan application delivery is no longer admissible",
+                        )
+                    return application_receipt.response
+                if application_receipt.outbox_payload:
+                    from backend.main import dispatcher
+
+                    admitted = await dispatcher.enqueue_plan_application_receipt(
+                        application_receipt.receipt_key
+                    )
+                    if not admitted:
+                        raise HTTPException(
+                            409,
+                            "Plan application delivery is no longer admissible",
+                        )
+                    if application_receipt.response:
+                        return application_receipt.response
+                raise HTTPException(
+                    409, "Plan application receipt is still being processed"
+                )
         if not task.session_id:
             raise HTTPException(
                 400,
                 "No previous session on this task. Run the task first.",
             )
         await _validate_chat_command_admission(task, command, db)
+        from backend.services.plan_tasks import approved_plans_for_message
+
+        try:
+            if body.plan_version_ids:
+                from backend.services.plan_service import (
+                    approved_versions_for_message,
+                )
+
+                approved_versions = await approved_versions_for_message(
+                    db,
+                    target=task,
+                    version_ids=body.plan_version_ids,
+                    confirmed_stale_version_ids=(
+                        body.confirmed_stale_plan_version_ids
+                    ),
+                )
+            else:
+                approved_plans = await approved_plans_for_message(
+                    db,
+                    task,
+                    body.plan_task_ids,
+                    confirmed_stale_plan_task_ids=(
+                        body.confirmed_stale_plan_task_ids
+                    ),
+                )
+        except ValueError as exc:
+            staleness = getattr(exc, "staleness", None)
+            if staleness is not None:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": str(exc),
+                        "plan_task_id": getattr(exc, "plan_task_id", None),
+                        "plan_version_id": getattr(
+                            exc, "plan_version_id", None
+                        ),
+                        "staleness": staleness,
+                    },
+                ) from exc
+            raise HTTPException(400, str(exc)) from exc
 
     command_skills: dict | None = None
 
@@ -653,6 +820,14 @@ async def send_chat_message(
             .limit(1)
         )
         workspace_review_baseline_run_id = baseline.scalar_one_or_none()
+    if approved_plans:
+        from backend.services.plan_tasks import build_approved_plan_prompt
+
+        prompt = build_approved_plan_prompt(approved_plans, prompt)
+    elif approved_versions:
+        from backend.services.plan_service import build_versioned_plan_prompt
+
+        prompt = build_versioned_plan_prompt(approved_versions, prompt)
 
     # Build file attachment metadata for storage and display
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -666,6 +841,16 @@ async def send_chat_message(
             "is_image": ext in _IMAGE_EXTS,
         })
 
+    applied_plan_data: list[dict[str, object]] = []
+    if approved_plans:
+        from backend.services.plan_tasks import applied_plan_snapshots
+
+        applied_plan_data = applied_plan_snapshots(approved_plans)
+    elif approved_versions:
+        from backend.services.plan_service import versioned_plan_snapshots
+
+        applied_plan_data = versioned_plan_snapshots(approved_versions)
+
     # Store user message as a log entry (use instance_id=1 as placeholder)
     log_metadata: dict = {"raw_content": model_message}
     if attachments:
@@ -675,6 +860,11 @@ async def send_chat_message(
         # Model-facing history rebuilds must use this exact original text,
         # never guess by regex (the user's real message may start with [BUG]).
         log_metadata["sender_name"] = sender_display_name
+    if applied_plan_data:
+        # Persist the exact approved version that was prepended to this turn.
+        # The Plan row may later be revised or deleted, but chat history must
+        # still explain what context the model actually received.
+        log_metadata["applied_plans"] = applied_plan_data
     user_log = LogEntry(
         instance_id=1,
         task_id=task_id,
@@ -685,6 +875,126 @@ async def send_chat_message(
         is_error=False,
     )
     db.add(user_log)
+    await db.flush()
+    # Persist an epoch timestamp in the durable outbox. Unlike a monotonic
+    # process clock, this remains comparable with messages admitted after a
+    # process or host restart.
+    queue_timestamp = time.time()
+    plan_queue_admission_fence = None
+    if approved_versions:
+        from backend.main import dispatcher
+        from backend.services.dispatcher import TaskStartPausedError
+
+        try:
+            plan_queue_admission_fence = (
+                await dispatcher.snapshot_plan_queue_admission(task_id)
+            )
+        except (TaskStartPausedError, RuntimeError) as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Task queue is stopping; the Plan Version was not applied",
+            ) from exc
+    application_receipt_key = (
+        body.plan_application_receipt_key or str(uuid.uuid4())
+        if approved_versions
+        else None
+    )
+    response = {
+        "ok": True,
+        "queued": True,
+        "session_id": task.session_id,
+        "applied_plan_task_ids": [plan.id for plan in approved_plans],
+        "applied_plan_version_ids": [
+            version.id for _plan, version in approved_versions
+        ],
+    }
+    if application_receipt_key is not None:
+        response["plan_application_receipt_key"] = application_receipt_key
+    if application_receipt_key and approved_versions:
+        from backend.models.plan import PlanApplicationReceipt
+
+        outbox_payload = {
+            "prompt": prompt,
+            "priority": 0,
+            "source": "user",
+            "command_skills": command_skills,
+            "model_override": body.model,
+            "expected_task_routing": list(admitted_routing),
+            "source_log_id": user_log.id,
+            "user_message_text": model_message,
+            # Keep the full immutable model request (including the approved
+            # Plan) for compaction/session-recovery rebuilds. The raw user
+            # text above is the separate HTTP replay identity.
+            "current_message": prompt,
+            "attachment_paths": all_paths,
+            "queue_timestamp": queue_timestamp,
+            "queue_admission_fence": plan_queue_admission_fence,
+        }
+        application_receipt = PlanApplicationReceipt(
+            receipt_key=application_receipt_key,
+            target_task_id=task_id,
+            manager_user_log_id=user_log.id,
+            plan_version_ids=[version.id for _plan, version in approved_versions],
+            status="committed",
+            response=response,
+            delivery_status="pending",
+            outbox_payload=outbox_payload,
+            payload_digest=_plan_delivery_digest(outbox_payload),
+        )
+        db.add(application_receipt)
+        await db.flush()
+    if approved_plans:
+        from sqlalchemy import update as sa_update
+
+        applied_at = datetime.utcnow()
+        for plan in approved_plans:
+            applied = await db.execute(
+                sa_update(Task)
+                .where(
+                    Task.id == plan.id,
+                    Task.mode == "plan",
+                    Task.plan_target_task_id == task_id,
+                    Task.plan_approved.is_(True),
+                    Task.status == "completed",
+                    Task.plan_applied_at.is_(None),
+                )
+                .values(
+                    plan_applied_at=applied_at,
+                    plan_applied_to_session_id=task.session_id,
+                    plan_applied_log_id=user_log.id,
+                )
+            )
+            if applied.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    f"Plan Task #{plan.id} was applied concurrently",
+                )
+    elif approved_versions:
+        from backend.models.plan import PlanApplication
+
+        for plan, version in approved_versions:
+            db.add(
+                PlanApplication(
+                    plan_id=plan.id,
+                    plan_version_id=version.id,
+                    application_type="chat_message",
+                    target_task_id=task_id,
+                    target_session_id=task.session_id,
+                    user_log_id=user_log.id,
+                    applied_by=get_current_user_id(request),
+                    application_receipt_key=application_receipt_key,
+                )
+            )
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "A selected Plan Version was applied concurrently",
+            ) from exc
     await db.commit()
 
     # Broadcast user message to task channel
@@ -697,6 +1007,7 @@ async def send_chat_message(
         "raw_content": model_message,
         "image_urls": image_urls,
         "attachments": attachments,
+        "applied_plans": applied_plan_data,
     })
     if sender_display_name:
         broadcast_data["sender_name"] = sender_display_name
@@ -706,29 +1017,111 @@ async def send_chat_message(
     from backend.main import dispatcher
     from backend.services.dispatcher import PRIORITY_USER, TaskStartPausedError
     try:
-        await dispatcher.enqueue_message(
-            task_id=task_id,
-            prompt=prompt,
-            priority=PRIORITY_USER,
-            source="user",
-            command_skills=command_skills,
-            model_override=body.model,
-            expected_task_routing=admitted_routing,
-            source_log_id=user_log.id,
+        if application_receipt is not None:
+            admitted = await dispatcher.enqueue_plan_application_receipt(
+                application_receipt.receipt_key
+            )
+            if not admitted:
+                raise HTTPException(
+                    409,
+                    "Plan application was cancelled before queue admission",
+                )
+        else:
+            await dispatcher.enqueue_message(
+                task_id=task_id,
+                prompt=prompt,
+                priority=PRIORITY_USER,
+                source="user",
+                command_skills=command_skills,
+                model_override=body.model,
+                expected_task_routing=admitted_routing,
+                source_log_id=user_log.id,
+                queue_timestamp=queue_timestamp,
+            )
+    except (TaskStartPausedError, RuntimeError) as exc:
+        if application_receipt is None:
+            if approved_plans:
+                # Legacy Task-backed Plans have no durable outbox. Queue
+                # admission failures are therefore known pre-delivery and
+                # must restore their one-shot application markers exactly as
+                # before the first-class Version path was introduced.
+                async with get_task_operation_lock(task_id):
+                    for plan in approved_plans:
+                        await db.execute(
+                            sa_update(Task)
+                            .where(
+                                Task.id == plan.id,
+                                Task.plan_applied_log_id == user_log.id,
+                            )
+                            .values(
+                                plan_applied_at=None,
+                                plan_applied_to_session_id=None,
+                                plan_applied_log_id=None,
+                            )
+                        )
+                    log_metadata.pop("applied_plans", None)
+                    user_log.raw_json = json.dumps(log_metadata)
+                    await db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="服务即将重启，消息未进入执行队列，请重连后重试",
+            ) from exc
+        # The application and exact queue envelope are already durable. A
+        # restart recovers pending/queued delivery. Cancellation or a
+        # permanent admission failure may have won the same dispatcher gate,
+        # though, so do not acknowledge a message that was synchronously
+        # released for retry.
+        await db.rollback()
+        delivery_status = (
+            await db.execute(
+                select(PlanApplicationReceipt.delivery_status).where(
+                    PlanApplicationReceipt.receipt_key
+                    == application_receipt.receipt_key
+                )
+            )
+        ).scalar_one_or_none()
+        if delivery_status in {"failed", "cancelled"}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Plan application was cancelled before launch; "
+                    "the Version may be applied again"
+                ),
+            ) from exc
+        if delivery_status == "uncertain":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Plan application launch outcome is uncertain; "
+                    "administrator reconciliation is required"
+                ),
+            ) from exc
+        if delivery_status not in {"pending", "queued", "launching", "launched"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Plan application delivery state could not be confirmed",
+            ) from exc
+        logger.info(
+            "Deferred durable Plan application delivery %s: %s",
+            application_receipt.receipt_key,
+            exc,
         )
-    except TaskStartPausedError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="服务即将重启，消息未进入执行队列，请重连后重试",
-        ) from exc
+    if approved_versions:
+        from backend.services.plan_events import broadcast_plan_event
 
-    return {
-        "ok": True,
-        "queued": True,
-        "session_id": task.session_id,
-        "workspace_review_expected": review_routing_prompt is not None,
-        "workspace_review_baseline_run_id": workspace_review_baseline_run_id,
-    }
+        for plan, version in approved_versions:
+            await broadcast_plan_event(
+                event="plan_version_applied",
+                plan_id=plan.id,
+                target_task_id=task_id,
+                version_id=version.id,
+                user_log_id=user_log.id,
+            )
+    response["workspace_review_expected"] = review_routing_prompt is not None
+    response["workspace_review_baseline_run_id"] = (
+        workspace_review_baseline_run_id
+    )
+    return response
 
 
 @router.get(
@@ -788,7 +1181,9 @@ async def start_frontend_review_goal(
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
             _retry_local_task_safely,
-            _validate_task_service_tier_configuration,
+        )
+        from backend.services.task_creation import (
+            validate_task_service_tier_configuration,
         )
 
         _require_expected_task_routing(
@@ -859,7 +1254,7 @@ async def start_frontend_review_goal(
                 or "Project 尚未确认可信 Preview 配置",
             )
         try:
-            _validate_task_service_tier_configuration(
+            validate_task_service_tier_configuration(
                 provider=current.provider,
                 model=current.model,
                 codex_service_tier=current.codex_service_tier,
@@ -1191,7 +1586,8 @@ async def fork_codex_task(
             else f"Fork of #{source.id}"
         )
         now = datetime.utcnow()
-        forked_task = Task(
+        forked_task = await stage_task_record(
+            db,
             title=(body.title.strip() if body.title and body.title.strip() else default_title)[:200],
             description=(
                 source.description
@@ -1226,9 +1622,6 @@ async def fork_codex_task(
             started_at=now,
             completed_at=now,
         )
-        db.add(forked_task)
-        await db.flush()
-
         for row in rows:
             if row.id > cutoff:
                 break
@@ -1399,6 +1792,43 @@ async def _send_shared_chat(
     return {"ok": True, "queued": True}
 
 
+async def _preserve_remote_uncertain_plan_receipt(
+    db: AsyncSession,
+    *,
+    receipt,
+    remote_receipt: dict,
+    request: Request | None,
+) -> None:
+    """Mirror a Worker's ambiguous launch as a consumed, visible Version."""
+
+    from backend.services.plan_events import broadcast_plan_event
+    from backend.services.plan_service import preserve_uncertain_plan_application
+
+    error = str(
+        remote_receipt.get("delivery_error")
+        or "Worker restarted after the launch claim; automatic replay was blocked"
+    )[:2000]
+    evidence = remote_receipt.get("launch_evidence")
+    response = remote_receipt.get("response")
+    plan_ids = await preserve_uncertain_plan_application(
+        db,
+        receipt=receipt,
+        error=error,
+        launch_evidence=evidence if isinstance(evidence, dict) else None,
+        response=response if isinstance(response, dict) else None,
+        applied_by=(get_current_user_id(request) if request is not None else None),
+    )
+    await db.commit()
+    for plan_id in plan_ids:
+        await broadcast_plan_event(
+            event="plan_application_delivery_uncertain",
+            plan_id=plan_id,
+            target_task_id=receipt.target_task_id,
+            receipt_key=receipt.receipt_key,
+            delivery_status="uncertain",
+        )
+
+
 async def _send_worker_chat(
     task: Task,
     body: ChatMessage,
@@ -1460,6 +1890,42 @@ async def _send_worker_chat(
             operation_lock_held=True,
         )
 
+        approved_versions = []
+        remote_version_ids: list[int] = []
+        remote_confirmed_version_ids: list[int] = []
+        if body.plan_version_ids:
+            from backend.services.plan_service import approved_versions_for_message
+
+            try:
+                approved_versions = await approved_versions_for_message(
+                    db,
+                    target=current,
+                    version_ids=body.plan_version_ids,
+                    confirmed_stale_version_ids=(
+                        body.confirmed_stale_plan_version_ids
+                    ),
+                )
+            except ValueError as exc:
+                staleness = getattr(exc, "staleness", None)
+                if staleness is not None:
+                    raise HTTPException(
+                        409,
+                        detail={
+                            "message": str(exc),
+                            "plan_version_id": getattr(
+                                exc, "plan_version_id", None
+                            ),
+                            "staleness": staleness,
+                        },
+                    ) from exc
+                raise HTTPException(400, str(exc)) from exc
+            for plan, version in approved_versions:
+                if plan.target_task_id != current.id:
+                    raise HTTPException(
+                        409,
+                        f"Plan Version #{version.id} no longer targets this Task",
+                    )
+
         # Preserve the sender prefix for the Manager UI, but forward only the
         # raw user text so it never becomes part of the model prompt.
         model_message = body.message
@@ -1476,6 +1942,172 @@ async def _send_worker_chat(
             # matching endpoint contract before the Manager stores a user
             # bubble, otherwise a mixed-version rollout leaves a ghost row.
             await worker_proxy.require_terminal_pr_review_chat_support(worker)
+
+        # Reconcile a Worker commit whose HTTP ACK or Manager-side commit was
+        # lost. The prepared row is durable and binds the exact Manager log and
+        # Version set, so retrying cannot enqueue the model turn twice.
+        if approved_versions:
+            from backend.models.plan import (
+                PlanApplication,
+                PlanApplicationReceipt,
+            )
+            from backend.services.plan_service import versioned_plan_snapshots
+
+            wanted_ids = [version.id for _plan, version in approved_versions]
+            prepared_rows = list((await db.execute(
+                select(PlanApplicationReceipt).where(
+                    PlanApplicationReceipt.target_task_id == current.id,
+                    PlanApplicationReceipt.worker_id == worker.id,
+                    PlanApplicationReceipt.status == "prepared",
+                    PlanApplicationReceipt.delivery_status.not_in(
+                        ["failed", "cancelled"]
+                    ),
+                )
+            )).scalars())
+            prepared = next(
+                (row for row in prepared_rows if row.plan_version_ids == wanted_ids),
+                None,
+            )
+            if prepared is not None:
+                prior_log = await db.get(LogEntry, prepared.manager_user_log_id)
+                if prior_log is None:
+                    raise HTTPException(
+                        409,
+                        "Prepared Plan application lost its user log",
+                    )
+                prior_metadata = _raw_log_metadata(prior_log)
+                prior_paths = prior_metadata.get("file_paths") or []
+                requested_paths = body.file_paths or body.image_paths or []
+                if (
+                    prior_metadata.get("raw_content") != body.message
+                    or prior_paths != requested_paths
+                ):
+                    raise HTTPException(
+                        409,
+                        "A previous Worker Plan application is bound to a "
+                        "different message or attachment set",
+                    )
+                remote_receipt = await worker_proxy.get_plan_application_receipt(
+                    worker, prepared.receipt_key
+                )
+                remote_delivery_status = (
+                    remote_receipt.get("delivery_status")
+                    if isinstance(remote_receipt, dict)
+                    else None
+                )
+                if remote_delivery_status in {"failed", "cancelled"}:
+                    from backend.services.plan_service import (
+                        release_unstarted_plan_application,
+                    )
+
+                    await release_unstarted_plan_application(
+                        db,
+                        receipt_key=prepared.receipt_key,
+                        delivery_status=remote_delivery_status,
+                        error=str(remote_receipt.get("delivery_error") or "")[:2000],
+                        expected_worker_id=worker.id,
+                    )
+                    await db.commit()
+                    raise HTTPException(
+                        409,
+                        "Worker rejected the Plan application before launch; retry it",
+                    )
+                if remote_delivery_status == "uncertain":
+                    await _preserve_remote_uncertain_plan_receipt(
+                        db,
+                        receipt=prepared,
+                        remote_receipt=remote_receipt,
+                        request=request,
+                    )
+                    raise HTTPException(
+                        409,
+                        "Worker Plan application launch outcome is uncertain; "
+                        "automatic replay was blocked",
+                    )
+                if (
+                    remote_receipt is not None
+                    and remote_receipt.get("status") == "committed"
+                    and isinstance(remote_receipt.get("response"), dict)
+                ):
+                    remote_result = dict(remote_receipt["response"])
+                    receipt_committed = await db.execute(
+                        sa_update(PlanApplicationReceipt)
+                        .where(
+                            PlanApplicationReceipt.receipt_key
+                            == prepared.receipt_key,
+                            PlanApplicationReceipt.status == "prepared",
+                            PlanApplicationReceipt.delivery_status == "pending",
+                        )
+                        .values(
+                            status="committed",
+                            delivery_status=(
+                                "launched"
+                                if remote_delivery_status == "launched"
+                                else "queued"
+                            ),
+                            response=remote_result,
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    if receipt_committed.rowcount != 1:
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "Worker Plan delivery changed during reconciliation",
+                        )
+                    for plan, version in approved_versions:
+                        db.add(PlanApplication(
+                            plan_id=plan.id,
+                            plan_version_id=version.id,
+                            application_type="chat_message",
+                            target_task_id=current.id,
+                            target_session_id=remote_result.get("session_id") or current.session_id,
+                            user_log_id=prior_log.id,
+                            applied_by=get_current_user_id(request) if request else None,
+                            application_receipt_key=prepared.receipt_key,
+                        ))
+                    metadata = _raw_log_metadata(prior_log)
+                    metadata["applied_plans"] = versioned_plan_snapshots(approved_versions)
+                    prior_log.raw_json = json.dumps(metadata)
+                    await db.commit()
+                    from backend.services.plan_events import broadcast_plan_event
+
+                    for plan, version in approved_versions:
+                        await broadcast_plan_event(
+                            event="plan_version_applied",
+                            plan_id=plan.id,
+                            target_task_id=current.id,
+                            version_id=version.id,
+                            user_log_id=prior_log.id,
+                        )
+                    remote_result["instance_id"] = None
+                    remote_result["applied_plan_version_ids"] = wanted_ids
+                    return remote_result
+                raise HTTPException(
+                    409,
+                    "A previous Worker Plan application is awaiting receipt reconciliation; retry shortly",
+                )
+
+        remote_version_ids = []
+        remote_confirmed_version_ids = []
+        for plan, version in approved_versions:
+            try:
+                remote_version_id = await worker_proxy.materialize_plan_version(
+                    worker=worker,
+                    plan=plan,
+                    version=version,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    502,
+                    f"Plan Version #{version.id} could not be materialized on Worker",
+                ) from exc
+            remote_version_ids.append(remote_version_id)
+            # Manager already performed the authoritative staleness check (and
+            # required user confirmation when needed). Worker log ids belong
+            # to a different database namespace, so re-evaluating them could
+            # create a false stale conflict after Task migration.
+            remote_confirmed_version_ids.append(remote_version_id)
 
         all_paths = body.file_paths or body.image_paths or []
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -1508,7 +2140,7 @@ async def _send_worker_chat(
             log_metadata["file_paths"] = all_paths
         if sender_display_name:
             log_metadata["sender_name"] = sender_display_name
-        user_log = LogEntry(
+        manager_user_log = LogEntry(
             instance_id=None,
             task_id=current.id,
             event_type="user_message",
@@ -1517,11 +2149,13 @@ async def _send_worker_chat(
             raw_json=json.dumps(log_metadata) if log_metadata else None,
             is_error=False,
         )
-        db.add(user_log)
+        db.add(manager_user_log)
+        application_receipt_key = str(uuid.uuid4()) if approved_versions else None
+        manager_receipt = None
         await db.commit()
 
         # 2. Broadcast to the Manager frontend.
-        broadcast_data = persisted_chat_event(user_log, {
+        broadcast_data = persisted_chat_event(manager_user_log, {
             "event_type": "user_message",
             "role": "user",
             "content": display_content,
@@ -1547,26 +2181,86 @@ async def _send_worker_chat(
         # configuration is intentionally immutable and therefore needs no
         # Skill synchronization before a terminal discussion turn.
 
+        # Persist the handoff receipt only after every preflight step succeeds.
+        # From this commit onward the next network action is the idempotent
+        # Worker request carrying this exact key.
+        if approved_versions:
+            from backend.models.plan import PlanApplicationReceipt
+
+            manager_receipt = PlanApplicationReceipt(
+                receipt_key=application_receipt_key,
+                target_task_id=current.id,
+                worker_id=worker.id,
+                manager_user_log_id=manager_user_log.id,
+                plan_version_ids=[version.id for _plan, version in approved_versions],
+                status="prepared",
+            )
+            db.add(manager_receipt)
+            await db.commit()
+
         # 5. The common operation lock is already held; asking WorkerProxy to
         # acquire it again would deadlock.
-        result = await worker_proxy.proxy_to_worker(
-            current,
-            "POST",
-            f"/api/tasks/{current.id}/chat",
-            body={
-                "message": model_message,
-                "image_paths": body.image_paths,
-                "file_paths": body.file_paths,
-                "model": body.model,
-                "expected_routing": (
-                    body.expected_routing.model_dump(mode="json")
-                    if body.expected_routing is not None
-                    else None
-                ),
-            },
-            operation_lock_held=True,
-            pr_review_terminal_chat=terminal_pr_review_chat,
-        )
+        try:
+            result = await worker_proxy.proxy_to_worker(
+                current,
+                "POST",
+                f"/api/tasks/{current.id}/chat",
+                body={
+                    "message": model_message,
+                    "image_paths": body.image_paths,
+                    "file_paths": body.file_paths,
+                    "model": body.model,
+                    "plan_task_ids": body.plan_task_ids,
+                    "plan_version_ids": remote_version_ids or None,
+                    "confirmed_stale_plan_version_ids": (
+                        remote_confirmed_version_ids or None
+                    ),
+                    "confirmed_stale_plan_task_ids": (
+                        body.confirmed_stale_plan_task_ids
+                    ),
+                    "expected_routing": (
+                        body.expected_routing.model_dump(mode="json")
+                        if body.expected_routing is not None
+                        else None
+                    ),
+                    "plan_application_receipt_key": application_receipt_key,
+                },
+                operation_lock_held=True,
+                pr_review_terminal_chat=terminal_pr_review_chat,
+            )
+        except Exception:
+            remote_receipt = (
+                await worker_proxy.get_plan_application_receipt(
+                    worker, application_receipt_key
+                )
+                if application_receipt_key is not None
+                else None
+            )
+            if (
+                manager_receipt is not None
+                and isinstance(remote_receipt, dict)
+                and remote_receipt.get("delivery_status") == "uncertain"
+            ):
+                await _preserve_remote_uncertain_plan_receipt(
+                    db,
+                    receipt=manager_receipt,
+                    remote_receipt=remote_receipt,
+                    request=request,
+                )
+                raise HTTPException(
+                    409,
+                    "Worker Plan application launch outcome is uncertain; "
+                    "administrator reconciliation is required",
+                )
+            if (
+                remote_receipt is None
+                or remote_receipt.get("status") != "committed"
+                or not isinstance(remote_receipt.get("response"), dict)
+                or remote_receipt.get("delivery_status")
+                in {"failed", "cancelled", "uncertain"}
+            ):
+                raise
+            result = remote_receipt["response"]
 
         # 6. A delayed response can only update the generation that issued the
         # request.  Even responses without a session id perform a no-op CAS so
@@ -1585,10 +2279,149 @@ async def _send_worker_chat(
                 409,
                 "Task Worker assignment or generation changed while chat was in flight",
             )
+        applied_plan_ids = (
+            result.get("applied_plan_task_ids")
+            if isinstance(result, dict)
+            else None
+        )
+        if isinstance(applied_plan_ids, list):
+            applied_at = datetime.utcnow()
+            normalized_applied_ids: list[int] = []
+            for plan_id in applied_plan_ids:
+                if isinstance(plan_id, bool) or not isinstance(plan_id, int):
+                    continue
+                normalized_applied_ids.append(plan_id)
+                local_applied = await db.execute(
+                    sa_update(Task)
+                    .where(
+                        Task.id == plan_id,
+                        Task.mode == "plan",
+                        Task.plan_target_task_id == current.id,
+                        Task.plan_approved.is_(True),
+                        Task.plan_applied_at.is_(None),
+                    )
+                    .values(
+                        plan_applied_at=applied_at,
+                        plan_applied_to_session_id=(
+                            result.get("session_id") or current.session_id
+                        ),
+                        plan_applied_log_id=manager_user_log.id,
+                    )
+                )
+                if local_applied.rowcount != 1:
+                    logger.warning(
+                        "Worker applied Plan Task %s but Manager mirror could "
+                        "not claim its local application row",
+                        plan_id,
+                    )
+            if normalized_applied_ids:
+                from backend.services.plan_tasks import applied_plan_snapshots
+
+                rows = await db.execute(
+                    select(Task).where(Task.id.in_(normalized_applied_ids))
+                )
+                plans_by_id = {plan.id: plan for plan in rows.scalars().all()}
+                snapshot_plans = [
+                    plans_by_id[plan_id]
+                    for plan_id in normalized_applied_ids
+                    if plan_id in plans_by_id
+                ]
+                manager_metadata = _raw_log_metadata(manager_user_log)
+                manager_metadata["applied_plans"] = applied_plan_snapshots(
+                    snapshot_plans
+                )
+                manager_user_log.raw_json = json.dumps(manager_metadata)
+        applied_remote_version_ids = (
+            result.get("applied_plan_version_ids")
+            if isinstance(result, dict)
+            else None
+        )
+        if approved_versions:
+            if applied_remote_version_ids != remote_version_ids:
+                await db.rollback()
+                raise HTTPException(
+                    502,
+                    "Worker did not confirm the exact selected Plan Versions",
+                )
+            from backend.models.plan import PlanApplication
+            from backend.services.plan_service import versioned_plan_snapshots
+
+            if manager_receipt is not None:
+                receipt_committed = await db.execute(
+                    sa_update(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.receipt_key
+                        == manager_receipt.receipt_key,
+                        PlanApplicationReceipt.status == "prepared",
+                        PlanApplicationReceipt.delivery_status == "pending",
+                    )
+                    .values(
+                        status="committed",
+                        delivery_status="queued",
+                        response=(result if isinstance(result, dict) else None),
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+                if receipt_committed.rowcount != 1:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "Worker Plan delivery changed before Manager commit",
+                    )
+
+            for plan, version in approved_versions:
+                db.add(
+                    PlanApplication(
+                        plan_id=plan.id,
+                        plan_version_id=version.id,
+                        application_type="chat_message",
+                        target_task_id=current.id,
+                        target_session_id=(
+                            result.get("session_id") or current.session_id
+                        ),
+                        user_log_id=manager_user_log.id,
+                        applied_by=(
+                            get_current_user_id(request)
+                            if request is not None
+                            else None
+                        ),
+                        application_receipt_key=application_receipt_key,
+                    )
+                )
+            manager_metadata = _raw_log_metadata(manager_user_log)
+            manager_metadata["applied_plans"] = versioned_plan_snapshots(
+                approved_versions
+            )
+            manager_user_log.raw_json = json.dumps(manager_metadata)
+            try:
+                await db.flush()
+            except IntegrityError as exc:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "A selected Plan Version was applied concurrently",
+                ) from exc
         await db.commit()
+
+        if approved_versions:
+            from backend.services.plan_events import broadcast_plan_event
+
+            for plan, version in approved_versions:
+                await broadcast_plan_event(
+                    event="plan_version_applied",
+                    plan_id=plan.id,
+                    target_task_id=current.id,
+                    version_id=version.id,
+                    user_log_id=manager_user_log.id,
+                )
 
         if isinstance(result, dict):
             result["instance_id"] = None  # Worker instance ids are not Manager ids.
+            result["applied_plan_version_ids"] = [
+                version.id for _plan, version in approved_versions
+            ]
+            if application_receipt_key is not None:
+                result["plan_application_receipt_key"] = application_receipt_key
         return result
 
 
@@ -1715,6 +2548,33 @@ async def get_chat_history(
 
     _TRUNCATE = 20_000  # chars; tool outputs can be huge (file reads, bash output)
 
+    # Older application rows predate message-level Plan snapshots. Reconstruct
+    # them while the Plan still exists so already-applied production history is
+    # upgraded on read; new rows keep an immutable copy in raw_json and remain
+    # explainable even if the Plan is later deleted.
+    historical_applied_plans: dict[int, list[dict[str, object]]] = {}
+    history_log_ids = [
+        row.id for row in rows if row.event_type == "user_message"
+    ]
+    if history_log_ids:
+        from backend.services.plan_tasks import applied_plan_snapshots
+
+        historical_rows = await db.execute(
+            select(Task)
+            .where(
+                Task.mode == "plan",
+                Task.plan_applied_log_id.in_(history_log_ids),
+            )
+            .order_by(Task.id.asc())
+        )
+        for historical_plan in historical_rows.scalars().all():
+            log_id = historical_plan.plan_applied_log_id
+            if log_id is None:
+                continue
+            historical_applied_plans.setdefault(log_id, []).extend(
+                applied_plan_snapshots([historical_plan])
+            )
+
     messages = []
     current_source = None  # track monitor context
     for row in rows:
@@ -1741,6 +2601,7 @@ async def get_chat_history(
         image_urls = None
         source = None
         raw_content = None
+        applied_plans = None
         item_id = None
         turn_id = None
         native_item_type = None
@@ -1784,8 +2645,12 @@ async def get_chat_history(
                         source = raw["source"]
                     if isinstance(raw.get("raw_content"), str):
                         raw_content = raw["raw_content"]
+                    if isinstance(raw.get("applied_plans"), list):
+                        applied_plans = raw["applied_plans"]
             except (json.JSONDecodeError, TypeError):
                 pass
+        if applied_plans is None:
+            applied_plans = historical_applied_plans.get(row.id)
 
         if row.event_type in ("user_message", "system_event") and source:
             current_source = source
@@ -1815,6 +2680,7 @@ async def get_chat_history(
             "attachments": attachments,
             "source": msg_source,
             "raw_content": raw_content,
+            "applied_plans": applied_plans,
             "item_id": item_id,
             "turn_id": turn_id,
             "native_item_type": native_item_type,

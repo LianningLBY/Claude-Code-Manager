@@ -1,5 +1,3 @@
-from typing import Any
-
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from backend.api.deps import require_admin
@@ -14,6 +12,8 @@ from backend.schemas.global_settings import (
     RuntimeSettingsUpdate,
     RuntimeSettingsResponse,
 )
+from backend.schemas.plan import PlanPipelineConfig
+from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -46,6 +46,29 @@ async def update_git_settings(request: Request, body: GlobalSettingsUpdate, db: 
     await db.commit()
     await db.refresh(row)
     return row
+
+
+@router.get("/plan-pipeline", response_model=PlanPipelineConfig)
+async def get_plan_pipeline_settings(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    require_admin(request)
+    return await effective_plan_pipeline_config(db)
+
+
+@router.put("/plan-pipeline", response_model=PlanPipelineConfig)
+async def update_plan_pipeline_settings(
+    request: Request,
+    body: PlanPipelineConfig,
+    db: AsyncSession = Depends(get_db),
+):
+    require_admin(request)
+    row = await _get_or_create(db)
+    row.plan_pipeline_config = body.model_dump(mode="json")
+    await db.commit()
+    await db.refresh(row)
+    return PlanPipelineConfig.model_validate(row.plan_pipeline_config)
 
 
 def _pty_available() -> bool:

@@ -62,7 +62,13 @@ async def stats(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/config")
-async def get_config():
+async def get_config(db: AsyncSession = Depends(get_db)):
+    from backend.services.plan_pipeline_settings import (
+        effective_plan_pipeline_config,
+    )
+
+    plan_pipeline = await effective_plan_pipeline_config(db)
+
     return {
         "default_model": settings.default_model,
         "model_options": [m.strip() for m in settings.model_options.split(",") if m.strip()],
@@ -80,6 +86,8 @@ async def get_config():
         "default_codex_service_tier": DEFAULT_CODEX_SERVICE_TIER,
         "codex_service_tier_options": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
+        "versioned_plan_worker_protocol": 3,
+        "plan_pipeline_defaults": plan_pipeline.model_dump(mode="json"),
         # Manager must see this exact capability before forwarding a PR review
         # to a Worker. Older Workers would run it from their CCM checkout and
         # silently load unrelated CLAUDE.md/AGENTS.md instructions.

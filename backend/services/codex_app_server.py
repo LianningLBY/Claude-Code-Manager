@@ -20,6 +20,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -558,10 +559,30 @@ class CodexTurnProcess:
         self.stderr = asyncio.StreamReader(limit=1024 * 1024)
         self._interrupt = interrupt
         self._done = asyncio.get_running_loop().create_future()
+        # Lightweight per-turn stream telemetry. Auxiliary callers such as
+        # the Plan pipeline can persist this before deleting a disposable
+        # thread, and can distinguish slow initial reasoning from a response
+        # stream that stopped making progress after output began.
+        self.last_delta_at: datetime | None = None
+        self.last_delta_monotonic: float | None = None
+        self.streamed_output_chars = 0
+        self.last_event_type: str | None = None
 
     def feed(self, payload: dict[str, Any]) -> None:
         if self.returncode is not None:
             return
+        event_type = payload.get("type")
+        if isinstance(event_type, str) and event_type:
+            self.last_event_type = event_type
+        if event_type in {
+            "item.agent_message.delta",
+            "item.reasoning.delta",
+        }:
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                self.streamed_output_chars += len(delta)
+            self.last_delta_at = datetime.utcnow()
+            self.last_delta_monotonic = time.monotonic()
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         self.stdout.feed_data(line.encode("utf-8") + b"\n")
 
@@ -1522,6 +1543,22 @@ class CodexAppServer:
                 else set()
             )
         if len(active_turn_ids) != 1:
+            # Native Goals (including collaboration agents waiting on their
+            # own descendants) can keep a thread ``active`` without exposing
+            # a running turn in ``thread/read``.  A turn interrupt is
+            # impossible in that state, but the Goal protocol still provides
+            # an exact, thread-scoped stop.  Pause it before giving up; this
+            # avoids forcing callers to kill the account-wide shared
+            # app-server just to release one task.
+            try:
+                goal_paused = await self._pause_active_goal(thread_id)
+            except (asyncio.TimeoutError, CodexAppServerError):
+                goal_paused = False
+            if goal_paused:
+                return await self._wait_descendant_terminal(
+                    context,
+                    thread_id,
+                )
             return False
 
         turn_id = next(iter(active_turn_ids))
@@ -1970,7 +2007,7 @@ class CodexAppServer:
         )
         self._detach_turn_context(context)
 
-    async def _pause_active_goal(self, thread_id: str) -> None:
+    async def _pause_active_goal(self, thread_id: str) -> bool:
         """Pause an adopted native goal with one bounded protocol round trip."""
 
         try:
@@ -1993,8 +2030,9 @@ class CodexAppServer:
                     "continuing direct turn interrupt",
                     thread_id,
                 )
-                return
+                return False
             raise
+        return True
 
     async def _steer_detached_native_goal(
         self,
@@ -2336,10 +2374,12 @@ class CodexAppServer:
         task_id: int | None,
         mcp_specs: Sequence[McpServerSpec] = (),
         disable_project_config: bool = False,
+        disable_user_mcp: bool = False,
         skill_context: str = "",
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
+        output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
@@ -2415,6 +2455,11 @@ class CodexAppServer:
                     f"Invalid required Codex MCP configuration: {exc}"
                 ) from exc
             raise
+        if disable_user_mcp:
+            # This is a whole-map thread override. Plan/other read-only
+            # auxiliary turns must not inherit user or project MCP servers
+            # from the shared account process.
+            thread_config["mcp_servers"] = {}
         if self._actual_tier_proxy_route is not None:
             # A thread-scoped ``features`` table can outrank the app-server's
             # process-level ``--disable enable_request_compression`` override
@@ -2991,6 +3036,8 @@ class CodexAppServer:
             # between thread admission and this turn.
             "serviceTier": rpc_service_tier,
         }
+        if output_schema is not None:
+            turn_params["outputSchema"] = output_schema
         if tools_disabled:
             # A turn-level cwd without an explicit empty environment causes
             # Codex to silently restore its default local environment. Repeat
@@ -5620,12 +5667,16 @@ class CodexAppServerRegistry:
         *,
         reason: str,
     ) -> bool:
-        """Stop one durably-owned turn without killing peers on its transport.
+        """Stop one durably-owned turn and recycle its account transport.
 
-        A failed exact interrupt is safe to escalate to account transport
-        shutdown only when no other live turn or admitted RPC shares that
-        server generation.  Otherwise the caller must retain its Task,
-        Instance and consumer ownership and surface a retryable conflict.
+        Exact thread/turn interruption is always attempted first.  It is not,
+        however, sufficient proof that task-scoped native helpers are gone:
+        Codex keeps MCP servers and code-mode hosts below the persistent
+        app-server even after a turn reports ``interrupted``.  Once admission
+        is drained, therefore recycle the account transport for every explicit
+        stop.  Non-target adapters fail and use the ordinary task retry path;
+        returning success while target-owned native helpers remain alive is
+        not an acceptable outcome.
 
         Returns whether transport shutdown was required.
         """
@@ -5681,9 +5732,6 @@ class CodexAppServerRegistry:
                         "Failed to interrupt claimed Codex turn: %s",
                         home,
                     )
-                if interrupt_confirmed or process.returncode is not None:
-                    return False
-
                 async with self._lock:
                     server_is_current = self._servers.get(home) is server
                     target_is_current = server.owns_live_turn_process(process)
@@ -5694,10 +5742,14 @@ class CodexAppServerRegistry:
                     registry_shutdown = self._shutdown_requested
 
                 blockers: list[str] = []
-                if not server_is_current or not target_is_current:
+                if not server_is_current:
+                    blockers.append("the exact transport generation changed")
+                if (
+                    not interrupt_confirmed
+                    and process.returncode is None
+                    and not target_is_current
+                ):
                     blockers.append("the exact target generation changed")
-                if has_peer_turns:
-                    blockers.append("another live turn shares the transport")
                 if starting:
                     blockers.append(
                         f"{starting} admitted app-server request(s) are in flight"
@@ -5711,21 +5763,42 @@ class CodexAppServerRegistry:
                         + "; ".join(blockers)
                     )
 
-                # Admission is drained and the target is the only remaining
-                # live adapter.  A verified transport stop is now isolated to
-                # this claimed task generation.
+                if has_peer_turns:
+                    logger.warning(
+                        "Recycling shared Codex app-server transport after "
+                        "an explicit turn interrupt; peer turns "
+                        "will fail and retry: %s",
+                        home,
+                    )
+
+                # Admission is drained.  Transport recycle is the only
+                # available lifecycle boundary that also closes task-scoped
+                # MCP/code-mode helpers retained by Codex after a confirmed
+                # turn interrupt.
                 shutdown_attempted = True
                 await server.shutdown(
                     interrupted_process=process,
                     reason=reason,
                 )
 
-                # Real servers finish the target in their reader.  Preserve
+                # Real servers finish all adapters in their reader. Preserve
                 # the same guarantee for test doubles and an already-settled
-                # reader cancellation race.
+                # reader cancellation race. Peers are failures, never false
+                # successful completions.
                 for context in list(server._contexts_by_thread.values()):
                     if context.process is process:
-                        server._detach_turn_context(context)
+                        context.process.finish(
+                            130,
+                            reason,
+                            termination_kind="internal_abort",
+                        )
+                    else:
+                        context.process.finish(
+                            1,
+                            "Codex app-server recycled after another turn's "
+                            "explicit interrupt could not be confirmed",
+                        )
+                    server._detach_turn_context(context)
                 process.finish(
                     130,
                     reason,

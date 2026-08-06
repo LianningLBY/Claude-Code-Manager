@@ -10,7 +10,10 @@ from sqlalchemy import update
 import backend.main as main_module
 import backend.services.task_migrator as task_migrator_module
 from backend.models.task import Task
+from backend.models.plan import Plan
+from backend.models.plan_agent import PlanAgentRun
 from backend.models.worker import Worker
+from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.task_migrator import (
     MigrationError,
     TaskMigrator,
@@ -98,6 +101,133 @@ async def test_migrate_local_to_worker(db_factory, session_factory, monkeypatch)
     assert (w.id, t.id) in relay.subscribed
     m._move_session.assert_called_once()
     m._ensure_worker_task.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("plan_status", "approved"),
+    [
+        ("in_progress", None),
+        ("plan_review", None),
+        ("completed", True),
+    ],
+)
+async def test_target_migration_blocks_actionable_related_plans(
+    db_factory,
+    session_factory,
+    plan_status,
+    approved,
+):
+    worker = await _mk_worker(session_factory)
+    target = await _mk_task(session_factory)
+    await _mk_task(
+        session_factory,
+        mode="plan",
+        status=plan_status,
+        plan_target_task_id=target.id,
+        plan_approved=approved,
+        plan_applied_at=None,
+    )
+
+    with pytest.raises(MigrationError, match="待审批或待应用"):
+        await _migrator(db_factory).migrate(target.id, worker.id)
+
+
+async def test_target_migration_blocks_first_class_plan_active_run(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    target = await _mk_task(session_factory)
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Versioned related Plan",
+            initial_request="Plan it",
+            target_task_id=target.id,
+            pipeline_config=pipeline,
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="initial",
+            request_text="Plan it",
+            pipeline_config=pipeline,
+            status="waiting_user",
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+
+    with pytest.raises(MigrationError, match="active Run"):
+        await _migrator(db_factory).migrate(target.id, worker.id)
+
+
+async def test_target_migration_rechecks_plan_created_after_claim(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    target = await _mk_task(session_factory, status="completed")
+    migrator = _migrator(db_factory)
+    real_claim = migrator._claim_migration
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+
+    async def claim_then_create_plan(observed, **kwargs):
+        claimed = await real_claim(observed, **kwargs)
+        async with session_factory() as db:
+            plan = Plan(
+                title="Racing Plan",
+                initial_request="Plan during migration",
+                target_task_id=target.id,
+                pipeline_config=pipeline,
+                priority=0,
+            )
+            db.add(plan)
+            await db.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                run_type="initial",
+                request_text="Plan during migration",
+                pipeline_config=pipeline,
+                status="queued",
+            )
+            db.add(run)
+            await db.flush()
+            plan.active_run_id = run.id
+            await db.commit()
+        return claimed
+
+    migrator._claim_migration = claim_then_create_plan
+
+    with pytest.raises(MigrationError, match="active Run"):
+        await migrator.migrate(target.id, worker.id)
+
+    async with session_factory() as db:
+        restored = await db.get(Task, target.id)
+    assert restored.status == "completed"
+    assert restored.worker_id is None
+
+
+async def test_related_plan_cannot_migrate_independently(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    target = await _mk_task(session_factory)
+    plan = await _mk_task(
+        session_factory,
+        mode="plan",
+        status="completed",
+        plan_target_task_id=target.id,
+        plan_approved=True,
+        plan_applied_at=None,
+    )
+
+    with pytest.raises(MigrationError, match="不能脱离目标 Task"):
+        await _migrator(db_factory).migrate(plan.id, worker.id)
 
 
 @pytest.mark.parametrize(

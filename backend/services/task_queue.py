@@ -2,21 +2,52 @@ import errno
 import os
 from datetime import datetime
 
-from sqlalchemy import Float, case, delete as sa_delete, func, select, update
+from sqlalchemy import Float, and_, delete as sa_delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
-from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.services.task_creation import stage_task_record
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
 
 
 PR_REVIEW_SUPERSEDED_METADATA_KEY = "pr_review_superseded"
+BASE_DELETABLE_TASK_STATUSES = frozenset(
+    {"pending", "failed", "cancelled", "conflict", "completed"}
+)
+PLAN_DELETABLE_TASK_STATUSES = BASE_DELETABLE_TASK_STATUSES | {
+    "plan_review",
+    "superseded",
+}
+TASK_KIND_STANDALONE_PLAN = "standalone_plan"
+TASK_KIND_RELATED_PLAN = "related_plan"
+TASK_KIND_MAIN = "main"
+
+
+def _task_kind_predicate(task_kind: str):
+    if task_kind == TASK_KIND_STANDALONE_PLAN:
+        return and_(Task.mode == "plan", Task.plan_target_task_id.is_(None))
+    if task_kind == TASK_KIND_RELATED_PLAN:
+        return and_(Task.mode == "plan", Task.plan_target_task_id.is_not(None))
+    if task_kind == TASK_KIND_MAIN:
+        return Task.mode != "plan"
+    raise ValueError(f"Unsupported task kind: {task_kind}")
+
+
+def is_task_status_deletable(*, mode: str, status: str) -> bool:
+    """Return whether a stopped Task generation may enter safe deletion."""
+
+    statuses = (
+        PLAN_DELETABLE_TASK_STATUSES
+        if mode == "plan"
+        else BASE_DELETABLE_TASK_STATUSES
+    )
+    return status in statuses
 
 
 class _UnixTimestamp(FunctionElement):
@@ -202,8 +233,7 @@ class TaskQueue:
         self.db = db
 
     async def create(self, **kwargs) -> Task:
-        task = Task(**kwargs)
-        self.db.add(task)
+        task = await stage_task_record(self.db, **kwargs)
         await self.db.commit()
         await self.db.refresh(task)
         return task
@@ -221,6 +251,7 @@ class TaskQueue:
         archived_only: bool = False,
         project_id: int | None = None, starred: bool | None = None,
         has_unread: bool | None = None,
+        task_kind: str | None = None,
         limit: int = 50, offset: int = 0,
         user_id: int | None = None,
     ) -> list[Task]:
@@ -228,9 +259,9 @@ class TaskQueue:
         effective_key = _effective_key_expr(auto_sort)
         stmt = select(Task).where(Task.shared_from_id.is_(None)).order_by(Task.starred.desc(), effective_key.desc(), Task.id.desc())
         if archived_only:
-            stmt = stmt.where(Task.archived == True)
+            stmt = stmt.where(Task.archived.is_(True))
         elif not include_archived:
-            stmt = stmt.where(Task.archived == False)
+            stmt = stmt.where(Task.archived.is_(False))
         if status:
             parts = [s.strip() for s in status.split(",") if s.strip()]
             stmt = stmt.where(Task.status.in_(parts)) if len(parts) > 1 else stmt.where(Task.status == parts[0])
@@ -240,6 +271,8 @@ class TaskQueue:
             stmt = stmt.where(Task.starred == starred)
         if has_unread is not None:
             stmt = stmt.where(Task.has_unread == has_unread)
+        if task_kind is not None:
+            stmt = stmt.where(_task_kind_predicate(task_kind))
         # Team CCM: member sees tasks on own Workers, created by them, or shared to them
         if user_id is not None:
             from backend.models.worker import Worker
@@ -270,13 +303,14 @@ class TaskQueue:
         archived_only: bool = False,
         project_id: int | None = None, starred: bool | None = None,
         has_unread: bool | None = None,
+        task_kind: str | None = None,
         user_id: int | None = None,
     ) -> int:
         stmt = select(func.count(Task.id)).where(Task.shared_from_id.is_(None))
         if archived_only:
-            stmt = stmt.where(Task.archived == True)
+            stmt = stmt.where(Task.archived.is_(True))
         elif not include_archived:
-            stmt = stmt.where(Task.archived == False)
+            stmt = stmt.where(Task.archived.is_(False))
         if status:
             parts = [s.strip() for s in status.split(",") if s.strip()]
             stmt = stmt.where(Task.status.in_(parts)) if len(parts) > 1 else stmt.where(Task.status == parts[0])
@@ -286,6 +320,8 @@ class TaskQueue:
             stmt = stmt.where(Task.starred == starred)
         if has_unread is not None:
             stmt = stmt.where(Task.has_unread == has_unread)
+        if task_kind is not None:
+            stmt = stmt.where(_task_kind_predicate(task_kind))
         if user_id is not None:
             from backend.models.worker import Worker
             from backend.models.team_share import TeamTaskShare, TeamProjectShare
@@ -386,13 +422,9 @@ class TaskQueue:
         ) = expected_fence or task_delete_fence(task)
         if (
             not remote_worker_deleted
-            and observed_status
-            not in (
-                "pending",
-                "failed",
-                "cancelled",
-                "conflict",
-                "completed",
+            and not is_task_status_deletable(
+                mode=task.mode,
+                status=observed_status,
             )
         ):
             return False
@@ -510,6 +542,26 @@ class TaskQueue:
             await self.db.rollback()
             return False
 
+        from backend.services.plan_agent_runner import (
+            has_unreaped_plan_agent_for_task,
+        )
+
+        if has_unreaped_plan_agent_for_task(task_id):
+            await self.db.rollback()
+            return False
+
+        # Plan history is a first-class child of its target Task. Refuse to
+        # create dangling history; users can explicitly delete those Plans
+        # before deleting the target.
+        related_plan_id = await self.db.scalar(
+            select(Task.id)
+            .where(Task.plan_target_task_id == task_id)
+            .limit(1)
+        )
+        if related_plan_id is not None:
+            await self.db.rollback()
+            return False
+
         from backend.models.monitor_session import MonitorCheck, MonitorSession
 
         monitor_rows = list(
@@ -614,6 +666,28 @@ class TaskQueue:
                 return False
 
         await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
+        from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+
+        plan_run_ids = list(
+            (
+                await self.db.execute(
+                    select(PlanAgentRun.id).where(
+                        PlanAgentRun.plan_task_id == task_id
+                    )
+                )
+            ).scalars().all()
+        )
+        if plan_run_ids:
+            await self.db.execute(
+                sa_delete(PlanAgentStep).where(
+                    PlanAgentStep.run_id.in_(plan_run_ids)
+                )
+            )
+            await self.db.execute(
+                sa_delete(PlanAgentRun).where(
+                    PlanAgentRun.id.in_(plan_run_ids)
+                )
+            )
         if monitor_ids:
             await self.db.execute(
                 sa_delete(MonitorCheck).where(

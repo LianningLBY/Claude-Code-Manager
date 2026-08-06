@@ -60,9 +60,7 @@ class TaskProcessTerminationConflict(TaskTerminationConflict):
                 + ", ".join(map(str, instance_ids))
             )
         else:
-            message = (
-                "Detached Task/session cleanup could not be confirmed"
-            )
+            message = "Detached Task/session cleanup could not be confirmed"
         super().__init__(message)
 
 
@@ -117,9 +115,7 @@ class LocalTaskGeneration:
 
 _T = TypeVar("_T")
 _MAX_LATE_AUXILIARY_REAP_SWEEPS = 8
-_AUXILIARY_TERMINAL_STATUSES = frozenset(
-    {"completed", "failed", "stopped"}
-)
+_AUXILIARY_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped"})
 
 
 async def _finish_despite_cancellation(awaitable: Awaitable[_T]) -> _T:
@@ -197,8 +193,7 @@ def local_task_generation_predicates(
         (
             Task.pty_background_generation.is_(None)
             if generation.pty_background_generation is None
-            else Task.pty_background_generation
-            == generation.pty_background_generation
+            else Task.pty_background_generation == generation.pty_background_generation
         ),
     ]
 
@@ -216,9 +211,7 @@ async def stop_task_process(
     task_id: int,
     db: AsyncSession,
     *,
-    expected_generations: list[
-        tuple[int, int | None, datetime | None]
-    ],
+    expected_generations: list[tuple[int, int | None, datetime | None]],
     task_status: str = "completed",
 ) -> bool:
     """Stop only exact Instance generations invalidated by the caller.
@@ -230,23 +223,53 @@ async def stop_task_process(
     retry of the same task id (ABA), even when PID/start fences are later used.
     """
 
-    del db  # The manager verifies ownership with independent current reads.
     from backend.main import instance_manager
 
     stopped = False
     for instance_id, expected_pid, expected_started_at in expected_generations:
-        stopped = (
-            await instance_manager.stop(
-                instance_id,
-                expected_task_id=task_id,
-                expected_pid=expected_pid,
-                expected_started_at=expected_started_at,
-                task_status=task_status,
-                terminal_consumer_timeout=30.0,
-                consumer_cancel_timeout=10.0,
-            )
-            or stopped
+        generation_stopped = await instance_manager.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_pid=expected_pid,
+            expected_started_at=expected_started_at,
+            task_status=task_status,
+            terminal_consumer_timeout=30.0,
+            consumer_cancel_timeout=10.0,
         )
+        if not generation_stopped:
+            # ``stop(False)`` can still mean that terminal bookkeeping won
+            # and only a later publication lost its fence. Re-read outside
+            # the old transaction before attempting orphan reconciliation.
+            await db.rollback()
+            exact_owner_remains = await db.scalar(
+                select(Instance.id).where(
+                    Instance.id == instance_id,
+                    Instance.current_task_id == task_id,
+                    (
+                        Instance.pid.is_(None)
+                        if expected_pid is None
+                        else Instance.pid == expected_pid
+                    ),
+                    (
+                        Instance.started_at.is_(None)
+                        if expected_started_at is None
+                        else Instance.started_at == expected_started_at
+                    ),
+                )
+            )
+            await db.rollback()
+        else:
+            exact_owner_remains = None
+        if not generation_stopped and exact_owner_remains is not None:
+            generation_stopped = (
+                await instance_manager.reconcile_dead_reverse_task_owner(
+                    instance_id,
+                    expected_task_id=task_id,
+                    expected_pid=expected_pid,
+                    expected_started_at=expected_started_at,
+                )
+            )
+        stopped = generation_stopped or stopped
     return stopped
 
 
@@ -275,9 +298,7 @@ async def remaining_task_process_generations(
     task_id: int,
     db: AsyncSession,
     *,
-    expected_generations: list[
-        tuple[int, int | None, datetime | None]
-    ],
+    expected_generations: list[tuple[int, int | None, datetime | None]],
 ) -> list[int]:
     """Return exact owner generations that stop could not clear.
 
@@ -303,9 +324,7 @@ async def remaining_task_process_generations(
             ),
         ]
         owner = await db.scalar(
-            select(Instance.id)
-            .where(*predicates)
-            .with_for_update()
+            select(Instance.id).where(*predicates).with_for_update()
         )
         if owner is not None:
             remaining.append(instance_id)
@@ -351,14 +370,11 @@ async def lock_task_generation(
         (
             Task.pty_background_generation.is_(None)
             if expected_pty_background_generation is None
-            else Task.pty_background_generation
-            == expected_pty_background_generation
+            else Task.pty_background_generation == expected_pty_background_generation
         ),
     ]
     locked = await db.execute(
-        sa_update(Task)
-        .where(*predicates)
-        .values(status=expected_status)
+        sa_update(Task).where(*predicates).values(status=expected_status)
     )
     if not locked.rowcount:
         await db.rollback()
@@ -398,11 +414,7 @@ def _auxiliary_runtime_snapshot(
         not isinstance(snapshot, tuple)
         or len(snapshot) != 2
         or not all(isinstance(ids, set) for ids in snapshot)
-        or any(
-            type(session_id) is not int
-            for ids in snapshot
-            for session_id in ids
-        )
+        or any(type(session_id) is not int for ids in snapshot for session_id in ids)
     ):
         raise TaskAuxiliaryTerminationConflict(session_ids)
     return snapshot
@@ -457,10 +469,7 @@ async def _stop_auxiliary_sessions(
             monitor_ids=monitor_ids,
             sub_agent_ids=sub_agent_ids,
         )
-        if (
-            not runtime_present
-            and status in _AUXILIARY_TERMINAL_STATUSES
-        ):
+        if not runtime_present and status in _AUXILIARY_TERMINAL_STATUSES:
             confirmed.add(session_id)
             continue
         try:
@@ -564,11 +573,7 @@ async def _read_pr_review_supersede_generation(
             task_id,
             expected_generation,
         )
-    task = (
-        await db.execute(
-            select(Task).where(*predicates)
-        )
-    ).scalar_one_or_none()
+    task = (await db.execute(select(Task).where(*predicates))).scalar_one_or_none()
     if task is None:
         await db.rollback()
         raise TaskGenerationTerminationConflict(
@@ -623,7 +628,11 @@ async def _terminate_local_task_generation_impl(
     )
 
     try:
-        cleared = await dispatcher.abort_task_queue(task_id)
+        cleared = await dispatcher.abort_task_queue(
+            task_id,
+            cancel_durable=False,
+            durable_db=db,
+        )
     except Exception as exc:
         from backend.services.dispatcher import TaskQueueAbortTimeoutError
 
@@ -645,10 +654,12 @@ async def _terminate_local_task_generation_impl(
     task = (
         await db.execute(
             select(Task)
-            .where(*local_task_generation_predicates(
-                task_id,
-                pre_abort_generation,
-            ))
+            .where(
+                *local_task_generation_predicates(
+                    task_id,
+                    pre_abort_generation,
+                )
+            )
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -668,9 +679,7 @@ async def _terminate_local_task_generation_impl(
 
     terminal_status = "completed" if transitioned else previous_status
     metadata = dict(task.metadata_ or {})
-    marker_already_persisted = (
-        metadata.get(PR_REVIEW_SUPERSEDED_METADATA_KEY) is True
-    )
+    marker_already_persisted = metadata.get(PR_REVIEW_SUPERSEDED_METADATA_KEY) is True
     if not marker_already_persisted:
         metadata[PR_REVIEW_SUPERSEDED_METADATA_KEY] = True
         gate = await db.execute(
@@ -734,9 +743,7 @@ async def _terminate_local_task_generation_impl(
     # Stop auxiliary process groups while the Task still advertises its real
     # active state.  A failure leaves both Task and auxiliary DB evidence
     # unchanged and retryable.
-    reaped_auxiliary_ids = await _stop_auxiliary_sessions(
-        auxiliary_sessions
-    )
+    reaped_auxiliary_ids = await _stop_auxiliary_sessions(auxiliary_sessions)
 
     stopped = False
     detached_stop_used = False
@@ -829,13 +836,10 @@ async def _terminate_local_task_generation_impl(
                 .with_for_update()
             )
         ).scalar_one_or_none()
-        if current is None or not _same_local_identity(
-            current, observed_generation
-        ):
+        if current is None or not _same_local_identity(current, observed_generation):
             await db.rollback()
             raise TaskGenerationTerminationConflict(
-                "Task started a newer generation while its old session was "
-                "stopping"
+                "Task started a newer generation while its old session was stopping"
             )
 
         current_completed_at = _utc_naive(current.completed_at)
@@ -892,26 +896,19 @@ async def _terminate_local_task_generation_impl(
             )
             .with_for_update()
         )
-        unreaped_auxiliary_sessions = (
-            _auxiliary_sessions_requiring_reap(
-                dispatcher,
-                list(auxiliary_rows.all()),
-                reaped_auxiliary_ids,
-            )
+        unreaped_auxiliary_sessions = _auxiliary_sessions_requiring_reap(
+            dispatcher,
+            list(auxiliary_rows.all()),
+            reaped_auxiliary_ids,
         )
         if unreaped_auxiliary_sessions:
             await db.rollback()
-            if (
-                late_auxiliary_sweeps
-                >= _MAX_LATE_AUXILIARY_REAP_SWEEPS
-            ):
+            if late_auxiliary_sweeps >= _MAX_LATE_AUXILIARY_REAP_SWEEPS:
                 raise TaskAuxiliaryTerminationConflict(
                     [row.id for row in unreaped_auxiliary_sessions]
                 )
             reaped_auxiliary_ids.update(
-                await _stop_auxiliary_sessions(
-                    unreaped_auxiliary_sessions
-                )
+                await _stop_auxiliary_sessions(unreaped_auxiliary_sessions)
             )
             late_auxiliary_sweeps += 1
             continue
@@ -937,13 +934,9 @@ async def _terminate_local_task_generation_impl(
             )
         generation_predicates = task_generation_fence(task_id, current)
         if not marker_already_persisted:
-            generation_predicates.append(
-                task_retry_not_superseded_predicate()
-            )
+            generation_predicates.append(task_retry_not_superseded_predicate())
         guarded = await db.execute(
-            sa_update(Task)
-            .where(*generation_predicates)
-            .values(**values)
+            sa_update(Task).where(*generation_predicates).values(**values)
         )
         if not guarded.rowcount:
             await db.rollback()
@@ -1023,8 +1016,7 @@ async def _terminate_local_task_generation_impl(
         )
     )
     should_publish = (
-        transitioned
-        or observed_generation.pty_background_generation is not None
+        transitioned or observed_generation.pty_background_generation is not None
     ) and not manager_already_published
     if should_publish:
         locked_task = await lock_task_generation(
@@ -1069,6 +1061,30 @@ async def _terminate_local_task_generation_impl(
     )
 
 
+async def _terminate_local_task_generation_with_cancellation_lease(
+    task_id: int,
+    db: AsyncSession,
+    *,
+    reason: str,
+    expected_generation: LocalTaskGeneration | None,
+    active_statuses: tuple[str, ...],
+    terminal_statuses: tuple[str, ...],
+) -> TaskTerminationResult:
+    """Fence new messages through the exact terminal generation commit."""
+
+    from backend.main import dispatcher
+
+    async with dispatcher.task_queue_cancellation_lease(task_id):
+        return await _terminate_local_task_generation_impl(
+            task_id,
+            db,
+            reason=reason,
+            expected_generation=expected_generation,
+            active_statuses=active_statuses,
+            terminal_statuses=terminal_statuses,
+        )
+
+
 async def terminate_local_task_generation(
     task_id: int,
     db: AsyncSession,
@@ -1098,7 +1114,7 @@ async def terminate_local_task_generation(
     """
 
     return await _finish_despite_cancellation(
-        _terminate_local_task_generation_impl(
+        _terminate_local_task_generation_with_cancellation_lease(
             task_id,
             db,
             reason=reason,
@@ -1178,9 +1194,7 @@ async def _terminate_worker_task_generation_impl(
         else None
     )
     operation_lock = (
-        worker_proxy.task_operation_lock(task_id)
-        if not operation_locks_held
-        else None
+        worker_proxy.task_operation_lock(task_id) if not operation_locks_held else None
     )
     async with AsyncExitStack() as stack:
         if not operation_locks_held:
@@ -1230,15 +1244,10 @@ async def _terminate_worker_task_generation_impl(
                 f"Could not read Worker task {task_id} before stop"
             ) from exc
 
-        remote_background_generation = remote_before.get(
-            "pty_background_generation"
-        )
-        if (
-            "pty_background_generation" not in remote_before
-            or (
-                remote_background_generation is not None
-                and not isinstance(remote_background_generation, str)
-            )
+        remote_background_generation = remote_before.get("pty_background_generation")
+        if "pty_background_generation" not in remote_before or (
+            remote_background_generation is not None
+            and not isinstance(remote_background_generation, str)
         ):
             raise WorkerTaskTerminationConflict(
                 f"Worker task {task_id} omitted its opaque termination generation"
@@ -1299,9 +1308,10 @@ async def _terminate_worker_task_generation_impl(
             result_values is None
             or remote_result.get("retry_count") != observed.retry_count
             or remote_result.get("status") not in terminal_statuses
-            or (
-                remote_result.get("metadata_") or {}
-            ).get(PR_REVIEW_SUPERSEDED_METADATA_KEY) is not True
+            or (remote_result.get("metadata_") or {}).get(
+                PR_REVIEW_SUPERSEDED_METADATA_KEY
+            )
+            is not True
         ):
             raise WorkerTaskTerminationConflict(
                 f"Worker task {task_id} returned a non-terminal generation"
@@ -1321,10 +1331,7 @@ async def _terminate_worker_task_generation_impl(
             # Worker retry generation or CAS the current mirror once more.
             await db.rollback()
             current = await read_worker_task_generation(db, task_id, worker_id)
-            if (
-                current is None
-                or current.retry_count != remote_result["retry_count"]
-            ):
+            if current is None or current.retry_count != remote_result["retry_count"]:
                 raise WorkerTaskTerminationConflict(
                     f"Task {task_id} mirror changed before Worker stop applied"
                 )
@@ -1434,7 +1441,5 @@ async def task_termination_operation_locks(task_ids):
             # optional Worker runtime is disabled. Supersede must therefore
             # always take the same lock rather than condition ownership on a
             # constructed WorkerProxy instance.
-            await stack.enter_async_context(
-                get_task_operation_lock(task_id)
-            )
+            await stack.enter_async_context(get_task_operation_lock(task_id))
         yield

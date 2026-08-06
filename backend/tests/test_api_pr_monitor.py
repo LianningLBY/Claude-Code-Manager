@@ -2750,7 +2750,10 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
 
     assert synchronized.status_code == 200, synchronized.text
     assert synchronized.json()["status"] == "accepted"
-    abort_queue.assert_awaited_once_with(old_task_id)
+    abort_queue.assert_awaited_once()
+    assert abort_queue.await_args.args == (old_task_id,)
+    assert abort_queue.await_args.kwargs["cancel_durable"] is False
+    assert abort_queue.await_args.kwargs["durable_db"] is not None
     assert launch_barrier.await_count == 2
     launch_barrier.assert_awaited_with(instance_id, old_task_id)
     stop.assert_awaited_once()

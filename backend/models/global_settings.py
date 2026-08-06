@@ -29,5 +29,7 @@ class GlobalSettings(Base):
     # Default skills/plugins selection for new tasks
     default_enabled_plugins: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     default_enabled_user_skills: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Concrete defaults snapshotted onto each newly created Plan Task
+    plan_pipeline_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # CC settings template (JSON string) synced to all pool account config dirs
     cc_settings_template: Mapped[str | None] = mapped_column(Text, nullable=True)

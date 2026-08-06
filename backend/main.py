@@ -52,6 +52,8 @@ from backend.api.browser_reviews import (
 )
 from backend.api.workspace_reviews import router as workspace_reviews_router
 from backend.api.test_harness import router as test_harness_router
+from backend.api.plans import router as plans_router
+from backend.api.plan_resources import router as plan_resources_router
 from backend.middleware.auth import TokenAuthMiddleware
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 from backend.services.instance_manager import InstanceManager
@@ -909,6 +911,8 @@ app.include_router(browser_reviews_router)
 app.include_router(task_browser_reviews_router)
 app.include_router(workspace_reviews_router)
 app.include_router(test_harness_router)
+app.include_router(plans_router)
+app.include_router(plan_resources_router)
 
 # Serve frontend static files in production
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

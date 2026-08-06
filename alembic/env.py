@@ -50,6 +50,8 @@ from backend.models.test_harness import (  # noqa: F401
     TestHarnessFinding,
     TestHarnessRun,
 )
+from backend.models.plan_agent import PlanAgentRun, PlanAgentStep  # noqa: F401
+from backend.models.plan import Plan, PlanVersion, PlanInputRequest, PlanApplication, PlanLegacyTaskLink  # noqa: F401
 from backend.database import Base, _async_url_to_sync, _is_sqlite
 
 target_metadata = Base.metadata

@@ -374,6 +374,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       ? detail
       : detail && typeof detail === 'object' && typeof detail.error === 'string'
         ? detail.error
+        : detail && typeof detail === 'object' && typeof detail.message === 'string'
+          ? detail.message
         : res.statusText;
     const requestError = new Error(message) as ApiRequestError;
     requestError.status = res.status;
@@ -499,6 +501,54 @@ export interface FrontendReviewConfig {
   max_iterations: number;
 }
 
+export interface PlanModelRoute {
+  provider: 'claude' | 'codex';
+  model: string;
+  effort: string | null;
+}
+
+export interface PlanStageRoutes {
+  primary: PlanModelRoute;
+  fallback: PlanModelRoute;
+}
+
+export interface PlanReviewerRoutes extends PlanStageRoutes {
+  enabled: boolean;
+}
+
+export interface PlanPipelineConfig {
+  version: 1;
+  planner: PlanStageRoutes;
+  reviewer: PlanReviewerRoutes;
+  max_revision_cycles: number;
+  max_interactions: number;
+}
+
+export interface SystemConfig {
+  default_provider: string;
+  provider_options: string[];
+  default_model: string;
+  model_options: string[];
+  default_codex_model: string;
+  codex_model_options: string[];
+  default_effort: string;
+  effort_options: string[];
+  claude_model_efforts: Record<string, string[]>;
+  claude_model_context_windows: Record<string, number>;
+  codex_effort_options: string[];
+  codex_model_efforts: Record<string, string[]>;
+  default_codex_service_tier?: CodexServiceTier;
+  codex_service_tier_options?: CodexServiceTier[];
+  codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+  versioned_plan_worker_protocol?: number;
+  /** Manager/Worker capability fences; absent on older deployments. */
+  pr_review_snapshot_context_version?: number;
+  pr_review_terminal_chat_version?: number;
+  task_artifact_scope_version?: number;
+  /** Absent when the UI is connected to an older Manager/Worker. */
+  plan_pipeline_defaults?: PlanPipelineConfig;
+}
+
 export interface TaskRoutingExpectation {
   provider: string;
   model: string | null;
@@ -533,6 +583,21 @@ export interface Task {
   goal_last_reason: string | null;
   plan_content: string | null;
   plan_approved: boolean | null;
+  plan_target_task_id: number | null;
+  supersedes_plan_task_id: number | null;
+  plan_approved_at: string | null;
+  plan_approved_by: number | null;
+  plan_applied_at: string | null;
+  plan_applied_to_session_id: string | null;
+  plan_execution_task_id: number | null;
+  canonical_plan_id: number | null;
+  plan_pipeline_config: PlanPipelineConfig | null;
+  plan_stage?: string | null;
+  plan_stage_round?: number | null;
+  plan_stage_provider?: string | null;
+  plan_stage_model?: string | null;
+  plan_stage_effort?: string | null;
+  plan_stage_route_slot?: 'primary' | 'fallback' | null;
   starred: boolean;
   archived: boolean;
   has_unread: boolean;
@@ -556,6 +621,7 @@ export interface Task {
   tags: string[] | null;
   attention_tag?: string | null;
   metadata_: {
+    file_paths?: string[];
     image_paths?: string[];
     attachments?: FileAttachment[];
     secret_ids?: number[];
@@ -567,6 +633,12 @@ export interface Task {
     fork_seed_message?: string;
     fork_seed_log_id?: number | null;
     fork_seed_uploads?: UploadResult[];
+    plan_agent_run_id?: number;
+    plan_review_verdict?: 'approve' | 'revise';
+    plan_review_feedback?: string;
+    plan_review_exhausted?: boolean;
+    revised_from_plan_task_id?: number;
+    plan_superseded_by_task_id?: number;
     ccm_worker_managed_task?: boolean;
     ccm_user_skill_snapshots?: unknown[];
     frontend_review?: FrontendReviewConfig;
@@ -595,6 +667,7 @@ export interface Instance {
   pid: number | null;
   status: string;
   current_task_id: number | null;
+  current_plan_run_id: number | null;
   worktree_path: string | null;
   provider: string;
   model: string;
@@ -611,6 +684,15 @@ export interface FileAttachment {
   url: string;
   name: string;
   is_image: boolean;
+}
+
+export interface AppliedPlanSnapshot {
+  id: number;
+  plan_id?: number;
+  version_id?: number;
+  version_number?: number;
+  title: string;
+  content: string;
 }
 
 export interface ChatMessage {
@@ -632,6 +714,8 @@ export interface ChatMessage {
   source?: string | null;
   /** Original user text without the display-only sender prefix. */
   raw_content?: string | null;
+  /** Exact approved Plan versions prepended to this user turn. */
+  applied_plans?: AppliedPlanSnapshot[] | null;
   /** Live-only app-server item id used to merge streamed deltas into the final message. */
   stream_item_id?: string | null;
   /** Native Codex ids used to resolve a safe thread/fork boundary. */
@@ -656,6 +740,226 @@ export interface CodexForkAnchor {
   content: string;
   timestamp: string | null;
   attachments: FileAttachment[];
+}
+
+export interface PlanStaleness {
+  stale: boolean;
+  reasons: string[];
+  hard_conflict?: boolean;
+  hard_conflicts?: string[];
+  can_confirm?: boolean;
+  current_log_id: number | null;
+  current_repo_revision: Record<string, unknown> | null;
+}
+
+export interface PlanAgentStep {
+  id: number;
+  generation?: number;
+  input_request_id?: number | null;
+  step_type: 'planner' | 'reviewer';
+  round: number;
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  route_slot: 'primary' | 'fallback' | null;
+  status: string;
+  output: string | null;
+  error: string | null;
+  last_delta_at?: string | null;
+  streamed_output_chars?: number;
+  last_event_type?: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface PlanAgentRun {
+  id: number;
+  plan_task_id: number;
+  status: string;
+  combo_used: string | null;
+  planner_provider: string | null;
+  planner_model: string | null;
+  planner_effort: string | null;
+  reviewer_provider: string | null;
+  reviewer_model: string | null;
+  reviewer_effort: string | null;
+  pipeline_config: PlanPipelineConfig | null;
+  round: number;
+  review_verdict: string | null;
+  review_feedback: string | null;
+  review_exhausted: boolean;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  steps: PlanAgentStep[];
+}
+
+export interface PlanExecutionResult {
+  plan_task: Task;
+  execution_task: Task;
+}
+
+export interface PlanQuestionOption {
+  value: string;
+  label: string;
+}
+
+export interface PlanQuestion {
+  id: string;
+  header: string;
+  question: string;
+  response_type: 'text' | 'single_choice' | 'multi_choice';
+  options: PlanQuestionOption[];
+  required: boolean;
+}
+
+export interface PlanInputRequest {
+  id: number;
+  plan_id: number;
+  run_id: number;
+  source_step_id: number;
+  requested_by: 'planner' | 'reviewer';
+  reason: string | null;
+  questions: PlanQuestion[];
+  status: 'prepared' | 'open' | 'answered' | 'cancelled';
+  answers: { question_id: string; value: string | string[] | null }[] | null;
+  response_text: string | null;
+  attachments: FileAttachment[] | null;
+  answered_by: number | null;
+  opened_at: string | null;
+  answered_at: string | null;
+  created_at: string;
+}
+
+export interface PlanVersion {
+  id: number;
+  plan_id: number;
+  version_number: number;
+  parent_version_id: number | null;
+  produced_by_run_id: number | null;
+  produced_by_step_id: number | null;
+  content: string;
+  context_session_id: string | null;
+  context_log_id: number | null;
+  repo_revision: Record<string, unknown> | null;
+  reviewer_repo_revision: Record<string, unknown> | null;
+  review_verdict: 'approve' | 'revise' | 'disabled' | 'exhausted' | null;
+  review_feedback: string | null;
+  reviewed_by_step_id: number | null;
+  review_exhausted: boolean;
+  reviewed_at: string | null;
+  human_decision: 'pending' | 'approved' | 'rejected';
+  decided_at: string | null;
+  decided_by: number | null;
+  superseded_by_version_id: number | null;
+  applied: boolean;
+  display_state: 'applied' | 'approved' | 'rejected' | 'superseded' | 'awaiting_review' | 'draft';
+  created_at: string;
+}
+
+export interface PlanRun {
+  id: number;
+  plan_id: number;
+  run_type: string;
+  status: 'queued' | 'running' | 'waiting_user' | 'completed' | 'failed' | 'cancelled';
+  current_stage: string;
+  base_version_id: number | null;
+  source_run_id: number | null;
+  result_version_id: number | null;
+  draft_content?: string | null;
+  draft_step_id?: number | null;
+  draft_repo_revision?: Record<string, unknown> | null;
+  request_text: string | null;
+  round: number;
+  generation: number;
+  instance_id: number | null;
+  worker_id: number | null;
+  open_input_request_id: number | null;
+  interaction_count: number;
+  max_interactions: number;
+  execution_seconds: number;
+  last_execution_started_at: string | null;
+  review_verdict: string | null;
+  review_feedback: string | null;
+  review_exhausted: boolean;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  steps: PlanAgentStep[];
+  input_requests: PlanInputRequest[];
+}
+
+export interface PlanResource {
+  id: number;
+  title: string;
+  initial_request: string;
+  initial_attachments: FileAttachment[] | null;
+  target_task_id: number | null;
+  project_id: number | null;
+  target_repo: string | null;
+  target_branch: string | null;
+  worker_id: number | null;
+  priority: number;
+  timeout_hours: number | null;
+  created_by: number | null;
+  current_version_id: number | null;
+  active_run_id: number | null;
+  forked_from_version_id: number | null;
+  archived_at: string | null;
+  closed_at: string | null;
+  lock_version: number;
+  created_at: string;
+  updated_at: string;
+  display_state: string;
+  legacy: boolean;
+  latest_run_status: string | null;
+  latest_run_error: string | null;
+  pipeline_config: PlanPipelineConfig;
+  application: PlanApplication | null;
+  applications: PlanApplication[];
+  application_attempts: PlanApplicationAttempt[];
+  current_version: PlanVersion | null;
+  active_run: PlanRun | null;
+  open_input_request: PlanInputRequest | null;
+}
+
+export interface PlanApplication {
+  id: number;
+  plan_id: number;
+  plan_version_id: number;
+  application_type: 'chat_message' | 'execution_task';
+  target_task_id: number | null;
+  target_session_id: string | null;
+  user_log_id: number | null;
+  execution_task_id: number | null;
+  execution_task_available: boolean | null;
+  application_receipt_key?: string | null;
+  delivery_status?: string | null;
+  delivery_error?: string | null;
+  launch_evidence?: Record<string, unknown> | null;
+  delivery_resolution?: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface PlanApplicationAttempt {
+  id: number;
+  plan_id: number;
+  plan_version_id: number;
+  application_receipt_key: string;
+  application_type: 'chat_message' | 'execution_task';
+  target_task_id: number | null;
+  target_session_id: string | null;
+  user_log_id: number | null;
+  execution_task_id: number | null;
+  applied_by: number | null;
+  application_created_at: string;
+  released_at: string;
+  delivery_status: string;
+  delivery_error: string | null;
+  launch_evidence: Record<string, unknown> | null;
+  delivery_resolution: Record<string, unknown> | null;
 }
 
 export interface AskUserOption {
@@ -1548,6 +1852,13 @@ export const api = {
   getGitSettings: () => request<GlobalSettings>('/api/settings/git'),
   updateGitSettings: (data: Partial<GlobalSettings>) =>
     request<GlobalSettings>('/api/settings/git', { method: 'PUT', body: JSON.stringify(data) }),
+  getPlanPipelineSettings: () =>
+    request<PlanPipelineConfig>('/api/settings/plan-pipeline'),
+  updatePlanPipelineSettings: (data: PlanPipelineConfig) =>
+    request<PlanPipelineConfig>('/api/settings/plan-pipeline', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
   getDefaultSkills: () => request<{ default_enabled_plugins: Record<string, boolean> | null; default_enabled_user_skills: number[] | null }>('/api/settings/default-skills'),
   setDefaultSkills: (plugins: Record<string, boolean> | null, userSkills: number[] | null) =>
     request<{ default_enabled_plugins: Record<string, boolean> | null; default_enabled_user_skills: number[] | null }>('/api/settings/default-skills', { method: 'PUT', body: JSON.stringify({ default_enabled_plugins: plugins, default_enabled_user_skills: userSkills }) }),
@@ -1606,23 +1917,25 @@ export const api = {
   // Tasks
   getTask: (id: number) =>
     request<Task>(`/api/tasks/${id}`),
-  listTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, limit?: number, offset?: number, archivedOnly?: boolean, hasUnread?: boolean) =>
+  listTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, limit?: number, offset?: number, archivedOnly?: boolean, hasUnread?: boolean, taskKind?: 'standalone_plan' | 'related_plan' | 'main') =>
     request<Task[]>(`/api/tasks?${new URLSearchParams({
       ...(status ? { status } : {}),
       ...(archivedOnly ? { archived_only: 'true' } : includeArchived ? { include_archived: 'true' } : {}),
       ...(projectId != null ? { project_id: String(projectId) } : {}),
       ...(starred != null ? { starred: String(starred) } : {}),
       ...(hasUnread != null ? { has_unread: String(hasUnread) } : {}),
+      ...(taskKind ? { task_kind: taskKind } : {}),
       ...(limit != null ? { limit: String(limit) } : {}),
       ...(offset != null ? { offset: String(offset) } : {}),
     })}`),
-  countTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, archivedOnly?: boolean, hasUnread?: boolean) =>
+  countTasks: (status?: string, includeArchived?: boolean, projectId?: number, starred?: boolean, archivedOnly?: boolean, hasUnread?: boolean, taskKind?: 'standalone_plan' | 'related_plan' | 'main') =>
     request<{ total: number }>(`/api/tasks/count?${new URLSearchParams({
       ...(status ? { status } : {}),
       ...(archivedOnly ? { archived_only: 'true' } : includeArchived ? { include_archived: 'true' } : {}),
       ...(projectId != null ? { project_id: String(projectId) } : {}),
       ...(starred != null ? { starred: String(starred) } : {}),
       ...(hasUnread != null ? { has_unread: String(hasUnread) } : {}),
+      ...(taskKind ? { task_kind: taskKind } : {}),
     })}`),
   starTask: (id: number) =>
     request<Task>(`/api/tasks/${id}/star`, { method: 'POST' }),
@@ -1656,7 +1969,7 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; frontend_review?: FrontendReviewConfig; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; frontend_review?: FrontendReviewConfig; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
   updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -1666,10 +1979,162 @@ export const api = {
     request<Task>(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   retryTask: (id: number, expectedRouting?: TaskRoutingExpectation) =>
     request<Task>(`/api/tasks/${id}/retry`, { method: 'POST', body: JSON.stringify({ expected_routing: expectedRouting }) }),
-  approvePlan: (id: number, expectedRouting?: TaskRoutingExpectation) =>
-    request<Task>(`/api/tasks/${id}/plan/approve`, { method: 'POST', body: JSON.stringify({ expected_routing: expectedRouting }) }),
-  rejectPlan: (id: number) =>
-    request<Task>(`/api/tasks/${id}/plan/reject`, { method: 'POST' }),
+  createPlan: (data: {
+    input: string;
+    title?: string;
+    target_task_id?: number;
+    project_id?: number;
+    target_repo?: string;
+    target_branch?: string;
+    worker_id?: number;
+    priority?: number;
+    timeout_hours?: number | null;
+    file_paths?: string[];
+    image_paths?: string[];
+    attachments?: FileAttachment[];
+  }) => request<PlanResource>('/api/plans', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  listPlans: (params?: {
+    target_task_id?: number;
+    kind?: 'standalone' | 'related';
+    display_state?: string;
+    project_id?: number;
+    include_archived?: boolean;
+    archived_only?: boolean;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.target_task_id != null) query.set('target_task_id', String(params.target_task_id));
+    if (params?.kind) query.set('kind', params.kind);
+    if (params?.display_state) query.set('display_state', params.display_state);
+    if (params?.project_id != null) query.set('project_id', String(params.project_id));
+    if (params?.archived_only) query.set('archived_only', 'true');
+    else if (params?.include_archived) query.set('include_archived', 'true');
+    if (params?.q?.trim()) query.set('q', params.q.trim());
+    if (params?.limit != null) query.set('limit', String(params.limit));
+    if (params?.offset != null) query.set('offset', String(params.offset));
+    return request<PlanResource[]>(`/api/plans${query.size ? `?${query}` : ''}`);
+  },
+  countPlans: (params?: {
+    target_task_id?: number;
+    kind?: 'standalone' | 'related';
+    display_state?: string;
+    project_id?: number;
+    include_archived?: boolean;
+    archived_only?: boolean;
+    q?: string;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.target_task_id != null) query.set('target_task_id', String(params.target_task_id));
+    if (params?.kind) query.set('kind', params.kind);
+    if (params?.display_state) query.set('display_state', params.display_state);
+    if (params?.project_id != null) query.set('project_id', String(params.project_id));
+    if (params?.archived_only) query.set('archived_only', 'true');
+    else if (params?.include_archived) query.set('include_archived', 'true');
+    if (params?.q?.trim()) query.set('q', params.q.trim());
+    return request<{ total: number }>(`/api/plans/count${query.size ? `?${query}` : ''}`);
+  },
+  getPlan: (planId: number) => request<PlanResource>(`/api/plans/${planId}`),
+  resolvePlanApplicationDelivery: (
+    planId: number,
+    receiptKey: string,
+    action: 'confirm_launched' | 'release_for_retry',
+    note: string,
+  ) => request<{
+    receipt_key: string;
+    action: string;
+    plan_ids: number[];
+    target_task_id: number | null;
+  }>(`/api/plans/${planId}/application-deliveries/${encodeURIComponent(receiptKey)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ action, note }),
+  }),
+  updatePlan: (planId: number, data: {
+    title?: string;
+    archived?: boolean;
+    expected_lock_version: number;
+  }) => request<PlanResource>(`/api/plans/${planId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  listPlanVersions: (planId: number) =>
+    request<PlanVersion[]>(`/api/plans/${planId}/versions`),
+  listPlanResourceRuns: (planId: number) =>
+    request<PlanRun[]>(`/api/plans/${planId}/runs`),
+  createPlanRun: (planId: number, data: {
+    run_type: 'user_revision' | 'refresh_context' | 'retry';
+    request: string;
+    base_version_id?: number;
+    expected_current_version_id?: number;
+    source_run_id?: number;
+    file_paths?: string[];
+    image_paths?: string[];
+    attachments?: FileAttachment[];
+  }) => request<PlanRun>(`/api/plans/${planId}/runs`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  forkPlan: (planId: number, data: {
+    base_version_id: number;
+    title?: string;
+    request?: string;
+  }) => request<PlanResource>(`/api/plans/${planId}/fork`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  approvePlanVersion: (versionId: number, expectedCurrentVersionId: number, confirmStale = false) =>
+    request<PlanVersion>(`/api/plan-versions/${versionId}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_current_version_id: expectedCurrentVersionId,
+        confirm_stale: confirmStale,
+      }),
+    }),
+  rejectPlanVersion: (versionId: number, expectedCurrentVersionId: number, confirmStale = false) =>
+    request<PlanVersion>(`/api/plan-versions/${versionId}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_current_version_id: expectedCurrentVersionId,
+        confirm_stale: confirmStale,
+      }),
+    }),
+  getPlanVersionStaleness: (versionId: number) =>
+    request<PlanStaleness>(`/api/plan-versions/${versionId}/staleness`),
+  cancelPlanRun: (runId: number) =>
+    request<PlanRun>(`/api/plan-runs/${runId}/cancel`, { method: 'POST' }),
+  answerPlanInput: (runId: number, requestId: number, data: {
+    expected_run_generation: number;
+    idempotency_key: string;
+    answers: { question_id: string; value: string | string[] | null }[];
+    response_text?: string;
+    file_paths?: string[];
+    image_paths?: string[];
+    attachments?: FileAttachment[];
+  }) => request<PlanInputRequest>(
+    `/api/plan-runs/${runId}/input-requests/${requestId}/answer`,
+    { method: 'POST', body: JSON.stringify(data) },
+  ),
+  createVersionExecutionTask: (
+    versionId: number,
+    expectedCurrentVersionId: number,
+    confirmStale = false,
+    approveIfPending = false,
+  ) =>
+    request<{ plan: PlanResource; version: PlanVersion; execution_task_id: number }>(
+      `/api/plan-versions/${versionId}/create-execution-task`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_current_version_id: expectedCurrentVersionId,
+          confirm_stale: confirmStale,
+          approve_if_pending: approveIfPending,
+        }),
+      },
+    ),
   // Instances
   listInstances: () => request<Instance[]>('/api/instances'),
   createInstance: (data: { name: string }) =>
@@ -1707,8 +2172,46 @@ export const api = {
     request<{ ok: boolean }>('/api/dispatcher/stop', { method: 'POST' }),
 
   // Chat (task-based)
-  sendTaskChat: (taskId: number, message: string, filePaths?: string[], secretIds?: number[], model?: string | null, expectedRouting?: TaskRoutingExpectation) =>
-    request<{ ok: boolean; queued: boolean; session_id: string; workspace_review_expected: boolean; workspace_review_baseline_run_id: string | null }>(`/api/tasks/${taskId}/chat`, { method: 'POST', body: JSON.stringify({ message, file_paths: filePaths, secret_ids: secretIds, ...(model ? { model } : {}), expected_routing: expectedRouting }) }),
+  sendTaskChat: (
+    taskId: number,
+    message: string,
+    filePaths?: string[],
+    secretIds?: number[],
+    model?: string | null,
+    expectedRouting?: TaskRoutingExpectation,
+    planTaskIds?: number[],
+    confirmedStalePlanTaskIds?: number[],
+    planVersionIds?: number[],
+    confirmedStalePlanVersionIds?: number[],
+  ) =>
+    request<{
+      ok: boolean;
+      pid: number;
+      instance_id: number;
+      session_id: string;
+      applied_plan_task_ids?: number[];
+      applied_plan_version_ids?: number[];
+      plan_application_receipt_key?: string;
+      workspace_review_expected: boolean;
+      workspace_review_baseline_run_id: string | null;
+    }>(`/api/tasks/${taskId}/chat`, {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        file_paths: filePaths,
+        secret_ids: secretIds,
+        ...(model ? { model } : {}),
+        expected_routing: expectedRouting,
+        ...(planTaskIds?.length ? { plan_task_ids: planTaskIds } : {}),
+        ...(confirmedStalePlanTaskIds?.length
+          ? { confirmed_stale_plan_task_ids: confirmedStalePlanTaskIds }
+          : {}),
+        ...(planVersionIds?.length ? { plan_version_ids: planVersionIds } : {}),
+        ...(confirmedStalePlanVersionIds?.length
+          ? { confirmed_stale_plan_version_ids: confirmedStalePlanVersionIds }
+          : {}),
+      }),
+    }),
   startFrontendReviewGoal: (
     taskId: number,
     data: {
@@ -2196,7 +2699,7 @@ export const api = {
   // System
   health: () => request<{ status: string; commit?: string }>('/api/system/health'),
   stats: () => request<{ tasks: Record<string, number>; running_instances: number }>('/api/system/stats'),
-  config: () => request<{ default_provider: string; provider_options: string[]; default_model: string; model_options: string[]; default_codex_model: string; codex_model_options: string[]; default_effort: string; effort_options: string[]; claude_model_efforts: Record<string, string[]>; claude_model_context_windows: Record<string, number>; codex_effort_options: string[]; codex_model_efforts: Record<string, string[]>; default_codex_service_tier?: CodexServiceTier; codex_service_tier_options?: CodexServiceTier[]; codex_model_service_tiers: Record<string, CodexServiceTier[]>; pr_review_snapshot_context_version?: number; pr_review_terminal_chat_version?: number }>('/api/system/config'),
+  config: () => request<SystemConfig>('/api/system/config'),
   listSkills: () => request<{ key: string; label: string; description: string; always: boolean; priority: number; tags: string[] }[]>('/api/system/skills'),
   listSkillsCached: () => listSkillsCached(),
   listUserSkillsCached: () => listUserSkillsCached(),

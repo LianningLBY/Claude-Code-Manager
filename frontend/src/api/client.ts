@@ -230,6 +230,32 @@ export interface SSHProfileTestResult {
   detail: string | null;
 }
 
+export type TaskSSHCapability = 'exec' | 'read' | 'write';
+
+export interface TaskSSHGrantInput {
+  profile_id: number;
+  capabilities: TaskSSHCapability[];
+}
+
+export interface TaskSSHGrant {
+  id: number;
+  task_id: number;
+  profile_id: number;
+  profile_name: string;
+  host: string;
+  port: number;
+  username: string;
+  host_key_fingerprint: string;
+  profile_revision: number;
+  current_profile_revision: number;
+  capabilities: TaskSSHCapability[];
+  valid: boolean;
+  invalid_reason: string | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export type ProjectTodoStatus = 'open' | 'done' | 'archived';
 
 export interface ProjectTodo {
@@ -1701,7 +1727,7 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; ssh_grants?: TaskSSHGrantInput[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
   updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -2038,6 +2064,13 @@ export const api = {
     request<SSHProfile>('/api/ssh-profiles', {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+  listTaskSSHGrants: (taskId: number) =>
+    request<TaskSSHGrant[]>(`/api/tasks/${taskId}/ssh-grants`),
+  updateTaskSSHGrants: (taskId: number, grants: TaskSSHGrantInput[]) =>
+    request<TaskSSHGrant[]>(`/api/tasks/${taskId}/ssh-grants`, {
+      method: 'PUT',
+      body: JSON.stringify({ grants }),
     }),
   updateSSHProfile: (id: number, data: Partial<SSHProfileInput>) =>
     request<SSHProfile>(`/api/ssh-profiles/${id}`, {

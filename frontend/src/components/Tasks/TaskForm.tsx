@@ -15,7 +15,6 @@ interface TaskFormProps {
 
 const NEW_PROJECT_VALUE = '__new__';
 const STORAGE_KEY = 'cc_default_task_config';
-
 interface StoredTaskDefaults {
   priority?: number;
   mode?: string;
@@ -460,6 +459,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       fileUpload.clear();
       setSelectedSecretIds([]);
       setCloneFromTaskId('');
+      setGoalCondition('');
+      setGoalMaxTurns('30');
       // Restore localStorage defaults (or fall back to server defaults)
       applyStoredDefaults(readStoredTaskDefaults(), defaultProvider);
       onCreated();
@@ -691,7 +692,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                 <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={mode}
-                  onChange={(e) => setMode(e.target.value)}
+                  onChange={(e) => {
+                    const nextMode = e.target.value;
+                    setMode(nextMode);
+                  }}
                 >
                   <option value="auto">Auto</option>
                   <option value="plan">Plan</option>

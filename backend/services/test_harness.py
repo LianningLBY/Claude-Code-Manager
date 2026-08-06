@@ -1,0 +1,1507 @@
+"""Durable, provider-neutral frontend test harness orchestration."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import stat
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from sqlalchemy import delete, select
+
+from backend.config import settings
+from backend.database import async_session
+from backend.models.project import Project
+from backend.models.task import Task
+from backend.models.test_harness import (
+    TestHarnessAttempt,
+    TestHarnessEvent,
+    TestHarnessEvidence,
+    TestHarnessFinding,
+    TestHarnessRun,
+)
+from backend.models.workspace_review import WorkspaceReviewRun
+from backend.services.test_harness_contracts import (
+    HARNESS_TERMINAL_STATUSES,
+    TestHarnessContractError,
+    TestHarnessSpec,
+    compile_test_plan,
+    normalize_verdict,
+    request_fingerprint,
+)
+from backend.services.test_harness_targets import (
+    PreparedHarnessTarget,
+    TestHarnessTargetManager,
+    test_harness_target_manager,
+)
+
+
+logger = logging.getLogger(__name__)
+
+_WORKSPACE_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+_BROWSER_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+_CONTENT_TYPES = {
+    ".png": "image/png",
+    ".md": "text/markdown; charset=utf-8",
+    ".json": "application/json",
+    ".jsonl": "application/x-ndjson",
+}
+
+
+class TestHarnessError(RuntimeError):
+    """Safe user-visible harness failure."""
+
+
+class TestHarnessBusyError(TestHarnessError):
+    """The Task already owns a non-terminal harness run."""
+
+
+class TestHarnessIdempotencyError(TestHarnessError):
+    """An idempotency key was reused for different immutable input."""
+
+
+class TestHarnessService:
+    """Facade shared by Task chat, MCP, Goal, PR targets, and future loops."""
+
+    def __init__(
+        self,
+        *,
+        db_factory=async_session,
+        target_manager: TestHarnessTargetManager | None = None,
+        poll_interval: float = 0.5,
+    ) -> None:
+        self.db_factory = db_factory
+        self.target_manager = target_manager or test_harness_target_manager
+        self.poll_interval = poll_interval
+        self._pipelines: dict[str, asyncio.Task[None]] = {}
+        self._lock = asyncio.Lock()
+        self._db_lock = asyncio.Lock()
+
+    async def start_task_run(
+        self,
+        *,
+        task_id: int,
+        spec: TestHarnessSpec,
+        owner_user_id: int | None = None,
+    ) -> TestHarnessRun:
+        normalized = spec.normalized()
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id)
+            if task is None:
+                raise TestHarnessError("Task not found")
+            project = await db.get(Project, task.project_id) if task.project_id else None
+            runtime = self._runtime_for_task(task, normalized)
+            plan = compile_test_plan(
+                goal=normalized.goal,
+                profile=normalized.profile,
+                allow_actions=normalized.allow_actions,
+                viewport_width=normalized.viewport_width,
+                viewport_height=normalized.viewport_height,
+                max_steps=normalized.max_steps or 20,
+                max_actions=normalized.max_actions or 0,
+                supplied=normalized.test_plan,
+            )
+            project_id = project.id if project is not None else None
+
+        run, created = await self._create_run(
+            task_id=task_id,
+            project_id=project_id,
+            owner_user_id=owner_user_id,
+            spec=normalized,
+            plan=plan,
+            runtime=runtime,
+        )
+        if not created:
+            return run
+
+        if normalized.target_kind == "current_workspace":
+            try:
+                await self._start_workspace_review(
+                    run_id=run.id,
+                    spec=normalized,
+                    test_plan=plan,
+                )
+            except BaseException as exc:
+                await self._fail_start(run.id, exc)
+                raise
+        elif normalized.target_kind in {"pull_request", "git_ref"}:
+            pipeline = asyncio.create_task(
+                self._run_git_target(
+                    run_id=run.id,
+                    spec=normalized,
+                    test_plan=plan,
+                ),
+                name=f"test-harness-target-{run.id}",
+            )
+            self._register_pipeline(run.id, pipeline)
+        elif normalized.target_kind == "fixed_url":
+            # A fixed URL needs the caller to reserve either an inline browser
+            # tool or a separate Task, then attach that exact job below.
+            await self._update_run(
+                run.id,
+                values={"stage": "waiting_for_browser"},
+                event_type="lifecycle",
+                title="等待浏览器执行器",
+                source_key="harness:waiting-for-browser",
+            )
+        else:  # pragma: no cover - normalized() is the authority.
+            raise TestHarnessContractError("unsupported target kind")
+        current = await self.get_run_model(run.id)
+        assert current is not None
+        return current
+
+    async def _create_run(
+        self,
+        *,
+        task_id: int | None,
+        project_id: int | None,
+        owner_user_id: int | None,
+        spec: TestHarnessSpec,
+        plan: dict[str, Any],
+        runtime: dict[str, Any],
+    ) -> tuple[TestHarnessRun, bool]:
+        scope = f"task:{task_id}" if task_id is not None else f"admin:{owner_user_id or 0}"
+        fingerprint = request_fingerprint(
+            target_kind=spec.target_kind,
+            target=spec.target,
+            test_plan=plan,
+            runtime=runtime,
+        )
+        async with self._lock:
+            async with self.db_factory() as db:
+                if spec.idempotency_key:
+                    existing = await db.scalar(
+                        select(TestHarnessRun).where(
+                            TestHarnessRun.idempotency_scope == scope,
+                            TestHarnessRun.idempotency_key == spec.idempotency_key,
+                        )
+                    )
+                    if existing is not None:
+                        if existing.request_fingerprint != fingerprint:
+                            raise TestHarnessIdempotencyError(
+                                "idempotency key already belongs to different test input"
+                            )
+                        return existing, False
+                if task_id is not None:
+                    active = await db.scalar(
+                        select(TestHarnessRun.id).where(
+                            TestHarnessRun.task_id == task_id,
+                            TestHarnessRun.status.not_in(HARNESS_TERMINAL_STATUSES),
+                        )
+                    )
+                    if active is not None:
+                        raise TestHarnessBusyError(
+                            "This Task already has an active frontend test run"
+                        )
+
+                parent: TestHarnessRun | None = None
+                if spec.parent_run_id:
+                    parent = await db.get(TestHarnessRun, spec.parent_run_id)
+                    if parent is None:
+                        raise TestHarnessError("Parent test run not found")
+                    if parent.task_id != task_id:
+                        raise TestHarnessError("Parent test run belongs to another Task")
+                    if parent.status not in HARNESS_TERMINAL_STATUSES:
+                        raise TestHarnessError("Parent test run is not terminal")
+
+                run_id = uuid.uuid4().hex
+                run = TestHarnessRun(
+                    id=run_id,
+                    task_id=task_id,
+                    project_id=project_id,
+                    owner_user_id=owner_user_id,
+                    target_kind=spec.target_kind,
+                    target_spec={"kind": spec.target_kind, **spec.target},
+                    test_plan=plan,
+                    runtime_config=runtime,
+                    request_fingerprint=fingerprint,
+                    idempotency_scope=scope if spec.idempotency_key else None,
+                    idempotency_key=spec.idempotency_key,
+                    parent_run_id=parent.id if parent is not None else None,
+                    root_run_id=parent.root_run_id if parent is not None else run_id,
+                    attempt_number=(parent.attempt_number + 1) if parent is not None else 1,
+                    status="queued",
+                    stage="queued",
+                    cleanup_status="pending",
+                    event_sequence=1,
+                )
+                db.add(run)
+                db.add(
+                    TestHarnessEvent(
+                        run_id=run_id,
+                        sequence=1,
+                        event_type="lifecycle",
+                        stage="queued",
+                        title="测试运行已创建",
+                        detail="输入契约和测试计划已冻结。",
+                        data={"target_kind": spec.target_kind},
+                        source_key="harness:created",
+                    )
+                )
+                await db.commit()
+                await db.refresh(run)
+                return run, True
+
+    @staticmethod
+    def _runtime_for_task(task: Task, spec: TestHarnessSpec) -> dict[str, Any]:
+        provider = task.provider if task.provider in {"claude", "codex"} else "codex"
+        model = task.model or (
+            settings.default_codex_model if provider == "codex" else settings.default_model
+        )
+        return {
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": task.effort_level or settings.default_effort,
+            "codex_service_tier": task.codex_service_tier or "default",
+            "profile": spec.profile,
+            "allow_actions": spec.allow_actions,
+            "browser_channel": spec.browser_channel,
+            "viewport_width": spec.viewport_width,
+            "viewport_height": spec.viewport_height,
+            "max_steps": spec.max_steps,
+            "max_actions": spec.max_actions,
+            "terminal_owner": (
+                "workspace" if spec.target_kind != "fixed_url" else "browser"
+            ),
+            "context_policy": "isolated_black_box_v1",
+        }
+
+    async def _start_workspace_review(
+        self,
+        *,
+        run_id: str,
+        spec: TestHarnessSpec,
+        test_plan: dict[str, Any],
+        prepared: PreparedHarnessTarget | None = None,
+        await_completion: bool = False,
+    ) -> WorkspaceReviewRun:
+        run = await self.get_run_model(run_id)
+        if run is None or run.task_id is None:
+            raise TestHarnessError("Harness run has no owning Task")
+        async with self.db_factory() as db:
+            task = await db.get(Task, run.task_id)
+            project = await db.get(Project, task.project_id) if task and task.project_id else None
+            if task is None:
+                raise TestHarnessError("Harness owner Task disappeared")
+            preview_config = project.preview_config if project is not None else None
+        if preview_config is None:
+            raise TestHarnessError("Project has no confirmed Preview configuration")
+
+        from backend.services.workspace_review import workspace_review_manager
+
+        workspace_run = await workspace_review_manager.start(
+            task_id=run.task_id,
+            goal=spec.goal,
+            mode="review_only",
+            profile=spec.profile,
+            allow_actions=spec.allow_actions,
+            browser_channel=spec.browser_channel,
+            viewport_width=spec.viewport_width,
+            viewport_height=spec.viewport_height,
+            max_steps=spec.max_steps,
+            max_actions=spec.max_actions,
+            harness_run_id=run_id,
+            workspace_override=prepared.workspace if prepared is not None else None,
+            preview_config_override=preview_config if prepared is not None else None,
+            test_plan=test_plan,
+        )
+        await self._update_run(
+            run_id,
+            values={
+                "workspace_review_run_id": workspace_run.id,
+                "source_git_head": workspace_run.git_head,
+                "source_fingerprint": workspace_run.workspace_fingerprint,
+                "status": "preparing_environment",
+                "stage": "fingerprinted",
+                "started_at": workspace_run.started_at or datetime.utcnow(),
+            },
+            event_type="lifecycle",
+            title="已锁定测试目标",
+            detail=f"Commit {workspace_run.git_head[:12]}，工作区指纹 {workspace_run.workspace_fingerprint[:12]}。",
+            source_key=f"workspace:{workspace_run.id}:linked",
+        )
+        if await_completion:
+            await self._watch_workspace_run(
+                run_id=run_id,
+                workspace_run_id=workspace_run.id,
+                prepared=prepared,
+            )
+        else:
+            watcher = asyncio.create_task(
+                self._watch_workspace_run(
+                    run_id=run_id,
+                    workspace_run_id=workspace_run.id,
+                    prepared=prepared,
+                ),
+                name=f"test-harness-workspace-{run_id}",
+            )
+            self._register_pipeline(run_id, watcher)
+        return workspace_run
+
+    async def _run_git_target(
+        self,
+        *,
+        run_id: str,
+        spec: TestHarnessSpec,
+        test_plan: dict[str, Any],
+    ) -> None:
+        prepared: PreparedHarnessTarget | None = None
+        workspace_run_id: str | None = None
+        try:
+            await self._update_run(
+                run_id,
+                values={"status": "resolving_target", "stage": "resolving_git_target"},
+                event_type="lifecycle",
+                title="正在解析 Git 测试目标",
+                source_key="target:resolving",
+            )
+            async with self.db_factory() as db:
+                run = await db.get(TestHarnessRun, run_id)
+                task = await db.get(Task, run.task_id) if run and run.task_id else None
+                project = await db.get(Project, task.project_id) if task and task.project_id else None
+            if run is None or task is None:
+                raise TestHarnessError("Harness owner Task disappeared")
+            prepared = await self.target_manager.prepare(
+                run_id=run_id,
+                task=task,
+                project=project,
+                kind=spec.target_kind,
+                target=spec.target,
+            )
+            await self._update_run(
+                run_id,
+                values={
+                    "target_spec": prepared.public_spec,
+                    "source_git_head": prepared.git_head,
+                    "status": "preparing_environment",
+                    "stage": "detached_worktree_ready",
+                },
+                event_type="lifecycle",
+                title="隔离 Git worktree 已就绪",
+                detail=f"精确提交 {prepared.git_head[:12]}，未切换开发工作区。",
+                source_key="target:prepared",
+            )
+            workspace_run = await self._start_workspace_review(
+                run_id=run_id,
+                spec=spec,
+                test_plan=test_plan,
+                prepared=prepared,
+                await_completion=True,
+            )
+            workspace_run_id = workspace_run.id
+        except asyncio.CancelledError:
+            if workspace_run_id is None:
+                current = await self.get_run_model(run_id)
+                workspace_run_id = current.workspace_review_run_id if current else None
+            if workspace_run_id:
+                from backend.services.workspace_review import workspace_review_manager
+
+                await asyncio.shield(workspace_review_manager.cancel(workspace_run_id))
+            await self._mark_cancelled(run_id)
+            raise
+        except Exception as exc:
+            logger.exception("Test harness Git target pipeline failed run=%s", run_id)
+            await self._fail_start(run_id, exc)
+        finally:
+            if prepared is not None:
+                try:
+                    await asyncio.shield(self.target_manager.cleanup(prepared))
+                except Exception as exc:
+                    await self._update_run(
+                        run_id,
+                        values={
+                            "cleanup_status": "failed",
+                            "cleanup_error": _safe_error(exc),
+                        },
+                        event_type="cleanup",
+                        title="隔离 worktree 清理失败",
+                        detail=_safe_error(exc),
+                        source_key="target:cleanup-failed",
+                    )
+                else:
+                    await self._update_run(
+                        run_id,
+                        values={"cleanup_status": "completed", "cleanup_error": None},
+                        event_type="cleanup",
+                        title="隔离 worktree 已清理",
+                        source_key="target:cleanup-completed",
+                    )
+
+    async def _watch_workspace_run(
+        self,
+        *,
+        run_id: str,
+        workspace_run_id: str,
+        prepared: PreparedHarnessTarget | None,
+    ) -> None:
+        while True:
+            async with self.db_factory() as db:
+                workspace_run = await db.get(WorkspaceReviewRun, workspace_run_id)
+            if workspace_run is None:
+                raise TestHarnessError("Workspace review record disappeared")
+            await self._sync_workspace_run(run_id, workspace_run)
+            if workspace_run.browser_review_job_id:
+                from backend.services.browser_review_jobs import browser_review_job_manager
+
+                job = await browser_review_job_manager.get(
+                    workspace_run.browser_review_job_id
+                )
+                if job is not None:
+                    await self.sync_browser_job(job)
+            if (
+                workspace_run.status in _WORKSPACE_TERMINAL
+                and workspace_run.cleanup_status != "pending"
+            ):
+                return
+            await asyncio.sleep(self.poll_interval)
+
+    async def _sync_workspace_run(
+        self,
+        run_id: str,
+        workspace_run: WorkspaceReviewRun,
+    ) -> None:
+        if workspace_run.status == "queued":
+            status = "queued"
+        elif workspace_run.status == "preparing":
+            status = "preparing_environment"
+        elif workspace_run.status == "ready":
+            status = "preview_ready"
+        elif workspace_run.status in {"reviewing", "running"}:
+            status = "running"
+        elif workspace_run.status == "completed":
+            status = "stale" if workspace_run.stale else "completed"
+        else:
+            status = workspace_run.status
+        if status == "completed":
+            structured_verdict = None
+            if workspace_run.browser_review_job_id:
+                async with self.db_factory() as db:
+                    attempt = await db.scalar(
+                        select(TestHarnessAttempt).where(
+                            TestHarnessAttempt.run_id == run_id,
+                            TestHarnessAttempt.browser_review_job_id
+                            == workspace_run.browser_review_job_id,
+                        )
+                    )
+                if attempt is not None and isinstance(attempt.result_data, dict):
+                    structured_verdict = attempt.result_data.get("verdict")
+            verdict = normalize_verdict(
+                structured_verdict,
+                report=workspace_run.report,
+            )
+        elif status == "stale":
+            verdict = "stale"
+        elif status == "cancelled":
+            verdict = "cancelled"
+        elif status == "failed":
+            verdict = "error"
+        else:
+            verdict = None
+        await self._update_run(
+            run_id,
+            values={
+                "workspace_review_run_id": workspace_run.id,
+                "browser_review_job_id": workspace_run.browser_review_job_id,
+                "agent_task_id": workspace_run.agent_task_id,
+                "status": status,
+                "stage": workspace_run.stage,
+                "verdict": verdict,
+                "source_git_head": workspace_run.git_head,
+                "source_fingerprint": workspace_run.workspace_fingerprint,
+                "stale": workspace_run.stale,
+                "report": workspace_run.report,
+                "error": workspace_run.error,
+                "cleanup_status": workspace_run.cleanup_status,
+                "cleanup_error": workspace_run.cleanup_error,
+                "started_at": workspace_run.started_at,
+                "completed_at": workspace_run.completed_at,
+            },
+            event_type="lifecycle",
+            title=_workspace_stage_title(workspace_run.stage),
+            detail=workspace_run.error,
+            source_key=(
+                f"workspace:{workspace_run.id}:{workspace_run.status}:"
+                f"{workspace_run.stage}:{workspace_run.cleanup_status}"
+            ),
+        )
+
+    async def attach_browser_job(
+        self,
+        *,
+        run_id: str,
+        job: Any,
+        watch_terminal: bool,
+        browser_manager: Any | None = None,
+    ) -> None:
+        job.harness_run_id = run_id
+        payload = job.as_dict()
+        attempt_id = uuid.uuid4().hex
+        async with self._db_lock:
+            async with self.db_factory() as db:
+                run = await db.get(TestHarnessRun, run_id)
+                if run is None:
+                    raise TestHarnessError("Harness run not found")
+                existing = await db.scalar(
+                    select(TestHarnessAttempt).where(
+                        TestHarnessAttempt.run_id == run_id,
+                        TestHarnessAttempt.ordinal == 1,
+                    )
+                )
+                if existing is None:
+                    existing = TestHarnessAttempt(
+                        id=attempt_id,
+                        run_id=run_id,
+                        ordinal=1,
+                        status=job.status,
+                        stage=job.stage,
+                        provider=job.provider,
+                        model=job.options.model,
+                        reasoning_effort=job.options.reasoning_effort,
+                        codex_service_tier=job.codex_service_tier,
+                        agent_task_id=job.task_id,
+                        browser_review_job_id=job.id,
+                        artifact_root=str(job.options.output_dir),
+                        result_data=payload,
+                    )
+                    db.add(existing)
+                run.browser_review_job_id = job.id
+                run.agent_task_id = job.task_id
+                run.status = "running" if job.status == "running" else run.status
+                run.stage = job.stage
+                await self._append_event(
+                    db,
+                    run,
+                    event_type="lifecycle",
+                    title="浏览器执行器已绑定",
+                    stage=job.stage,
+                    data={"browser_review_job_id": job.id},
+                    source_key=f"browser:{job.id}:attached",
+                )
+                await db.commit()
+        await self.sync_browser_job(job)
+        if watch_terminal:
+            watcher = asyncio.create_task(
+                self._watch_browser_job(run_id, job.id, browser_manager),
+                name=f"test-harness-browser-{run_id}",
+            )
+            self._register_pipeline(run_id, watcher)
+
+    async def start_fixed_url_browser(
+        self,
+        *,
+        run_id: str,
+        inline: bool,
+    ) -> Any:
+        """Attach the fixed-URL adapter to an already persisted harness run."""
+
+        run = await self.get_run_model(run_id)
+        if run is None or run.task_id is None or run.target_kind != "fixed_url":
+            raise TestHarnessError("Fixed URL harness run not found")
+        async with self.db_factory() as db:
+            task = await db.get(Task, run.task_id)
+            if task is None:
+                raise TestHarnessError("Harness owner Task disappeared")
+            created_by = task.created_by
+        runtime = run.runtime_config
+        from backend.services.browser_review import BrowserReviewOptions
+        from backend.services.browser_review_jobs import browser_review_job_manager
+
+        options = BrowserReviewOptions(
+            url=str(run.target_spec["url"]),
+            goal=str(run.test_plan["objective"]),
+            model=str(runtime["model"]),
+            reasoning_effort=str(runtime["reasoning_effort"]),
+            headless=True,
+            allow_actions=bool(runtime["allow_actions"]),
+            browser_channel=(
+                "chrome" if runtime.get("browser_channel") == "chrome" else None
+            ),
+            viewport_width=int(runtime["viewport_width"]),
+            viewport_height=int(runtime["viewport_height"]),
+            max_steps=int(runtime["max_steps"]),
+            max_actions=int(runtime["max_actions"]),
+        )
+        job = None
+        try:
+            if inline:
+                job = await browser_review_job_manager.prepare_task_tool(
+                    options,
+                    task_id=task.id,
+                    provider=str(runtime["provider"]),
+                    codex_service_tier=str(runtime["codex_service_tier"]),
+                    harness_run_id=run_id,
+                )
+            else:
+                job = await browser_review_job_manager.prepare_agent(
+                    options,
+                    provider=str(runtime["provider"]),
+                    codex_service_tier=str(runtime["codex_service_tier"]),
+                    harness_run_id=run_id,
+                )
+                from backend.services.task_queue import TaskQueue
+                from backend.services.workspace_review import _browser_agent_prompt
+
+                async with self.db_factory() as db:
+                    child = await TaskQueue(db).create(
+                        title=f"Frontend Test Harness: Task {task.id}"[:200],
+                        description=_browser_agent_prompt(
+                            job.id,
+                            job.options,
+                            profile=str(runtime.get("profile") or "standard"),
+                            test_plan=run.test_plan,
+                        ),
+                        status="pending",
+                        priority=0,
+                        max_retries=0,
+                        mode="auto",
+                        provider=str(runtime["provider"]),
+                        model=str(runtime["model"]),
+                        codex_service_tier=str(runtime["codex_service_tier"]),
+                        effort_level=str(runtime["reasoning_effort"]),
+                        timeout_hours=1.0,
+                        enabled_skills={"browser-review": job.id},
+                        metadata_={
+                            "browser_review_job_id": job.id,
+                            "test_harness_run_id": run_id,
+                            "test_harness_parent_task_id": task.id,
+                            "isolated_browser_agent": True,
+                        },
+                        created_by=created_by,
+                        archived=True,
+                    )
+                await browser_review_job_manager.attach_task(
+                    job.id,
+                    child.id,
+                    owner_task_id=task.id,
+                )
+                try:
+                    from backend.main import dispatcher
+
+                    if dispatcher is not None:
+                        dispatcher.wake()
+                except Exception:
+                    logger.exception("Could not wake dispatcher for harness browser agent")
+            await self.attach_browser_job(
+                run_id=run_id,
+                job=job,
+                watch_terminal=True,
+            )
+            return job
+        except BaseException as exc:
+            if job is not None:
+                await browser_review_job_manager.fail_start(job.id, exc)
+            await self._fail_start(run_id, exc)
+            raise
+
+    async def _watch_browser_job(
+        self,
+        run_id: str,
+        job_id: str,
+        browser_manager: Any | None = None,
+    ) -> None:
+        if browser_manager is None:
+            from backend.services.browser_review_jobs import browser_review_job_manager
+
+            browser_manager = browser_review_job_manager
+
+        while True:
+            job = await browser_manager.get(job_id)
+            if job is None:
+                await self._fail_start(
+                    run_id,
+                    TestHarnessError("Browser Review job disappeared"),
+                )
+                return
+            await self.sync_browser_job(job)
+            if job.status in _BROWSER_TERMINAL:
+                return
+            await asyncio.sleep(self.poll_interval)
+
+    async def sync_browser_job(self, job: Any) -> None:
+        run_id = getattr(job, "harness_run_id", None)
+        if not isinstance(run_id, str) or not run_id:
+            return
+        payload = job.as_dict()
+        async with self._db_lock:
+            async with self.db_factory() as db:
+                run = await db.get(TestHarnessRun, run_id)
+                if run is None:
+                    return
+                attempt = await db.scalar(
+                    select(TestHarnessAttempt).where(
+                        TestHarnessAttempt.run_id == run_id,
+                        TestHarnessAttempt.browser_review_job_id == job.id,
+                    )
+                )
+                if attempt is None:
+                    attempt = TestHarnessAttempt(
+                        id=uuid.uuid4().hex,
+                        run_id=run_id,
+                        ordinal=1,
+                        provider=job.provider,
+                        model=job.options.model,
+                        reasoning_effort=job.options.reasoning_effort,
+                        codex_service_tier=job.codex_service_tier,
+                        browser_review_job_id=job.id,
+                        artifact_root=str(job.options.output_dir),
+                    )
+                    db.add(attempt)
+                attempt.status = job.status
+                attempt.stage = job.stage
+                attempt.agent_task_id = job.task_id
+                attempt.artifact_root = str(job.options.output_dir)
+                attempt.result_data = _json_copy(payload)
+                attempt.error = job.error
+                attempt.started_at = _parse_datetime(job.started_at)
+                attempt.completed_at = _parse_datetime(job.completed_at)
+                run.browser_review_job_id = job.id
+                run.agent_task_id = job.task_id
+
+                terminal_owner = run.runtime_config.get("terminal_owner")
+                if terminal_owner == "browser":
+                    if job.status == "completed":
+                        run.status = "completed"
+                        run.verdict = normalize_verdict(job.verdict, report=payload.get("report"))
+                        run.report = payload.get("report")
+                        run.completed_at = _parse_datetime(job.completed_at) or datetime.utcnow()
+                        run.cleanup_status = "completed"
+                    elif job.status == "failed":
+                        run.status = "failed"
+                        run.verdict = "error"
+                        run.error = job.error
+                        run.completed_at = _parse_datetime(job.completed_at) or datetime.utcnow()
+                        run.cleanup_status = "completed"
+                    elif job.status == "cancelled":
+                        run.status = "cancelled"
+                        run.verdict = "cancelled"
+                        run.completed_at = _parse_datetime(job.completed_at) or datetime.utcnow()
+                        run.cleanup_status = "completed"
+                    else:
+                        run.status = "running"
+                    run.stage = job.stage
+                    run.started_at = run.started_at or _parse_datetime(job.started_at)
+                elif run.status not in HARNESS_TERMINAL_STATUSES:
+                    run.stage = job.stage
+                if terminal_owner == "workspace" and job.status == "completed":
+                    # WorkspaceReviewRun owns preview cleanup/staleness, while
+                    # the browser attempt owns the structured semantic result.
+                    # Keep that exact verdict instead of falling back to a
+                    # brittle Markdown keyword guess.
+                    run.verdict = normalize_verdict(
+                        job.verdict,
+                        report=payload.get("report"),
+                    )
+
+                await self._append_event(
+                    db,
+                    run,
+                    event_type="browser_state",
+                    title=_browser_stage_title(job.stage),
+                    stage=job.stage,
+                    data={
+                        "steps": job.steps,
+                        "actions": job.actions,
+                        "latest_screenshot": job.latest_screenshot,
+                    },
+                    source_key=(
+                        f"browser:{job.id}:{job.status}:{job.stage}:"
+                        f"{job.steps}:{job.actions}:{job.latest_screenshot or '-'}"
+                    ),
+                )
+                for event in job.trace_events:
+                    source_id = event.get("id")
+                    await self._append_event(
+                        db,
+                        run,
+                        event_type=str(event.get("kind") or "trace"),
+                        title=str(event.get("title") or "模型操作轨迹")[:240],
+                        detail=(
+                            str(event["detail"])[:8000]
+                            if event.get("detail") is not None
+                            else None
+                        ),
+                        stage=job.stage,
+                        data={
+                            "tool_name": event.get("tool_name"),
+                            "source_timestamp": event.get("timestamp"),
+                        },
+                        source_key=f"trace:{job.id}:{source_id}",
+                    )
+                await self._sync_evidence(db, run_id, attempt.id, job)
+                await self._sync_findings(db, run_id, job.findings)
+                await db.commit()
+
+    async def _sync_evidence(
+        self,
+        db: Any,
+        run_id: str,
+        attempt_id: str,
+        job: Any,
+    ) -> None:
+        root_value = job.options.output_dir
+        if root_value is None:
+            return
+        try:
+            root = Path(root_value).resolve(strict=True)
+        except OSError:
+            return
+        for name in job.artifact_names():
+            candidate = root / name
+            try:
+                info = candidate.lstat()
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
+                continue
+            digest = hashlib.sha256()
+            with candidate.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            evidence = await db.scalar(
+                select(TestHarnessEvidence).where(
+                    TestHarnessEvidence.run_id == run_id,
+                    TestHarnessEvidence.name == name,
+                )
+            )
+            kind = (
+                "screenshot"
+                if candidate.suffix == ".png"
+                else "report"
+                if candidate.suffix == ".md"
+                else "telemetry"
+            )
+            if evidence is None:
+                evidence = TestHarnessEvidence(
+                    id=uuid.uuid4().hex,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    kind=kind,
+                    name=name,
+                    content_type=_CONTENT_TYPES.get(
+                        candidate.suffix, "application/octet-stream"
+                    ),
+                    storage_path=str(resolved),
+                    sha256=digest.hexdigest(),
+                    byte_size=info.st_size,
+                    metadata_={"browser_review_job_id": job.id},
+                )
+                db.add(evidence)
+            else:
+                evidence.attempt_id = attempt_id
+                evidence.storage_path = str(resolved)
+                evidence.sha256 = digest.hexdigest()
+                evidence.byte_size = info.st_size
+
+    async def _sync_findings(
+        self,
+        db: Any,
+        run_id: str,
+        findings: list[dict[str, Any]],
+    ) -> None:
+        if not findings:
+            return
+        fingerprints = {item["fingerprint"] for item in findings}
+        await db.execute(
+            delete(TestHarnessFinding).where(
+                TestHarnessFinding.run_id == run_id,
+                TestHarnessFinding.fingerprint.not_in(fingerprints),
+            )
+        )
+        existing = {
+            item.fingerprint: item
+            for item in (
+                await db.execute(
+                    select(TestHarnessFinding).where(
+                        TestHarnessFinding.run_id == run_id
+                    )
+                )
+            ).scalars()
+        }
+        for item in findings:
+            row = existing.get(item["fingerprint"])
+            if row is None:
+                row = TestHarnessFinding(
+                    id=uuid.uuid4().hex,
+                    run_id=run_id,
+                    ordinal=item["ordinal"],
+                    fingerprint=item["fingerprint"],
+                    scenario_id=item["scenario_id"],
+                    severity=item["severity"],
+                    category=item["category"],
+                    title=item["title"],
+                    route=item["route"],
+                    locator=item["locator"],
+                    expected=item["expected"],
+                    actual=item["actual"],
+                    reproduction=item["reproduction"],
+                    evidence_names=item["evidence_names"],
+                    confidence=item["confidence"],
+                )
+                db.add(row)
+            else:
+                for key in (
+                    "ordinal",
+                    "scenario_id",
+                    "severity",
+                    "category",
+                    "title",
+                    "route",
+                    "locator",
+                    "expected",
+                    "actual",
+                    "reproduction",
+                    "evidence_names",
+                    "confidence",
+                ):
+                    setattr(row, key, item[key])
+
+    async def _update_run(
+        self,
+        run_id: str,
+        *,
+        values: dict[str, Any],
+        event_type: str,
+        title: str,
+        detail: str | None = None,
+        source_key: str | None = None,
+    ) -> None:
+        async with self._db_lock:
+            async with self.db_factory() as db:
+                run = await db.get(TestHarnessRun, run_id)
+                if run is None:
+                    return
+                for key, value in values.items():
+                    setattr(run, key, value)
+                await self._append_event(
+                    db,
+                    run,
+                    event_type=event_type,
+                    title=title,
+                    detail=detail,
+                    stage=str(values.get("stage") or run.stage),
+                    source_key=source_key,
+                )
+                await db.commit()
+
+    async def _append_event(
+        self,
+        db: Any,
+        run: TestHarnessRun,
+        *,
+        event_type: str,
+        title: str,
+        stage: str | None = None,
+        detail: str | None = None,
+        data: dict[str, Any] | None = None,
+        source_key: str | None = None,
+    ) -> bool:
+        if source_key is not None:
+            duplicate = await db.scalar(
+                select(TestHarnessEvent.id).where(
+                    TestHarnessEvent.run_id == run.id,
+                    TestHarnessEvent.source_key == source_key,
+                )
+            )
+            if duplicate is not None:
+                return False
+        run.event_sequence += 1
+        db.add(
+            TestHarnessEvent(
+                run_id=run.id,
+                sequence=run.event_sequence,
+                event_type=event_type[:32],
+                stage=stage[:48] if stage else None,
+                title=title[:240],
+                detail=detail[:8000] if detail else None,
+                data=_json_copy(data or {}),
+                source_key=source_key[:200] if source_key else None,
+            )
+        )
+        return True
+
+    async def _fail_start(self, run_id: str, exc: BaseException) -> None:
+        await self._update_run(
+            run_id,
+            values={
+                "status": "failed",
+                "stage": "failed",
+                "verdict": "error",
+                "error": _safe_error(exc),
+                "completed_at": datetime.utcnow(),
+            },
+            event_type="error",
+            title="测试运行失败",
+            detail=_safe_error(exc),
+            source_key="harness:failed",
+        )
+
+    async def _mark_cancelled(self, run_id: str) -> None:
+        await self._update_run(
+            run_id,
+            values={
+                "status": "cancelled",
+                "stage": "cancelled",
+                "verdict": "cancelled",
+                "completed_at": datetime.utcnow(),
+            },
+            event_type="lifecycle",
+            title="测试运行已停止",
+            source_key="harness:cancelled",
+        )
+
+    async def cancel(
+        self,
+        run_id: str,
+        *,
+        stop_agent_task: Callable[[int], Awaitable[None]] | None = None,
+    ) -> TestHarnessRun | None:
+        run = await self.get_run_model(run_id)
+        if run is None or run.status in HARNESS_TERMINAL_STATUSES:
+            return run
+        await self._update_run(
+            run_id,
+            values={"status": "cancelling", "stage": "cancelling"},
+            event_type="lifecycle",
+            title="正在停止测试运行",
+            source_key="harness:cancelling",
+        )
+        if run.workspace_review_run_id:
+            from backend.services.workspace_review import workspace_review_manager
+
+            await workspace_review_manager.cancel(run.workspace_review_run_id)
+        elif run.agent_task_id is not None and stop_agent_task is not None:
+            await stop_agent_task(run.agent_task_id)
+        elif run.browser_review_job_id:
+            from backend.services.browser_review_jobs import browser_review_job_manager
+
+            await browser_review_job_manager.cancel(run.browser_review_job_id)
+        pipeline = self._pipelines.get(run_id)
+        if pipeline is not None and not pipeline.done():
+            pipeline.cancel()
+            await asyncio.gather(pipeline, return_exceptions=True)
+        current = await self.get_run_model(run_id)
+        if current is not None and current.status not in HARNESS_TERMINAL_STATUSES:
+            await self._mark_cancelled(run_id)
+        return await self.get_run_model(run_id)
+
+    async def get_run_model(self, run_id: str) -> TestHarnessRun | None:
+        async with self.db_factory() as db:
+            return await db.get(TestHarnessRun, run_id)
+
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        async with self.db_factory() as db:
+            run = await db.get(TestHarnessRun, run_id)
+            if run is None:
+                return None
+            return await self._serialize_run(db, run)
+
+    async def list_for_task(self, task_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
+        async with self.db_factory() as db:
+            runs = list(
+                (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(TestHarnessRun.task_id == task_id)
+                        .order_by(TestHarnessRun.created_at.desc(), TestHarnessRun.id.desc())
+                        .limit(min(100, max(1, limit)))
+                    )
+                ).scalars()
+            )
+            return [await self._serialize_run(db, run) for run in runs]
+
+    async def refresh_task_staleness(self, task_id: int) -> None:
+        """Project current-workspace freshness into durable Harness records."""
+
+        from backend.services.workspace_review import refresh_workspace_review_staleness
+
+        await refresh_workspace_review_staleness(
+            task_id,
+            db_factory=self.db_factory,
+        )
+        async with self.db_factory() as db:
+            workspace_runs = list(
+                (
+                    await db.execute(
+                        select(WorkspaceReviewRun).where(
+                            WorkspaceReviewRun.task_id == task_id,
+                            WorkspaceReviewRun.harness_run_id.is_not(None),
+                        )
+                    )
+                ).scalars()
+            )
+        for workspace_run in workspace_runs:
+            if workspace_run.harness_run_id:
+                await self._sync_workspace_run(
+                    workspace_run.harness_run_id,
+                    workspace_run,
+                )
+
+    async def _serialize_run(self, db: Any, run: TestHarnessRun) -> dict[str, Any]:
+        attempts = list(
+            (
+                await db.execute(
+                    select(TestHarnessAttempt)
+                    .where(TestHarnessAttempt.run_id == run.id)
+                    .order_by(TestHarnessAttempt.ordinal.asc())
+                )
+            ).scalars()
+        )
+        events = list(
+            (
+                await db.execute(
+                    select(TestHarnessEvent)
+                    .where(TestHarnessEvent.run_id == run.id)
+                    .order_by(TestHarnessEvent.sequence.asc())
+                )
+            ).scalars()
+        )
+        evidence = list(
+            (
+                await db.execute(
+                    select(TestHarnessEvidence)
+                    .where(TestHarnessEvidence.run_id == run.id)
+                    .order_by(TestHarnessEvidence.created_at.asc())
+                )
+            ).scalars()
+        )
+        findings = list(
+            (
+                await db.execute(
+                    select(TestHarnessFinding)
+                    .where(TestHarnessFinding.run_id == run.id)
+                    .order_by(TestHarnessFinding.ordinal.asc())
+                )
+            ).scalars()
+        )
+        workspace_payload = None
+        if run.workspace_review_run_id:
+            workspace = await db.get(WorkspaceReviewRun, run.workspace_review_run_id)
+            if workspace is not None:
+                from backend.services.workspace_review import workspace_review_run_dict
+
+                workspace_payload = workspace_review_run_dict(workspace)
+        browser_payload = attempts[-1].result_data if attempts else None
+        return {
+            "id": run.id,
+            "task_id": run.task_id,
+            "project_id": run.project_id,
+            "workspace_review_run_id": run.workspace_review_run_id,
+            "browser_review_job_id": run.browser_review_job_id,
+            "agent_task_id": run.agent_task_id,
+            "target_kind": run.target_kind,
+            "target": run.target_spec,
+            "test_plan": run.test_plan,
+            "runtime": run.runtime_config,
+            "request_fingerprint": run.request_fingerprint,
+            "parent_run_id": run.parent_run_id,
+            "root_run_id": run.root_run_id,
+            "attempt_number": run.attempt_number,
+            "status": run.status,
+            "stage": run.stage,
+            "verdict": run.verdict,
+            "source_git_head": run.source_git_head,
+            "source_fingerprint": run.source_fingerprint,
+            "stale": run.stale,
+            "report": run.report,
+            "error": run.error,
+            "cleanup_status": run.cleanup_status,
+            "cleanup_error": run.cleanup_error,
+            "created_at": _iso(run.created_at),
+            "started_at": _iso(run.started_at),
+            "completed_at": _iso(run.completed_at),
+            "attempts": [
+                {
+                    "id": item.id,
+                    "ordinal": item.ordinal,
+                    "status": item.status,
+                    "stage": item.stage,
+                    "provider": item.provider,
+                    "model": item.model,
+                    "reasoning_effort": item.reasoning_effort,
+                    "codex_service_tier": item.codex_service_tier,
+                    "agent_task_id": item.agent_task_id,
+                    "browser_review_job_id": item.browser_review_job_id,
+                    "error": item.error,
+                    "created_at": _iso(item.created_at),
+                    "started_at": _iso(item.started_at),
+                    "completed_at": _iso(item.completed_at),
+                }
+                for item in attempts
+            ],
+            "events": [
+                {
+                    "id": item.id,
+                    "sequence": item.sequence,
+                    "event_type": item.event_type,
+                    "stage": item.stage,
+                    "title": item.title,
+                    "detail": item.detail,
+                    "data": item.data,
+                    "created_at": _iso(item.created_at),
+                }
+                for item in events
+            ],
+            "evidence": [
+                {
+                    "id": item.id,
+                    "kind": item.kind,
+                    "name": item.name,
+                    "content_type": item.content_type,
+                    "sha256": item.sha256,
+                    "byte_size": item.byte_size,
+                    "metadata": item.metadata_,
+                    "created_at": _iso(item.created_at),
+                }
+                for item in evidence
+            ],
+            "findings": [
+                {
+                    "id": item.id,
+                    "fingerprint": item.fingerprint,
+                    "scenario_id": item.scenario_id,
+                    "severity": item.severity,
+                    "category": item.category,
+                    "title": item.title,
+                    "route": item.route,
+                    "locator": item.locator,
+                    "expected": item.expected,
+                    "actual": item.actual,
+                    "reproduction": item.reproduction,
+                    "evidence": item.evidence_names,
+                    "confidence": item.confidence,
+                }
+                for item in findings
+            ],
+            "workspace_review": workspace_payload,
+            "browser_review": browser_payload,
+        }
+
+    async def resolve_evidence(self, run_id: str, name: str) -> Path | None:
+        if not name or len(name) > 255 or "/" in name or "\\" in name:
+            return None
+        async with self.db_factory() as db:
+            evidence = await db.scalar(
+                select(TestHarnessEvidence).where(
+                    TestHarnessEvidence.run_id == run_id,
+                    TestHarnessEvidence.name == name,
+                )
+            )
+        if evidence is None:
+            return None
+        candidate = Path(evidence.storage_path)
+        try:
+            info = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
+            return None
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        if digest != evidence.sha256 or info.st_size != evidence.byte_size:
+            return None
+        return resolved
+
+    async def compare(self, base_run_id: str, candidate_run_id: str) -> dict[str, Any]:
+        async with self.db_factory() as db:
+            base = await db.get(TestHarnessRun, base_run_id)
+            candidate = await db.get(TestHarnessRun, candidate_run_id)
+            if base is None or candidate is None:
+                raise TestHarnessError("Test run not found")
+            if base.task_id != candidate.task_id:
+                raise TestHarnessError("Test runs belong to different Tasks")
+            base_findings = {
+                item.fingerprint: item
+                for item in (
+                    await db.execute(
+                        select(TestHarnessFinding).where(
+                            TestHarnessFinding.run_id == base_run_id
+                        )
+                    )
+                ).scalars()
+            }
+            candidate_findings = {
+                item.fingerprint: item
+                for item in (
+                    await db.execute(
+                        select(TestHarnessFinding).where(
+                            TestHarnessFinding.run_id == candidate_run_id
+                        )
+                    )
+                ).scalars()
+            }
+        return {
+            "base_run_id": base_run_id,
+            "candidate_run_id": candidate_run_id,
+            "new": sorted(set(candidate_findings) - set(base_findings)),
+            "persisting": sorted(set(candidate_findings) & set(base_findings)),
+            "resolved": sorted(set(base_findings) - set(candidate_findings)),
+            "base_verdict": base.verdict,
+            "candidate_verdict": candidate.verdict,
+        }
+
+    async def repeat(self, run_id: str, *, owner_user_id: int | None = None) -> TestHarnessRun:
+        source = await self.get_run_model(run_id)
+        if source is None or source.task_id is None:
+            raise TestHarnessError("Test run not found")
+        if source.status not in HARNESS_TERMINAL_STATUSES:
+            raise TestHarnessError("Test run is not terminal")
+        runtime = source.runtime_config
+        spec = TestHarnessSpec(
+            target_kind=source.target_kind,  # type: ignore[arg-type]
+            target={
+                key: value
+                for key, value in source.target_spec.items()
+                if key in {"url", "pr_number", "remote", "ref", "fetch"}
+            },
+            goal=str(source.test_plan.get("objective") or "Repeat frontend test"),
+            profile=runtime.get("profile", "standard"),
+            allow_actions=bool(runtime.get("allow_actions", True)),
+            browser_channel=runtime.get("browser_channel", "chrome"),
+            viewport_width=int(runtime.get("viewport_width", 1440)),
+            viewport_height=int(runtime.get("viewport_height", 900)),
+            max_steps=int(runtime.get("max_steps", 20)),
+            max_actions=int(runtime.get("max_actions", 0)),
+            test_plan=source.test_plan,
+            parent_run_id=source.id,
+        )
+        return await self.start_task_run(
+            task_id=source.task_id,
+            spec=spec,
+            owner_user_id=owner_user_id,
+        )
+
+    async def recover_interrupted_runs(self) -> int:
+        async with self._db_lock:
+            async with self.db_factory() as db:
+                runs = list(
+                    (
+                        await db.execute(
+                            select(TestHarnessRun).where(
+                                TestHarnessRun.status.not_in(HARNESS_TERMINAL_STATUSES)
+                            )
+                        )
+                    ).scalars()
+                )
+                for run in runs:
+                    run.status = "failed"
+                    run.stage = "interrupted"
+                    run.verdict = "error"
+                    run.error = "Manager restarted before this test run reached a terminal state"
+                    run.cleanup_status = "unconfirmed"
+                    run.cleanup_error = (
+                        "The previous process could not prove browser, preview, or worktree cleanup"
+                    )
+                    run.completed_at = datetime.utcnow()
+                    await self._append_event(
+                        db,
+                        run,
+                        event_type="error",
+                        title="服务重启中断测试",
+                        detail=run.cleanup_error,
+                        stage="interrupted",
+                        source_key="harness:interrupted",
+                    )
+                if runs:
+                    attempt_rows = list(
+                        (
+                            await db.execute(
+                                select(TestHarnessAttempt).where(
+                                    TestHarnessAttempt.run_id.in_([run.id for run in runs]),
+                                    TestHarnessAttempt.status.not_in(_BROWSER_TERMINAL),
+                                )
+                            )
+                        ).scalars()
+                    )
+                    for attempt in attempt_rows:
+                        attempt.status = "failed"
+                        attempt.stage = "interrupted"
+                        attempt.error = "Manager restarted before the browser attempt ended"
+                        attempt.completed_at = datetime.utcnow()
+                    await db.commit()
+                return len(runs)
+
+    async def shutdown(self) -> None:
+        tasks = [task for task in self._pipelines.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _register_pipeline(self, run_id: str, task: asyncio.Task[None]) -> None:
+        existing = self._pipelines.get(run_id)
+        if existing is not None and not existing.done() and existing is not task:
+            task.cancel()
+            raise TestHarnessBusyError("Harness run already owns a pipeline")
+        self._pipelines[run_id] = task
+
+        def _done(done: asyncio.Task[None]) -> None:
+            if self._pipelines.get(run_id) is done:
+                self._pipelines.pop(run_id, None)
+
+        task.add_done_callback(_done)
+
+
+def _workspace_stage_title(stage: str) -> str:
+    return {
+        "fingerprinted": "工作区指纹已记录",
+        "starting_preview": "正在启动隔离预览",
+        "preview_ready": "隔离预览已就绪",
+        "browser_agent_queued": "黑盒浏览器 Agent 已排队",
+        "browser_ready": "浏览器已打开页面",
+        "executing_actions": "正在执行测试场景",
+        "completed": "测试运行已完成",
+        "stale": "测试结果已过期",
+        "failed": "测试运行失败",
+        "cancelled": "测试运行已停止",
+        "interrupted": "测试被服务重启中断",
+    }.get(stage, stage.replace("_", " "))
+
+
+def _browser_stage_title(stage: str) -> str:
+    return {
+        "queued": "浏览器任务等待执行",
+        "waiting_for_agent": "等待黑盒 Agent",
+        "waiting_for_browser": "等待浏览器启动",
+        "agent_starting": "黑盒 Agent 正在启动",
+        "browser_ready": "浏览器页面已打开",
+        "executing_actions": "浏览器正在验证页面",
+        "agent_reported": "Agent 已提交结构化结果",
+        "completed": "浏览器测试已完成",
+        "failed": "浏览器测试失败",
+        "cancelled": "浏览器测试已停止",
+    }.get(stage, stage.replace("_", " "))
+
+
+def _safe_error(exc: BaseException) -> str:
+    value = str(exc).strip() or exc.__class__.__name__
+    return value[:4000]
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _json_copy(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+test_harness_service = TestHarnessService()

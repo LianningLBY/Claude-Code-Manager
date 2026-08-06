@@ -701,6 +701,11 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     target_worker_id = data.get("worker_id")
     if project is None:
         await require_worker_target_access(request, target_worker_id, db)
+    if body.frontend_review is not None and target_worker_id is not None:
+        raise HTTPException(
+            400,
+            "Frontend Review Goal currently requires a Manager-local Project",
+        )
 
     if data.get("id") is None:
         data.pop("id", None)  # 未指定 → 正常自增；指定 → 用 Manager 分配的全局 ID
@@ -709,6 +714,7 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
     attachments = data.pop("attachments", None)
     secret_ids = data.pop("secret_ids", None)
     clone_from_task_id = data.pop("clone_from_task_id", None)
+    frontend_review = data.pop("frontend_review", None)
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
     if user_skill_snapshots is not None:
         require_admin(request)
@@ -720,6 +726,24 @@ async def create_task(request: Request, body: TaskCreate, queue: TaskQueue = Dep
         meta["attachments"] = attachments
     if secret_ids:
         meta["secret_ids"] = secret_ids
+    if frontend_review is not None:
+        from backend.services.frontend_review_goal import (
+            FRONTEND_REVIEW_METADATA_KEY,
+            build_frontend_review_goal_condition,
+            frontend_review_goal_config,
+        )
+
+        normalized_frontend_review = frontend_review_goal_config({
+            FRONTEND_REVIEW_METADATA_KEY: frontend_review,
+        })
+        if normalized_frontend_review is None:  # defensive: schema validates this
+            raise HTTPException(422, "Invalid Frontend Review Goal configuration")
+        meta[FRONTEND_REVIEW_METADATA_KEY] = normalized_frontend_review
+        data["mode"] = "goal"
+        data["goal_max_turns"] = normalized_frontend_review["max_iterations"]
+        data["goal_condition"] = build_frontend_review_goal_condition(
+            data.get("goal_condition")
+        )
     if user_skill_snapshots is not None:
         from backend.services.skill_context import (
             USER_SKILL_SNAPSHOTS_METADATA_KEY,
@@ -824,6 +848,7 @@ async def import_migrated_task(
     data = body.model_dump()
     source_status = data.pop("source_status")
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
+    frontend_review = data.pop("frontend_review", None)
     for transient_field in (
         "image_paths",
         "file_paths",
@@ -844,6 +869,25 @@ async def import_migrated_task(
         migration_metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = (
             user_skill_snapshots
         )
+    if frontend_review is not None:
+        from backend.services.frontend_review_goal import (
+            FRONTEND_REVIEW_METADATA_KEY,
+            build_frontend_review_goal_condition,
+            frontend_review_goal_config,
+        )
+
+        normalized_frontend_review = frontend_review_goal_config({
+            FRONTEND_REVIEW_METADATA_KEY: frontend_review,
+        })
+        if normalized_frontend_review is not None:
+            migration_metadata[FRONTEND_REVIEW_METADATA_KEY] = (
+                normalized_frontend_review
+            )
+            data["mode"] = "goal"
+            data["goal_max_turns"] = normalized_frontend_review["max_iterations"]
+            data["goal_condition"] = build_frontend_review_goal_condition(
+                data.get("goal_condition")
+            )
     data["metadata_"] = migration_metadata
     data.update(
         worker_id=None,
@@ -2278,6 +2322,9 @@ async def _retry_local_task_safely(
     task_id: int,
     queue: TaskQueue,
     db: AsyncSession,
+    *,
+    task_updates: dict | None = None,
+    commit: bool = True,
 ) -> Task | None:
     """Retry without discarding evidence of a possibly-live orphan process.
 
@@ -2496,6 +2543,8 @@ async def _retry_local_task_safely(
             expected_statuses=(observed_status,),
             generation_fence=observed_generation,
             rollback_on_miss=True,
+            task_updates=task_updates,
+            commit=commit,
         )
         if retried is None:
             raise HTTPException(
@@ -3068,6 +3117,8 @@ async def _stop_task_session_local_impl(
                 "ok": True,
                 "stopped": False,
                 "cleared_messages": cleared,
+                "task_status": active_task.status,
+                "background_active": False,
             }
         await db.rollback()
         raise HTTPException(400, "No running session found for this task")
@@ -3223,6 +3274,8 @@ async def _stop_task_session_local_impl(
             "ok": True,
             "stopped": True,
             "cleared_messages": cleared,
+            "task_status": expected_status,
+            "background_active": False,
         }
 
     if observed_background_generation is not None:
@@ -3296,6 +3349,8 @@ async def _stop_task_session_local_impl(
             "ok": True,
             "stopped": True,
             "cleared_messages": cleared,
+            "task_status": observed_status,
+            "background_active": False,
         }
 
     transitioned = observed_status in {"executing", "in_progress"}
@@ -3352,6 +3407,8 @@ async def _stop_task_session_local_impl(
             "stopped": False,
             "cleared_messages": cleared,
             "note": "No running process found, task marked as completed",
+            "task_status": "completed",
+            "background_active": False,
         }
 
     guarded = await db.execute(
@@ -3366,13 +3423,16 @@ async def _stop_task_session_local_impl(
             "Task generation changed while stopping its session",
         )
     await db.commit()
-    if cleared:
-        return {
-            "ok": True,
-            "stopped": False,
-            "cleared_messages": cleared,
-        }
-    raise HTTPException(400, "No running session found for this task")
+    return {
+        "ok": True,
+        "stopped": False,
+        "cleared_messages": cleared,
+        "note": (
+            f"Task is already {active_task.status}; no running process found"
+        ),
+        "task_status": active_task.status,
+        "background_active": False,
+    }
 
 
 @router.post("/{task_id}/stop-session")

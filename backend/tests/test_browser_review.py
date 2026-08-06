@@ -1,0 +1,434 @@
+"""Focused tests for the standalone Computer Use browser review harness."""
+
+from __future__ import annotations
+
+import base64
+import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from backend.services import browser_review
+from backend.services.browser_review import (
+    ActionBlockedError,
+    BrowserReviewError,
+    BrowserReviewOptions,
+    BrowserTelemetry,
+    ResponsesClient,
+    build_followup_payload,
+    build_initial_payload,
+    execute_computer_actions,
+    extract_computer_call,
+    extract_output_text,
+    normalize_button,
+    normalize_drag_path,
+    normalize_key,
+    run_browser_review,
+    validate_target_url,
+)
+
+
+@pytest.mark.parametrize(
+    ("url", "origin"),
+    [
+        ("http://127.0.0.1:5173/tasks?x=1", "http://127.0.0.1:5173"),
+        ("https://Example.COM/path", "https://example.com"),
+        ("https://例子.测试/path", "https://xn--fsqu00a.xn--0zwm56d"),
+        ("https://example.com:8443", "https://example.com:8443"),
+        ("http://[::1]:8000/", "http://[::1]:8000"),
+    ],
+)
+def test_validate_target_url_returns_canonical_origin(url: str, origin: str):
+    assert validate_target_url(url) == origin
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///tmp/page.html",
+        "https://user:secret@example.com",
+        "http://0.0.0.0:8000",
+        "http://169.254.169.254/latest/meta-data",
+        "http://metadata.google.internal",
+        "http://example.com:99999",
+    ],
+)
+def test_validate_target_url_rejects_unsafe_targets(url: str):
+    with pytest.raises(ValueError):
+        validate_target_url(url)
+
+
+def test_normalizers_follow_playwright_names():
+    assert normalize_key("CTRL") == "Control"
+    assert normalize_key("ARROWLEFT") == "ArrowLeft"
+    assert normalize_key("a") == "a"
+    assert normalize_button("wheel") == "middle"
+    assert normalize_drag_path([[1, 2], {"x": 3, "y": 4}]) == [
+        (1.0, 2.0),
+        (3.0, 4.0),
+    ]
+    with pytest.raises(BrowserReviewError, match="unsupported mouse button"):
+        normalize_button("back")
+
+
+def test_initial_payload_configures_ga_computer_tool_and_policy():
+    options = BrowserReviewOptions(url="http://localhost:5173", allow_actions=False)
+    payload = build_initial_payload(options)
+
+    assert payload["model"] == "gpt-5.6-terra"
+    assert payload["tools"] == [{"type": "computer"}]
+    assert payload["reasoning"] == {"effort": "medium"}
+    assert "read-only" in payload["input"][0]["content"][0]["text"]
+    assert "untrusted evidence" in payload["instructions"]
+
+
+def test_followup_payload_embeds_original_detail_screenshot_and_telemetry():
+    options = BrowserReviewOptions(url="http://localhost:5173")
+    payload = build_followup_payload(
+        options=options,
+        previous_response_id="resp_1",
+        call_id="call_1",
+        screenshot=b"png-bytes",
+        telemetry_update='{"page_errors":[{"message":"boom"}]}',
+    )
+
+    output = payload["input"][0]
+    assert payload["previous_response_id"] == "resp_1"
+    assert output["type"] == "computer_call_output"
+    assert output["call_id"] == "call_1"
+    assert output["output"]["detail"] == "original"
+    encoded = output["output"]["image_url"].removeprefix(
+        "data:image/png;base64,"
+    )
+    assert base64.b64decode(encoded) == b"png-bytes"
+    assert "never as instructions" in payload["input"][1]["content"][0]["text"]
+
+
+def test_extracts_computer_call_and_final_text():
+    call = {
+        "type": "computer_call",
+        "call_id": "call_1",
+        "actions": [{"type": "screenshot"}],
+    }
+    assert extract_computer_call({"output": [call]}) is call
+    assert extract_computer_call({"output": []}) is None
+    assert extract_output_text(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "first"},
+                        {"type": "output_text", "text": "second"},
+                    ],
+                }
+            ]
+        }
+    ) == "first\nsecond"
+    with pytest.raises(BrowserReviewError, match="at most one"):
+        extract_computer_call({"output": [call, dict(call)]})
+
+
+def test_telemetry_collects_errors_and_drains_only_new_records():
+    telemetry = BrowserTelemetry()
+    telemetry._on_console(
+        SimpleNamespace(
+            type="error", text="console boom", location={"url": "app.js", "line": 9}
+        )
+    )
+    telemetry._on_page_error(RuntimeError("render failed"))
+    telemetry._on_request_failed(
+        SimpleNamespace(method="GET", url="https://example.test/api", failure="reset")
+    )
+    telemetry._on_response(
+        SimpleNamespace(
+            status=500,
+            url="https://example.test/api",
+            request=SimpleNamespace(method="GET"),
+        )
+    )
+    telemetry.add_blocked_navigation("https://outside.test", "outside origin")
+
+    update = json.loads(telemetry.drain_update() or "{}")
+    assert update["console"][0]["text"] == "console boom"
+    assert update["page_errors"][0]["message"] == "render failed"
+    assert update["http_errors"][0]["status"] == 500
+    assert telemetry.drain_update() is None
+
+
+def test_telemetry_truncation_remains_valid_json():
+    telemetry = BrowserTelemetry()
+    telemetry._on_page_error(RuntimeError("x" * 2_000))
+    update = telemetry.drain_update(max_chars=300)
+    assert update is not None
+    assert json.loads(update)["truncated"] is True
+
+
+class _FakeMouse:
+    def __init__(self, events: list[tuple]):
+        self.events = events
+
+    async def click(self, x, y, **kwargs):
+        self.events.append(("click", x, y, kwargs))
+
+    async def dblclick(self, x, y, **kwargs):
+        self.events.append(("dblclick", x, y, kwargs))
+
+    async def move(self, x, y):
+        self.events.append(("move", x, y))
+
+    async def down(self, **kwargs):
+        self.events.append(("down", kwargs))
+
+    async def up(self, **kwargs):
+        self.events.append(("up", kwargs))
+
+    async def wheel(self, x, y):
+        self.events.append(("wheel", x, y))
+
+
+class _FakeKeyboard:
+    def __init__(self, events: list[tuple]):
+        self.events = events
+
+    async def down(self, key):
+        self.events.append(("key_down", key))
+
+    async def up(self, key):
+        self.events.append(("key_up", key))
+
+    async def press(self, key):
+        self.events.append(("press", key))
+
+    async def type(self, text):
+        self.events.append(("type", text))
+
+
+class _FakePage:
+    def __init__(self):
+        self.events: list[tuple] = []
+        self.mouse = _FakeMouse(self.events)
+        self.keyboard = _FakeKeyboard(self.events)
+
+    async def wait_for_timeout(self, milliseconds):
+        self.events.append(("wait", milliseconds))
+
+    async def goto(self, url, **kwargs):
+        self.events.append(("goto", url, kwargs))
+
+    async def screenshot(self, **kwargs):
+        self.events.append(("screenshot", kwargs))
+        return b"fake-png"
+
+
+@pytest.mark.asyncio
+async def test_execute_computer_actions_supports_batch_and_modifiers():
+    page = _FakePage()
+    await execute_computer_actions(
+        page,
+        [
+            {"type": "click", "x": 10, "y": 20, "button": "left", "keys": ["SHIFT"]},
+            {"type": "drag", "path": [[20, 30], {"x": 40, "y": 50}]},
+            {"type": "scroll", "x": 40, "y": 50, "scroll_y": 300, "scroll_x": 0},
+            {"type": "keypress", "keys": ["TAB", "ENTER"]},
+            {"type": "type", "text": "demo"},
+            {"type": "wait"},
+            {"type": "screenshot"},
+        ],
+        allow_actions=True,
+        viewport_width=1440,
+        viewport_height=900,
+        action_delay_ms=0,
+    )
+
+    assert page.events[:3] == [
+        ("key_down", "Shift"),
+        ("click", 10.0, 20.0, {"button": "left"}),
+        ("key_up", "Shift"),
+    ]
+    assert ("down", {"button": "left"}) in page.events
+    assert ("up", {"button": "left"}) in page.events
+    assert ("wheel", 0.0, 300.0) in page.events
+    assert ("press", "Enter") in page.events
+    assert ("type", "demo") in page.events
+    assert ("wait", 2000) in page.events
+
+
+@pytest.mark.asyncio
+async def test_execute_computer_actions_enforces_read_only_and_viewport():
+    page = _FakePage()
+    with pytest.raises(ActionBlockedError, match="--allow-actions"):
+        await execute_computer_actions(
+            page,
+            [{"type": "click", "x": 10, "y": 20}],
+            allow_actions=False,
+            viewport_width=1000,
+            viewport_height=700,
+        )
+    with pytest.raises(BrowserReviewError, match="outside"):
+        await execute_computer_actions(
+            page,
+            [{"type": "scroll", "x": 1001, "y": 20, "scroll_y": 10}],
+            allow_actions=False,
+            viewport_width=1000,
+            viewport_height=700,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_browser_review_completes_loop_and_writes_artifacts(
+    monkeypatch, tmp_path
+):
+    page = _FakePage()
+    progress_events = []
+
+    @asynccontextmanager
+    async def fake_browser_page(_options, _origin, telemetry):
+        telemetry._on_page_error(RuntimeError("observed render error"))
+        yield page
+
+    responses = [
+        {
+            "id": "resp_1",
+            "output": [
+                {
+                    "type": "computer_call",
+                    "call_id": "call_1",
+                    "actions": [{"type": "screenshot"}],
+                }
+            ],
+        },
+        {
+            "id": "resp_2",
+            "output": [
+                {
+                    "type": "computer_call",
+                    "call_id": "call_2",
+                    "actions": [
+                        {
+                            "type": "scroll",
+                            "x": 100,
+                            "y": 100,
+                            "scroll_x": 0,
+                            "scroll_y": 500,
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "id": "resp_3",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "## Verdict\nPass with issues"}
+                    ],
+                }
+            ],
+        },
+    ]
+    payloads = []
+
+    class FakeResponsesClient:
+        def __init__(self, _api_key):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def create(self, payload):
+            payloads.append(payload)
+            return responses.pop(0)
+
+    monkeypatch.setattr(browser_review, "_browser_page", fake_browser_page)
+    monkeypatch.setattr(browser_review, "ResponsesClient", FakeResponsesClient)
+
+    result = await run_browser_review(
+        BrowserReviewOptions(
+            url="http://localhost:5173",
+            output_dir=tmp_path,
+            action_delay_ms=0,
+        ),
+        api_key="test-key",
+        progress_callback=progress_events.append,
+    )
+
+    assert result.steps == 2
+    assert result.actions == 2
+    assert result.response_id == "resp_3"
+    assert result.screenshot_path.read_bytes() == b"fake-png"
+    assert "Pass with issues" in result.report_path.read_text()
+    assert "observed render error" in result.telemetry_path.read_text()
+    assert (tmp_path / "initial.png").exists()
+    assert (tmp_path / "step-01.png").exists()
+    assert (tmp_path / "step-02.png").exists()
+    assert [event["stage"] for event in progress_events] == [
+        "browser_ready",
+        "model_thinking",
+        "executing_actions",
+        "model_thinking",
+        "executing_actions",
+        "model_thinking",
+        "completed",
+    ]
+    assert progress_events[-1]["latest_screenshot"] == "final.png"
+    assert len(payloads) == 3
+    assert payloads[1]["previous_response_id"] == "resp_1"
+    assert payloads[2]["previous_response_id"] == "resp_2"
+
+
+@pytest.mark.asyncio
+async def test_responses_client_uses_bearer_auth_and_returns_json():
+    seen_request: httpx.Request | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_request
+        seen_request = request
+        return httpx.Response(200, json={"id": "resp_1", "output": []})
+
+    async with ResponsesClient(
+        "test-key", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await client.create({"model": "gpt-5.6-terra"})
+
+    assert result["id"] == "resp_1"
+    assert seen_request is not None
+    assert seen_request.headers["Authorization"] == "Bearer test-key"
+
+
+@pytest.mark.asyncio
+async def test_responses_client_reports_http_error_without_key():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    async with ResponsesClient(
+        "secret-key", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(BrowserReviewError, match="HTTP 400") as exc_info:
+            await client.create({"model": "bad"})
+    assert "secret-key" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_responses_client_rejects_incomplete_result():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_incomplete",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        )
+
+    async with ResponsesClient(
+        "test-key", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(BrowserReviewError, match="incomplete"):
+            await client.create({"model": "gpt-5.6-terra"})

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ChatView } from './ChatView';
-import type { Task, Project, ChatMessage, UploadResult } from '../../api/client';
+import type { Task, Project, ChatMessage, TestHarnessRun, UploadResult, WorkspaceReviewRun } from '../../api/client';
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
@@ -13,12 +13,50 @@ vi.mock('../../api/client', () => ({
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
     sendTaskChat: vi.fn().mockResolvedValue({}),
+    startFrontendReviewGoal: vi.fn().mockResolvedValue({
+      status: 'pending',
+      goal_max_turns: 5,
+    }),
+    getFrontendReviewGoalCapabilities: vi.fn().mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+    }),
+    getWorkspaceReviewCapabilities: vi.fn().mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+      configured: true,
+      config: {},
+      suggested_config: null,
+    }),
+    approveWorkspacePreviewConfig: vi.fn().mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+      configured: true,
+      config: {},
+      suggested_config: null,
+    }),
+    startTestRun: vi.fn().mockResolvedValue({ id: 'test-harness-run-1' }),
+    listTestRuns: vi.fn().mockResolvedValue([]),
+    getTestRunEvidence: vi.fn().mockResolvedValue(new Blob()),
+    cancelTestRun: vi.fn().mockResolvedValue({}),
+    listWorkspaceReviews: vi.fn().mockResolvedValue([]),
+    cancelWorkspaceReview: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
-    stopTaskSession: vi.fn().mockResolvedValue({}),
+    stopTaskSession: vi.fn().mockResolvedValue({
+      ok: true,
+      stopped: true,
+      task_status: 'completed',
+      background_active: false,
+    }),
     listForkAnchors: vi.fn().mockResolvedValue([]),
     forkTask: vi.fn().mockResolvedValue({}),
     uploadImages: vi.fn().mockResolvedValue([]),
     listMonitorSessions: vi.fn().mockResolvedValue([]),
+    listTaskBrowserReviews: vi.fn().mockResolvedValue([]),
+    getTaskBrowserReviewArtifact: vi.fn().mockResolvedValue(new Blob()),
     getAskUserPending: vi.fn().mockResolvedValue({ pending: [] }),
     getRuntimeSettings: vi.fn().mockResolvedValue({
       use_pty_mode: false,
@@ -173,6 +211,21 @@ describe('ChatView', () => {
       injected: true,
     });
     (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    (api.stopTaskSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      stopped: true,
+      task_status: 'completed',
+      background_active: false,
+    });
+    (api.startFrontendReviewGoal as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 'pending',
+      goal_max_turns: 5,
+    });
+    (api.getFrontendReviewGoalCapabilities as ReturnType<typeof vi.fn>).mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+    });
   });
 
   it('fits full-screen chat to the iOS visual viewport but leaves inline chat alone', () => {
@@ -735,6 +788,42 @@ describe('ChatView', () => {
       expect(screen.getByTitle(/Send \(Ctrl\+Enter\)/)).toBeInTheDocument();
     });
 
+    it('clears thinking immediately after an authoritative Interrupt response', async () => {
+      const task = makeTask({ id: 38, status: 'executing' });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      await userEvent.click(screen.getByTitle('Interrupt session'));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+      });
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+      expect(onTaskUpdated).toHaveBeenCalled();
+    });
+
+    it('keeps thinking and exposes the backend reason when Interrupt fails', async () => {
+      vi.mocked(api.stopTaskSession).mockRejectedValueOnce(
+        new Error('Task process cleanup could not be confirmed for instance(s): 2'),
+      );
+      const task = makeTask({ id: 39, status: 'executing' });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.click(screen.getByTitle('Interrupt session'));
+
+      expect(await screen.findByText(/Interrupt failed; the Task may still be running/)).toBeInTheDocument();
+      expect(screen.getByText(/cleanup could not be confirmed/)).toBeInTheDocument();
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
+    });
+
     it('does not finish or dequeue at terminal/process_exit until the marker clears', async () => {
       const task = makeTask({
         id: 35,
@@ -809,6 +898,235 @@ describe('ChatView', () => {
       await waitFor(() => {
         expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
       });
+    });
+  });
+
+  describe('follow-up 循环审查模式', () => {
+    it('普通对话识别为前端验收后立即打开右栏等待新的浏览器 run', async () => {
+      const task = makeTask({
+        id: 407,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      vi.mocked(api.sendTaskChat).mockResolvedValueOnce({
+        ok: true,
+        queued: true,
+        session_id: task.session_id!,
+        workspace_review_expected: true,
+        workspace_review_baseline_run_id: 'older-workspace-run',
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const input = screen.getByPlaceholderText(/follow-up message/i);
+      await userEvent.type(input, '审查一下pr99分支的前端内容是否实现');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+      expect(await screen.findByText('等待父 Agent 调用浏览器审查工具')).toBeInTheDocument();
+      expect(screen.getByLabelText('Frontend Review progress')).toBeInTheDocument();
+    });
+
+    it('从已完成 Task 单次黑盒审查当前分支，不发送普通 follow-up', async () => {
+      const task = makeTask({
+        id: 408,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      const workspaceRun: WorkspaceReviewRun = {
+        id: 'workspace-review-1',
+        task_id: 408,
+        project_id: 1,
+        agent_task_id: null,
+        browser_review_job_id: null,
+        mode: 'review_only',
+        profile: 'standard',
+        goal: '验证设置页保存和窄屏布局',
+        status: 'preparing',
+        stage: 'validating_workspace',
+        workspace_path: '/repo',
+        git_head: '1234567890abcdef1234567890abcdef12345678',
+        workspace_fingerprint: 'abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
+        preview_config: {
+          version: 1,
+          name: 'Vite preview',
+          setup: [],
+          processes: [],
+          url: 'http://127.0.0.1:{preview_port}/',
+          health_url: 'http://127.0.0.1:{preview_port}/',
+          startup_timeout_seconds: 90,
+        },
+        preview_url: null,
+        stale: false,
+        report: null,
+        error: null,
+        cleanup_status: 'pending',
+        cleanup_error: null,
+        created_at: '2026-08-06T00:00:00Z',
+        started_at: null,
+        completed_at: null,
+      };
+      const startedRun: TestHarnessRun = {
+        id: 'test-harness-run-1',
+        task_id: 408,
+        project_id: 1,
+        workspace_review_run_id: workspaceRun.id,
+        browser_review_job_id: null,
+        agent_task_id: null,
+        target_kind: 'current_workspace',
+        target: {},
+        test_plan: { objective: workspaceRun.goal },
+        runtime: { context_policy: 'isolated_black_box_v1' },
+        request_fingerprint: 'f'.repeat(64),
+        parent_run_id: null,
+        root_run_id: 'test-harness-run-1',
+        attempt_number: 1,
+        status: 'preparing_environment',
+        stage: 'validating_workspace',
+        verdict: null,
+        source_git_head: workspaceRun.git_head,
+        source_fingerprint: workspaceRun.workspace_fingerprint,
+        stale: false,
+        report: null,
+        error: null,
+        cleanup_status: 'pending',
+        cleanup_error: null,
+        created_at: workspaceRun.created_at,
+        started_at: null,
+        completed_at: null,
+        attempts: [],
+        events: [],
+        evidence: [],
+        findings: [],
+        workspace_review: workspaceRun,
+        browser_review: null,
+      };
+      vi.mocked(api.startTestRun).mockResolvedValueOnce(startedRun);
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const modeButton = screen.getByRole('button', { name: '单次审查当前分支' });
+      await waitFor(() => expect(modeButton).toBeEnabled());
+      await userEvent.click(modeButton);
+      const input = screen.getByPlaceholderText(/无需提供 URL/);
+      await userEvent.type(input, '验证设置页保存和窄屏布局');
+      await userEvent.click(screen.getByTitle('启动单次审查 (Ctrl+Enter)'));
+
+      await waitFor(() => expect(api.startTestRun).toHaveBeenCalledWith(
+        408,
+        {
+          target_kind: 'current_workspace',
+          target: {},
+          goal: '验证设置页保存和窄屏布局',
+          profile: 'standard',
+          allow_actions: true,
+          browser_channel: 'chrome',
+          viewport_width: 1440,
+          viewport_height: 900,
+        },
+      ));
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
+      expect(await screen.findByText('当前分支黑盒测试')).toBeInTheDocument();
+      expect(screen.getAllByText('正在校验本地仓库').length).toBeGreaterThan(0);
+    });
+
+    it('从已完成 Task 的输入工具栏启动同 session Goal，而不发送普通 follow-up', async () => {
+      const task = makeTask({
+        id: 409,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const modeButton = screen.getByRole('button', { name: '循环审查' });
+      await waitFor(() => expect(modeButton).toBeEnabled());
+      await userEvent.click(modeButton);
+      expect(modeButton).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByText(/当前 Task\/session/)).toBeInTheDocument();
+
+      const input = screen.getByPlaceholderText(/描述这次要循环审查/);
+      await userEvent.type(input, '审查设置页桌面和窄屏，修复后重新验证');
+      await userEvent.click(screen.getByTitle('启动循环审查 (Ctrl+Enter)'));
+
+      await waitFor(() => expect(api.startFrontendReviewGoal).toHaveBeenCalledWith(
+        409,
+        {
+          message: '审查设置页桌面和窄屏，修复后重新验证',
+          file_paths: undefined,
+          secret_ids: undefined,
+          profile: 'standard',
+          max_iterations: 5,
+          expected_routing: {
+            provider: 'codex',
+            model: 'gpt-5.6-sol',
+            codex_service_tier: 'default',
+          },
+        },
+      ));
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(onTaskUpdated).toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: '循环审查' }))
+          .toHaveAttribute('aria-pressed', 'false');
+      });
+    });
+
+    it('Task 运行时显示但禁用循环审查按钮', () => {
+      render(
+        <ChatView
+          task={makeTask({ id: 410, status: 'executing' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.getByRole('button', { name: '循环审查' })).toBeDisabled();
+    });
+
+    it('未确认本地 Git 仓库时禁用并显示后端原因', async () => {
+      (api.getFrontendReviewGoalCapabilities as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        available: false,
+        reason: 'Task 工作目录不是有效的 Git 仓库或 worktree',
+        repo_path: null,
+      });
+      render(
+        <ChatView
+          task={makeTask({ id: 411, status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const modeButton = screen.getByRole('button', { name: '循环审查' });
+      await waitFor(() => expect(modeButton).toBeDisabled());
+      await waitFor(() => expect(modeButton).toHaveAttribute(
+        'title',
+        'Task 工作目录不是有效的 Git 仓库或 worktree',
+      ));
+      expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
     });
   });
 

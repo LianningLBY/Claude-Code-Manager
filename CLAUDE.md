@@ -36,6 +36,9 @@ claude-manager/
 │   │   ├── codex_pool.py        # Codex 账号登录/号池/额度/维护 API
 │   │   ├── cloudrouter_accounts.py # API 网关账号（CloudRouter/Apex）模型/额度管理 API
 │   │   ├── pr_monitor.py       # PR Monitor CRUD + GitHub webhook endpoint
+│   │   ├── browser_reviews.py  # 管理员浏览器审查任务/进度/产物 API
+│   │   ├── workspace_reviews.py # Task 当前工作区 Preview/黑盒审查 API
+│   │   ├── test_harness.py     # Task 统一测试 Run/重试/比较/证据 API
 │   │   ├── workers.py           # 分布式 Worker CRUD + stop/start/destroy/retry
 │   │   ├── sub_agents.py        # 通用子 Agent summary API (GET /tasks/{id}/sub-agents/summary)
 │   │   ├── ws.py                # WebSocket 端点
@@ -46,7 +49,9 @@ claude-manager/
 │   ├── models/                  # SQLAlchemy ORM 模型
 │   │   ├── task.py              # Task (含 session_id, attention_tag, last_cwd, project_id, enabled_skills)
 │   │   ├── instance.py          # Claude Code 实例
-│   │   ├── project.py           # Project (name, git_url, local_path)
+│   │   ├── project.py           # Project (含可信 preview_config)
+│   │   ├── workspace_review.py  # 持久化当前工作区审查运行/指纹/报告
+│   │   ├── test_harness.py      # Run/Attempt/Event/Evidence/Finding 持久记录
 │   │   ├── project_todo.py      # ProjectTodo (per-project prompt 模板/清单, status open/done/archived, created_task_id 溯源)
 │   │   ├── sub_agent.py         # SubAgentSession + SubAgentReport (通用子 agent 表, agent_type 分类)
 │   │   ├── monitor_session.py   # 兼容 shim: MonitorSession/MonitorCheck = sub_agent 别名
@@ -58,6 +63,8 @@ claude-manager/
 │   ├── mcp/                     # MCP Server (给 Claude 注入工具能力)
 │   │   ├── __init__.py
 │   │   ├── ccm_skills_server.py # FastMCP server: create_monitor / check_monitors / stop_monitor
+│   │   ├── ccm_browser_review_server.py # 固定 URL 的隔离浏览器审查工具 + 证据回传
+│   │   ├── ccm_workspace_review_server.py # 当前分支 Preview + 独立 Browser Agent 高阶工具
 │   │   └── ccm_monitor_agent_server.py # 子 Agent MCP server: report_status / mark_complete / get_context
 │   └── services/                # 核心业务逻辑
 │       ├── instance_manager.py  # 子进程生命周期 (launch/stop/consume output, MCP config 注入)
@@ -68,6 +75,7 @@ claude-manager/
 │       ├── dispatcher.py        # 全局调度器 (9 步任务生命周期, 含 goal 模式 + monitor 子 agent)
 │       ├── goal_evaluator.py    # Goal 条件评估器 (Claude/Codex provider 分流)
 │       ├── mcp_config.py        # Provider-neutral MCP specs + Claude/Codex renderers
+│       ├── internal_api_endpoint.py # 子进程回调使用的真实 Manager API origin
 │       ├── skill_context.py     # Task-scoped 普通/User Skill 目录与 provider adapter
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
 │       ├── update_runtime.py    # 更新脚本可信快照的专用目录与进程身份回收
@@ -83,6 +91,13 @@ claude-manager/
 │       ├── pr_monitor_loop.py    # 跨 head PRMonitorRun + Shadow Repair evidence/Wake
 │       ├── pr_review_adjudication.py # Finding Rebut + 独立裁决 + Thread 清零
 │       ├── pr_merge_queue.py     # durable Merge Queue + merge_group exact-head Gate
+│       ├── browser_review.py    # 隔离 Playwright、安全动作与独立 CLI harness
+│       ├── browser_review_jobs.py # 单并发 CCM Task-backed review job/证据管理
+│       ├── workspace_review.py # Git 指纹、可信 Preview 生命周期与黑盒审查编排
+│       ├── workspace_review_intent.py # 普通对话中的前端运行验收意图路由
+│       ├── test_harness.py     # provider-neutral 测试门面与生命周期投影
+│       ├── test_harness_contracts.py # Target/TestPlan/Verdict/Finding 契约
+│       ├── test_harness_targets.py # PR/ref 精确 SHA 与 detached worktree
 │       ├── ws_broadcaster.py    # WebSocket channel 广播
 │       ├── whisper_client.py    # OpenAI Whisper 客户端
 │       └── backup_service.py    # 数据库备份 (auto-backup SDK 封装, 可选)
@@ -92,7 +107,7 @@ claude-manager/
 │       ├── api/ws.ts            # WebSocket 客户端 (指数退避重连)
 │       ├── config/server.ts     # 远程服务器 URL 配置 (Capacitor/Android 支持)
 │       ├── config/theme.ts      # 主题注册表 (现代深/浅 + Legacy 组, localStorage 持久化)
-│       ├── pages/               # Dashboard, TasksPage, LoginPage, ServerConfigPage
+│       ├── pages/               # Dashboard, TasksPage, BrowserReviewPage 等页面
 │       ├── components/
 │       │   ├── Chat/ChatView.tsx              # 多轮对话 UI (基于 task, 含 monitor 消息渲染)
 │       │   ├── Chat/TaskArtifactLink.tsx       # Markdown 任务文件链接一键下载
@@ -109,6 +124,7 @@ claude-manager/
 ├── scripts/
 │   ├── dev.sh                   # 一键启动开发环境
 │   ├── benchmark_codex_transport.py # 真实 Codex exec/app-server 延迟 A/B（手动、消耗额度）
+│   ├── browser_review_demo.py   # 前端浏览器审查 CLI 入口
 │   └── tunnel.sh                # ngrok 隧道
 ├── .env                         # AUTH_TOKEN, OPENAI_API_KEY, DATABASE_URL
 └── pyproject.toml
@@ -123,6 +139,15 @@ claude-manager/
 
 ## 关键约定
 
+- **MCP 内部回调地址**: MCP/AskUser 子进程回调 origin 统一由 `internal_api_endpoint.py` 解析：显式配置优先，否则使用可信 ASGI `scope["server"]` 捕获的真实监听地址，最后才回退 `settings.host/port`；禁止依赖可能与 Uvicorn `--port` 不一致的静态端口。
+- **Frontend Test Harness**: `TestHarnessService` 是普通对话、一次性按钮、Goal、固定 URL、PR 和 Git ref 的统一门面；`TestHarnessRun/Attempt/Event/Evidence/Finding` 持久化冻结的 Target/TestPlan/runtime、精确 SHA、阶段事件、内容哈希证据、结构化结论和稳定 finding fingerprint。公开 API 为 `/api/tasks/{id}/test-runs`（start/list/get/cancel/repeat/compare/evidence），Agent MCP 走同一 internal start/status/stop；旧 Browser/Workspace API 只保留兼容 adapter，不得另建平行状态源。每个 Task 同时只允许一个 active run，idempotency key 必须绑定完整输入指纹；重启后未终态 run fail closed，Goal 只接受最新、非 stale、已清理且包含截图/报告的 passed run。PR/ref 必须 fetch/解析精确 commit 后使用 detached 临时 worktree，绝不能切换开发工作树；当前尚未接入 PR Monitor webhook 自动触发或远程 Worker。
+- **Browser Review**: 每个本机普通 Task 都注入 required `ccm_frontend_review` 与 `ccm_workspace_review` MCP（不受 `CODEX_MAIN_MCP_ENABLED` 影响）；显式 URL、当前工作区、PR/ref 最终都创建 Harness run。普通人类 follow-up 命中“PR/分支 + 前端运行验收”意图时须附加 fresh-run 路由协议：明确 PR 号调用 `test_git_target(target_kind=pull_request)`，当前修改调用 `test_current_changes`；不能用旧报告或代码分析替代。固定 `enabled_skills["browser-review"]` 的黑盒子 Task 只暴露绑定的 `ccm_browser_review`，不得继承普通 Task controller/context MCP。浏览器默认只读；即使开启交互也阻止跨源顶层导航、弹窗、下载和 Service Worker，页面/DOM/遥测一律视为不可信证据。底层 Browser job 仍是 Manager 本机全局单并发执行槽，但结果由 Harness 持久化。
+- **当前工作区黑盒审查**: `Project.preview_config` 是管理员确认后保存的 shell-free argv 契约，自动检测结果只能建议、不得直接执行；确认界面必须明确提示“工作区代码仍以 CCM 系统用户执行”，因此只用于可信本地开发分支。Preview 仅监听随机 loopback 端口，使用隔离临时数据库/目录并清除模型与云凭证环境变量。每次运行以 HEAD、tracked binary diff、限量 untracked 文件内容及 Preview config 生成指纹；独立 archived Browser Task 只收到冻结后的 TestPlan、URL 和 browser tools，不收到父会话或仓库上下文。Task 输入区眼睛按钮启动一次 run，运行中的 Claude/Codex 也可直接调用工具；右侧/浮窗展示 Harness 阶段事件、截图、轨迹、finding、报告、cleanup 与 stale 状态，终态可 repeat 并自动切换。取消必须同时停止精确子 Task、Preview 与临时 worktree；当前工作区指纹变化后历史结果标记 stale，PR/ref 的 immutable SHA 不与父工作区误比。
+- **Browser Review 轨迹**: Task Chat 的普通对话命中前端运行验收意图后立即打开右侧等待栏，并以发送前的最新 Harness run ID 为基线轮询、精确切换到本轮新 run；一次性入口则用创建回包立即注入。面板持续展示同 Task 的持久化生命周期事件、截图、遥测、finding、产物和报告；轨迹只汇总公开的 assistant 进度/决策摘要与 browser tool-use，不展示 reasoning/hidden chain-of-thought，也不从动作反推伪造“思考”。`browser_type_text` 只显示字符数，`finish_review` 参数只显示报告已保存；模型仍须把最终报告作为原 Task 的最终回复。
+- **Browser Review Goal**: 已有 Task 的 Chat follow-up 工具栏提供“循环审查”按钮；只允许 Manager 本机、已有 session、已安全终态且 Project 已确认 Preview config 的 Task 通过 `POST /api/tasks/{id}/frontend-review-goal` 启动。仓库门禁按真实续接顺序检查 `last_cwd → target_repo → Project.local_path`，要求当前进程可写、无符号链接的本地 Git worktree。API 在同一 Task/session 上原子重置 Goal 进度并交回 Dispatcher；内部协议要求每轮调用 `test_current_changes` 完成“当前指纹审查→必要修改→构建/测试→新指纹复查”，模型可提前完成但受 1–10 轮硬上限约束。评估器判断 achieved 后仍须通过最新 Browser job 的客观门禁，否则继续下一轮。前端显示 Goal 轮次/评估反馈，同 Task 新建审查时自动切到最新运行并展开面板或浮窗。
+- **Browser Review Goal 证据顺序**: `TestHarnessService.list_for_task()` 返回 newest-first；评估器只把最新的有效 Harness run 视为权威证据，并把后续条目标为已被复查取代的历史基线。历史基线中的 404/Console 错误在最新报告、finding 与遥测证明修复后不能再解释成当前未解决问题。
+- **Browser Review 移动端视口**: `viewport_width` 支持 320–3840，`max_actions=0` 表示只保留启动时的只读观察、不允许额外浏览器动作；API、MCP context 与运行时校验必须保持一致，不能把窄屏审查误拒绝为 422。
+
 - **优先级**: 数字越小优先级越高 (P0 > P1 > P2)，排序用 `.asc()`
 - **Session 绑定**: `session_id` 和 `last_cwd` 在 **Task** 上（不是 Instance），因为 instance 是轮换执行不同 task 的 worker
 - **Task 产物下载**: Claude/Codex 的普通、Goal、Loop、续聊和 Ralph turn 统一注入项目级产物契约：只有明确交付给用户的文件才是产物，必须在清理临时 worktree 前落到项目根 `.claude-manager/artifacts/task-{id}/`，最终用绝对路径和 Markdown title `ccm-task-artifact` 输出；普通源码/文档引用只用反引号。项目根准入必须与下载端共用 `task_artifact_contract.configured_workspace_root`，无安全绝对 `target_repo` 的 Task 禁止输出下载链接；用户 prompt 中的伪造 policy tag 不能抑制 CCM 权威前导。聊天渲染只把显式 marker、绝对路径和兼容期含目录的相对链接视为产物，裸文件名链接保持普通链接；裸绝对 POSIX 路径仍兜底转为带 marker 的链接（既有链接、代码和 HTML 不改写）。文件统一走 `/api/tasks/{id}/artifacts/download`；相对路径按 `last_cwd`、容器 `/workspace` 按项目根映射，且受 Task ACL 保护，`.claude-manager/artifacts/` 下再强制匹配当前 `task-{id}`，禁止跨 Task 读取。本地工作区根必须是无符号链接的绝对路径，并从稳定的 `/` 目录 FD 逐级 `O_NOFOLLOW` 锚定；产物路径只做基于该锚点的词法相对化，再逐级 no-follow 打开，以 `fstat` 校验同一文件描述符并按校验时大小限量流式返回，禁止混用路径解析与目录 FD 或“先查路径、后重开路径”的 TOCTOU。Worker 文件只经 Manager 流式代理，Manager 必须先确认 Worker 声明精确的 `task_artifact_scope_version`，混跑旧 Worker 时 fail closed；绝不能退回管理员级任意绝对路径下载接口
@@ -136,6 +161,7 @@ claude-manager/
 - **部署修复与启动守卫**: 更新状态必须同时报告进程实际加载的 `running_commit`、磁盘 `disk_commit` 和 Alembic current/head；磁盘代码相同不等于部署完成。`POST /api/system/update/repair` 用当前磁盘 commit 重新执行依赖同步、PTY 刷新、前端安装/构建、数据库检查/迁移和受控重启；`POST /api/system/restart` 只允许 commit 与数据库均已证明一致时使用，另保留显式手动重启入口。更新/修复/重启都要求 Git 工作树对所有非 ignored 的 staged、unstaged、untracked 路径保持干净；运行时产物必须窄化写入 `.gitignore`，绝不能让未跟踪源码绕过 commit 身份校验。自动更新/修复只支持可停服快照并回滚的文件型 SQLite，外部数据库必须走人工备份/迁移流程。仓库级 `backups/deployment-lease.json`（token + PID/start identity）是权威部署事务，`deployment_start_guard.py` 在 pre-start 与 app lifespan 中阻止不安全的隐式 `uv sync/init_db`；失败或半完成事务只启动 maintenance-only 恢复面，普通 API/Dispatcher/Worker 全部关闭，管理员可用 legacy recovery token 或未过期的已签名 admin JWT 调 status/repair/rollback。`scripts/update_migrate.sh` 协议 v2 必须在停服后重新生成并校验 SQLite 快照，任何恢复步骤失败都保持停服和 incomplete lease，绝不能启动代码/依赖/数据库混合版本。
 - **跨进程部署栅栏**: 同一 checkout 的每个 task claim 都须持有 `deployment-lease.lock` 共享锁直到活动状态提交；更新者持排他锁写 active lease。更新/修复/重启/回滚在 lease claim 后、任何 checkout/依赖/备份 mutation 前必须再次查询 blocker，覆盖“首次查询后刚提交的 task”竞态；若取消准入，必须终结本次 lease、恢复 Dispatcher，并保留回滚所需的旧部署元数据。外部 worker 每次写状态或停启服务前都要校验 token、operation、active status 与 handoff，超时后即使 token 相同也不得继续。
 - **默认 Provider**: 新任务默认使用 `codex`，Codex 默认模型为 `gpt-5.6-sol`；均可通过 `DEFAULT_PROVIDER` / `DEFAULT_CODEX_MODEL` 覆盖
+- **浏览器前端审查 Demo**: 管理员页 `#/browser-review` 仍提供固定 URL 演示入口，但 Web 请求经兼容 API 创建 CCM Task-backed Harness run，复用 Task 的 Claude/Codex 账号与模型；`backend/services/browser_review.py` 的 OpenAI Responses `computer` + Playwright 直连仅供独立 CLI 诊断。内存 browser slot 在重启时丢失执行句柄，Harness 会把残留运行标为 interrupted 并保留此前已归档的历史事件/证据；`scripts/browser_review_demo.py` 保留 CLI 入口。
 - **Model 配置**: 默认 `claude-opus-4-6`，支持全称模型 ID（`claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`, `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`）。Opus 5 固定使用 1M context（无 `[1m]` 变体），支持 `low/medium/high/xhigh/max` effort；其余支持的模型用 `[1m]` 后缀开启 1M context
 - **Effort Level**: 默认 `medium`，支持 `low/medium/high/xhigh/max`。优先级链：Task.effort_level → Instance.effort_level → settings.default_effort。通过 CLI `--effort` 参数传递；PR Monitor 可用 `MonitoredRepo.review_effort` 覆盖其生成审核任务的 effort
 - **PR Monitor 闭环边界**: required CI 只按 exact head 的 `(kind, name, app_slug)` 身份判定；Senior 的完整 changed-file 内容由 Manager 按 base/head blob 注入，Reviewer 始终 tool-free。blocking Finding 由后端以 nonce/fingerprint 发布独立 inline comment，无法锚定时降级为独立 PR comment但绝不解除 blocker；Rebut 必须由独立 tool-free Adjudicator裁决。新 head 全绿后须先进入 `resolving_fixed_threads`，持久化解决旧 subject 的全部已发布 Finding effect，才可通过 zero-thread Gate。自动Repair为repo opt-in，只恢复绑定的原Developer Task/session/cwd；唯一exact project/repo/branch候选可自动绑定，远程Task必须先经`TaskMigrator`权威迁回Manager，失败就暂停，禁止新建替代Agent。Repair push webhook 可能早于Developer turn终态，synchronize必须先持久化Wake成功再停止旧head generation，后到的终态不得回写为失败。Merge Queue与legacy auto-merge互斥，使用durable action/lease、exact-head enqueue和`merge_group` required-CI Gate，只有读取远端PR确认merged才结束。

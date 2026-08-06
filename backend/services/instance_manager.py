@@ -1070,6 +1070,23 @@ class InstanceManager:
             and settings.codex_main_mcp_enabled
             and not pr_review_task
         )
+        browser_review_job_id = (
+            enabled_skills.get("browser-review")
+            if isinstance(enabled_skills, dict)
+            else None
+        )
+        codex_browser_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and isinstance(browser_review_job_id, str)
+            and browser_review_job_id.strip()
+        )
+        codex_frontend_review_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and not pr_review_task
+            and not codex_browser_mcp_required
+        )
         codex_sub_agent_mcp_required = bool(
             provider == "codex"
             and task_id is not None
@@ -1078,7 +1095,10 @@ class InstanceManager:
             and not pr_review_task
         )
         codex_mcp_required = (
-            codex_main_mcp_required or codex_sub_agent_mcp_required
+            codex_main_mcp_required
+            or codex_browser_mcp_required
+            or codex_frontend_review_mcp_required
+            or codex_sub_agent_mcp_required
         )
         codex_mcp_specs: tuple["McpServerSpec", ...] = ()
         codex_exec_route = "direct-exec"
@@ -1091,12 +1111,37 @@ class InstanceManager:
                 provider=provider,
                 codex_monitor_enabled=codex_monitor_enabled,
             )
-        elif codex_sub_agent_mcp_required:
-            from backend.services.mcp_config import (
-                build_sub_agent_controller_mcp_server_specs,
-            )
+        else:
+            direct_specs: list["McpServerSpec"] = []
+            if codex_browser_mcp_required:
+                from backend.services.mcp_config import (
+                    build_browser_review_mcp_server_specs,
+                )
 
-            codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
+                direct_specs.extend(
+                    build_browser_review_mcp_server_specs(browser_review_job_id)
+                )
+            elif codex_frontend_review_mcp_required:
+                from backend.services.mcp_config import (
+                    build_frontend_review_mcp_server_specs,
+                    build_workspace_review_mcp_server_specs,
+                )
+
+                direct_specs.extend(
+                    build_frontend_review_mcp_server_specs(task_id)
+                )
+                direct_specs.extend(
+                    build_workspace_review_mcp_server_specs(task_id)
+                )
+            if codex_sub_agent_mcp_required:
+                from backend.services.mcp_config import (
+                    build_sub_agent_controller_mcp_server_specs,
+                )
+
+                direct_specs.extend(
+                    build_sub_agent_controller_mcp_server_specs(task_id)
+                )
+            codex_mcp_specs = tuple(direct_specs)
 
         if (
             provider == "codex"
@@ -1193,7 +1238,11 @@ class InstanceManager:
                             "turn/start; exec fallback is disabled for Fast"
                         ) from exc
                     if (
-                        codex_main_mcp_required
+                        (
+                            codex_main_mcp_required
+                            or codex_browser_mcp_required
+                            or codex_frontend_review_mcp_required
+                        )
                         and not codex_sub_agent_mcp_required
                     ):
                         codex_exec_route = "safe-fallback"
@@ -1338,7 +1387,7 @@ class InstanceManager:
             task_id=task_id,
             skill_context=task_skill_context,
             codex_mcp_specs=(
-                codex_mcp_specs if codex_main_mcp_required else ()
+                codex_mcp_specs if codex_mcp_required else ()
             ),
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
@@ -1352,7 +1401,7 @@ class InstanceManager:
                 task_id,
                 instance_id,
                 config_dir,
-                codex_main_mcp_required,
+                codex_mcp_required,
             )
 
         # Must unset CLAUDE_CODE env var to avoid nested session detection
@@ -9952,6 +10001,29 @@ class InstanceManager:
                         instance_id,
                     )
             await self._pty_backend.stop(instance_id)
+            # claude-pty normally completes its asyncio-compatible proxy from
+            # the consumer's on_exit callback. A forced Interrupt may cancel
+            # that consumer after the native Session has already reaped the
+            # Claude process, leaving proxy.wait() blocked forever even though
+            # there is no live child left. Bridge only from exact native death
+            # evidence; a still-live or unknown Session remains fail-closed.
+            if process.returncode is None:
+                native_session = getattr(process, "session", None)
+                native_dead = (
+                    native_session is not None
+                    and getattr(native_session, "is_alive", None) is False
+                )
+                complete_proxy = getattr(process, "complete", None)
+                if native_dead and callable(complete_proxy):
+                    native_process = getattr(native_session, "_process", None)
+                    native_exit_code = getattr(
+                        native_process, "exit_code", None
+                    )
+                    complete_proxy(
+                        native_exit_code
+                        if isinstance(native_exit_code, int)
+                        else 130
+                    )
             try:
                 await self._wait_process_tree(instance_id, process, 10.0)
             except asyncio.TimeoutError:

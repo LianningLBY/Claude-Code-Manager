@@ -846,6 +846,8 @@ class TaskQueue:
         instance_id: int | None = None,
         generation_fence: TaskGenerationFence | None = None,
         rollback_on_miss: bool = False,
+        task_updates: dict | None = None,
+        commit: bool = True,
     ) -> Task | None:
         """CAS a retryable task back to pending and release old ownership.
 
@@ -865,18 +867,21 @@ class TaskQueue:
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicates, generation_fence)
+        values = {
+            "status": "pending",
+            "retry_count": Task.retry_count + 1,
+            "instance_id": None,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+            "pty_background_generation": None,
+        }
+        if task_updates:
+            values.update(task_updates)
         result = await self.db.execute(
             update(Task)
             .where(*predicates)
-            .values(
-                status="pending",
-                retry_count=Task.retry_count + 1,
-                instance_id=None,
-                error_message=None,
-                started_at=None,
-                completed_at=None,
-                pty_background_generation=None,
-            )
+            .values(**values)
         )
         if not result.rowcount:
             if rollback_on_miss:
@@ -887,7 +892,10 @@ class TaskQueue:
                 # in the same transaction opt into rollback_on_miss.
                 await self.db.commit()
             return None
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         self.db.expire_all()
         task = await self.get(task_id)
         if task is not None:

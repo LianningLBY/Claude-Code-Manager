@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import type { Components } from 'react-markdown';
 import { api, isApiRequestError } from '../../api/client';
-import type { ChatMessage, CodexForkAnchor, FileAttachment, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer } from '../../api/client';
+import type { ChatMessage, CodexForkAnchor, FileAttachment, FrontendReviewGoalCapabilities, InjectTaskAttachments, Task, Project, UploadResult, MonitorSession, AskUserQuestion, AskUserAnswer, WorkspaceReviewCapabilities, TestHarnessRun } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -23,6 +23,11 @@ import {
 } from '../../hooks/useFileUpload';
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
+import {
+  BrowserReviewPanel,
+  type BrowserReviewDisplayMode,
+  type BrowserReviewGoalProgress,
+} from './BrowserReviewPanel';
 import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
@@ -501,6 +506,108 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [forkSeedUploads, forkSeedUploadsConsumedKey, forkSeedUploadsKey]);
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
+  const [browserReviewAvailable, setBrowserReviewAvailable] = useState(false);
+  const [showBrowserReviewPanel, setShowBrowserReviewPanel] = useState(false);
+  const [frontendReviewComposerMode, setFrontendReviewComposerMode] = useState(false);
+  const [workspaceReviewComposerMode, setWorkspaceReviewComposerMode] = useState(false);
+  const [frontendReviewGoalCapability, setFrontendReviewGoalCapability] = useState<FrontendReviewGoalCapabilities | null>(null);
+  const [workspaceReviewCapability, setWorkspaceReviewCapability] = useState<WorkspaceReviewCapabilities | null>(null);
+  const [startedWorkspaceReview, setStartedWorkspaceReview] = useState<TestHarnessRun | null>(null);
+  const [expectedWorkspaceReviewBaseline, setExpectedWorkspaceReviewBaseline] = useState<string | null | undefined>(undefined);
+  const [frontendReviewGoalCapabilityLoading, setFrontendReviewGoalCapabilityLoading] = useState(false);
+  const [browserReviewDisplayMode, setBrowserReviewDisplayMode] = useState<BrowserReviewDisplayMode>(() => (
+    localStorage.getItem('ccm-browser-review-display-mode') === 'floating' ? 'floating' : 'docked'
+  ));
+  const previousBrowserReviewAvailable = useRef(false);
+  const handleBrowserReviewAvailable = useCallback((available: boolean) => {
+    setBrowserReviewAvailable(available);
+    if (available && !previousBrowserReviewAvailable.current) {
+      setShowBrowserReviewPanel(true);
+    }
+    previousBrowserReviewAvailable.current = available;
+  }, []);
+  const handleBrowserReviewDisplayModeChange = useCallback((mode: BrowserReviewDisplayMode) => {
+    setBrowserReviewDisplayMode(mode);
+    setShowBrowserReviewPanel(true);
+    try { localStorage.setItem('ccm-browser-review-display-mode', mode); } catch { /* storage may be unavailable */ }
+  }, []);
+  const handleNewBrowserReview = useCallback(() => {
+    setShowBrowserReviewPanel(true);
+  }, []);
+  const handleExpectedWorkspaceReviewFound = useCallback(() => {
+    setExpectedWorkspaceReviewBaseline(undefined);
+  }, []);
+
+  useEffect(() => {
+    previousBrowserReviewAvailable.current = false;
+    setBrowserReviewAvailable(false);
+    setShowBrowserReviewPanel(false);
+    setFrontendReviewComposerMode(false);
+    setWorkspaceReviewComposerMode(false);
+    setStartedWorkspaceReview(null);
+    setExpectedWorkspaceReviewBaseline(undefined);
+  }, [task.id]);
+
+  useEffect(() => {
+    let active = true;
+    setFrontendReviewGoalCapability(null);
+    setWorkspaceReviewCapability(null);
+    if (task.worker_id != null || task.shared_from_id != null || !task.session_id) {
+      setFrontendReviewGoalCapabilityLoading(false);
+      return () => { active = false; };
+    }
+    setFrontendReviewGoalCapabilityLoading(true);
+    Promise.all([
+      api.getFrontendReviewGoalCapabilities(task.id),
+      api.getWorkspaceReviewCapabilities(task.id),
+    ])
+      .then(([goalCapability, reviewCapability]) => {
+        if (active) {
+          setFrontendReviewGoalCapability(goalCapability);
+          setWorkspaceReviewCapability(reviewCapability);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setFrontendReviewGoalCapability({
+            available: false,
+            reason: '无法确认本地 Git 仓库，请刷新后重试',
+            repo_path: null,
+          });
+          setWorkspaceReviewCapability({
+            available: false,
+            reason: '无法确认本地 Git 仓库，请刷新后重试',
+            repo_path: null,
+            configured: false,
+            config: null,
+            suggested_config: null,
+          });
+        }
+      })
+      .finally(() => {
+        if (active) setFrontendReviewGoalCapabilityLoading(false);
+      });
+    return () => { active = false; };
+  }, [
+    task.id,
+    task.project_id,
+    task.session_id,
+    task.shared_from_id,
+    task.status,
+    task.target_repo,
+    task.worker_id,
+  ]);
+
+  useEffect(() => {
+    if (
+      frontendReviewGoalCapability?.available === false
+      || (workspaceReviewCapability !== null
+        && !workspaceReviewCapability.available
+        && workspaceReviewCapability.suggested_config === null)
+    ) {
+      setFrontendReviewComposerMode(false);
+    }
+  }, [frontendReviewGoalCapability?.available, workspaceReviewCapability]);
 
   // Distill state
   const [distillOpen, setDistillOpen] = useState(false);
@@ -516,6 +623,59 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
+  const workspaceReviewCanBeConfigured = (
+    workspaceReviewCapability?.available === true
+    || workspaceReviewCapability?.suggested_config != null
+  );
+  const canStartWorkspaceReview = (
+    task.worker_id == null
+    && task.shared_from_id == null
+    && Boolean(task.session_id)
+    && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
+    && !isProcessing
+    && workspaceReviewCanBeConfigured
+  );
+  const canStartFrontendReviewGoal = (
+    task.worker_id == null
+    && task.shared_from_id == null
+    && Boolean(task.session_id)
+    && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
+    && !isProcessing
+    && frontendReviewGoalCapability?.available === true
+    && workspaceReviewCanBeConfigured
+  );
+  const workspaceReviewUnavailableReason = !task.session_id
+    ? 'Task 完成并建立 session 后才能审查当前分支'
+    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+      ? 'Task 正在执行；Agent 可在对话中调用测试工具，或等待完成后从这里启动'
+      : frontendReviewGoalCapabilityLoading
+        ? '正在确认本地 Git 仓库与 Preview 配置…'
+        : workspaceReviewCapability?.reason || '当前 Task 没有可运行的本地 Preview';
+  const frontendReviewGoalUnavailableReason = !task.session_id
+    ? 'Task 完成并建立 session 后才能启动循环审查'
+    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+      ? 'Task 正在执行，请等待完成后再启动循环审查'
+      : frontendReviewGoalCapabilityLoading
+        ? '正在确认可修改的本地 Git 仓库…'
+        : workspaceReviewCapability?.reason || frontendReviewGoalCapability?.reason || '尚未确认存在可修改的本地 Git 仓库';
+  const isFrontendReviewGoal = task.metadata_?.frontend_review?.mode === 'goal';
+  const [frontendReviewGoalProgress, setFrontendReviewGoalProgress] = useState<BrowserReviewGoalProgress>({
+    turn: task.goal_turns_used || 0,
+    maxTurns: task.goal_max_turns || 5,
+    lastReason: task.goal_last_reason,
+    active: isProcessing,
+  });
+  useEffect(() => {
+    setFrontendReviewGoalProgress({
+      turn: task.goal_turns_used || 0,
+      maxTurns: task.goal_max_turns || 5,
+      lastReason: task.goal_last_reason,
+      active: ['pending', 'in_progress', 'executing'].includes(task.status),
+    });
+  }, [task.id, task.goal_turns_used, task.goal_max_turns, task.goal_last_reason, task.status]);
+  useEffect(() => {
+    setFrontendReviewGoalProgress((current) => ({ ...current, active: isProcessing }));
+  }, [isProcessing]);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const historyCursorRef = useRef<{
@@ -775,6 +935,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (msg.channel !== `task:${task.id}` || !msg.data) return;
 
     const eventType = msg.data.event_type as string || (msg.data.event as string);
+    if (eventType === 'goal_evaluation') {
+      setFrontendReviewGoalProgress({
+        turn: Number(msg.data.turn) || 0,
+        maxTurns: Number(msg.data.max_turns) || task.goal_max_turns || 5,
+        lastReason: typeof msg.data.reason === 'string' ? msg.data.reason : null,
+        active: !msg.data.achieved,
+      });
+      return;
+    }
     if (eventType === 'monitor_session_created' || eventType === 'monitor_session_status'
         || eventType === 'sub_agent_session_created' || eventType === 'sub_agent_session_status') {
       api.listMonitorSessions(task.id).then(setMonitorSessions).catch(() => {});
@@ -1156,7 +1325,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(task.id, next);
       return next;
     });
-  }, [markAskUserResolved, task.id, task.worker_id]);
+  }, [markAskUserResolved, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -1539,6 +1708,31 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   };
 
+  const ensureWorkspacePreviewConfigured = async (): Promise<boolean> => {
+    if (workspaceReviewCapability?.available) return true;
+    const suggestion = workspaceReviewCapability?.suggested_config;
+    if (!suggestion) {
+      setError(workspaceReviewCapability?.reason || '当前 Project 没有可用的 Preview 配置。');
+      return false;
+    }
+    const commands = [
+      ...suggestion.setup.map((item) => `${item.cwd}: ${item.command.join(' ')}`),
+      ...suggestion.processes.map((item) => `${item.cwd}: ${item.command.join(' ')}`),
+    ].join('\n');
+    const approved = window.confirm(
+      `首次运行需要保存并信任 Project Preview 配置。\n\n${suggestion.name}\n${commands}\n\n这些命令会以 CCM 当前系统用户执行该工作区代码；服务仅监听本机回环地址，模型/云凭证环境变量会被清除。只应确认你信任的本地分支。是否继续？`,
+    );
+    if (!approved) return false;
+    try {
+      const capability = await api.approveWorkspacePreviewConfig(task.id, suggestion);
+      setWorkspaceReviewCapability(capability);
+      return capability.available;
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : '保存 Preview 配置失败');
+      return false;
+    }
+  };
+
   const handleSend = async (overrideText?: string, fromQueue?: boolean, preUploadedResults?: UploadResult[]) => {
     const text = (overrideText ?? input).trim();
     const fileUploadResultsForTurn = dedupeUploadResults(
@@ -1572,6 +1766,49 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         uploadedResultsForTurn,
       );
       return;
+    }
+
+    if (frontendReviewComposerMode && !fromQueue && !canStartFrontendReviewGoal) {
+      setError(frontendReviewGoalUnavailableReason);
+      return;
+    }
+    if (workspaceReviewComposerMode && !fromQueue && !canStartWorkspaceReview) {
+      setError(workspaceReviewUnavailableReason);
+      return;
+    }
+    if (workspaceReviewComposerMode && !fromQueue) {
+      if (sendableAttachmentCount > 0) {
+        setError('单次黑盒审查暂不接收附件；请在目标分支中保存改动后再启动。');
+        return;
+      }
+      setSending(true);
+      setError(null);
+      try {
+        if (!await ensureWorkspacePreviewConfigured()) return;
+        const startedReview = await api.startTestRun(task.id, {
+          target_kind: 'current_workspace',
+          target: {},
+          goal: text,
+          profile: 'standard',
+          allow_actions: true,
+          browser_channel: 'chrome',
+          viewport_width: 1440,
+          viewport_height: 900,
+        });
+        setStartedWorkspaceReview(startedReview);
+        setInput('');
+        setWorkspaceReviewComposerMode(false);
+        setShowBrowserReviewPanel(true);
+        onTaskUpdated?.();
+      } catch (nextError) {
+        setError(nextError instanceof Error ? nextError.message : '启动当前分支审查失败');
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
+    if (frontendReviewComposerMode && !fromQueue) {
+      if (!await ensureWorkspacePreviewConfigured()) return;
     }
 
     // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
@@ -1621,18 +1858,48 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         setSending(true);
       }
 
-      await api.sendTaskChat(
-        task.id,
-        text || '(files attached)',
-        uploadedPaths,
-        selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
-        modelOverride,
-        {
-          provider: task.provider,
-          model: modelOverride || task.model,
-          codex_service_tier: task.codex_service_tier,
-        },
-      );
+      if (frontendReviewComposerMode && !fromQueue) {
+        const activatedTask = await api.startFrontendReviewGoal(task.id, {
+          message: text,
+          file_paths: uploadedPaths,
+          secret_ids: selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+          profile: 'standard',
+          max_iterations: 5,
+          expected_routing: {
+            provider: task.provider,
+            model: task.model,
+            codex_service_tier: task.codex_service_tier,
+          },
+        });
+        setFrontendReviewComposerMode(false);
+        setLocalStatus(activatedTask.status || 'pending');
+        setFrontendReviewGoalProgress({
+          turn: 0,
+          maxTurns: activatedTask.goal_max_turns || 5,
+          lastReason: null,
+          active: true,
+        });
+        onTaskUpdated?.();
+      } else {
+        const chatResponse = await api.sendTaskChat(
+          task.id,
+          text || '(files attached)',
+          uploadedPaths,
+          selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+          modelOverride,
+          {
+            provider: task.provider,
+            model: modelOverride || task.model,
+            codex_service_tier: task.codex_service_tier,
+          },
+        );
+        if (chatResponse.workspace_review_expected) {
+          setExpectedWorkspaceReviewBaseline(
+            chatResponse.workspace_review_baseline_run_id,
+          );
+          setShowBrowserReviewPanel(true);
+        }
+      }
       if (!fromQueue) {
         consumeForkSeedUploads();
       }
@@ -1702,6 +1969,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 后台运行中
               </span>
             )}
+            {isFrontendReviewGoal && (
+              <span
+                className="whitespace-nowrap rounded bg-indigo-500/20 px-1.5 text-xs font-medium text-indigo-300"
+                title={frontendReviewGoalProgress.lastReason || '模型将自动判断是否继续下一轮'}
+              >
+                Goal 审查 · 第 {Math.max(1, frontendReviewGoalProgress.turn + (frontendReviewGoalProgress.active ? 1 : 0))} 轮 · 自动
+              </span>
+            )}
             {task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
@@ -1730,6 +2005,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               active={monitorCount > 0}
               onNavigate={() => setShowMonitorPanel(!showMonitorPanel)}
             />
+            {browserReviewAvailable && (
+              <button
+                type="button"
+                onClick={() => setShowBrowserReviewPanel((value) => !value)}
+                className={`relative rounded p-1.5 transition-colors ${
+                  showBrowserReviewPanel
+                    ? 'bg-indigo-500/15 text-indigo-300'
+                    : 'text-gray-600 hover:text-indigo-400'
+                }`}
+                title={browserReviewDisplayMode === 'floating' ? '查看前端运行审查浮窗' : '查看前端运行审查'}
+                aria-label="Toggle Frontend Review panel"
+              >
+                <Eye size={18} />
+                <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              </button>
+            )}
             <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
             <button
               onClick={() => {
@@ -1759,19 +2050,44 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     const resp = await api.stopTaskSession(task.id);
                     setSending(false);
                     setStillRunning(false);
+                    const stoppedStatus = resp.task_status
+                      || (resp.stopped !== false ? 'completed' : null)
+                      || (resp.note?.includes('marked as completed') ? 'completed' : null);
+                    if (stoppedStatus) {
+                      lastWsStatusAt.current = Date.now();
+                      setLocalStatus(stoppedStatus);
+                    }
+                    if (typeof resp.background_active === 'boolean') {
+                      lastWsBackgroundAt.current = Date.now();
+                      setLocalBackgroundActive(resp.background_active);
+                    } else if (stoppedStatus) {
+                      lastWsBackgroundAt.current = Date.now();
+                      setLocalBackgroundActive(false);
+                    }
                     if (resp.stopped === false) {
                       const cleared = resp.cleared_messages ?? 0;
-                      setError(
-                        `Interrupt: no running process found${cleared > 0 ? `, cleared ${cleared} queued message(s)` : ''}. ` +
-                        'If output keeps arriving, the session may still be finishing.'
-                      );
+                      if (stoppedStatus === 'completed') {
+                        setError(null);
+                      } else {
+                        setError(
+                          `Interrupt: no running process found${cleared > 0 ? `, cleared ${cleared} queued message(s)` : ''}. ` +
+                          'The latest Task status is being refreshed.'
+                        );
+                      }
                     } else {
                       setError(null);
                     }
+                    onTaskUpdated?.();
                   } catch (e) {
                     setSending(false);
                     setStillRunning(false);
                     setLocalStatus(null);
+                    setError(
+                      `Interrupt failed; the Task may still be running: ${
+                        e instanceof Error ? e.message : String(e)
+                      }`,
+                    );
+                    onTaskUpdated?.();
                   }
                   finally { setInterrupting(false); }
                 }}
@@ -2119,6 +2435,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       )}
 
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {/* Load older messages banner — fixed above scroll area */}
       {messages.length > 0 && hasMoreHistory && (
         <div className="flex justify-center py-1.5 border-b border-gray-800 bg-gray-950/80 shrink-0">
@@ -2411,13 +2729,65 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <Paperclip size={18} />
             </button>
             <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInject)} />
-            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || (!task.session_id && !task.shared_from_id)} />
+            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!task.session_id && !task.shared_from_id)} />
+            {task.worker_id == null && task.shared_from_id == null && (
+              <button
+                type="button"
+                onClick={() => {
+                  setWorkspaceReviewComposerMode((value) => !value);
+                  setFrontendReviewComposerMode(false);
+                  setInjectMode(false);
+                  setModelOverride(null);
+                }}
+                disabled={injecting || !canStartWorkspaceReview}
+                aria-label="单次审查当前分支"
+                aria-pressed={workspaceReviewComposerMode}
+                className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:cursor-not-allowed disabled:opacity-40 ${
+                  workspaceReviewComposerMode
+                    ? 'bg-cyan-500/15 text-cyan-300 ring-1 ring-inset ring-cyan-400/40'
+                    : 'text-gray-500 hover:bg-cyan-500/10 hover:text-cyan-300'
+                }`}
+                title={canStartWorkspaceReview
+                  ? workspaceReviewComposerMode
+                    ? '单次审查已选择：启动隔离 Preview，并由独立浏览器 Agent 黑盒测试'
+                    : '单次审查当前开发分支（不修改代码）'
+                  : workspaceReviewUnavailableReason}
+              >
+                <Eye size={16} />
+              </button>
+            )}
+            {task.worker_id == null && task.shared_from_id == null && (
+              <button
+                type="button"
+                onClick={() => {
+                  setFrontendReviewComposerMode((value) => !value);
+                  setWorkspaceReviewComposerMode(false);
+                  setInjectMode(false);
+                  setModelOverride(null);
+                }}
+                disabled={injecting || !canStartFrontendReviewGoal}
+                aria-label="循环审查"
+                aria-pressed={frontendReviewComposerMode}
+                className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:cursor-not-allowed disabled:opacity-40 ${
+                  frontendReviewComposerMode
+                    ? 'bg-indigo-500/15 text-indigo-400 ring-1 ring-inset ring-indigo-400/40'
+                    : 'text-gray-500 hover:bg-indigo-500/10 hover:text-indigo-400'
+                }`}
+                title={canStartFrontendReviewGoal
+                  ? frontendReviewComposerMode
+                    ? '循环审查已选择：发送后在当前 Task/session 中自动审查、修改并复查'
+                    : '启动循环审查（当前 Task/session，最多 5 轮）'
+                  : frontendReviewGoalUnavailableReason}
+              >
+                <RefreshCw size={16} />
+              </button>
+            )}
             {/* Temp model override (one-shot) */}
             <div className="relative" data-temp-model>
               <button
                 type="button"
                 onClick={() => setShowModelMenu((v) => !v)}
-                disabled={injecting || (!task.session_id && !task.shared_from_id)}
+                disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!task.session_id && !task.shared_from_id)}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   modelOverride ? 'text-indigo-300 bg-indigo-600/20' : 'text-gray-500 hover:text-gray-300'
                 }`}
@@ -2511,6 +2881,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               文本、图片和文件会注入当前 turn；只有服务器明确确认成功后才会清空输入和附件。
             </div>
           )}
+          {frontendReviewComposerMode && (
+            <div className="flex min-w-0 items-center gap-1.5 text-[10px] leading-relaxed text-indigo-400">
+              <RefreshCw size={11} className="shrink-0" />
+              <span className="truncate">当前 Task/session：浏览器审查 → 必要修改 → 测试 → 重新审查（最多 5 轮）</span>
+            </div>
+          )}
+          {workspaceReviewComposerMode && (
+            <div className="flex min-w-0 items-center gap-1.5 text-[10px] leading-relaxed text-cyan-300">
+              <Eye size={11} className="shrink-0" />
+              <span className="truncate">单次黑盒审查当前分支：隔离 Preview → 浏览器验证 → 截图与报告（不修改代码）</span>
+            </div>
+          )}
           <div className="flex gap-2 items-end">
             <textarea
               ref={textareaRef}
@@ -2522,6 +2904,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   ? 'Run the task first to start a session...'
                   : injectMode && canInject
                     ? '注入模式：消息将直接注入运行中的 turn...'
+                    : frontendReviewComposerMode
+                      ? '描述这次要循环审查的页面、URL、流程或前端改动...'
+                    : workspaceReviewComposerMode
+                      ? '描述要验证的功能、页面和关键流程；无需提供 URL...'
                     : isProcessing
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
@@ -2533,22 +2919,42 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || (!task.session_id && !task.shared_from_id) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!task.session_id && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
                 : injectMode && canInject
                 ? (isProcessing ? '注入到运行中的 turn (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
+                : frontendReviewComposerMode ? '启动循环审查 (Ctrl+Enter)'
+                : workspaceReviewComposerMode ? '启动单次审查 (Ctrl+Enter)'
                 : isProcessing ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
                 injectMode && canInject ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
+                : frontendReviewComposerMode ? 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
+                : workspaceReviewComposerMode ? 'bg-cyan-600 hover:bg-cyan-500 shadow-cyan-600/25'
                 : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
-              {injectMode && canInject ? <Syringe size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
+              {injectMode && canInject ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
             </button>
           </div>
           </div>
         </div>
+      </div>
+        </div>
+        <BrowserReviewPanel
+          taskId={task.id}
+          taskActive={isProcessing}
+          open={showBrowserReviewPanel}
+          displayMode={browserReviewDisplayMode}
+          onAvailableChange={handleBrowserReviewAvailable}
+          onClose={() => setShowBrowserReviewPanel(false)}
+          onDisplayModeChange={handleBrowserReviewDisplayModeChange}
+          onNewReview={handleNewBrowserReview}
+          startedWorkspaceRun={startedWorkspaceReview}
+          expectedWorkspaceReviewBaseline={expectedWorkspaceReviewBaseline}
+          onExpectedWorkspaceReviewFound={handleExpectedWorkspaceReviewFound}
+          goalProgress={isFrontendReviewGoal ? frontendReviewGoalProgress : undefined}
+        />
       </div>
     </div>
   );

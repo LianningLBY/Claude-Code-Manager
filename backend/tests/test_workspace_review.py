@@ -123,6 +123,31 @@ def test_preview_config_is_shell_free_and_auto_detection_requires_confirmation(t
         validate_preview_config(unsafe, workspace)
 
 
+def test_ccm_preview_detection_installs_locked_frontend_dependencies_before_build(tmp_path):
+    workspace = _make_repo(tmp_path)
+    (workspace / "frontend").mkdir()
+    (workspace / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+    (workspace / "backend").mkdir()
+    (workspace / "backend" / "main.py").write_text("", encoding="utf-8")
+
+    suggestion = detect_preview_config(workspace)
+
+    assert suggestion is not None
+    assert suggestion["name"] == "CCM full-stack isolated preview"
+    assert suggestion["setup"] == [
+        {
+            "command": ["npm", "ci", "--no-audit", "--no-fund"],
+            "cwd": "frontend",
+            "timeout_seconds": 900,
+        },
+        {
+            "command": ["npm", "run", "build"],
+            "cwd": "frontend",
+            "timeout_seconds": 600,
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_workspace_fingerprint_covers_head_tracked_and_untracked_content(tmp_path):
     workspace = _make_repo(tmp_path)

@@ -250,6 +250,11 @@ def detect_preview_config(workspace: Path) -> dict[str, Any] | None:
             "name": "CCM full-stack isolated preview",
             "setup": [
                 {
+                    "command": ["npm", "ci", "--no-audit", "--no-fund"],
+                    "cwd": "frontend",
+                    "timeout_seconds": 900,
+                },
+                {
                     "command": ["npm", "run", "build"],
                     "cwd": "frontend",
                     "timeout_seconds": 600,

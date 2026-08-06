@@ -34,15 +34,18 @@ vi.mock('../components/PlanReview/PlanCatalog', () => ({
     plans,
     selectedPlanId,
     onSelectPlan,
+    onNavigateTask,
     onSetArchived,
   }: {
     plans: PlanResource[];
     selectedPlanId: number | null;
     onSelectPlan: (id: number) => void;
+    onNavigateTask: (taskId: number) => void;
     onSetArchived: (plan: PlanResource, archived: boolean) => Promise<void>;
   }) => <div>{plans.map((item) => (
     <div key={item.id}>
       <button type="button" aria-pressed={selectedPlanId === item.id} onClick={() => onSelectPlan(item.id)}>{item.title}</button>
+      {item.target_task_id != null && <button type="button" onClick={() => onNavigateTask(item.target_task_id!)}>Open related Task #{item.target_task_id}</button>}
       {item.active_run_id == null && <button type="button" onClick={() => void onSetArchived(item, item.archived_at == null)}>{item.archived_at ? `Restore Plan #${item.id}` : `Archive Plan #${item.id}`}</button>}
     </div>
   ))}</div>,
@@ -284,11 +287,11 @@ describe('PlansPage', () => {
     const onSelectedPlanChange = vi.fn();
     const onNavigateTask = vi.fn();
 
-    render(<PlansPage selectedPlanId={relatedPlan.id} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={onNavigateTask} onNavigateSettings={vi.fn()} />);
+    render(<PlansPage selectedPlanId={null} onSelectedPlanChange={onSelectedPlanChange} onNavigateTask={onNavigateTask} onNavigateSettings={vi.fn()} />);
     await userEvent.click(await screen.findByRole('button', { name: 'Open related Task #200' }));
 
     expect(onNavigateTask).toHaveBeenCalledWith(200);
-    expect(onSelectedPlanChange).toHaveBeenCalledWith(null);
+    expect(onSelectedPlanChange).not.toHaveBeenCalled();
   });
 
   it('provides an in-app shortcut to the Plan settings page', async () => {

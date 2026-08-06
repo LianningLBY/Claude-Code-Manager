@@ -27,6 +27,7 @@ describe('PlanCatalog', () => {
         projects={[]}
         selectedPlanId={2}
         onSelectPlan={onSelectPlan}
+        onNavigateTask={vi.fn()}
         onSetArchived={vi.fn()}
       />,
     );
@@ -52,7 +53,7 @@ describe('PlanCatalog', () => {
     ['archived', 'text-gray-400'],
     ['draft', 'text-gray-400'],
   ])('uses a semantic badge color for %s', (displayState, expectedClass) => {
-    render(<PlanCatalog plans={[{ ...plan(1, 'Plan'), display_state: displayState }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onSetArchived={vi.fn()} />);
+    render(<PlanCatalog plans={[{ ...plan(1, 'Plan'), display_state: displayState }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={vi.fn()} onSetArchived={vi.fn()} />);
     expect(screen.getByText(displayState === 'waiting_user' ? 'Needs input' : displayState === 'awaiting_review' ? 'Needs approval' : displayState[0].toUpperCase() + displayState.slice(1))).toHaveClass(expectedClass);
   });
 
@@ -60,7 +61,7 @@ describe('PlanCatalog', () => {
     const onSelectPlan = vi.fn();
     const onSetArchived = vi.fn().mockResolvedValue(undefined);
     const archived = { ...plan(2, 'Archived Plan'), archived_at: '2026-08-01T00:00:00Z' };
-    render(<PlanCatalog plans={[plan(1, 'Current Plan'), archived]} projects={[]} selectedPlanId={null} onSelectPlan={onSelectPlan} onSetArchived={onSetArchived} />);
+    render(<PlanCatalog plans={[plan(1, 'Current Plan'), archived]} projects={[]} selectedPlanId={null} onSelectPlan={onSelectPlan} onNavigateTask={vi.fn()} onSetArchived={onSetArchived} />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Archive Plan #1' }));
     await userEvent.click(screen.getByRole('button', { name: 'Restore Plan #2' }));
@@ -71,14 +72,14 @@ describe('PlanCatalog', () => {
   });
 
   it('hides archive actions for active Plans', () => {
-    render(<PlanCatalog plans={[{ ...plan(1, 'Running Plan'), active_run_id: 42 }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onSetArchived={vi.fn()} />);
+    render(<PlanCatalog plans={[{ ...plan(1, 'Running Plan'), active_run_id: 42 }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={vi.fn()} onSetArchived={vi.fn()} />);
     expect(screen.queryByRole('button', { name: 'Archive Plan #1' })).not.toBeInTheDocument();
   });
 
   it('disables the archive action while it is pending and keeps its accessible name', async () => {
     let resolve!: () => void;
     const pending = new Promise<void>((done) => { resolve = done; });
-    render(<PlanCatalog plans={[plan(1, 'Current Plan')]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onSetArchived={() => pending} />);
+    render(<PlanCatalog plans={[plan(1, 'Current Plan')]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={vi.fn()} onSetArchived={() => pending} />);
 
     const archive = screen.getByRole('button', { name: 'Archive Plan #1' });
     await userEvent.click(archive);
@@ -86,5 +87,18 @@ describe('PlanCatalog', () => {
     expect(archive).toHaveAttribute('title', 'Archive');
     resolve();
     await vi.waitFor(() => expect(archive).not.toBeDisabled());
+  });
+
+  it('opens a related Task without selecting the Plan', async () => {
+    const onSelectPlan = vi.fn();
+    const onNavigateTask = vi.fn();
+    render(<PlanCatalog plans={[{ ...plan(1, 'Related Plan'), target_task_id: 200 }]} projects={[]} selectedPlanId={null} onSelectPlan={onSelectPlan} onNavigateTask={onNavigateTask} onSetArchived={vi.fn()} />);
+
+    const openTask = screen.getByRole('button', { name: 'Open related Task #200' });
+    expect(openTask).toHaveAttribute('title', 'Open related Task #200');
+    await userEvent.click(openTask);
+
+    expect(onNavigateTask).toHaveBeenCalledWith(200);
+    expect(onSelectPlan).not.toHaveBeenCalled();
   });
 });

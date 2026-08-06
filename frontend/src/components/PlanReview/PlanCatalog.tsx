@@ -1,6 +1,6 @@
 import type { PlanResource, Project } from '../../api/client';
 import { useState } from 'react';
-import { Archive, ArchiveRestore, ChevronRight } from '../icons';
+import { Archive, ArchiveRestore, ChevronRight, ListTodo } from '../icons';
 import { planDisplayStateClassName, planDisplayStateLabel } from './planResourceStatus';
 
 interface Props {
@@ -8,10 +8,11 @@ interface Props {
   projects: Project[];
   selectedPlanId: number | null;
   onSelectPlan: (planId: number) => void;
+  onNavigateTask: (taskId: number) => void;
   onSetArchived: (plan: PlanResource, archived: boolean) => Promise<void>;
 }
 
-export function PlanCatalog({ plans, projects, selectedPlanId, onSelectPlan, onSetArchived }: Props) {
+export function PlanCatalog({ plans, projects, selectedPlanId, onSelectPlan, onNavigateTask, onSetArchived }: Props) {
   const [updatingPlanId, setUpdatingPlanId] = useState<number | null>(null);
   if (plans.length === 0) {
     return <div className="rounded-xl border border-gray-800 bg-gray-900/50 px-4 py-10 text-center text-sm text-gray-500">No Plans match this filter.</div>;
@@ -53,7 +54,8 @@ export function PlanCatalog({ plans, projects, selectedPlanId, onSelectPlan, onS
           </div>
           </button>
           <div className="flex shrink-0 items-center gap-1 pr-3">
-            {plan.active_run_id == null && <button type="button" onClick={() => void setArchived()} disabled={updating} aria-label={archiveLabel} title={archived ? 'Restore' : 'Archive'} className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-gray-700/70 hover:text-gray-200 disabled:pointer-events-none disabled:opacity-40">{archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}</button>}
+            {plan.target_task_id != null && <button type="button" onClick={() => onNavigateTask(plan.target_task_id!)} aria-label={`Open related Task #${plan.target_task_id}`} title={`Open related Task #${plan.target_task_id}`} className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs text-gray-500 transition-colors hover:bg-indigo-500/15 hover:text-indigo-300"><ListTodo size={15} /><span className="hidden lg:inline">Task #{plan.target_task_id}</span></button>}
+            {plan.active_run_id == null && <button type="button" onClick={() => void setArchived()} disabled={updating} aria-label={archiveLabel} title={archived ? 'Restore' : 'Archive'} className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs text-gray-500 transition-colors hover:bg-gray-700/70 hover:text-gray-200 disabled:pointer-events-none disabled:opacity-40">{archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}<span className="hidden lg:inline">{archived ? 'Restore' : 'Archive'}</span></button>}
             <ChevronRight size={15} aria-hidden="true" className={`shrink-0 ${selected ? 'text-indigo-300' : 'text-gray-600'}`} />
           </div>
         </div>;
